@@ -35,7 +35,7 @@ OpenTelemetry-Go + **otelpgx** · slog · aws-sdk-go-v2 (S3/R2, presigned) · go
 ## Convenções que carregam peso
 - **Identificadores em inglês** (tabelas/colunas/tipos), conforme `docs/erd-modelo-de-dados.md`. Enums = `text` + CHECK/validação na app.
 - **tenant_id em toda tabela de usuário** + isolamento em 2 barreiras: filtro na app (`tenantID` em toda assinatura de repo, vindo do token, nunca do body) **e** RLS (`SET LOCAL app.tenant_id` por tx).
-- **Erros tipados e agnósticos de HTTP** (`AppError`+`Kind` em `lib/httpx`); status HTTP só na borda (mapa `statusByKind`). 5xx loga `cause` com `trace_id`, não vaza ao cliente. "Não existe" = erro tipado `ENTITY_NOT_FOUND`, nunca `nil,nil`.
+- **Erros tipados e agnósticos de HTTP**: `AppError`+`Kind` vivem em **`lib/apperr`** (livre de Fiber — domínio e repos importam sem puxar HTTP). O mapa `statusByKind` + `WriteError` ficam em `lib/httpx` (a borda, que conhece Fiber). 5xx loga `cause` com `trace_id`, não vaza ao cliente. "Não existe" = erro tipado `ENTITY_NOT_FOUND`, nunca `nil,nil`.
 - **Escrita sempre em tx**: o **caso de uso** abre a tx (Unit of Work em `lib/database`); o repo *participa* dela. Entidade + `outbox` commitam juntos (transactional outbox).
 - **Repo devolve a entidade mapeada** (`*Draft`), nunca a row do sqlc — o `mapper.go` absorve `pgtype.*`. Leitura de tela usa read model (DTO por query dedicada), não monta o agregado.
 - **Eventos**: produtor grava no `outbox` na mesma tx; `worker-outbox-relay` publica no asynq (`FOR UPDATE SKIP LOCKED`); consumidor (`listener.go`) checa `processed_event` (idempotência, at-least-once). `trace_context` viaja no payload (trace ponta a ponta).
