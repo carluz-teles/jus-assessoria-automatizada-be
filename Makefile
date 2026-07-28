@@ -22,9 +22,14 @@ tidy:
 sqlc:
 	sqlc generate
 
-# Builda a imagem única (multi-stage) que roda em dev e em produção (§5d).
+# Builda as SEIS imagens lean (uma por serviço) a partir do único Dockerfile
+# parametrizado por SVC (§5d). Cada imagem carrega só o seu binário; o ENTRYPOINT
+# é o próprio binário (sem command override — o provider da Railway não seta um).
 docker-build:
-	docker build -t jus-assessoria:local .
+	@for svc in api worker-ingestao worker-documents worker-ai worker-outbox-relay scheduler; do \
+		echo "==> building jus-$$svc:local"; \
+		docker build --build-arg SVC=$$svc -t jus-$$svc:local . || exit 1; \
+	done
 
 # Sobe a stack local completa (postgres + redis + api + workers + scheduler).
 up:

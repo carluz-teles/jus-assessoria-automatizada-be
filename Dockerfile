@@ -1,10 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# The SAME image runs every service in dev and in prod (docs/erd-backend.md §5d):
-# what you build locally is what Railway runs. compose/Railway only override the
-# `command` to pick which of the six binaries a given service runs.
+# ONE Dockerfile, parameterized by service (docs/erd-backend.md §5d). The build
+# ARG `SVC` selects which cmd/ to compile, so this single file produces SIX lean
+# per-service images (jus-<svc>:local) — each carrying ONLY its own binary and an
+# ENTRYPOINT that IS that binary. No command override is ever needed, which is the
+# whole point: the Railway community provider's railway_service has no
+# start_command, so the image must be self-contained per service.
 
-# ---- build stage: compile all six binaries, statically -----------------------
+# ---- build stage: compile the one selected binary, statically ----------------
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 
@@ -13,22 +16,25 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Then the source. CGO off + fully static so the binaries run on distroless
-# static (no libc). -trimpath strips local paths; -s -w drop debug/symbol tables.
+# Then the source. `SVC` picks the cmd/ to build (api, worker-ingestao,
+# worker-documents, worker-ai, worker-outbox-relay, scheduler). CGO off + fully
+# static so the binary runs on distroless static (no libc). -trimpath strips
+# local paths; -s -w drop debug/symbol tables.
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/...
+ARG SVC=api
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SVC}
 
 # ---- final stage: minimal, non-root, no shell --------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 
-# The six entrypoints, plus the SQL the api applies at boot (the api embeds the
-# migrations too — this copy keeps them available for inspection/tools per §5d).
-COPY --from=build /out/ /app/
+# Just this service's binary. The migrations ride along too: only the api applies
+# them at boot, but the copy is cheap and harmless (keeps them available for
+# inspection/tools per §5d and keeps every image built the same way).
+COPY --from=build /out/app /app/app
 COPY migrations/ /app/migrations/
 
 USER nonroot:nonroot
 
-# api is the default; compose/Railway override `command` per service to run
-# scheduler / worker-* off this same image. One image, six start commands.
-ENTRYPOINT ["/app/api"]
+# The ENTRYPOINT is the binary itself — no per-service command to override.
+ENTRYPOINT ["/app/app"]

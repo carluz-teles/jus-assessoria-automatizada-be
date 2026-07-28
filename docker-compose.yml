@@ -1,15 +1,11 @@
-# Dev stack (docs/erd-backend.md §5d): the SAME built image runs every service;
-# compose only provides Postgres + Redis around it. `docker compose up` brings up
-# the full local stack. The artifact is identical to production — only the
-# environment around it is declared here, which kills "works on my machine".
-#
-# `api` is the one service with a `build:`; it tags the shared image, and every
-# worker/scheduler references that same tag with a different `command`.
+# Dev stack (docs/erd-backend.md §5d): each app service builds its OWN lean image
+# from the one parameterized Dockerfile (build arg SVC → jus-<svc>:local), and
+# compose provides Postgres + Redis around them. `docker compose up` brings up the
+# full local stack. Each image's ENTRYPOINT is its own binary — there is no
+# `command:` to override (the Railway provider can't set one), so what you run
+# locally is exactly what Railway runs, killing "works on my machine".
 
 name: jus-assessoria
-
-# The one image the whole stack shares.
-x-image: &image jus-assessoria:local
 
 # In-network addresses for the deps. Set as `environment` (which overrides
 # env_file) so the same .env — whose defaults point at localhost for host runs —
@@ -25,10 +21,10 @@ x-deps-healthy: &deps-healthy
   redis:
     condition: service_healthy
 
-# Shared shape for the workers and scheduler: same image, same env, same
-# dependencies — each overrides only its `command`.
+# Shared shape for the workers and scheduler: same env, same dependencies. Each
+# service still declares its own `build.args.SVC` and `image` tag — one lean
+# image per binary.
 x-worker: &worker
-  image: *image
   env_file: .env
   environment: *net-env
   depends_on: *deps-healthy
@@ -61,11 +57,13 @@ services:
       timeout: 5s
       retries: 10
 
-  # The api builds the shared image and is the only service that migrates at boot.
+  # The api is the only service that migrates at boot.
   api:
-    build: .
-    image: *image
-    command: ["/app/api"]
+    build:
+      context: .
+      args:
+        SVC: api
+    image: jus-api:local
     env_file: .env
     environment: *net-env
     ports:
@@ -75,23 +73,43 @@ services:
 
   worker-ingestao:
     <<: *worker
-    command: ["/app/worker-ingestao"]
+    build:
+      context: .
+      args:
+        SVC: worker-ingestao
+    image: jus-worker-ingestao:local
 
   worker-documents:
     <<: *worker
-    command: ["/app/worker-documents"]
+    build:
+      context: .
+      args:
+        SVC: worker-documents
+    image: jus-worker-documents:local
 
   worker-ai:
     <<: *worker
-    command: ["/app/worker-ai"]
+    build:
+      context: .
+      args:
+        SVC: worker-ai
+    image: jus-worker-ai:local
 
   worker-outbox-relay:
     <<: *worker
-    command: ["/app/worker-outbox-relay"]
+    build:
+      context: .
+      args:
+        SVC: worker-outbox-relay
+    image: jus-worker-outbox-relay:local
 
   scheduler:
     <<: *worker
-    command: ["/app/scheduler"]
+    build:
+      context: .
+      args:
+        SVC: scheduler
+    image: jus-scheduler:local
 
 volumes:
   pgdata:
