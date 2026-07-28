@@ -10,6 +10,12 @@ import "github.com/caarlos0/env/v11"
 
 // Config é a configuração tipada do processo. Segredos (ClerkSecret,
 // AnthropicKey) chegam só pelo ambiente — nunca no código nem no repositório.
+//
+// Os campos `required` morrem no boot se faltarem (fail fast, docs §5b.4). Os
+// demais são opcionais com default sensato: o binário que precisa deles valida
+// no ponto de uso (ex.: storage.New exige bucket/região/credenciais). Manter os
+// novos campos opcionais preserva o contrato dos binários que não os usam — um
+// worker não deve morrer por não ter S3 configurado.
 type Config struct {
 	DatabaseURL  string `env:"DATABASE_URL,required"`
 	RedisURL     string `env:"REDIS_URL,required"`
@@ -18,6 +24,22 @@ type Config struct {
 	AnthropicKey string `env:"ANTHROPIC_API_KEY,required"`
 	OTELEndpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT,required"`
 	Env          string `env:"APP_ENV" envDefault:"development"`
+
+	// HTTP + Clerk auth (só o api os consome). Port tem default; o issuer e o
+	// segredo do webhook são opcionais — issuer vazio deixa o ClerkVerifier
+	// aceitar o issuer padrão da instância, segredo vazio só quebra ao verificar
+	// um webhook, não no boot.
+	Port               string `env:"PORT" envDefault:"8080"`
+	ClerkIssuer        string `env:"CLERK_ISSUER"`
+	ClerkWebhookSecret string `env:"CLERK_WEBHOOK_SECRET"`
+
+	// Object storage S3-compatível (S3/R2/MinIO). Opcional: o api só monta o
+	// storage.Client quando S3Enabled() — ver o método abaixo.
+	S3Endpoint  string `env:"S3_ENDPOINT"`
+	S3Region    string `env:"S3_REGION"`
+	S3Bucket    string `env:"S3_BUCKET"`
+	S3AccessKey string `env:"S3_ACCESS_KEY"`
+	S3SecretKey string `env:"S3_SECRET_KEY"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do
@@ -30,4 +52,16 @@ func Load() (Config, error) {
 // IsProduction indica se o processo roda em produção (APP_ENV=production).
 func (c Config) IsProduction() bool {
 	return c.Env == "production"
+}
+
+// S3Enabled informa se o storage de objetos está totalmente configurado. O api
+// só monta o storage.Client quando todos os campos exigidos por storage.New
+// estão presentes (endpoint é opcional: vazio = AWS real). Configuração parcial
+// conta como desabilitada em vez de falhar o boot — a feature que usa S3 chega
+// depois; até lá o binário sobe sem ele.
+func (c Config) S3Enabled() bool {
+	return c.S3Bucket != "" &&
+		c.S3Region != "" &&
+		c.S3AccessKey != "" &&
+		c.S3SecretKey != ""
 }

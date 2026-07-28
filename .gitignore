@@ -4,6 +4,13 @@
 *.exe
 *.test
 *.out
+# Compiled cmd/ binaries dropped at repo root by `go build ./cmd/<name>`
+/api
+/scheduler
+/worker-ingestao
+/worker-documents
+/worker-ai
+/worker-outbox-relay
 
 # Env & secrets — NUNCA commitar
 .env
