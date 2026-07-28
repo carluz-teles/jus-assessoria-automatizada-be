@@ -3,6 +3,7 @@ package httpx_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -207,5 +208,32 @@ func TestWriteValidationError_FallsBackToWriteError(t *testing.T) {
 	}
 	if body.Kind != string(apperr.KindConflict) {
 		t.Errorf("kind = %q, want %q", body.Kind, apperr.KindConflict)
+	}
+}
+
+// TestWriteValidationError_WrappedIsUnwrapped guards B1: a validation.Errors
+// hidden one layer down the chain must still be reached via errors.As, not lost
+// to a bare type assertion (which would misclassify it as a 500 INFRA error).
+func TestWriteValidationError_WrappedIsUnwrapped(t *testing.T) {
+	t.Parallel()
+
+	verr := sampleReq{}.validate()
+	if verr == nil {
+		t.Fatal("expected validation to fail on empty title")
+	}
+	wrapped := fmt.Errorf("bind request: %w", verr)
+
+	status, body, _ := runHandler(t, func(c *fiber.Ctx) error {
+		return httpx.WriteValidationError(c, wrapped)
+	})
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if body.Kind != string(apperr.KindInvalid) {
+		t.Errorf("kind = %q, want %q", body.Kind, apperr.KindInvalid)
+	}
+	if _, ok := body.Details["title"]; !ok {
+		t.Errorf("details = %v, want a message under the \"title\" field", body.Details)
 	}
 }

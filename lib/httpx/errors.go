@@ -5,6 +5,7 @@
 package httpx
 
 import (
+	"errors"
 	"log/slog"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
@@ -78,8 +79,8 @@ func WriteError(c *fiber.Ctx, err error) error {
 // map[string]error that marshals to {field: message} using the request's json
 // tags. Anything that is not a validation.Errors falls back to WriteError.
 func WriteValidationError(c *fiber.Ctx, err error) error {
-	verrs, ok := err.(validation.Errors)
-	if !ok {
+	var verrs validation.Errors
+	if !errors.As(err, &verrs) {
 		return WriteError(c, err)
 	}
 
