@@ -1,0 +1,23 @@
+# sqlc — geração de código type-safe a partir do SQL.
+# Ref: https://docs.sqlc.dev (config v2, pgx/v5).
+#
+# Vertical slice: cada slice tem seu PRÓPRIO pacote gerado — logo, um bloco por
+# slice em `sql:` abaixo. O schema é compartilhado (migrations/, fonte de verdade
+# do banco em docs/erd-modelo-de-dados.md); as queries são por-slice
+# (internal/<slice>/queries). Ao criar um slice novo, copie o bloco-modelo.
+#
+# Starter: ainda não há slice com queries. Adicione o primeiro bloco quando
+# `internal/<slice>/queries/*.sql` existir. NÃO rode `sqlc generate` sem ele.
+version: "2"
+sql: []
+  # Bloco-modelo (descomentar ao criar o primeiro slice, ex.: draft):
+  # - engine: "postgresql"
+  #   schema: "migrations/"
+  #   queries: "internal/draft/queries"
+  #   gen:
+  #     go:
+  #       package: "draft"
+  #       out: "internal/draft"
+  #       sql_package: "pgx/v5"
+  #       emit_interface: true
+  #       emit_pointers_for_null_types: true
