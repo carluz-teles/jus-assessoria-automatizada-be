@@ -35,3 +35,28 @@ func Base(logger *slog.Logger) []fiber.Handler {
 		RequestLogger(logger),
 	}
 }
+
+// WithAuth returns the base chain with the Clerk Auth handler spliced into its
+// documented position — after Recover (so a panic in token verification is
+// caught) and before RequestLogger (so the access log carries the resolved
+// tenant), per §4.5. Base stays untouched; the api binary composes the two:
+//
+//	chain := middleware.WithAuth(middleware.Base(logger), middleware.Auth(v, r))
+//	for _, h := range chain {
+//	    app.Use(h)
+//	}
+//
+// RequestLogger is always the last handler Base emits, so Auth is inserted just
+// before it. Passing an empty base yields a chain of Auth alone.
+func WithAuth(base []fiber.Handler, auth fiber.Handler) []fiber.Handler {
+	if len(base) == 0 {
+		return []fiber.Handler{auth}
+	}
+
+	last := len(base) - 1
+	chain := make([]fiber.Handler, 0, len(base)+1)
+	chain = append(chain, base[:last]...)
+	chain = append(chain, auth)
+	chain = append(chain, base[last])
+	return chain
+}

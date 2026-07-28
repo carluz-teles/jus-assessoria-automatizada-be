@@ -63,6 +63,30 @@ func (uc *UseCase) ProvisionUser(ctx context.Context, clerkUserID, clerkOrgID, e
 	return user, nil
 }
 
+// SyncUser resyncs an existing app_user's email and name from a Clerk
+// user.updated webhook. Role and tenant are immutable here — membership decides
+// those, not a profile edit — so it reuses the stored values and lets UpsertUser's
+// ON CONFLICT clause touch only email/name. Idempotent for at-least-once
+// delivery. ErrUserNotFound propagates when the update races ahead of the
+// membership webhook that first creates the row.
+func (uc *UseCase) SyncUser(ctx context.Context, clerkUserID, email, name string) (*AppUser, error) {
+	existing, err := uc.repo.FindUserByClerkUser(ctx, clerkUserID)
+	if err != nil {
+		return nil, err
+	}
+
+	var user *AppUser
+	err = uc.uow.Do(ctx, existing.TenantID, func(tx database.Tx) error {
+		var err error
+		user, err = uc.repo.UpsertUser(ctx, tx, clerkUserID, existing.TenantID, email, name, existing.Role)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
 // ResolvePrincipal looks up the local user + tenant behind a verified Clerk JWT
 // and assembles the Principal the auth middleware injects into the request. The
 // TenantID is the internal uuid (from app_user), never the Clerk org id.

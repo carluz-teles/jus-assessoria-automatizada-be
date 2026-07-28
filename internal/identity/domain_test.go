@@ -203,6 +203,58 @@ func TestUseCase_ProvisionUser(t *testing.T) {
 	})
 }
 
+func TestUseCase_SyncUser(t *testing.T) {
+	ctx := context.Background()
+	existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleAdmin}
+
+	t.Run("resyncs email/name under the tenant scope, keeping tenant and role", func(t *testing.T) {
+		var upsert struct {
+			tenantID, email, name string
+			role                  Role
+		}
+		repo := &mockRepo{
+			findUser: func(context.Context, string) (*AppUser, error) { return existing, nil },
+			upsertUser: func(_ context.Context, _ database.Tx, _, tenantID, email, name string, role Role) (*AppUser, error) {
+				upsert.tenantID, upsert.email, upsert.name, upsert.role = tenantID, email, name, role
+				return existing, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		got, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova")
+		if err != nil {
+			t.Fatalf("SyncUser() error = %v", err)
+		}
+		if got != existing {
+			t.Fatalf("SyncUser() = %+v, want %+v", got, existing)
+		}
+		if uow.scope != existing.TenantID {
+			t.Fatalf("RLS scope = %q, want %q", uow.scope, existing.TenantID)
+		}
+		if upsert.tenantID != existing.TenantID || upsert.role != existing.Role {
+			t.Fatalf("tenant/role not preserved: %+v", upsert)
+		}
+		if upsert.email != "new@b.com" || upsert.name != "Ana Nova" {
+			t.Fatalf("resynced fields = %+v", upsert)
+		}
+	})
+
+	t.Run("missing user propagates ErrUserNotFound without opening a tx", func(t *testing.T) {
+		repo := &mockRepo{
+			findUser: func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
+		}
+		uow := &fakeUOW{}
+
+		_, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "x@y.com", "X")
+		if !errors.Is(err, ErrUserNotFound) {
+			t.Fatalf("error = %v, want ErrUserNotFound", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite missing user")
+		}
+	})
+}
+
 func TestUseCase_ResolvePrincipal(t *testing.T) {
 	ctx := context.Background()
 	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
