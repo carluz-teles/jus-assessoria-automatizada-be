@@ -1,0 +1,29 @@
+# Binaries / build output
+/bin/
+/out/
+*.exe
+*.test
+*.out
+
+# Env & secrets — NUNCA commitar
+.env
+.env.*
+!.env.example
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!*.tfvars.example
