@@ -1,0 +1,105 @@
+package database
+
+import (
+	"errors"
+	"io"
+	"io/fs"
+	"testing"
+
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+
+	"github.com/jusassessoria/platform/migrations"
+)
+
+// TestEmbeddedSource asserts the migration files embed and parse as a valid
+// golang-migrate iofs source without touching a live database (the plain green
+// gate has no Postgres — real-DB apply is covered by an integration test later).
+func TestEmbeddedSource(t *testing.T) {
+	t.Parallel()
+
+	src, err := iofs.New(migrations.FS, ".")
+	if err != nil {
+		t.Fatalf("iofs.New: %v", err)
+	}
+	defer src.Close()
+
+	first, err := src.First()
+	if err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if first != 1 {
+		t.Fatalf("first migration version = %d, want 1", first)
+	}
+
+	// Version 1 must have a non-empty up and a non-empty down (the pair).
+	up, _, err := src.ReadUp(1)
+	if err != nil {
+		t.Fatalf("ReadUp(1): %v", err)
+	}
+	defer up.Close()
+	if n := mustReadLen(t, up); n == 0 {
+		t.Fatal("up migration for version 1 is empty")
+	}
+
+	down, _, err := src.ReadDown(1)
+	if err != nil {
+		t.Fatalf("ReadDown(1): %v", err)
+	}
+	defer down.Close()
+	if n := mustReadLen(t, down); n == 0 {
+		t.Fatal("down migration for version 1 is empty")
+	}
+
+	// v0 ships exactly one migration: there is no version after 1.
+	if _, err := src.Next(1); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(1) error = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestPgxURL covers the DATABASE_URL -> pgx5:// scheme rewrite the migrate
+// pgx/v5 driver requires. Pure and DB-less.
+func TestPgxURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "postgres scheme is rewritten",
+			in:   "postgres://user:pass@localhost:5432/jus",
+			want: "pgx5://user:pass@localhost:5432/jus",
+		},
+		{
+			name: "postgresql scheme is rewritten, query preserved",
+			in:   "postgresql://user:pass@host/jus?sslmode=disable",
+			want: "pgx5://user:pass@host/jus?sslmode=disable",
+		},
+		{
+			name: "already pgx5 is passed through",
+			in:   "pgx5://user@host/jus",
+			want: "pgx5://user@host/jus",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := pgxURL(tt.in); got != tt.want {
+				t.Errorf("pgxURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func mustReadLen(t *testing.T, r io.Reader) int {
+	t.Helper()
+
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading migration: %v", err)
+	}
+	return len(b)
+}
