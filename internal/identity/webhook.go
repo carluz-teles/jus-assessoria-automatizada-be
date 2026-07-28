@@ -35,6 +35,17 @@ func NewWebhookHandler(secret string, uc *UseCase) *WebhookHandler {
 	return &WebhookHandler{secret: secret, uc: uc}
 }
 
+// Register mounts identity's public HTTP routes on r — the slice owns its own
+// routing, so the api composes by calling this and never names the path itself.
+// The Clerk provisioning webhook is the whole public surface for now: it
+// authenticates via its svix signature (§4d.3), so it needs no bearer token and
+// hangs off the router root rather than the /v1 group. When identity gains
+// authenticated routes, add a RegisterV1(r fiber.Router) for the /v1 group
+// alongside this one.
+func (h *WebhookHandler) Register(r fiber.Router) {
+	r.Post("/webhooks/clerk", h.Handle)
+}
+
 // clerkEvent is the envelope every Clerk webhook shares: a type discriminator and
 // an opaque data object decoded per event in dispatch.
 type clerkEvent struct {

@@ -49,13 +49,15 @@ func newRouter(deps routerDeps) *fiber.App {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
-	// Public: Clerk provisioning webhook. It is unauthenticated at the router
-	// level because the handler verifies the svix signature itself (§4d.3).
-	app.Post("/webhooks/clerk", deps.webhook.Handle)
+	// Domain routes come from each slice, never hand-listed here — the api only
+	// composes. identity owns its public Clerk provisioning webhook (svix-verified
+	// inside, so unauthenticated at the router level, §4d.3) and mounts it via
+	// Register. Adding a domain = one more slice.Register(...) call, no route here.
+	deps.webhook.Register(app)
 
 	// Authenticated surface. Auth verifies the JWT and resolves the internal
 	// Principal before any /v1 handler runs; the placeholder ping proves the
-	// group is wired — feature slices hang their routes off it.
+	// group is wired — feature slices mount their routes here via RegisterV1.
 	v1 := app.Group("/v1", middleware.Auth(deps.verifier, deps.resolver))
 	v1.Get("/ping", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
