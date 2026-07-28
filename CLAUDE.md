@@ -27,6 +27,12 @@ Regra de dependência DENTRO do slice: `handler|listener → domain(caso de uso)
 `entity.go` não importa repository/handler/lib. `domain.go` depende da **interface** Repository, não da impl.
 **Slices só se comunicam por evento** (nunca importam entity/repo um do outro; podem importar o contrato de evento).
 
+**Handlers auto-registráveis (o slice é dono das suas rotas):** cada slice expõe no `handler.go` um
+`func (h *Handler) Register(r fiber.Router)` (ou `RegisterPublic`/`RegisterV1` quando precisa distinguir rota
+pública de autenticada) que monta **todas** as rotas daquele domínio. O `cmd/api` só **compõe** —
+`identity.Register(v1)`, `processo.Register(v1)`, … — e **não conhece nenhuma rota individual**. Adicionar um
+domínio = criar o slice + **uma linha** de `Register` na composição da API. A `main` nunca lista `app.Get/Post`.
+
 ## Stack / libs (usar a versão instalada; conferir doc via context7 antes de codar)
 Fiber · sqlc + pgx/v5 · asynq + Redis · PostgreSQL + pgvector · golang-migrate · **ozzo-validation** (método
 `Validate()` na Request, não tags) · **caarlos0/env/v11** (config) · **Clerk** SDK Go + **svix** (webhook) ·
