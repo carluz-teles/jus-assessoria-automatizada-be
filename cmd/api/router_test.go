@@ -5,11 +5,18 @@ import (
 	"encoding/json"
 	"io"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/telemetry"
 )
+
+// testWebhookSecret is svix's documented example signing secret (whsec_ + base64),
+// valid in format so NewWebhook succeeds; a request with no svix headers then fails
+// verification with 401 — enough to prove the route reaches Handle through Register.
+const testWebhookSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
 
 // fakeVerifier and fakeResolver stand in for the Clerk-backed implementations so
 // the router builds without any network or database. The /health test never
@@ -77,5 +84,26 @@ func TestNewRouter_V1_RequiresAuth(t *testing.T) {
 
 	if resp.StatusCode != 401 {
 		t.Fatalf("GET /v1/ping without token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// The Clerk webhook is not hand-listed in newRouter; identity mounts it via
+// Register. Posting without svix headers must reach Handle and be rejected at the
+// signature check (401) — proof the public route is wired through the composed
+// router, not that any hand-written app.Post exists in main.
+func TestNewRouter_Webhook_WiredThroughRegister(t *testing.T) {
+	deps := newTestRouterDeps()
+	deps.webhook = identity.NewWebhookHandler(testWebhookSecret, nil)
+	app := newRouter(deps)
+
+	req := httptest.NewRequest("POST", "/webhooks/clerk", strings.NewReader(`{}`))
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 401 {
+		t.Fatalf("POST /webhooks/clerk without signature status = %d, want 401", resp.StatusCode)
 	}
 }

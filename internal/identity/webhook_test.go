@@ -161,11 +161,12 @@ func TestWebhookHandler_Handle(t *testing.T) {
 }
 
 // doWebhook runs req through a fiber app mounting the handler and returns the
-// response.
+// response. It mounts via Register (not a hand-listed route) so this exercises
+// the same entry point the api composes with.
 func doWebhook(t *testing.T, h *WebhookHandler, req *http.Request) *http.Response {
 	t.Helper()
 	app := fiber.New()
-	app.Post("/webhooks/clerk", h.Handle)
+	h.Register(app)
 	resp, err := app.Test(req)
 	if err != nil {
 		t.Fatalf("app.Test: %v", err)
