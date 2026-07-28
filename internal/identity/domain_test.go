@@ -1,0 +1,262 @@
+package identity
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/jusassessoria/platform/lib/database"
+)
+
+// mockRepo is a hand-written Repository double: each method delegates to a func
+// field, so every test injects exactly the behavior it needs. Unset fields fail
+// loudly (nil call) if a test reaches a path it did not expect.
+type mockRepo struct {
+	upsertTenant func(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
+	findTenant   func(ctx context.Context, clerkOrgID string) (*Tenant, error)
+	upsertUser   func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error)
+	findUser     func(ctx context.Context, clerkUserID string) (*AppUser, error)
+}
+
+func (m *mockRepo) UpsertTenant(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error) {
+	return m.upsertTenant(ctx, tx, clerkOrgID, name)
+}
+
+func (m *mockRepo) FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error) {
+	return m.findTenant(ctx, clerkOrgID)
+}
+
+func (m *mockRepo) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error) {
+	return m.upsertUser(ctx, tx, clerkUserID, tenantID, email, name, role)
+}
+
+func (m *mockRepo) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
+	return m.findUser(ctx, clerkUserID)
+}
+
+// fakeUOW is a no-op unit of work: it records the RLS scope the use case asked
+// for and runs fn with a nil tx (the mocked repo never touches it). err injects
+// a boundary failure (Begin/Commit) to prove it propagates unwrapped.
+type fakeUOW struct {
+	scope  string
+	called bool
+	err    error
+}
+
+func (u *fakeUOW) Do(ctx context.Context, tenantID string, fn func(tx database.Tx) error) error {
+	u.called = true
+	u.scope = tenantID
+	if u.err != nil {
+		return u.err
+	}
+	return fn(nil)
+}
+
+func TestUseCase_ProvisionTenant(t *testing.T) {
+	ctx := context.Background()
+	want := &Tenant{ID: "t-1", ClerkOrgID: "org_abc", Name: "Escritório"}
+
+	t.Run("upserts and returns the tenant with no RLS scope", func(t *testing.T) {
+		var calls int
+		repo := &mockRepo{
+			upsertTenant: func(_ context.Context, _ database.Tx, clerkOrgID, name string) (*Tenant, error) {
+				calls++
+				if clerkOrgID != "org_abc" || name != "Escritório" {
+					t.Fatalf("upsert args = (%q, %q)", clerkOrgID, name)
+				}
+				return want, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		got, err := NewUseCase(repo, uow).ProvisionTenant(ctx, "org_abc", "Escritório")
+		if err != nil {
+			t.Fatalf("ProvisionTenant() error = %v", err)
+		}
+		if got != want {
+			t.Fatalf("ProvisionTenant() = %+v, want %+v", got, want)
+		}
+		// tenant has no tenant_id of its own — the scope must stay empty.
+		if uow.scope != "" {
+			t.Fatalf("RLS scope = %q, want empty", uow.scope)
+		}
+		if calls != 1 {
+			t.Fatalf("UpsertTenant calls = %d, want 1", calls)
+		}
+	})
+
+	t.Run("idempotent: replaying the webhook upserts the same tenant", func(t *testing.T) {
+		repo := &mockRepo{
+			upsertTenant: func(_ context.Context, _ database.Tx, _, _ string) (*Tenant, error) {
+				return want, nil // ON CONFLICT ... DO UPDATE always yields the row
+			},
+		}
+		uc := NewUseCase(repo, &fakeUOW{})
+
+		first, err1 := uc.ProvisionTenant(ctx, "org_abc", "Escritório")
+		second, err2 := uc.ProvisionTenant(ctx, "org_abc", "Escritório")
+		if err1 != nil || err2 != nil {
+			t.Fatalf("errors = %v, %v", err1, err2)
+		}
+		if first != second {
+			t.Fatalf("replays diverged: %+v vs %+v", first, second)
+		}
+	})
+
+	t.Run("propagates a commit failure unwrapped", func(t *testing.T) {
+		boom := errors.New("commit failed")
+		repo := &mockRepo{
+			upsertTenant: func(_ context.Context, _ database.Tx, _, _ string) (*Tenant, error) {
+				return want, nil
+			},
+		}
+
+		got, err := NewUseCase(repo, &fakeUOW{err: boom}).ProvisionTenant(ctx, "org_abc", "x")
+		if !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
+		}
+		if got != nil {
+			t.Fatalf("tenant = %+v, want nil on error", got)
+		}
+	})
+}
+
+func TestUseCase_ProvisionUser(t *testing.T) {
+	ctx := context.Background()
+	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
+	want := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleLawyer}
+
+	t.Run("invalid role short-circuits before any repo call", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				t.Fatal("FindTenantByClerkOrg must not be called on invalid role")
+				return nil, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		_, err := NewUseCase(repo, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", "OWNER")
+		if !errors.Is(err, ErrInvalidRole) {
+			t.Fatalf("error = %v, want ErrInvalidRole", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite invalid role")
+		}
+	})
+
+	t.Run("tenant not provisioned propagates ErrTenantNotFound", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				return nil, ErrTenantNotFound
+			},
+		}
+		uow := &fakeUOW{}
+
+		_, err := NewUseCase(repo, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
+		if !errors.Is(err, ErrTenantNotFound) {
+			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite missing tenant")
+		}
+	})
+
+	t.Run("upserts the user under the tenant's RLS scope", func(t *testing.T) {
+		var upsertArgs struct {
+			clerkUserID, tenantID, email, name string
+			role                               Role
+		}
+		repo := &mockRepo{
+			findTenant: func(_ context.Context, clerkOrgID string) (*Tenant, error) {
+				if clerkOrgID != "org_abc" {
+					t.Fatalf("findTenant org = %q", clerkOrgID)
+				}
+				return tenant, nil
+			},
+			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error) {
+				upsertArgs.clerkUserID = clerkUserID
+				upsertArgs.tenantID = tenantID
+				upsertArgs.email = email
+				upsertArgs.name = name
+				upsertArgs.role = role
+				return want, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		got, err := NewUseCase(repo, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
+		if err != nil {
+			t.Fatalf("ProvisionUser() error = %v", err)
+		}
+		if got != want {
+			t.Fatalf("ProvisionUser() = %+v, want %+v", got, want)
+		}
+		if uow.scope != tenant.ID {
+			t.Fatalf("RLS scope = %q, want %q", uow.scope, tenant.ID)
+		}
+		if upsertArgs.tenantID != tenant.ID {
+			t.Fatalf("upsert tenantID = %q, want internal %q", upsertArgs.tenantID, tenant.ID)
+		}
+		if upsertArgs.clerkUserID != "user_xyz" || upsertArgs.email != "a@b.com" || upsertArgs.name != "Ana" || upsertArgs.role != RoleLawyer {
+			t.Fatalf("upsert args = %+v", upsertArgs)
+		}
+	})
+}
+
+func TestUseCase_ResolvePrincipal(t *testing.T) {
+	ctx := context.Background()
+	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
+	user := &AppUser{ID: "user-uuid", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleAdmin}
+
+	t.Run("assembles the principal from user + tenant", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return user, nil },
+		}
+
+		got, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		if err != nil {
+			t.Fatalf("ResolvePrincipal() error = %v", err)
+		}
+		want := Principal{UserID: "user-uuid", TenantID: "tenant-uuid", Role: RoleAdmin}
+		if got != want {
+			t.Fatalf("ResolvePrincipal() = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("missing tenant propagates ErrTenantNotFound", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+		}
+
+		_, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		if !errors.Is(err, ErrTenantNotFound) {
+			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		}
+	})
+
+	t.Run("missing user propagates ErrUserNotFound", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
+		}
+
+		_, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		if !errors.Is(err, ErrUserNotFound) {
+			t.Fatalf("error = %v, want ErrUserNotFound", err)
+		}
+	})
+
+	t.Run("user of another tenant is treated as not found", func(t *testing.T) {
+		other := &AppUser{ID: "user-uuid", TenantID: "different-tenant", Role: RoleAdmin}
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return other, nil },
+		}
+
+		_, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		if !errors.Is(err, ErrUserNotFound) {
+			t.Fatalf("error = %v, want ErrUserNotFound on tenant mismatch", err)
+		}
+	})
+}
