@@ -1,0 +1,20 @@
+# environments/staging.tfvars.example — tamanhos menores, réplicas = 1 (docs §5e.3).
+#
+# Copie para staging.tfvars (ignorado pelo git) e ajuste. SEGREDOS NÃO ENTRAM AQUI —
+# chegam por -var / TF_VAR_* do cofre/CI no apply (§5e.5).
+
+environment    = "staging"
+image_registry = "ghcr.io/jusassessoria"
+image_tag      = "latest"
+region         = "us-east4-eqdc4a"
+api_domain     = "api.staging.court-legal.app"
+
+# Staging: tudo réplica 1 (menor e mais barato).
+service_replicas = {
+  api                 = 1
+  worker-ingestao     = 1
+  worker-documents    = 1
+  worker-ai           = 1
+  worker-outbox-relay = 1
+  scheduler           = 1
+}
