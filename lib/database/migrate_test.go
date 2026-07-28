@@ -21,7 +21,13 @@ func TestEmbeddedSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("iofs.New: %v", err)
 	}
-	defer src.Close()
+	// Close over an embed.FS source is a no-op that cannot fail, but the rule is that
+	// returned errors are never silently dropped — surface it as a cleanup failure.
+	t.Cleanup(func() {
+		if err := src.Close(); err != nil {
+			t.Errorf("src.Close: %v", err)
+		}
+	})
 
 	first, err := src.First()
 	if err != nil {
@@ -36,7 +42,11 @@ func TestEmbeddedSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadUp(1): %v", err)
 	}
-	defer up.Close()
+	t.Cleanup(func() {
+		if err := up.Close(); err != nil {
+			t.Errorf("up.Close: %v", err)
+		}
+	})
 	if n := mustReadLen(t, up); n == 0 {
 		t.Fatal("up migration for version 1 is empty")
 	}
@@ -45,7 +55,11 @@ func TestEmbeddedSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDown(1): %v", err)
 	}
-	defer down.Close()
+	t.Cleanup(func() {
+		if err := down.Close(); err != nil {
+			t.Errorf("down.Close: %v", err)
+		}
+	})
 	if n := mustReadLen(t, down); n == 0 {
 		t.Fatal("down migration for version 1 is empty")
 	}

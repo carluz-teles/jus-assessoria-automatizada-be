@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -38,6 +39,15 @@ func Up(ctx context.Context, databaseURL string) error {
 	if err != nil {
 		return fmt.Errorf("building migrator: %w", err)
 	}
+	// migrate opens its own pgx pool for the migration; release it on return so it
+	// does not outlive this call. Close reports the source and database close errors
+	// separately; the migration outcome is the primary return, so these are logged,
+	// not returned (single-handling rule).
+	defer func() {
+		if srcErr, dbErr := m.Close(); srcErr != nil || dbErr != nil {
+			slog.Warn("closing migrator", "src_err", srcErr, "db_err", dbErr)
+		}
+	}()
 
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return fmt.Errorf("applying migrations: %w", err)
