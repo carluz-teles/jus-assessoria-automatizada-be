@@ -1,0 +1,21 @@
+# environments/prod.tfvars.example — tamanhos/réplicas de PRODUÇÃO (docs §5e.3).
+#
+# Copie para prod.tfvars (ignorado pelo git) e ajuste. SEGREDOS NÃO ENTRAM AQUI:
+# railway_token, clerk_*, anthropic_key, otel_endpoint, postgres_password, s3_*
+# chegam por -var / TF_VAR_* do cofre/CI no apply (§5e.5).
+
+environment    = "prod"
+image_registry = "ghcr.io/jusassessoria"
+image_tag      = "latest" # o pipeline sobrescreve com :sha no deploy
+region         = "us-east4-eqdc4a"
+api_domain     = "api.court-legal.app"
+
+# Produção: api com folga, workers conforme carga.
+service_replicas = {
+  api                 = 2
+  worker-ingestao     = 2
+  worker-documents    = 2
+  worker-ai           = 2
+  worker-outbox-relay = 1
+  scheduler           = 1
+}
