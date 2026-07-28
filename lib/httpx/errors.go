@@ -1,0 +1,100 @@
+// Package httpx is the HTTP edge: it is the only place that knows about Fiber
+// and HTTP status codes. It maps the transport-agnostic apperr.Kind to a status,
+// renders the single client-facing error envelope, and provides the cursor
+// pagination primitives. Domain and repositories import lib/apperr, never this.
+package httpx
+
+import (
+	"log/slog"
+
+	validation "github.com/go-ozzo/ozzo-validation/v4"
+	"github.com/gofiber/fiber/v2"
+
+	"github.com/jusassessoria/platform/lib/apperr"
+)
+
+// statusByKind is the ONLY place that maps an apperr.Kind to an HTTP status
+// (docs/erd-backend.md §4.3). Keeping it here — and nowhere else — is what lets
+// the domain and repositories stay free of net/http.
+var statusByKind = map[apperr.Kind]int{
+	apperr.KindInvalid:      fiber.StatusBadRequest,          // 400
+	apperr.KindUnauthorized: fiber.StatusUnauthorized,        // 401
+	apperr.KindForbidden:    fiber.StatusForbidden,           // 403
+	apperr.KindNotFound:     fiber.StatusNotFound,            // 404
+	apperr.KindConflict:     fiber.StatusConflict,            // 409
+	apperr.KindInfra:        fiber.StatusInternalServerError, // 500
+}
+
+// ErrorBody is the single client-facing error envelope (§4.4): {kind, message,
+// details?}. It never carries the wrapped cause — that is logged at the edge,
+// never leaked to the client.
+type ErrorBody struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+	Details any    `json:"details,omitempty"`
+}
+
+// WriteError maps any error to the single error envelope and writes it.
+//
+// A non-AppError is treated as a bug: it is wrapped as INFRA (500) so an
+// unclassified error never escapes as anything softer than a server error. For
+// status >= 500 the cause is logged with the request context (the trace_id
+// rides along) and the client receives a generic message — internals never
+// leak. For status < 500 the AppError.Message is safe to expose.
+func WriteError(c *fiber.Ctx, err error) error {
+	ae, ok := apperr.From(err)
+	if !ok {
+		ae = apperr.NewInfra("internal error", err)
+	}
+
+	status, known := statusByKind[ae.Kind]
+	if !known {
+		status = fiber.StatusInternalServerError
+	}
+
+	if status >= fiber.StatusInternalServerError {
+		slog.ErrorContext(
+			c.UserContext(),
+			"internal error",
+			"kind", string(ae.Kind),
+			"cause", causeOf(ae),
+		)
+
+		return c.Status(status).JSON(ErrorBody{
+			Kind:    string(ae.Kind),
+			Message: "internal error",
+		})
+	}
+
+	return c.Status(status).JSON(ErrorBody{
+		Kind:    string(ae.Kind),
+		Message: ae.Message,
+		Details: ae.Details,
+	})
+}
+
+// WriteValidationError renders ozzo validation failures as a 400 with the
+// field→message map under Details. ozzo's validation.Errors is a
+// map[string]error that marshals to {field: message} using the request's json
+// tags. Anything that is not a validation.Errors falls back to WriteError.
+func WriteValidationError(c *fiber.Ctx, err error) error {
+	verrs, ok := err.(validation.Errors)
+	if !ok {
+		return WriteError(c, err)
+	}
+
+	return c.Status(fiber.StatusBadRequest).JSON(ErrorBody{
+		Kind:    string(apperr.KindInvalid),
+		Message: "validation failed",
+		Details: verrs,
+	})
+}
+
+// causeOf returns the underlying cause the edge logs for a 5xx. It falls back to
+// the AppError itself when nothing was wrapped, so the log line is never empty.
+func causeOf(ae *apperr.AppError) error {
+	if cause := ae.Unwrap(); cause != nil {
+		return cause
+	}
+	return ae
+}
