@@ -1,0 +1,97 @@
+# Dev stack (docs/erd-backend.md §5d): the SAME built image runs every service;
+# compose only provides Postgres + Redis around it. `docker compose up` brings up
+# the full local stack. The artifact is identical to production — only the
+# environment around it is declared here, which kills "works on my machine".
+#
+# `api` is the one service with a `build:`; it tags the shared image, and every
+# worker/scheduler references that same tag with a different `command`.
+
+name: jus-assessoria
+
+# The one image the whole stack shares.
+x-image: &image jus-assessoria:local
+
+# In-network addresses for the deps. Set as `environment` (which overrides
+# env_file) so the same .env — whose defaults point at localhost for host runs —
+# also works inside compose, where the deps are reachable by service name.
+x-net-env: &net-env
+  DATABASE_URL: postgres://jus:jus@postgres:5432/jusassessoria?sslmode=disable
+  REDIS_URL: redis://redis:6379/0
+
+# Both deps healthy before any app container starts.
+x-deps-healthy: &deps-healthy
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
+# Shared shape for the workers and scheduler: same image, same env, same
+# dependencies — each overrides only its `command`.
+x-worker: &worker
+  image: *image
+  env_file: .env
+  environment: *net-env
+  depends_on: *deps-healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: jus
+      POSTGRES_PASSWORD: jus
+      POSTGRES_DB: jusassessoria
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jus -d jusassessoria"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # The api builds the shared image and is the only service that migrates at boot.
+  api:
+    build: .
+    image: *image
+    command: ["/app/api"]
+    env_file: .env
+    environment: *net-env
+    ports:
+      - "8080:8080"
+    depends_on: *deps-healthy
+    restart: unless-stopped
+
+  worker-ingestao:
+    <<: *worker
+    command: ["/app/worker-ingestao"]
+
+  worker-documents:
+    <<: *worker
+    command: ["/app/worker-documents"]
+
+  worker-ai:
+    <<: *worker
+    command: ["/app/worker-ai"]
+
+  worker-outbox-relay:
+    <<: *worker
+    command: ["/app/worker-outbox-relay"]
+
+  scheduler:
+    <<: *worker
+    command: ["/app/scheduler"]
+
+volumes:
+  pgdata:

@@ -1,0 +1,42 @@
+# Keep the build context small: only Go source, go.mod/go.sum and migrations are
+# needed to build. Everything below is noise or secret.
+
+# VCS
+.git
+.gitignore
+
+# Build output / test artifacts
+/out
+/bin
+*.test
+*.out
+*.exe
+
+# Compiled cmd/ binaries dropped at the repo root by `go build ./cmd/<name>`
+/api
+/scheduler
+/worker-ingestao
+/worker-documents
+/worker-ai
+/worker-outbox-relay
+
+# Env & secrets — NEVER in the image
+.env
+.env.*
+!.env.example
+
+# Node / frontend tooling (frontend arrives later)
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Editor / OS
+.idea
+.vscode
+.DS_Store
+*.swp
+
+# Not needed to build the binaries
+infra
+docs
+*.md

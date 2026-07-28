@@ -1,0 +1,41 @@
+# Ephemeral deps for integration/e2e tests (docs/erd-backend.md §5d): Postgres +
+# Redis on tmpfs (RAM), no named volumes — nothing survives `down`, every run
+# starts from a clean slate. Ports are shifted off the dev-stack defaults so this
+# can run alongside `docker compose up`.
+#
+# The integration test suite (test/integration, `-tags=integration`) spins its
+# own throwaway Postgres via testcontainers, so it does NOT need this file. This
+# is for running the app's tests against a compose-provided stack (e.g. e2e, or
+# CI that prefers compose over the Docker-in-Docker testcontainers needs).
+
+name: jus-assessoria-test
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: jus
+      POSTGRES_PASSWORD: jus
+      POSTGRES_DB: jus
+    ports:
+      - "5433:5432"
+    # RAM-backed data dir: fast and ephemeral, no volume to clean up.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jus -d jus"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
