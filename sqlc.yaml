@@ -6,18 +6,42 @@
 # do banco em docs/erd-modelo-de-dados.md); as queries são por-slice
 # (internal/<slice>/queries). Ao criar um slice novo, copie o bloco-modelo.
 #
-# Starter: ainda não há slice com queries. Adicione o primeiro bloco quando
-# `internal/<slice>/queries/*.sql` existir. NÃO rode `sqlc generate` sem ele.
+# sqlc lê o diretório de migrations e IGNORA os arquivos *.down.sql (convenção
+# golang-migrate), aplicando só os *.up.sql para montar o catálogo.
 version: "2"
-sql: []
-  # Bloco-modelo (descomentar ao criar o primeiro slice, ex.: draft):
+sql:
+  # ── identity (Slice 10): tenant + app_user ──────────────────────────────────
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/identity/queries"
+    gen:
+      go:
+        package: "identitydb"
+        out: "internal/identity/identitydb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          # uuid é o tipo de todas as PKs/FKs — mapeia para google/uuid.UUID
+          # (o mapper do slice o converte para string na fronteira da entidade).
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
+  # Bloco-modelo (copiar ao criar o próximo slice, ex.: draft):
   # - engine: "postgresql"
-  #   schema: "migrations/"
+  #   schema: "migrations"
   #   queries: "internal/draft/queries"
   #   gen:
   #     go:
-  #       package: "draft"
-  #       out: "internal/draft"
+  #       package: "draftdb"
+  #       out: "internal/draft/draftdb"
   #       sql_package: "pgx/v5"
   #       emit_interface: true
+  #       emit_json_tags: true
   #       emit_pointers_for_null_types: true
+  #       overrides:
+  #         - db_type: "uuid"
+  #           go_type: { import: "github.com/google/uuid", type: "UUID" }
