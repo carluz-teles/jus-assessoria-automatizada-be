@@ -31,20 +31,16 @@ locals {
     S3_SECRET_KEY               = var.s3_secret_key
   }
 
-  # Índice (svc → nome da var) NÃO-sensível: seguro para for_each. Os valores (que
-  # carregam segredos) são buscados à parte, por chave, no atributo `value`.
-  app_var_index = merge([
-    for svc in local.app_services : {
-      for name in keys(local.app_env) : "${svc}:${name}" => { service = svc, name = name }
-    }
-  ]...)
 }
 
-resource "railway_variable" "app" {
-  for_each = local.app_var_index
+# Uma variable_collection por serviço: TODAS as env vars numa tacada = 1 redeploy por
+# serviço, não 1 por variável. Criar variável a variável dispara serviceInstanceRedeploy
+# a cada uma e estoura o "Service deployment rate limit" do Railway (docs §5e.3).
+resource "railway_variable_collection" "app" {
+  for_each = toset(local.app_services)
 
-  name           = each.value.name
-  value          = local.app_env[each.value.name]
   environment_id = local.active_environment_id
-  service_id     = railway_service.app[each.value.service].id
+  service_id     = railway_service.app[each.key].id
+
+  variables = [for name, value in local.app_env : { name = name, value = value }]
 }

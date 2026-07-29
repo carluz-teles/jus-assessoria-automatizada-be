@@ -32,11 +32,9 @@ locals {
   }
 }
 
-resource "railway_variable" "postgres" {
-  for_each = toset(keys(local.postgres_vars))
-
-  name           = each.key
-  value          = local.postgres_vars[each.key]
+resource "railway_variable_collection" "postgres" {
   environment_id = local.active_environment_id
   service_id     = railway_service.postgres.id
+
+  variables = [for name, value in local.postgres_vars : { name = name, value = value }]
 }
