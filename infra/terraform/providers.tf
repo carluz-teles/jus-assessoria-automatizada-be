@@ -10,6 +10,10 @@
 # organização e o workspace vêm do ambiente (TF_CLOUD_ORGANIZATION / TF_WORKSPACE),
 # nunca hardcoded. O green gate valida com `terraform init -backend=false` (sem contatar
 # o TF Cloud); o `init` real (CI/apply) autentica via TF_TOKEN_app_terraform_io.
+#
+# CI: merge em main tocando infra/terraform/** dispara plan+apply automático
+# (.github/workflows/terraform.yml). O workspace TFC precisa estar em Execution
+# Mode = Local para o apply enxergar os TF_VAR_* do runner do GitHub Actions.
 
 terraform {
   required_version = "~> 1.9"
