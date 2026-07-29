@@ -3,7 +3,7 @@ name: Pipeline
 # Um pipeline gated: test -> build -> deploy (encadeado por `needs`). Teste vermelho
 # BLOQUEIA o build; o deploy só roda depois que as 6 imagens sobem. `test` roda em todo
 # push e PR (green gate em qualquer branch); `build` e `deploy` só no main (build também
-# em tags de versão). Terraform é outro ciclo (terraform.yml).
+# em tags de versão).
 on:
   push:
   pull_request:

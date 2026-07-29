@@ -18,7 +18,7 @@ REUSE / EXTEND / CREATE com o porquê. Lógica duplicada é bug de design (uma s
 /lib        infra compartilhada (não é domínio), injetada nos slices
 /migrations SQL versionado (golang-migrate), roda no boot só do api
 /pkg        utilitários genéricos, sem regra de negócio
-/infra      terraform (Railway)
+/infra      provisionamento Railway via API GraphQL (infra/railway/*.sh) — não é mais Terraform
 ```
 Anatomia de um slice (`internal/<slice>`): `entity.go` `errors.go` `validation.go` `mapper.go` `domain.go`
 `handler.go` `listener.go` `repository.go` `events.go` `/queries/*.sql` `*_test.go`.

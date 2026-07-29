@@ -28,9 +28,3 @@ go.work.sum
 .vscode/
 *.swp
 
-# Terraform
-*.tfstate
-*.tfstate.*
-.terraform/
-*.tfvars
-!*.tfvars.example
