@@ -2,6 +2,7 @@
 # Tudo o mais (ambientes, serviços, banco, variáveis, domínio) pendura aqui.
 
 resource "railway_project" "main" {
-  name    = var.project_name
-  private = true
+  name         = var.project_name
+  private      = true
+  workspace_id = var.railway_workspace_id
 }

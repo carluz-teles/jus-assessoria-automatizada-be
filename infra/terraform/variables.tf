@@ -20,6 +20,12 @@ variable "project_name" {
   default     = "court-legal"
 }
 
+variable "railway_workspace_id" {
+  description = "Workspace/Team do Railway onde o projeto é criado. Obrigatório quando o token acessa múltiplos workspaces (projectCreate exige workspaceId). É um identificador, não segredo — por isso vem com default."
+  type        = string
+  default     = "27838c17-0a9b-4799-9c59-fab7c6dbff19"
+}
+
 variable "environment" {
   description = "Ambiente-alvo deste apply: 'prod' ou 'staging'. Seleciona para qual railway_environment as variáveis e o domínio são aplicados."
   type        = string
