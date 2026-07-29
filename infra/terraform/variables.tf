@@ -39,9 +39,9 @@ variable "image_tag" {
 }
 
 variable "region" {
-  description = "Região Railway onde os serviços rodam."
+  description = "Região Railway onde os serviços rodam. Este workspace provisiona em 'sfo' (Metal); pedir outra região gera drift (o Railway sobrepõe para sfo → 'inconsistent result after apply')."
   type        = string
-  default     = "us-east4-eqdc4a"
+  default     = "sfo"
 }
 
 variable "service_replicas" {

@@ -6,7 +6,7 @@
 
 image_registry = "ghcr.io/jusassessoria"
 image_tag      = "latest" # o pipeline sobrescreve com :sha no deploy
-region         = "us-east4-eqdc4a"
+region         = "sfo"
 api_domain     = "api.court-legal.app"
 
 # Fase atual: tudo réplica 1 (footprint mínimo no Railway); escala depois.
