@@ -14,8 +14,10 @@ import (
 
 	"github.com/hibiken/asynq"
 
+	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
@@ -69,10 +71,16 @@ func run(logger *slog.Logger) error {
 		Queues:      map[string]int{queueName: concurrency},
 	})
 
-	// Feature slices register their listeners on this mux, e.g.
-	//   mux.HandleFunc("ingestao.sync.requested", listener.Handle)
-	// Empty for now: the queue is served, but no task type is handled yet.
+	// Feature slices register their listeners on this mux. Each slice owns its
+	// task-type registration via a Register(mux) call; the worker only composes.
 	mux := asynq.NewServeMux()
+
+	backfill := acquisition.NewBackfillUseCase(
+		acquisition.NewRepository(pool),
+		events.NewOutbox(),
+		database.NewUnitOfWork(pool),
+	)
+	acquisition.NewListener(backfill).Register(mux)
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)

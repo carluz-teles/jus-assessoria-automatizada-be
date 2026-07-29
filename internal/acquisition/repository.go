@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jusassessoria/platform/internal/acquisition/acquisitiondb"
 	"github.com/jusassessoria/platform/lib/database"
@@ -20,6 +21,12 @@ type Repository interface {
 	GetBySource(ctx context.Context, tx database.Tx, tenantID, source string) (*Integration, error)
 	Upsert(ctx context.Context, tx database.Tx, tenantID, source string, scope Scope) (*Integration, error)
 	List(ctx context.Context, tenantID string) ([]*Integration, error)
+
+	// Backfill onboarding — the listener's first-activation guard and job insert.
+	// Grouped here as the slice's single persistence port; the backfill use case
+	// depends on the narrow backfillRepo view of these two methods.
+	BackfillJobExistsByIntegration(ctx context.Context, tx database.Tx, integrationID string) (bool, error)
+	InsertBackfillJob(ctx context.Context, tx database.Tx, params BackfillJobParams) (id string, err error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -101,4 +108,45 @@ func (r *pgRepository) List(ctx context.Context, tenantID string) ([]*Integratio
 		out = append(out, ent)
 	}
 	return out, nil
+}
+
+// BackfillJobExistsByIntegration reports whether any backfill_job already exists
+// for the integration, inside the caller's tx. It is the listener's
+// first-activation guard: true means a re-activation, so no new backfill.
+func (r *pgRepository) BackfillJobExistsByIntegration(ctx context.Context, tx database.Tx, integrationID string) (bool, error) {
+	iid, err := uuid.Parse(integrationID)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	exists, err := acquisitiondb.New(tx).BackfillJobExistsByIntegration(ctx, iid)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	return exists, nil
+}
+
+// InsertBackfillJob creates the backfill_job inside the caller's tx and returns
+// its new id. The date-only window bounds are lifted to pgtype.Date here (this
+// is a write param, so the conversion lives with the query, not the mapper).
+func (r *pgRepository) InsertBackfillJob(ctx context.Context, tx database.Tx, params BackfillJobParams) (string, error) {
+	tid, err := uuid.Parse(params.TenantID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	iid, err := uuid.Parse(params.IntegrationID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	id, err := acquisitiondb.New(tx).InsertBackfillJob(ctx, acquisitiondb.InsertBackfillJobParams{
+		TenantID:      tid,
+		IntegrationID: iid,
+		WindowFrom:    pgtype.Date{Time: params.WindowFrom, Valid: true},
+		WindowTo:      pgtype.Date{Time: params.WindowTo, Valid: true},
+		TotalSlices:   int32(params.TotalSlices),
+		Status:        params.Status,
+	})
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return id.String(), nil
 }

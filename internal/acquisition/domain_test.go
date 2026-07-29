@@ -55,6 +55,17 @@ func (m *mockRepo) List(_ context.Context, _ string) ([]*Integration, error) {
 	return m.listResp, nil
 }
 
+// The backfill methods satisfy the widened Repository interface; the activation
+// use case under test here never calls them (they are exercised by the backfill
+// use case's own stub in backfill_test.go).
+func (m *mockRepo) BackfillJobExistsByIntegration(_ context.Context, _ database.Tx, _ string) (bool, error) {
+	return false, nil
+}
+
+func (m *mockRepo) InsertBackfillJob(_ context.Context, _ database.Tx, _ BackfillJobParams) (string, error) {
+	return "", nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {

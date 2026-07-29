@@ -11,7 +11,21 @@ import (
 )
 
 type Querier interface {
+	// backfill_job queries (acquisition slice).
+	// The backfill listener reacts to integration_activated: on the FIRST activation
+	// of an integration it creates one backfill_job and emits the sync slices. These
+	// two queries are the job's first-activation guard (exists) and its insert; the
+	// counters/completion (slices_ok, slices_error, final status) belong to the sync
+	// slice, not here.
+	// True when a backfill_job already exists for this integration (any status). The
+	// listener uses it as the first-activation guard: a re-activation must not
+	// re-dispatch a backfill.
+	BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
+	// Create the onboarding backfill job. total_slices is precomputed by the use
+	// case; the counters default to zero and status is passed explicitly so a
+	// zero-slice horizon can land COMPLETED instead of RUNNING.
+	InsertBackfillJob(ctx context.Context, arg InsertBackfillJobParams) (uuid.UUID, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)

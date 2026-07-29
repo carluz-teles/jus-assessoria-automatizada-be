@@ -64,13 +64,17 @@ func TestEmbeddedSource(t *testing.T) {
 		t.Fatal("down migration for version 1 is empty")
 	}
 
-	// The acquisition slice adds migration 2 (integration.updated_at), so version
-	// 1 is followed by 2, and 2 is the last — there is nothing after it.
+	// The acquisition slice adds migration 2 (integration.updated_at) and 3
+	// (backfill_job integration_id index), so 1→2→3 and 3 is the last — there is
+	// nothing after it.
 	if next, err := src.Next(1); err != nil || next != 2 {
 		t.Fatalf("Next(1) = (%d, %v), want (2, nil)", next, err)
 	}
-	if _, err := src.Next(2); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(2) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(2); err != nil || next != 3 {
+		t.Fatalf("Next(2) = (%d, %v), want (3, nil)", next, err)
+	}
+	if _, err := src.Next(3); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(3) error = %v, want fs.ErrNotExist", err)
 	}
 }
 
