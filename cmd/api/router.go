@@ -5,6 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
@@ -14,10 +15,11 @@ import (
 // the graph here (not inside newRouter) keeps the router a pure function of its
 // dependencies — the test builds it with fakes and never touches the network.
 type routerDeps struct {
-	logger   *slog.Logger
-	verifier middleware.TokenVerifier
-	resolver middleware.PrincipalResolver
-	webhook  *identity.WebhookHandler
+	logger      *slog.Logger
+	verifier    middleware.TokenVerifier
+	resolver    middleware.PrincipalResolver
+	webhook     *identity.WebhookHandler
+	acquisition *acquisition.Handler
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -62,6 +64,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	v1.Get("/ping", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
+
+	// acquisition owns its /v1 routes and mounts them via RegisterV1 — the api
+	// only composes. Nil-guarded so the router test's fixture (which wires no
+	// domain use cases) still builds.
+	if deps.acquisition != nil {
+		deps.acquisition.RegisterV1(v1)
+	}
 
 	return app
 }

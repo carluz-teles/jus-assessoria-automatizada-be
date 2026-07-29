@@ -30,6 +30,24 @@ sql:
               import: "github.com/google/uuid"
               type: "UUID"
 
+  # ── acquisition (Slice): integration ────────────────────────────────────────
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/acquisition/queries"
+    gen:
+      go:
+        package: "acquisitiondb"
+        out: "internal/acquisition/acquisitiondb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
   # Bloco-modelo (copiar ao criar o próximo slice, ex.: draft):
   # - engine: "postgresql"
   #   schema: "migrations"
