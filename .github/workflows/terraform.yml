@@ -1,10 +1,13 @@
 name: Terraform
 
-# erd-infraestrutura §5: provisionar != publicar, and apply is a human decision.
+# erd-infraestrutura §5: provisionar != publicar.
 #   - PR touching infra/terraform/** -> fmt + init (-backend=false) + validate only,
 #     no cloud credentials required, nothing provisioned.
-#   - workflow_dispatch (manual) -> real init against Terraform Cloud + apply, gated by
-#     the `prod` GitHub Environment (required reviewers in Settings -> Environments).
+#   - push/merge to main touching infra/terraform/** -> real init against Terraform
+#     Cloud + plan + apply automatically. The `prod` GitHub Environment is the OPTIONAL
+#     gate: leave it without protection rules for a fully automatic apply, or add
+#     required reviewers (Settings -> Environments) to pause for approval.
+#   - workflow_dispatch (manual) -> same plan + apply, on demand.
 # State lives in Terraform Cloud (empty `cloud {}` block; org/workspace via env).
 # Object storage is a Cloudflare R2 bucket created MANUALLY in the R2 dashboard — the
 # S3_* vars below are R2 credentials injected into the Railway services, not AWS.
@@ -12,6 +15,11 @@ name: Terraform
 # Variables (non-secret). Never hardcoded in code.
 on:
   pull_request:
+    paths:
+      - 'infra/terraform/**'
+  push:
+    branches:
+      - main
     paths:
       - 'infra/terraform/**'
   workflow_dispatch:
@@ -70,11 +78,15 @@ jobs:
         run: terraform -chdir=infra/terraform validate
 
   apply:
-    name: Apply (manual, gated)
-    if: github.event_name == 'workflow_dispatch'
+    name: Apply (merge to main / manual)
+    # Runs on merge to main (auto) or manual dispatch — never on PRs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-    # The `prod` Environment protection rule (required reviewers) IS the approval
-    # gate — that is why no -auto-approve is used anywhere below.
+    # `prod` is the OPTIONAL approval gate: without protection rules it applies
+    # automatically; add required reviewers to pause here. No -auto-approve below —
+    # apply consumes the exact plan produced in this run.
     environment: prod
     steps:
       - name: Checkout
