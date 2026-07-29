@@ -1,0 +1,121 @@
+name: Terraform
+
+# erd-infraestrutura §5: provisionar != publicar, and apply is a human decision.
+#   - PR touching infra/terraform/** -> `plan` only, uploaded as an artifact.
+#   - workflow_dispatch (manual) -> `apply`, gated by the `prod` GitHub Environment
+#     (configure required reviewers in repo Settings -> Environments -> prod).
+# Secrets live in GitHub Actions Secrets (per Environment) and never in code.
+on:
+  pull_request:
+    paths:
+      - 'infra/terraform/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # AWS creds for the S3 *state* backend (court-legal-tfstate). The backend block
+  # declares no region, so Terraform reads it from AWS_REGION at init time.
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+  # GH Actions Secrets -> TF_VAR_* for the SENSITIVE variables (no defaults in
+  # variables.tf). Only ${{ secrets.* }} references — never hardcoded values.
+  TF_VAR_railway_token: ${{ secrets.RAILWAY_TOKEN }}
+  TF_VAR_clerk_secret_key: ${{ secrets.CLERK_SECRET_KEY }}
+  TF_VAR_clerk_jwks_url: ${{ secrets.CLERK_JWKS_URL }}
+  TF_VAR_clerk_webhook_secret: ${{ secrets.CLERK_WEBHOOK_SECRET }}
+  TF_VAR_clerk_issuer: ${{ secrets.CLERK_ISSUER }}
+  TF_VAR_anthropic_key: ${{ secrets.ANTHROPIC_API_KEY }}
+  TF_VAR_otel_endpoint: ${{ secrets.OTEL_ENDPOINT }}
+  TF_VAR_postgres_password: ${{ secrets.POSTGRES_PASSWORD }}
+  TF_VAR_s3_endpoint: ${{ secrets.S3_ENDPOINT }}
+  TF_VAR_s3_region: ${{ secrets.S3_REGION }}
+  TF_VAR_s3_bucket: ${{ secrets.S3_BUCKET }}
+  TF_VAR_s3_access_key: ${{ secrets.S3_ACCESS_KEY }}
+  TF_VAR_s3_secret_key: ${{ secrets.S3_SECRET_KEY }}
+
+jobs:
+  plan:
+    name: Plan (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform -chdir=infra/terraform fmt -check -recursive
+
+      # Non-secret prod sizing lives in prod.tfvars (gitignored); only the
+      # .example is committed. Materialize it for CI if absent.
+      - name: Prepare prod.tfvars
+        run: |
+          cd infra/terraform/environments
+          [ -f prod.tfvars ] || cp prod.tfvars.example prod.tfvars
+
+      - name: Terraform init
+        run: terraform -chdir=infra/terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform -chdir=infra/terraform validate
+
+      - name: Terraform plan
+        run: |
+          terraform -chdir=infra/terraform plan -input=false \
+            -var-file=environments/prod.tfvars \
+            -var image_registry=ghcr.io/${{ github.repository_owner }} \
+            -var image_tag=${{ github.sha }} \
+            -out=tfplan
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: infra/terraform/tfplan
+          retention-days: 5
+
+  apply:
+    name: Apply (manual, gated)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # The `prod` Environment protection rule (required reviewers) IS the approval
+    # gate — that is why no -auto-approve is used anywhere below.
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Prepare prod.tfvars
+        run: |
+          cd infra/terraform/environments
+          [ -f prod.tfvars ] || cp prod.tfvars.example prod.tfvars
+
+      - name: Terraform init
+        run: terraform -chdir=infra/terraform init -input=false
+
+      - name: Terraform plan
+        run: |
+          terraform -chdir=infra/terraform plan -input=false -lock-timeout=5m \
+            -var-file=environments/prod.tfvars \
+            -var image_registry=ghcr.io/${{ github.repository_owner }} \
+            -var image_tag=${{ github.sha }} \
+            -out=tfplan
+
+      # Applies the reviewed plan artifact — no -auto-approve; the Environment gate approved it.
+      - name: Terraform apply
+        run: terraform -chdir=infra/terraform apply -input=false -lock-timeout=5m tfplan
