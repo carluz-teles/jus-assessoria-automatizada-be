@@ -46,7 +46,7 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	if err := health.CheckAll(ctx, cfg); err != nil {
+	if err := health.WaitAll(ctx, cfg); err != nil {
 		return fmt.Errorf("dependency health check: %w", err)
 	}
 

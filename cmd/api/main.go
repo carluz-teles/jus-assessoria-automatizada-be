@@ -48,7 +48,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	// 2. Health — refuse to boot against unreachable dependencies.
-	if err := health.CheckAll(ctx, cfg); err != nil {
+	if err := health.WaitAll(ctx, cfg); err != nil {
 		return fmt.Errorf("dependency health check: %w", err)
 	}
 

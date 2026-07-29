@@ -43,6 +43,44 @@ func CheckAll(ctx context.Context, cfg config.Config) error {
 	return nil
 }
 
+// waitTimeout / waitBackoff bound WaitAll: retry CheckAll for up to ~1 min, pausing
+// between attempts. Wide enough to absorb a datastore that boots alongside this
+// process; short enough that a genuinely-down dependency still fails the boot fast.
+const (
+	waitTimeout = 60 * time.Second
+	waitBackoff = 2 * time.Second
+)
+
+// WaitAll polls CheckAll with a fixed backoff until every dependency is reachable or
+// waitTimeout elapses. In an orchestrated environment (Railway, compose, k8s) a
+// process and its datastores start together, so a one-shot probe makes boot ORDER a
+// race: a worker that boots a second before Postgres accepts connections would die on
+// the way up (docs §5b.1). Retrying for a bounded window turns "dependency not up YET"
+// into a short wait, while still failing fast when a dependency is genuinely down.
+func WaitAll(ctx context.Context, cfg config.Config) error {
+	return waitFor(ctx, func(c context.Context) error { return CheckAll(c, cfg) }, waitTimeout, waitBackoff)
+}
+
+// waitFor is WaitAll's testable core: it retries check until it returns nil or the
+// timeout elapses, sleeping backoff between attempts. Split out so the retry/timeout
+// logic is unit-tested without real datastores (check is injected).
+func waitFor(ctx context.Context, check func(context.Context) error, timeout, backoff time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for {
+		lastErr := check(ctx)
+		if lastErr == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("health: dependencies not ready after %s: %w", timeout, lastErr)
+		case <-time.After(backoff):
+		}
+	}
+}
+
 // checkPostgres opens a short-lived pool and pings it. The pool is closed before
 // returning — this is a probe, not the application pool (database.NewPool owns
 // that, later in boot).
