@@ -1,9 +1,9 @@
 name: Build & push images
 
 # Slice 15: the parameterized Dockerfile (ARG SVC) yields one lean image per
-# service. Publish all six to GHCR on main and on version tags. This is
-# "publicar" (erd-infraestrutura §5, provisionar != publicar); Terraform then
-# points services at these tags via image_tag=<sha> (see terraform.yml).
+# service. Publish all six to GHCR on main and on version tags, then trigger a
+# redeploy on Railway — it does NOT pull automatically when a registry tag changes,
+# so the redeploy job closes the loop (build+push -> Railway pulls the new :latest).
 on:
   push:
     branches: [main]
@@ -48,3 +48,18 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/jus-${{ matrix.svc }}:latest
           cache-from: type=gha,scope=${{ matrix.svc }}
           cache-to: type=gha,mode=max,scope=${{ matrix.svc }}
+
+  redeploy:
+    name: Redeploy on Railway
+    # Only after ALL six images are pushed, so services never pull a half-updated set.
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trigger Railway redeploy
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          PROJECT_NAME: court-legal
+        run: bash infra/railway/redeploy.sh
