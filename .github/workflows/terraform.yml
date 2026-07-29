@@ -1,10 +1,15 @@
 name: Terraform
 
 # erd-infraestrutura §5: provisionar != publicar, and apply is a human decision.
-#   - PR touching infra/terraform/** -> `plan` only, uploaded as an artifact.
-#   - workflow_dispatch (manual) -> `apply`, gated by the `prod` GitHub Environment
-#     (configure required reviewers in repo Settings -> Environments -> prod).
-# Secrets live in GitHub Actions Secrets (per Environment) and never in code.
+#   - PR touching infra/terraform/** -> fmt + init (-backend=false) + validate only,
+#     no cloud credentials required, nothing provisioned.
+#   - workflow_dispatch (manual) -> real init against Terraform Cloud + apply, gated by
+#     the `prod` GitHub Environment (required reviewers in Settings -> Environments).
+# State lives in Terraform Cloud (empty `cloud {}` block; org/workspace via env).
+# Object storage is a Cloudflare R2 bucket created MANUALLY in the R2 dashboard — the
+# S3_* vars below are R2 credentials injected into the Railway services, not AWS.
+# Secrets live in GitHub Actions Secrets; TF_CLOUD_ORGANIZATION/TF_WORKSPACE are repo
+# Variables (non-secret). Never hardcoded in code.
 on:
   pull_request:
     paths:
@@ -15,14 +20,15 @@ permissions:
   contents: read
 
 env:
-  # AWS creds for the S3 *state* backend (court-legal-tfstate). The backend block
-  # declares no region, so Terraform reads it from AWS_REGION at init time.
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_REGION: ${{ secrets.AWS_REGION }}
+  # Terraform Cloud auth + config. TF_API_TOKEN is a secret (a TFC user/team API token);
+  # the org/workspace are repo Variables, not secrets. Only the apply job contacts TFC.
+  TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+  TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+  TF_WORKSPACE: ${{ vars.TF_WORKSPACE }}
 
   # GH Actions Secrets -> TF_VAR_* for the SENSITIVE variables (no defaults in
   # variables.tf). Only ${{ secrets.* }} references — never hardcoded values.
+  # The S3_* set now holds Cloudflare R2 credentials (no AWS anywhere).
   TF_VAR_railway_token: ${{ secrets.RAILWAY_TOKEN }}
   TF_VAR_clerk_secret_key: ${{ secrets.CLERK_SECRET_KEY }}
   TF_VAR_clerk_jwks_url: ${{ secrets.CLERK_JWKS_URL }}
@@ -38,8 +44,8 @@ env:
   TF_VAR_s3_secret_key: ${{ secrets.S3_SECRET_KEY }}
 
 jobs:
-  plan:
-    name: Plan (PR)
+  validate:
+    name: Validate (PR)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -55,33 +61,13 @@ jobs:
       - name: Terraform fmt
         run: terraform -chdir=infra/terraform fmt -check -recursive
 
-      # Non-secret prod sizing lives in prod.tfvars (gitignored); only the
-      # .example is committed. Materialize it for CI if absent.
-      - name: Prepare prod.tfvars
-        run: |
-          cd infra/terraform/environments
-          [ -f prod.tfvars ] || cp prod.tfvars.example prod.tfvars
-
-      - name: Terraform init
-        run: terraform -chdir=infra/terraform init -input=false
+      # No cloud credentials on PRs: -backend=false skips Terraform Cloud entirely,
+      # so init + validate run offline and provision nothing.
+      - name: Terraform init (no backend)
+        run: terraform -chdir=infra/terraform init -backend=false -input=false
 
       - name: Terraform validate
         run: terraform -chdir=infra/terraform validate
-
-      - name: Terraform plan
-        run: |
-          terraform -chdir=infra/terraform plan -input=false \
-            -var-file=environments/prod.tfvars \
-            -var image_registry=ghcr.io/${{ github.repository_owner }} \
-            -var image_tag=${{ github.sha }} \
-            -out=tfplan
-
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfplan
-          path: infra/terraform/tfplan
-          retention-days: 5
 
   apply:
     name: Apply (manual, gated)
@@ -100,11 +86,15 @@ jobs:
           terraform_version: 1.9.8
           terraform_wrapper: false
 
+      # Non-secret prod sizing lives in prod.tfvars (gitignored); only the
+      # .example is committed. Materialize it for CI if absent.
       - name: Prepare prod.tfvars
         run: |
           cd infra/terraform/environments
           [ -f prod.tfvars ] || cp prod.tfvars.example prod.tfvars
 
+      # Real init: authenticates to Terraform Cloud via TF_TOKEN_app_terraform_io and
+      # binds the state to TF_CLOUD_ORGANIZATION / TF_WORKSPACE.
       - name: Terraform init
         run: terraform -chdir=infra/terraform init -input=false
 
@@ -116,6 +106,6 @@ jobs:
             -var image_tag=${{ github.sha }} \
             -out=tfplan
 
-      # Applies the reviewed plan artifact — no -auto-approve; the Environment gate approved it.
+      # Applies the reviewed plan — no -auto-approve; the Environment gate approved it.
       - name: Terraform apply
         run: terraform -chdir=infra/terraform apply -input=false -lock-timeout=5m tfplan

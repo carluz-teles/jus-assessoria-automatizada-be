@@ -125,31 +125,31 @@ variable "postgres_password" {
 }
 
 variable "s3_endpoint" {
-  description = "S3_ENDPOINT — endpoint S3-compatível (S3/R2/MinIO). Vazio = AWS real."
+  description = "S3_ENDPOINT — endpoint S3-compatível do R2: https://<account_id>.r2.cloudflarestorage.com."
   type        = string
   sensitive   = true
 }
 
 variable "s3_region" {
-  description = "S3_REGION — região do bucket S3-compatível."
+  description = "S3_REGION — região do bucket R2; para R2 é sempre \"auto\"."
   type        = string
   sensitive   = true
 }
 
 variable "s3_bucket" {
-  description = "S3_BUCKET — bucket de PDFs/payloads brutos."
+  description = "S3_BUCKET — nome do bucket R2 de PDFs/payloads brutos (criado à mão no painel R2)."
   type        = string
   sensitive   = true
 }
 
 variable "s3_access_key" {
-  description = "S3_ACCESS_KEY — credencial de acesso ao storage."
+  description = "S3_ACCESS_KEY — access key do token de API do R2."
   type        = string
   sensitive   = true
 }
 
 variable "s3_secret_key" {
-  description = "S3_SECRET_KEY — credencial secreta do storage."
+  description = "S3_SECRET_KEY — secret key do token de API do R2."
   type        = string
   sensitive   = true
 }

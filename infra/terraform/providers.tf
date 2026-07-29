@@ -2,12 +2,14 @@
 #
 # Toda a infra do Railway (projeto, ambientes, serviços, banco, Redis, variáveis,
 # domínio) é gerenciada pelo provider community `terraform-community-providers/railway`.
-# O bucket S3-compatível dos PDFs/payloads (storage.tf) vive FORA do Railway; é
-# provisionado pelo provider `aws` apontado para um endpoint S3-compatível (S3/R2/MinIO).
+# O storage dos PDFs/payloads é um bucket Cloudflare R2 criado MANUALMENTE no painel
+# (S3-compatível, fora do Terraform — ver storage.tf); o Terraform só injeta as env
+# vars S3_* nos serviços (variables_env.tf). NÃO há provider AWS.
 #
-# State REMOTO, nunca local (§5e.5): fica num bucket S3 versionado com lock. O green
-# gate valida com `-backend=false`, então o backend é declarado mas não inicializado
-# durante a validação; `terraform init` real (CI) recebe as credenciais do backend.
+# State REMOTO no Terraform Cloud (§5e.5), nunca local. O bloco `cloud {}` é vazio: a
+# organização e o workspace vêm do ambiente (TF_CLOUD_ORGANIZATION / TF_WORKSPACE),
+# nunca hardcoded. O green gate valida com `terraform init -backend=false` (sem contatar
+# o TF Cloud); o `init` real (CI/apply) autentica via TF_TOKEN_app_terraform_io.
 
 terraform {
   required_version = "~> 1.9"
@@ -17,18 +19,9 @@ terraform {
       source  = "terraform-community-providers/railway"
       version = "~> 0.5"
     }
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
   }
 
-  backend "s3" {
-    bucket = "court-legal-tfstate"
-    key    = "railway/terraform.tfstate"
-    # region/encrypt/lock são passados no `terraform init` real (CI/vault). O lock
-    # usa DynamoDB (< 1.10) ou `use_lockfile` (>= 1.10) conforme o runtime do CI.
-  }
+  cloud {}
 }
 
 provider "railway" {
