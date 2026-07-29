@@ -26,15 +26,10 @@ variable "railway_workspace_id" {
   default     = "27838c17-0a9b-4799-9c59-fab7c6dbff19"
 }
 
-variable "environment" {
-  description = "Ambiente-alvo deste apply: 'prod' ou 'staging'. Seleciona para qual railway_environment as variáveis e o domínio são aplicados."
+variable "railway_prod_environment_id" {
+  description = "ID do environment 'production' que o Railway cria junto com o projeto. É referenciado (não criado) para evitar a colisão 'environment with that name already exists'. Identificador, não segredo — por isso vem com default."
   type        = string
-  default     = "prod"
-
-  validation {
-    condition     = contains(["prod", "staging"], var.environment)
-    error_message = "environment deve ser 'prod' ou 'staging'."
-  }
+  default     = "4d20bb2c-ef54-4411-a324-9db9e246138e"
 }
 
 variable "image_registry" {
@@ -56,10 +51,10 @@ variable "region" {
 }
 
 variable "service_replicas" {
-  description = "Réplicas por serviço, ajustável por ambiente (staging menor). A api recebe >= 1; workers conforme carga."
+  description = "Réplicas por serviço. Tudo em 1 nesta fase (footprint mínimo no Railway); escala depois."
   type        = map(number)
   default = {
-    api                 = 2
+    api                 = 1
     worker-ingestao     = 1
     worker-documents    = 1
     worker-ai           = 1

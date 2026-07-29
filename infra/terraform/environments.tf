@@ -1,23 +1,11 @@
-# environments.tf — ambientes staging e prod, do mesmo código (docs §5e.1).
+# environments.tf — ambiente de produção (docs §5e.1). Prod-only nesta fase.
 #
-# Ambos são declarados; var.environment escolhe para qual as variáveis e o domínio
-# são aplicados neste run (local.active_environment_id). Assim staging e prod saem
-# do mesmo módulo, parametrizados por tfvars — some o "funciona em staging, não em prod".
-#
-# NOTA de apply: o Railway cria um environment default junto com o projeto. Na
-# primeira aplicação, importe-o (`terraform import railway_environment.prod <id>`)
-# ou renomeie-o, para o Terraform não tentar criar um duplicado. Detalhe no README.
-
-resource "railway_environment" "prod" {
-  name       = "production"
-  project_id = railway_project.main.id
-}
-
-resource "railway_environment" "staging" {
-  name       = "staging"
-  project_id = railway_project.main.id
-}
+# O Railway cria um environment "production" DEFAULT junto com o projeto. Criar um
+# recurso railway_environment "production" colide ("environment with that name already
+# exists"). Em vez disso, referenciamos o existente por ID (var.railway_prod_environment_id)
+# — identificador, não segredo, mesmo padrão de railway_workspace_id. Todas as variáveis
+# de app, os datastores e o domínio penduram neste environment via local.active_environment_id.
 
 locals {
-  active_environment_id = var.environment == "prod" ? railway_environment.prod.id : railway_environment.staging.id
+  active_environment_id = var.railway_prod_environment_id
 }

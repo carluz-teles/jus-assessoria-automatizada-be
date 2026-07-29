@@ -9,8 +9,8 @@ locals {
   database_url = "postgres://${var.postgres_user}:${urlencode(var.postgres_password)}@${railway_service.postgres.name}.railway.internal:5432/${var.postgres_db}?sslmode=disable"
   redis_url    = "redis://${railway_service.redis.name}.railway.internal:6379/0"
 
-  # APP_ENV precisa ser "production" para Config.IsProduction(); staging fica "staging".
-  app_env_name = var.environment == "prod" ? "production" : "staging"
+  # APP_ENV = "production" para Config.IsProduction() (prod-only nesta fase).
+  app_env_name = "production"
 
   # As env vars de todo serviço de app. Workers ignoram PORT; a api ignora nada.
   app_env = {
