@@ -53,7 +53,15 @@ func run(logger *slog.Logger) error {
 	}
 
 	// 3. Migrations — the api, and only the api, applies the schema (§5b.3).
-	if err := database.Up(ctx, cfg.DatabaseURL); err != nil {
+	// MIGRATE_RESET=true forces a one-time destructive reset (drop + re-apply) to
+	// recover a database whose schema_migrations drifted from the real schema; unset
+	// it right after so normal boots only apply pending migrations.
+	if os.Getenv("MIGRATE_RESET") == "true" {
+		logger.Warn("MIGRATE_RESET=true — resetting the schema before migrating")
+		if err := database.Reset(ctx, cfg.DatabaseURL); err != nil {
+			return fmt.Errorf("reset migrations: %w", err)
+		}
+	} else if err := database.Up(ctx, cfg.DatabaseURL); err != nil {
 		return fmt.Errorf("apply migrations: %w", err)
 	}
 
