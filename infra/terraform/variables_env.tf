@@ -6,7 +6,7 @@
 # Segredos vêm das variáveis sensíveis (cofre/CI), nunca hardcoded (§5e.5).
 
 locals {
-  database_url = "postgres://${var.postgres_user}:${var.postgres_password}@${railway_service.postgres.name}.railway.internal:5432/${var.postgres_db}?sslmode=disable"
+  database_url = "postgres://${var.postgres_user}:${urlencode(var.postgres_password)}@${railway_service.postgres.name}.railway.internal:5432/${var.postgres_db}?sslmode=disable"
   redis_url    = "redis://${railway_service.redis.name}.railway.internal:6379/0"
 
   # APP_ENV precisa ser "production" para Config.IsProduction(); staging fica "staging".
