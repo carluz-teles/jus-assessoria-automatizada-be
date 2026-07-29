@@ -112,6 +112,13 @@ variable "otel_endpoint" {
   sensitive   = true
 }
 
+variable "otel_headers" {
+  description = "OTEL_EXPORTER_OTLP_HEADERS — headers OTLP no formato key=value,key2=value2 (New Relic: api-key=<license>). Vazio = sem headers."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "postgres_password" {
   description = "Senha do Postgres. Compõe a DATABASE_URL por referência (variables_env.tf)."
   type        = string

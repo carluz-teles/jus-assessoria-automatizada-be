@@ -35,6 +35,7 @@ env:
   TF_VAR_clerk_issuer: ${{ secrets.CLERK_ISSUER }}
   TF_VAR_anthropic_key: ${{ secrets.ANTHROPIC_API_KEY }}
   TF_VAR_otel_endpoint: ${{ secrets.OTEL_ENDPOINT }}
+  TF_VAR_otel_headers: ${{ secrets.OTEL_HEADERS }}
   TF_VAR_postgres_password: ${{ secrets.POSTGRES_PASSWORD }}
   TF_VAR_s3_endpoint: ${{ secrets.S3_ENDPOINT }}
   TF_VAR_s3_region: ${{ secrets.S3_REGION }}

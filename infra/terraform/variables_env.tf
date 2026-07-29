@@ -21,6 +21,7 @@ locals {
     CLERK_ISSUER                = var.clerk_issuer
     ANTHROPIC_API_KEY           = var.anthropic_key
     OTEL_EXPORTER_OTLP_ENDPOINT = var.otel_endpoint
+    OTEL_EXPORTER_OTLP_HEADERS  = var.otel_headers
     APP_ENV                     = local.app_env_name
     PORT                        = "8080"
     S3_ENDPOINT                 = var.s3_endpoint

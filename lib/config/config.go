@@ -24,6 +24,14 @@ type Config struct {
 	OTELEndpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT,required"`
 	Env          string `env:"APP_ENV" envDefault:"development"`
 
+	// Exportação OTLP — opcionais, com default seguro para produção (New Relic):
+	// sem headers e com TLS ligado. OTELHeaders é a string crua no formato da spec
+	// (`key1=value1,key2=value2`, ex.: `api-key=<license>`); vazia = nenhum header.
+	// OTELInsecure default false mantém o TLS ligado (spec-compliant, exigido pelo
+	// New Relic); o dev local com collector sem TLS seta INSECURE=true.
+	OTELHeaders  string `env:"OTEL_EXPORTER_OTLP_HEADERS"`
+	OTELInsecure bool   `env:"OTEL_EXPORTER_OTLP_INSECURE" envDefault:"false"`
+
 	// HTTP + Clerk auth (só o api os consome). Port tem default; o issuer e o
 	// segredo do webhook são opcionais — issuer vazio deixa o ClerkVerifier
 	// aceitar o issuer padrão da instância, segredo vazio só quebra ao verificar
