@@ -49,10 +49,26 @@ func Up(ctx context.Context, databaseURL string) error {
 		}
 	}()
 
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+	// Version before applying, for an informative boot log. golang-migrate is silent
+	// on success, so without this the api log gives no sign the schema was applied —
+	// making "did migrations run?" unanswerable from the outside. ErrNilVersion means
+	// a fresh database (nothing applied yet).
+	before, _, verr := m.Version()
+
+	switch err := m.Up(); {
+	case errors.Is(err, migrate.ErrNoChange):
+		slog.Info("migrations: schema already current", "version", before)
+		return nil
+	case err != nil:
 		return fmt.Errorf("applying migrations: %w", err)
 	}
 
+	after, _, _ := m.Version()
+	if errors.Is(verr, migrate.ErrNilVersion) {
+		slog.Info("migrations: applied on empty schema", "to_version", after)
+	} else {
+		slog.Info("migrations: applied", "from_version", before, "to_version", after)
+	}
 	return nil
 }
 
