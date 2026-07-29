@@ -88,12 +88,6 @@ variable "clerk_secret_key" {
   sensitive   = true
 }
 
-variable "clerk_jwks_url" {
-  description = "CLERK_JWKS_URL — verificação de JWT (JWKS)."
-  type        = string
-  sensitive   = true
-}
-
 variable "clerk_webhook_secret" {
   description = "CLERK_WEBHOOK_SECRET — verificação da assinatura svix do webhook."
   type        = string

@@ -31,7 +31,6 @@ env:
   # The S3_* set now holds Cloudflare R2 credentials (no AWS anywhere).
   TF_VAR_railway_token: ${{ secrets.RAILWAY_TOKEN }}
   TF_VAR_clerk_secret_key: ${{ secrets.CLERK_SECRET_KEY }}
-  TF_VAR_clerk_jwks_url: ${{ secrets.CLERK_JWKS_URL }}
   TF_VAR_clerk_webhook_secret: ${{ secrets.CLERK_WEBHOOK_SECRET }}
   TF_VAR_clerk_issuer: ${{ secrets.CLERK_ISSUER }}
   TF_VAR_anthropic_key: ${{ secrets.ANTHROPIC_API_KEY }}

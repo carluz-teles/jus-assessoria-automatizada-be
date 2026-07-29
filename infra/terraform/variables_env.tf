@@ -17,7 +17,6 @@ locals {
     DATABASE_URL                = local.database_url
     REDIS_URL                   = local.redis_url
     CLERK_SECRET_KEY            = var.clerk_secret_key
-    CLERK_JWKS_URL              = var.clerk_jwks_url
     CLERK_WEBHOOK_SECRET        = var.clerk_webhook_secret
     CLERK_ISSUER                = var.clerk_issuer
     ANTHROPIC_API_KEY           = var.anthropic_key

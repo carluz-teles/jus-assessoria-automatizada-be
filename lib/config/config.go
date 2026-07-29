@@ -20,7 +20,6 @@ type Config struct {
 	DatabaseURL  string `env:"DATABASE_URL,required"`
 	RedisURL     string `env:"REDIS_URL,required"`
 	ClerkSecret  string `env:"CLERK_SECRET_KEY,required"`
-	ClerkJWKSURL string `env:"CLERK_JWKS_URL,required"`
 	AnthropicKey string `env:"ANTHROPIC_API_KEY,required"`
 	OTELEndpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT,required"`
 	Env          string `env:"APP_ENV" envDefault:"development"`

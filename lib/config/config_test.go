@@ -14,7 +14,6 @@ var requiredVars = map[string]string{
 	"DATABASE_URL":                "postgres://user:pass@localhost:5432/jus",
 	"REDIS_URL":                   "redis://localhost:6379/0",
 	"CLERK_SECRET_KEY":            "sk_test_123",
-	"CLERK_JWKS_URL":              "https://clerk.example.com/.well-known/jwks.json",
 	"ANTHROPIC_API_KEY":           "anthropic_key_123",
 	"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
 }
@@ -74,9 +73,6 @@ func TestLoad_AllRequiredSet_DefaultsEnv(t *testing.T) {
 	}
 	if cfg.ClerkSecret != requiredVars["CLERK_SECRET_KEY"] {
 		t.Errorf("ClerkSecret = %q, want %q", cfg.ClerkSecret, requiredVars["CLERK_SECRET_KEY"])
-	}
-	if cfg.ClerkJWKSURL != requiredVars["CLERK_JWKS_URL"] {
-		t.Errorf("ClerkJWKSURL = %q, want %q", cfg.ClerkJWKSURL, requiredVars["CLERK_JWKS_URL"])
 	}
 	if cfg.AnthropicKey != requiredVars["ANTHROPIC_API_KEY"] {
 		t.Errorf("AnthropicKey = %q, want %q", cfg.AnthropicKey, requiredVars["ANTHROPIC_API_KEY"])
@@ -164,7 +160,6 @@ func TestLoad_RequiredVarsUnchanged(t *testing.T) {
 		"DATABASE_URL",
 		"REDIS_URL",
 		"CLERK_SECRET_KEY",
-		"CLERK_JWKS_URL",
 		"ANTHROPIC_API_KEY",
 		"OTEL_EXPORTER_OTLP_ENDPOINT",
 	}
