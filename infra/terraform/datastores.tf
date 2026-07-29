@@ -1,19 +1,18 @@
 # datastores.tf — Postgres (pgvector) e Redis como railway_service (docs §5e.3).
 #
 # Postgres roda a imagem pgvector/pgvector:pg16 (o schema usa pgvector, docs
-# erd-modelo-de-dados). Volume persistente montado no datadir. `volume.size` é
-# COMPUTED no provider (definido pelo plano do Railway), então NÃO é setável aqui —
-# só name e mount_path. Redis é o redis:7-alpine, efêmero (fila asynq).
+# erd-modelo-de-dados). Redis é o redis:7-alpine, efêmero (fila asynq).
+#
+# VOLUME fora do Terraform (mesmo padrão do bucket R2): o atributo `volume` inline do
+# provider railway v0.6.2 produz "inconsistent result after apply" (bug do provider,
+# sem fix na última versão) — taint→replace→colisão em loop. O volume persistente do
+# Postgres (mount /var/lib/postgresql/data) é criado via API do Railway, uma vez,
+# anexado a este serviço. Ver README (Notas de infra).
 
 resource "railway_service" "postgres" {
   name         = "postgres"
   project_id   = railway_project.main.id
   source_image = "pgvector/pgvector:pg16"
-
-  volume = {
-    name       = "postgres-data"
-    mount_path = "/var/lib/postgresql/data"
-  }
 }
 
 resource "railway_service" "redis" {

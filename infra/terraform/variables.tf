@@ -26,12 +26,6 @@ variable "railway_workspace_id" {
   default     = "27838c17-0a9b-4799-9c59-fab7c6dbff19"
 }
 
-variable "railway_prod_environment_id" {
-  description = "ID do environment 'production' que o Railway cria junto com o projeto. É referenciado (não criado) para evitar a colisão 'environment with that name already exists'. Identificador, não segredo — por isso vem com default."
-  type        = string
-  default     = "4d20bb2c-ef54-4411-a324-9db9e246138e"
-}
-
 variable "image_registry" {
   description = "Registry + namespace das imagens (ex.: ghcr.io/jusassessoria). A imagem de cada serviço é <registry>/jus-<svc>:<tag>."
   type        = string

@@ -27,7 +27,7 @@ imaginava). Em vez disso:
 providers.tf     provider railway + backend `cloud {}` (state no Terraform Cloud)
 variables.tf     inputs: forma da infra (defaults) + segredos (sensíveis, sem default)
 project.tf       railway_project
-environments.tf  referencia o environment production por ID (var.railway_prod_environment_id) — prod-only
+environments.tf  cria um environment próprio "prod" (nome ≠ "production" default) — prod-only
 services.tf      os 6 serviços (for_each), cada um na sua imagem jus-<svc>
 datastores.tf    postgres (pgvector + volume) e redis + suas variáveis
 variables_env.tf env vars de cada serviço de app (DATABASE_URL/REDIS_URL + S3_* por referência)
@@ -104,11 +104,19 @@ terraform -chdir=infra/terraform validate
 
 ### Environment default do Railway
 
-O Railway cria um environment `production` default junto com o projeto. Em vez de criar um
-(que colidiria: "environment with that name already exists"), o módulo **referencia o
-existente por ID** via `var.railway_prod_environment_id` (default = o id da conta). Pegue o id
-com a API do Railway (`project(id).environments`) e ajuste a var se recriar o projeto. Sem
-`terraform import` e sem environment de staging nesta fase.
+O Railway cria um environment `production` default junto com o projeto. Criar um recurso com
+esse mesmo nome colide ("environment with that name already exists"), então o módulo gerencia
+um environment PRÓPRIO chamado **`prod`** (nome distinto do default). Assim o apply funciona
+from-scratch, sem hardcode de ID nem `terraform import`; o `production` default fica ocioso.
+Sem environment de staging nesta fase.
+
+### Volume do Postgres (fora do Terraform)
+
+O atributo `volume` inline do provider railway v0.6.2 produz `Provider produced inconsistent
+result after apply` no create (bug do provider, sem fix na última versão), causando um loop
+taint→replace→colisão de volume. Por isso — como o bucket R2 — o volume persistente do Postgres
+é criado **via API do Railway** (mutation `volumeCreate`, mount `/var/lib/postgresql/data`,
+anexado ao serviço `postgres`), uma vez, fora do Terraform. O Terraform gerencia só o serviço.
 
 ## Notas de infra pendentes
 
