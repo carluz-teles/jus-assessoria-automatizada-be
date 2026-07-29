@@ -13,6 +13,7 @@ package health
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/hibiken/asynq"
@@ -68,11 +69,19 @@ func waitFor(ctx context.Context, check func(context.Context) error, timeout, ba
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	for {
+	for attempt := 1; ; attempt++ {
 		lastErr := check(ctx)
 		if lastErr == nil {
+			// Only log if we actually waited — a first-try success is the common
+			// case and stays quiet.
+			if attempt > 1 {
+				slog.Info("dependencies ready", "attempts", attempt)
+			}
 			return nil
 		}
+		// Log every wait so a process blocked here is visible in the logs instead of
+		// looking like a silent boot hang (docs §5b.1).
+		slog.Warn("waiting for dependencies", "attempt", attempt, "error", lastErr)
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("health: dependencies not ready after %s: %w", timeout, lastErr)

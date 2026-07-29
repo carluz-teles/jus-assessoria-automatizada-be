@@ -16,6 +16,12 @@ import (
 // hung shutdown step cannot hold the process open past this.
 const shutdownTimeout = 30 * time.Second
 
+// readyGrace is how long serve must stay up before we announce readiness. Long
+// enough to let a fast boot failure (a bind error, an immediately-returning loop)
+// surface as an error first; short enough that a healthy service logs "ready"
+// almost immediately, so a running process is never mistaken for a boot loop.
+const readyGrace = 750 * time.Millisecond
+
 // RunWithGracefulShutdown runs serve in the foreground until either the process
 // receives SIGTERM/SIGINT or serve returns on its own, then invokes shutdown
 // with a bounded context so in-flight work drains before exit. name labels the
@@ -38,16 +44,20 @@ func RunWithGracefulShutdown(name string, serve func() error, shutdown func(cont
 		serveErr <- serve()
 	}()
 
+	// If serve survives the grace window it is genuinely running: announce readiness
+	// so the logs clearly show "up and serving", not a silent process that might be
+	// looping. A serve that returns within the grace skips "ready" and drains.
 	select {
 	case err := <-serveErr:
-		// serve exited before any signal: a bind failure, or a loop that ended.
-		// Non-nil is a real fault; either way fall through to shutdown so already
-		// wired resources are released.
-		if err != nil {
-			slog.Error("service stopped unexpectedly", "service", name, "error", err)
+		logServeExit(name, err)
+	case <-time.After(readyGrace):
+		slog.Info("service ready", "service", name)
+		select {
+		case err := <-serveErr:
+			logServeExit(name, err)
+		case <-ctx.Done():
+			slog.Info("shutdown signal received", "service", name)
 		}
-	case <-ctx.Done():
-		slog.Info("shutdown signal received", "service", name)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -58,4 +68,13 @@ func RunWithGracefulShutdown(name string, serve func() error, shutdown func(cont
 	}
 
 	slog.Info("service stopped", "service", name)
+}
+
+// logServeExit logs when serve returns before a shutdown signal. A non-nil error is
+// a real fault (a bind failure, a loop that died); a nil return is an orderly stop.
+// Either way the caller still runs shutdown to release what was already wired.
+func logServeExit(name string, err error) {
+	if err != nil {
+		slog.Error("service stopped unexpectedly", "service", name, "error", err)
+	}
 }
