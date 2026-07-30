@@ -178,6 +178,7 @@ func TestQueueFor(t *testing.T) {
 		{"ingestao.movimento.observed", "ingestao"},
 		{"documents.file.extracted", "documents"},
 		{"ai.revisao.requested", "ai"},
+		{"notification.requested", "notifications"},
 		{"minuta.revised", "default"},
 		{"nodot", "default"},
 		{"", "default"},

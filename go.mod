@@ -18,6 +18,7 @@ require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/pashagolub/pgxmock/v4 v4.9.0
 	github.com/pgvector/pgvector-go v0.4.0
+	github.com/resend/resend-go/v2 v2.28.0
 	github.com/stripe/stripe-go/v86 v86.2.0
 	github.com/svix/svix-webhooks v1.99.1
 	github.com/testcontainers/testcontainers-go v0.43.0

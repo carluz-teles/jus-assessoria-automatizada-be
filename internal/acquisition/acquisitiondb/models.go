@@ -170,6 +170,28 @@ type Membership struct {
 	RemovedAt         pgtype.Timestamptz `json:"removed_at"`
 }
 
+type Notification struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	RecipientUserID pgtype.UUID        `json:"recipient_user_id"`
+	Type            string             `json:"type"`
+	Payload         []byte             `json:"payload"`
+	Status          string             `json:"status"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type NotificationDelivery struct {
+	ID                uuid.UUID          `json:"id"`
+	NotificationID    uuid.UUID          `json:"notification_id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	Channel           string             `json:"channel"`
+	Status            string             `json:"status"`
+	ProviderMessageID *string            `json:"provider_message_id"`
+	Error             *string            `json:"error"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Outbox struct {
 	ID             int64              `json:"id"`
 	AggregateType  string             `json:"aggregate_type"`

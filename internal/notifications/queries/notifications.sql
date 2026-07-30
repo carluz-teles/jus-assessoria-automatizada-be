@@ -1,0 +1,46 @@
+-- notifications slice queries (the avisos domain: notification + delivery).
+-- Writes participate in the use case's transaction (transactional outbox / dedup
+-- commit together); the recipient read runs inside that same tx so RLS scopes it
+-- to the event's tenant. Absence is a typed error at the mapper, never (nil, nil).
+
+-- name: InsertNotification :one
+-- Record the aviso itself (the fact that a user should be told something), inside
+-- the caller's tx. recipient_user_id is nullable (some avisos are tenant-level);
+-- payload is the template data. status starts CREATED — the delivery rows carry
+-- the per-channel lifecycle.
+INSERT INTO notification (
+    tenant_id, recipient_user_id, type, payload, status
+) VALUES ($1, $2, $3, $4, $5)
+RETURNING *;
+
+-- name: InsertDelivery :one
+-- Open a per-channel delivery attempt for a notification, inside the caller's tx.
+-- UNIQUE(notification_id, channel) is the idempotency floor: at most one delivery
+-- per channel per notification. The consumer-side event dedup (processed_event)
+-- already prevents re-processing, so a fresh notification never conflicts here.
+INSERT INTO notification_delivery (
+    notification_id, tenant_id, channel, status, provider_message_id, error
+) VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING *;
+
+-- name: UpdateDeliveryStatus :one
+-- Record the outcome of a send: SENT with the provider's message id, or FAILED
+-- with the reason. Scoped by id AND tenant_id (app-layer barrier) on top of RLS.
+-- No row (a delivery from another tenant) → the mapper maps pgx.ErrNoRows to a
+-- typed not-found.
+UPDATE notification_delivery
+   SET status = $3,
+       provider_message_id = $4,
+       error = $5,
+       updated_at = now()
+ WHERE id = $1
+   AND tenant_id = $2
+RETURNING *;
+
+-- name: FindRecipientEmail :one
+-- Resolve the recipient's e-mail by internal app_user id, scoped to the tenant
+-- (WHERE + RLS). No row → the mapper maps pgx.ErrNoRows to a typed not-found, and
+-- the use case records a FAILED delivery rather than dropping the aviso.
+SELECT email FROM app_user
+WHERE id = $1
+  AND tenant_id = $2;

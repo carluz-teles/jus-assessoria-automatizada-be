@@ -47,6 +47,14 @@ type Config struct {
 	StripeSecretKey     string `env:"STRIPE_SECRET_KEY"`
 	StripeWebhookSecret string `env:"STRIPE_WEBHOOK_SECRET"`
 
+	// Resend — provedor de e-mail transacional (só o worker que roda o listener de
+	// notifications os consome). Opcionais no agregado pelo mesmo motivo do Stripe/S3:
+	// mantê-los opcionais preserva o boot dos demais binários (api/scheduler/relay),
+	// que não enviam e-mail. O worker de notifications valida a presença no boot
+	// (NewResendClient/NewEmailChannel devolvem Invalid) e falha rápido se faltarem.
+	ResendAPIKey    string `env:"RESEND_API_KEY"`
+	ResendFromEmail string `env:"RESEND_FROM_EMAIL"`
+
 	// Object storage S3-compatível (S3/R2/MinIO). Opcional: o api só monta o
 	// storage.Client quando S3Enabled() — ver o método abaixo.
 	S3Endpoint  string `env:"S3_ENDPOINT"`

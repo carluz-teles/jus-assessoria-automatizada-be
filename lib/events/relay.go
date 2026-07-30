@@ -162,6 +162,8 @@ func queueFor(typ string) string {
 		return "documents"
 	case "ai":
 		return "ai"
+	case "notification":
+		return "notifications"
 	default:
 		return "default"
 	}

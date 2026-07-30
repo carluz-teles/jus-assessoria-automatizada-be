@@ -15,6 +15,7 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -26,6 +27,10 @@ import (
 const (
 	serviceName = "worker-ingestao"
 	queueName   = "ingestao"
+	// notificationsQueue carries the avisos domain's `notification.*` events. It
+	// shares this worker (the process where the async listeners live) but its own
+	// queue, so a slow e-mail send never blocks court sync.
+	notificationsQueue = "notifications"
 	// concurrency is generous: court sync is I/O-bound and tolerates many
 	// in-flight jobs. Tune per real load with the docker slice.
 	concurrency = 10
@@ -68,7 +73,10 @@ func run(logger *slog.Logger) error {
 
 	srv := asynq.NewServer(redisOpt, asynq.Config{
 		Concurrency: concurrency,
-		Queues:      map[string]int{queueName: concurrency},
+		Queues: map[string]int{
+			queueName:          concurrency,
+			notificationsQueue: concurrency,
+		},
 	})
 
 	// Feature slices register their listeners on this mux. Each slice owns its
@@ -94,6 +102,25 @@ func run(logger *slog.Logger) error {
 	sync := acquisition.NewSyncUseCase(repo, outbox, uow, connector, acquisition.NewStubParser())
 
 	acquisition.NewListener(backfill, sync).Register(mux)
+
+	// notifications: consume notification.requested and deliver by e-mail (Resend).
+	// The provider config is required here (this worker runs the listener), so a
+	// missing key fails the boot rather than silently dropping avisos later.
+	resendClient, err := notifications.NewResendClient(cfg.ResendAPIKey)
+	if err != nil {
+		return fmt.Errorf("build resend client: %w", err)
+	}
+	emailChannel, err := notifications.NewEmailChannel(cfg.ResendFromEmail, resendClient)
+	if err != nil {
+		return fmt.Errorf("build email channel: %w", err)
+	}
+	notifyUC := notifications.NewNotifyUseCase(
+		notifications.NewRepository(),
+		emailChannel,
+		notifications.NewDedup(),
+		uow,
+	)
+	notifications.NewListener(notifyUC).Register(mux)
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)
