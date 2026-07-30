@@ -18,6 +18,7 @@ type AppUser struct {
 	Name        *string            `json:"name"`
 	Role        string             `json:"role"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	Phone       *string            `json:"phone"`
 }
 
 type BackfillJob struct {
@@ -212,8 +213,13 @@ type SyncRun struct {
 }
 
 type Tenant struct {
-	ID         uuid.UUID          `json:"id"`
-	ClerkOrgID string             `json:"clerk_org_id"`
-	Name       string             `json:"name"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	ID                    uuid.UUID          `json:"id"`
+	ClerkOrgID            string             `json:"clerk_org_id"`
+	Name                  string             `json:"name"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	Cnpj                  *string            `json:"cnpj"`
+	LegalName             *string            `json:"legal_name"`
+	TradeName             *string            `json:"trade_name"`
+	Address               []byte             `json:"address"`
+	OnboardingCompletedAt pgtype.Timestamptz `json:"onboarding_completed_at"`
 }

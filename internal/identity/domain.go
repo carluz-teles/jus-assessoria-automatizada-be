@@ -54,7 +54,9 @@ func (uc *UseCase) ProvisionUser(ctx context.Context, clerkUserID, clerkOrgID, e
 	var user *AppUser
 	err = uc.uow.Do(ctx, tenant.ID, func(tx database.Tx) error {
 		var err error
-		user, err = uc.repo.UpsertUser(ctx, tx, clerkUserID, tenant.ID, email, name, role)
+		// Membership events carry no phone; pass empty so the COALESCE in the
+		// upsert leaves any phone already synced from user.updated untouched.
+		user, err = uc.repo.UpsertUser(ctx, tx, clerkUserID, tenant.ID, email, name, "", role)
 		return err
 	})
 	if err != nil {
@@ -63,13 +65,13 @@ func (uc *UseCase) ProvisionUser(ctx context.Context, clerkUserID, clerkOrgID, e
 	return user, nil
 }
 
-// SyncUser resyncs an existing app_user's email and name from a Clerk
+// SyncUser resyncs an existing app_user's email, name and phone from a Clerk
 // user.updated webhook. Role and tenant are immutable here — membership decides
 // those, not a profile edit — so it reuses the stored values and lets UpsertUser's
-// ON CONFLICT clause touch only email/name. Idempotent for at-least-once
+// ON CONFLICT clause touch only email/name/phone. Idempotent for at-least-once
 // delivery. ErrUserNotFound propagates when the update races ahead of the
 // membership webhook that first creates the row.
-func (uc *UseCase) SyncUser(ctx context.Context, clerkUserID, email, name string) (*AppUser, error) {
+func (uc *UseCase) SyncUser(ctx context.Context, clerkUserID, email, name, phone string) (*AppUser, error) {
 	existing, err := uc.repo.FindUserByClerkUser(ctx, clerkUserID)
 	if err != nil {
 		return nil, err
@@ -78,7 +80,7 @@ func (uc *UseCase) SyncUser(ctx context.Context, clerkUserID, email, name string
 	var user *AppUser
 	err = uc.uow.Do(ctx, existing.TenantID, func(tx database.Tx) error {
 		var err error
-		user, err = uc.repo.UpsertUser(ctx, tx, clerkUserID, existing.TenantID, email, name, existing.Role)
+		user, err = uc.repo.UpsertUser(ctx, tx, clerkUserID, existing.TenantID, email, name, phone, existing.Role)
 		return err
 	})
 	if err != nil {

@@ -12,7 +12,7 @@ import (
 )
 
 const getTenantByClerkOrg = `-- name: GetTenantByClerkOrg :one
-SELECT id, clerk_org_id, name, created_at FROM tenant
+SELECT id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at FROM tenant
 WHERE clerk_org_id = $1
 `
 
@@ -24,12 +24,17 @@ func (q *Queries) GetTenantByClerkOrg(ctx context.Context, clerkOrgID string) (T
 		&i.ClerkOrgID,
 		&i.Name,
 		&i.CreatedAt,
+		&i.Cnpj,
+		&i.LegalName,
+		&i.TradeName,
+		&i.Address,
+		&i.OnboardingCompletedAt,
 	)
 	return i, err
 }
 
 const getTenantByID = `-- name: GetTenantByID :one
-SELECT id, clerk_org_id, name, created_at FROM tenant
+SELECT id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at FROM tenant
 WHERE id = $1
 `
 
@@ -41,12 +46,17 @@ func (q *Queries) GetTenantByID(ctx context.Context, id uuid.UUID) (Tenant, erro
 		&i.ClerkOrgID,
 		&i.Name,
 		&i.CreatedAt,
+		&i.Cnpj,
+		&i.LegalName,
+		&i.TradeName,
+		&i.Address,
+		&i.OnboardingCompletedAt,
 	)
 	return i, err
 }
 
 const getUserByClerkUser = `-- name: GetUserByClerkUser :one
-SELECT id, clerk_user_id, tenant_id, email, name, role, created_at FROM app_user
+SELECT id, clerk_user_id, tenant_id, email, name, role, created_at, phone FROM app_user
 WHERE clerk_user_id = $1
 `
 
@@ -61,12 +71,13 @@ func (q *Queries) GetUserByClerkUser(ctx context.Context, clerkUserID string) (A
 		&i.Name,
 		&i.Role,
 		&i.CreatedAt,
+		&i.Phone,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, clerk_user_id, tenant_id, email, name, role, created_at FROM app_user
+SELECT id, clerk_user_id, tenant_id, email, name, role, created_at, phone FROM app_user
 WHERE id = $1
 `
 
@@ -81,6 +92,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (AppUser, error
 		&i.Name,
 		&i.Role,
 		&i.CreatedAt,
+		&i.Phone,
 	)
 	return i, err
 }
@@ -91,7 +103,7 @@ INSERT INTO tenant (clerk_org_id, name)
 VALUES ($1, $2)
 ON CONFLICT (clerk_org_id) DO UPDATE
    SET name = EXCLUDED.name
-RETURNING id, clerk_org_id, name, created_at
+RETURNING id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at
 `
 
 type UpsertTenantParams struct {
@@ -110,17 +122,23 @@ func (q *Queries) UpsertTenant(ctx context.Context, arg UpsertTenantParams) (Ten
 		&i.ClerkOrgID,
 		&i.Name,
 		&i.CreatedAt,
+		&i.Cnpj,
+		&i.LegalName,
+		&i.TradeName,
+		&i.Address,
+		&i.OnboardingCompletedAt,
 	)
 	return i, err
 }
 
 const upsertUser = `-- name: UpsertUser :one
-INSERT INTO app_user (clerk_user_id, tenant_id, email, name, role)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO app_user (clerk_user_id, tenant_id, email, name, role, phone)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (clerk_user_id) DO UPDATE
    SET email = EXCLUDED.email,
-       name  = EXCLUDED.name
-RETURNING id, clerk_user_id, tenant_id, email, name, role, created_at
+       name  = EXCLUDED.name,
+       phone = COALESCE(EXCLUDED.phone, app_user.phone)
+RETURNING id, clerk_user_id, tenant_id, email, name, role, created_at, phone
 `
 
 type UpsertUserParams struct {
@@ -129,10 +147,15 @@ type UpsertUserParams struct {
 	Email       string    `json:"email"`
 	Name        *string   `json:"name"`
 	Role        string    `json:"role"`
+	Phone       *string   `json:"phone"`
 }
 
 // Provision or refresh an app_user from its Clerk User. Role is set on first
 // insert only; membership webhooks resync email/name, not the product role.
+// phone is COALESCEd, not overwritten: only user.updated carries a phone, while
+// membership.created (which also flows through here) carries none. The COALESCE
+// keeps an at-least-once membership replay from clearing a phone already synced
+// from user.updated — the phone-less path passes NULL and leaves it untouched.
 func (q *Queries) UpsertUser(ctx context.Context, arg UpsertUserParams) (AppUser, error) {
 	row := q.db.QueryRow(ctx, upsertUser,
 		arg.ClerkUserID,
@@ -140,6 +163,7 @@ func (q *Queries) UpsertUser(ctx context.Context, arg UpsertUserParams) (AppUser
 		arg.Email,
 		arg.Name,
 		arg.Role,
+		arg.Phone,
 	)
 	var i AppUser
 	err := row.Scan(
@@ -150,6 +174,7 @@ func (q *Queries) UpsertUser(ctx context.Context, arg UpsertUserParams) (AppUser
 		&i.Name,
 		&i.Role,
 		&i.CreatedAt,
+		&i.Phone,
 	)
 	return i, err
 }

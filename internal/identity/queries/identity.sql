@@ -20,11 +20,16 @@ WHERE id = $1;
 -- name: UpsertUser :one
 -- Provision or refresh an app_user from its Clerk User. Role is set on first
 -- insert only; membership webhooks resync email/name, not the product role.
-INSERT INTO app_user (clerk_user_id, tenant_id, email, name, role)
-VALUES ($1, $2, $3, $4, $5)
+-- phone is COALESCEd, not overwritten: only user.updated carries a phone, while
+-- membership.created (which also flows through here) carries none. The COALESCE
+-- keeps an at-least-once membership replay from clearing a phone already synced
+-- from user.updated — the phone-less path passes NULL and leaves it untouched.
+INSERT INTO app_user (clerk_user_id, tenant_id, email, name, role, phone)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (clerk_user_id) DO UPDATE
    SET email = EXCLUDED.email,
-       name  = EXCLUDED.name
+       name  = EXCLUDED.name,
+       phone = COALESCE(EXCLUDED.phone, app_user.phone)
 RETURNING *;
 
 -- name: GetUserByClerkUser :one

@@ -81,6 +81,11 @@ type userData struct {
 		ID           string `json:"id"`
 		EmailAddress string `json:"email_address"`
 	} `json:"email_addresses"`
+	PrimaryPhoneNumberID string `json:"primary_phone_number_id"`
+	PhoneNumbers         []struct {
+		ID          string `json:"id"`
+		PhoneNumber string `json:"phone_number"`
+	} `json:"phone_numbers"`
 }
 
 // Handle verifies the svix signature — always, since the webhook is a public
@@ -144,7 +149,7 @@ func (h *WebhookHandler) dispatch(ctx context.Context, ev clerkEvent) error {
 		if err := json.Unmarshal(ev.Data, &d); err != nil {
 			return apperr.NewInvalid("malformed user payload")
 		}
-		_, err := h.uc.SyncUser(ctx, d.ID, primaryEmail(d), fullName(d.FirstName, d.LastName))
+		_, err := h.uc.SyncUser(ctx, d.ID, primaryEmail(d), fullName(d.FirstName, d.LastName), primaryPhone(d))
 		return err
 
 	default:
@@ -186,6 +191,22 @@ func primaryEmail(d userData) string {
 	}
 	if len(d.EmailAddresses) > 0 {
 		return d.EmailAddresses[0].EmailAddress
+	}
+	return ""
+}
+
+// primaryPhone returns the user's primary phone number, falling back to the
+// first listed number when the primary id is unset or unmatched. An empty string
+// (no phone on the Clerk User) means "leave the stored phone untouched" — the
+// upsert COALESCEs it. Mirrors primaryEmail.
+func primaryPhone(d userData) string {
+	for _, p := range d.PhoneNumbers {
+		if p.ID == d.PrimaryPhoneNumberID {
+			return p.PhoneNumber
+		}
+	}
+	if len(d.PhoneNumbers) > 0 {
+		return d.PhoneNumbers[0].PhoneNumber
 	}
 	return ""
 }

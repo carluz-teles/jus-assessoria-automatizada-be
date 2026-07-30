@@ -38,8 +38,12 @@ type AppUser struct {
 	TenantID    string
 	Email       string
 	Name        string
-	Role        Role
-	CreatedAt   time.Time
+	// Phone is the user's phone number, synced from the Clerk User
+	// (user.updated). Optional: an empty string stands in for SQL NULL when the
+	// user has no phone on Clerk.
+	Phone     string
+	Role      Role
+	CreatedAt time.Time
 }
 
 // Principal is the authenticated caller resolved from a verified Clerk JWT: who

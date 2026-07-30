@@ -35,14 +35,17 @@ func TestTenantToEntity(t *testing.T) {
 func TestUserToEntity(t *testing.T) {
 	id, tenantID := uuid.New(), uuid.New()
 	name := "Ana"
+	phone := "+5511987654321"
 
 	tests := []struct {
-		name     string
-		rowName  *string
-		wantName string
+		name      string
+		rowName   *string
+		rowPhone  *string
+		wantName  string
+		wantPhone string
 	}{
-		{name: "named user", rowName: &name, wantName: "Ana"},
-		{name: "null name collapses to empty string", rowName: nil, wantName: ""},
+		{name: "named user with phone", rowName: &name, rowPhone: &phone, wantName: "Ana", wantPhone: phone},
+		{name: "null name and phone collapse to empty string", rowName: nil, rowPhone: nil, wantName: "", wantPhone: ""},
 	}
 
 	for _, tt := range tests {
@@ -53,6 +56,7 @@ func TestUserToEntity(t *testing.T) {
 				TenantID:    tenantID,
 				Email:       "a@b.com",
 				Name:        tt.rowName,
+				Phone:       tt.rowPhone,
 				Role:        "ADMIN",
 				CreatedAt:   pgtype.Timestamptz{Time: time.Unix(0, 0), Valid: true},
 			})
@@ -63,6 +67,9 @@ func TestUserToEntity(t *testing.T) {
 			if got.Name != tt.wantName {
 				t.Errorf("Name = %q, want %q", got.Name, tt.wantName)
 			}
+			if got.Phone != tt.wantPhone {
+				t.Errorf("Phone = %q, want %q", got.Phone, tt.wantPhone)
+			}
 			if got.Role != RoleAdmin {
 				t.Errorf("Role = %q, want %q", got.Role, RoleAdmin)
 			}
@@ -70,20 +77,20 @@ func TestUserToEntity(t *testing.T) {
 	}
 }
 
-func TestNameToNull(t *testing.T) {
-	if got := nameToNull(""); got != nil {
-		t.Errorf("nameToNull(\"\") = %v, want nil", got)
+func TestTextToNull(t *testing.T) {
+	if got := textToNull(""); got != nil {
+		t.Errorf("textToNull(\"\") = %v, want nil", got)
 	}
-	got := nameToNull("Ana")
+	got := textToNull("Ana")
 	if got == nil || *got != "Ana" {
-		t.Errorf("nameToNull(\"Ana\") = %v, want pointer to \"Ana\"", got)
+		t.Errorf("textToNull(\"Ana\") = %v, want pointer to \"Ana\"", got)
 	}
 }
 
-// derefString and nameToNull are inverses for any non-empty name.
-func TestNameRoundTrip(t *testing.T) {
-	const name = "Ana"
-	if got := derefString(nameToNull(name)); got != name {
-		t.Errorf("round-trip = %q, want %q", got, name)
+// derefString and textToNull are inverses for any non-empty text.
+func TestTextRoundTrip(t *testing.T) {
+	const value = "Ana"
+	if got := derefString(textToNull(value)); got != value {
+		t.Errorf("round-trip = %q, want %q", got, value)
 	}
 }

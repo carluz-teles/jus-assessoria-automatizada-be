@@ -17,7 +17,7 @@ import (
 type Repository interface {
 	UpsertTenant(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
 	FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error)
-	UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error)
+	UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error)
 }
 
@@ -61,7 +61,7 @@ func (r *pgRepository) FindTenantByClerkOrg(ctx context.Context, clerkOrgID stri
 
 // UpsertUser provisions or refreshes an app_user inside the caller's tx. tenantID
 // is the internal uuid (a string on the entity), parsed back to uuid.UUID here.
-func (r *pgRepository) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error) {
+func (r *pgRepository) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -70,7 +70,8 @@ func (r *pgRepository) UpsertUser(ctx context.Context, tx database.Tx, clerkUser
 		ClerkUserID: clerkUserID,
 		TenantID:    tid,
 		Email:       email,
-		Name:        nameToNull(name),
+		Name:        textToNull(name),
+		Phone:       textToNull(phone),
 		Role:        string(role),
 	})
 	if err != nil {

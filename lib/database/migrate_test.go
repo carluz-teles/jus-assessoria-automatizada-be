@@ -65,16 +65,20 @@ func TestEmbeddedSource(t *testing.T) {
 	}
 
 	// The acquisition slice adds migration 2 (integration.updated_at) and 3
-	// (backfill_job integration_id index), so 1→2→3 and 3 is the last — there is
-	// nothing after it.
+	// (backfill_job integration_id index); the identity onboarding slice adds 4
+	// (tenant company cols + app_user.phone). So 1→2→3→4 and 4 is the last —
+	// there is nothing after it.
 	if next, err := src.Next(1); err != nil || next != 2 {
 		t.Fatalf("Next(1) = (%d, %v), want (2, nil)", next, err)
 	}
 	if next, err := src.Next(2); err != nil || next != 3 {
 		t.Fatalf("Next(2) = (%d, %v), want (3, nil)", next, err)
 	}
-	if _, err := src.Next(3); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(3) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(3); err != nil || next != 4 {
+		t.Fatalf("Next(3) = (%d, %v), want (4, nil)", next, err)
+	}
+	if _, err := src.Next(4); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(4) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

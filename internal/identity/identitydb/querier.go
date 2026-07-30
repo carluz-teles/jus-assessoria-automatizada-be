@@ -21,6 +21,10 @@ type Querier interface {
 	UpsertTenant(ctx context.Context, arg UpsertTenantParams) (Tenant, error)
 	// Provision or refresh an app_user from its Clerk User. Role is set on first
 	// insert only; membership webhooks resync email/name, not the product role.
+	// phone is COALESCEd, not overwritten: only user.updated carries a phone, while
+	// membership.created (which also flows through here) carries none. The COALESCE
+	// keeps an at-least-once membership replay from clearing a phone already synced
+	// from user.updated — the phone-less path passes NULL and leaves it untouched.
 	UpsertUser(ctx context.Context, arg UpsertUserParams) (AppUser, error)
 }
 

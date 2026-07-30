@@ -14,7 +14,7 @@ import (
 type mockRepo struct {
 	upsertTenant func(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
 	findTenant   func(ctx context.Context, clerkOrgID string) (*Tenant, error)
-	upsertUser   func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error)
+	upsertUser   func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	findUser     func(ctx context.Context, clerkUserID string) (*AppUser, error)
 }
 
@@ -26,8 +26,8 @@ func (m *mockRepo) FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) 
 	return m.findTenant(ctx, clerkOrgID)
 }
 
-func (m *mockRepo) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error) {
-	return m.upsertUser(ctx, tx, clerkUserID, tenantID, email, name, role)
+func (m *mockRepo) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error) {
+	return m.upsertUser(ctx, tx, clerkUserID, tenantID, email, name, phone, role)
 }
 
 func (m *mockRepo) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
@@ -163,8 +163,8 @@ func TestUseCase_ProvisionUser(t *testing.T) {
 
 	t.Run("upserts the user under the tenant's RLS scope", func(t *testing.T) {
 		var upsertArgs struct {
-			clerkUserID, tenantID, email, name string
-			role                               Role
+			clerkUserID, tenantID, email, name, phone string
+			role                                      Role
 		}
 		repo := &mockRepo{
 			findTenant: func(_ context.Context, clerkOrgID string) (*Tenant, error) {
@@ -173,11 +173,12 @@ func TestUseCase_ProvisionUser(t *testing.T) {
 				}
 				return tenant, nil
 			},
-			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error) {
+			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error) {
 				upsertArgs.clerkUserID = clerkUserID
 				upsertArgs.tenantID = tenantID
 				upsertArgs.email = email
 				upsertArgs.name = name
+				upsertArgs.phone = phone
 				upsertArgs.role = role
 				return want, nil
 			},
@@ -200,6 +201,11 @@ func TestUseCase_ProvisionUser(t *testing.T) {
 		if upsertArgs.clerkUserID != "user_xyz" || upsertArgs.email != "a@b.com" || upsertArgs.name != "Ana" || upsertArgs.role != RoleLawyer {
 			t.Fatalf("upsert args = %+v", upsertArgs)
 		}
+		// Membership events carry no phone: the use case must pass empty so the
+		// upsert's COALESCE preserves any phone synced from user.updated.
+		if upsertArgs.phone != "" {
+			t.Fatalf("membership provisioning passed phone %q, want empty", upsertArgs.phone)
+		}
 	})
 }
 
@@ -207,21 +213,21 @@ func TestUseCase_SyncUser(t *testing.T) {
 	ctx := context.Background()
 	existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleAdmin}
 
-	t.Run("resyncs email/name under the tenant scope, keeping tenant and role", func(t *testing.T) {
+	t.Run("resyncs email/name/phone under the tenant scope, keeping tenant and role", func(t *testing.T) {
 		var upsert struct {
-			tenantID, email, name string
-			role                  Role
+			tenantID, email, name, phone string
+			role                         Role
 		}
 		repo := &mockRepo{
 			findUser: func(context.Context, string) (*AppUser, error) { return existing, nil },
-			upsertUser: func(_ context.Context, _ database.Tx, _, tenantID, email, name string, role Role) (*AppUser, error) {
-				upsert.tenantID, upsert.email, upsert.name, upsert.role = tenantID, email, name, role
+			upsertUser: func(_ context.Context, _ database.Tx, _, tenantID, email, name, phone string, role Role) (*AppUser, error) {
+				upsert.tenantID, upsert.email, upsert.name, upsert.phone, upsert.role = tenantID, email, name, phone, role
 				return existing, nil
 			},
 		}
 		uow := &fakeUOW{}
 
-		got, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova")
+		got, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova", "+5511987654321")
 		if err != nil {
 			t.Fatalf("SyncUser() error = %v", err)
 		}
@@ -237,6 +243,35 @@ func TestUseCase_SyncUser(t *testing.T) {
 		if upsert.email != "new@b.com" || upsert.name != "Ana Nova" {
 			t.Fatalf("resynced fields = %+v", upsert)
 		}
+		// AC2: the phone from the webhook is propagated to the upsert.
+		if upsert.phone != "+5511987654321" {
+			t.Fatalf("phone = %q, want propagated to upsert", upsert.phone)
+		}
+	})
+
+	t.Run("resyncs without a phone passes empty (upsert COALESCE leaves it unchanged)", func(t *testing.T) {
+		var gotPhone string
+		called := false
+		repo := &mockRepo{
+			findUser: func(context.Context, string) (*AppUser, error) { return existing, nil },
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, phone string, _ Role) (*AppUser, error) {
+				gotPhone = phone
+				called = true
+				return existing, nil
+			},
+		}
+
+		// AC3: a user.updated with no phone must not panic and must forward empty
+		// (the repo's COALESCE then keeps the stored phone / leaves it null).
+		if _, err := NewUseCase(repo, &fakeUOW{}).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova", ""); err != nil {
+			t.Fatalf("SyncUser() error = %v", err)
+		}
+		if !called {
+			t.Fatal("UpsertUser was not called")
+		}
+		if gotPhone != "" {
+			t.Fatalf("phone = %q, want empty", gotPhone)
+		}
 	})
 
 	t.Run("missing user propagates ErrUserNotFound without opening a tx", func(t *testing.T) {
@@ -245,7 +280,7 @@ func TestUseCase_SyncUser(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		_, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "x@y.com", "X")
+		_, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "x@y.com", "X", "")
 		if !errors.Is(err, ErrUserNotFound) {
 			t.Fatalf("error = %v, want ErrUserNotFound", err)
 		}

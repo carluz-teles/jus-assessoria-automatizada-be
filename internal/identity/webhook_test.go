@@ -74,7 +74,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 			findTenant: func(context.Context, string) (*Tenant, error) {
 				return &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}, nil
 			},
-			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name string, role Role) (*AppUser, error) {
+			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name, _ string, role Role) (*AppUser, error) {
 				got.clerkUserID, got.tenantID, got.email, got.name, got.role = clerkUserID, tenantID, email, name, role
 				return &AppUser{ID: "u-1", ClerkUserID: clerkUserID}, nil
 			},
@@ -98,23 +98,27 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		}
 	})
 
-	t.Run("user.updated resyncs email and name but preserves the role", func(t *testing.T) {
+	t.Run("user.updated resyncs email, name and the primary phone but preserves the role", func(t *testing.T) {
 		existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleLawyer}
 		var got struct {
-			email, name string
-			role        Role
+			email, name, phone string
+			role               Role
 		}
 		repo := &mockRepo{
 			findUser: func(context.Context, string) (*AppUser, error) { return existing, nil },
-			upsertUser: func(_ context.Context, _ database.Tx, _, _, email, name string, role Role) (*AppUser, error) {
-				got.email, got.name, got.role = email, name, role
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, email, name, phone string, role Role) (*AppUser, error) {
+				got.email, got.name, got.phone, got.role = email, name, phone, role
 				return existing, nil
 			},
 		}
 		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
 
+		// Two phone numbers; primary_phone_number_id selects the second, proving
+		// the primary (not the first listed) is the one persisted.
 		body := []byte(`{"type":"user.updated","data":{"id":"user_xyz","first_name":"Ana","last_name":"Souza",` +
-			`"primary_email_address_id":"idn_1","email_addresses":[{"id":"idn_1","email_address":"ana@new.com"}]}}`)
+			`"primary_email_address_id":"idn_1","email_addresses":[{"id":"idn_1","email_address":"ana@new.com"}],` +
+			`"primary_phone_number_id":"phn_2","phone_numbers":[` +
+			`{"id":"phn_1","phone_number":"+5511111111111"},{"id":"phn_2","phone_number":"+5511987654321"}]}}`)
 		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
 
 		if resp.StatusCode != http.StatusOK {
@@ -123,8 +127,38 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		if got.email != "ana@new.com" || got.name != "Ana Souza" {
 			t.Fatalf("resynced fields = %+v", got)
 		}
+		// AC2: the primary phone number reaches the upsert.
+		if got.phone != "+5511987654321" {
+			t.Fatalf("phone = %q, want the primary number", got.phone)
+		}
 		if got.role != RoleLawyer {
 			t.Fatalf("role = %q, want LAWYER preserved", got.role)
+		}
+	})
+
+	t.Run("user.updated without any phone forwards empty without panicking", func(t *testing.T) {
+		existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleLawyer}
+		var gotPhone string
+		repo := &mockRepo{
+			findUser: func(context.Context, string) (*AppUser, error) { return existing, nil },
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, phone string, _ Role) (*AppUser, error) {
+				gotPhone = phone
+				return existing, nil
+			},
+		}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
+
+		// AC3: no phone_numbers array at all — the handler must not panic and must
+		// forward empty so the upsert's COALESCE leaves the stored phone as-is.
+		body := []byte(`{"type":"user.updated","data":{"id":"user_xyz","first_name":"Ana","last_name":"Souza",` +
+			`"primary_email_address_id":"idn_1","email_addresses":[{"id":"idn_1","email_address":"ana@new.com"}]}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if gotPhone != "" {
+			t.Fatalf("phone = %q, want empty when the payload carries none", gotPhone)
 		}
 	})
 
