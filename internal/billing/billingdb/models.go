@@ -2,7 +2,7 @@
 // versions:
 //   sqlc v1.30.0
 
-package acquisitiondb
+package billingdb
 
 import (
 	"github.com/google/uuid"

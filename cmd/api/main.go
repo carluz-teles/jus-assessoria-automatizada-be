@@ -15,6 +15,7 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/lib/config"
@@ -102,6 +103,14 @@ func run(logger *slog.Logger) error {
 		acquisition.NewUseCase(acquisition.NewRepository(pool), events.NewOutbox(), uow),
 	)
 
+	// Billing wiring: the slice owns the domain; the binary only assembles it
+	// (repo + Stripe gateway + shared outbox + dedup + unit of work → use case →
+	// webhook). The gateway is the sole holder of the Stripe SDK and secrets.
+	billingGateway := billing.NewStripeGateway(cfg.StripeSecretKey, cfg.StripeWebhookSecret)
+	billingWebhook := billing.NewWebhookHandler(
+		billing.NewUseCase(billing.NewRepository(pool), billingGateway, events.NewOutbox(), billing.NewDedup(), uow),
+	)
+
 	// Lookup wiring: a stateless proxy over the BrasilAPI registry. No pool, no
 	// outbox — the slice owns only an HTTP port; the binary just injects the
 	// client and mounts the handler.
@@ -125,13 +134,14 @@ func run(logger *slog.Logger) error {
 
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
-		logger:      logger,
-		verifier:    verifier,
-		resolver:    resolver,
-		webhook:     webhook,
-		identity:    identityHandler,
-		acquisition: acquisitionHandler,
-		lookup:      lookupHandler,
+		logger:         logger,
+		verifier:       verifier,
+		resolver:       resolver,
+		webhook:        webhook,
+		billingWebhook: billingWebhook,
+		identity:       identityHandler,
+		acquisition:    acquisitionHandler,
+		lookup:         lookupHandler,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext

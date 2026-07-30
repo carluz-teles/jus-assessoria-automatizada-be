@@ -7,6 +7,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/lib/httpx"
@@ -28,13 +29,14 @@ const identityMePath = "/v1/identity/me"
 // the graph here (not inside newRouter) keeps the router a pure function of its
 // dependencies — the test builds it with fakes and never touches the network.
 type routerDeps struct {
-	logger      *slog.Logger
-	verifier    middleware.TokenVerifier
-	resolver    middleware.PrincipalResolver
-	webhook     *identity.WebhookHandler
-	identity    *identity.Handler
-	acquisition *acquisition.Handler
-	lookup      *lookup.Handler
+	logger         *slog.Logger
+	verifier       middleware.TokenVerifier
+	resolver       middleware.PrincipalResolver
+	webhook        *identity.WebhookHandler
+	billingWebhook *billing.WebhookHandler
+	identity       *identity.Handler
+	acquisition    *acquisition.Handler
+	lookup         *lookup.Handler
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -77,6 +79,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// inside, so unauthenticated at the router level, §4d.3) and mounts it via
 	// Register. Adding a domain = one more slice.Register(...) call, no route here.
 	deps.webhook.Register(app)
+
+	// billing owns its public Stripe webhook (svix-analog: the Stripe signature is
+	// verified inside the use case, so unauthenticated at the router level) and
+	// mounts it via Register. Nil-guarded so the router test fixture builds without
+	// a use case, like the others.
+	if deps.billingWebhook != nil {
+		deps.billingWebhook.Register(app)
+	}
 
 	// Authenticated surface. The dispatch middleware runs ahead of every /v1
 	// route (registered before them), picking the right auth by subtree.
