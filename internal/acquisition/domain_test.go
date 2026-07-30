@@ -66,6 +66,18 @@ func (m *mockRepo) InsertBackfillJob(_ context.Context, _ database.Tx, _ Backfil
 	return "", nil
 }
 
+func (m *mockRepo) IncrementBackfillSlicesOK(_ context.Context, _ database.Tx, _, _ string) (BackfillCounters, error) {
+	return BackfillCounters{}, nil
+}
+
+func (m *mockRepo) IncrementBackfillSlicesError(_ context.Context, _ database.Tx, _, _ string) (BackfillCounters, error) {
+	return BackfillCounters{}, nil
+}
+
+func (m *mockRepo) FinalizeBackfillJob(_ context.Context, _ database.Tx, _, _, _ string) error {
+	return nil
+}
+
 // The sync methods satisfy the widened Repository interface; the activation use
 // case under test here never calls them (they are exercised by the sync use
 // case's own narrow stub in sync_test.go).

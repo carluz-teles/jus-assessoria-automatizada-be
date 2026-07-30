@@ -15,9 +15,12 @@ import (
 // error kind decide retry vs. archive (a decode fault is SkipRetry, infra is
 // retryable). One Listener consumes every event this slice reacts to.
 
-// backfillListenerUC is the port for the integration_activated consumer.
+// backfillListenerUC is the port for the backfill consumers: onboarding
+// (integration_activated) and the completion counter (sync_completed/failed).
 type backfillListenerUC interface {
 	OnIntegrationActivated(ctx context.Context, ev IntegrationActivated) error
+	OnSyncCompleted(ctx context.Context, ev SyncCompleted) error
+	OnSyncFailed(ctx context.Context, ev SyncFailed) error
 }
 
 // syncListenerUC is the port for the sync_requested consumer.
@@ -44,6 +47,8 @@ func NewListener(backfill backfillListenerUC, sync syncListenerUC) *Listener {
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntegrationActivated, l.handleIntegrationActivated)
 	mux.HandleFunc(TypeSyncRequested, l.handleSyncRequested)
+	mux.HandleFunc(TypeSyncCompleted, l.handleSyncCompleted)
+	mux.HandleFunc(TypeSyncFailed, l.handleSyncFailed)
 }
 
 // handleIntegrationActivated is the asynq.HandlerFunc for
@@ -71,4 +76,29 @@ func (l *Listener) handleSyncRequested(ctx context.Context, t *asynq.Task) error
 		return err
 	}
 	return l.sync.OnSyncRequested(ctx, ev)
+}
+
+// handleSyncCompleted is the asynq.HandlerFunc for acquisition.sync_completed. It
+// continues the trace, decodes the payload, and hands off to the backfill
+// completion counter. A decode fault wraps asynq.SkipRetry (archived, not
+// retried); an infra error from the use case stays retryable.
+func (l *Listener) handleSyncCompleted(ctx context.Context, t *asynq.Task) error {
+	ctx = events.ExtractTrace(ctx, t)
+	ev, err := events.Decode[SyncCompleted](t)
+	if err != nil {
+		return err
+	}
+	return l.backfill.OnSyncCompleted(ctx, ev)
+}
+
+// handleSyncFailed is the asynq.HandlerFunc for acquisition.sync_failed — the
+// failure-side counterpart of handleSyncCompleted, dispatching to the same
+// completion counter so a failed slice still advances the job toward finish.
+func (l *Listener) handleSyncFailed(ctx context.Context, t *asynq.Task) error {
+	ctx = events.ExtractTrace(ctx, t)
+	ev, err := events.Decode[SyncFailed](t)
+	if err != nil {
+		return err
+	}
+	return l.backfill.OnSyncFailed(ctx, ev)
 }

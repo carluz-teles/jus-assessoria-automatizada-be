@@ -12,6 +12,12 @@ const TypeIntegrationActivated = "acquisition.integration_activated"
 // consumes it to fetch that window; this slice only produces it.
 const TypeSyncRequested = "acquisition.sync_requested"
 
+// TypeBackfillFinished is the dotted id of the terminal backfill event: the
+// completion counter emits it exactly once, when the LAST slice of a job closes
+// (the counter reaches total_slices), carrying the final tally and status. Its
+// aggregate is the backfill_job.
+const TypeBackfillFinished = "acquisition.backfill_finished"
+
 // Type ids of the events the sync cycle produces. sync_completed/sync_failed
 // bracket a run; court_record_observed/docket_entry_observed announce what the
 // sync saw so downstream slices (consolidation, deadlines, documents) can react.
@@ -145,3 +151,25 @@ var _ events.Event = SyncFailed{}
 
 func (SyncFailed) Type() string          { return TypeSyncFailed }
 func (SyncFailed) AggregateType() string { return aggregateTypeSyncRun }
+
+// BackfillFinished closes an onboarding backfill. The completion counter emits it
+// once, in the same transaction as the RUNNING → terminal status update, when the
+// last slice's sync_completed/sync_failed lands. It carries the final tally so a
+// consumer (notification, read models) can report the outcome without re-reading
+// the job. Status is COMPLETED when every slice succeeded, PARTIAL when at least
+// one failed. Aggregate id is the backfill_job id.
+type BackfillFinished struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	BackfillJobID string `json:"backfill_job_id"`
+	IntegrationID string `json:"integration_id"`
+	TotalSlices   int    `json:"total_slices"`
+	SlicesOK      int    `json:"slices_ok"`
+	SlicesError   int    `json:"slices_error"`
+	Status        string `json:"status"`
+}
+
+var _ events.Event = BackfillFinished{}
+
+func (BackfillFinished) Type() string          { return TypeBackfillFinished }
+func (BackfillFinished) AggregateType() string { return aggregateTypeBackfillJob }

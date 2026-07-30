@@ -133,11 +133,22 @@ func (u *stubBackfillUoW) Do(_ context.Context, tenantID string, fn func(databas
 }
 
 // stubBackfillRepo answers the guard from a preset flag and records the insert.
+// For the completion-counter tests it also holds a mutable job state: each
+// increment bumps a counter and returns the post-bump tallies (mirroring the
+// real UPDATE ... RETURNING), or ErrBackfillJobNotFound when notFound is set.
 type stubBackfillRepo struct {
 	exists      bool
 	existsCalls int
 	insertCalls int
 	lastInsert  BackfillJobParams
+
+	// counter path
+	counters       BackfillCounters // current job tallies; increments mutate & return
+	notFound       bool             // simulate an RLS/tenant miss on increment
+	incOKCalls     int
+	incErrorCalls  int
+	finalizeCalls  int
+	finalizeStatus string
 }
 
 func (s *stubBackfillRepo) BackfillJobExistsByIntegration(context.Context, database.Tx, string) (bool, error) {
@@ -149,6 +160,31 @@ func (s *stubBackfillRepo) InsertBackfillJob(_ context.Context, _ database.Tx, p
 	s.insertCalls++
 	s.lastInsert = p
 	return "job-1", nil
+}
+
+func (s *stubBackfillRepo) IncrementBackfillSlicesOK(context.Context, database.Tx, string, string) (BackfillCounters, error) {
+	s.incOKCalls++
+	if s.notFound {
+		return BackfillCounters{}, ErrBackfillJobNotFound
+	}
+	s.counters.SlicesOK++
+	return s.counters, nil
+}
+
+func (s *stubBackfillRepo) IncrementBackfillSlicesError(context.Context, database.Tx, string, string) (BackfillCounters, error) {
+	s.incErrorCalls++
+	if s.notFound {
+		return BackfillCounters{}, ErrBackfillJobNotFound
+	}
+	s.counters.SlicesError++
+	return s.counters, nil
+}
+
+func (s *stubBackfillRepo) FinalizeBackfillJob(_ context.Context, _ database.Tx, _, _, status string) error {
+	s.finalizeCalls++
+	s.finalizeStatus = status
+	s.counters.Status = status
+	return nil
 }
 
 // withHorizon overrides the horizon/window (same-package test seam) to exercise
@@ -281,5 +317,229 @@ func TestBackfillUseCase_ZeroSlicesCompletesImmediately(t *testing.T) {
 	}
 	if outbox.calls != 0 {
 		t.Fatalf("published = %d, want 0 (nothing to sync)", outbox.calls)
+	}
+}
+
+// --- completion counter (sync_completed / sync_failed) -----------------------
+
+func syncCompletedEvent(backfillJobID string) SyncCompleted {
+	return SyncCompleted{
+		Base:          events.Base{EventID: "evt-sc-1", Aggregate: "run-1"},
+		TenantID:      testTenant,
+		SyncRunID:     "run-1",
+		IntegrationID: "integ-1",
+		BackfillJobID: backfillJobID,
+		SliceIndex:    2,
+	}
+}
+
+func syncFailedEvent(backfillJobID string) SyncFailed {
+	return SyncFailed{
+		Base:          events.Base{EventID: "evt-sf-1", Aggregate: "run-1"},
+		TenantID:      testTenant,
+		SyncRunID:     "run-1",
+		IntegrationID: "integ-1",
+		BackfillJobID: backfillJobID,
+		SliceIndex:    2,
+		Reason:        "fetch timeout",
+	}
+}
+
+// D3: a sync_completed with no backfill job (a standalone re-sync) is acked
+// before any transaction opens — no unit of work, no increment, no publish.
+func TestBackfillUseCase_SyncCompleted_NoBackfillJobNoOps(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncCompleted(context.Background(), syncCompletedEvent("")); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v", err)
+	}
+	if uow.calls != 0 {
+		t.Fatalf("unit of work runs = %d, want 0 (standalone sync)", uow.calls)
+	}
+	if repo.incOKCalls != 0 || outbox.calls != 0 {
+		t.Fatalf("standalone sync caused work: increments=%d publishes=%d", repo.incOKCalls, outbox.calls)
+	}
+}
+
+// D4: a non-final successful slice increments slices_ok and does NOT finalize —
+// no FinalizeBackfillJob, no backfill_finished.
+func TestBackfillUseCase_SyncCompleted_NotLastSlice(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{counters: BackfillCounters{TotalSlices: 3, Status: BackfillStatusRunning}}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncCompleted(context.Background(), syncCompletedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v", err)
+	}
+	if repo.incOKCalls != 1 {
+		t.Fatalf("slices_ok increments = %d, want 1", repo.incOKCalls)
+	}
+	if repo.finalizeCalls != 0 || outbox.calls != 0 {
+		t.Fatalf("non-final slice finalized: finalize=%d publishes=%d", repo.finalizeCalls, outbox.calls)
+	}
+}
+
+// D5: a failed slice increments slices_error (not slices_ok).
+func TestBackfillUseCase_SyncFailed_IncrementsError(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{counters: BackfillCounters{TotalSlices: 3, Status: BackfillStatusRunning}}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncFailed(context.Background(), syncFailedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncFailed() error = %v", err)
+	}
+	if repo.incErrorCalls != 1 || repo.incOKCalls != 0 {
+		t.Fatalf("increments = {ok:%d error:%d}, want {0 1}", repo.incOKCalls, repo.incErrorCalls)
+	}
+	if repo.finalizeCalls != 0 || outbox.calls != 0 {
+		t.Fatalf("non-final slice finalized: finalize=%d publishes=%d", repo.finalizeCalls, outbox.calls)
+	}
+}
+
+// D6: the last slice with zero errors finalizes COMPLETED and emits exactly one
+// backfill_finished carrying the final tally.
+func TestBackfillUseCase_SyncCompleted_LastSliceCompletes(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{counters: BackfillCounters{TotalSlices: 3, SlicesOK: 2, Status: BackfillStatusRunning}}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncCompleted(context.Background(), syncCompletedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v", err)
+	}
+	if repo.finalizeCalls != 1 || repo.finalizeStatus != BackfillStatusCompleted {
+		t.Fatalf("finalize = {calls:%d status:%q}, want {1 COMPLETED}", repo.finalizeCalls, repo.finalizeStatus)
+	}
+	if outbox.calls != 1 {
+		t.Fatalf("published = %d, want 1 backfill_finished", outbox.calls)
+	}
+	fin, ok := outbox.published[0].(BackfillFinished)
+	if !ok {
+		t.Fatalf("published[0] type = %T, want BackfillFinished", outbox.published[0])
+	}
+	if fin.Status != BackfillStatusCompleted || fin.Type() != TypeBackfillFinished {
+		t.Fatalf("finished event = {status:%q type:%q}, want {COMPLETED %s}", fin.Status, fin.Type(), TypeBackfillFinished)
+	}
+	if fin.TotalSlices != 3 || fin.SlicesOK != 3 || fin.SlicesError != 0 {
+		t.Fatalf("finished tally = {total:%d ok:%d err:%d}, want {3 3 0}", fin.TotalSlices, fin.SlicesOK, fin.SlicesError)
+	}
+	if fin.BackfillJobID != "job-1" || fin.TenantID != testTenant || fin.IntegrationID != "integ-1" {
+		t.Fatalf("finished ids = %+v, unexpected", fin)
+	}
+	if fin.AggregateID() != "job-1" {
+		t.Fatalf("aggregate id = %q, want the backfill_job id", fin.AggregateID())
+	}
+}
+
+// D7: the last slice when at least one failed finalizes PARTIAL.
+func TestBackfillUseCase_SyncFailed_LastSlicePartial(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{counters: BackfillCounters{TotalSlices: 3, SlicesOK: 2, Status: BackfillStatusRunning}}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncFailed(context.Background(), syncFailedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncFailed() error = %v", err)
+	}
+	if repo.finalizeCalls != 1 || repo.finalizeStatus != BackfillStatusPartial {
+		t.Fatalf("finalize = {calls:%d status:%q}, want {1 PARTIAL}", repo.finalizeCalls, repo.finalizeStatus)
+	}
+	if outbox.calls != 1 {
+		t.Fatalf("published = %d, want 1 backfill_finished", outbox.calls)
+	}
+	fin := outbox.published[0].(BackfillFinished)
+	if fin.Status != BackfillStatusPartial || fin.SlicesError != 1 || fin.SlicesOK != 2 {
+		t.Fatalf("finished event = {status:%q ok:%d err:%d}, want {PARTIAL 2 1}", fin.Status, fin.SlicesOK, fin.SlicesError)
+	}
+}
+
+// D8: a duplicate delivery (SeenOrMark reports seen) is a no-op — no increment,
+// no finalize, no publish, and the task acks.
+func TestBackfillUseCase_SyncCompleted_DuplicateNoOps(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{counters: BackfillCounters{TotalSlices: 3, SlicesOK: 2, Status: BackfillStatusRunning}}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 0}} // 0 rows affected = already seen
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncCompleted(context.Background(), syncCompletedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v", err)
+	}
+	if repo.incOKCalls != 0 || repo.finalizeCalls != 0 || outbox.calls != 0 {
+		t.Fatalf("seen event caused work: increments=%d finalize=%d publishes=%d",
+			repo.incOKCalls, repo.finalizeCalls, outbox.calls)
+	}
+}
+
+// D9: finalize is idempotent — if the increment reads back a non-RUNNING status
+// (the job was already finalized), the counter does NOT re-finalize or re-emit,
+// even when the tally has reached the total.
+func TestBackfillUseCase_SyncCompleted_AlreadyFinalizedNoReEmit(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{counters: BackfillCounters{TotalSlices: 3, SlicesOK: 2, Status: BackfillStatusCompleted}}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncCompleted(context.Background(), syncCompletedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v", err)
+	}
+	if repo.finalizeCalls != 0 || outbox.calls != 0 {
+		t.Fatalf("re-finalized an already-finalized job: finalize=%d publishes=%d", repo.finalizeCalls, outbox.calls)
+	}
+}
+
+// D9b: a vanished/invisible job (ErrBackfillJobNotFound from the increment) is a
+// no-op ack — no finalize, no publish, no error.
+func TestBackfillUseCase_SyncCompleted_JobNotFoundNoOps(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{notFound: true}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncCompleted(context.Background(), syncCompletedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v, want nil (no-op ack)", err)
+	}
+	if repo.finalizeCalls != 0 || outbox.calls != 0 {
+		t.Fatalf("not-found job caused work: finalize=%d publishes=%d", repo.finalizeCalls, outbox.calls)
+	}
+}
+
+// D10: the unit of work is scoped to the event's tenant (RLS barrier 2).
+func TestBackfillUseCase_SyncCompleted_UoWScopedToTenant(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{counters: BackfillCounters{TotalSlices: 3, Status: BackfillStatusRunning}}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnSyncCompleted(context.Background(), syncCompletedEvent("job-1")); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v", err)
+	}
+	if uow.calls != 1 {
+		t.Fatalf("unit of work runs = %d, want 1", uow.calls)
+	}
+	if uow.tenantID != testTenant {
+		t.Fatalf("uow tenantID = %q, want %q", uow.tenantID, testTenant)
 	}
 }

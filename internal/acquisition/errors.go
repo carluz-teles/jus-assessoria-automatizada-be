@@ -13,4 +13,9 @@ var (
 	// ErrConnectorNotFound — the orchestrator has no connector registered for a
 	// source. Surfaces at composition time (a misconfigured worker), not per event.
 	ErrConnectorNotFound = apperr.NewNotFound("no connector registered for source")
+
+	// ErrBackfillJobNotFound — no backfill_job matched the (tenant, id) of a slice
+	// increment: the row is invisible under this tenant (RLS/tenant mismatch) or no
+	// longer exists. The completion counter treats it as a no-op ack, never a retry.
+	ErrBackfillJobNotFound = apperr.NewNotFound("backfill job not found")
 )

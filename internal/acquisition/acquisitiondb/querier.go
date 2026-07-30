@@ -21,10 +21,23 @@ type Querier interface {
 	// listener uses it as the first-activation guard: a re-activation must not
 	// re-dispatch a backfill.
 	BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error)
+	// Flip the job to its terminal status, but ONLY from RUNNING: the WHERE guard
+	// makes this the single winning transition, so a late or over-count delivery that
+	// reaches here cannot re-finalize. Scoped by tenant_id (isolation barrier 1).
+	FinalizeBackfillJob(ctx context.Context, arg FinalizeBackfillJobParams) error
 	// Resolve a court record by its natural key inside the caller's tx. A miss
 	// (pgx.ErrNoRows) is how FindOrCreateCourtRecord learns it must create one.
 	GetCourtRecordByKey(ctx context.Context, arg GetCourtRecordByKeyParams) (GetCourtRecordByKeyRow, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
+	// Count one failed slice; same atomic lock-and-read-back contract as
+	// IncrementBackfillSlicesOK. A job with any failed slice finalizes PARTIAL.
+	IncrementBackfillSlicesError(ctx context.Context, arg IncrementBackfillSlicesErrorParams) (IncrementBackfillSlicesErrorRow, error)
+	// Count one successful slice and read the job's tallies back atomically. The
+	// UPDATE takes a row lock, so concurrent slice closes serialize and the counter
+	// never loses a bump; the RETURNING lets the caller decide, in the same tx,
+	// whether this was the last slice. Scoped by tenant_id (isolation barrier 1); a
+	// non-matching row (wrong tenant / gone) affects zero rows and returns no row.
+	IncrementBackfillSlicesOK(ctx context.Context, arg IncrementBackfillSlicesOKParams) (IncrementBackfillSlicesOKRow, error)
 	// Create the onboarding backfill job. total_slices is precomputed by the use
 	// case; the counters default to zero and status is passed explicitly so a
 	// zero-slice horizon can land COMPLETED instead of RUNNING.

@@ -11,17 +11,34 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 )
 
-// spyListenerUC records the event the listener decoded and hands back a preset
-// error, so the test can assert the decode+dispatch wiring in isolation.
+// spyListenerUC records the events the listener decoded and hands back a preset
+// error, so the test can assert the decode+dispatch wiring in isolation. It
+// covers all three backfill consumers (activated, sync_completed, sync_failed).
 type spyListenerUC struct {
-	got  IntegrationActivated
-	call int
-	err  error
+	got          IntegrationActivated
+	call         int
+	completed    SyncCompleted
+	completeCall int
+	failed       SyncFailed
+	failCall     int
+	err          error
 }
 
 func (s *spyListenerUC) OnIntegrationActivated(_ context.Context, ev IntegrationActivated) error {
 	s.call++
 	s.got = ev
+	return s.err
+}
+
+func (s *spyListenerUC) OnSyncCompleted(_ context.Context, ev SyncCompleted) error {
+	s.completeCall++
+	s.completed = ev
+	return s.err
+}
+
+func (s *spyListenerUC) OnSyncFailed(_ context.Context, ev SyncFailed) error {
+	s.failCall++
+	s.failed = ev
 	return s.err
 }
 
@@ -143,5 +160,112 @@ func TestListener_HandleSyncRequested_BadPayloadSkipsRetry(t *testing.T) {
 	}
 	if spy.call != 0 {
 		t.Fatalf("use case reached %d times on a bad payload, want 0", spy.call)
+	}
+}
+
+// D1: a well-formed sync_completed task is decoded and dispatched to the backfill
+// completion counter with its payload intact.
+func TestListener_HandleSyncCompleted_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := SyncCompleted{
+		Base:          events.Base{EventID: "evt-c1", Aggregate: "run-1"},
+		TenantID:      "tenant-1",
+		SyncRunID:     "run-1",
+		IntegrationID: "integ-1",
+		BackfillJobID: "job-1",
+		SliceIndex:    5,
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+
+	spy := &spyListenerUC{}
+	l := NewListener(spy, nil)
+	task := asynq.NewTask(TypeSyncCompleted, payload)
+
+	if err := l.handleSyncCompleted(context.Background(), task); err != nil {
+		t.Fatalf("handleSyncCompleted() error = %v", err)
+	}
+	if spy.completeCall != 1 {
+		t.Fatalf("use case calls = %d, want 1", spy.completeCall)
+	}
+	if spy.completed.BackfillJobID != "job-1" || spy.completed.SliceIndex != 5 || spy.completed.TenantID != "tenant-1" {
+		t.Fatalf("dispatched event = %+v, payload lost", spy.completed)
+	}
+}
+
+// D1 (failed side): a well-formed sync_failed task is decoded and dispatched.
+func TestListener_HandleSyncFailed_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := SyncFailed{
+		Base:          events.Base{EventID: "evt-f1", Aggregate: "run-1"},
+		TenantID:      "tenant-1",
+		SyncRunID:     "run-1",
+		IntegrationID: "integ-1",
+		BackfillJobID: "job-1",
+		SliceIndex:    5,
+		Reason:        "fetch timeout",
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+
+	spy := &spyListenerUC{}
+	l := NewListener(spy, nil)
+	task := asynq.NewTask(TypeSyncFailed, payload)
+
+	if err := l.handleSyncFailed(context.Background(), task); err != nil {
+		t.Fatalf("handleSyncFailed() error = %v", err)
+	}
+	if spy.failCall != 1 {
+		t.Fatalf("use case calls = %d, want 1", spy.failCall)
+	}
+	if spy.failed.BackfillJobID != "job-1" || spy.failed.SliceIndex != 5 {
+		t.Fatalf("dispatched event = %+v, payload lost", spy.failed)
+	}
+}
+
+// D2: a malformed sync_completed payload wraps asynq.SkipRetry and never reaches
+// the use case.
+func TestListener_HandleSyncCompleted_BadPayloadSkipsRetry(t *testing.T) {
+	t.Parallel()
+
+	spy := &spyListenerUC{}
+	l := NewListener(spy, nil)
+	task := asynq.NewTask(TypeSyncCompleted, []byte("{not json"))
+
+	err := l.handleSyncCompleted(context.Background(), task)
+	if err == nil {
+		t.Fatal("handleSyncCompleted() error = nil, want decode failure")
+	}
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("error = %v, want it to wrap asynq.SkipRetry", err)
+	}
+	if spy.completeCall != 0 {
+		t.Fatalf("use case reached %d times on a bad payload, want 0", spy.completeCall)
+	}
+}
+
+// D2 (failed side): a malformed sync_failed payload wraps asynq.SkipRetry.
+func TestListener_HandleSyncFailed_BadPayloadSkipsRetry(t *testing.T) {
+	t.Parallel()
+
+	spy := &spyListenerUC{}
+	l := NewListener(spy, nil)
+	task := asynq.NewTask(TypeSyncFailed, []byte("{not json"))
+
+	err := l.handleSyncFailed(context.Background(), task)
+	if err == nil {
+		t.Fatal("handleSyncFailed() error = nil, want decode failure")
+	}
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("error = %v, want it to wrap asynq.SkipRetry", err)
+	}
+	if spy.failCall != 0 {
+		t.Fatalf("use case reached %d times on a bad payload, want 0", spy.failCall)
 	}
 }

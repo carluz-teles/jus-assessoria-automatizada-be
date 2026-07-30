@@ -35,6 +35,95 @@ func (q *Queries) BackfillJobExistsByIntegration(ctx context.Context, integratio
 	return job_exists, err
 }
 
+const finalizeBackfillJob = `-- name: FinalizeBackfillJob :exec
+UPDATE backfill_job
+SET status = $3
+WHERE id = $1 AND tenant_id = $2 AND status = 'RUNNING'
+`
+
+type FinalizeBackfillJobParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Status   string    `json:"status"`
+}
+
+// Flip the job to its terminal status, but ONLY from RUNNING: the WHERE guard
+// makes this the single winning transition, so a late or over-count delivery that
+// reaches here cannot re-finalize. Scoped by tenant_id (isolation barrier 1).
+func (q *Queries) FinalizeBackfillJob(ctx context.Context, arg FinalizeBackfillJobParams) error {
+	_, err := q.db.Exec(ctx, finalizeBackfillJob, arg.ID, arg.TenantID, arg.Status)
+	return err
+}
+
+const incrementBackfillSlicesError = `-- name: IncrementBackfillSlicesError :one
+UPDATE backfill_job
+SET slices_error = slices_error + 1
+WHERE id = $1 AND tenant_id = $2
+RETURNING total_slices, slices_ok, slices_error, status
+`
+
+type IncrementBackfillSlicesErrorParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type IncrementBackfillSlicesErrorRow struct {
+	TotalSlices int32  `json:"total_slices"`
+	SlicesOk    int32  `json:"slices_ok"`
+	SlicesError int32  `json:"slices_error"`
+	Status      string `json:"status"`
+}
+
+// Count one failed slice; same atomic lock-and-read-back contract as
+// IncrementBackfillSlicesOK. A job with any failed slice finalizes PARTIAL.
+func (q *Queries) IncrementBackfillSlicesError(ctx context.Context, arg IncrementBackfillSlicesErrorParams) (IncrementBackfillSlicesErrorRow, error) {
+	row := q.db.QueryRow(ctx, incrementBackfillSlicesError, arg.ID, arg.TenantID)
+	var i IncrementBackfillSlicesErrorRow
+	err := row.Scan(
+		&i.TotalSlices,
+		&i.SlicesOk,
+		&i.SlicesError,
+		&i.Status,
+	)
+	return i, err
+}
+
+const incrementBackfillSlicesOK = `-- name: IncrementBackfillSlicesOK :one
+UPDATE backfill_job
+SET slices_ok = slices_ok + 1
+WHERE id = $1 AND tenant_id = $2
+RETURNING total_slices, slices_ok, slices_error, status
+`
+
+type IncrementBackfillSlicesOKParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type IncrementBackfillSlicesOKRow struct {
+	TotalSlices int32  `json:"total_slices"`
+	SlicesOk    int32  `json:"slices_ok"`
+	SlicesError int32  `json:"slices_error"`
+	Status      string `json:"status"`
+}
+
+// Count one successful slice and read the job's tallies back atomically. The
+// UPDATE takes a row lock, so concurrent slice closes serialize and the counter
+// never loses a bump; the RETURNING lets the caller decide, in the same tx,
+// whether this was the last slice. Scoped by tenant_id (isolation barrier 1); a
+// non-matching row (wrong tenant / gone) affects zero rows and returns no row.
+func (q *Queries) IncrementBackfillSlicesOK(ctx context.Context, arg IncrementBackfillSlicesOKParams) (IncrementBackfillSlicesOKRow, error) {
+	row := q.db.QueryRow(ctx, incrementBackfillSlicesOK, arg.ID, arg.TenantID)
+	var i IncrementBackfillSlicesOKRow
+	err := row.Scan(
+		&i.TotalSlices,
+		&i.SlicesOk,
+		&i.SlicesError,
+		&i.Status,
+	)
+	return i, err
+}
+
 const insertBackfillJob = `-- name: InsertBackfillJob :one
 INSERT INTO backfill_job
     (tenant_id, integration_id, window_from, window_to, total_slices, status)

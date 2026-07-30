@@ -23,11 +23,15 @@ type Repository interface {
 	Upsert(ctx context.Context, tx database.Tx, tenantID, source string, scope Scope) (*Integration, error)
 	List(ctx context.Context, tenantID string) ([]*Integration, error)
 
-	// Backfill onboarding — the listener's first-activation guard and job insert.
-	// Grouped here as the slice's single persistence port; the backfill use case
-	// depends on the narrow backfillRepo view of these two methods.
+	// Backfill onboarding — the listener's first-activation guard and job insert,
+	// plus the completion counter's atomic increment/finalize. Grouped here as the
+	// slice's single persistence port; the backfill use case depends on the narrow
+	// backfillRepo view of these methods.
 	BackfillJobExistsByIntegration(ctx context.Context, tx database.Tx, integrationID string) (bool, error)
 	InsertBackfillJob(ctx context.Context, tx database.Tx, params BackfillJobParams) (id string, err error)
+	IncrementBackfillSlicesOK(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (BackfillCounters, error)
+	IncrementBackfillSlicesError(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (BackfillCounters, error)
+	FinalizeBackfillJob(ctx context.Context, tx database.Tx, tenantID, backfillJobID, status string) error
 
 	// Sync cycle — the sync listener's run bookkeeping and consolidation upserts.
 	// The sync use case depends on the narrow syncRepo view of these five methods.
@@ -158,6 +162,88 @@ func (r *pgRepository) InsertBackfillJob(ctx context.Context, tx database.Tx, pa
 		return "", database.WrapInfra(err)
 	}
 	return id.String(), nil
+}
+
+// IncrementBackfillSlicesOK bumps slices_ok inside the caller's tx and returns
+// the job's tallies read back atomically (the UPDATE's row lock serializes
+// concurrent slice closes). A row invisible under this tenant (RLS) or gone
+// yields pgx.ErrNoRows, mapped to the typed ErrBackfillJobNotFound.
+func (r *pgRepository) IncrementBackfillSlicesOK(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (BackfillCounters, error) {
+	tid, jid, err := parseTenantJob(tenantID, backfillJobID)
+	if err != nil {
+		return BackfillCounters{}, err
+	}
+	row, err := acquisitiondb.New(tx).IncrementBackfillSlicesOK(ctx, acquisitiondb.IncrementBackfillSlicesOKParams{
+		ID:       jid,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BackfillCounters{}, ErrBackfillJobNotFound
+	}
+	if err != nil {
+		return BackfillCounters{}, database.WrapInfra(err)
+	}
+	return BackfillCounters{
+		TotalSlices: int(row.TotalSlices),
+		SlicesOK:    int(row.SlicesOk),
+		SlicesError: int(row.SlicesError),
+		Status:      row.Status,
+	}, nil
+}
+
+// IncrementBackfillSlicesError bumps slices_error inside the caller's tx with the
+// same atomic lock-and-read-back contract as IncrementBackfillSlicesOK.
+func (r *pgRepository) IncrementBackfillSlicesError(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (BackfillCounters, error) {
+	tid, jid, err := parseTenantJob(tenantID, backfillJobID)
+	if err != nil {
+		return BackfillCounters{}, err
+	}
+	row, err := acquisitiondb.New(tx).IncrementBackfillSlicesError(ctx, acquisitiondb.IncrementBackfillSlicesErrorParams{
+		ID:       jid,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BackfillCounters{}, ErrBackfillJobNotFound
+	}
+	if err != nil {
+		return BackfillCounters{}, database.WrapInfra(err)
+	}
+	return BackfillCounters{
+		TotalSlices: int(row.TotalSlices),
+		SlicesOK:    int(row.SlicesOk),
+		SlicesError: int(row.SlicesError),
+		Status:      row.Status,
+	}, nil
+}
+
+// FinalizeBackfillJob flips the job to status inside the caller's tx, guarded to
+// the RUNNING → terminal transition by the query's WHERE clause (so it is a
+// no-op if some other delivery already finalized). Scoped by tenant_id.
+func (r *pgRepository) FinalizeBackfillJob(ctx context.Context, tx database.Tx, tenantID, backfillJobID, status string) error {
+	tid, jid, err := parseTenantJob(tenantID, backfillJobID)
+	if err != nil {
+		return err
+	}
+	err = acquisitiondb.New(tx).FinalizeBackfillJob(ctx, acquisitiondb.FinalizeBackfillJobParams{
+		ID:       jid,
+		TenantID: tid,
+		Status:   status,
+	})
+	return database.WrapInfra(err)
+}
+
+// parseTenantJob parses the tenant and backfill-job ids shared by the counter
+// path, wrapping a bad uuid as a typed infra error.
+func parseTenantJob(tenantID, backfillJobID string) (tid, jid uuid.UUID, err error) {
+	tid, err = uuid.Parse(tenantID)
+	if err != nil {
+		return uuid.UUID{}, uuid.UUID{}, database.WrapInfra(err)
+	}
+	jid, err = uuid.Parse(backfillJobID)
+	if err != nil {
+		return uuid.UUID{}, uuid.UUID{}, database.WrapInfra(err)
+	}
+	return tid, jid, nil
 }
 
 // InsertSyncRun opens a sync_run (RUNNING) inside the caller's tx and returns its
