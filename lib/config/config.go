@@ -54,6 +54,11 @@ type Config struct {
 	// (NewResendClient/NewEmailChannel devolvem Invalid) e falha rápido se faltarem.
 	ResendAPIKey    string `env:"RESEND_API_KEY"`
 	ResendFromEmail string `env:"RESEND_FROM_EMAIL"`
+	// ResendWebhookSecret assina os webhooks de bounce/complaint (svix). Opcional
+	// pelo mesmo motivo do ClerkWebhookSecret: um segredo vazio só quebra ao
+	// verificar um webhook, não no boot — e mantê-lo opcional preserva o boot dos
+	// demais binários, que não recebem webhook do Resend. Só o api o consome.
+	ResendWebhookSecret string `env:"RESEND_WEBHOOK_SECRET"`
 
 	// Object storage S3-compatível (S3/R2/MinIO). Opcional: o api só monta o
 	// storage.Client quando S3Enabled() — ver o método abaixo.

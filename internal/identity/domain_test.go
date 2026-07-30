@@ -384,13 +384,15 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		if upsertM.tenantID != tenant.ID || upsertM.appUserID != user.ID || upsertM.clerkMembershipID != "orgmem_1" || upsertM.role != RoleLawyer {
 			t.Fatalf("UpsertMembership args = %+v", upsertM)
 		}
-		// Exactly one member_joined, published inside the same unit of work.
-		if len(outbox.published) != 1 {
-			t.Fatalf("published %d events, want 1", len(outbox.published))
+		// Two events, in order, published inside the same unit of work: the domain
+		// fact member_joined, then the notification.requested that turns the join into
+		// a welcome e-mail.
+		if len(outbox.published) != 2 {
+			t.Fatalf("published %d events, want 2 (member_joined + notification.requested)", len(outbox.published))
 		}
 		ev, ok := outbox.published[0].(MemberJoined)
 		if !ok {
-			t.Fatalf("event type = %T, want MemberJoined", outbox.published[0])
+			t.Fatalf("event[0] type = %T, want MemberJoined", outbox.published[0])
 		}
 		if ev.Type() != TypeMemberJoined || ev.AggregateType() != aggregateTypeTenant {
 			t.Fatalf("event ids = (%q, %q)", ev.Type(), ev.AggregateType())
@@ -400,6 +402,29 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		}
 		if ev.IdempotencyKey() == "" {
 			t.Fatal("event idempotency key (event id) is empty")
+		}
+
+		// AC1: the notification.requested carries the routed type, the tenant
+		// aggregate, the recipient (the just-joined app_user) and the template data;
+		// its own fresh idempotency key means a relay replay dedups it independently.
+		notif, ok := outbox.published[1].(NotificationRequested)
+		if !ok {
+			t.Fatalf("event[1] type = %T, want NotificationRequested", outbox.published[1])
+		}
+		if notif.Type() != TypeNotificationRequested || notif.AggregateType() != aggregateTypeTenant {
+			t.Fatalf("notification ids = (%q, %q)", notif.Type(), notif.AggregateType())
+		}
+		if notif.AggregateID() != tenant.ID || notif.TenantID != tenant.ID || notif.RecipientUserID != user.ID {
+			t.Fatalf("notification envelope = %+v", notif)
+		}
+		if notif.NotifyType != notifyTypeMemberJoined {
+			t.Fatalf("notification template selector = %q, want %q", notif.NotifyType, notifyTypeMemberJoined)
+		}
+		if notif.Payload["member_name"] != "Ana" {
+			t.Fatalf("notification payload = %+v, want member_name Ana", notif.Payload)
+		}
+		if notif.IdempotencyKey() == "" || notif.IdempotencyKey() == ev.IdempotencyKey() {
+			t.Fatalf("notification needs its own non-empty event id, got %q (member_joined %q)", notif.IdempotencyKey(), ev.IdempotencyKey())
 		}
 	})
 

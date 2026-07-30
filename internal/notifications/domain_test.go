@@ -22,10 +22,11 @@ func baseWithID(eventID string) events.Base {
 // params it saw so tests assert what was written. Unset fields fail loudly (nil
 // call) if a test reaches a path it did not expect.
 type mockRepo struct {
-	insertNotif    func(ctx context.Context, tx database.Tx, p InsertNotificationParams) (*Notification, error)
-	insertDelivery func(ctx context.Context, tx database.Tx, p InsertDeliveryParams) (*NotificationDelivery, error)
-	updateStatus   func(ctx context.Context, tx database.Tx, p UpdateDeliveryStatusParams) (*NotificationDelivery, error)
-	findEmail      func(ctx context.Context, tx database.Tx, tenantID, appUserID string) (string, error)
+	insertNotif      func(ctx context.Context, tx database.Tx, p InsertNotificationParams) (*Notification, error)
+	insertDelivery   func(ctx context.Context, tx database.Tx, p InsertDeliveryParams) (*NotificationDelivery, error)
+	updateStatus     func(ctx context.Context, tx database.Tx, p UpdateDeliveryStatusParams) (*NotificationDelivery, error)
+	findEmail        func(ctx context.Context, tx database.Tx, tenantID, appUserID string) (string, error)
+	findByProviderID func(ctx context.Context, providerMessageID string) (*NotificationDelivery, error)
 
 	insertedNotif    []InsertNotificationParams
 	insertedDelivery []InsertDeliveryParams
@@ -49,6 +50,10 @@ func (m *mockRepo) UpdateDeliveryStatus(ctx context.Context, tx database.Tx, p U
 
 func (m *mockRepo) FindRecipientEmail(ctx context.Context, tx database.Tx, tenantID, appUserID string) (string, error) {
 	return m.findEmail(ctx, tx, tenantID, appUserID)
+}
+
+func (m *mockRepo) FindDeliveryByProviderMessageID(ctx context.Context, providerMessageID string) (*NotificationDelivery, error) {
+	return m.findByProviderID(ctx, providerMessageID)
 }
 
 // spyChannel records the message it was asked to send and returns a preset id/error.
@@ -291,4 +296,145 @@ func TestNotifyUseCase_OnNotificationRequested_DedupErrorPropagates(t *testing.T
 	if len(repo.insertedNotif) != 0 || len(channel.sent) != 0 {
 		t.Fatal("wrote or sent despite a dedup fault")
 	}
+}
+
+// deliveryAt builds a persisted delivery fixture in a given status carrying a
+// provider id, so the webhook use-case tests can drive the lookup → update flow.
+func deliveryAt(status DeliveryStatus, providerID string) *NotificationDelivery {
+	return &NotificationDelivery{
+		ID:                deliveryID,
+		NotificationID:    notifID,
+		TenantID:          tenantID,
+		Channel:           ChannelEmail,
+		Status:            status,
+		ProviderMessageID: providerID,
+	}
+}
+
+// AC3/AC4: a provider bounce/complaint webhook locates the delivery by the provider's
+// message id and flips its status in that delivery's tenant scope, preserving the
+// provider id and recording the reason. An unknown id or an already-applied status is
+// an idempotent no-op (the endpoint just acks).
+func TestWebhookUseCase_MarkDeliveryOutcome(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("bounce flips the located delivery to BOUNCED under its tenant scope", func(t *testing.T) {
+		repo := &mockRepo{
+			findByProviderID: func(_ context.Context, providerID string) (*NotificationDelivery, error) {
+				if providerID != "resend-abc" {
+					t.Fatalf("looked up %q, want resend-abc", providerID)
+				}
+				return deliveryAt(DeliverySent, "resend-abc"), nil
+			},
+			updateStatus: func(_ context.Context, _ database.Tx, p UpdateDeliveryStatusParams) (*NotificationDelivery, error) {
+				return &NotificationDelivery{ID: p.DeliveryID, Status: p.Status}, nil
+			},
+		}
+		uow := &fakeUOW{}
+		uc := NewWebhookUseCase(repo, uow)
+
+		if err := uc.MarkDeliveryOutcome(ctx, "resend-abc", DeliveryBounced, "hard bounce"); err != nil {
+			t.Fatalf("MarkDeliveryOutcome: %v", err)
+		}
+		// The write ran in the delivery's tenant scope (barrier 2).
+		if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+			t.Fatalf("update scopes = %v, want one under %q", uow.scopes, tenantID)
+		}
+		// It flipped to BOUNCED, kept the provider id, and recorded the reason.
+		if len(repo.updatedStatus) != 1 {
+			t.Fatalf("updates = %d, want 1", len(repo.updatedStatus))
+		}
+		got := repo.updatedStatus[0]
+		if got.DeliveryID != deliveryID || got.TenantID != tenantID || got.Status != DeliveryBounced {
+			t.Fatalf("update = %+v, want BOUNCED for the delivery under its tenant", got)
+		}
+		if got.ProviderMessageID != "resend-abc" || got.Error != "hard bounce" {
+			t.Fatalf("update = %+v, want provider id preserved and reason recorded", got)
+		}
+	})
+
+	t.Run("complaint flips to COMPLAINED", func(t *testing.T) {
+		repo := &mockRepo{
+			findByProviderID: func(context.Context, string) (*NotificationDelivery, error) {
+				return deliveryAt(DeliverySent, "resend-xyz"), nil
+			},
+			updateStatus: func(_ context.Context, _ database.Tx, p UpdateDeliveryStatusParams) (*NotificationDelivery, error) {
+				return &NotificationDelivery{ID: p.DeliveryID, Status: p.Status}, nil
+			},
+		}
+		uc := NewWebhookUseCase(repo, &fakeUOW{})
+
+		if err := uc.MarkDeliveryOutcome(ctx, "resend-xyz", DeliveryComplained, complaintReason); err != nil {
+			t.Fatalf("MarkDeliveryOutcome: %v", err)
+		}
+		if len(repo.updatedStatus) != 1 || repo.updatedStatus[0].Status != DeliveryComplained {
+			t.Fatalf("updates = %+v, want one COMPLAINED", repo.updatedStatus)
+		}
+	})
+
+	t.Run("unknown provider id is an ack — no update, no tx", func(t *testing.T) {
+		repo := &mockRepo{
+			findByProviderID: func(context.Context, string) (*NotificationDelivery, error) {
+				return nil, ErrDeliveryNotFound
+			},
+		}
+		uow := &fakeUOW{}
+		uc := NewWebhookUseCase(repo, uow)
+
+		if err := uc.MarkDeliveryOutcome(ctx, "never-sent", DeliveryBounced, "x"); err != nil {
+			t.Fatalf("MarkDeliveryOutcome: %v", err)
+		}
+		if len(repo.updatedStatus) != 0 || len(uow.scopes) != 0 {
+			t.Fatal("updated or opened a tx for an unknown provider id")
+		}
+	})
+
+	t.Run("already at the target status is an idempotent no-op", func(t *testing.T) {
+		repo := &mockRepo{
+			findByProviderID: func(context.Context, string) (*NotificationDelivery, error) {
+				return deliveryAt(DeliveryBounced, "resend-dup"), nil
+			},
+		}
+		uow := &fakeUOW{}
+		uc := NewWebhookUseCase(repo, uow)
+
+		if err := uc.MarkDeliveryOutcome(ctx, "resend-dup", DeliveryBounced, "x"); err != nil {
+			t.Fatalf("MarkDeliveryOutcome: %v", err)
+		}
+		if len(repo.updatedStatus) != 0 || len(uow.scopes) != 0 {
+			t.Fatal("re-updated a delivery already at the target status")
+		}
+	})
+
+	t.Run("an empty provider id is an ack — no lookup", func(t *testing.T) {
+		called := false
+		repo := &mockRepo{
+			findByProviderID: func(context.Context, string) (*NotificationDelivery, error) {
+				called = true
+				return nil, nil
+			},
+		}
+		uc := NewWebhookUseCase(repo, &fakeUOW{})
+
+		if err := uc.MarkDeliveryOutcome(ctx, "", DeliveryBounced, "x"); err != nil {
+			t.Fatalf("MarkDeliveryOutcome: %v", err)
+		}
+		if called {
+			t.Fatal("looked up a delivery for an empty provider id")
+		}
+	})
+
+	t.Run("a lookup infra fault propagates", func(t *testing.T) {
+		boom := errors.New("pool unreachable")
+		repo := &mockRepo{
+			findByProviderID: func(context.Context, string) (*NotificationDelivery, error) {
+				return nil, boom
+			},
+		}
+		uc := NewWebhookUseCase(repo, &fakeUOW{})
+
+		if err := uc.MarkDeliveryOutcome(ctx, "resend-err", DeliveryBounced, "x"); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the lookup fault", err)
+		}
+	})
 }

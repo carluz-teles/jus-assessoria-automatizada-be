@@ -148,11 +148,18 @@ func (uc *UseCase) OnMembershipCreated(ctx context.Context, clerkUserID, clerkOr
 			return err
 		}
 		// Replay of an already-active membership: the write is idempotent, but the
-		// event must fire once per real join, so skip publishing here.
+		// events must fire once per real join, so skip publishing here.
 		if !joined {
 			return nil
 		}
-		return uc.outbox.Publish(ctx, tx, newMemberJoined(tenant.ID, membership.AppUserID, membership.Role))
+		// A real join emits two events in this same tx: member_joined (the domain
+		// fact other slices react to) and notification.requested (the aviso that
+		// turns the join into a welcome e-mail, delivered by the notifications slice
+		// without importing it — the generic event carries the template + data).
+		if err := uc.outbox.Publish(ctx, tx, newMemberJoined(tenant.ID, membership.AppUserID, membership.Role)); err != nil {
+			return err
+		}
+		return uc.outbox.Publish(ctx, tx, newMemberJoinedNotification(tenant, membership.AppUserID, name))
 	})
 	if err != nil {
 		return nil, err
@@ -311,6 +318,34 @@ func newMemberJoined(tenantID, appUserID string, role Role) MemberJoined {
 		AppUserID: appUserID,
 		Role:      role,
 	}
+}
+
+// newMemberJoinedNotification builds the notification.requested that turns a join
+// into a welcome e-mail, minting a fresh v7 event id (time-ordered) as the
+// aggregate/idempotency key carrier. The aggregate is the tenant; the recipient is
+// the just-joined app_user; the payload carries the template data the member_joined
+// e-mail renders (the member's name and the escritório's display name).
+func newMemberJoinedNotification(tenant *Tenant, appUserID, memberName string) NotificationRequested {
+	return NotificationRequested{
+		Base:            events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: tenant.ID},
+		TenantID:        tenant.ID,
+		RecipientUserID: appUserID,
+		NotifyType:      notifyTypeMemberJoined,
+		Payload: map[string]any{
+			"member_name": memberName,
+			"org_name":    orgDisplayName(tenant),
+		},
+	}
+}
+
+// orgDisplayName is the escritório's human name for an aviso: the onboarding trade
+// name once set, else the Clerk organization name (always present). Keeps the welcome
+// e-mail from rendering an empty {{.org_name}} before the profile is completed.
+func orgDisplayName(tenant *Tenant) string {
+	if tenant.TradeName != "" {
+		return tenant.TradeName
+	}
+	return tenant.Name
 }
 
 // newMemberRemoved builds the event for a soft-removed membership, minting a fresh v7

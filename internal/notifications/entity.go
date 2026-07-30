@@ -1,14 +1,15 @@
 // Package notifications is the avisos domain: it CONSUMES the generic
 // `notification.requested` event and DELIVERS the aviso to a recipient through a
-// channel. v0 ships EMAIL only (via Resend); IN_APP/SMS are later channels, and a
-// bounce webhook is a later slice (3d).
+// channel. v0 ships EMAIL only (via Resend); IN_APP/SMS are later channels. The
+// provider (Resend) reports bounces and complaints back through a signed webhook,
+// which flips the affected delivery to BOUNCED/COMPLAINED (see webhook.go).
 //
-// The producer of `notification.requested` is a separate, future slice — identity
-// translating its own member_joined into a notification request. This slice never
-// imports identity; it reacts to the event contract alone (docs §2.5: slices talk
-// by event). Two aggregates model the work: a `notification` is the fact (someone
-// should be told X), a `notification_delivery` is one per-channel attempt to tell
-// them — so adding a channel adds a delivery row, not another notification.
+// The producer of `notification.requested` is another slice — identity translating
+// its own member_joined into a notification request. This slice never imports
+// identity; it reacts to the event contract alone (docs §2.5: slices talk by event).
+// Two aggregates model the work: a `notification` is the fact (someone should be told
+// X), a `notification_delivery` is one per-channel attempt to tell them — so adding a
+// channel adds a delivery row, not another notification.
 package notifications
 
 import "time"
@@ -23,22 +24,25 @@ type NotificationStatus string
 const StatusCreated NotificationStatus = "CREATED"
 
 // DeliveryStatus is the lifecycle of a single channel delivery: QUEUED at creation,
-// then SENT (the provider accepted it) or FAILED (it could not be sent). BOUNCED is
-// reserved for the provider-webhook slice (3d) — v0 never sets it, but the enum
-// carries it so the schema and the type agree from the start.
+// then SENT (the provider accepted it) or FAILED (it could not be sent). BOUNCED and
+// COMPLAINED are the provider-webhook outcomes (slice 3d): the recipient's server
+// permanently rejected the message, or the recipient marked it as spam. The status
+// column is text + CHECK-on-app, so adding COMPLAINED needs no migration.
 type DeliveryStatus string
 
 const (
-	DeliveryQueued  DeliveryStatus = "QUEUED"
-	DeliverySent    DeliveryStatus = "SENT"
-	DeliveryFailed  DeliveryStatus = "FAILED"
-	DeliveryBounced DeliveryStatus = "BOUNCED"
+	DeliveryQueued     DeliveryStatus = "QUEUED"
+	DeliverySent       DeliveryStatus = "SENT"
+	DeliveryFailed     DeliveryStatus = "FAILED"
+	DeliveryBounced    DeliveryStatus = "BOUNCED"
+	DeliveryComplained DeliveryStatus = "COMPLAINED"
 )
 
 // Valid reports whether s is a known delivery status. The zero value ("") is
 // invalid on purpose, so an unset status never silently passes as a real one.
 func (s DeliveryStatus) Valid() bool {
-	return s == DeliveryQueued || s == DeliverySent || s == DeliveryFailed || s == DeliveryBounced
+	return s == DeliveryQueued || s == DeliverySent || s == DeliveryFailed ||
+		s == DeliveryBounced || s == DeliveryComplained
 }
 
 // ChannelEmail is the channel value stored on a delivery and returned by the email
@@ -60,8 +64,9 @@ type Notification struct {
 }
 
 // NotificationDelivery is one channel's attempt to deliver a Notification.
-// ProviderMessageID is set once SENT (the provider's id, for later correlation);
-// Error is set once FAILED (the reason). CreatedAt/UpdatedAt bracket the attempt.
+// ProviderMessageID is set once SENT (the provider's id — the key the bounce webhook
+// correlates on); Error is set once FAILED, BOUNCED or COMPLAINED (the reason).
+// CreatedAt/UpdatedAt bracket the attempt.
 type NotificationDelivery struct {
 	ID                string
 	NotificationID    string

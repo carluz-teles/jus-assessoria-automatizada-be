@@ -115,7 +115,7 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("build email channel: %w", err)
 	}
 	notifyUC := notifications.NewNotifyUseCase(
-		notifications.NewRepository(),
+		notifications.NewRepository(pool),
 		emailChannel,
 		notifications.NewDedup(),
 		uow,

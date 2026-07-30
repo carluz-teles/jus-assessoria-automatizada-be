@@ -47,9 +47,19 @@ func (c *spyChannel) Send(_ context.Context, msg notifications.EmailMessage) (st
 // (stubbed) channel.
 func newNotifyUC(pool *pgxpool.Pool, ch notifications.Channel) *notifications.NotifyUseCase {
 	return notifications.NewNotifyUseCase(
-		notifications.NewRepository(),
+		notifications.NewRepository(pool),
 		ch,
 		notifications.NewDedup(),
+		database.NewUnitOfWork(pool),
+	)
+}
+
+// newWebhookUC wires the provider-webhook use case (bounce/complaint) against the
+// real container — a pool-backed repo (the delivery lookup is tenant-less) plus the
+// shared unit of work for the tenant-scoped status write.
+func newWebhookUC(pool *pgxpool.Pool) *notifications.WebhookUseCase {
+	return notifications.NewWebhookUseCase(
+		notifications.NewRepository(pool),
 		database.NewUnitOfWork(pool),
 	)
 }
@@ -196,6 +206,61 @@ func TestNotifications_UnresolvableRecipient_RecordsFailed(t *testing.T) {
 	}
 	if len(ch.sent) != 0 {
 		t.Fatalf("sent %d e-mails for an unresolvable recipient, want 0", len(ch.sent))
+	}
+}
+
+// AC3/AC4: a Resend bounce webhook locates the delivery by its provider_message_id
+// (a tenant-less lookup on the pool) and flips it to BOUNCED under that delivery's
+// tenant scope — provider id preserved, reason recorded. A replay is idempotent.
+func TestNotifications_Webhook_BounceUpdatesDeliveryByProviderID(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-notif-bounce", 0)
+	recipientID, _ := seedRecipient(t, pool, tenantID, "org-notif-bounce")
+
+	// Send a member_joined first so a SENT delivery exists carrying the provider id.
+	const providerID = "resend-bounce-1"
+	if err := newNotifyUC(pool, &spyChannel{id: providerID}).
+		OnNotificationRequested(ctx, memberJoined("evt_bounce_1", tenantID, recipientID)); err != nil {
+		t.Fatalf("seed send: %v", err)
+	}
+	if row, _ := readDelivery(t, pool, tenantID); row.status != string(notifications.DeliverySent) {
+		t.Fatalf("precondition: delivery = %+v, want SENT", row)
+	}
+
+	// The webhook carries no tenant — it finds the delivery by provider id alone and
+	// flips it to BOUNCED with a reason.
+	uc := newWebhookUC(pool)
+	if err := uc.MarkDeliveryOutcome(ctx, providerID, notifications.DeliveryBounced, "hard bounce"); err != nil {
+		t.Fatalf("MarkDeliveryOutcome: %v", err)
+	}
+
+	row, ok := readDelivery(t, pool, tenantID)
+	if !ok {
+		t.Fatal("delivery row vanished")
+	}
+	if row.status != string(notifications.DeliveryBounced) {
+		t.Fatalf("status = %q, want BOUNCED", row.status)
+	}
+	if row.providerID == nil || *row.providerID != providerID {
+		t.Fatalf("provider id = %v, want %q preserved", row.providerID, providerID)
+	}
+	if row.errText == nil || *row.errText != "hard bounce" {
+		t.Fatalf("error = %v, want the bounce reason", row.errText)
+	}
+
+	// Idempotent replay: the same webhook again leaves the state untouched.
+	if err := uc.MarkDeliveryOutcome(ctx, providerID, notifications.DeliveryBounced, "hard bounce"); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if row2, _ := readDelivery(t, pool, tenantID); row2.status != string(notifications.DeliveryBounced) {
+		t.Fatalf("status after replay = %q, want BOUNCED", row2.status)
+	}
+
+	// An unknown provider id is a no-op ack, not an error.
+	if err := uc.MarkDeliveryOutcome(ctx, "never-sent-id", notifications.DeliveryComplained, "x"); err != nil {
+		t.Fatalf("unknown id should ack, got %v", err)
 	}
 }
 

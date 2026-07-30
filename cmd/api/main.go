@@ -18,6 +18,7 @@ import (
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
+	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -111,6 +112,15 @@ func run(logger *slog.Logger) error {
 		billing.NewUseCase(billing.NewRepository(pool), billingGateway, events.NewOutbox(), billing.NewDedup(), uow),
 	)
 
+	// Notifications wiring: the api only mounts the provider (Resend) webhook — the
+	// bounce/complaint callback. The listener that sends e-mail lives in the worker;
+	// here the slice owns just the public webhook, verified by its svix signature and
+	// backed by a pool-only use case (locate a delivery by provider id → flip status).
+	notificationsWebhook := notifications.NewWebhookHandler(
+		notifications.NewSvixVerifier(cfg.ResendWebhookSecret),
+		notifications.NewWebhookUseCase(notifications.NewRepository(pool), uow),
+	)
+
 	// Lookup wiring: a stateless proxy over the BrasilAPI registry. No pool, no
 	// outbox — the slice owns only an HTTP port; the binary just injects the
 	// client and mounts the handler.
@@ -134,14 +144,15 @@ func run(logger *slog.Logger) error {
 
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
-		logger:         logger,
-		verifier:       verifier,
-		resolver:       resolver,
-		webhook:        webhook,
-		billingWebhook: billingWebhook,
-		identity:       identityHandler,
-		acquisition:    acquisitionHandler,
-		lookup:         lookupHandler,
+		logger:               logger,
+		verifier:             verifier,
+		resolver:             resolver,
+		webhook:              webhook,
+		billingWebhook:       billingWebhook,
+		notificationsWebhook: notificationsWebhook,
+		identity:             identityHandler,
+		acquisition:          acquisitionHandler,
+		lookup:               lookupHandler,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext

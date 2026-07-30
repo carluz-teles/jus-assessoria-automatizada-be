@@ -44,3 +44,13 @@ RETURNING *;
 SELECT email FROM app_user
 WHERE id = $1
   AND tenant_id = $2;
+
+-- name: FindDeliveryByProviderMessageID :one
+-- Locate a delivery by the provider's message id (the Resend email id), on the
+-- pool. A provider bounce/complaint webhook carries no tenant, so this read crosses
+-- tenants (the owner bypasses RLS) to recover the delivery AND its tenant; the
+-- caller then scopes the status update to that tenant (barrier 2). No row → the
+-- mapper maps pgx.ErrNoRows to a typed not-found (an unknown id the webhook acks).
+SELECT * FROM notification_delivery
+WHERE provider_message_id = $1
+LIMIT 1;

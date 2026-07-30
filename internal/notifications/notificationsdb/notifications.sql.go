@@ -12,6 +12,34 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const findDeliveryByProviderMessageID = `-- name: FindDeliveryByProviderMessageID :one
+SELECT id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at FROM notification_delivery
+WHERE provider_message_id = $1
+LIMIT 1
+`
+
+// Locate a delivery by the provider's message id (the Resend email id), on the
+// pool. A provider bounce/complaint webhook carries no tenant, so this read crosses
+// tenants (the owner bypasses RLS) to recover the delivery AND its tenant; the
+// caller then scopes the status update to that tenant (barrier 2). No row → the
+// mapper maps pgx.ErrNoRows to a typed not-found (an unknown id the webhook acks).
+func (q *Queries) FindDeliveryByProviderMessageID(ctx context.Context, providerMessageID *string) (NotificationDelivery, error) {
+	row := q.db.QueryRow(ctx, findDeliveryByProviderMessageID, providerMessageID)
+	var i NotificationDelivery
+	err := row.Scan(
+		&i.ID,
+		&i.NotificationID,
+		&i.TenantID,
+		&i.Channel,
+		&i.Status,
+		&i.ProviderMessageID,
+		&i.Error,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const findRecipientEmail = `-- name: FindRecipientEmail :one
 SELECT email FROM app_user
 WHERE id = $1

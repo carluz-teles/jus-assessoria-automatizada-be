@@ -23,6 +23,19 @@ const TypeMemberJoined = "identity.member_joined"
 // is soft-removed from a tenant (ACTIVE → REMOVED). Its aggregate is the tenant.
 const TypeMemberRemoved = "identity.member_removed"
 
+// TypeNotificationRequested is the dotted id of the GENERIC request-to-notify event
+// identity EMITS so the notifications slice delivers an aviso (docs §2.5: slices talk
+// by event, never by import). It is the one event whose type deliberately lives on
+// both sides of the boundary: the notifications slice owns a decode-only struct of the
+// same name, and each producer owns the struct that PUBLISHES it — so identity turns a
+// member join into an e-mail without importing the notifications package (which would
+// drag its Resend/template machinery into every identity binary).
+const TypeNotificationRequested = "notification.requested"
+
+// notifyTypeMemberJoined is the template selector carried in the notification's
+// payload Type: it names the notifications-side e-mail template rendered for a join.
+const notifyTypeMemberJoined = "member_joined"
+
 const aggregateTypeTenant = "tenant"
 
 // TenantProvisioned is emitted after a tenant is created or synced from Clerk.
@@ -85,3 +98,24 @@ var _ events.Event = MemberRemoved{}
 
 func (MemberRemoved) Type() string          { return TypeMemberRemoved }
 func (MemberRemoved) AggregateType() string { return aggregateTypeTenant }
+
+// NotificationRequested is the producer-side shape identity PUBLISHES to ask the
+// notifications slice to deliver an aviso. Its JSON is byte-for-byte the contract the
+// notifications slice DECODES (same field tags), so the two never import each other —
+// identity turns a member join into an e-mail through the outbox alone (docs §2.5).
+//
+// NotifyType is the template selector carried as DATA (json "type"), distinct from
+// Type() — the events.Event method that names the routed event id. One generic event
+// (notification.requested) drives every kind of aviso; NotifyType picks the template.
+type NotificationRequested struct {
+	events.Base
+	TenantID        string         `json:"tenant_id"`
+	RecipientUserID string         `json:"recipient_user_id"`
+	NotifyType      string         `json:"type"`
+	Payload         map[string]any `json:"payload"`
+}
+
+var _ events.Event = NotificationRequested{}
+
+func (NotificationRequested) Type() string          { return TypeNotificationRequested }
+func (NotificationRequested) AggregateType() string { return aggregateTypeTenant }

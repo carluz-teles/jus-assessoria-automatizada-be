@@ -10,6 +10,7 @@ import (
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
+	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
 )
@@ -29,14 +30,15 @@ const identityMePath = "/v1/identity/me"
 // the graph here (not inside newRouter) keeps the router a pure function of its
 // dependencies — the test builds it with fakes and never touches the network.
 type routerDeps struct {
-	logger         *slog.Logger
-	verifier       middleware.TokenVerifier
-	resolver       middleware.PrincipalResolver
-	webhook        *identity.WebhookHandler
-	billingWebhook *billing.WebhookHandler
-	identity       *identity.Handler
-	acquisition    *acquisition.Handler
-	lookup         *lookup.Handler
+	logger               *slog.Logger
+	verifier             middleware.TokenVerifier
+	resolver             middleware.PrincipalResolver
+	webhook              *identity.WebhookHandler
+	billingWebhook       *billing.WebhookHandler
+	notificationsWebhook *notifications.WebhookHandler
+	identity             *identity.Handler
+	acquisition          *acquisition.Handler
+	lookup               *lookup.Handler
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -86,6 +88,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// a use case, like the others.
 	if deps.billingWebhook != nil {
 		deps.billingWebhook.Register(app)
+	}
+
+	// notifications owns its public Resend webhook (bounce/complaint), verified by
+	// its svix signature inside the handler, so unauthenticated at the router level.
+	// Mounted via Register and nil-guarded so the router test fixture builds without
+	// a use case, like the others.
+	if deps.notificationsWebhook != nil {
+		deps.notificationsWebhook.Register(app)
 	}
 
 	// Authenticated surface. The dispatch middleware runs ahead of every /v1

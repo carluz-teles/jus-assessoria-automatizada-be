@@ -195,3 +195,57 @@ func (uc *NotifyUseCase) deliver(ctx context.Context, p pendingSend) error {
 		return err
 	})
 }
+
+// WebhookUseCase records a provider-callback outcome (a Resend bounce/complaint) onto
+// the delivery it concerns. It is the api-side counterpart to the listener's
+// NotifyUseCase: it needs no Channel and no dedup registration — it only locates a
+// delivery by the provider's message id and flips its status. It depends on the
+// Repository and UnitOfWork interfaces, never a concrete implementation (docs §2.5).
+type WebhookUseCase struct {
+	repo Repository
+	uow  database.UnitOfWork
+}
+
+// NewWebhookUseCase wires the provider-webhook use case to its repository and unit of
+// work. The repository must be pool-backed (NewRepository) — the delivery lookup is
+// tenant-less and runs outside any tx.
+func NewWebhookUseCase(repo Repository, uow database.UnitOfWork) *WebhookUseCase {
+	return &WebhookUseCase{repo: repo, uow: uow}
+}
+
+// MarkDeliveryOutcome flips the delivery identified by the provider's message id to
+// status (BOUNCED or COMPLAINED), stamping reason on its error. The lookup runs on
+// the pool (the webhook carries no tenant); the write runs in that delivery's tenant
+// scope, so barrier 2 (RLS) still guards it. The provider id is preserved, not
+// re-derived, so the correlation to the original send survives.
+//
+// Idempotent for at-least-once webhook delivery: an unknown message id (nothing we
+// sent) and a status already at the target both collapse to a no-op so the endpoint
+// simply acks and the provider stops retrying.
+func (uc *WebhookUseCase) MarkDeliveryOutcome(ctx context.Context, providerMessageID string, status DeliveryStatus, reason string) error {
+	if providerMessageID == "" {
+		return nil // nothing to correlate — ack
+	}
+
+	delivery, err := uc.repo.FindDeliveryByProviderMessageID(ctx, providerMessageID)
+	if errors.Is(err, ErrDeliveryNotFound) {
+		return nil // an id we never sent — ack, do not make the provider retry
+	}
+	if err != nil {
+		return err
+	}
+	if delivery.Status == status {
+		return nil // replay of the same outcome — already recorded
+	}
+
+	return uc.uow.Do(ctx, delivery.TenantID, func(tx database.Tx) error {
+		_, err := uc.repo.UpdateDeliveryStatus(ctx, tx, UpdateDeliveryStatusParams{
+			DeliveryID:        delivery.ID,
+			TenantID:          delivery.TenantID,
+			Status:            status,
+			ProviderMessageID: delivery.ProviderMessageID,
+			Error:             reason,
+		})
+		return err
+	})
+}

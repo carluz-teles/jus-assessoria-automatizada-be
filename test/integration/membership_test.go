@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jusassessoria/platform/internal/identity"
+	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/migrations"
 )
@@ -133,6 +134,37 @@ func TestIdentity_OnMembershipCreated_PersistsAndOutboxSameTx(t *testing.T) {
 		t.Fatalf("event ids = (%q, %q), want a v7 id and the tenant aggregate", ev.EventID, ev.AggregateID())
 	}
 
+	// AC1/AC2: the same tx also emitted notification.requested. Decode its outbox
+	// payload with the CONSUMER's struct (notifications.NotificationRequested) — the
+	// round-trip proves the producer's bytes are exactly what the notifications
+	// listener consumes, so the join drives a welcome e-mail without either slice
+	// importing the other.
+	if n := countOutboxByType(t, pool, notifications.TypeNotificationRequested, tenantID); n != 1 {
+		t.Fatalf("notification.requested outbox rows = %d, want 1", n)
+	}
+	var notifPayload []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT payload FROM outbox WHERE type = $1 AND aggregate_id::text = $2`,
+		notifications.TypeNotificationRequested, tenantID).Scan(&notifPayload); err != nil {
+		t.Fatalf("read notification.requested payload: %v", err)
+	}
+	var notif notifications.NotificationRequested
+	if err := json.Unmarshal(notifPayload, &notif); err != nil {
+		t.Fatalf("unmarshal notification.requested with the consumer struct: %v", err)
+	}
+	if notif.TenantID != tenantID || notif.RecipientUserID != user.ID {
+		t.Fatalf("notification envelope = %+v, want tenant/recipient of the join", notif)
+	}
+	if notif.Type != "member_joined" {
+		t.Fatalf("notification template selector = %q, want member_joined", notif.Type)
+	}
+	if notif.Payload["member_name"] != "Ana" {
+		t.Fatalf("notification payload = %+v, want member_name Ana", notif.Payload)
+	}
+	if notif.EventID == "" || notif.EventID == ev.EventID {
+		t.Fatalf("notification needs its own event id, got %q (member_joined %q)", notif.EventID, ev.EventID)
+	}
+
 	// Replay: the same membership.created must NOT duplicate the row nor republish.
 	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, "orgmem-1", "ana@b.com", "Ana", identity.RoleAdmin); err != nil {
 		t.Fatalf("replay OnMembershipCreated: %v", err)
@@ -142,6 +174,9 @@ func TestIdentity_OnMembershipCreated_PersistsAndOutboxSameTx(t *testing.T) {
 	}
 	if n := countMemberJoinedOutbox(t, pool, tenantID); n != 1 {
 		t.Fatalf("member_joined outbox rows after replay = %d, want 1 (no republish)", n)
+	}
+	if n := countOutboxByType(t, pool, notifications.TypeNotificationRequested, tenantID); n != 1 {
+		t.Fatalf("notification.requested outbox rows after replay = %d, want 1 (no republish)", n)
 	}
 }
 

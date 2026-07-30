@@ -45,9 +45,11 @@ type UpdateDeliveryStatusParams struct {
 }
 
 // Repository is the persistence port the use case depends on (never the concrete
-// impl). Every method takes the caller's tx: the writes participate in the use
+// impl). The write methods take the caller's tx so they participate in the use
 // case's unit of work, and the recipient read runs inside it too so RLS scopes it to
-// the event's tenant (docs §4b.1).
+// the event's tenant (docs §4b.1). FindDeliveryByProviderMessageID is the exception:
+// a provider webhook carries no tenant, so that lookup runs on the pool (the billing
+// FindByStripeCustomer molde) to recover the delivery and the tenant to scope by.
 type Repository interface {
 	InsertNotification(ctx context.Context, tx database.Tx, params InsertNotificationParams) (*Notification, error)
 	InsertDelivery(ctx context.Context, tx database.Tx, params InsertDeliveryParams) (*NotificationDelivery, error)
@@ -55,17 +57,28 @@ type Repository interface {
 	// FindRecipientEmail resolves an app_user's e-mail by internal id, scoped to the
 	// tenant. A missing row is ErrRecipientNotFound, never (nil, nil).
 	FindRecipientEmail(ctx context.Context, tx database.Tx, tenantID, appUserID string) (string, error)
+	// FindDeliveryByProviderMessageID locates a delivery by the provider's message
+	// id, on the pool (a resolution read, no tx — the webhook has no tenant). A
+	// missing row is ErrDeliveryNotFound, never (nil, nil).
+	FindDeliveryByProviderMessageID(ctx context.Context, providerMessageID string) (*NotificationDelivery, error)
 }
 
-// pgRepository is the sqlc-backed implementation. It holds no pool: every query
-// binds the generated code to the passed tx (all work is transactional).
-type pgRepository struct{}
+// pgRepository is the sqlc-backed implementation. q is bound to the pool for the
+// tenant-less resolution read (FindDeliveryByProviderMessageID); every other method
+// binds the generated code to the passed tx (all writes are transactional).
+type pgRepository struct {
+	q *notificationsdb.Queries
+}
 
 var _ Repository = (*pgRepository)(nil)
 
-// NewRepository returns the sqlc-backed repository. It is stateless — each method
-// binds the generated queries to the tx it is given.
-func NewRepository() Repository { return &pgRepository{} }
+// NewRepository binds the resolution read to pool (used only by the provider
+// webhook). Inject a *pgxpool.Pool in production; both it and a mock satisfy
+// notificationsdb.DBTX. The write methods ignore it — they bind to the tx they are
+// given.
+func NewRepository(pool notificationsdb.DBTX) Repository {
+	return &pgRepository{q: notificationsdb.New(pool)}
+}
 
 // InsertNotification records the aviso inside the caller's tx. The tenant id parses
 // to a uuid, the recipient id to a nullable pgtype.UUID (SQL NULL when empty), and
@@ -176,4 +189,20 @@ func (r *pgRepository) FindRecipientEmail(ctx context.Context, tx database.Tx, t
 		return "", database.WrapInfra(err)
 	}
 	return email, nil
+}
+
+// FindDeliveryByProviderMessageID reads the delivery bearing the provider's message
+// id on the pool (a resolution read, no tx — the bounce/complaint webhook carries no
+// tenant). A no-row result (an id we never sent, or already garbage-collected) maps
+// to ErrDeliveryNotFound, which the webhook use case turns into an ack, never a
+// (nil, nil).
+func (r *pgRepository) FindDeliveryByProviderMessageID(ctx context.Context, providerMessageID string) (*NotificationDelivery, error) {
+	row, err := r.q.FindDeliveryByProviderMessageID(ctx, textToNull(providerMessageID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDeliveryNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return deliveryToEntity(row), nil
 }
