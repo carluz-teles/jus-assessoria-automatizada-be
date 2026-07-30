@@ -24,6 +24,8 @@ var optionalVars = []string{
 	"PORT",
 	"CLERK_ISSUER",
 	"CLERK_WEBHOOK_SECRET",
+	"STRIPE_SECRET_KEY",
+	"STRIPE_WEBHOOK_SECRET",
 	"S3_ENDPOINT",
 	"S3_REGION",
 	"S3_BUCKET",
@@ -128,6 +130,12 @@ func TestLoad_OptionalFields_Defaults(t *testing.T) {
 	}
 	if cfg.ClerkWebhookSecret != "" {
 		t.Errorf("ClerkWebhookSecret = %q, want empty", cfg.ClerkWebhookSecret)
+	}
+	if cfg.StripeSecretKey != "" {
+		t.Errorf("StripeSecretKey = %q, want empty", cfg.StripeSecretKey)
+	}
+	if cfg.StripeWebhookSecret != "" {
+		t.Errorf("StripeWebhookSecret = %q, want empty", cfg.StripeWebhookSecret)
 	}
 	if cfg.S3Bucket != "" {
 		t.Errorf("S3Bucket = %q, want empty", cfg.S3Bucket)

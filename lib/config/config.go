@@ -40,6 +40,13 @@ type Config struct {
 	ClerkIssuer        string `env:"CLERK_ISSUER"`
 	ClerkWebhookSecret string `env:"CLERK_WEBHOOK_SECRET"`
 
+	// Stripe billing (só o api os consome, no webhook /webhooks/stripe). Opcionais
+	// pelo mesmo motivo do ClerkWebhookSecret: um segredo vazio só quebra ao
+	// verificar/resolver um webhook, não no boot — e mantê-los opcionais preserva o
+	// boot dos demais binários (worker/scheduler), que não falam com o Stripe.
+	StripeSecretKey     string `env:"STRIPE_SECRET_KEY"`
+	StripeWebhookSecret string `env:"STRIPE_WEBHOOK_SECRET"`
+
 	// Object storage S3-compatível (S3/R2/MinIO). Opcional: o api só monta o
 	// storage.Client quando S3Enabled() — ver o método abaixo.
 	S3Endpoint  string `env:"S3_ENDPOINT"`

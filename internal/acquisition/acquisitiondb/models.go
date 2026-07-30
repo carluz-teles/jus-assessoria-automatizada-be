@@ -207,6 +207,19 @@ type Review struct {
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
+type Subscription struct {
+	ID                   uuid.UUID          `json:"id"`
+	TenantID             uuid.UUID          `json:"tenant_id"`
+	StripeCustomerID     *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID *string            `json:"stripe_subscription_id"`
+	Status               string             `json:"status"`
+	Plan                 *string            `json:"plan"`
+	CurrentPeriodEnd     pgtype.Timestamptz `json:"current_period_end"`
+	ActiveProcessLimit   *int32             `json:"active_process_limit"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
 type SyncRun struct {
 	ID               uuid.UUID          `json:"id"`
 	TenantID         uuid.UUID          `json:"tenant_id"`
