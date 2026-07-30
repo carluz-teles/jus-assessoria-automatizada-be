@@ -93,6 +93,11 @@ type stubSyncRepo struct {
 	intimNew    int
 
 	updates []SyncRunOutcome
+	// closedRuns models the sync_run's status=RUNNING compare-and-swap: the first
+	// close of a given run id wins (closed=true), any later close of the SAME id
+	// finds it already closed (closed=false) — exactly what the real UPDATE ...
+	// WHERE status='RUNNING' RETURNING id reports under a concurrent redelivery.
+	closedRuns map[string]bool
 }
 
 func (s *stubSyncRepo) InsertSyncRun(_ context.Context, _ database.Tx, p SyncRunParams) (string, error) {
@@ -112,9 +117,16 @@ func (s *stubSyncRepo) FindSyncRunByEventID(_ context.Context, _ database.Tx, _ 
 	return nil, ErrSyncRunNotFound
 }
 
-func (s *stubSyncRepo) UpdateSyncRun(_ context.Context, _ database.Tx, o SyncRunOutcome) error {
+func (s *stubSyncRepo) UpdateSyncRun(_ context.Context, _ database.Tx, o SyncRunOutcome) (bool, error) {
 	s.updates = append(s.updates, o)
-	return nil
+	if s.closedRuns == nil {
+		s.closedRuns = map[string]bool{}
+	}
+	if s.closedRuns[o.ID] {
+		return false, nil // already closed (CAS misses): a concurrent execution won.
+	}
+	s.closedRuns[o.ID] = true
+	return true, nil
 }
 
 func (s *stubSyncRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, p FindOrCreateCourtRecordParams) (*CourtRecord, error) {
@@ -471,6 +483,89 @@ func TestSyncUseCase_RedeliveryClosedRun_NoOps(t *testing.T) {
 				t.Fatalf("closed-run redelivery published %d events, want 0", outbox.calls)
 			}
 		})
+	}
+}
+
+// U13: two executions race to close the SAME run (the original attempt is still
+// in flight when a redelivery resumes it — both read the run RUNNING in UoW-1 and
+// both reach the close in UoW-2). The status=RUNNING compare-and-swap lets exactly
+// ONE win: it publishes sync_completed and the observed events; the loser's close
+// affects zero rows (closed=false) and publishes NOTHING — so the terminal event
+// (and the backfill slice count it drives) fires exactly once. Without the guard
+// both would publish, double-counting the backfill slice.
+func TestSyncUseCase_ConcurrentClose_PublishesCompletedOnce(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{
+		syncRunID:      "run-1",
+		docketNewCount: 2,
+		// A redelivery resolving the same run finds it still RUNNING (the original
+		// attempt has not committed its close yet).
+		findByEventRun: &SyncRun{ID: "run-1", Status: SyncStatusRunning},
+	}
+	outbox := &fakeOutbox{}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	orch := orchestratorWith(SourceDJEN, conn)
+
+	// Execution A — the first delivery opens run-1 and closes it OK (CAS wins).
+	ucA := NewSyncUseCase(repo, outbox, &stubBackfillUoW{tx: stubTx{rows: 1}}, orch, parser)
+	if err := ucA.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("first execution error = %v", err)
+	}
+	// Execution B — a concurrent redelivery resumes the SAME run-1 and races to
+	// close it, but the run is already OK, so the CAS misses.
+	ucB := NewSyncUseCase(repo, outbox, &stubBackfillUoW{tx: stubTx{rows: 0}}, orch, parser)
+	if err := ucB.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("redelivery execution error = %v", err)
+	}
+
+	if len(repo.updates) != 2 {
+		t.Fatalf("UpdateSyncRun attempts = %d, want 2 (both executions tried to close run-1)", len(repo.updates))
+	}
+	counts := countByType(outbox.published)
+	if counts[TypeSyncCompleted] != 1 {
+		t.Fatalf("sync_completed = %d, want 1 (published exactly once despite the race)", counts[TypeSyncCompleted])
+	}
+	if counts[TypeCourtRecordObserved] != 1 || counts[TypeDocketEntryObserved] != 2 {
+		t.Fatalf("observed events = %v, want court_record_observed:1 docket_entry_observed:2 (only the winner emits them)", counts)
+	}
+}
+
+// U14: the same race on the FAILURE path — two executions both hit a fetch fault
+// and race to mark the SAME run FAILED. The CAS lets one win and publish
+// sync_failed; the loser's close misses (closed=false) and publishes nothing, so
+// sync_failed fires exactly once.
+func TestSyncUseCase_ConcurrentClose_PublishesFailedOnce(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{
+		syncRunID:      "run-1",
+		findByEventRun: &SyncRun{ID: "run-1", Status: SyncStatusRunning},
+	}
+	outbox := &fakeOutbox{}
+	conn := &stubConnector{fetchErr: errors.New("connector unreachable")}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	orch := orchestratorWith(SourceDJEN, conn)
+
+	ucA := NewSyncUseCase(repo, outbox, &stubBackfillUoW{tx: stubTx{rows: 1}}, orch, parser)
+	if err := ucA.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("first execution error = %v", err)
+	}
+	ucB := NewSyncUseCase(repo, outbox, &stubBackfillUoW{tx: stubTx{rows: 0}}, orch, parser)
+	if err := ucB.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("redelivery execution error = %v", err)
+	}
+
+	if len(repo.updates) != 2 {
+		t.Fatalf("UpdateSyncRun attempts = %d, want 2 (both executions tried to fail run-1)", len(repo.updates))
+	}
+	counts := countByType(outbox.published)
+	if counts[TypeSyncFailed] != 1 {
+		t.Fatalf("sync_failed = %d, want 1 (published exactly once despite the race)", counts[TypeSyncFailed])
+	}
+	if counts[TypeSyncCompleted] != 0 {
+		t.Fatalf("sync_completed = %d on a failed cycle, want 0", counts[TypeSyncCompleted])
 	}
 }
 

@@ -37,7 +37,7 @@ type Repository interface {
 	// The sync use case depends on the narrow syncRepo view of these methods.
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
-	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error
+	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
@@ -289,18 +289,23 @@ func (r *pgRepository) FindSyncRunByEventID(ctx context.Context, tx database.Tx,
 	return syncRunToEntity(row), nil
 }
 
-// UpdateSyncRun closes a sync_run inside the caller's tx. The error reason (empty
-// on OK) is encoded to the error jsonb column; NULL when there is none.
-func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error {
+// UpdateSyncRun closes a sync_run inside the caller's tx, guarded to the RUNNING →
+// terminal transition by the query's WHERE clause (compare-and-swap). It reports
+// whether THIS call won the close: a matched row means it flipped RUNNING to the
+// outcome (closed=true), while pgx.ErrNoRows means the run was already closed by a
+// concurrent execution (closed=false) — the caller then skips the terminal event
+// so it is published exactly once. The error reason (empty on OK) is encoded to
+// the error jsonb column; NULL when there is none.
+func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (bool, error) {
 	id, err := uuid.Parse(outcome.ID)
 	if err != nil {
-		return database.WrapInfra(err)
+		return false, database.WrapInfra(err)
 	}
 	errJSON, err := encodeSyncError(outcome.Error)
 	if err != nil {
-		return err
+		return false, err
 	}
-	err = acquisitiondb.New(tx).UpdateSyncRun(ctx, acquisitiondb.UpdateSyncRunParams{
+	_, err = acquisitiondb.New(tx).UpdateSyncRun(ctx, acquisitiondb.UpdateSyncRunParams{
 		ID:           id,
 		Status:       outcome.Status,
 		ItemsNew:     int32(outcome.ItemsNew),
@@ -308,7 +313,13 @@ func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcom
 		FinishedAt:   pgtype.Timestamptz{Time: outcome.FinishedAt, Valid: true},
 		Error:        errJSON,
 	})
-	return database.WrapInfra(err)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	return true, nil
 }
 
 // FindOrCreateCourtRecord resolves a court record by its natural key inside the
