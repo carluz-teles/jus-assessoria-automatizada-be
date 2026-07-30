@@ -60,13 +60,16 @@ func (IntegrationActivated) AggregateType() string { return aggregateTypeIntegra
 // history. The backfill listener emits one per slice of the onboarding horizon,
 // in the same transaction as the backfill_job insert. The window bounds are
 // bare dates (matching the backfill_job date columns); SliceIndex is the
-// window's position in the horizon. Base carries the per-slice event id (the
-// consumer's dedup key) and the backfill_job aggregate id.
+// window's position in the horizon. Source names the data source (DJEN, DATAJUD,
+// …) so the sync consumer resolves the matching connector via the Orchestrator.
+// Base carries the per-slice event id (the consumer's dedup key) and the
+// backfill_job aggregate id.
 type SyncRequested struct {
 	events.Base
 	BackfillJobID string `json:"backfill_job_id"`
 	TenantID      string `json:"tenant_id"`
 	IntegrationID string `json:"integration_id"`
+	Source        string `json:"source"`
 	SliceIndex    int    `json:"slice_index"`
 	WindowFrom    string `json:"window_from"`
 	WindowTo      string `json:"window_to"`

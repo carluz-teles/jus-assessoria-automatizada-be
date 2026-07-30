@@ -89,17 +89,13 @@ func run(logger *slog.Logger) error {
 
 	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow)
 
-	// The sync use case drives a connector resolved from the orchestrator. Until
-	// the real DJEN/DataJud connectors land, a stub is registered per source and
-	// paired with the stub parser (no network I/O).
+	// The sync use case resolves its connector per event from the orchestrator, by
+	// the event's source. Until the real DJEN/DataJud connectors land, a stub is
+	// registered per source and paired with the stub parser (no network I/O).
 	orchestrator := acquisition.NewOrchestrator()
 	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewStubConnector(acquisition.SourceDJEN))
 	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewStubConnector(acquisition.SourceDATAJUD))
-	connector, err := orchestrator.ConnectorFor(acquisition.SourceDJEN)
-	if err != nil {
-		return fmt.Errorf("resolve sync connector: %w", err)
-	}
-	sync := acquisition.NewSyncUseCase(repo, outbox, uow, connector, acquisition.NewStubParser())
+	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, acquisition.NewStubParser())
 
 	acquisition.NewListener(backfill, sync).Register(mux)
 

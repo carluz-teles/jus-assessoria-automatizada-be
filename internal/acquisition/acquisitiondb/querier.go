@@ -25,6 +25,12 @@ type Querier interface {
 	// makes this the single winning transition, so a late or over-count delivery that
 	// reaches here cannot re-finalize. Scoped by tenant_id (isolation barrier 1).
 	FinalizeBackfillJob(ctx context.Context, arg FinalizeBackfillJobParams) error
+	// Resolve the sync_run opened by a given sync_requested event, inside the caller's
+	// (tenant-scoped) tx. On a re-delivery of an already-marked event, the sync use
+	// case reads this to decide: a RUNNING run means a prior attempt died before
+	// closing it (so the cycle resumes it), while a closed (OK/FAILED) run is a no-op
+	// ack. A miss (pgx.ErrNoRows) is the typed ErrSyncRunNotFound.
+	FindSyncRunByEventID(ctx context.Context, eventID *string) (FindSyncRunByEventIDRow, error)
 	// Resolve a court record by its natural key inside the caller's tx. A miss
 	// (pgx.ErrNoRows) is how FindOrCreateCourtRecord learns it must create one.
 	GetCourtRecordByKey(ctx context.Context, arg GetCourtRecordByKeyParams) (GetCourtRecordByKeyRow, error)
@@ -64,7 +70,9 @@ type Querier interface {
 	// inserts nothing new (ON CONFLICT DO NOTHING) and the RETURNING clause tells the
 	// caller which rows were actually new.
 	// Open a sync run. court_record_id is left NULL (OAB window discovery is not yet
-	// tied to one record); finished_at/error stay NULL until the run closes.
+	// tied to one record); finished_at/error stay NULL until the run closes. event_id
+	// records the sync_requested event that opened it, so a re-delivery can find and
+	// resume a run that never closed (FindSyncRunByEventID).
 	InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.

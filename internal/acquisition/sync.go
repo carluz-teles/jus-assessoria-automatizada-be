@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -35,7 +36,9 @@ const (
 // after a successful sync; the scheduler slice (future) reads next_sync_at.
 const defaultSyncInterval = 24 * time.Hour
 
-// SyncRunParams is the insert payload for a sync_run opening in RUNNING.
+// SyncRunParams is the insert payload for a sync_run opening in RUNNING. EventID
+// is the sync_requested event that opened it — persisted so a re-delivery can
+// locate and resume a run that never closed (FindSyncRunByEventID).
 type SyncRunParams struct {
 	TenantID         string
 	IntegrationID    string
@@ -43,6 +46,7 @@ type SyncRunParams struct {
 	ConnectorVersion string
 	StartedAt        time.Time
 	Status           string
+	EventID          string
 }
 
 // SyncRunOutcome closes a run. Error is empty on OK (the repo writes NULL) and
@@ -102,6 +106,7 @@ type IntimationParams struct {
 // for each new one and tally new vs. deduped.
 type syncRepo interface {
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
+	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
@@ -110,32 +115,35 @@ type syncRepo interface {
 
 // SyncUseCase reacts to sync_requested by running one fetch→parse→upsert cycle.
 // It depends on the narrow syncRepo port, the outbox publisher, the unit of work,
-// and the connector/parser ports — never on the concrete pg implementation or a
-// real data source. now is a seam: it defaults to time.Now and the unit test
-// overrides it for deterministic timestamps.
+// the connector orchestrator, and the parser port — never on the concrete pg
+// implementation or a real data source. The connector is resolved per event from
+// the orchestrator by the event's source (a DATAJUD event runs under the DATAJUD
+// connector, a DJEN one under DJEN), so one use case serves every source. now is a
+// seam: it defaults to time.Now and the unit test overrides it for deterministic
+// timestamps.
 type SyncUseCase struct {
-	repo      syncRepo
-	outbox    publisher
-	uow       database.UnitOfWork
-	connector Connector
-	parser    Parser
-	now       func() time.Time
+	repo         syncRepo
+	outbox       publisher
+	uow          database.UnitOfWork
+	orchestrator *Orchestrator
+	parser       Parser
+	now          func() time.Time
 }
 
 // syncOption tunes a SyncUseCase at construction. Options are unexported:
 // production callers take the defaults, only same-package tests override the clock.
 type syncOption func(*SyncUseCase)
 
-// NewSyncUseCase wires the sync use case. The connector and parser are injected
-// (a stub in this slice, resolved via the Orchestrator at composition time).
-func NewSyncUseCase(repo syncRepo, outbox publisher, uow database.UnitOfWork, connector Connector, parser Parser, opts ...syncOption) *SyncUseCase {
+// NewSyncUseCase wires the sync use case. The orchestrator resolves the connector
+// per event by source (stubs in this slice); the parser is injected (a stub here).
+func NewSyncUseCase(repo syncRepo, outbox publisher, uow database.UnitOfWork, orchestrator *Orchestrator, parser Parser, opts ...syncOption) *SyncUseCase {
 	uc := &SyncUseCase{
-		repo:      repo,
-		outbox:    outbox,
-		uow:       uow,
-		connector: connector,
-		parser:    parser,
-		now:       time.Now,
+		repo:         repo,
+		outbox:       outbox,
+		uow:          uow,
+		orchestrator: orchestrator,
+		parser:       parser,
+		now:          time.Now,
 	}
 	for _, opt := range opts {
 		opt(uc)
@@ -151,9 +159,18 @@ func NewSyncUseCase(repo syncRepo, outbox publisher, uow database.UnitOfWork, co
 // malformed payload never parses on retry).
 //
 // tenantID comes from the event payload (a trusted internal producer, no Clerk
-// token on the worker) and scopes every transaction's RLS.
+// token on the worker) and scopes every transaction's RLS. The connector is
+// resolved from the event's source before opening the run (so the sync_run audit
+// row is stamped with the connector that actually serves this source); an unknown
+// source is the typed ErrConnectorNotFound — a misconfigured worker — which stays
+// retryable so a redeploy that registers the connector heals it.
 func (uc *SyncUseCase) OnSyncRequested(ctx context.Context, ev SyncRequested) error {
-	syncRunID, seen, err := uc.startRun(ctx, ev)
+	connector, err := uc.orchestrator.ConnectorFor(ev.Source)
+	if err != nil {
+		return fmt.Errorf("resolve connector for source %q: %w", ev.Source, err)
+	}
+
+	syncRunID, seen, err := uc.startRun(ctx, ev, connector)
 	if err != nil {
 		return err
 	}
@@ -161,7 +178,7 @@ func (uc *SyncUseCase) OnSyncRequested(ctx context.Context, ev SyncRequested) er
 		return nil
 	}
 
-	raw, err := uc.connector.Fetch(ctx, fetchRequestFromEvent(ev))
+	raw, err := connector.Fetch(ctx, fetchRequestFromEvent(ev))
 	if err != nil {
 		if ferr := uc.failRun(ctx, ev, syncRunID, err); ferr != nil {
 			return ferr
@@ -184,26 +201,29 @@ func (uc *SyncUseCase) OnSyncRequested(ctx context.Context, ev SyncRequested) er
 }
 
 // startRun is UoW-1: dedup the event and, if it is the first sighting, open the
-// sync_run in RUNNING. A seen event commits only the dedup mark and reports
-// seen=true so the caller acks without running the cycle.
-func (uc *SyncUseCase) startRun(ctx context.Context, ev SyncRequested) (syncRunID string, seen bool, err error) {
+// sync_run in RUNNING (stamped with the resolved connector and the event id). On a
+// re-delivery of an already-marked event it does NOT blindly no-op: it reconciles
+// the run the event opened (resolveSeenRun) — a run left RUNNING by a crashed prior
+// attempt is resumed (seen=false, its id returned), a closed one is a no-op ack.
+func (uc *SyncUseCase) startRun(ctx context.Context, ev SyncRequested, connector Connector) (syncRunID string, seen bool, err error) {
 	err = uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		already, derr := events.NewDedup(tx).SeenOrMark(ctx, consumerSync, ev.EventID)
 		if derr != nil {
 			return derr
 		}
 		if already {
-			seen = true
-			return nil
+			syncRunID, seen, derr = uc.resolveSeenRun(ctx, tx, ev)
+			return derr
 		}
 
 		id, ierr := uc.repo.InsertSyncRun(ctx, tx, SyncRunParams{
 			TenantID:         ev.TenantID,
 			IntegrationID:    ev.IntegrationID,
-			ConnectorID:      uc.connector.ID(),
-			ConnectorVersion: uc.connector.Version(),
+			ConnectorID:      connector.ID(),
+			ConnectorVersion: connector.Version(),
 			StartedAt:        uc.now(),
 			Status:           SyncStatusRunning,
+			EventID:          ev.EventID,
 		})
 		if ierr != nil {
 			return ierr
@@ -212,6 +232,27 @@ func (uc *SyncUseCase) startRun(ctx context.Context, ev SyncRequested) (syncRunI
 		return nil
 	})
 	return syncRunID, seen, err
+}
+
+// resolveSeenRun reconciles a re-delivery of an already-marked event with the
+// sync_run it opened. A RUNNING run means a prior attempt died between the dedup
+// mark (UoW-1) and the close, leaving no committed effect (fetch/parse are I/O-only
+// and applyResult/failRun are single atomic transactions) — so the cycle RESUMES:
+// seen=false returns the existing run id and the caller re-runs fetch→parse→close
+// against it, opening no second run and duplicating no outbox. A closed run
+// (OK/FAILED), or none at all (defensive), is a no-op ack (seen=true).
+func (uc *SyncUseCase) resolveSeenRun(ctx context.Context, tx database.Tx, ev SyncRequested) (syncRunID string, seen bool, err error) {
+	run, err := uc.repo.FindSyncRunByEventID(ctx, tx, ev.EventID)
+	if errors.Is(err, ErrSyncRunNotFound) {
+		return "", true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if run.Status == SyncStatusRunning {
+		return run.ID, false, nil
+	}
+	return "", true, nil
 }
 
 // failRun is the UoW-2 for a fetch/parse fault: mark the run FAILED with the

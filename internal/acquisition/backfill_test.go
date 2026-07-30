@@ -246,6 +246,9 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 	if first.SliceIndex != 0 || first.BackfillJobID != "job-1" || first.Type() != TypeSyncRequested {
 		t.Fatalf("first slice = %+v, unexpected", first)
 	}
+	if first.Source != SourceDJEN {
+		t.Fatalf("first slice source = %q, want %q (carried through from the activation)", first.Source, SourceDJEN)
+	}
 	if first.WindowFrom == "" || first.WindowTo == "" {
 		t.Fatalf("first slice has empty window bounds: %+v", first)
 	}

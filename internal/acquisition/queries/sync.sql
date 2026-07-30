@@ -9,11 +9,24 @@
 
 -- name: InsertSyncRun :one
 -- Open a sync run. court_record_id is left NULL (OAB window discovery is not yet
--- tied to one record); finished_at/error stay NULL until the run closes.
+-- tied to one record); finished_at/error stay NULL until the run closes. event_id
+-- records the sync_requested event that opened it, so a re-delivery can find and
+-- resume a run that never closed (FindSyncRunByEventID).
 INSERT INTO sync_run
-    (tenant_id, integration_id, connector_id, connector_version, started_at, status)
-VALUES ($1, $2, $3, $4, $5, $6)
+    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING id;
+
+-- name: FindSyncRunByEventID :one
+-- Resolve the sync_run opened by a given sync_requested event, inside the caller's
+-- (tenant-scoped) tx. On a re-delivery of an already-marked event, the sync use
+-- case reads this to decide: a RUNNING run means a prior attempt died before
+-- closing it (so the cycle resumes it), while a closed (OK/FAILED) run is a no-op
+-- ack. A miss (pgx.ErrNoRows) is the typed ErrSyncRunNotFound.
+SELECT id, tenant_id, court_record_id, integration_id, connector_id,
+       connector_version, status, items_new, items_deduped, started_at, finished_at
+FROM sync_run
+WHERE event_id = $1;
 
 -- name: UpdateSyncRun :exec
 -- Close a sync run: OK carries the item tallies and a NULL error; FAILED carries

@@ -12,6 +12,51 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const findSyncRunByEventID = `-- name: FindSyncRunByEventID :one
+SELECT id, tenant_id, court_record_id, integration_id, connector_id,
+       connector_version, status, items_new, items_deduped, started_at, finished_at
+FROM sync_run
+WHERE event_id = $1
+`
+
+type FindSyncRunByEventIDRow struct {
+	ID               uuid.UUID          `json:"id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	CourtRecordID    pgtype.UUID        `json:"court_record_id"`
+	IntegrationID    uuid.UUID          `json:"integration_id"`
+	ConnectorID      string             `json:"connector_id"`
+	ConnectorVersion string             `json:"connector_version"`
+	Status           string             `json:"status"`
+	ItemsNew         int32              `json:"items_new"`
+	ItemsDeduped     int32              `json:"items_deduped"`
+	StartedAt        pgtype.Timestamptz `json:"started_at"`
+	FinishedAt       pgtype.Timestamptz `json:"finished_at"`
+}
+
+// Resolve the sync_run opened by a given sync_requested event, inside the caller's
+// (tenant-scoped) tx. On a re-delivery of an already-marked event, the sync use
+// case reads this to decide: a RUNNING run means a prior attempt died before
+// closing it (so the cycle resumes it), while a closed (OK/FAILED) run is a no-op
+// ack. A miss (pgx.ErrNoRows) is the typed ErrSyncRunNotFound.
+func (q *Queries) FindSyncRunByEventID(ctx context.Context, eventID *string) (FindSyncRunByEventIDRow, error) {
+	row := q.db.QueryRow(ctx, findSyncRunByEventID, eventID)
+	var i FindSyncRunByEventIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CourtRecordID,
+		&i.IntegrationID,
+		&i.ConnectorID,
+		&i.ConnectorVersion,
+		&i.Status,
+		&i.ItemsNew,
+		&i.ItemsDeduped,
+		&i.StartedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
 const getCourtRecordByKey = `-- name: GetCourtRecordByKey :one
 SELECT id, case_id
 FROM court_record
@@ -167,8 +212,8 @@ func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationPara
 const insertSyncRun = `-- name: InsertSyncRun :one
 
 INSERT INTO sync_run
-    (tenant_id, integration_id, connector_id, connector_version, started_at, status)
-VALUES ($1, $2, $3, $4, $5, $6)
+    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING id
 `
 
@@ -179,6 +224,7 @@ type InsertSyncRunParams struct {
 	ConnectorVersion string             `json:"connector_version"`
 	StartedAt        pgtype.Timestamptz `json:"started_at"`
 	Status           string             `json:"status"`
+	EventID          *string            `json:"event_id"`
 }
 
 // sync cycle queries (acquisition slice).
@@ -190,7 +236,9 @@ type InsertSyncRunParams struct {
 // inserts nothing new (ON CONFLICT DO NOTHING) and the RETURNING clause tells the
 // caller which rows were actually new.
 // Open a sync run. court_record_id is left NULL (OAB window discovery is not yet
-// tied to one record); finished_at/error stay NULL until the run closes.
+// tied to one record); finished_at/error stay NULL until the run closes. event_id
+// records the sync_requested event that opened it, so a re-delivery can find and
+// resume a run that never closed (FindSyncRunByEventID).
 func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertSyncRun,
 		arg.TenantID,
@@ -199,6 +247,7 @@ func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (u
 		arg.ConnectorVersion,
 		arg.StartedAt,
 		arg.Status,
+		arg.EventID,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)

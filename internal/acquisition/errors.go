@@ -18,4 +18,9 @@ var (
 	// increment: the row is invisible under this tenant (RLS/tenant mismatch) or no
 	// longer exists. The completion counter treats it as a no-op ack, never a retry.
 	ErrBackfillJobNotFound = apperr.NewNotFound("backfill job not found")
+
+	// ErrSyncRunNotFound — no sync_run matched an event_id lookup. On a re-delivery
+	// of an already-marked event the sync use case treats it defensively as a
+	// closed/absent run: a no-op ack, never a reopen.
+	ErrSyncRunNotFound = apperr.NewNotFound("sync run not found")
 )
