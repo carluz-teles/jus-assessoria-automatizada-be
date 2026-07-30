@@ -49,35 +49,6 @@ func (uc *UseCase) ProvisionTenant(ctx context.Context, clerkOrgID, name string)
 	return tenant, nil
 }
 
-// ProvisionUser creates or refreshes the app_user mirroring a Clerk User, linked
-// to its tenant. Idempotent for at-least-once webhook delivery. The write runs
-// under the tenant's RLS scope (isolation barrier 2, docs §4d.4).
-func (uc *UseCase) ProvisionUser(ctx context.Context, clerkUserID, clerkOrgID, email, name string, role Role) (*AppUser, error) {
-	if !role.Valid() {
-		return nil, ErrInvalidRole
-	}
-
-	// The tenant must already exist (its webhook fired first). ErrTenantNotFound
-	// propagates when a membership event races ahead of organization.created.
-	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
-	if err != nil {
-		return nil, err
-	}
-
-	var user *AppUser
-	err = uc.uow.Do(ctx, tenant.ID, func(tx database.Tx) error {
-		var err error
-		// Membership events carry no phone; pass empty so the COALESCE in the
-		// upsert leaves any phone already synced from user.updated untouched.
-		user, err = uc.repo.UpsertUser(ctx, tx, clerkUserID, tenant.ID, email, name, "", role)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return user, nil
-}
-
 // SyncUser resyncs an existing app_user's email, name and phone from a Clerk
 // user.updated webhook. Role and tenant are immutable here — membership decides
 // those, not a profile edit — so it reuses the stored values and lets UpsertUser's

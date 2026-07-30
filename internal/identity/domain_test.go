@@ -175,94 +175,6 @@ func TestUseCase_ProvisionTenant(t *testing.T) {
 	})
 }
 
-func TestUseCase_ProvisionUser(t *testing.T) {
-	ctx := context.Background()
-	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
-	want := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleLawyer}
-
-	t.Run("invalid role short-circuits before any repo call", func(t *testing.T) {
-		repo := &mockRepo{
-			findTenant: func(context.Context, string) (*Tenant, error) {
-				t.Fatal("FindTenantByClerkOrg must not be called on invalid role")
-				return nil, nil
-			},
-		}
-		uow := &fakeUOW{}
-
-		_, err := NewUseCase(repo, noopOutbox{}, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", "OWNER")
-		if !errors.Is(err, ErrInvalidRole) {
-			t.Fatalf("error = %v, want ErrInvalidRole", err)
-		}
-		if uow.called {
-			t.Fatal("unit of work opened despite invalid role")
-		}
-	})
-
-	t.Run("tenant not provisioned propagates ErrTenantNotFound", func(t *testing.T) {
-		repo := &mockRepo{
-			findTenant: func(context.Context, string) (*Tenant, error) {
-				return nil, ErrTenantNotFound
-			},
-		}
-		uow := &fakeUOW{}
-
-		_, err := NewUseCase(repo, noopOutbox{}, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
-		if !errors.Is(err, ErrTenantNotFound) {
-			t.Fatalf("error = %v, want ErrTenantNotFound", err)
-		}
-		if uow.called {
-			t.Fatal("unit of work opened despite missing tenant")
-		}
-	})
-
-	t.Run("upserts the user under the tenant's RLS scope", func(t *testing.T) {
-		var upsertArgs struct {
-			clerkUserID, tenantID, email, name, phone string
-			role                                      Role
-		}
-		repo := &mockRepo{
-			findTenant: func(_ context.Context, clerkOrgID string) (*Tenant, error) {
-				if clerkOrgID != "org_abc" {
-					t.Fatalf("findTenant org = %q", clerkOrgID)
-				}
-				return tenant, nil
-			},
-			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error) {
-				upsertArgs.clerkUserID = clerkUserID
-				upsertArgs.tenantID = tenantID
-				upsertArgs.email = email
-				upsertArgs.name = name
-				upsertArgs.phone = phone
-				upsertArgs.role = role
-				return want, nil
-			},
-		}
-		uow := &fakeUOW{}
-
-		got, err := NewUseCase(repo, noopOutbox{}, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
-		if err != nil {
-			t.Fatalf("ProvisionUser() error = %v", err)
-		}
-		if got != want {
-			t.Fatalf("ProvisionUser() = %+v, want %+v", got, want)
-		}
-		if uow.scope != tenant.ID {
-			t.Fatalf("RLS scope = %q, want %q", uow.scope, tenant.ID)
-		}
-		if upsertArgs.tenantID != tenant.ID {
-			t.Fatalf("upsert tenantID = %q, want internal %q", upsertArgs.tenantID, tenant.ID)
-		}
-		if upsertArgs.clerkUserID != "user_xyz" || upsertArgs.email != "a@b.com" || upsertArgs.name != "Ana" || upsertArgs.role != RoleLawyer {
-			t.Fatalf("upsert args = %+v", upsertArgs)
-		}
-		// Membership events carry no phone: the use case must pass empty so the
-		// upsert's COALESCE preserves any phone synced from user.updated.
-		if upsertArgs.phone != "" {
-			t.Fatalf("membership provisioning passed phone %q, want empty", upsertArgs.phone)
-		}
-	})
-}
-
 func TestUseCase_SyncUser(t *testing.T) {
 	ctx := context.Background()
 	existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleAdmin}
@@ -351,6 +263,10 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 	membership := &Membership{ID: "m-1", TenantID: tenant.ID, AppUserID: user.ID, Role: RoleLawyer, Status: MembershipActive}
 
 	t.Run("new join upserts user + membership and emits member_joined in the same UoW", func(t *testing.T) {
+		var upsertU struct {
+			clerkUserID, tenantID, email, name, phone string
+			role                                      Role
+		}
 		var upsertM struct {
 			tenantID, appUserID, clerkMembershipID string
 			role                                   Role
@@ -358,7 +274,8 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		repo := &mockRepo{
 			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
 			findUser:   func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
-			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, _ string, _ Role) (*AppUser, error) {
+			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error) {
+				upsertU.clerkUserID, upsertU.tenantID, upsertU.email, upsertU.name, upsertU.phone, upsertU.role = clerkUserID, tenantID, email, name, phone, role
 				return user, nil
 			},
 			upsertMembership: func(_ context.Context, _ database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error) {
@@ -380,6 +297,18 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		// the internal ids and the clerk membership id.
 		if uow.scope != tenant.ID {
 			t.Fatalf("RLS scope = %q, want %q", uow.scope, tenant.ID)
+		}
+		// The app_user is upserted with the internal tenant id and the membership's
+		// role. Membership events carry no phone, so the use case must pass empty and
+		// let the upsert's COALESCE preserve any phone synced from user.updated.
+		if upsertU.tenantID != tenant.ID {
+			t.Fatalf("upsert tenantID = %q, want internal %q", upsertU.tenantID, tenant.ID)
+		}
+		if upsertU.clerkUserID != "user_xyz" || upsertU.email != "ana@b.com" || upsertU.name != "Ana" || upsertU.role != RoleLawyer {
+			t.Fatalf("UpsertUser args = %+v", upsertU)
+		}
+		if upsertU.phone != "" {
+			t.Fatalf("membership provisioning passed phone %q, want empty", upsertU.phone)
 		}
 		if upsertM.tenantID != tenant.ID || upsertM.appUserID != user.ID || upsertM.clerkMembershipID != "orgmem_1" || upsertM.role != RoleLawyer {
 			t.Fatalf("UpsertMembership args = %+v", upsertM)
