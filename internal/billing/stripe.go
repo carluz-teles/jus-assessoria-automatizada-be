@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"time"
 
@@ -23,6 +24,42 @@ const (
 	productMetaActiveProcessLimit = "active_process_limit"
 	productMetaPlan               = "plan"
 )
+
+// Idempotency keys make the write calls to Stripe safe to re-submit. The local
+// subscription row that StartCheckout guards on is only projected LATER by the
+// webhook, so within the checkout window (a double-click, two tabs, a fast FE
+// retry) FindByTenant is still not-found and EnsureCustomer/CreateCheckoutSession
+// would otherwise run twice with no protection — creating two customers/sessions
+// that each bill the tenant. A deterministic key per tenant/operation makes Stripe
+// return the object it already created instead of a duplicate.
+//
+// The keys carry NO clock and NO nonce so a retry always derives the same value.
+// Stripe stores a key's result for 24h, which matches a Checkout Session's own
+// validity: a genuine re-subscribe to the same price within that window returns the
+// still-valid pending session (correct, not a duplicate); past it Stripe issues a
+// fresh one.
+func customerIdempotencyKey(tenantID string) string {
+	return "ensure-customer:" + tenantID
+}
+
+func checkoutIdempotencyKey(tenantID, priceID string) string {
+	return "checkout:" + tenantID + ":" + priceID
+}
+
+// mapStripeError classifies a stripe-go SDK error for the HTTP edge. An
+// invalid_request_error — an unknown or inactive price_id, a malformed argument —
+// is the CALLER's fault, so it becomes a 400 (apperr.NewInvalid) carrying Stripe's
+// own explanation. Every other failure (a network error, a timeout, a rate limit,
+// a 5xx, any other Stripe error type) stays a 503 (apperr.NewUnavailable): the
+// provider is momentarily unreachable and the caller may retry. op is the stable,
+// low-cardinality action label reused for both the message and the 503 log.
+func mapStripeError(op string, err error) error {
+	var se *stripe.Error
+	if errors.As(err, &se) && se.Type == stripe.ErrorTypeInvalidRequest {
+		return apperr.NewInvalid(op + ": " + se.Msg)
+	}
+	return apperr.NewUnavailable(op, err)
+}
 
 // stripeGateway is the concrete StripeGateway: the ONLY place the stripe-go SDK is
 // imported (the domain depends on the port, not the SDK). It verifies webhooks
@@ -95,7 +132,7 @@ func (g *stripeGateway) ResolvePlan(ctx context.Context, priceID string) (string
 
 	price, err := g.client.V1Prices.Retrieve(ctx, priceID, params)
 	if err != nil {
-		return "", 0, apperr.NewUnavailable("resolve stripe price", err)
+		return "", 0, mapStripeError("resolve stripe price", err)
 	}
 	if price.Product == nil {
 		return "", 0, ErrPlanUnresolved
@@ -121,9 +158,13 @@ func (g *stripeGateway) EnsureCustomer(ctx context.Context, tenantID string) (st
 	params := &stripe.CustomerCreateParams{
 		Metadata: map[string]string{metadataTenantID: tenantID},
 	}
+	// Deterministic per tenant: a re-submit before the webhook projects the row
+	// reuses this key, so Stripe returns the existing customer instead of a second.
+	params.SetIdempotencyKey(customerIdempotencyKey(tenantID))
+
 	c, err := g.client.V1Customers.Create(ctx, params)
 	if err != nil {
-		return "", apperr.NewUnavailable("create stripe customer", err)
+		return "", mapStripeError("create stripe customer", err)
 	}
 	return c.ID, nil
 }
@@ -151,10 +192,14 @@ func (g *stripeGateway) CreateCheckoutSession(ctx context.Context, p CheckoutPar
 		},
 		SubscriptionData: subData,
 	}
+	// Deterministic per tenant+price: a double-click / two-tab / fast FE retry for
+	// the same plan reuses the pending session instead of opening a second one that
+	// would create a second subscription. A different price is a different key.
+	params.SetIdempotencyKey(checkoutIdempotencyKey(p.TenantID, p.PriceID))
 
 	session, err := g.client.V1CheckoutSessions.Create(ctx, params)
 	if err != nil {
-		return "", apperr.NewUnavailable("create stripe checkout session", err)
+		return "", mapStripeError("create stripe checkout session", err)
 	}
 	return session.URL, nil
 }
@@ -168,7 +213,7 @@ func (g *stripeGateway) CreatePortalSession(ctx context.Context, customerID, ret
 	}
 	session, err := g.client.V1BillingPortalSessions.Create(ctx, params)
 	if err != nil {
-		return "", apperr.NewUnavailable("create stripe portal session", err)
+		return "", mapStripeError("create stripe portal session", err)
 	}
 	return session.URL, nil
 }
@@ -185,7 +230,7 @@ func (g *stripeGateway) ListPlans(ctx context.Context) ([]Plan, error) {
 	plans := []Plan{}
 	for price, err := range g.client.V1Prices.List(ctx, params).All(ctx) {
 		if err != nil {
-			return nil, apperr.NewUnavailable("list stripe prices", err)
+			return nil, mapStripeError("list stripe prices", err)
 		}
 		plan, ok := toPlan(price)
 		if !ok {
