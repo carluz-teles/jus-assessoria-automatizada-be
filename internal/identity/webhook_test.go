@@ -162,6 +162,34 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		}
 	})
 
+	t.Run("user.updated falls back to unsafe_metadata.phone when no phone_number is set", func(t *testing.T) {
+		existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleLawyer}
+		var gotPhone string
+		repo := &mockRepo{
+			findUser: func(context.Context, string) (*AppUser, error) { return existing, nil },
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, phone string, _ Role) (*AppUser, error) {
+				gotPhone = phone
+				return existing, nil
+			},
+		}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
+
+		// The onboarding wizard stores the phone in unsafe_metadata (a verified
+		// phone_number needs an SMS round-trip). With no phone_numbers, primaryPhone
+		// must fall back to it so the phone still reaches the upsert.
+		body := []byte(`{"type":"user.updated","data":{"id":"user_xyz","first_name":"Ana","last_name":"Souza",` +
+			`"primary_email_address_id":"idn_1","email_addresses":[{"id":"idn_1","email_address":"ana@new.com"}],` +
+			`"unsafe_metadata":{"phone":"+5511987654321"}}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if gotPhone != "+5511987654321" {
+			t.Fatalf("phone = %q, want the unsafe_metadata fallback", gotPhone)
+		}
+	})
+
 	t.Run("unknown event type is acknowledged and ignored", func(t *testing.T) {
 		repo := &mockRepo{} // any repo call would nil-panic — proving none happens
 		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))

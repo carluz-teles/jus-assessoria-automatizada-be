@@ -86,6 +86,12 @@ type userData struct {
 		ID          string `json:"id"`
 		PhoneNumber string `json:"phone_number"`
 	} `json:"phone_numbers"`
+	// unsafe_metadata.phone is where the onboarding wizard stores the phone: a
+	// verified Clerk phone number needs an SMS round-trip, so the FE keeps the
+	// (optional) phone in unsafe metadata. A verified phone_number still wins.
+	UnsafeMetadata struct {
+		Phone string `json:"phone"`
+	} `json:"unsafe_metadata"`
 }
 
 // Handle verifies the svix signature — always, since the webhook is a public
@@ -208,7 +214,8 @@ func primaryPhone(d userData) string {
 	if len(d.PhoneNumbers) > 0 {
 		return d.PhoneNumbers[0].PhoneNumber
 	}
-	return ""
+	// Fallback: the phone the onboarding wizard set in unsafe metadata.
+	return d.UnsafeMetadata.Phone
 }
 
 // fullName joins a Clerk first/last name into the single name app_user stores,
