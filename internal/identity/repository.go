@@ -19,6 +19,12 @@ type Repository interface {
 	FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error)
 	UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error)
+	// UpsertMembership provisions or reactivates the ACTIVE membership linking an
+	// app_user to its tenant, inside the caller's tx. The bool return is `joined`:
+	// true when this is a real join (a new row, or a REMOVED one reactivated), false
+	// when it merely replays an already-ACTIVE membership — the use case emits
+	// member_joined only when true.
+	UpsertMembership(ctx context.Context, tx database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error)
 	// GetMeByClerkUser reads the onboarding read model (tenant + gate) for a Clerk
 	// user. Returns ErrUserNotFound when the user has no tenant yet — the caller
 	// folds that into the "not onboarded" state, it is not a 5xx.
@@ -85,6 +91,33 @@ func (r *pgRepository) UpsertUser(ctx context.Context, tx database.Tx, clerkUser
 		return nil, database.WrapInfra(err)
 	}
 	return userToEntity(row), nil
+}
+
+// UpsertMembership provisions or reactivates the membership inside the caller's tx.
+// tenantID/appUserID are internal uuids (strings on the entity), parsed back here;
+// clerkMembershipID is written as SQL NULL when empty. RETURNING always yields a
+// row, so there is no not-found branch — only the `joined` flag distinguishing a
+// real join from an at-least-once replay.
+func (r *pgRepository) UpsertMembership(ctx context.Context, tx database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, false, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(appUserID)
+	if err != nil {
+		return nil, false, database.WrapInfra(err)
+	}
+
+	row, err := identitydb.New(tx).UpsertMembership(ctx, identitydb.UpsertMembershipParams{
+		TenantID:          tid,
+		AppUserID:         uid,
+		ClerkMembershipID: textToNull(clerkMembershipID),
+		Role:              string(role),
+	})
+	if err != nil {
+		return nil, false, database.WrapInfra(err)
+	}
+	return membershipToEntity(row), row.Joined, nil
 }
 
 func (r *pgRepository) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {

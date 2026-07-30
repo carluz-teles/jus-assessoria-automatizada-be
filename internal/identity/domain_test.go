@@ -17,6 +17,7 @@ type mockRepo struct {
 	upsertTenant     func(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
 	findTenant       func(ctx context.Context, clerkOrgID string) (*Tenant, error)
 	upsertUser       func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
+	upsertMembership func(ctx context.Context, tx database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error)
 	findUser         func(ctx context.Context, clerkUserID string) (*AppUser, error)
 	getMe            func(ctx context.Context, clerkUserID string) (*Me, error)
 	updateOrgProfile func(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error)
@@ -32,6 +33,10 @@ func (m *mockRepo) FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) 
 
 func (m *mockRepo) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error) {
 	return m.upsertUser(ctx, tx, clerkUserID, tenantID, email, name, phone, role)
+}
+
+func (m *mockRepo) UpsertMembership(ctx context.Context, tx database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error) {
+	return m.upsertMembership(ctx, tx, tenantID, appUserID, clerkMembershipID, role)
 }
 
 func (m *mockRepo) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
@@ -320,6 +325,141 @@ func TestUseCase_SyncUser(t *testing.T) {
 		}
 		if uow.called {
 			t.Fatal("unit of work opened despite missing user")
+		}
+	})
+}
+
+func TestUseCase_OnMembershipCreated(t *testing.T) {
+	ctx := context.Background()
+	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
+	user := &AppUser{ID: "user-uuid", ClerkUserID: "user_xyz", TenantID: tenant.ID, Role: RoleLawyer}
+	membership := &Membership{ID: "m-1", TenantID: tenant.ID, AppUserID: user.ID, Role: RoleLawyer, Status: MembershipActive}
+
+	t.Run("new join upserts user + membership and emits member_joined in the same UoW", func(t *testing.T) {
+		var upsertM struct {
+			tenantID, appUserID, clerkMembershipID string
+			role                                   Role
+		}
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, _ string, _ Role) (*AppUser, error) {
+				return user, nil
+			},
+			upsertMembership: func(_ context.Context, _ database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error) {
+				upsertM.tenantID, upsertM.appUserID, upsertM.clerkMembershipID, upsertM.role = tenantID, appUserID, clerkMembershipID, role
+				return membership, true, nil // joined
+			},
+		}
+		outbox := &recordingOutbox{}
+		uow := &fakeUOW{}
+
+		got, err := NewUseCase(repo, outbox, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		if err != nil {
+			t.Fatalf("OnMembershipCreated() error = %v", err)
+		}
+		if got != user {
+			t.Fatalf("OnMembershipCreated() = %+v, want %+v", got, user)
+		}
+		// The membership was upserted under the tenant's RLS scope (barrier 2) with
+		// the internal ids and the clerk membership id.
+		if uow.scope != tenant.ID {
+			t.Fatalf("RLS scope = %q, want %q", uow.scope, tenant.ID)
+		}
+		if upsertM.tenantID != tenant.ID || upsertM.appUserID != user.ID || upsertM.clerkMembershipID != "orgmem_1" || upsertM.role != RoleLawyer {
+			t.Fatalf("UpsertMembership args = %+v", upsertM)
+		}
+		// Exactly one member_joined, published inside the same unit of work.
+		if len(outbox.published) != 1 {
+			t.Fatalf("published %d events, want 1", len(outbox.published))
+		}
+		ev, ok := outbox.published[0].(MemberJoined)
+		if !ok {
+			t.Fatalf("event type = %T, want MemberJoined", outbox.published[0])
+		}
+		if ev.Type() != TypeMemberJoined || ev.AggregateType() != aggregateTypeTenant {
+			t.Fatalf("event ids = (%q, %q)", ev.Type(), ev.AggregateType())
+		}
+		if ev.AggregateID() != tenant.ID || ev.TenantID != tenant.ID || ev.AppUserID != user.ID || ev.Role != RoleLawyer {
+			t.Fatalf("event payload = %+v", ev)
+		}
+		if ev.IdempotencyKey() == "" {
+			t.Fatal("event idempotency key (event id) is empty")
+		}
+	})
+
+	t.Run("replay of an active membership upserts but publishes no event", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return user, nil },
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, _ string, _ Role) (*AppUser, error) {
+				return user, nil
+			},
+			upsertMembership: func(_ context.Context, _ database.Tx, _, _, _ string, _ Role) (*Membership, bool, error) {
+				return membership, false, nil // already ACTIVE — not a real join
+			},
+		}
+		outbox := &recordingOutbox{}
+
+		got, err := NewUseCase(repo, outbox, &fakeUOW{}).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		if err != nil {
+			t.Fatalf("OnMembershipCreated() error = %v", err)
+		}
+		if got != user {
+			t.Fatalf("OnMembershipCreated() = %+v, want %+v", got, user)
+		}
+		if len(outbox.published) != 0 {
+			t.Fatalf("published %d events on replay, want 0", len(outbox.published))
+		}
+	})
+
+	t.Run("a user already in another tenant is refused with a conflict, no tx", func(t *testing.T) {
+		other := &AppUser{ID: "user-uuid", ClerkUserID: "user_xyz", TenantID: "different-tenant", Role: RoleAdmin}
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return other, nil },
+		}
+		uow := &fakeUOW{}
+
+		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		if !errors.Is(err, ErrMembershipConflict) {
+			t.Fatalf("error = %v, want ErrMembershipConflict", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite the multi-org conflict")
+		}
+	})
+
+	t.Run("missing tenant propagates ErrTenantNotFound without opening a tx", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+		}
+		uow := &fakeUOW{}
+
+		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		if !errors.Is(err, ErrTenantNotFound) {
+			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite the missing tenant")
+		}
+	})
+
+	t.Run("invalid role short-circuits before any repo call", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				t.Fatal("FindTenantByClerkOrg must not be called on invalid role")
+				return nil, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "a@b.com", "Ana", "MEMBER")
+		if !errors.Is(err, ErrInvalidRole) {
+			t.Fatalf("error = %v, want ErrInvalidRole", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite invalid role")
 		}
 	})
 }

@@ -102,6 +102,64 @@ func (uc *UseCase) SyncUser(ctx context.Context, clerkUserID, email, name, phone
 	return user, nil
 }
 
+// OnMembershipCreated provisions a user's membership in a tenant from an
+// organizationMembership.created webhook: it upserts the app_user and its ACTIVE
+// membership, and emits identity.member_joined in the SAME transaction the first
+// time the user genuinely joins (a new or reactivated membership) — never on an
+// at-least-once replay of an already-active one.
+//
+// The tenant must already exist (ErrTenantNotFound propagates so Clerk retries a
+// membership event that raced ahead of organization.created). Multi-org is refused
+// up front (1 user = 1 escritório in v0): a Clerk user already living under another
+// tenant yields ErrMembershipConflict rather than a blind upsert that would strand
+// a membership under the wrong tenant.
+func (uc *UseCase) OnMembershipCreated(ctx context.Context, clerkUserID, clerkOrgID, clerkMembershipID, email, name string, role Role) (*AppUser, error) {
+	if !role.Valid() {
+		return nil, ErrInvalidRole
+	}
+
+	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Multi-org guard: refuse a user who already belongs to a different tenant.
+	// A first-time user (ErrUserNotFound) is fine — that is the join we provision.
+	existing, err := uc.repo.FindUserByClerkUser(ctx, clerkUserID)
+	if err != nil && !errors.Is(err, ErrUserNotFound) {
+		return nil, err
+	}
+	if existing != nil && existing.TenantID != tenant.ID {
+		return nil, ErrMembershipConflict
+	}
+
+	var user *AppUser
+	err = uc.uow.Do(ctx, tenant.ID, func(tx database.Tx) error {
+		var err error
+		// Membership events carry no phone; pass empty so the upsert's COALESCE
+		// leaves any phone already synced from user.updated untouched.
+		user, err = uc.repo.UpsertUser(ctx, tx, clerkUserID, tenant.ID, email, name, "", role)
+		if err != nil {
+			return err
+		}
+
+		membership, joined, err := uc.repo.UpsertMembership(ctx, tx, tenant.ID, user.ID, clerkMembershipID, role)
+		if err != nil {
+			return err
+		}
+		// Replay of an already-active membership: the write is idempotent, but the
+		// event must fire once per real join, so skip publishing here.
+		if !joined {
+			return nil
+		}
+		return uc.outbox.Publish(ctx, tx, newMemberJoined(tenant.ID, membership.AppUserID, membership.Role))
+	})
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
 // ResolvePrincipal looks up the local user + tenant behind a verified Clerk JWT
 // and assembles the Principal the auth middleware injects into the request. The
 // TenantID is the internal uuid (from app_user), never the Clerk org id.
@@ -179,5 +237,18 @@ func newOrgProfileUpdated(tenant *Tenant) OrgProfileUpdated {
 		TenantID:  tenant.ID,
 		CNPJ:      tenant.CNPJ,
 		TradeName: tenant.TradeName,
+	}
+}
+
+// newMemberJoined builds the event for a user's join, minting a fresh v7 event id
+// (time-ordered) as the aggregate/idempotency key carrier. The aggregate is the
+// tenant; the payload carries the internal ids and role so a consumer can react
+// without re-reading the membership.
+func newMemberJoined(tenantID, appUserID string, role Role) MemberJoined {
+	return MemberJoined{
+		Base:      events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: tenantID},
+		TenantID:  tenantID,
+		AppUserID: appUserID,
+		Role:      role,
 	}
 }

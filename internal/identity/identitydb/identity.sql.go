@@ -169,6 +169,68 @@ func (q *Queries) UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfilePara
 	return i, err
 }
 
+const upsertMembership = `-- name: UpsertMembership :one
+WITH prev AS (
+    SELECT status FROM membership WHERE tenant_id = $1 AND app_user_id = $2
+)
+INSERT INTO membership (tenant_id, app_user_id, clerk_membership_id, role, status)
+VALUES ($1, $2, $3, $4, 'ACTIVE')
+ON CONFLICT (tenant_id, app_user_id) DO UPDATE
+   SET role                = EXCLUDED.role,
+       clerk_membership_id = EXCLUDED.clerk_membership_id,
+       status              = 'ACTIVE',
+       removed_at          = NULL
+RETURNING id, tenant_id, app_user_id, clerk_membership_id, role, status, joined_at, removed_at, coalesce((SELECT status FROM prev), '') <> 'ACTIVE' AS joined
+`
+
+type UpsertMembershipParams struct {
+	TenantID          uuid.UUID `json:"tenant_id"`
+	AppUserID         uuid.UUID `json:"app_user_id"`
+	ClerkMembershipID *string   `json:"clerk_membership_id"`
+	Role              string    `json:"role"`
+}
+
+type UpsertMembershipRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	AppUserID         uuid.UUID          `json:"app_user_id"`
+	ClerkMembershipID *string            `json:"clerk_membership_id"`
+	Role              string             `json:"role"`
+	Status            string             `json:"status"`
+	JoinedAt          pgtype.Timestamptz `json:"joined_at"`
+	RemovedAt         pgtype.Timestamptz `json:"removed_at"`
+	Joined            bool               `json:"joined"`
+}
+
+// Provision or reactivate a membership from an organizationMembership.created
+// webhook. Idempotent for at-least-once delivery: ON CONFLICT re-asserts the
+// ACTIVE link (role/clerk id refreshed, removed_at cleared). The `joined` flag
+// tells the use case whether this is a genuine join (a brand-new row, or a REMOVED
+// one reactivated) versus a replay of an already-ACTIVE membership — so the
+// member_joined event fires once per real join, not on every retry. prev captures
+// the pre-upsert status: NULL (no row) or 'REMOVED' both differ from 'ACTIVE'.
+func (q *Queries) UpsertMembership(ctx context.Context, arg UpsertMembershipParams) (UpsertMembershipRow, error) {
+	row := q.db.QueryRow(ctx, upsertMembership,
+		arg.TenantID,
+		arg.AppUserID,
+		arg.ClerkMembershipID,
+		arg.Role,
+	)
+	var i UpsertMembershipRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.AppUserID,
+		&i.ClerkMembershipID,
+		&i.Role,
+		&i.Status,
+		&i.JoinedAt,
+		&i.RemovedAt,
+		&i.Joined,
+	)
+	return i, err
+}
+
 const upsertTenant = `-- name: UpsertTenant :one
 
 INSERT INTO tenant (clerk_org_id, name)

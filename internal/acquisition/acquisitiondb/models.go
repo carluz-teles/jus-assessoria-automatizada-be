@@ -145,6 +145,17 @@ type Integration struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type Membership struct {
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	AppUserID         uuid.UUID          `json:"app_user_id"`
+	ClerkMembershipID *string            `json:"clerk_membership_id"`
+	Role              string             `json:"role"`
+	Status            string             `json:"status"`
+	JoinedAt          pgtype.Timestamptz `json:"joined_at"`
+	RemovedAt         pgtype.Timestamptz `json:"removed_at"`
+}
+
 type Notification struct {
 	ID              uuid.UUID   `json:"id"`
 	TenantID        uuid.UUID   `json:"tenant_id"`

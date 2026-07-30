@@ -91,6 +91,38 @@ type AppUser struct {
 	CreatedAt time.Time
 }
 
+// MembershipStatus is the lifecycle of a user's link to a tenant. A text enum
+// validated in the application (CHECK-on-app), not a DB enum type. REMOVED is a
+// soft-delete stamped by a later slice (F2-2); F2-1 only ever writes ACTIVE.
+type MembershipStatus string
+
+const (
+	MembershipActive  MembershipStatus = "ACTIVE"
+	MembershipRemoved MembershipStatus = "REMOVED"
+)
+
+// Valid reports whether s is one of the known statuses. The zero value ("") is
+// invalid on purpose, so an unset status never silently passes as a real one.
+func (s MembershipStatus) Valid() bool {
+	return s == MembershipActive || s == MembershipRemoved
+}
+
+// Membership is the join between an app_user and its tenant — the ACTIVE link an
+// organizationMembership.created webhook provisions. It lives in its own table (not
+// columns on app_user) so removal and role changes (F2-2) mutate the link without
+// touching the user. ClerkMembershipID bridges to Clerk (empty for rows backfilled
+// from pre-existing app_users); RemovedAt is nil until a soft-delete stamps it.
+type Membership struct {
+	ID                string
+	TenantID          string
+	AppUserID         string
+	ClerkMembershipID string
+	Role              Role
+	Status            MembershipStatus
+	JoinedAt          time.Time
+	RemovedAt         *time.Time
+}
+
 // Principal is the authenticated caller resolved from a verified Clerk JWT: who
 // they are (UserID), which escritório they belong to (internal TenantID), and
 // what they may do (Role). The auth middleware (a later slice) builds it via

@@ -59,6 +59,7 @@ type orgData struct {
 }
 
 type membershipData struct {
+	ID           string `json:"id"` // clerk_membership_id — the bridge to this membership
 	Role         string `json:"role"`
 	Organization struct {
 		ID   string `json:"id"`
@@ -140,10 +141,11 @@ func (h *WebhookHandler) dispatch(ctx context.Context, ev clerkEvent) error {
 		if err := json.Unmarshal(ev.Data, &d); err != nil {
 			return apperr.NewInvalid("malformed membership payload")
 		}
-		_, err := h.uc.ProvisionUser(
+		_, err := h.uc.OnMembershipCreated(
 			ctx,
 			d.PublicUserData.UserID,
 			d.Organization.ID,
+			d.ID,
 			d.PublicUserData.Identifier,
 			fullName(d.PublicUserData.FirstName, d.PublicUserData.LastName),
 			mapClerkRole(d.Role),

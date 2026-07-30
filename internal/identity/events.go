@@ -14,6 +14,11 @@ import "github.com/jusassessoria/platform/lib/events"
 // company profile is saved during onboarding. Its aggregate is the tenant.
 const TypeOrgProfileUpdated = "identity.org_profile_updated"
 
+// TypeMemberJoined is the dotted id of the event emitted when a user joins a
+// tenant (an ACTIVE membership is first created or reactivated). Its aggregate is
+// the tenant.
+const TypeMemberJoined = "identity.member_joined"
+
 const aggregateTypeTenant = "tenant"
 
 // TenantProvisioned is emitted after a tenant is created or synced from Clerk.
@@ -44,3 +49,19 @@ var _ events.Event = OrgProfileUpdated{}
 
 func (OrgProfileUpdated) Type() string          { return TypeOrgProfileUpdated }
 func (OrgProfileUpdated) AggregateType() string { return aggregateTypeTenant }
+
+// MemberJoined is emitted, in the same transaction as the membership write, when a
+// user joins a tenant (a new or reactivated ACTIVE membership). The payload carries
+// the internal ids and the role so a consumer can react without re-reading the
+// membership. Base adds the event id (consumer dedup) and the aggregate id (tenant).
+type MemberJoined struct {
+	events.Base
+	TenantID  string `json:"tenant_id"`
+	AppUserID string `json:"app_user_id"`
+	Role      Role   `json:"role"`
+}
+
+var _ events.Event = MemberJoined{}
+
+func (MemberJoined) Type() string          { return TypeMemberJoined }
+func (MemberJoined) AggregateType() string { return aggregateTypeTenant }

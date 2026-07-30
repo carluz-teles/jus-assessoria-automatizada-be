@@ -65,23 +65,33 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		}
 	})
 
-	t.Run("organizationMembership.created provisions the user with the mapped role", func(t *testing.T) {
+	t.Run("organizationMembership.created provisions the user + membership with the mapped role", func(t *testing.T) {
 		var got struct {
 			clerkUserID, tenantID, email, name string
 			role                               Role
+		}
+		var gotMembership struct {
+			clerkMembershipID string
+			role              Role
 		}
 		repo := &mockRepo{
 			findTenant: func(context.Context, string) (*Tenant, error) {
 				return &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}, nil
 			},
+			findUser: func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
 			upsertUser: func(_ context.Context, _ database.Tx, clerkUserID, tenantID, email, name, _ string, role Role) (*AppUser, error) {
 				got.clerkUserID, got.tenantID, got.email, got.name, got.role = clerkUserID, tenantID, email, name, role
-				return &AppUser{ID: "u-1", ClerkUserID: clerkUserID}, nil
+				return &AppUser{ID: "u-1", ClerkUserID: clerkUserID, TenantID: tenantID, Role: role}, nil
+			},
+			upsertMembership: func(_ context.Context, _ database.Tx, _, _, clerkMembershipID string, role Role) (*Membership, bool, error) {
+				gotMembership.clerkMembershipID, gotMembership.role = clerkMembershipID, role
+				return &Membership{ID: "m-1", AppUserID: "u-1", Role: role, Status: MembershipActive}, true, nil
 			},
 		}
 		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
 
 		body := []byte(`{"type":"organizationMembership.created","data":{` +
+			`"id":"orgmem_1",` +
 			`"role":"org:admin",` +
 			`"organization":{"id":"org_abc","name":"Escritório"},` +
 			`"public_user_data":{"user_id":"user_xyz","identifier":"ana@b.com","first_name":"Ana","last_name":"Lima"}}}`)
@@ -95,6 +105,10 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		}
 		if got.role != RoleAdmin {
 			t.Fatalf("role = %q, want ADMIN (org:admin maps to admin)", got.role)
+		}
+		// The membership carries the clerk membership id (data.id) and the mapped role.
+		if gotMembership.clerkMembershipID != "orgmem_1" || gotMembership.role != RoleAdmin {
+			t.Fatalf("UpsertMembership args = %+v", gotMembership)
 		}
 	})
 

@@ -12,4 +12,8 @@ var (
 	ErrUserNotFound = apperr.NewNotFound("user not found")
 	// ErrInvalidRole — a role outside {ADMIN, LAWYER} (→ 400).
 	ErrInvalidRole = apperr.NewInvalid("invalid role")
+	// ErrMembershipConflict — a Clerk user already belongs to another tenant (1
+	// user = 1 escritório in v0); a membership.created for a different org is
+	// refused rather than silently moving the user (→ 409).
+	ErrMembershipConflict = apperr.NewConflict("user already belongs to another organization")
 )
