@@ -24,6 +24,7 @@ var statusByKind = map[apperr.Kind]int{
 	apperr.KindNotFound:     fiber.StatusNotFound,            // 404
 	apperr.KindConflict:     fiber.StatusConflict,            // 409
 	apperr.KindInfra:        fiber.StatusInternalServerError, // 500
+	apperr.KindUnavailable:  fiber.StatusServiceUnavailable,  // 503
 }
 
 // ErrorBody is the single client-facing error envelope (§4.4): {kind, message,

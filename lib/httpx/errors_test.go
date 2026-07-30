@@ -92,6 +92,12 @@ func TestWriteError_KindMapsToStatus(t *testing.T) {
 			wantStatus: http.StatusConflict,
 			wantKind:   string(apperr.KindConflict),
 		},
+		{
+			name:       "unavailable",
+			err:        apperr.NewUnavailable("provedor indisponível", nil),
+			wantStatus: http.StatusServiceUnavailable,
+			wantKind:   string(apperr.KindUnavailable),
+		},
 	}
 
 	for _, tt := range tests {
@@ -152,6 +158,31 @@ func TestWriteError_PlainErrorIsGeneric500(t *testing.T) {
 	// The cause MUST NOT leak into the client payload.
 	if strings.Contains(raw, "hunter2") || strings.Contains(raw, "10.0.0.1") {
 		t.Errorf("cause leaked into body: %s", raw)
+	}
+}
+
+func TestWriteError_UnavailableHidesUpstreamCause(t *testing.T) {
+	t.Parallel()
+
+	// 503 is a 5xx: the upstream cause is logged, never sent. The client gets the
+	// Kind (so it can retry) and a generic message — no raw provider detail leaks.
+	const upstream = "brasilapi 500: internal upstream trace"
+
+	status, body, raw := runHandler(t, func(c *fiber.Ctx) error {
+		return httpx.WriteError(c, apperr.NewUnavailable("registry unavailable", errors.New(upstream)))
+	})
+
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
+	}
+	if body.Kind != string(apperr.KindUnavailable) {
+		t.Errorf("kind = %q, want %q", body.Kind, apperr.KindUnavailable)
+	}
+	if body.Message != "internal error" {
+		t.Errorf("message = %q, want generic %q", body.Message, "internal error")
+	}
+	if strings.Contains(raw, "upstream trace") || strings.Contains(raw, "brasilapi") {
+		t.Errorf("upstream cause leaked into body: %s", raw)
 	}
 }
 

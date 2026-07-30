@@ -128,6 +128,91 @@ func TestAuth_Rejects(t *testing.T) {
 	}
 }
 
+func TestAuthUser_ValidTokenInjectsClerkUserIDAndContinues(t *testing.T) {
+	t.Parallel()
+
+	// A verified token but NO resolver: AuthUser must not require a tenant, so a
+	// signed-up user with no org still reaches the handler (the onboarding case).
+	v := fakeVerifier{userID: "user_onboarding", orgID: "", role: ""}
+
+	app := fiber.New()
+	app.Get("/v1/lookup/cnpj/x", middleware.AuthUser(v), func(c *fiber.Ctx) error {
+		id, ok := httpx.ClerkUserIDFromCtx(c)
+		if !ok {
+			return c.SendStatus(fiber.StatusInternalServerError)
+		}
+		// No Principal is set — AuthUser never resolves a tenant.
+		if _, hasPrincipal := httpx.PrincipalFromCtx(c); hasPrincipal {
+			return c.SendStatus(fiber.StatusInternalServerError)
+		}
+		return c.SendString(id)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/lookup/cnpj/x", nil)
+	req.Header.Set(fiber.HeaderAuthorization, "Bearer any.jwt.here")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "user_onboarding" {
+		t.Fatalf("clerk user id = %q, want user_onboarding", body)
+	}
+}
+
+func TestAuthUser_Rejects(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		authHeader string
+		verifier   fakeVerifier
+	}{
+		{
+			name:       "missing bearer is 401",
+			authHeader: "",
+		},
+		{
+			name:       "verifier error is 401",
+			authHeader: "Bearer bad.jwt",
+			verifier:   fakeVerifier{err: apperr.NewUnauthorized("boom")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			app := fiber.New()
+			app.Get("/v1/lookup/cep/x", middleware.AuthUser(tt.verifier), func(c *fiber.Ctx) error {
+				return c.SendStatus(fiber.StatusOK) // must never be reached
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/v1/lookup/cep/x", nil)
+			if tt.authHeader != "" {
+				req.Header.Set(fiber.HeaderAuthorization, tt.authHeader)
+			}
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", resp.StatusCode)
+			}
+			if got := decodeKind(t, resp.Body); got != string(apperr.KindUnauthorized) {
+				t.Fatalf("error kind = %q, want %q", got, apperr.KindUnauthorized)
+			}
+		})
+	}
+}
+
 func TestRequireRole(t *testing.T) {
 	t.Parallel()
 

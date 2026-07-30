@@ -23,6 +23,10 @@ const (
 	KindNotFound     Kind = "ENTITY_NOT_FOUND"
 	KindConflict     Kind = "CONFLICT"
 	KindInfra        Kind = "INFRA_ERROR"
+	// KindUnavailable is a dependency the request needs — a third-party API, an
+	// upstream service — being unreachable or failing (→ 503 at the edge). Unlike
+	// KindInfra it is not a bug in our code: the caller may simply retry later.
+	KindUnavailable Kind = "SERVICE_UNAVAILABLE"
 )
 
 // AppError is a typed application error. Message is safe to expose to the
@@ -75,6 +79,13 @@ func NewConflict(msg string) *AppError { return &AppError{Kind: KindConflict, Me
 // errors.Is/As and for logging at the edge, but never exposed to the client.
 func NewInfra(msg string, cause error) *AppError {
 	return &AppError{Kind: KindInfra, Message: msg, cause: cause}
+}
+
+// NewUnavailable reports that an external dependency is unreachable or failing
+// (→ 503). The cause is preserved for errors.Is/As and for logging at the edge —
+// the client sees only the Kind, never the upstream's raw status or body.
+func NewUnavailable(msg string, cause error) *AppError {
+	return &AppError{Kind: KindUnavailable, Message: msg, cause: cause}
 }
 
 // From extracts an *AppError from anywhere in err's chain. Call sites may also

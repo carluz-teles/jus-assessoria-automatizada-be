@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/jusassessoria/platform/internal/identity"
+	"github.com/jusassessoria/platform/internal/lookup"
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/telemetry"
 )
@@ -44,6 +46,27 @@ func newTestRouterDeps() routerDeps {
 		// free of a real UseCase.
 		webhook: nil,
 	}
+}
+
+// erroringResolver fails every resolution, standing in for a user whose tenant
+// cannot be resolved (the onboarding case). Any route that runs tenant Auth turns
+// this into a 401; a route that runs AuthUser never calls it.
+type erroringResolver struct{}
+
+func (erroringResolver) Resolve(context.Context, string, string) (httpx.Principal, error) {
+	return httpx.Principal{}, apperr.NewNotFound("no tenant for user")
+}
+
+// stubRegistry is a lookup.RegistryLookup that always succeeds, so the lookup
+// route reaches 200 whenever auth lets it through.
+type stubRegistry struct{}
+
+func (stubRegistry) LookupCNPJ(context.Context, string) (lookup.Company, error) {
+	return lookup.Company{CNPJ: "19131243000197"}, nil
+}
+
+func (stubRegistry) LookupCEP(context.Context, string) (lookup.Address, error) {
+	return lookup.Address{CEP: "01311902"}, nil
 }
 
 func TestNewRouter_Health_Returns200(t *testing.T) {
@@ -84,6 +107,59 @@ func TestNewRouter_V1_RequiresAuth(t *testing.T) {
 
 	if resp.StatusCode != 401 {
 		t.Fatalf("GET /v1/ping without token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// The onboarding lookup subtree authenticates WITHOUT a tenant: with a resolver
+// that would 401 any tenant route, a valid-token request to /v1/lookup must still
+// reach the handler (200), while a tenant route (/v1/ping) with the same token is
+// 401. This proves AuthUser is scoped to /v1/lookup and Auth guards the rest.
+func TestNewRouter_Lookup_AuthenticatesWithoutTenant(t *testing.T) {
+	deps := newTestRouterDeps()
+	deps.resolver = erroringResolver{}
+	deps.lookup = lookup.NewHandler(stubRegistry{})
+	app := newRouter(deps)
+
+	// Valid token, no resolvable tenant → lookup still succeeds.
+	reqLookup := httptest.NewRequest("GET", "/v1/lookup/cnpj/19131243000197", nil)
+	reqLookup.Header.Set("Authorization", "Bearer any.jwt.here")
+	respLookup, err := app.Test(reqLookup)
+	if err != nil {
+		t.Fatalf("app.Test(lookup): %v", err)
+	}
+	defer respLookup.Body.Close()
+	if respLookup.StatusCode != 200 {
+		t.Fatalf("GET /v1/lookup/cnpj with token status = %d, want 200", respLookup.StatusCode)
+	}
+
+	// Same token on a tenant route → tenant Auth runs, resolver fails → 401.
+	reqPing := httptest.NewRequest("GET", "/v1/ping", nil)
+	reqPing.Header.Set("Authorization", "Bearer any.jwt.here")
+	respPing, err := app.Test(reqPing)
+	if err != nil {
+		t.Fatalf("app.Test(ping): %v", err)
+	}
+	defer respPing.Body.Close()
+	if respPing.StatusCode != 401 {
+		t.Fatalf("GET /v1/ping with unresolvable tenant status = %d, want 401", respPing.StatusCode)
+	}
+}
+
+// A lookup route with no bearer token must be rejected by AuthUser (401) before
+// reaching the handler — the subtree is authenticated, just tenant-less.
+func TestNewRouter_Lookup_RequiresToken(t *testing.T) {
+	deps := newTestRouterDeps()
+	deps.lookup = lookup.NewHandler(stubRegistry{})
+	app := newRouter(deps)
+
+	req := httptest.NewRequest("GET", "/v1/lookup/cnpj/19131243000197", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("GET /v1/lookup/cnpj without token status = %d, want 401", resp.StatusCode)
 	}
 }
 

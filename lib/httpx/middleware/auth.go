@@ -66,6 +66,33 @@ func Auth(v TokenVerifier, r PrincipalResolver) fiber.Handler {
 	}
 }
 
+// AuthUser is the tenant-less authentication middleware for the onboarding
+// endpoints the wizard hits BEFORE an escritório (tenant) exists — e.g. the
+// CNPJ/CEP lookups in step 2. It verifies the Clerk JWT with the SAME
+// TokenVerifier as Auth, but stops there: it does NOT call Resolve and does NOT
+// require a tenant, so a freshly-signed-up user with no org still passes. A
+// missing or invalid token is a 401, exactly like Auth; a valid one injects the
+// Clerk user id as a session marker (ClerkUserIDFromCtx) and continues.
+//
+// It shares bearerToken and the 401 semantics with Auth on purpose; the only
+// difference is the absent principal resolution.
+func AuthUser(v TokenVerifier) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		bearer := bearerToken(c)
+		if bearer == "" {
+			return httpx.WriteError(c, apperr.NewUnauthorized("missing bearer token"))
+		}
+
+		userID, _, _, err := v.Verify(c.UserContext(), bearer)
+		if err != nil {
+			return httpx.WriteError(c, apperr.NewUnauthorized("invalid token"))
+		}
+
+		httpx.SetClerkUserID(c, userID)
+		return c.Next()
+	}
+}
+
 // RequireRole guards a route by product role (docs §4d.5). It reads the Principal
 // Auth injected and answers 403 when the role does not match. A missing Principal
 // means Auth did not run ahead of this guard — that is a 401, not a 403.

@@ -54,6 +54,12 @@ func TestConstructors_SetKindAndMessage(t *testing.T) {
 			wantKind: apperr.KindInfra,
 			wantMsg:  "erro interno",
 		},
+		{
+			name:     "unavailable",
+			build:    func() *apperr.AppError { return apperr.NewUnavailable("provedor indisponível", errors.New("timeout")) },
+			wantKind: apperr.KindUnavailable,
+			wantMsg:  "provedor indisponível",
+		},
 	}
 
 	for _, tt := range tests {
@@ -86,6 +92,7 @@ func TestKind_Values(t *testing.T) {
 		{apperr.KindNotFound, "ENTITY_NOT_FOUND"},
 		{apperr.KindConflict, "CONFLICT"},
 		{apperr.KindInfra, "INFRA_ERROR"},
+		{apperr.KindUnavailable, "SERVICE_UNAVAILABLE"},
 	}
 
 	for _, tt := range tests {

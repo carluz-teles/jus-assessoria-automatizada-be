@@ -16,6 +16,7 @@ import (
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/identity"
+	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -99,6 +100,11 @@ func run(logger *slog.Logger) error {
 		acquisition.NewUseCase(acquisition.NewRepository(pool), events.NewOutbox(), uow),
 	)
 
+	// Lookup wiring: a stateless proxy over the BrasilAPI registry. No pool, no
+	// outbox — the slice owns only an HTTP port; the binary just injects the
+	// client and mounts the handler.
+	lookupHandler := lookup.NewHandler(lookup.NewBrasilAPIClient())
+
 	// Storage is optional at v0: only wired when S3 is fully configured. No route
 	// consumes it yet — the upload slice injects it — so it is built to fail fast
 	// on bad credentials at boot and logged as ready.
@@ -122,6 +128,7 @@ func run(logger *slog.Logger) error {
 		resolver:    resolver,
 		webhook:     webhook,
 		acquisition: acquisitionHandler,
+		lookup:      lookupHandler,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext
