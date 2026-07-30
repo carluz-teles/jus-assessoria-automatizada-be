@@ -39,6 +39,33 @@ func (q *Queries) FindByStripeCustomer(ctx context.Context, stripeCustomerID *st
 	return i, err
 }
 
+const findByTenant = `-- name: FindByTenant :one
+SELECT id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at FROM subscription
+WHERE tenant_id = $1
+`
+
+// Read the tenant's own subscription projection (Stripe Customer = tenant, one row
+// per tenant). Backs the read-model endpoint (GET /v1/billing/subscription) and the
+// checkout/portal flows that need the stored stripe_customer_id. Scoped by tenant_id
+// (WHERE + RLS). No row → the caller maps pgx.ErrNoRows to a typed not-found.
+func (q *Queries) FindByTenant(ctx context.Context, tenantID uuid.UUID) (Subscription, error) {
+	row := q.db.QueryRow(ctx, findByTenant, tenantID)
+	var i Subscription
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.StripeCustomerID,
+		&i.StripeSubscriptionID,
+		&i.Status,
+		&i.Plan,
+		&i.CurrentPeriodEnd,
+		&i.ActiveProcessLimit,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const updateSubscriptionStatus = `-- name: UpdateSubscriptionStatus :one
 UPDATE subscription
    SET status = $2,

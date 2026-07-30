@@ -6,6 +6,8 @@ package billingdb
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 type Querier interface {
@@ -14,6 +16,11 @@ type Querier interface {
 	// tenant_id metadata — the customer→tenant mapping was persisted at subscription
 	// creation. No row → typed not-found (the caller retries).
 	FindByStripeCustomer(ctx context.Context, stripeCustomerID *string) (Subscription, error)
+	// Read the tenant's own subscription projection (Stripe Customer = tenant, one row
+	// per tenant). Backs the read-model endpoint (GET /v1/billing/subscription) and the
+	// checkout/portal flows that need the stored stripe_customer_id. Scoped by tenant_id
+	// (WHERE + RLS). No row → the caller maps pgx.ErrNoRows to a typed not-found.
+	FindByTenant(ctx context.Context, tenantID uuid.UUID) (Subscription, error)
 	// Flip only the lifecycle status (a customer.subscription.deleted → canceled, an
 	// invoice.payment_failed → past_due). It leaves plan / active_process_limit /
 	// current_period_end untouched: those events carry no catalog data, so a status-only

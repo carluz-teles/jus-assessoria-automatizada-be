@@ -19,6 +19,7 @@ type mockRepo struct {
 	upsert         func(ctx context.Context, tx database.Tx, params UpsertParams) (*Subscription, error)
 	updateStatus   func(ctx context.Context, tx database.Tx, tenantID string, status Status) (*Subscription, error)
 	findByCustomer func(ctx context.Context, stripeCustomerID string) (*Subscription, error)
+	findByTenant   func(ctx context.Context, tenantID string) (*Subscription, error)
 }
 
 func (m *mockRepo) UpsertSubscription(ctx context.Context, tx database.Tx, params UpsertParams) (*Subscription, error) {
@@ -33,11 +34,22 @@ func (m *mockRepo) FindByStripeCustomer(ctx context.Context, stripeCustomerID st
 	return m.findByCustomer(ctx, stripeCustomerID)
 }
 
-// mockGateway is a StripeGateway double: verify returns the event a test crafts
-// (so no real signing is needed), resolvePlan the plan a test wants.
+func (m *mockRepo) FindByTenant(ctx context.Context, tenantID string) (*Subscription, error) {
+	return m.findByTenant(ctx, tenantID)
+}
+
+// mockGateway is a StripeGateway double: each method delegates to a func field so
+// a test injects only the behavior its path needs (an unset field nil-panics,
+// proving that path was not expected). verify returns the event a webhook test
+// crafts (no real signing), resolvePlan the plan; the 4-B fields drive the
+// checkout/portal/plans use cases.
 type mockGateway struct {
-	verify      func(payload []byte, sigHeader string) (StripeEvent, error)
-	resolvePlan func(ctx context.Context, priceID string) (string, int, error)
+	verify         func(payload []byte, sigHeader string) (StripeEvent, error)
+	resolvePlan    func(ctx context.Context, priceID string) (string, int, error)
+	ensureCustomer func(ctx context.Context, tenantID string) (string, error)
+	createCheckout func(ctx context.Context, params CheckoutParams) (string, error)
+	createPortal   func(ctx context.Context, customerID, returnURL string) (string, error)
+	listPlans      func(ctx context.Context) ([]Plan, error)
 }
 
 func (m *mockGateway) VerifyWebhook(payload []byte, sigHeader string) (StripeEvent, error) {
@@ -46,6 +58,22 @@ func (m *mockGateway) VerifyWebhook(payload []byte, sigHeader string) (StripeEve
 
 func (m *mockGateway) ResolvePlan(ctx context.Context, priceID string) (string, int, error) {
 	return m.resolvePlan(ctx, priceID)
+}
+
+func (m *mockGateway) EnsureCustomer(ctx context.Context, tenantID string) (string, error) {
+	return m.ensureCustomer(ctx, tenantID)
+}
+
+func (m *mockGateway) CreateCheckoutSession(ctx context.Context, params CheckoutParams) (string, error) {
+	return m.createCheckout(ctx, params)
+}
+
+func (m *mockGateway) CreatePortalSession(ctx context.Context, customerID, returnURL string) (string, error) {
+	return m.createPortal(ctx, customerID, returnURL)
+}
+
+func (m *mockGateway) ListPlans(ctx context.Context) ([]Plan, error) {
+	return m.listPlans(ctx)
 }
 
 // fakeUOW is a no-op unit of work: it records the RLS scope the use case asked
@@ -402,6 +430,207 @@ func TestUseCase_HandleWebhook_InvalidSignaturePropagates(t *testing.T) {
 	// AC2: a verification failure surfaces the typed error (the edge maps it to 400).
 	if err := uc.HandleWebhook(context.Background(), []byte(`{}`), "bad"); !errors.Is(err, ErrInvalidSignature) {
 		t.Fatalf("err = %v, want ErrInvalidSignature", err)
+	}
+}
+
+// --- checkout / portal / read-model use cases (fatia 4-B) -------------------
+
+// checkoutCfg is a fixed CheckoutConfig the endpoint use cases redirect through.
+var checkoutCfg = CheckoutConfig{
+	SuccessURL: "https://app/success",
+	CancelURL:  "https://app/cancel",
+	ReturnURL:  "https://app/billing",
+	TrialDays:  14,
+}
+
+// AC1: no prior subscription → a fresh Customer is provisioned, then Checkout is
+// created with the config URLs/trial and the tenant stamped on the params.
+func TestUseCase_StartCheckout_NoSubscription_EnsuresCustomer(t *testing.T) {
+	var gotParams CheckoutParams
+	var ensuredTenant string
+	repo := &mockRepo{
+		findByTenant: func(context.Context, string) (*Subscription, error) {
+			return nil, ErrSubscriptionNotFound
+		},
+	}
+	gw := &mockGateway{
+		ensureCustomer: func(_ context.Context, tenantID string) (string, error) {
+			ensuredTenant = tenantID
+			return "cus_new", nil
+		},
+		createCheckout: func(_ context.Context, p CheckoutParams) (string, error) {
+			gotParams = p
+			return "https://checkout/session", nil
+		},
+	}
+	uc := NewUseCase(repo, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithCheckoutConfig(checkoutCfg))
+
+	url, err := uc.StartCheckout(context.Background(), "tenant-1", "price_1")
+	if err != nil {
+		t.Fatalf("StartCheckout: %v", err)
+	}
+	if url != "https://checkout/session" {
+		t.Fatalf("url = %q", url)
+	}
+	if ensuredTenant != "tenant-1" {
+		t.Fatalf("EnsureCustomer tenant = %q, want tenant-1", ensuredTenant)
+	}
+	if gotParams.CustomerID != "cus_new" || gotParams.PriceID != "price_1" || gotParams.TenantID != "tenant-1" {
+		t.Fatalf("checkout params = %+v", gotParams)
+	}
+	if gotParams.SuccessURL != checkoutCfg.SuccessURL || gotParams.CancelURL != checkoutCfg.CancelURL || gotParams.TrialDays != 14 {
+		t.Fatalf("checkout config not forwarded: %+v", gotParams)
+	}
+}
+
+// AC1: a canceled subscription still holds its Stripe customer id — re-subscribing
+// reuses it instead of provisioning a second Customer.
+func TestUseCase_StartCheckout_ReusesStoredCustomer(t *testing.T) {
+	var gotParams CheckoutParams
+	repo := &mockRepo{
+		findByTenant: func(context.Context, string) (*Subscription, error) {
+			return &Subscription{TenantID: "tenant-1", StripeCustomerID: "cus_old", Status: StatusCanceled}, nil
+		},
+	}
+	gw := &mockGateway{
+		ensureCustomer: func(context.Context, string) (string, error) {
+			t.Fatal("EnsureCustomer ran despite a stored customer id")
+			return "", nil
+		},
+		createCheckout: func(_ context.Context, p CheckoutParams) (string, error) {
+			gotParams = p
+			return "https://checkout/session", nil
+		},
+	}
+	uc := NewUseCase(repo, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithCheckoutConfig(checkoutCfg))
+
+	if _, err := uc.StartCheckout(context.Background(), "tenant-1", "price_1"); err != nil {
+		t.Fatalf("StartCheckout: %v", err)
+	}
+	if gotParams.CustomerID != "cus_old" {
+		t.Fatalf("customer id = %q, want the stored cus_old", gotParams.CustomerID)
+	}
+}
+
+// AC1: a live subscription (active/trialing) refuses a second checkout with 409.
+func TestUseCase_StartCheckout_AlreadySubscribed_Conflicts(t *testing.T) {
+	for _, status := range []Status{StatusActive, StatusTrialing} {
+		t.Run(string(status), func(t *testing.T) {
+			repo := &mockRepo{
+				findByTenant: func(context.Context, string) (*Subscription, error) {
+					return &Subscription{TenantID: "tenant-1", StripeCustomerID: "cus_1", Status: status}, nil
+				},
+			}
+			gw := &mockGateway{
+				createCheckout: func(context.Context, CheckoutParams) (string, error) {
+					t.Fatal("checkout created despite a live subscription")
+					return "", nil
+				},
+			}
+			uc := NewUseCase(repo, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithCheckoutConfig(checkoutCfg))
+
+			if _, err := uc.StartCheckout(context.Background(), "tenant-1", "price_1"); !errors.Is(err, ErrAlreadySubscribed) {
+				t.Fatalf("err = %v, want ErrAlreadySubscribed", err)
+			}
+		})
+	}
+}
+
+// AC2: a stored customer opens the portal with the config return URL.
+func TestUseCase_OpenPortal_Opens(t *testing.T) {
+	var gotCustomer, gotReturn string
+	repo := &mockRepo{
+		findByTenant: func(context.Context, string) (*Subscription, error) {
+			return &Subscription{TenantID: "tenant-1", StripeCustomerID: "cus_1", Status: StatusActive}, nil
+		},
+	}
+	gw := &mockGateway{
+		createPortal: func(_ context.Context, customerID, returnURL string) (string, error) {
+			gotCustomer, gotReturn = customerID, returnURL
+			return "https://portal/session", nil
+		},
+	}
+	uc := NewUseCase(repo, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithCheckoutConfig(checkoutCfg))
+
+	url, err := uc.OpenPortal(context.Background(), "tenant-1")
+	if err != nil {
+		t.Fatalf("OpenPortal: %v", err)
+	}
+	if url != "https://portal/session" || gotCustomer != "cus_1" || gotReturn != checkoutCfg.ReturnURL {
+		t.Fatalf("portal url=%q customer=%q return=%q", url, gotCustomer, gotReturn)
+	}
+}
+
+// AC2: a tenant that never checked out (no subscription, or a row without a
+// customer id) has nothing to manage → ErrNoStripeCustomer (404), no Stripe call.
+func TestUseCase_OpenPortal_NoCustomer(t *testing.T) {
+	tests := []struct {
+		name string
+		find func(context.Context, string) (*Subscription, error)
+	}{
+		{
+			name: "no subscription row",
+			find: func(context.Context, string) (*Subscription, error) { return nil, ErrSubscriptionNotFound },
+		},
+		{
+			name: "row without a stored customer id",
+			find: func(context.Context, string) (*Subscription, error) {
+				return &Subscription{TenantID: "tenant-1", Status: StatusCanceled}, nil
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := &mockGateway{
+				createPortal: func(context.Context, string, string) (string, error) {
+					t.Fatal("portal opened without a customer")
+					return "", nil
+				},
+			}
+			uc := NewUseCase(&mockRepo{findByTenant: tt.find}, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithCheckoutConfig(checkoutCfg))
+
+			if _, err := uc.OpenPortal(context.Background(), "tenant-1"); !errors.Is(err, ErrNoStripeCustomer) {
+				t.Fatalf("err = %v, want ErrNoStripeCustomer", err)
+			}
+		})
+	}
+}
+
+// AC3: GetSubscription reads the local projection — no Stripe call at request time.
+func TestUseCase_GetSubscription_ReadsLocalProjection(t *testing.T) {
+	want := &Subscription{TenantID: "tenant-1", Plan: "pro", Status: StatusActive, ActiveProcessLimit: 50}
+	repo := &mockRepo{
+		findByTenant: func(_ context.Context, tenantID string) (*Subscription, error) {
+			if tenantID != "tenant-1" {
+				t.Fatalf("tenant = %q, want tenant-1", tenantID)
+			}
+			return want, nil
+		},
+	}
+	// An empty gateway proves no Stripe call happens on the read path.
+	uc := NewUseCase(repo, &mockGateway{}, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	got, err := uc.GetSubscription(context.Background(), "tenant-1")
+	if err != nil {
+		t.Fatalf("GetSubscription: %v", err)
+	}
+	if got != want {
+		t.Fatalf("got = %+v, want %+v", got, want)
+	}
+}
+
+// AC4: ListPlans passes the Stripe catalog through unchanged.
+func TestUseCase_ListPlans_ReturnsCatalog(t *testing.T) {
+	want := []Plan{{PriceID: "price_1", Name: "Pro", Amount: 4990, Interval: "month", ActiveProcessLimit: 50}}
+	gw := &mockGateway{listPlans: func(context.Context) ([]Plan, error) { return want, nil }}
+	uc := NewUseCase(&mockRepo{}, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	got, err := uc.ListPlans(context.Background())
+	if err != nil {
+		t.Fatalf("ListPlans: %v", err)
+	}
+	if len(got) != 1 || got[0].PriceID != "price_1" || got[0].ActiveProcessLimit != 50 {
+		t.Fatalf("plans = %+v", got)
 	}
 }
 

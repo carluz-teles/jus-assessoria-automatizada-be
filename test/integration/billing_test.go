@@ -44,6 +44,25 @@ func (g stubGateway) ResolvePlan(context.Context, string) (string, int, error) {
 	return g.plan, g.limit, nil
 }
 
+// The 4-B endpoint methods are unused by the webhook/read-model projection tests
+// below (they drive Stripe, which stays out of the container), so they are inert
+// here — present only to satisfy billing.StripeGateway.
+func (g stubGateway) EnsureCustomer(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (g stubGateway) CreateCheckoutSession(context.Context, billing.CheckoutParams) (string, error) {
+	return "", nil
+}
+
+func (g stubGateway) CreatePortalSession(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (g stubGateway) ListPlans(context.Context) ([]billing.Plan, error) {
+	return nil, nil
+}
+
 // newBillingUC wires the billing use case against the real container with the
 // given (stubbed) gateway.
 func newBillingUC(pool *pgxpool.Pool, gw billing.StripeGateway) *billing.UseCase {
@@ -205,6 +224,44 @@ func TestBilling_SubscriptionCreated_PublishFailRollsBackAll(t *testing.T) {
 	}
 	if got := countBillingProcessedEvent(t, pool, "billing", "evt_rollback_1"); got != 0 {
 		t.Fatalf("processed_event rows after rollback = %d, want 0", got)
+	}
+}
+
+// AC3/AC6: GetSubscription reads the tenant's projection back from REAL Postgres
+// (FindByTenant on the pool) — the read model the endpoint serves without any
+// Stripe call. A tenant that never checked out gets ErrSubscriptionNotFound.
+func TestBilling_GetSubscription_ReadsProjectionFromPostgres(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-billing-getsub", 0)
+
+	periodEnd := time.Unix(1893456000, 0).UTC()
+	gw := stubGateway{event: createdEvent("evt_getsub_1", tenantID, periodEnd), plan: "pro", limit: 50}
+	uc := newBillingUC(pool, gw)
+
+	// A missing tenant is the typed not-found, never (nil, nil).
+	if _, err := uc.GetSubscription(ctx, tenantID); !errors.Is(err, billing.ErrSubscriptionNotFound) {
+		t.Fatalf("GetSubscription before checkout = %v, want ErrSubscriptionNotFound", err)
+	}
+
+	// Project the subscription via the webhook, then read it back.
+	if err := uc.HandleWebhook(ctx, nil, ""); err != nil {
+		t.Fatalf("HandleWebhook: %v", err)
+	}
+
+	sub, err := uc.GetSubscription(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("GetSubscription: %v", err)
+	}
+	if sub.TenantID != tenantID || sub.Plan != "pro" || sub.Status != billing.StatusActive || sub.ActiveProcessLimit != 50 {
+		t.Fatalf("read model = %+v", sub)
+	}
+	if sub.StripeCustomerID != "cus_"+tenantID {
+		t.Fatalf("stripe customer id = %q, want cus_%s", sub.StripeCustomerID, tenantID)
+	}
+	if sub.CurrentPeriodEnd == nil || !sub.CurrentPeriodEnd.Equal(periodEnd) {
+		t.Fatalf("period end = %v, want %v", sub.CurrentPeriodEnd, periodEnd)
 	}
 }
 

@@ -16,10 +16,11 @@ const (
 	EventCheckoutCompleted   = "checkout.session.completed"
 )
 
-// StripeGateway is the port over Stripe: it verifies inbound webhooks and reads
-// the plan catalog. The domain depends on this interface only — the concrete
-// implementation (stripeGateway) owns the stripe-go dependency, so entity.go /
-// domain.go never import the SDK (docs §4b: the slice's core stays pure).
+// StripeGateway is the port over Stripe: it verifies inbound webhooks, reads the
+// plan catalog and — for the checkout/portal endpoints (fatia 4-B) — provisions
+// customers and hosted sessions. The domain depends on this interface only; the
+// concrete implementation (stripeGateway) owns the stripe-go dependency, so
+// entity.go / domain.go never import the SDK (docs §4b: the slice's core stays pure).
 type StripeGateway interface {
 	// VerifyWebhook checks the Stripe-Signature header against the signing secret
 	// over the RAW body and decodes the event into the SDK-agnostic StripeEvent.
@@ -31,6 +32,49 @@ type StripeGateway interface {
 	// product behind a price id (the catalog lives in Stripe product metadata).
 	// A missing/zero active_process_limit is ErrPlanUnresolved.
 	ResolvePlan(ctx context.Context, priceID string) (plan string, activeProcessLimit int, err error)
+	// EnsureCustomer creates a Stripe Customer stamped with metadata.tenant_id so a
+	// later webhook can recover the tenant from the customer→tenant mapping. The
+	// caller (StartCheckout) reuses the customer id already stored on the tenant's
+	// subscription when present and only calls this for a tenant that has none yet.
+	EnsureCustomer(ctx context.Context, tenantID string) (customerID string, err error)
+	// CreateCheckoutSession opens a hosted Stripe Checkout in subscription mode for
+	// the customer/price and returns the redirect URL. It stamps tenant_id on the
+	// subscription's metadata (subscription_data) so the 4-A webhook can scope the
+	// projection — the checkout is the sole place that metadata is set. trialDays > 0
+	// starts the subscription on a trial.
+	CreateCheckoutSession(ctx context.Context, params CheckoutParams) (url string, err error)
+	// CreatePortalSession opens a Stripe Billing Portal session for the customer and
+	// returns the redirect URL the tenant manages its subscription through.
+	CreatePortalSession(ctx context.Context, customerID, returnURL string) (url string, err error)
+	// ListPlans reads the active plan catalog from Stripe (active recurring prices
+	// with their product expanded). Each Plan carries the ACTIVE-process ceiling from
+	// the product metadata; prices whose product lacks a usable limit are skipped.
+	ListPlans(ctx context.Context) ([]Plan, error)
+}
+
+// CheckoutParams is the input to CreateCheckoutSession — grouped into a struct
+// because the call carries more than a handful of fields (options struct over a
+// long positional signature). TenantID is stamped onto the subscription metadata,
+// not shown to the customer; the URLs and TrialDays come from config.
+type CheckoutParams struct {
+	CustomerID string
+	PriceID    string
+	TenantID   string
+	SuccessURL string
+	CancelURL  string
+	TrialDays  int
+}
+
+// Plan is the SDK-agnostic projection of a Stripe price+product the plans endpoint
+// returns: the price id (the checkout key), the product name, the recurring amount
+// and interval, and the ACTIVE-process ceiling read from the product metadata. It
+// is built by the gateway so the domain/handler never touch stripe-go types.
+type Plan struct {
+	PriceID            string
+	Name               string
+	Amount             int64
+	Interval           string
+	ActiveProcessLimit int
 }
 
 // StripeEvent is the SDK-agnostic projection of a verified Stripe webhook the

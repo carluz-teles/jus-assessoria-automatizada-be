@@ -105,12 +105,22 @@ func run(logger *slog.Logger) error {
 	)
 
 	// Billing wiring: the slice owns the domain; the binary only assembles it
-	// (repo + Stripe gateway + shared outbox + dedup + unit of work → use case →
-	// webhook). The gateway is the sole holder of the Stripe SDK and secrets.
+	// (repo + Stripe gateway + shared outbox + dedup + unit of work + checkout
+	// config → use case → webhook + endpoint handler). One use case backs both the
+	// public webhook and the authenticated endpoints. The gateway is the sole holder
+	// of the Stripe SDK and secrets.
 	billingGateway := billing.NewStripeGateway(cfg.StripeSecretKey, cfg.StripeWebhookSecret)
-	billingWebhook := billing.NewWebhookHandler(
-		billing.NewUseCase(billing.NewRepository(pool), billingGateway, events.NewOutbox(), billing.NewDedup(), uow),
+	billingUC := billing.NewUseCase(
+		billing.NewRepository(pool), billingGateway, events.NewOutbox(), billing.NewDedup(), uow,
+		billing.WithCheckoutConfig(billing.CheckoutConfig{
+			SuccessURL: cfg.BillingSuccessURL,
+			CancelURL:  cfg.BillingCancelURL,
+			ReturnURL:  cfg.BillingReturnURL,
+			TrialDays:  cfg.StripeTrialDays,
+		}),
 	)
+	billingWebhook := billing.NewWebhookHandler(billingUC)
+	billingHandler := billing.NewHandler(billingUC)
 
 	// Notifications wiring: the api only mounts the provider (Resend) webhook — the
 	// bounce/complaint callback. The listener that sends e-mail lives in the worker;
@@ -150,6 +160,7 @@ func run(logger *slog.Logger) error {
 		webhook:              webhook,
 		billingWebhook:       billingWebhook,
 		notificationsWebhook: notificationsWebhook,
+		billing:              billingHandler,
 		identity:             identityHandler,
 		acquisition:          acquisitionHandler,
 		lookup:               lookupHandler,

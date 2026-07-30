@@ -36,6 +36,7 @@ type routerDeps struct {
 	webhook              *identity.WebhookHandler
 	billingWebhook       *billing.WebhookHandler
 	notificationsWebhook *notifications.WebhookHandler
+	billing              *billing.Handler
 	identity             *identity.Handler
 	acquisition          *acquisition.Handler
 	lookup               *lookup.Handler
@@ -131,6 +132,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// domain use cases) still builds.
 	if deps.acquisition != nil {
 		deps.acquisition.RegisterV1(v1)
+	}
+
+	// billing owns its authenticated /v1 routes (checkout/portal/subscription/plans)
+	// and mounts them via RegisterV1 — its public Stripe webhook is a separate
+	// handler mounted off the root above. Nil-guarded like the others so the router
+	// test fixture builds without a use case.
+	if deps.billing != nil {
+		deps.billing.RegisterV1(v1)
 	}
 
 	// lookup owns the onboarding /v1/lookup routes (tenant-less, AuthUser above)
