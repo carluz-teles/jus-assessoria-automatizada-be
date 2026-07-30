@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/google/uuid"
@@ -27,6 +28,14 @@ type Repository interface {
 	// depends on the narrow backfillRepo view of these two methods.
 	BackfillJobExistsByIntegration(ctx context.Context, tx database.Tx, integrationID string) (bool, error)
 	InsertBackfillJob(ctx context.Context, tx database.Tx, params BackfillJobParams) (id string, err error)
+
+	// Sync cycle — the sync listener's run bookkeeping and consolidation upserts.
+	// The sync use case depends on the narrow syncRepo view of these five methods.
+	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
+	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error
+	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
+	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
+	UpsertNotifications(ctx context.Context, tx database.Tx, params []NotificationParams) (newCount int, err error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -149,4 +158,237 @@ func (r *pgRepository) InsertBackfillJob(ctx context.Context, tx database.Tx, pa
 		return "", database.WrapInfra(err)
 	}
 	return id.String(), nil
+}
+
+// InsertSyncRun opens a sync_run (RUNNING) inside the caller's tx and returns its
+// id. court_record_id is left NULL by the query (window discovery is not yet tied
+// to one record); the clock-stamped started_at is lifted to pgtype here.
+func (r *pgRepository) InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (string, error) {
+	tid, err := uuid.Parse(params.TenantID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	iid, err := uuid.Parse(params.IntegrationID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	id, err := acquisitiondb.New(tx).InsertSyncRun(ctx, acquisitiondb.InsertSyncRunParams{
+		TenantID:         tid,
+		IntegrationID:    iid,
+		ConnectorID:      params.ConnectorID,
+		ConnectorVersion: params.ConnectorVersion,
+		StartedAt:        pgtype.Timestamptz{Time: params.StartedAt, Valid: true},
+		Status:           params.Status,
+	})
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return id.String(), nil
+}
+
+// UpdateSyncRun closes a sync_run inside the caller's tx. The error reason (empty
+// on OK) is encoded to the error jsonb column; NULL when there is none.
+func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error {
+	id, err := uuid.Parse(outcome.ID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	errJSON, err := encodeSyncError(outcome.Error)
+	if err != nil {
+		return err
+	}
+	err = acquisitiondb.New(tx).UpdateSyncRun(ctx, acquisitiondb.UpdateSyncRunParams{
+		ID:           id,
+		Status:       outcome.Status,
+		ItemsNew:     int32(outcome.ItemsNew),
+		ItemsDeduped: int32(outcome.ItemsDeduped),
+		FinishedAt:   pgtype.Timestamptz{Time: outcome.FinishedAt, Valid: true},
+		Error:        errJSON,
+	})
+	return database.WrapInfra(err)
+}
+
+// FindOrCreateCourtRecord resolves a court record by its natural key inside the
+// caller's tx, creating the case+record on a miss, then marks it synced
+// (completeness + next_sync_at) whether new or found. It returns the entity the
+// cycle keys its docket/notification upserts and observed events on.
+func (r *pgRepository) FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error) {
+	tid, err := uuid.Parse(params.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	q := acquisitiondb.New(tx)
+
+	row, err := q.GetCourtRecordByKey(ctx, acquisitiondb.GetCourtRecordByKeyParams{
+		TenantID:  tid,
+		CnjNumber: params.CNJNumber,
+		Degree:    params.Degree,
+	})
+	switch {
+	case err == nil:
+		if merr := r.markCourtRecordSynced(ctx, q, row.ID, params); merr != nil {
+			return nil, merr
+		}
+		return newCourtRecordEntity(row.ID, row.CaseID, params), nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return r.createCourtRecord(ctx, q, tid, params)
+	default:
+		return nil, database.WrapInfra(err)
+	}
+}
+
+// createCourtRecord seeds a fresh case + record (v0 has no consolidation, so one
+// case per record) and marks it synced.
+func (r *pgRepository) createCourtRecord(ctx context.Context, q *acquisitiondb.Queries, tenantID uuid.UUID, params FindOrCreateCourtRecordParams) (*CourtRecord, error) {
+	caseID, err := q.InsertCourtCase(ctx, tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	recID, err := q.InsertCourtRecord(ctx, acquisitiondb.InsertCourtRecordParams{
+		TenantID:     tenantID,
+		CaseID:       caseID,
+		CnjNumber:    params.CNJNumber,
+		Degree:       params.Degree,
+		Court:        params.Court,
+		Class:        nullString(params.Class),
+		Subject:      nullString(params.Subject),
+		Completeness: params.Completeness,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	if err := r.markCourtRecordSynced(ctx, q, recID, params); err != nil {
+		return nil, err
+	}
+	return newCourtRecordEntity(recID, caseID, params), nil
+}
+
+// markCourtRecordSynced writes the post-sync completeness and next-sweep time.
+func (r *pgRepository) markCourtRecordSynced(ctx context.Context, q *acquisitiondb.Queries, id uuid.UUID, params FindOrCreateCourtRecordParams) error {
+	err := q.MarkCourtRecordSynced(ctx, acquisitiondb.MarkCourtRecordSyncedParams{
+		ID:           id,
+		Completeness: params.Completeness,
+		NextSyncAt:   pgtype.Timestamptz{Time: params.NextSyncAt, Valid: true},
+	})
+	return database.WrapInfra(err)
+}
+
+// UpsertDocketEntries inserts each andamento ON CONFLICT DO NOTHING inside the
+// caller's tx. A conflict returns pgx.ErrNoRows (the row already existed), which
+// is folded into "deduped"; the returned slice is the entries that were ACTUALLY
+// new (each with its assigned id), so the use case emits an observed event only
+// for those and tallies new vs. deduped.
+func (r *pgRepository) UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) ([]DocketEntry, error) {
+	q := acquisitiondb.New(tx)
+	newEntries := make([]DocketEntry, 0, len(params))
+	for _, p := range params {
+		crid, err := uuid.Parse(p.CourtRecordID)
+		if err != nil {
+			return nil, database.WrapInfra(err)
+		}
+		id, err := q.InsertDocketEntry(ctx, acquisitiondb.InsertDocketEntryParams{
+			CourtRecordID: crid,
+			Hash:          p.Hash,
+			OccurredAt:    pgtype.Timestamptz{Time: p.OccurredAt, Valid: true},
+			ObservedAt:    pgtype.Timestamptz{Time: p.ObservedAt, Valid: true},
+			Source:        p.Source,
+			Fidelity:      int32(p.Fidelity),
+			Text:          p.Text,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, database.WrapInfra(err)
+		}
+		newEntries = append(newEntries, DocketEntry{
+			ID:            id.String(),
+			CourtRecordID: p.CourtRecordID,
+			Hash:          p.Hash,
+			OccurredAt:    p.OccurredAt,
+			ObservedAt:    p.ObservedAt,
+			Source:        p.Source,
+			Fidelity:      p.Fidelity,
+			Text:          p.Text,
+		})
+	}
+	return newEntries, nil
+}
+
+// UpsertNotifications inserts each intimação ON CONFLICT DO NOTHING inside the
+// caller's tx and returns how many were new (same conflict-as-dedup contract as
+// docket entries). This slice emits no notification-observed event, so only the
+// count is returned.
+func (r *pgRepository) UpsertNotifications(ctx context.Context, tx database.Tx, params []NotificationParams) (int, error) {
+	q := acquisitiondb.New(tx)
+	newCount := 0
+	for _, p := range params {
+		tid, err := uuid.Parse(p.TenantID)
+		if err != nil {
+			return 0, database.WrapInfra(err)
+		}
+		caseID, err := uuid.Parse(p.CaseID)
+		if err != nil {
+			return 0, database.WrapInfra(err)
+		}
+		crid, err := uuid.Parse(p.CourtRecordID)
+		if err != nil {
+			return 0, database.WrapInfra(err)
+		}
+		_, err = q.InsertNotification(ctx, acquisitiondb.InsertNotificationParams{
+			TenantID:        tid,
+			CaseID:          caseID,
+			CourtRecordID:   crid,
+			Hash:            p.Hash,
+			MadeAvailableAt: pgtype.Date{Time: p.MadeAvailableAt, Valid: true},
+			PublishedAt:     pgtype.Date{Time: p.PublishedAt, Valid: true},
+			DeadlineStartAt: pgtype.Date{Time: p.DeadlineStartAt, Valid: true},
+			Content:         p.Content,
+			Source:          p.Source,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return 0, database.WrapInfra(err)
+		}
+		newCount++
+	}
+	return newCount, nil
+}
+
+// newCourtRecordEntity assembles the CourtRecord the use case works with from the
+// resolved ids and the request's natural-key fields.
+func newCourtRecordEntity(id, caseID uuid.UUID, params FindOrCreateCourtRecordParams) *CourtRecord {
+	return &CourtRecord{
+		ID:        id.String(),
+		TenantID:  params.TenantID,
+		CaseID:    caseID.String(),
+		CNJNumber: params.CNJNumber,
+		Degree:    params.Degree,
+		Court:     params.Court,
+	}
+}
+
+// nullString maps an empty string to a SQL NULL (nil *string) for the nullable
+// text columns; a non-empty value is written as-is.
+func nullString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// encodeSyncError serializes a failure reason to the sync_run.error jsonb, or nil
+// (SQL NULL) when there is no error. The wrapper stays a low-cardinality shape
+// ({"message": ...}) so the column is queryable.
+func encodeSyncError(reason string) ([]byte, error) {
+	if reason == "" {
+		return nil, nil
+	}
+	raw, err := json.Marshal(map[string]string{"message": reason})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return raw, nil
 }

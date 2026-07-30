@@ -75,12 +75,25 @@ func run(logger *slog.Logger) error {
 	// task-type registration via a Register(mux) call; the worker only composes.
 	mux := asynq.NewServeMux()
 
-	backfill := acquisition.NewBackfillUseCase(
-		acquisition.NewRepository(pool),
-		events.NewOutbox(),
-		database.NewUnitOfWork(pool),
-	)
-	acquisition.NewListener(backfill).Register(mux)
+	repo := acquisition.NewRepository(pool)
+	outbox := events.NewOutbox()
+	uow := database.NewUnitOfWork(pool)
+
+	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow)
+
+	// The sync use case drives a connector resolved from the orchestrator. Until
+	// the real DJEN/DataJud connectors land, a stub is registered per source and
+	// paired with the stub parser (no network I/O).
+	orchestrator := acquisition.NewOrchestrator()
+	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewStubConnector(acquisition.SourceDJEN))
+	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewStubConnector(acquisition.SourceDATAJUD))
+	connector, err := orchestrator.ConnectorFor(acquisition.SourceDJEN)
+	if err != nil {
+		return fmt.Errorf("resolve sync connector: %w", err)
+	}
+	sync := acquisition.NewSyncUseCase(repo, outbox, uow, connector, acquisition.NewStubParser())
+
+	acquisition.NewListener(backfill, sync).Register(mux)
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)

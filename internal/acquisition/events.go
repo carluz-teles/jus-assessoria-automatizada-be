@@ -12,9 +12,25 @@ const TypeIntegrationActivated = "acquisition.integration_activated"
 // consumes it to fetch that window; this slice only produces it.
 const TypeSyncRequested = "acquisition.sync_requested"
 
+// Type ids of the events the sync cycle produces. sync_completed/sync_failed
+// bracket a run; court_record_observed/docket_entry_observed announce what the
+// sync saw so downstream slices (consolidation, deadlines, documents) can react.
+const (
+	TypeSyncCompleted       = "acquisition.sync_completed"
+	TypeSyncFailed          = "acquisition.sync_failed"
+	TypeCourtRecordObserved = "acquisition.court_record_observed"
+	TypeDocketEntryObserved = "acquisition.docket_entry_observed"
+)
+
 const aggregateTypeIntegration = "integration"
 
 const aggregateTypeBackfillJob = "backfill_job"
+
+const aggregateTypeSyncRun = "sync_run"
+
+const aggregateTypeCourtRecord = "court_record"
+
+const aggregateTypeDocketEntry = "docket_entry"
 
 // IntegrationActivated is emitted, in the same transaction as the upsert, when a
 // source is activated or its scope meaningfully changes. The payload carries
@@ -54,3 +70,78 @@ var _ events.Event = SyncRequested{}
 
 func (SyncRequested) Type() string          { return TypeSyncRequested }
 func (SyncRequested) AggregateType() string { return aggregateTypeBackfillJob }
+
+// CourtRecordObserved announces that a sync saw a court record this run — a
+// brand-new one or a re-observation. It carries the record's identity and the
+// case it hangs on, so the consolidation slice can link/merge and the read
+// models can refresh. Aggregate id is the court_record id.
+type CourtRecordObserved struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	SyncRunID     string `json:"sync_run_id"`
+	CourtRecordID string `json:"court_record_id"`
+	CaseID        string `json:"case_id"`
+	CNJNumber     string `json:"cnj_number"`
+	Degree        string `json:"degree"`
+}
+
+var _ events.Event = CourtRecordObserved{}
+
+func (CourtRecordObserved) Type() string          { return TypeCourtRecordObserved }
+func (CourtRecordObserved) AggregateType() string { return aggregateTypeCourtRecord }
+
+// DocketEntryObserved announces one NEWLY inserted andamento (deduped entries do
+// not emit it, so a re-sync of the same window is silent). It carries the entry
+// and record ids and the source hash; the deadline/documents slices consume it.
+// Aggregate id is the docket_entry id.
+type DocketEntryObserved struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	SyncRunID     string `json:"sync_run_id"`
+	CourtRecordID string `json:"court_record_id"`
+	DocketEntryID string `json:"docket_entry_id"`
+	Hash          string `json:"hash"`
+}
+
+var _ events.Event = DocketEntryObserved{}
+
+func (DocketEntryObserved) Type() string          { return TypeDocketEntryObserved }
+func (DocketEntryObserved) AggregateType() string { return aggregateTypeDocketEntry }
+
+// SyncCompleted closes a successful run with its item tallies (new vs. deduped),
+// so the backfill slice can advance its slice counters (a later sub-slice).
+// Aggregate id is the sync_run id.
+type SyncCompleted struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	SyncRunID     string `json:"sync_run_id"`
+	IntegrationID string `json:"integration_id"`
+	BackfillJobID string `json:"backfill_job_id"`
+	SliceIndex    int    `json:"slice_index"`
+	ItemsNew      int    `json:"items_new"`
+	ItemsDeduped  int    `json:"items_deduped"`
+}
+
+var _ events.Event = SyncCompleted{}
+
+func (SyncCompleted) Type() string          { return TypeSyncCompleted }
+func (SyncCompleted) AggregateType() string { return aggregateTypeSyncRun }
+
+// SyncFailed closes a failed run with a human-readable reason (a fetch or parse
+// fault). The backfill slice counts it toward slices_error; the reason is
+// operational context, never the raw wrapped error. Aggregate id is the
+// sync_run id.
+type SyncFailed struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	SyncRunID     string `json:"sync_run_id"`
+	IntegrationID string `json:"integration_id"`
+	BackfillJobID string `json:"backfill_job_id"`
+	SliceIndex    int    `json:"slice_index"`
+	Reason        string `json:"reason"`
+}
+
+var _ events.Event = SyncFailed{}
+
+func (SyncFailed) Type() string          { return TypeSyncFailed }
+func (SyncFailed) AggregateType() string { return aggregateTypeSyncRun }

@@ -21,14 +21,47 @@ type Querier interface {
 	// listener uses it as the first-activation guard: a re-activation must not
 	// re-dispatch a backfill.
 	BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error)
+	// Resolve a court record by its natural key inside the caller's tx. A miss
+	// (pgx.ErrNoRows) is how FindOrCreateCourtRecord learns it must create one.
+	GetCourtRecordByKey(ctx context.Context, arg GetCourtRecordByKeyParams) (GetCourtRecordByKeyRow, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
 	// Create the onboarding backfill job. total_slices is precomputed by the use
 	// case; the counters default to zero and status is passed explicitly so a
 	// zero-slice horizon can land COMPLETED instead of RUNNING.
 	InsertBackfillJob(ctx context.Context, arg InsertBackfillJobParams) (uuid.UUID, error)
+	// Create the lide a first-seen court record hangs on. v0 has no consolidation
+	// yet, so every new record gets its own case; merging is a later slice.
+	InsertCourtCase(ctx context.Context, tenantID uuid.UUID) (uuid.UUID, error)
+	// Create a court record under a case. The natural key (tenant, cnj, degree) is
+	// UNIQUE, so a racing double-create fails loudly rather than duplicating.
+	InsertCourtRecord(ctx context.Context, arg InsertCourtRecordParams) (uuid.UUID, error)
+	// Append one andamento, idempotent on (court_record_id, hash). On conflict the
+	// row is left untouched and no id is returned (pgx.ErrNoRows), which the caller
+	// reads as "deduped" — so a re-sync emits no docket_entry_observed for it.
+	InsertDocketEntry(ctx context.Context, arg InsertDocketEntryParams) (uuid.UUID, error)
+	// Append one intimação, idempotent on (tenant_id, case_id, hash). Same
+	// conflict-as-dedup contract as docket entries; recipients defaults to '[]'.
+	InsertNotification(ctx context.Context, arg InsertNotificationParams) (uuid.UUID, error)
+	// sync cycle queries (acquisition slice).
+	// The sync listener reacts to sync_requested: it opens a sync_run (RUNNING),
+	// fetches+parses a window, then upserts the observed records/entries/notifications
+	// and closes the run (OK/FAILED) — all keyed off the court_record's natural key
+	// (tenant_id, cnj_number, degree). Idempotency lives in the schema: docket_entry
+	// and notification carry UNIQUE constraints, so a re-sync of the same window
+	// inserts nothing new (ON CONFLICT DO NOTHING) and the RETURNING clause tells the
+	// caller which rows were actually new.
+	// Open a sync run. court_record_id is left NULL (OAB window discovery is not yet
+	// tied to one record); finished_at/error stay NULL until the run closes.
+	InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)
+	// Record that a sync touched this court record: refresh its completeness and
+	// schedule the next sweep (next_sync_at drives the scheduler slice later).
+	MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecordSyncedParams) error
+	// Close a sync run: OK carries the item tallies and a NULL error; FAILED carries
+	// the error jsonb and zero tallies. finished_at is set by the caller's clock.
+	UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) error
 	// acquisition slice queries (integration).
 	// The upsert is keyed by (tenant_id, source) so re-activating a source is
 	// idempotent at the row level; credential_ref is never written from here (it

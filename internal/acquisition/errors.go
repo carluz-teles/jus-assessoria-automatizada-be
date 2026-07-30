@@ -9,4 +9,8 @@ var (
 	// repository returns it instead of (nil, nil); the activation use case treats
 	// it as "first activation", not a client-facing 404.
 	ErrIntegrationNotFound = apperr.NewNotFound("integration not found")
+
+	// ErrConnectorNotFound — the orchestrator has no connector registered for a
+	// source. Surfaces at composition time (a misconfigured worker), not per event.
+	ErrConnectorNotFound = apperr.NewNotFound("no connector registered for source")
 )

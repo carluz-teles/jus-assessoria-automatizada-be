@@ -66,6 +66,29 @@ func (m *mockRepo) InsertBackfillJob(_ context.Context, _ database.Tx, _ Backfil
 	return "", nil
 }
 
+// The sync methods satisfy the widened Repository interface; the activation use
+// case under test here never calls them (they are exercised by the sync use
+// case's own narrow stub in sync_test.go).
+func (m *mockRepo) InsertSyncRun(_ context.Context, _ database.Tx, _ SyncRunParams) (string, error) {
+	return "", nil
+}
+
+func (m *mockRepo) UpdateSyncRun(_ context.Context, _ database.Tx, _ SyncRunOutcome) error {
+	return nil
+}
+
+func (m *mockRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, _ FindOrCreateCourtRecordParams) (*CourtRecord, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, _ []DocketEntryParams) ([]DocketEntry, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) UpsertNotifications(_ context.Context, _ database.Tx, _ []NotificationParams) (int, error) {
+	return 0, nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {

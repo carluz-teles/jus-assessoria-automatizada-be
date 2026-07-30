@@ -46,3 +46,78 @@ type Integration struct {
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
+
+// Degree constants — a court_record's instance level, part of its natural key
+// (tenant, cnj_number, degree). UNKNOWN is the safe default when the source does
+// not disclose the degree.
+const (
+	DegreeG1       = "G1"
+	DegreeG2       = "G2"
+	DegreeJE       = "JE"
+	DegreeSuperior = "SUPERIOR"
+	DegreeUnknown  = "UNKNOWN"
+)
+
+// SyncRun is the auditable record of one sync execution: which connector ran,
+// under which integration, and its outcome. It lands RUNNING at the start of the
+// cycle and transitions to OK (with the item counters) or FAILED (with the
+// error) at the end, in a second transaction. CourtRecordID is empty on OAB
+// discovery (the run is not yet tied to a single record).
+type SyncRun struct {
+	ID               string
+	TenantID         string
+	CourtRecordID    string
+	IntegrationID    string
+	ConnectorID      string
+	ConnectorVersion string
+	Status           string
+	ItemsNew         int
+	ItemsDeduped     int
+	StartedAt        time.Time
+	FinishedAt       time.Time
+}
+
+// CourtRecord is what the court knows about a process at one degree — the
+// FindOrCreate result the sync cycle keys everything else on. ID and CaseID are
+// what downstream upserts (docket entries, notifications) and the
+// court_record_observed event need; the rest of the schema's columns are not
+// materialized into the entity in this slice.
+type CourtRecord struct {
+	ID        string
+	TenantID  string
+	CaseID    string
+	CNJNumber string
+	Degree    string
+	Court     string
+}
+
+// DocketEntry is one andamento persisted by the sync cycle. The use case builds
+// it only for entries that were actually inserted (the new set), so it can emit
+// docket_entry_observed for each — ID is the freshly assigned row id.
+type DocketEntry struct {
+	ID            string
+	CourtRecordID string
+	Hash          string
+	OccurredAt    time.Time
+	ObservedAt    time.Time
+	Source        string
+	Fidelity      int
+	Text          string
+}
+
+// Notification is one intimação persisted by the sync cycle, deduped within the
+// (tenant, case) scope. This slice does not emit a notification-observed event
+// (the deadline slice owns that), so the entity is the persisted shape, not an
+// event carrier.
+type Notification struct {
+	ID              string
+	TenantID        string
+	CaseID          string
+	CourtRecordID   string
+	Hash            string
+	MadeAvailableAt time.Time
+	PublishedAt     time.Time
+	DeadlineStartAt time.Time
+	Content         string
+	Source          string
+}
