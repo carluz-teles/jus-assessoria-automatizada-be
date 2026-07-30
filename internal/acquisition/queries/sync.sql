@@ -52,6 +52,16 @@ SELECT id, case_id
 FROM court_record
 WHERE tenant_id = $1 AND cnj_number = $2 AND degree = $3;
 
+-- name: CountActiveCourtRecordsByTenant :one
+-- Count the tenant's ACTIVE court records inside the caller's tx. The entitlement
+-- gate reads this against the subscription's active_process_limit before creating a
+-- BRAND-NEW record (the MISS path of FindOrCreateCourtRecord only — a reobservation
+-- of an existing record is never gated). It runs in the SAME tx as the pending
+-- INSERT so the count is consistent with what is about to be created. lifecycle is
+-- the schema's process-liveness flag; only ACTIVE records count against the ceiling.
+SELECT count(*) FROM court_record
+WHERE tenant_id = $1 AND lifecycle = 'ACTIVE';
+
 -- name: InsertCourtCase :one
 -- Create the lide a first-seen court record hangs on. v0 has no consolidation
 -- yet, so every new record gets its own case; merging is a later slice.

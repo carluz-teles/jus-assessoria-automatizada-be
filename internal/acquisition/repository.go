@@ -340,15 +340,39 @@ func (r *pgRepository) FindOrCreateCourtRecord(ctx context.Context, tx database.
 	})
 	switch {
 	case err == nil:
+		// HIT — reobservation of a record already tracked. Never gated: mark it synced
+		// and return, regardless of the entitlement ceiling.
 		if merr := r.markCourtRecordSynced(ctx, q, row.ID, params); merr != nil {
 			return nil, merr
 		}
 		return newCourtRecordEntity(row.ID, row.CaseID, params), nil
 	case errors.Is(err, pgx.ErrNoRows):
+		// MISS — a brand-new process. This is the ONLY place the billing entitlement
+		// gates a create: refuse with ErrProcessLimitReached when the tenant is already
+		// at its active_process_limit, in the same tx as the pending INSERT.
+		if gerr := r.enforceProcessLimit(ctx, q, tid, params.ActiveProcessLimit); gerr != nil {
+			return nil, gerr
+		}
 		return r.createCourtRecord(ctx, q, tid, params)
 	default:
 		return nil, database.WrapInfra(err)
 	}
+}
+
+// enforceProcessLimit counts the tenant's ACTIVE court records in the caller's tx and
+// returns the typed ErrProcessLimitReached when that count already meets the limit —
+// so the pending create would push the tenant over its plan ceiling. The repo only
+// compares numbers; the use case owns where the limit comes from (the billing
+// entitlement). A count query fault is a plain infra error.
+func (r *pgRepository) enforceProcessLimit(ctx context.Context, q *acquisitiondb.Queries, tenantID uuid.UUID, limit int) error {
+	count, err := q.CountActiveCourtRecordsByTenant(ctx, tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	if count >= int64(limit) {
+		return ErrProcessLimitReached
+	}
+	return nil
 }
 
 // createCourtRecord seeds a fresh case + record (v0 has no consolidation, so one

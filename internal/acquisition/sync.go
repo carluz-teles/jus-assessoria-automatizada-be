@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -72,6 +74,12 @@ type FindOrCreateCourtRecordParams struct {
 	Subject      string
 	Completeness float32
 	NextSyncAt   time.Time
+	// ActiveProcessLimit is the tenant's ceiling on ACTIVE processes (the billing
+	// entitlement), resolved by the use case and passed down so the repo can gate a
+	// NEW record against it. The repo only compares the count to this number; it
+	// never decides where the number comes from. A create is refused with
+	// ErrProcessLimitReached when the tenant's ACTIVE count already meets it.
+	ActiveProcessLimit int
 }
 
 // DocketEntryParams is one andamento to upsert (idempotent on court_record+hash).
@@ -113,6 +121,30 @@ type syncRepo interface {
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
 }
 
+// EntitlementChecker resolves a tenant's ceiling on ACTIVE processes — the v0
+// billing entitlement (active_process_limit). It is defined HERE, in the consumer,
+// and implemented in the billing slice (an adapter injected only at the worker's
+// composition root), so acquisition never imports billing and vice versa — the same
+// consumer-defines-the-port rule the docs apply to routes, here applied to a
+// synchronous read across slices. It takes no tx: the read need not share the
+// court_record transaction (a small overshoot under concurrent syncs is accepted in
+// v0). A tenant with no subscription resolves to 0 (fail-closed) inside the adapter,
+// never as an error — the use case only ever receives an int (or a real infra error).
+type EntitlementChecker interface {
+	ActiveProcessLimit(ctx context.Context, tenantID string) (int, error)
+}
+
+// unlimitedEntitlement is the default EntitlementChecker a SyncUseCase falls back to
+// when none is injected: it imposes no ceiling. Production ALWAYS wires the billing
+// adapter through WithEntitlementChecker at the worker's composition root; this
+// default only keeps same-package tests that do not exercise gating source-compatible
+// (mirrors the now:time.Now seam).
+type unlimitedEntitlement struct{}
+
+func (unlimitedEntitlement) ActiveProcessLimit(context.Context, string) (int, error) {
+	return math.MaxInt, nil
+}
+
 // SyncUseCase reacts to sync_requested by running one fetch→parse→upsert cycle.
 // It depends on the narrow syncRepo port, the outbox publisher, the unit of work,
 // the connector orchestrator, and the parser port — never on the concrete pg
@@ -127,15 +159,27 @@ type SyncUseCase struct {
 	uow          database.UnitOfWork
 	orchestrator *Orchestrator
 	parser       Parser
+	checker      EntitlementChecker
 	now          func() time.Time
 }
 
-// syncOption tunes a SyncUseCase at construction. Options are unexported:
-// production callers take the defaults, only same-package tests override the clock.
+// syncOption tunes a SyncUseCase at construction. The clock override stays
+// unexported (same-package tests only); WithEntitlementChecker is exported so the
+// worker's composition root can inject the billing adapter across the slice boundary.
 type syncOption func(*SyncUseCase)
+
+// WithEntitlementChecker injects the billing entitlement port the cycle consults to
+// gate NEW court records against the tenant's active_process_limit. Without it the
+// use case imposes no ceiling (unlimitedEntitlement); cmd/worker-ingestao wires the
+// real billing adapter here.
+func WithEntitlementChecker(c EntitlementChecker) syncOption {
+	return func(uc *SyncUseCase) { uc.checker = c }
+}
 
 // NewSyncUseCase wires the sync use case. The orchestrator resolves the connector
 // per event by source (stubs in this slice); the parser is injected (a stub here).
+// The entitlement checker defaults to no ceiling and is overridden with the billing
+// adapter via WithEntitlementChecker at the worker.
 func NewSyncUseCase(repo syncRepo, outbox publisher, uow database.UnitOfWork, orchestrator *Orchestrator, parser Parser, opts ...syncOption) *SyncUseCase {
 	uc := &SyncUseCase{
 		repo:         repo,
@@ -143,6 +187,7 @@ func NewSyncUseCase(repo syncRepo, outbox publisher, uow database.UnitOfWork, or
 		uow:          uow,
 		orchestrator: orchestrator,
 		parser:       parser,
+		checker:      unlimitedEntitlement{},
 		now:          time.Now,
 	}
 	for _, opt := range opts {
@@ -284,22 +329,49 @@ func (uc *SyncUseCase) failRun(ctx context.Context, ev SyncRequested, syncRunID 
 // all atomically. court_record_observed fires per observed record;
 // docket_entry_observed only for entries that were actually new.
 func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRunID string, parsed ParsedResult) error {
+	// Resolve the tenant's entitlement ONCE per cycle (not per record), OUTSIDE the
+	// tx — it is a read on the billing pool that must not hold this tx's connection,
+	// and a small overshoot under concurrent syncs is accepted (v0). A real error
+	// here fails the whole cycle (the run stays RUNNING; asynq re-delivers and
+	// resolveSeenRun resumes it); only ErrSubscriptionNotFound is folded to limit 0,
+	// and that folding is the adapter's job, never surfaced here.
+	limit, err := uc.checker.ActiveProcessLimit(ctx, ev.TenantID)
+	if err != nil {
+		return fmt.Errorf("resolve active process limit for tenant %s: %w", ev.TenantID, err)
+	}
+
 	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		records := make(map[string]*CourtRecord, len(parsed.CourtRecords))
 		ordered := make([]*CourtRecord, 0, len(parsed.CourtRecords))
+		blocked := make(map[string]bool)
 		nextSync := uc.now().Add(defaultSyncInterval)
 
 		for _, pr := range parsed.CourtRecords {
 			cr, err := uc.repo.FindOrCreateCourtRecord(ctx, tx, FindOrCreateCourtRecordParams{
-				TenantID:     ev.TenantID,
-				CNJNumber:    pr.CNJNumber,
-				Degree:       pr.Degree,
-				Court:        pr.Court,
-				Class:        pr.Class,
-				Subject:      pr.Subject,
-				Completeness: pr.Completeness,
-				NextSyncAt:   nextSync,
+				TenantID:           ev.TenantID,
+				CNJNumber:          pr.CNJNumber,
+				Degree:             pr.Degree,
+				Court:              pr.Court,
+				Class:              pr.Class,
+				Subject:            pr.Subject,
+				Completeness:       pr.Completeness,
+				NextSyncAt:         nextSync,
+				ActiveProcessLimit: limit,
 			})
+			if errors.Is(err, ErrProcessLimitReached) {
+				// Expected, not a failure: the tenant is at its plan ceiling and this is a
+				// brand-new process. Skip it (and its docket/intimation children below),
+				// keep folding the rest of the batch, and let the run close OK. Disparo de
+				// notification.requested avisando o tenant fica para uma fatia futura.
+				slog.WarnContext(ctx, "acquisition: active process limit reached; skipping new court record",
+					"tenant_id", ev.TenantID,
+					"cnj_number", pr.CNJNumber,
+					"court", pr.Court,
+					"degree", pr.Degree,
+				)
+				blocked[recordKey(pr.CNJNumber, pr.Degree)] = true
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -307,7 +379,7 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			ordered = append(ordered, cr)
 		}
 
-		docketParams, err := docketParamsFor(parsed.DocketEntries, records)
+		docketParams, err := docketParamsFor(parsed.DocketEntries, records, blocked)
 		if err != nil {
 			return err
 		}
@@ -316,7 +388,7 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			return err
 		}
 
-		intimParams, err := intimationParamsFor(ev.TenantID, parsed.Intimations, records)
+		intimParams, err := intimationParamsFor(ev.TenantID, parsed.Intimations, records, blocked)
 		if err != nil {
 			return err
 		}
@@ -367,12 +439,18 @@ func (uc *SyncUseCase) publishObserved(ctx context.Context, tx database.Tx, ev S
 }
 
 // docketParamsFor resolves each parsed docket entry to its court_record id via
-// the find-or-create map. An entry naming a record not in this result is a
-// parser invariant violation and aborts the cycle (fail closed).
-func docketParamsFor(entries []ParsedDocketEntry, records map[string]*CourtRecord) ([]DocketEntryParams, error) {
+// the find-or-create map. An entry whose record was gated by the entitlement limit
+// (blocked) is dropped silently — its record was never created, so it has nothing to
+// hang on. An entry naming a record that is neither created nor blocked is a parser
+// invariant violation and aborts the cycle (fail closed).
+func docketParamsFor(entries []ParsedDocketEntry, records map[string]*CourtRecord, blocked map[string]bool) ([]DocketEntryParams, error) {
 	params := make([]DocketEntryParams, 0, len(entries))
 	for _, pd := range entries {
-		cr, ok := records[recordKey(pd.CNJNumber, pd.Degree)]
+		key := recordKey(pd.CNJNumber, pd.Degree)
+		if blocked[key] {
+			continue
+		}
+		cr, ok := records[key]
 		if !ok {
 			return nil, fmt.Errorf("docket entry %q references unknown court record %s/%s", pd.Hash, pd.CNJNumber, pd.Degree)
 		}
@@ -390,12 +468,16 @@ func docketParamsFor(entries []ParsedDocketEntry, records map[string]*CourtRecor
 }
 
 // intimationParamsFor resolves each parsed intimation to its case/record ids
-// via the find-or-create map, under the event's tenant. Same fail-closed rule as
-// docket entries.
-func intimationParamsFor(tenantID string, intims []ParsedIntimation, records map[string]*CourtRecord) ([]IntimationParams, error) {
+// via the find-or-create map, under the event's tenant. Same blocked-drop and
+// fail-closed rules as docket entries.
+func intimationParamsFor(tenantID string, intims []ParsedIntimation, records map[string]*CourtRecord, blocked map[string]bool) ([]IntimationParams, error) {
 	params := make([]IntimationParams, 0, len(intims))
 	for _, pn := range intims {
-		cr, ok := records[recordKey(pn.CNJNumber, pn.Degree)]
+		key := recordKey(pn.CNJNumber, pn.Degree)
+		if blocked[key] {
+			continue
+		}
+		cr, ok := records[key]
 		if !ok {
 			return nil, fmt.Errorf("intimation %q references unknown court record %s/%s", pn.Hash, pn.CNJNumber, pn.Degree)
 		}
