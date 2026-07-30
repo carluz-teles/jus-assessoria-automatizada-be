@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -34,6 +35,7 @@ type membershipRow struct {
 	role       string
 	status     string
 	clerkMemID *string
+	removedAt  *time.Time
 }
 
 // readMembership reads the membership columns for a Clerk user id (joined through
@@ -42,28 +44,45 @@ func readMembership(t *testing.T, pool *pgxpool.Pool, clerkUserID string) member
 	t.Helper()
 	var row membershipRow
 	if err := pool.QueryRow(context.Background(),
-		`SELECT m.role, m.status, m.clerk_membership_id
+		`SELECT m.role, m.status, m.clerk_membership_id, m.removed_at
 		   FROM membership m
 		   JOIN app_user u ON u.id = m.app_user_id
 		  WHERE u.clerk_user_id = $1`, clerkUserID,
-	).Scan(&row.role, &row.status, &row.clerkMemID); err != nil {
+	).Scan(&row.role, &row.status, &row.clerkMemID, &row.removedAt); err != nil {
 		t.Fatalf("read membership: %v", err)
 	}
 	return row
 }
 
-// countMemberJoinedOutbox counts unpublished member_joined events for a tenant (the
+// appUserRole reads the raw role column for a Clerk user id (as owner, RLS bypassed).
+func appUserRole(t *testing.T, pool *pgxpool.Pool, clerkUserID string) string {
+	t.Helper()
+	var role string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT role FROM app_user WHERE clerk_user_id = $1`, clerkUserID).Scan(&role); err != nil {
+		t.Fatalf("read app_user role: %v", err)
+	}
+	return role
+}
+
+// countOutboxByType counts unpublished events of a given type for a tenant (the
 // outbox aggregate id is the tenant id).
-func countMemberJoinedOutbox(t *testing.T, pool *pgxpool.Pool, tenantID string) int {
+func countOutboxByType(t *testing.T, pool *pgxpool.Pool, eventType, tenantID string) int {
 	t.Helper()
 	var n int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM outbox
 		  WHERE type = $1 AND published_at IS NULL AND aggregate_id::text = $2`,
-		identity.TypeMemberJoined, tenantID).Scan(&n); err != nil {
-		t.Fatalf("count member_joined outbox: %v", err)
+		eventType, tenantID).Scan(&n); err != nil {
+		t.Fatalf("count %s outbox: %v", eventType, err)
 	}
 	return n
+}
+
+// countMemberJoinedOutbox counts unpublished member_joined events for a tenant.
+func countMemberJoinedOutbox(t *testing.T, pool *pgxpool.Pool, tenantID string) int {
+	t.Helper()
+	return countOutboxByType(t, pool, identity.TypeMemberJoined, tenantID)
 }
 
 // AC2/AC3: organizationMembership.created persists an ACTIVE membership and emits
@@ -156,6 +175,153 @@ func TestIdentity_OnMembershipCreated_PublishFailRollsBackAll(t *testing.T) {
 	}
 	if users != 0 {
 		t.Fatalf("app_user rows after rollback = %d, want 0 (join is one tx)", users)
+	}
+}
+
+// AC1/AC2: organizationMembership.deleted soft-removes an ACTIVE membership
+// (status REMOVED + removed_at stamped, role and app_user preserved) and emits
+// member_removed in the SAME tx; a replay of the deleted webhook is a no-op that
+// neither re-stamps nor republishes.
+func TestIdentity_OnMembershipRemoved_SoftDeletesAndOutboxSameTx(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	const org = "org-membership-remove"
+	seedTenant(t, pool, tenantID, org, 0)
+
+	uc := newIdentityUC(pool)
+	const clerkUser = org + "-user-1"
+	// clerk_membership_id is globally UNIQUE, so namespace it by org — the suite
+	// shares one database across tests.
+	const clerkMemID = org + "-mem-1"
+
+	// Join first (ACTIVE membership + app_user), then remove.
+	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, clerkMemID, "ana@b.com", "Ana", identity.RoleLawyer)
+	if err != nil {
+		t.Fatalf("OnMembershipCreated: %v", err)
+	}
+	if err := uc.OnMembershipRemoved(ctx, org, clerkMemID); err != nil {
+		t.Fatalf("OnMembershipRemoved: %v", err)
+	}
+
+	// The row is soft-removed: status REMOVED, removed_at stamped, role preserved.
+	row := readMembership(t, pool, clerkUser)
+	if row.status != string(identity.MembershipRemoved) {
+		t.Fatalf("membership status = %q, want REMOVED", row.status)
+	}
+	if row.removedAt == nil {
+		t.Fatal("removed_at is NULL, want a stamped timestamp")
+	}
+	if row.role != string(identity.RoleLawyer) {
+		t.Fatalf("membership role = %q, want LAWYER preserved on soft-delete", row.role)
+	}
+	// The app_user survives the removal (soft-delete only touches the membership).
+	if got := appUserRole(t, pool, clerkUser); got != string(identity.RoleLawyer) {
+		t.Fatalf("app_user role = %q, want LAWYER preserved", got)
+	}
+
+	// Exactly one member_removed, tied to the tenant, unpublished (same tx).
+	if n := countOutboxByType(t, pool, identity.TypeMemberRemoved, tenantID); n != 1 {
+		t.Fatalf("member_removed outbox rows = %d, want 1", n)
+	}
+	var payload []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT payload FROM outbox WHERE type = $1 AND aggregate_id::text = $2`,
+		identity.TypeMemberRemoved, tenantID).Scan(&payload); err != nil {
+		t.Fatalf("read event payload: %v", err)
+	}
+	var ev identity.MemberRemoved
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		t.Fatalf("unmarshal member_removed: %v", err)
+	}
+	if ev.TenantID != tenantID || ev.AppUserID != user.ID {
+		t.Fatalf("event payload = %+v, unexpected", ev)
+	}
+	if ev.EventID == "" || ev.AggregateID() != tenantID {
+		t.Fatalf("event ids = (%q, %q), want a v7 id and the tenant aggregate", ev.EventID, ev.AggregateID())
+	}
+
+	// Replay: an already-REMOVED membership must NOT republish member_removed.
+	if err := uc.OnMembershipRemoved(ctx, org, clerkMemID); err != nil {
+		t.Fatalf("replay OnMembershipRemoved: %v", err)
+	}
+	if n := countOutboxByType(t, pool, identity.TypeMemberRemoved, tenantID); n != 1 {
+		t.Fatalf("member_removed outbox rows after replay = %d, want 1 (no republish)", n)
+	}
+}
+
+// AC3: organizationMembership.updated re-points BOTH membership.role and
+// app_user.role in the same tx (org:admin → ADMIN), and is idempotent.
+func TestIdentity_OnMembershipUpdated_SyncsBothRoles(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	const org = "org-membership-update"
+	seedTenant(t, pool, tenantID, org, 0)
+
+	uc := newIdentityUC(pool)
+	const clerkUser = org + "-user-1"
+	const clerkMemID = org + "-mem-1" // globally UNIQUE — namespace by org
+
+	// Join as LAWYER (org:member), then promote to ADMIN (org:admin).
+	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, clerkMemID, "ana@b.com", "Ana", identity.RoleLawyer); err != nil {
+		t.Fatalf("OnMembershipCreated: %v", err)
+	}
+	if err := uc.OnMembershipUpdated(ctx, org, clerkMemID, identity.RoleAdmin); err != nil {
+		t.Fatalf("OnMembershipUpdated: %v", err)
+	}
+
+	// Both the membership link and the authorization role now read ADMIN.
+	if row := readMembership(t, pool, clerkUser); row.role != string(identity.RoleAdmin) {
+		t.Fatalf("membership role = %q, want ADMIN", row.role)
+	}
+	if got := appUserRole(t, pool, clerkUser); got != string(identity.RoleAdmin) {
+		t.Fatalf("app_user role = %q, want ADMIN (synced for ResolvePrincipal)", got)
+	}
+
+	// Idempotent: re-applying the same role holds both at ADMIN.
+	if err := uc.OnMembershipUpdated(ctx, org, clerkMemID, identity.RoleAdmin); err != nil {
+		t.Fatalf("replay OnMembershipUpdated: %v", err)
+	}
+	if got := appUserRole(t, pool, clerkUser); got != string(identity.RoleAdmin) {
+		t.Fatalf("app_user role after replay = %q, want ADMIN", got)
+	}
+}
+
+// AC4: ResolvePrincipal requires an ACTIVE membership. A member resolves to a normal
+// Principal; once soft-removed, the same lookup returns ErrUserNotFound (→ 401).
+func TestIdentity_ResolvePrincipal_RequiresActiveMembership(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	const org = "org-resolve-active"
+	seedTenant(t, pool, tenantID, org, 0)
+
+	uc := newIdentityUC(pool)
+	const clerkUser = org + "-user-1"
+	const clerkMemID = org + "-mem-1" // globally UNIQUE — namespace by org
+
+	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, clerkMemID, "ana@b.com", "Ana", identity.RoleAdmin)
+	if err != nil {
+		t.Fatalf("OnMembershipCreated: %v", err)
+	}
+
+	// ACTIVE member → the normal Principal, carrying the internal ids and role.
+	principal, err := uc.ResolvePrincipal(ctx, clerkUser, org)
+	if err != nil {
+		t.Fatalf("ResolvePrincipal (active): %v", err)
+	}
+	if principal.UserID != user.ID || principal.TenantID != tenantID || principal.Role != identity.RoleAdmin {
+		t.Fatalf("principal = %+v, want the active member", principal)
+	}
+
+	// Soft-remove, then the very same lookup must deny with ErrUserNotFound.
+	if err := uc.OnMembershipRemoved(ctx, org, clerkMemID); err != nil {
+		t.Fatalf("OnMembershipRemoved: %v", err)
+	}
+	_, err = uc.ResolvePrincipal(ctx, clerkUser, org)
+	if !errors.Is(err, identity.ErrUserNotFound) {
+		t.Fatalf("ResolvePrincipal (removed) error = %v, want ErrUserNotFound", err)
 	}
 }
 

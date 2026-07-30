@@ -36,6 +36,17 @@ RETURNING *;
 SELECT * FROM app_user
 WHERE clerk_user_id = $1;
 
+-- name: GetActiveUserByClerkUser :one
+-- Resolve the app_user behind a Clerk user ONLY while it still has an ACTIVE
+-- membership — the authorization gate ResolvePrincipal reads. A soft-removed member
+-- (status REMOVED) yields no row, so the caller maps it to ErrUserNotFound (→ 401),
+-- exactly like an unknown user. The role returned is app_user.role (kept in sync by
+-- an organizationMembership.updated), never the membership row's own copy.
+SELECT u.* FROM app_user u
+JOIN membership m
+  ON m.app_user_id = u.id AND m.tenant_id = u.tenant_id
+WHERE u.clerk_user_id = $1 AND m.status = 'ACTIVE';
+
 -- name: GetUserByID :one
 SELECT * FROM app_user
 WHERE id = $1;
@@ -59,6 +70,37 @@ ON CONFLICT (tenant_id, app_user_id) DO UPDATE
        status              = 'ACTIVE',
        removed_at          = NULL
 RETURNING *, coalesce((SELECT status FROM prev), '') <> 'ACTIVE' AS joined;
+
+-- name: SoftRemoveMembership :one
+-- Soft-delete a membership from an organizationMembership.deleted webhook: flip
+-- ACTIVE→REMOVED and stamp removed_at. WHERE status='ACTIVE' makes it fire at most
+-- once — a replay (already REMOVED) or an unknown clerk id matches no row, so
+-- RETURNING is empty (pgx.ErrNoRows) and the caller treats it as an idempotent
+-- no-op that republishes nothing. Role and app_user are untouched: a soft-delete
+-- preserves the projection, it does not rewrite it.
+UPDATE membership
+   SET status = 'REMOVED',
+       removed_at = now()
+ WHERE clerk_membership_id = $1 AND status = 'ACTIVE'
+RETURNING *;
+
+-- name: UpdateMembershipRole :exec
+-- Sync a role change from an organizationMembership.updated webhook. The role lives
+-- in two places: membership.role (the link) and app_user.role (what ResolvePrincipal
+-- authorizes on) — this updates BOTH in one statement so they never drift. The
+-- data-modifying CTE always runs to completion (Postgres guarantees it), so the
+-- membership write happens even though its output only feeds the app_user update.
+-- Idempotent: re-applying the same role is a harmless no-op; an unknown clerk id
+-- matches no membership, leaves the CTE empty, and updates nothing.
+WITH synced AS (
+    UPDATE membership
+       SET role = $2
+     WHERE clerk_membership_id = $1
+    RETURNING app_user_id
+)
+UPDATE app_user
+   SET role = $2
+ WHERE id = (SELECT app_user_id FROM synced);
 
 -- name: GetMeByClerkUser :one
 -- Onboarding read model for GET /identity/me: the caller's internal tenant and

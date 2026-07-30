@@ -19,12 +19,27 @@ type Repository interface {
 	FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error)
 	UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error)
+	// FindActiveUserByClerkUser resolves the app_user behind a Clerk user only while
+	// it still has an ACTIVE membership — the authorization gate for ResolvePrincipal.
+	// A soft-removed member yields ErrUserNotFound, exactly like an unknown user.
+	FindActiveUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error)
 	// UpsertMembership provisions or reactivates the ACTIVE membership linking an
 	// app_user to its tenant, inside the caller's tx. The bool return is `joined`:
 	// true when this is a real join (a new row, or a REMOVED one reactivated), false
 	// when it merely replays an already-ACTIVE membership — the use case emits
 	// member_joined only when true.
 	UpsertMembership(ctx context.Context, tx database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error)
+	// SoftRemoveMembership flips an ACTIVE membership to REMOVED (stamping removed_at)
+	// by its clerk id, inside the caller's tx. The bool return is `removed`: true when
+	// a row actually transitioned ACTIVE→REMOVED, false when nothing was active (a
+	// replay of an already-removed membership, or an unknown clerk id) — the use case
+	// emits member_removed only when true. Mirrors UpsertMembership's `joined`.
+	SoftRemoveMembership(ctx context.Context, tx database.Tx, clerkMembershipID string) (*Membership, bool, error)
+	// UpdateMembershipRole re-points a membership's role by its clerk id AND syncs
+	// app_user.role to match, in one statement inside the caller's tx, so the link
+	// and the authorization role never drift. Idempotent; an unknown clerk id is a
+	// no-op.
+	UpdateMembershipRole(ctx context.Context, tx database.Tx, clerkMembershipID string, role Role) error
 	// GetMeByClerkUser reads the onboarding read model (tenant + gate) for a Clerk
 	// user. Returns ErrUserNotFound when the user has no tenant yet — the caller
 	// folds that into the "not onboarded" state, it is not a 5xx.
@@ -120,8 +135,51 @@ func (r *pgRepository) UpsertMembership(ctx context.Context, tx database.Tx, ten
 	return membershipToEntity(row), row.Joined, nil
 }
 
+// SoftRemoveMembership flips an ACTIVE membership to REMOVED by its clerk id inside
+// the caller's tx. clerkMembershipID is always the non-empty id Clerk carries on the
+// deleted webhook, passed by pointer for the nullable column. A no-row result (the
+// membership was already REMOVED, or the clerk id is unknown) is NOT an error: it is
+// the `removed=false` no-op the use case swallows without republishing.
+func (r *pgRepository) SoftRemoveMembership(ctx context.Context, tx database.Tx, clerkMembershipID string) (*Membership, bool, error) {
+	row, err := identitydb.New(tx).SoftRemoveMembership(ctx, &clerkMembershipID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, database.WrapInfra(err)
+	}
+	return membershipModelToEntity(row), true, nil
+}
+
+// UpdateMembershipRole re-points the membership role and syncs app_user.role in one
+// statement inside the caller's tx. clerkMembershipID is passed by pointer for the
+// nullable column; an unknown id updates nothing (idempotent no-op).
+func (r *pgRepository) UpdateMembershipRole(ctx context.Context, tx database.Tx, clerkMembershipID string, role Role) error {
+	if err := identitydb.New(tx).UpdateMembershipRole(ctx, identitydb.UpdateMembershipRoleParams{
+		ClerkMembershipID: &clerkMembershipID,
+		Role:              string(role),
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
 func (r *pgRepository) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
 	row, err := r.q.GetUserByClerkUser(ctx, clerkUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return userToEntity(row), nil
+}
+
+// FindActiveUserByClerkUser reads on the pool (a resolution read, no tx). The join
+// to an ACTIVE membership is the authorization gate: no active membership → no row →
+// the typed ErrUserNotFound the auth boundary maps to 401, never (nil, nil).
+func (r *pgRepository) FindActiveUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
+	row, err := r.q.GetActiveUserByClerkUser(ctx, clerkUserID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}

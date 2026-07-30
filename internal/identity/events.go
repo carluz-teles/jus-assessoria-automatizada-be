@@ -19,6 +19,10 @@ const TypeOrgProfileUpdated = "identity.org_profile_updated"
 // the tenant.
 const TypeMemberJoined = "identity.member_joined"
 
+// TypeMemberRemoved is the dotted id of the event emitted when a user's membership
+// is soft-removed from a tenant (ACTIVE → REMOVED). Its aggregate is the tenant.
+const TypeMemberRemoved = "identity.member_removed"
+
 const aggregateTypeTenant = "tenant"
 
 // TenantProvisioned is emitted after a tenant is created or synced from Clerk.
@@ -65,3 +69,19 @@ var _ events.Event = MemberJoined{}
 
 func (MemberJoined) Type() string          { return TypeMemberJoined }
 func (MemberJoined) AggregateType() string { return aggregateTypeTenant }
+
+// MemberRemoved is emitted, in the same transaction as the soft-delete, when a
+// user's membership is removed from a tenant (ACTIVE → REMOVED). The payload carries
+// the internal ids so a consumer can react (revoke access, reassign work) without
+// re-reading the membership. Base adds the event id (consumer dedup) and the
+// aggregate id (the tenant).
+type MemberRemoved struct {
+	events.Base
+	TenantID  string `json:"tenant_id"`
+	AppUserID string `json:"app_user_id"`
+}
+
+var _ events.Event = MemberRemoved{}
+
+func (MemberRemoved) Type() string          { return TypeMemberRemoved }
+func (MemberRemoved) AggregateType() string { return aggregateTypeTenant }

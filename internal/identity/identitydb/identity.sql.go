@@ -12,6 +12,34 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getActiveUserByClerkUser = `-- name: GetActiveUserByClerkUser :one
+SELECT u.id, u.clerk_user_id, u.tenant_id, u.email, u.name, u.role, u.created_at, u.phone FROM app_user u
+JOIN membership m
+  ON m.app_user_id = u.id AND m.tenant_id = u.tenant_id
+WHERE u.clerk_user_id = $1 AND m.status = 'ACTIVE'
+`
+
+// Resolve the app_user behind a Clerk user ONLY while it still has an ACTIVE
+// membership — the authorization gate ResolvePrincipal reads. A soft-removed member
+// (status REMOVED) yields no row, so the caller maps it to ErrUserNotFound (→ 401),
+// exactly like an unknown user. The role returned is app_user.role (kept in sync by
+// an organizationMembership.updated), never the membership row's own copy.
+func (q *Queries) GetActiveUserByClerkUser(ctx context.Context, clerkUserID string) (AppUser, error) {
+	row := q.db.QueryRow(ctx, getActiveUserByClerkUser, clerkUserID)
+	var i AppUser
+	err := row.Scan(
+		&i.ID,
+		&i.ClerkUserID,
+		&i.TenantID,
+		&i.Email,
+		&i.Name,
+		&i.Role,
+		&i.CreatedAt,
+		&i.Phone,
+	)
+	return i, err
+}
+
 const getMeByClerkUser = `-- name: GetMeByClerkUser :one
 SELECT u.tenant_id,
        t.onboarding_completed_at
@@ -120,6 +148,65 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (AppUser, error
 		&i.Phone,
 	)
 	return i, err
+}
+
+const softRemoveMembership = `-- name: SoftRemoveMembership :one
+UPDATE membership
+   SET status = 'REMOVED',
+       removed_at = now()
+ WHERE clerk_membership_id = $1 AND status = 'ACTIVE'
+RETURNING id, tenant_id, app_user_id, clerk_membership_id, role, status, joined_at, removed_at
+`
+
+// Soft-delete a membership from an organizationMembership.deleted webhook: flip
+// ACTIVE→REMOVED and stamp removed_at. WHERE status='ACTIVE' makes it fire at most
+// once — a replay (already REMOVED) or an unknown clerk id matches no row, so
+// RETURNING is empty (pgx.ErrNoRows) and the caller treats it as an idempotent
+// no-op that republishes nothing. Role and app_user are untouched: a soft-delete
+// preserves the projection, it does not rewrite it.
+func (q *Queries) SoftRemoveMembership(ctx context.Context, clerkMembershipID *string) (Membership, error) {
+	row := q.db.QueryRow(ctx, softRemoveMembership, clerkMembershipID)
+	var i Membership
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.AppUserID,
+		&i.ClerkMembershipID,
+		&i.Role,
+		&i.Status,
+		&i.JoinedAt,
+		&i.RemovedAt,
+	)
+	return i, err
+}
+
+const updateMembershipRole = `-- name: UpdateMembershipRole :exec
+WITH synced AS (
+    UPDATE membership
+       SET role = $2
+     WHERE clerk_membership_id = $1
+    RETURNING app_user_id
+)
+UPDATE app_user
+   SET role = $2
+ WHERE id = (SELECT app_user_id FROM synced)
+`
+
+type UpdateMembershipRoleParams struct {
+	ClerkMembershipID *string `json:"clerk_membership_id"`
+	Role              string  `json:"role"`
+}
+
+// Sync a role change from an organizationMembership.updated webhook. The role lives
+// in two places: membership.role (the link) and app_user.role (what ResolvePrincipal
+// authorizes on) — this updates BOTH in one statement so they never drift. The
+// data-modifying CTE always runs to completion (Postgres guarantees it), so the
+// membership write happens even though its output only feeds the app_user update.
+// Idempotent: re-applying the same role is a harmless no-op; an unknown clerk id
+// matches no membership, leaves the CTE empty, and updates nothing.
+func (q *Queries) UpdateMembershipRole(ctx context.Context, arg UpdateMembershipRoleParams) error {
+	_, err := q.db.Exec(ctx, updateMembershipRole, arg.ClerkMembershipID, arg.Role)
+	return err
 }
 
 const updateOrgProfile = `-- name: UpdateOrgProfile :one

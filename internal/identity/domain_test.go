@@ -18,7 +18,10 @@ type mockRepo struct {
 	findTenant       func(ctx context.Context, clerkOrgID string) (*Tenant, error)
 	upsertUser       func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	upsertMembership func(ctx context.Context, tx database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error)
+	softRemoveMember func(ctx context.Context, tx database.Tx, clerkMembershipID string) (*Membership, bool, error)
+	updateMemberRole func(ctx context.Context, tx database.Tx, clerkMembershipID string, role Role) error
 	findUser         func(ctx context.Context, clerkUserID string) (*AppUser, error)
+	findActiveUser   func(ctx context.Context, clerkUserID string) (*AppUser, error)
 	getMe            func(ctx context.Context, clerkUserID string) (*Me, error)
 	updateOrgProfile func(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error)
 }
@@ -39,8 +42,20 @@ func (m *mockRepo) UpsertMembership(ctx context.Context, tx database.Tx, tenantI
 	return m.upsertMembership(ctx, tx, tenantID, appUserID, clerkMembershipID, role)
 }
 
+func (m *mockRepo) SoftRemoveMembership(ctx context.Context, tx database.Tx, clerkMembershipID string) (*Membership, bool, error) {
+	return m.softRemoveMember(ctx, tx, clerkMembershipID)
+}
+
+func (m *mockRepo) UpdateMembershipRole(ctx context.Context, tx database.Tx, clerkMembershipID string, role Role) error {
+	return m.updateMemberRole(ctx, tx, clerkMembershipID, role)
+}
+
 func (m *mockRepo) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
 	return m.findUser(ctx, clerkUserID)
+}
+
+func (m *mockRepo) FindActiveUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
+	return m.findActiveUser(ctx, clerkUserID)
 }
 
 func (m *mockRepo) GetMeByClerkUser(ctx context.Context, clerkUserID string) (*Me, error) {
@@ -464,15 +479,181 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 	})
 }
 
+func TestUseCase_OnMembershipRemoved(t *testing.T) {
+	ctx := context.Background()
+	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
+	membership := &Membership{ID: "m-1", TenantID: tenant.ID, AppUserID: "user-uuid", Status: MembershipRemoved}
+
+	t.Run("active membership is soft-removed and emits member_removed in the same UoW", func(t *testing.T) {
+		var gotClerkMemID string
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			softRemoveMember: func(_ context.Context, _ database.Tx, clerkMembershipID string) (*Membership, bool, error) {
+				gotClerkMemID = clerkMembershipID
+				return membership, true, nil // ACTIVE → REMOVED
+			},
+		}
+		outbox := &recordingOutbox{}
+		uow := &fakeUOW{}
+
+		if err := NewUseCase(repo, outbox, uow).OnMembershipRemoved(ctx, "org_abc", "orgmem_1"); err != nil {
+			t.Fatalf("OnMembershipRemoved() error = %v", err)
+		}
+		// The soft-delete ran under the tenant's RLS scope (barrier 2), keyed by the
+		// clerk membership id.
+		if uow.scope != tenant.ID {
+			t.Fatalf("RLS scope = %q, want %q", uow.scope, tenant.ID)
+		}
+		if gotClerkMemID != "orgmem_1" {
+			t.Fatalf("SoftRemoveMembership clerk id = %q, want orgmem_1", gotClerkMemID)
+		}
+		// Exactly one member_removed, published inside the same unit of work.
+		if len(outbox.published) != 1 {
+			t.Fatalf("published %d events, want 1", len(outbox.published))
+		}
+		ev, ok := outbox.published[0].(MemberRemoved)
+		if !ok {
+			t.Fatalf("event type = %T, want MemberRemoved", outbox.published[0])
+		}
+		if ev.Type() != TypeMemberRemoved || ev.AggregateType() != aggregateTypeTenant {
+			t.Fatalf("event ids = (%q, %q)", ev.Type(), ev.AggregateType())
+		}
+		if ev.AggregateID() != tenant.ID || ev.TenantID != tenant.ID || ev.AppUserID != membership.AppUserID {
+			t.Fatalf("event payload = %+v", ev)
+		}
+		if ev.IdempotencyKey() == "" {
+			t.Fatal("event idempotency key (event id) is empty")
+		}
+	})
+
+	t.Run("replay of an already-removed membership publishes nothing", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			softRemoveMember: func(_ context.Context, _ database.Tx, _ string) (*Membership, bool, error) {
+				return nil, false, nil // nothing was ACTIVE — no-op
+			},
+		}
+		outbox := &recordingOutbox{}
+		uow := &fakeUOW{}
+
+		if err := NewUseCase(repo, outbox, uow).OnMembershipRemoved(ctx, "org_abc", "orgmem_1"); err != nil {
+			t.Fatalf("OnMembershipRemoved() error = %v", err)
+		}
+		if !uow.called {
+			t.Fatal("unit of work not opened; the idempotent update must still run")
+		}
+		if len(outbox.published) != 0 {
+			t.Fatalf("published %d events on replay, want 0", len(outbox.published))
+		}
+	})
+
+	t.Run("missing tenant propagates ErrTenantNotFound without opening a tx", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+		}
+		uow := &fakeUOW{}
+
+		err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipRemoved(ctx, "org_abc", "orgmem_1")
+		if !errors.Is(err, ErrTenantNotFound) {
+			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite the missing tenant")
+		}
+	})
+
+	t.Run("a publish failure rolls the removal back", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			softRemoveMember: func(_ context.Context, _ database.Tx, _ string) (*Membership, bool, error) {
+				return membership, true, nil
+			},
+		}
+		outbox := &recordingOutbox{err: errors.New("outbox unreachable")}
+
+		err := NewUseCase(repo, outbox, &fakeUOW{}).OnMembershipRemoved(ctx, "org_abc", "orgmem_1")
+		if err == nil {
+			t.Fatal("OnMembershipRemoved() error = nil, want the publish failure")
+		}
+	})
+}
+
+func TestUseCase_OnMembershipUpdated(t *testing.T) {
+	ctx := context.Background()
+	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
+
+	t.Run("syncs the role under the tenant scope and emits nothing", func(t *testing.T) {
+		var got struct {
+			clerkMembershipID string
+			role              Role
+		}
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			updateMemberRole: func(_ context.Context, _ database.Tx, clerkMembershipID string, role Role) error {
+				got.clerkMembershipID, got.role = clerkMembershipID, role
+				return nil
+			},
+		}
+		outbox := &recordingOutbox{}
+		uow := &fakeUOW{}
+
+		if err := NewUseCase(repo, outbox, uow).OnMembershipUpdated(ctx, "org_abc", "orgmem_1", RoleAdmin); err != nil {
+			t.Fatalf("OnMembershipUpdated() error = %v", err)
+		}
+		if uow.scope != tenant.ID {
+			t.Fatalf("RLS scope = %q, want %q", uow.scope, tenant.ID)
+		}
+		if got.clerkMembershipID != "orgmem_1" || got.role != RoleAdmin {
+			t.Fatalf("UpdateMembershipRole args = %+v", got)
+		}
+		if len(outbox.published) != 0 {
+			t.Fatalf("published %d events, want 0 (a role change is silent in v0)", len(outbox.published))
+		}
+	})
+
+	t.Run("missing tenant propagates ErrTenantNotFound without opening a tx", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+		}
+		uow := &fakeUOW{}
+
+		err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipUpdated(ctx, "org_abc", "orgmem_1", RoleAdmin)
+		if !errors.Is(err, ErrTenantNotFound) {
+			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite the missing tenant")
+		}
+	})
+
+	t.Run("invalid role short-circuits before any repo call", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				t.Fatal("FindTenantByClerkOrg must not be called on invalid role")
+				return nil, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipUpdated(ctx, "org_abc", "orgmem_1", "MEMBER")
+		if !errors.Is(err, ErrInvalidRole) {
+			t.Fatalf("error = %v, want ErrInvalidRole", err)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened despite invalid role")
+		}
+	})
+}
+
 func TestUseCase_ResolvePrincipal(t *testing.T) {
 	ctx := context.Background()
 	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
 	user := &AppUser{ID: "user-uuid", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleAdmin}
 
-	t.Run("assembles the principal from user + tenant", func(t *testing.T) {
+	t.Run("assembles the principal from an ACTIVE member + tenant", func(t *testing.T) {
 		repo := &mockRepo{
-			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
-			findUser:   func(context.Context, string) (*AppUser, error) { return user, nil },
+			findTenant:     func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findActiveUser: func(context.Context, string) (*AppUser, error) { return user, nil },
 		}
 
 		got, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
@@ -496,10 +677,13 @@ func TestUseCase_ResolvePrincipal(t *testing.T) {
 		}
 	})
 
-	t.Run("missing user propagates ErrUserNotFound", func(t *testing.T) {
+	// AC4: no ACTIVE membership — whether the user never existed or was soft-removed,
+	// the resolution query returns no row and the repo surfaces ErrUserNotFound, which
+	// the auth boundary maps to 401.
+	t.Run("a member without an ACTIVE membership is treated as not found", func(t *testing.T) {
 		repo := &mockRepo{
-			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
-			findUser:   func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
+			findTenant:     func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findActiveUser: func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
 		}
 
 		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
@@ -511,8 +695,8 @@ func TestUseCase_ResolvePrincipal(t *testing.T) {
 	t.Run("user of another tenant is treated as not found", func(t *testing.T) {
 		other := &AppUser{ID: "user-uuid", TenantID: "different-tenant", Role: RoleAdmin}
 		repo := &mockRepo{
-			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
-			findUser:   func(context.Context, string) (*AppUser, error) { return other, nil },
+			findTenant:     func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findActiveUser: func(context.Context, string) (*AppUser, error) { return other, nil },
 		}
 
 		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")

@@ -160,16 +160,76 @@ func (uc *UseCase) OnMembershipCreated(ctx context.Context, clerkUserID, clerkOr
 	return user, nil
 }
 
+// OnMembershipRemoved soft-deletes a user's membership from an
+// organizationMembership.deleted webhook: it flips the ACTIVE membership to REMOVED
+// (stamping removed_at) and emits identity.member_removed in the SAME transaction —
+// but only the first time, when a row genuinely transitions. A replay of an
+// already-removed membership (at-least-once delivery) is a no-op that republishes
+// nothing, mirroring OnMembershipCreated's join/replay split.
+//
+// The tenant must already exist (ErrTenantNotFound propagates so Clerk retries a
+// deleted event that raced ahead of organization.created). We do NOT reject removing
+// the last admin here: the webhook is a fait accompli — Clerk already blocks that in
+// its UI — so re-litigating it would only strand our projection out of sync.
+func (uc *UseCase) OnMembershipRemoved(ctx context.Context, clerkOrgID, clerkMembershipID string) error {
+	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
+	if err != nil {
+		return err
+	}
+
+	return uc.uow.Do(ctx, tenant.ID, func(tx database.Tx) error {
+		membership, removed, err := uc.repo.SoftRemoveMembership(ctx, tx, clerkMembershipID)
+		if err != nil {
+			return err
+		}
+		// Nothing was ACTIVE (already-removed replay, or unknown clerk id): the write
+		// is idempotent, but the event must fire once per real removal, so skip it.
+		if !removed {
+			return nil
+		}
+		return uc.outbox.Publish(ctx, tx, newMemberRemoved(membership.TenantID, membership.AppUserID))
+	})
+}
+
+// OnMembershipUpdated syncs a role change from an organizationMembership.updated
+// webhook: it re-points membership.role AND app_user.role in the SAME transaction so
+// the link and the authorization role ResolvePrincipal reads never drift. Idempotent
+// for at-least-once delivery (re-applying the same role is a no-op); it emits no event
+// — a role change is a silent projection update in v0.
+//
+// The tenant must already exist (ErrTenantNotFound propagates so Clerk retries an
+// updated event that raced ahead of organization.created).
+func (uc *UseCase) OnMembershipUpdated(ctx context.Context, clerkOrgID, clerkMembershipID string, role Role) error {
+	if !role.Valid() {
+		return ErrInvalidRole
+	}
+
+	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
+	if err != nil {
+		return err
+	}
+
+	return uc.uow.Do(ctx, tenant.ID, func(tx database.Tx) error {
+		return uc.repo.UpdateMembershipRole(ctx, tx, clerkMembershipID, role)
+	})
+}
+
 // ResolvePrincipal looks up the local user + tenant behind a verified Clerk JWT
 // and assembles the Principal the auth middleware injects into the request. The
 // TenantID is the internal uuid (from app_user), never the Clerk org id.
+//
+// Authorization gate: the lookup requires an ACTIVE membership (barrier F2-2), so a
+// soft-removed member resolves to ErrUserNotFound and the auth boundary answers 401 —
+// access is denied the moment the membership goes REMOVED, not on the next login. The
+// Role carried is app_user.role, kept in lockstep with the membership by
+// OnMembershipUpdated.
 func (uc *UseCase) ResolvePrincipal(ctx context.Context, clerkUserID, clerkOrgID string) (Principal, error) {
 	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
 	if err != nil {
 		return Principal{}, err
 	}
 
-	user, err := uc.repo.FindUserByClerkUser(ctx, clerkUserID)
+	user, err := uc.repo.FindActiveUserByClerkUser(ctx, clerkUserID)
 	if err != nil {
 		return Principal{}, err
 	}
@@ -250,5 +310,17 @@ func newMemberJoined(tenantID, appUserID string, role Role) MemberJoined {
 		TenantID:  tenantID,
 		AppUserID: appUserID,
 		Role:      role,
+	}
+}
+
+// newMemberRemoved builds the event for a soft-removed membership, minting a fresh v7
+// event id (time-ordered) as the aggregate/idempotency key carrier. The aggregate is
+// the tenant; the payload carries the internal ids so a consumer can revoke access
+// without re-reading the membership.
+func newMemberRemoved(tenantID, appUserID string) MemberRemoved {
+	return MemberRemoved{
+		Base:      events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: tenantID},
+		TenantID:  tenantID,
+		AppUserID: appUserID,
 	}
 }

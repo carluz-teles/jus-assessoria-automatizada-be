@@ -11,6 +11,12 @@ import (
 )
 
 type Querier interface {
+	// Resolve the app_user behind a Clerk user ONLY while it still has an ACTIVE
+	// membership — the authorization gate ResolvePrincipal reads. A soft-removed member
+	// (status REMOVED) yields no row, so the caller maps it to ErrUserNotFound (→ 401),
+	// exactly like an unknown user. The role returned is app_user.role (kept in sync by
+	// an organizationMembership.updated), never the membership row's own copy.
+	GetActiveUserByClerkUser(ctx context.Context, clerkUserID string) (AppUser, error)
 	// Onboarding read model for GET /identity/me: the caller's internal tenant and
 	// its onboarding gate, joined from app_user by Clerk user id. No row → the
 	// authenticated user has no tenant yet (the domain treats that as "not
@@ -20,6 +26,21 @@ type Querier interface {
 	GetTenantByID(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetUserByClerkUser(ctx context.Context, clerkUserID string) (AppUser, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (AppUser, error)
+	// Soft-delete a membership from an organizationMembership.deleted webhook: flip
+	// ACTIVE→REMOVED and stamp removed_at. WHERE status='ACTIVE' makes it fire at most
+	// once — a replay (already REMOVED) or an unknown clerk id matches no row, so
+	// RETURNING is empty (pgx.ErrNoRows) and the caller treats it as an idempotent
+	// no-op that republishes nothing. Role and app_user are untouched: a soft-delete
+	// preserves the projection, it does not rewrite it.
+	SoftRemoveMembership(ctx context.Context, clerkMembershipID *string) (Membership, error)
+	// Sync a role change from an organizationMembership.updated webhook. The role lives
+	// in two places: membership.role (the link) and app_user.role (what ResolvePrincipal
+	// authorizes on) — this updates BOTH in one statement so they never drift. The
+	// data-modifying CTE always runs to completion (Postgres guarantees it), so the
+	// membership write happens even though its output only feeds the app_user update.
+	// Idempotent: re-applying the same role is a harmless no-op; an unknown clerk id
+	// matches no membership, leaves the CTE empty, and updates nothing.
+	UpdateMembershipRole(ctx context.Context, arg UpdateMembershipRoleParams) error
 	// Persist the escritório's company profile during onboarding and stamp the
 	// onboarding gate exactly once: COALESCE keeps the first completion time across
 	// replays (idempotent — a second PUT does not move onboarding_completed_at).

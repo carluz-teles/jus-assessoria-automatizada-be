@@ -112,6 +112,64 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		}
 	})
 
+	t.Run("organizationMembership.deleted soft-removes the membership by its clerk id", func(t *testing.T) {
+		var got struct{ clerkMembershipID string }
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				return &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}, nil
+			},
+			softRemoveMember: func(_ context.Context, _ database.Tx, clerkMembershipID string) (*Membership, bool, error) {
+				got.clerkMembershipID = clerkMembershipID
+				return &Membership{ID: "m-1", TenantID: "tenant-uuid", AppUserID: "u-1", Status: MembershipRemoved}, true, nil
+			},
+		}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
+
+		body := []byte(`{"type":"organizationMembership.deleted","data":{` +
+			`"id":"orgmem_1",` +
+			`"organization":{"id":"org_abc","name":"Escritório"},` +
+			`"public_user_data":{"user_id":"user_xyz"}}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if got.clerkMembershipID != "orgmem_1" {
+			t.Fatalf("SoftRemoveMembership clerk id = %q, want orgmem_1", got.clerkMembershipID)
+		}
+	})
+
+	t.Run("organizationMembership.updated syncs the role by clerk id with the mapped role", func(t *testing.T) {
+		var got struct {
+			clerkMembershipID string
+			role              Role
+		}
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				return &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}, nil
+			},
+			updateMemberRole: func(_ context.Context, _ database.Tx, clerkMembershipID string, role Role) error {
+				got.clerkMembershipID, got.role = clerkMembershipID, role
+				return nil
+			},
+		}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
+
+		body := []byte(`{"type":"organizationMembership.updated","data":{` +
+			`"id":"orgmem_1",` +
+			`"role":"org:admin",` +
+			`"organization":{"id":"org_abc","name":"Escritório"},` +
+			`"public_user_data":{"user_id":"user_xyz"}}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if got.clerkMembershipID != "orgmem_1" || got.role != RoleAdmin {
+			t.Fatalf("UpdateMembershipRole args = %+v (org:admin maps to ADMIN)", got)
+		}
+	})
+
 	t.Run("user.updated resyncs email, name and the primary phone but preserves the role", func(t *testing.T) {
 		existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleLawyer}
 		var got struct {

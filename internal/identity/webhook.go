@@ -17,6 +17,8 @@ import (
 const (
 	eventOrganizationCreated = "organization.created"
 	eventMembershipCreated   = "organizationMembership.created"
+	eventMembershipDeleted   = "organizationMembership.deleted"
+	eventMembershipUpdated   = "organizationMembership.updated"
 	eventUserUpdated         = "user.updated"
 )
 
@@ -151,6 +153,20 @@ func (h *WebhookHandler) dispatch(ctx context.Context, ev clerkEvent) error {
 			mapClerkRole(d.Role),
 		)
 		return err
+
+	case eventMembershipDeleted:
+		var d membershipData
+		if err := json.Unmarshal(ev.Data, &d); err != nil {
+			return apperr.NewInvalid("malformed membership payload")
+		}
+		return h.uc.OnMembershipRemoved(ctx, d.Organization.ID, d.ID)
+
+	case eventMembershipUpdated:
+		var d membershipData
+		if err := json.Unmarshal(ev.Data, &d); err != nil {
+			return apperr.NewInvalid("malformed membership payload")
+		}
+		return h.uc.OnMembershipUpdated(ctx, d.Organization.ID, d.ID, mapClerkRole(d.Role))
 
 	case eventUserUpdated:
 		var d userData

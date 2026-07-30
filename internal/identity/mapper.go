@@ -102,6 +102,22 @@ func membershipToEntity(r identitydb.UpsertMembershipRow) *Membership {
 	}
 }
 
+// membershipModelToEntity maps a base membership row (RETURNING *) to the entity,
+// absorbing the pgtype/uuid driver types. Used by the soft-delete path, which
+// returns the whole row rather than the UpsertMembership control shape.
+func membershipModelToEntity(r identitydb.Membership) *Membership {
+	return &Membership{
+		ID:                r.ID.String(),
+		TenantID:          r.TenantID.String(),
+		AppUserID:         r.AppUserID.String(),
+		ClerkMembershipID: derefString(r.ClerkMembershipID),
+		Role:              Role(r.Role),
+		Status:            MembershipStatus(r.Status),
+		JoinedAt:          r.JoinedAt.Time,
+		RemovedAt:         timeToPtr(r.RemovedAt),
+	}
+}
+
 // derefString collapses a nullable text column (*string) to a plain string, an
 // empty string standing in for SQL NULL — app_user.name and .phone are optional.
 func derefString(s *string) string {
