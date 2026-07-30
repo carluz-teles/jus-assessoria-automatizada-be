@@ -34,8 +34,9 @@ type Repository interface {
 	FinalizeBackfillJob(ctx context.Context, tx database.Tx, tenantID, backfillJobID, status string) error
 
 	// Sync cycle — the sync listener's run bookkeeping and consolidation upserts.
-	// The sync use case depends on the narrow syncRepo view of these five methods.
+	// The sync use case depends on the narrow syncRepo view of these methods.
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
+	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
@@ -265,11 +266,27 @@ func (r *pgRepository) InsertSyncRun(ctx context.Context, tx database.Tx, params
 		ConnectorVersion: params.ConnectorVersion,
 		StartedAt:        pgtype.Timestamptz{Time: params.StartedAt, Valid: true},
 		Status:           params.Status,
+		EventID:          nullString(params.EventID),
 	})
 	if err != nil {
 		return "", database.WrapInfra(err)
 	}
 	return id.String(), nil
+}
+
+// FindSyncRunByEventID resolves the sync_run opened by eventID inside the caller's
+// tx, mapping a miss (pgx.ErrNoRows) to the typed ErrSyncRunNotFound rather than
+// (nil, nil). The lookup is scoped by the tx's RLS tenant; event_id is globally
+// unique (partial index), so at most one row matches.
+func (r *pgRepository) FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error) {
+	row, err := acquisitiondb.New(tx).FindSyncRunByEventID(ctx, &eventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSyncRunNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return syncRunToEntity(row), nil
 }
 
 // UpdateSyncRun closes a sync_run inside the caller's tx. The error reason (empty

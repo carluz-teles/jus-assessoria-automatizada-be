@@ -22,25 +22,31 @@ import (
 )
 
 // newSyncUC wires the sync use case against a real pool, the real transactional
-// outbox, and the slice's stub connector/parser.
+// outbox, and the slice's stub connectors/parser resolved per source via the
+// orchestrator (DJEN + DATAJUD registered, mirroring the worker composition).
 func newSyncUC(pool *pgxpool.Pool) *acquisition.SyncUseCase {
+	orch := acquisition.NewOrchestrator()
+	orch.Register(acquisition.SourceDJEN, acquisition.NewStubConnector(acquisition.SourceDJEN))
+	orch.Register(acquisition.SourceDATAJUD, acquisition.NewStubConnector(acquisition.SourceDATAJUD))
 	return acquisition.NewSyncUseCase(
 		acquisition.NewRepository(pool),
 		events.NewOutbox(),
 		database.NewUnitOfWork(pool),
-		acquisition.NewStubConnector(acquisition.SourceDJEN),
+		orch,
 		acquisition.NewStubParser(),
 	)
 }
 
 // syncEvent builds a valid sync_requested event with a fresh event id (so a
-// second call is a distinct delivery, not a dedup no-op).
+// second call is a distinct delivery, not a dedup no-op). Source is DJEN so the
+// orchestrator resolves a connector.
 func syncEvent(tenantID, integrationID string) acquisition.SyncRequested {
 	return acquisition.SyncRequested{
 		Base:          events.Base{EventID: uuid.NewString(), Aggregate: integrationID},
 		BackfillJobID: uuid.NewString(),
 		TenantID:      tenantID,
 		IntegrationID: integrationID,
+		Source:        acquisition.SourceDJEN,
 		SliceIndex:    0,
 		WindowFrom:    "2024-01-01",
 		WindowTo:      "2024-01-08",
@@ -193,7 +199,84 @@ func TestSync_SyncCompleted_SameTxAsRun(t *testing.T) {
 	}
 }
 
-// I5: sync_run is tenant-isolated by RLS. As the non-owner app_rls role, a query
+// I5: the sync_run carries the event_id that opened it — the key a re-delivery
+// uses to find and resume a run that never closed.
+func TestSync_SyncRun_PersistsEventID(t *testing.T) {
+	pool := newPool(t)
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-sync-evt", 0)
+	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+
+	ev := syncEvent(tenantID, integID)
+	if err := newSyncUC(pool).OnSyncRequested(context.Background(), ev); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	var eventID string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT event_id FROM sync_run WHERE integration_id=$1`, integID).Scan(&eventID); err != nil {
+		t.Fatalf("read sync_run event_id: %v", err)
+	}
+	if eventID != ev.EventID {
+		t.Fatalf("sync_run event_id = %q, want %q", eventID, ev.EventID)
+	}
+}
+
+// I6: a run left RUNNING by a crashed prior attempt (its dedup mark committed in
+// UoW-1, but the close never ran) is RESUMED on re-delivery — the SAME run closes
+// OK and no second run is opened. The pre-state is manufactured directly: a
+// RUNNING sync_run stamped with the event id, plus the processed_event mark that
+// makes SeenOrMark report "already" — exactly what a mid-cycle crash leaves behind.
+func TestSync_RedeliveryRunningRun_ResumesAndCloses(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-sync-resume", 0)
+	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+
+	ev := syncEvent(tenantID, integID)
+
+	// The crashed prior attempt: a RUNNING run tagged with this event id ...
+	var stuckRunID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO sync_run (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id)
+		 VALUES ($1, $2, 'stub', 'v0', now(), 'RUNNING', $3) RETURNING id::text`,
+		tenantID, integID, ev.EventID).Scan(&stuckRunID); err != nil {
+		t.Fatalf("seed stuck sync_run: %v", err)
+	}
+	// ... and the dedup mark it committed in UoW-1 (consumer const is acquisition.sync).
+	mustExec(t, pool,
+		`INSERT INTO processed_event (consumer, event_id) VALUES ('acquisition.sync', $1)`, ev.EventID)
+
+	if err := newSyncUC(pool).OnSyncRequested(ctx, ev); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	// No second run opened; the stuck one closed OK.
+	if n := countRows(t, pool, `SELECT count(*) FROM sync_run WHERE integration_id=$1`, integID); n != 1 {
+		t.Fatalf("sync_run rows = %d, want 1 (resume reuses the stuck run)", n)
+	}
+	var id, status string
+	if err := pool.QueryRow(ctx,
+		`SELECT id::text, status FROM sync_run WHERE integration_id=$1`, integID).Scan(&id, &status); err != nil {
+		t.Fatalf("read sync_run: %v", err)
+	}
+	if id != stuckRunID {
+		t.Fatalf("closed run id = %q, want the stuck run %q", id, stuckRunID)
+	}
+	if status != acquisition.SyncStatusOK {
+		t.Fatalf("stuck run status = %q, want OK (resumed and closed)", status)
+	}
+	// The resume committed the close together with its sync_completed.
+	completed := countRows(t, pool,
+		`SELECT count(*) FROM outbox WHERE type=$1 AND payload->>'sync_run_id'=$2`,
+		acquisition.TypeSyncCompleted, stuckRunID)
+	if completed != 1 {
+		t.Fatalf("sync_completed outbox rows = %d, want 1 (same tx as the resumed close)", completed)
+	}
+}
+
+// I7: sync_run is tenant-isolated by RLS. As the non-owner app_rls role, a query
 // with app.tenant_id set sees the run only when it matches the run's tenant.
 func TestSync_RLS_TenantIsolation(t *testing.T) {
 	pool := newPool(t)

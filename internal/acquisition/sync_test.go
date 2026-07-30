@@ -20,14 +20,22 @@ import (
 // ports.
 
 // stubConnector is the connector port under the use case's control: it returns a
-// preset payload, or fetchErr to exercise the fetch-failure path.
+// preset payload, or fetchErr to exercise the fetch-failure path. id defaults to
+// "test-conn"; set it to prove the use case ran under a specific connector (the id
+// is stamped on the sync_run).
 type stubConnector struct {
+	id         string
 	payload    RawPayload
 	fetchErr   error
 	fetchCalls int
 }
 
-func (c *stubConnector) ID() string                 { return "test-conn" }
+func (c *stubConnector) ID() string {
+	if c.id == "" {
+		return "test-conn"
+	}
+	return c.id
+}
 func (c *stubConnector) Version() string            { return "test-v1" }
 func (c *stubConnector) Capabilities() []Capability { return []Capability{CapabilityDiscoverByOAB} }
 
@@ -67,6 +75,12 @@ type stubSyncRepo struct {
 	insertCalls int
 	lastInsert  SyncRunParams
 
+	// FindSyncRunByEventID knobs: findByEventRun is returned when set, else
+	// findByEventErr (default ErrSyncRunNotFound is what a real miss looks like).
+	findByEventRun   *SyncRun
+	findByEventErr   error
+	findByEventCalls int
+
 	findCalls  int
 	findParams []FindOrCreateCourtRecordParams
 
@@ -85,6 +99,17 @@ func (s *stubSyncRepo) InsertSyncRun(_ context.Context, _ database.Tx, p SyncRun
 	s.insertCalls++
 	s.lastInsert = p
 	return s.syncRunID, nil
+}
+
+func (s *stubSyncRepo) FindSyncRunByEventID(_ context.Context, _ database.Tx, _ string) (*SyncRun, error) {
+	s.findByEventCalls++
+	if s.findByEventErr != nil {
+		return nil, s.findByEventErr
+	}
+	if s.findByEventRun != nil {
+		return s.findByEventRun, nil
+	}
+	return nil, ErrSyncRunNotFound
 }
 
 func (s *stubSyncRepo) UpdateSyncRun(_ context.Context, _ database.Tx, o SyncRunOutcome) error {
@@ -136,17 +161,27 @@ func (s *stubSyncRepo) UpsertIntimations(_ context.Context, _ database.Tx, param
 	return s.intimNew, nil
 }
 
-// syncRequestedEvent builds a valid sync_requested event for the default tenant.
+// syncRequestedEvent builds a valid sync_requested event for the default tenant,
+// sourced from DJEN (so orchestratorWith(SourceDJEN, …) resolves its connector).
 func syncRequestedEvent() SyncRequested {
 	return SyncRequested{
 		Base:          events.Base{EventID: "sync-evt-1", Aggregate: "job-1"},
 		BackfillJobID: "job-1",
 		TenantID:      testTenant,
 		IntegrationID: "integ-1",
+		Source:        SourceDJEN,
 		SliceIndex:    0,
 		WindowFrom:    "2024-01-01",
 		WindowTo:      "2024-01-08",
 	}
+}
+
+// orchestratorWith registers a single connector under source — the minimal
+// orchestrator the sync use case needs so ConnectorFor(source) resolves it.
+func orchestratorWith(source string, c Connector) *Orchestrator {
+	o := NewOrchestrator()
+	o.Register(source, c)
+	return o
 }
 
 // countByType tallies published events by their dotted type id.
@@ -172,7 +207,7 @@ func TestSyncUseCase_FirstDelivery_RunsFullCycle(t *testing.T) {
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
 	parser := &stubParser{result: stubFixture(SourceDJEN)}
-	uc := NewSyncUseCase(repo, outbox, uow, conn, parser)
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
 
 	ev := syncRequestedEvent()
 	if err := uc.OnSyncRequested(context.Background(), ev); err != nil {
@@ -185,6 +220,9 @@ func TestSyncUseCase_FirstDelivery_RunsFullCycle(t *testing.T) {
 	if repo.lastInsert.ConnectorID != conn.ID() || repo.lastInsert.ConnectorVersion != conn.Version() {
 		t.Fatalf("sync_run connector = {%q %q}, want {%q %q}",
 			repo.lastInsert.ConnectorID, repo.lastInsert.ConnectorVersion, conn.ID(), conn.Version())
+	}
+	if repo.lastInsert.EventID != ev.EventID {
+		t.Fatalf("sync_run event_id = %q, want %q (the event that opened the run)", repo.lastInsert.EventID, ev.EventID)
 	}
 	if len(repo.updates) != 1 || repo.updates[0].Status != SyncStatusOK {
 		t.Fatalf("sync_run updates = %+v, want one OK", repo.updates)
@@ -225,7 +263,7 @@ func TestSyncUseCase_DuplicateDelivery_NoOps(t *testing.T) {
 	uow := &stubBackfillUoW{tx: stubTx{rows: 0}} // 0 rows affected = already seen
 	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
 	parser := &stubParser{result: stubFixture(SourceDJEN)}
-	uc := NewSyncUseCase(repo, outbox, uow, conn, parser)
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
 
 	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v", err)
@@ -252,7 +290,7 @@ func TestSyncUseCase_FetchError_FailsAndAcks(t *testing.T) {
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	conn := &stubConnector{fetchErr: errors.New("connector unreachable")}
 	parser := &stubParser{result: stubFixture(SourceDJEN)}
-	uc := NewSyncUseCase(repo, outbox, uow, conn, parser)
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
 
 	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v, want nil (fetch fault is acked)", err)
@@ -286,7 +324,7 @@ func TestSyncUseCase_ParseError_FailsAndSkipsRetry(t *testing.T) {
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
 	parser := &stubParser{parseErr: errors.New("unrecognized payload")}
-	uc := NewSyncUseCase(repo, outbox, uow, conn, parser)
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
 
 	err := uc.OnSyncRequested(context.Background(), syncRequestedEvent())
 	if err == nil {
@@ -318,7 +356,7 @@ func TestSyncUseCase_DocketDedup_ObservesOnlyNew(t *testing.T) {
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
 	parser := &stubParser{result: stubFixture(SourceDJEN)}
-	uc := NewSyncUseCase(repo, outbox, uow, conn, parser)
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
 
 	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v", err)
@@ -346,7 +384,7 @@ func TestSyncUseCase_RLSScopedToEventTenant(t *testing.T) {
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
 	parser := &stubParser{result: stubFixture(SourceDJEN)}
-	uc := NewSyncUseCase(repo, outbox, uow, conn, parser)
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
 
 	ev := syncRequestedEvent()
 	ev.TenantID = tenant
@@ -359,5 +397,146 @@ func TestSyncUseCase_RLSScopedToEventTenant(t *testing.T) {
 	}
 	if repo.lastInsert.TenantID != tenant {
 		t.Fatalf("sync_run tenantID = %q, want %q", repo.lastInsert.TenantID, tenant)
+	}
+}
+
+// U9: a re-delivery of an already-marked event whose sync_run is still RUNNING (a
+// prior attempt died between UoW-1 and the close) RESUMES the cycle — it opens no
+// second run, re-runs fetch→parse→apply, and closes the SAME run (run-stuck) OK.
+func TestSyncUseCase_RedeliveryRunningRun_Resumes(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{
+		docketNewCount: 2,
+		// SeenOrMark reports "already" (rows=0), and the run this event opened is
+		// still RUNNING — the crashed-mid-cycle state.
+		findByEventRun: &SyncRun{ID: "run-stuck", Status: SyncStatusRunning},
+	}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 0}} // 0 rows affected = already seen
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	if repo.insertCalls != 0 {
+		t.Fatalf("insertCalls = %d, want 0 (resume reuses the stuck run, opens no new one)", repo.insertCalls)
+	}
+	if conn.fetchCalls != 1 || parser.parseCalls != 1 {
+		t.Fatalf("resume did not re-run the cycle: fetch=%d parse=%d, want 1 1", conn.fetchCalls, parser.parseCalls)
+	}
+	if len(repo.updates) != 1 || repo.updates[0].Status != SyncStatusOK || repo.updates[0].ID != "run-stuck" {
+		t.Fatalf("sync_run updates = %+v, want one OK closing run-stuck", repo.updates)
+	}
+	counts := countByType(outbox.published)
+	if counts[TypeSyncCompleted] != 1 || counts[TypeCourtRecordObserved] != 1 || counts[TypeDocketEntryObserved] != 2 {
+		t.Fatalf("outbox by type = %v, want sync_completed:1 court_record_observed:1 docket_entry_observed:2", counts)
+	}
+}
+
+// U10: a re-delivery of an already-marked event whose sync_run is already CLOSED
+// (OK or FAILED) is a no-op ack — no fetch, no new run, no re-close, no outbox —
+// so a closed run is never reopened and its outbox is never duplicated.
+func TestSyncUseCase_RedeliveryClosedRun_NoOps(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []string{SyncStatusOK, SyncStatusFailed} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+
+			repo := &stubSyncRepo{
+				docketNewCount: 2,
+				findByEventRun: &SyncRun{ID: "run-closed", Status: status},
+			}
+			outbox := &fakeOutbox{}
+			uow := &stubBackfillUoW{tx: stubTx{rows: 0}} // already seen
+			conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+			parser := &stubParser{result: stubFixture(SourceDJEN)}
+			uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+			if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+				t.Fatalf("OnSyncRequested() error = %v", err)
+			}
+
+			if conn.fetchCalls != 0 || parser.parseCalls != 0 {
+				t.Fatalf("closed-run redelivery drove the cycle: fetch=%d parse=%d", conn.fetchCalls, parser.parseCalls)
+			}
+			if repo.insertCalls != 0 || len(repo.updates) != 0 {
+				t.Fatalf("closed-run redelivery wrote the run: insert=%d updates=%d", repo.insertCalls, len(repo.updates))
+			}
+			if outbox.calls != 0 {
+				t.Fatalf("closed-run redelivery published %d events, want 0", outbox.calls)
+			}
+		})
+	}
+}
+
+// U11: the connector is resolved per event by the integration's source — a DJEN
+// event runs under the DJEN connector, a DATAJUD event under DATAJUD (proven by
+// the distinct connector id stamped on the sync_run).
+func TestSyncUseCase_ResolvesConnectorBySource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		source string
+		wantID string
+	}{
+		{name: "djen event uses djen connector", source: SourceDJEN, wantID: "conn-djen"},
+		{name: "datajud event uses datajud connector", source: SourceDATAJUD, wantID: "conn-datajud"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			djen := &stubConnector{id: "conn-djen", payload: RawPayload{ConnectorID: stubConnectorID}}
+			datajud := &stubConnector{id: "conn-datajud", payload: RawPayload{ConnectorID: stubConnectorID}}
+			orch := NewOrchestrator()
+			orch.Register(SourceDJEN, djen)
+			orch.Register(SourceDATAJUD, datajud)
+
+			repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 2}
+			outbox := &fakeOutbox{}
+			uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+			parser := &stubParser{result: stubFixture(tt.source)}
+			uc := NewSyncUseCase(repo, outbox, uow, orch, parser)
+
+			ev := syncRequestedEvent()
+			ev.Source = tt.source
+			if err := uc.OnSyncRequested(context.Background(), ev); err != nil {
+				t.Fatalf("OnSyncRequested() error = %v", err)
+			}
+
+			if repo.lastInsert.ConnectorID != tt.wantID {
+				t.Fatalf("sync_run connector_id = %q, want %q (connector for %s)", repo.lastInsert.ConnectorID, tt.wantID, tt.source)
+			}
+		})
+	}
+}
+
+// U12: an event whose source has no registered connector fails with the typed
+// ErrConnectorNotFound and opens no run (the connector is resolved before UoW-1).
+func TestSyncUseCase_UnknownSource_TypedError(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{syncRunID: "run-1"}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	// Orchestrator with DJEN registered, but the event names an unregistered source.
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	ev := syncRequestedEvent()
+	ev.Source = SourceDATAJUD
+	err := uc.OnSyncRequested(context.Background(), ev)
+	if !errors.Is(err, ErrConnectorNotFound) {
+		t.Fatalf("error = %v, want it to wrap ErrConnectorNotFound", err)
+	}
+	if repo.insertCalls != 0 || conn.fetchCalls != 0 {
+		t.Fatalf("unknown source opened work: insert=%d fetch=%d, want 0 0", repo.insertCalls, conn.fetchCalls)
 	}
 }

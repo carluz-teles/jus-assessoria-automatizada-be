@@ -85,6 +85,10 @@ func (m *mockRepo) InsertSyncRun(_ context.Context, _ database.Tx, _ SyncRunPara
 	return "", nil
 }
 
+func (m *mockRepo) FindSyncRunByEventID(_ context.Context, _ database.Tx, _ string) (*SyncRun, error) {
+	return nil, nil
+}
+
 func (m *mockRepo) UpdateSyncRun(_ context.Context, _ database.Tx, _ SyncRunOutcome) error {
 	return nil
 }

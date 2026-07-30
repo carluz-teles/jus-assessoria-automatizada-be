@@ -256,6 +256,7 @@ type SyncRun struct {
 	ItemsDeduped     int32              `json:"items_deduped"`
 	RawPayloadRefs   []byte             `json:"raw_payload_refs"`
 	Error            []byte             `json:"error"`
+	EventID          *string            `json:"event_id"`
 }
 
 type Tenant struct {

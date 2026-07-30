@@ -222,7 +222,7 @@ func (uc *BackfillUseCase) createBackfill(ctx context.Context, tx database.Tx, e
 	}
 
 	for i, w := range windows {
-		req := newSyncRequested(jobID, ev.TenantID, ev.IntegrationID, i, w)
+		req := newSyncRequested(jobID, ev.TenantID, ev.IntegrationID, ev.Source, i, w)
 		if err := uc.outbox.Publish(ctx, tx, req); err != nil {
 			return err
 		}
@@ -231,14 +231,16 @@ func (uc *BackfillUseCase) createBackfill(ctx context.Context, tx database.Tx, e
 }
 
 // newSyncRequested builds one sync slice event, minting a fresh v7 event id
-// (time-ordered) as the per-slice idempotency key. The window bounds are
-// serialized as bare dates to match the schema's date columns.
-func newSyncRequested(jobID, tenantID, integrationID string, sliceIndex int, w syncWindow) SyncRequested {
+// (time-ordered) as the per-slice idempotency key. Source is carried through from
+// the activation so the sync consumer resolves the right connector. The window
+// bounds are serialized as bare dates to match the schema's date columns.
+func newSyncRequested(jobID, tenantID, integrationID, source string, sliceIndex int, w syncWindow) SyncRequested {
 	return SyncRequested{
 		Base:          events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: jobID},
 		BackfillJobID: jobID,
 		TenantID:      tenantID,
 		IntegrationID: integrationID,
+		Source:        source,
 		SliceIndex:    sliceIndex,
 		WindowFrom:    w.From.Format(dateLayout),
 		WindowTo:      w.To.Format(dateLayout),
