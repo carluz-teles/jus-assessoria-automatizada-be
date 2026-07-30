@@ -33,7 +33,7 @@
 # 1. Mapa das tabelas
 
 ```
-IDENTITY        tenant · app_user
+IDENTITY        tenant · app_user · membership
 ACQUISITION     integration · sync_run
 CONSOLIDATION   court_case · court_record · docket_entry · notification · case_link
 DOCUMENTS       document · chunk
@@ -49,6 +49,8 @@ Relacionamento das entidades de domínio:
 erDiagram
     tenant       ||--o{ integration : has
     tenant       ||--o{ app_user : has
+    tenant       ||--o{ membership : has
+    app_user     ||--o{ membership : joins
     integration  ||--o{ sync_run : runs
     tenant       ||--o{ court_case : owns
     court_case   ||--o{ court_record : groups
@@ -79,16 +81,22 @@ Espelha a Clerk Organization. É o escritório.
 
 ```sql
 CREATE TABLE tenant (
-  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  clerk_org_id text NOT NULL UNIQUE,       -- ponte com o Clerk
-  name         text NOT NULL,
-  created_at   timestamptz NOT NULL DEFAULT now()
+  id                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  clerk_org_id            text NOT NULL UNIQUE,   -- ponte com o Clerk
+  name                    text NOT NULL,          -- nome da org no Clerk (sincronizado)
+  -- perfil da empresa, preenchido no passo 2 do onboarding (todas nullable):
+  cnpj                    text,
+  legal_name              text,                   -- razão social
+  trade_name              text,                   -- nome fantasia
+  address                 jsonb,                  -- {cep,logradouro,numero,complemento,bairro,cidade,uf}
+  onboarding_completed_at timestamptz,            -- setado ao concluir o passo 2 (gate do shell)
+  created_at              timestamptz NOT NULL DEFAULT now()
 );
 ```
-`id` aparece em toda FK do sistema; `clerk_org_id` é só a ponte — trocar de provedor de auth muda a ponte, não o schema.
+`id` aparece em toda FK do sistema; `clerk_org_id` é só a ponte — trocar de provedor de auth muda a ponte, não o schema. Os campos fiscais (`cnpj`/`legal_name`/`trade_name`/`address`) vivem só aqui; o Clerk guarda apenas o `name`.
 
 ## app_user [v0]
-Espelha o Clerk User, vinculado ao tenant (1 user = 1 escritório).
+Espelha o Clerk User, vinculado ao tenant (1 user = 1 escritório). `clerk_user_id UNIQUE` impõe fisicamente esse modelo no v0.
 
 ```sql
 CREATE TABLE app_user (
@@ -97,11 +105,31 @@ CREATE TABLE app_user (
   tenant_id     uuid NOT NULL REFERENCES tenant(id),
   email         text NOT NULL,
   name          text,
+  phone         text,                             -- opcional (onboarding via unsafe_metadata)
   role          text NOT NULL DEFAULT 'LAWYER',   -- ADMIN | LAWYER
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX ON app_user (tenant_id);
 ```
+
+## membership [v0]
+O vínculo de um usuário a um escritório e seu ciclo de vida. Hoje `app_user` já carrega `tenant_id`+`role` (1 user = 1 org), mas `membership` reifica a relação para guardar o `clerk_membership_id` (reconciliação com o Clerk), o `status` (soft-remove) e preparar N membros/multi-org. `role` é espelhado em `app_user.role` (fonte de autorização do `ResolvePrincipal`).
+
+```sql
+CREATE TABLE membership (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id           uuid NOT NULL REFERENCES tenant(id),
+  app_user_id         uuid NOT NULL REFERENCES app_user(id),
+  clerk_membership_id text UNIQUE,                -- ponte com o organizationMembership do Clerk
+  role                text NOT NULL,              -- ADMIN | LAWYER
+  status              text NOT NULL DEFAULT 'ACTIVE',   -- ACTIVE | REMOVED (soft-delete)
+  joined_at           timestamptz NOT NULL DEFAULT now(),
+  removed_at          timestamptz,
+  UNIQUE (tenant_id, app_user_id)
+);
+CREATE INDEX ON membership (tenant_id);
+```
+Fluxo: `organizationMembership.created` (Clerk) → upsert membership `ACTIVE` + `identity.member_joined`; `.deleted` → `status=REMOVED` + `member_removed`; `.updated` → sincroniza `role`.
 
 ---
 
