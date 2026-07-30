@@ -52,7 +52,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 				return &Tenant{ID: "t-1", ClerkOrgID: clerkOrgID, Name: name}, nil
 			},
 		}
-		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
 
 		body := []byte(`{"type":"organization.created","data":{"id":"org_abc","name":"Escritório"}}`)
 		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
@@ -79,7 +79,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 				return &AppUser{ID: "u-1", ClerkUserID: clerkUserID}, nil
 			},
 		}
-		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
 
 		body := []byte(`{"type":"organizationMembership.created","data":{` +
 			`"role":"org:admin",` +
@@ -111,7 +111,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 				return existing, nil
 			},
 		}
-		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
 
 		// Two phone numbers; primary_phone_number_id selects the second, proving
 		// the primary (not the first listed) is the one persisted.
@@ -146,7 +146,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 				return existing, nil
 			},
 		}
-		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
 
 		// AC3: no phone_numbers array at all — the handler must not panic and must
 		// forward empty so the upsert's COALESCE leaves the stored phone as-is.
@@ -164,7 +164,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 
 	t.Run("unknown event type is acknowledged and ignored", func(t *testing.T) {
 		repo := &mockRepo{} // any repo call would nil-panic — proving none happens
-		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
 
 		body := []byte(`{"type":"session.created","data":{"id":"sess_1"}}`)
 		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
@@ -181,7 +181,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 				return nil, nil
 			},
 		}
-		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, &fakeUOW{}))
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
 
 		body := []byte(`{"type":"organization.created","data":{"id":"org_abc","name":"Escritório"}}`)
 		req := signedRequest(t, testWebhookSecret, body)

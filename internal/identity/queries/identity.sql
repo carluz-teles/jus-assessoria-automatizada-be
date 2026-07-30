@@ -39,3 +39,29 @@ WHERE clerk_user_id = $1;
 -- name: GetUserByID :one
 SELECT * FROM app_user
 WHERE id = $1;
+
+-- name: GetMeByClerkUser :one
+-- Onboarding read model for GET /identity/me: the caller's internal tenant and
+-- its onboarding gate, joined from app_user by Clerk user id. No row → the
+-- authenticated user has no tenant yet (the domain treats that as "not
+-- onboarded", a 200 with nulls, not an error).
+SELECT u.tenant_id,
+       t.onboarding_completed_at
+FROM app_user u
+JOIN tenant t ON t.id = u.tenant_id
+WHERE u.clerk_user_id = $1;
+
+-- name: UpdateOrgProfile :one
+-- Persist the escritório's company profile during onboarding and stamp the
+-- onboarding gate exactly once: COALESCE keeps the first completion time across
+-- replays (idempotent — a second PUT does not move onboarding_completed_at).
+-- WHERE id scopes the write to the caller's own tenant (app-level barrier; the
+-- tenant table has no tenant_id of its own and therefore no RLS policy).
+UPDATE tenant
+   SET cnpj = $2,
+       legal_name = $3,
+       trade_name = $4,
+       address = $5,
+       onboarding_completed_at = COALESCE(onboarding_completed_at, now())
+WHERE id = $1
+RETURNING *;

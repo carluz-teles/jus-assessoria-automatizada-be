@@ -19,6 +19,13 @@ type Repository interface {
 	FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error)
 	UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error)
+	// GetMeByClerkUser reads the onboarding read model (tenant + gate) for a Clerk
+	// user. Returns ErrUserNotFound when the user has no tenant yet — the caller
+	// folds that into the "not onboarded" state, it is not a 5xx.
+	GetMeByClerkUser(ctx context.Context, clerkUserID string) (*Me, error)
+	// UpdateOrgProfile persists the company profile onto the caller's tenant inside
+	// the caller's tx and returns the saved tenant. Scoped by tenant id (WHERE id).
+	UpdateOrgProfile(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -45,7 +52,7 @@ func (r *pgRepository) UpsertTenant(ctx context.Context, tx database.Tx, clerkOr
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	return tenantToEntity(row), nil
+	return tenantToEntity(row)
 }
 
 func (r *pgRepository) FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error) {
@@ -56,7 +63,7 @@ func (r *pgRepository) FindTenantByClerkOrg(ctx context.Context, clerkOrgID stri
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	return tenantToEntity(row), nil
+	return tenantToEntity(row)
 }
 
 // UpsertUser provisions or refreshes an app_user inside the caller's tx. tenantID
@@ -89,4 +96,48 @@ func (r *pgRepository) FindUserByClerkUser(ctx context.Context, clerkUserID stri
 		return nil, database.WrapInfra(err)
 	}
 	return userToEntity(row), nil
+}
+
+// GetMeByClerkUser reads on the pool (a screen read, no tx). A missing row is the
+// typed ErrUserNotFound — the caller distinguishes "no tenant yet" from an infra
+// fault by that sentinel, never by (nil, nil).
+func (r *pgRepository) GetMeByClerkUser(ctx context.Context, clerkUserID string) (*Me, error) {
+	row, err := r.q.GetMeByClerkUser(ctx, clerkUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrUserNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return meToEntity(row), nil
+}
+
+// UpdateOrgProfile writes the profile onto the tenant inside the caller's tx and
+// returns the saved tenant (RETURNING). tenantID is the internal uuid (a string on
+// the entity), parsed back to uuid.UUID here; the address is encoded to jsonb at
+// this boundary. A no-row result (the id does not exist) is ErrTenantNotFound.
+func (r *pgRepository) UpdateOrgProfile(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	address, err := encodeAddress(profile.Address)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	row, err := identitydb.New(tx).UpdateOrgProfile(ctx, identitydb.UpdateOrgProfileParams{
+		ID:        tid,
+		Cnpj:      &profile.CNPJ,
+		LegalName: &profile.LegalName,
+		TradeName: &profile.TradeName,
+		Address:   address,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTenantNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return tenantToEntity(row)
 }

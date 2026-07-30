@@ -13,23 +13,75 @@ import (
 func TestTenantToEntity(t *testing.T) {
 	id := uuid.New()
 	created := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	onboarded := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
-	got := tenantToEntity(identitydb.Tenant{
-		ID:         id,
-		ClerkOrgID: "org_abc",
-		Name:       "Escritório",
-		CreatedAt:  pgtype.Timestamptz{Time: created, Valid: true},
+	t.Run("bare tenant: profile columns unset map to zero values", func(t *testing.T) {
+		got, err := tenantToEntity(identitydb.Tenant{
+			ID:         id,
+			ClerkOrgID: "org_abc",
+			Name:       "Escritório",
+			CreatedAt:  pgtype.Timestamptz{Time: created, Valid: true},
+		})
+		if err != nil {
+			t.Fatalf("tenantToEntity() error = %v", err)
+		}
+		if got.ID != id.String() {
+			t.Errorf("ID = %q, want %q", got.ID, id.String())
+		}
+		if got.ClerkOrgID != "org_abc" || got.Name != "Escritório" {
+			t.Errorf("fields = %+v", got)
+		}
+		if !got.CreatedAt.Equal(created) {
+			t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, created)
+		}
+		// No profile yet: address stays nil (not an empty struct) and the gate is nil.
+		if got.Address != nil {
+			t.Errorf("Address = %+v, want nil", got.Address)
+		}
+		if got.OnboardingCompletedAt != nil {
+			t.Errorf("OnboardingCompletedAt = %v, want nil", *got.OnboardingCompletedAt)
+		}
 	})
 
-	if got.ID != id.String() {
-		t.Errorf("ID = %q, want %q", got.ID, id.String())
-	}
-	if got.ClerkOrgID != "org_abc" || got.Name != "Escritório" {
-		t.Errorf("fields = %+v", got)
-	}
-	if !got.CreatedAt.Equal(created) {
-		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, created)
-	}
+	t.Run("onboarded tenant: profile columns and address jsonb decode", func(t *testing.T) {
+		cnpj, legal, trade := "12345678000195", "Escritório LTDA", "Escritório"
+		got, err := tenantToEntity(identitydb.Tenant{
+			ID:                    id,
+			ClerkOrgID:            "org_abc",
+			Name:                  "Escritório",
+			CreatedAt:             pgtype.Timestamptz{Time: created, Valid: true},
+			Cnpj:                  &cnpj,
+			LegalName:             &legal,
+			TradeName:             &trade,
+			Address:               []byte(`{"cep":"01311902","logradouro":"Av Paulista","cidade":"São Paulo","uf":"SP"}`),
+			OnboardingCompletedAt: pgtype.Timestamptz{Time: onboarded, Valid: true},
+		})
+		if err != nil {
+			t.Fatalf("tenantToEntity() error = %v", err)
+		}
+		if got.CNPJ != cnpj || got.LegalName != legal || got.TradeName != trade {
+			t.Errorf("profile fields = %+v", got)
+		}
+		if got.Address == nil || got.Address.CEP != "01311902" || got.Address.UF != "SP" {
+			t.Errorf("Address = %+v, want decoded", got.Address)
+		}
+		if got.OnboardingCompletedAt == nil || !got.OnboardingCompletedAt.Equal(onboarded) {
+			t.Errorf("OnboardingCompletedAt = %v, want %v", got.OnboardingCompletedAt, onboarded)
+		}
+	})
+
+	t.Run("malformed address jsonb is an error, not a swallowed nil", func(t *testing.T) {
+		_, err := tenantToEntity(identitydb.Tenant{
+			ID:         id,
+			ClerkOrgID: "org_abc",
+			Name:       "Escritório",
+			CreatedAt:  pgtype.Timestamptz{Time: created, Valid: true},
+			Address:    []byte(`{not json`),
+		})
+		if err == nil {
+			t.Fatal("tenantToEntity() error = nil, want a decode error")
+		}
+	})
 }
 
 func TestUserToEntity(t *testing.T) {

@@ -11,10 +11,21 @@ import (
 )
 
 type Querier interface {
+	// Onboarding read model for GET /identity/me: the caller's internal tenant and
+	// its onboarding gate, joined from app_user by Clerk user id. No row → the
+	// authenticated user has no tenant yet (the domain treats that as "not
+	// onboarded", a 200 with nulls, not an error).
+	GetMeByClerkUser(ctx context.Context, clerkUserID string) (GetMeByClerkUserRow, error)
 	GetTenantByClerkOrg(ctx context.Context, clerkOrgID string) (Tenant, error)
 	GetTenantByID(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetUserByClerkUser(ctx context.Context, clerkUserID string) (AppUser, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (AppUser, error)
+	// Persist the escritório's company profile during onboarding and stamp the
+	// onboarding gate exactly once: COALESCE keeps the first completion time across
+	// replays (idempotent — a second PUT does not move onboarding_completed_at).
+	// WHERE id scopes the write to the caller's own tenant (app-level barrier; the
+	// tenant table has no tenant_id of its own and therefore no RLS policy).
+	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (Tenant, error)
 	// identity slice queries (tenant + app_user).
 	// Upserts are idempotent so the Clerk webhook (at-least-once) can replay safely.
 	// Provision or refresh a tenant from its Clerk Organization.

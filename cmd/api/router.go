@@ -19,6 +19,11 @@ import (
 // lookup routes and never a sibling that merely starts with "lookup".
 const lookupPrefix = "/v1/lookup/"
 
+// identityMePath is the other tenant-less onboarding route: the wizard reads it
+// before an escritório exists, so it runs under AuthUser like the lookup subtree.
+// Matched exactly (it is a single route, not a subtree) so no sibling is exempted.
+const identityMePath = "/v1/identity/me"
+
 // routerDeps carries everything newRouter wires into the Fiber app. Assembling
 // the graph here (not inside newRouter) keeps the router a pure function of its
 // dependencies — the test builds it with fakes and never touches the network.
@@ -27,6 +32,7 @@ type routerDeps struct {
 	verifier    middleware.TokenVerifier
 	resolver    middleware.PrincipalResolver
 	webhook     *identity.WebhookHandler
+	identity    *identity.Handler
 	acquisition *acquisition.Handler
 	lookup      *lookup.Handler
 }
@@ -79,7 +85,7 @@ func newRouter(deps routerDeps) *fiber.App {
 
 	v1 := app.Group("/v1")
 	v1.Use(func(c *fiber.Ctx) error {
-		if strings.HasPrefix(c.Path(), lookupPrefix) {
+		if strings.HasPrefix(c.Path(), lookupPrefix) || c.Path() == identityMePath {
 			return userAuth(c)
 		}
 		return tenantAuth(c)
@@ -90,6 +96,15 @@ func newRouter(deps routerDeps) *fiber.App {
 	v1.Get("/ping", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
+
+	// identity owns its onboarding /v1 routes and mounts them via RegisterMe (the
+	// tenant-less /identity/me, routed through AuthUser by the dispatch above) and
+	// RegisterV1 (the tenant-strict /organization/profile). Nil-guarded like the
+	// others so the router test fixture builds without a use case.
+	if deps.identity != nil {
+		deps.identity.RegisterMe(v1)
+		deps.identity.RegisterV1(v1)
+	}
 
 	// acquisition owns its /v1 routes and mounts them via RegisterV1 — the api
 	// only composes. Nil-guarded so the router test's fixture (which wires no

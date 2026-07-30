@@ -16,12 +16,17 @@ import (
 
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/events"
 )
 
-// newIdentityUC wires the identity use case against a real pool and the real
-// unit of work.
+// newIdentityUC wires the identity use case against a real pool, the real
+// transactional outbox and the real unit of work.
 func newIdentityUC(pool *pgxpool.Pool) *identity.UseCase {
-	return identity.NewUseCase(identity.NewRepository(pool), database.NewUnitOfWork(pool))
+	return identity.NewUseCase(
+		identity.NewRepository(pool),
+		events.NewOutbox(),
+		database.NewUnitOfWork(pool),
+	)
 }
 
 // appUserPhone reads the raw phone column for a Clerk user id (as owner, RLS

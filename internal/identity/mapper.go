@@ -1,18 +1,76 @@
 package identity
 
-import "github.com/jusassessoria/platform/internal/identity/identitydb"
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/jusassessoria/platform/internal/identity/identitydb"
+	"github.com/jusassessoria/platform/lib/database"
+)
 
 // mapper.go is the boundary where driver types die (docs/erd-backend.md §4b.3):
 // uuid.UUID and pgtype.* are absorbed here so the entity stays pure. Repositories
 // return *Tenant / *AppUser, never the sqlc row.
 
-func tenantToEntity(r identitydb.Tenant) *Tenant {
-	return &Tenant{
-		ID:         r.ID.String(),
-		ClerkOrgID: r.ClerkOrgID,
-		Name:       r.Name,
-		CreatedAt:  r.CreatedAt.Time,
+// tenantToEntity maps a tenant row to the entity, decoding the address jsonb into
+// a typed *Address. It returns an error because a malformed jsonb payload is an
+// infra fault (we wrote it, so it should always parse) that must not be swallowed.
+func tenantToEntity(r identitydb.Tenant) (*Tenant, error) {
+	address, err := decodeAddress(r.Address)
+	if err != nil {
+		return nil, database.WrapInfra(err)
 	}
+	return &Tenant{
+		ID:                    r.ID.String(),
+		ClerkOrgID:            r.ClerkOrgID,
+		Name:                  r.Name,
+		CreatedAt:             r.CreatedAt.Time,
+		CNPJ:                  derefString(r.Cnpj),
+		LegalName:             derefString(r.LegalName),
+		TradeName:             derefString(r.TradeName),
+		Address:               address,
+		OnboardingCompletedAt: timeToPtr(r.OnboardingCompletedAt),
+	}, nil
+}
+
+// meToEntity maps the GET /identity/me read model row to Me. UserID is left empty
+// here — the use case fills it with the Clerk user id — since the row itself
+// carries only the tenant scope and the onboarding gate.
+func meToEntity(r identitydb.GetMeByClerkUserRow) *Me {
+	tenantID := r.TenantID.String()
+	return &Me{
+		TenantID:              &tenantID,
+		OnboardingCompletedAt: timeToPtr(r.OnboardingCompletedAt),
+	}
+}
+
+// decodeAddress unmarshals the tenant.address jsonb into a typed Address. A NULL
+// or empty column maps to nil (the tenant has no address yet), not an empty struct.
+func decodeAddress(raw []byte) (*Address, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var address Address
+	if err := json.Unmarshal(raw, &address); err != nil {
+		return nil, err
+	}
+	return &address, nil
+}
+
+// encodeAddress serializes an Address to the jsonb payload written to the column.
+func encodeAddress(address Address) ([]byte, error) {
+	return json.Marshal(address)
+}
+
+// timeToPtr collapses a nullable timestamptz to a *time.Time, nil standing in for
+// SQL NULL — tenant.onboarding_completed_at is unset until onboarding completes.
+func timeToPtr(t pgtype.Timestamptz) *time.Time {
+	if !t.Valid {
+		return nil
+	}
+	return &t.Time
 }
 
 func userToEntity(r identitydb.AppUser) *AppUser {

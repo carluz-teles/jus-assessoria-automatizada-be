@@ -9,7 +9,32 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const getMeByClerkUser = `-- name: GetMeByClerkUser :one
+SELECT u.tenant_id,
+       t.onboarding_completed_at
+FROM app_user u
+JOIN tenant t ON t.id = u.tenant_id
+WHERE u.clerk_user_id = $1
+`
+
+type GetMeByClerkUserRow struct {
+	TenantID              uuid.UUID          `json:"tenant_id"`
+	OnboardingCompletedAt pgtype.Timestamptz `json:"onboarding_completed_at"`
+}
+
+// Onboarding read model for GET /identity/me: the caller's internal tenant and
+// its onboarding gate, joined from app_user by Clerk user id. No row → the
+// authenticated user has no tenant yet (the domain treats that as "not
+// onboarded", a 200 with nulls, not an error).
+func (q *Queries) GetMeByClerkUser(ctx context.Context, clerkUserID string) (GetMeByClerkUserRow, error) {
+	row := q.db.QueryRow(ctx, getMeByClerkUser, clerkUserID)
+	var i GetMeByClerkUserRow
+	err := row.Scan(&i.TenantID, &i.OnboardingCompletedAt)
+	return i, err
+}
 
 const getTenantByClerkOrg = `-- name: GetTenantByClerkOrg :one
 SELECT id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at FROM tenant
@@ -93,6 +118,53 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (AppUser, error
 		&i.Role,
 		&i.CreatedAt,
 		&i.Phone,
+	)
+	return i, err
+}
+
+const updateOrgProfile = `-- name: UpdateOrgProfile :one
+UPDATE tenant
+   SET cnpj = $2,
+       legal_name = $3,
+       trade_name = $4,
+       address = $5,
+       onboarding_completed_at = COALESCE(onboarding_completed_at, now())
+WHERE id = $1
+RETURNING id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at
+`
+
+type UpdateOrgProfileParams struct {
+	ID        uuid.UUID `json:"id"`
+	Cnpj      *string   `json:"cnpj"`
+	LegalName *string   `json:"legal_name"`
+	TradeName *string   `json:"trade_name"`
+	Address   []byte    `json:"address"`
+}
+
+// Persist the escritório's company profile during onboarding and stamp the
+// onboarding gate exactly once: COALESCE keeps the first completion time across
+// replays (idempotent — a second PUT does not move onboarding_completed_at).
+// WHERE id scopes the write to the caller's own tenant (app-level barrier; the
+// tenant table has no tenant_id of its own and therefore no RLS policy).
+func (q *Queries) UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (Tenant, error) {
+	row := q.db.QueryRow(ctx, updateOrgProfile,
+		arg.ID,
+		arg.Cnpj,
+		arg.LegalName,
+		arg.TradeName,
+		arg.Address,
+	)
+	var i Tenant
+	err := row.Scan(
+		&i.ID,
+		&i.ClerkOrgID,
+		&i.Name,
+		&i.CreatedAt,
+		&i.Cnpj,
+		&i.LegalName,
+		&i.TradeName,
+		&i.Address,
+		&i.OnboardingCompletedAt,
 	)
 	return i, err
 }

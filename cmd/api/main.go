@@ -86,13 +86,15 @@ func run(logger *slog.Logger) error {
 	}
 	asynqClient := asynq.NewClient(redisOpt)
 
-	// Identity wiring: the slice owns the domain; the binary only assembles it.
+	// Identity wiring: the slice owns the domain; the binary only assembles it
+	// (repo + shared outbox + unit of work → use case → resolver/webhook/handler).
 	uow := database.NewUnitOfWork(pool)
 	repo := identity.NewRepository(pool)
-	uc := identity.NewUseCase(repo, uow)
+	uc := identity.NewUseCase(repo, events.NewOutbox(), uow)
 	verifier := middleware.NewClerkVerifier(cfg.ClerkSecret, cfg.ClerkIssuer)
 	resolver := identity.NewResolver(uc)
 	webhook := identity.NewWebhookHandler(cfg.ClerkWebhookSecret, uc)
+	identityHandler := identity.NewHandler(uc)
 
 	// Acquisition wiring: the slice owns the domain; the binary only assembles it
 	// (repo + shared outbox + unit of work → use case → handler).
@@ -127,6 +129,7 @@ func run(logger *slog.Logger) error {
 		verifier:    verifier,
 		resolver:    resolver,
 		webhook:     webhook,
+		identity:    identityHandler,
 		acquisition: acquisitionHandler,
 		lookup:      lookupHandler,
 	})

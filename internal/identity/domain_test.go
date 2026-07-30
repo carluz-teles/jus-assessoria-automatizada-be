@@ -4,18 +4,22 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/events"
 )
 
 // mockRepo is a hand-written Repository double: each method delegates to a func
 // field, so every test injects exactly the behavior it needs. Unset fields fail
 // loudly (nil call) if a test reaches a path it did not expect.
 type mockRepo struct {
-	upsertTenant func(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
-	findTenant   func(ctx context.Context, clerkOrgID string) (*Tenant, error)
-	upsertUser   func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
-	findUser     func(ctx context.Context, clerkUserID string) (*AppUser, error)
+	upsertTenant     func(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
+	findTenant       func(ctx context.Context, clerkOrgID string) (*Tenant, error)
+	upsertUser       func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
+	findUser         func(ctx context.Context, clerkUserID string) (*AppUser, error)
+	getMe            func(ctx context.Context, clerkUserID string) (*Me, error)
+	updateOrgProfile func(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error)
 }
 
 func (m *mockRepo) UpsertTenant(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error) {
@@ -32,6 +36,14 @@ func (m *mockRepo) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, 
 
 func (m *mockRepo) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {
 	return m.findUser(ctx, clerkUserID)
+}
+
+func (m *mockRepo) GetMeByClerkUser(ctx context.Context, clerkUserID string) (*Me, error) {
+	return m.getMe(ctx, clerkUserID)
+}
+
+func (m *mockRepo) UpdateOrgProfile(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error) {
+	return m.updateOrgProfile(ctx, tx, tenantID, profile)
 }
 
 // fakeUOW is a no-op unit of work: it records the RLS scope the use case asked
@@ -52,6 +64,28 @@ func (u *fakeUOW) Do(ctx context.Context, tenantID string, fn func(tx database.T
 	return fn(nil)
 }
 
+// noopOutbox is a publisher that drops every event — used by the provisioning and
+// resolution use cases, which emit nothing, so their tests do not care about it.
+type noopOutbox struct{}
+
+func (noopOutbox) Publish(context.Context, database.Tx, events.Event) error { return nil }
+
+// recordingOutbox captures what a use case publishes (and can inject a publish
+// failure) so the UpdateOrgProfile tests can assert the org_profile_updated event
+// is emitted in the same unit of work.
+type recordingOutbox struct {
+	published []events.Event
+	err       error
+}
+
+func (r *recordingOutbox) Publish(_ context.Context, _ database.Tx, ev events.Event) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.published = append(r.published, ev)
+	return nil
+}
+
 func TestUseCase_ProvisionTenant(t *testing.T) {
 	ctx := context.Background()
 	want := &Tenant{ID: "t-1", ClerkOrgID: "org_abc", Name: "Escritório"}
@@ -69,7 +103,7 @@ func TestUseCase_ProvisionTenant(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		got, err := NewUseCase(repo, uow).ProvisionTenant(ctx, "org_abc", "Escritório")
+		got, err := NewUseCase(repo, noopOutbox{}, uow).ProvisionTenant(ctx, "org_abc", "Escritório")
 		if err != nil {
 			t.Fatalf("ProvisionTenant() error = %v", err)
 		}
@@ -91,7 +125,7 @@ func TestUseCase_ProvisionTenant(t *testing.T) {
 				return want, nil // ON CONFLICT ... DO UPDATE always yields the row
 			},
 		}
-		uc := NewUseCase(repo, &fakeUOW{})
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{})
 
 		first, err1 := uc.ProvisionTenant(ctx, "org_abc", "Escritório")
 		second, err2 := uc.ProvisionTenant(ctx, "org_abc", "Escritório")
@@ -111,7 +145,7 @@ func TestUseCase_ProvisionTenant(t *testing.T) {
 			},
 		}
 
-		got, err := NewUseCase(repo, &fakeUOW{err: boom}).ProvisionTenant(ctx, "org_abc", "x")
+		got, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{err: boom}).ProvisionTenant(ctx, "org_abc", "x")
 		if !errors.Is(err, boom) {
 			t.Fatalf("error = %v, want %v", err, boom)
 		}
@@ -135,7 +169,7 @@ func TestUseCase_ProvisionUser(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		_, err := NewUseCase(repo, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", "OWNER")
+		_, err := NewUseCase(repo, noopOutbox{}, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", "OWNER")
 		if !errors.Is(err, ErrInvalidRole) {
 			t.Fatalf("error = %v, want ErrInvalidRole", err)
 		}
@@ -152,7 +186,7 @@ func TestUseCase_ProvisionUser(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		_, err := NewUseCase(repo, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
+		_, err := NewUseCase(repo, noopOutbox{}, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
 		if !errors.Is(err, ErrTenantNotFound) {
 			t.Fatalf("error = %v, want ErrTenantNotFound", err)
 		}
@@ -185,7 +219,7 @@ func TestUseCase_ProvisionUser(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		got, err := NewUseCase(repo, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
+		got, err := NewUseCase(repo, noopOutbox{}, uow).ProvisionUser(ctx, "user_xyz", "org_abc", "a@b.com", "Ana", RoleLawyer)
 		if err != nil {
 			t.Fatalf("ProvisionUser() error = %v", err)
 		}
@@ -227,7 +261,7 @@ func TestUseCase_SyncUser(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		got, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova", "+5511987654321")
+		got, err := NewUseCase(repo, noopOutbox{}, uow).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova", "+5511987654321")
 		if err != nil {
 			t.Fatalf("SyncUser() error = %v", err)
 		}
@@ -263,7 +297,7 @@ func TestUseCase_SyncUser(t *testing.T) {
 
 		// AC3: a user.updated with no phone must not panic and must forward empty
 		// (the repo's COALESCE then keeps the stored phone / leaves it null).
-		if _, err := NewUseCase(repo, &fakeUOW{}).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova", ""); err != nil {
+		if _, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).SyncUser(ctx, "user_xyz", "new@b.com", "Ana Nova", ""); err != nil {
 			t.Fatalf("SyncUser() error = %v", err)
 		}
 		if !called {
@@ -280,7 +314,7 @@ func TestUseCase_SyncUser(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		_, err := NewUseCase(repo, uow).SyncUser(ctx, "user_xyz", "x@y.com", "X", "")
+		_, err := NewUseCase(repo, noopOutbox{}, uow).SyncUser(ctx, "user_xyz", "x@y.com", "X", "")
 		if !errors.Is(err, ErrUserNotFound) {
 			t.Fatalf("error = %v, want ErrUserNotFound", err)
 		}
@@ -301,7 +335,7 @@ func TestUseCase_ResolvePrincipal(t *testing.T) {
 			findUser:   func(context.Context, string) (*AppUser, error) { return user, nil },
 		}
 
-		got, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		got, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
 		if err != nil {
 			t.Fatalf("ResolvePrincipal() error = %v", err)
 		}
@@ -316,7 +350,7 @@ func TestUseCase_ResolvePrincipal(t *testing.T) {
 			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
 		}
 
-		_, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
 		if !errors.Is(err, ErrTenantNotFound) {
 			t.Fatalf("error = %v, want ErrTenantNotFound", err)
 		}
@@ -328,7 +362,7 @@ func TestUseCase_ResolvePrincipal(t *testing.T) {
 			findUser:   func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
 		}
 
-		_, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
 		if !errors.Is(err, ErrUserNotFound) {
 			t.Fatalf("error = %v, want ErrUserNotFound", err)
 		}
@@ -341,9 +375,164 @@ func TestUseCase_ResolvePrincipal(t *testing.T) {
 			findUser:   func(context.Context, string) (*AppUser, error) { return other, nil },
 		}
 
-		_, err := NewUseCase(repo, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ResolvePrincipal(ctx, "user_xyz", "org_abc")
 		if !errors.Is(err, ErrUserNotFound) {
 			t.Fatalf("error = %v, want ErrUserNotFound on tenant mismatch", err)
+		}
+	})
+}
+
+func TestUseCase_GetMe(t *testing.T) {
+	ctx := context.Background()
+	const clerkUser = "user_xyz"
+
+	t.Run("user with tenant returns the internal tenant and gate, user_id echoing the clerk id", func(t *testing.T) {
+		tenantID := "tenant-uuid"
+		onboarded := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+		repo := &mockRepo{
+			getMe: func(_ context.Context, gotClerkUser string) (*Me, error) {
+				if gotClerkUser != clerkUser {
+					t.Fatalf("getMe clerk user = %q, want %q", gotClerkUser, clerkUser)
+				}
+				return &Me{TenantID: &tenantID, OnboardingCompletedAt: &onboarded}, nil
+			},
+		}
+
+		got, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).GetMe(ctx, clerkUser)
+		if err != nil {
+			t.Fatalf("GetMe() error = %v", err)
+		}
+		if got.UserID != clerkUser {
+			t.Fatalf("UserID = %q, want the clerk id %q", got.UserID, clerkUser)
+		}
+		if got.TenantID == nil || *got.TenantID != tenantID {
+			t.Fatalf("TenantID = %v, want %q", got.TenantID, tenantID)
+		}
+		if got.OnboardingCompletedAt == nil || !got.OnboardingCompletedAt.Equal(onboarded) {
+			t.Fatalf("OnboardingCompletedAt = %v, want %v", got.OnboardingCompletedAt, onboarded)
+		}
+	})
+
+	t.Run("user without tenant is a 200 with nulls, not an error", func(t *testing.T) {
+		repo := &mockRepo{
+			getMe: func(context.Context, string) (*Me, error) { return nil, ErrUserNotFound },
+		}
+
+		got, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).GetMe(ctx, clerkUser)
+		if err != nil {
+			t.Fatalf("GetMe() error = %v, want nil (no tenant is not an error)", err)
+		}
+		if got.UserID != clerkUser {
+			t.Fatalf("UserID = %q, want the clerk id %q", got.UserID, clerkUser)
+		}
+		if got.TenantID != nil || got.OnboardingCompletedAt != nil {
+			t.Fatalf("tenant/gate = %+v, want nil for a user with no tenant", got)
+		}
+	})
+
+	t.Run("an infra error from the repo propagates", func(t *testing.T) {
+		boom := errors.New("db down")
+		repo := &mockRepo{
+			getMe: func(context.Context, string) (*Me, error) { return nil, boom },
+		}
+
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).GetMe(ctx, clerkUser)
+		if !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
+		}
+	})
+}
+
+func TestUseCase_UpdateOrgProfile(t *testing.T) {
+	ctx := context.Background()
+	const tenantID = "tenant-uuid"
+	profile := OrgProfile{
+		CNPJ:      "12345678000195",
+		LegalName: "Escritório LTDA",
+		TradeName: "Escritório",
+		Address:   Address{CEP: "01311902", Logradouro: "Av Paulista", Cidade: "São Paulo", UF: "SP"},
+	}
+	saved := &Tenant{ID: tenantID, CNPJ: profile.CNPJ, LegalName: profile.LegalName, TradeName: profile.TradeName}
+
+	t.Run("persists under the tenant scope and emits org_profile_updated in the same UoW", func(t *testing.T) {
+		var gotTenantID string
+		var gotProfile OrgProfile
+		repo := &mockRepo{
+			updateOrgProfile: func(_ context.Context, _ database.Tx, tid string, p OrgProfile) (*Tenant, error) {
+				gotTenantID, gotProfile = tid, p
+				return saved, nil
+			},
+		}
+		outbox := &recordingOutbox{}
+		uow := &fakeUOW{}
+
+		got, err := NewUseCase(repo, outbox, uow).UpdateOrgProfile(ctx, tenantID, profile)
+		if err != nil {
+			t.Fatalf("UpdateOrgProfile() error = %v", err)
+		}
+		if got != saved {
+			t.Fatalf("UpdateOrgProfile() = %+v, want %+v", got, saved)
+		}
+		if gotTenantID != tenantID || gotProfile != profile {
+			t.Fatalf("repo received (tenant=%q, profile=%+v)", gotTenantID, gotProfile)
+		}
+		// The write ran under the tenant's RLS scope (barrier 2).
+		if uow.scope != tenantID {
+			t.Fatalf("RLS scope = %q, want %q", uow.scope, tenantID)
+		}
+		// Exactly one event, published inside the same unit of work (AC3).
+		if len(outbox.published) != 1 {
+			t.Fatalf("published %d events, want 1", len(outbox.published))
+		}
+		ev, ok := outbox.published[0].(OrgProfileUpdated)
+		if !ok {
+			t.Fatalf("event type = %T, want OrgProfileUpdated", outbox.published[0])
+		}
+		if ev.Type() != TypeOrgProfileUpdated || ev.AggregateType() != aggregateTypeTenant {
+			t.Fatalf("event ids = (%q, %q)", ev.Type(), ev.AggregateType())
+		}
+		if ev.AggregateID() != tenantID || ev.TenantID != tenantID {
+			t.Fatalf("event aggregate/tenant = (%q, %q), want %q", ev.AggregateID(), ev.TenantID, tenantID)
+		}
+		if ev.CNPJ != profile.CNPJ || ev.TradeName != profile.TradeName {
+			t.Fatalf("event payload = %+v", ev)
+		}
+		if ev.IdempotencyKey() == "" {
+			t.Fatal("event idempotency key (event id) is empty")
+		}
+	})
+
+	t.Run("a publish failure rolls back — the error propagates and nothing is returned", func(t *testing.T) {
+		repo := &mockRepo{
+			updateOrgProfile: func(context.Context, database.Tx, string, OrgProfile) (*Tenant, error) {
+				return saved, nil
+			},
+		}
+		boom := errors.New("outbox unreachable")
+
+		got, err := NewUseCase(repo, &recordingOutbox{err: boom}, &fakeUOW{}).UpdateOrgProfile(ctx, tenantID, profile)
+		if !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
+		}
+		if got != nil {
+			t.Fatalf("tenant = %+v, want nil on publish failure", got)
+		}
+	})
+
+	t.Run("a repo error propagates and no event is published", func(t *testing.T) {
+		repo := &mockRepo{
+			updateOrgProfile: func(context.Context, database.Tx, string, OrgProfile) (*Tenant, error) {
+				return nil, ErrTenantNotFound
+			},
+		}
+		outbox := &recordingOutbox{}
+
+		_, err := NewUseCase(repo, outbox, &fakeUOW{}).UpdateOrgProfile(ctx, tenantID, profile)
+		if !errors.Is(err, ErrTenantNotFound) {
+			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		}
+		if len(outbox.published) != 0 {
+			t.Fatalf("published %d events, want 0 when the write failed", len(outbox.published))
 		}
 	})
 }

@@ -2,22 +2,35 @@ package identity
 
 import (
 	"context"
+	"errors"
+
+	"github.com/google/uuid"
 
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/events"
 )
 
-// UseCase carries the identity use cases: provisioning tenants/users from Clerk
-// webhooks (idempotent, at-least-once) and resolving a Principal for the auth
-// middleware. It depends on the Repository interface and the UnitOfWork, never
-// on the concrete pg implementation (docs §2.5).
-type UseCase struct {
-	repo Repository
-	uow  database.UnitOfWork
+// publisher is the narrow outbox port the use case needs — the producer half of
+// the transactional outbox. *events.Outbox satisfies it structurally.
+type publisher interface {
+	Publish(ctx context.Context, tx database.Tx, ev events.Event) error
 }
 
-// NewUseCase wires the use cases to their repository and unit of work.
-func NewUseCase(repo Repository, uow database.UnitOfWork) *UseCase {
-	return &UseCase{repo: repo, uow: uow}
+// UseCase carries the identity use cases: provisioning tenants/users from Clerk
+// webhooks (idempotent, at-least-once), resolving a Principal for the auth
+// middleware, and the onboarding profile reads/writes. It depends on the
+// Repository interface, the outbox publisher and the UnitOfWork, never on the
+// concrete pg implementation (docs §2.5).
+type UseCase struct {
+	repo   Repository
+	outbox publisher
+	uow    database.UnitOfWork
+}
+
+// NewUseCase wires the use cases to their repository, outbox publisher and unit
+// of work.
+func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork) *UseCase {
+	return &UseCase{repo: repo, outbox: outbox, uow: uow}
 }
 
 // ProvisionTenant creates or refreshes the tenant mirroring a Clerk Organization.
@@ -115,4 +128,56 @@ func (uc *UseCase) ResolvePrincipal(ctx context.Context, clerkUserID, clerkOrgID
 		TenantID: user.TenantID,
 		Role:     user.Role,
 	}, nil
+}
+
+// GetMe assembles the onboarding read model for a verified Clerk user (the
+// AuthUser endpoints run before a tenant exists). UserID always echoes the Clerk
+// user id — the stable identity of the caller. A user with no tenant yet is NOT an
+// error: the repo's ErrUserNotFound is folded into a Me with nil tenant/gate, so
+// the endpoint answers 200 with nulls and the wizard knows onboarding is pending.
+func (uc *UseCase) GetMe(ctx context.Context, clerkUserID string) (Me, error) {
+	me, err := uc.repo.GetMeByClerkUser(ctx, clerkUserID)
+	if errors.Is(err, ErrUserNotFound) {
+		return Me{UserID: clerkUserID}, nil
+	}
+	if err != nil {
+		return Me{}, err
+	}
+
+	me.UserID = clerkUserID
+	return *me, nil
+}
+
+// UpdateOrgProfile persists the escritório's company profile and emits
+// identity.org_profile_updated in the SAME transaction (transactional outbox): the
+// tenant write and the event commit together or not at all. The onboarding gate is
+// stamped once and only once (COALESCE in the query), so a replayed PUT is
+// idempotent. tenantID comes from the verified principal, never the body.
+func (uc *UseCase) UpdateOrgProfile(ctx context.Context, tenantID string, profile OrgProfile) (*Tenant, error) {
+	var tenant *Tenant
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		var err error
+		tenant, err = uc.repo.UpdateOrgProfile(ctx, tx, tenantID, profile)
+		if err != nil {
+			return err
+		}
+		return uc.outbox.Publish(ctx, tx, newOrgProfileUpdated(tenant))
+	})
+	if err != nil {
+		return nil, err
+	}
+	return tenant, nil
+}
+
+// newOrgProfileUpdated builds the event for a saved profile, minting a fresh v7
+// event id (time-ordered) as the aggregate/idempotency key carrier. The aggregate
+// is the tenant; the payload carries just enough for a consumer to react without
+// re-reading the tenant.
+func newOrgProfileUpdated(tenant *Tenant) OrgProfileUpdated {
+	return OrgProfileUpdated{
+		Base:      events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: tenant.ID},
+		TenantID:  tenant.ID,
+		CNPJ:      tenant.CNPJ,
+		TradeName: tenant.TradeName,
+	}
 }

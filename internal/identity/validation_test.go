@@ -1,0 +1,123 @@
+package identity
+
+import (
+	"testing"
+
+	validation "github.com/go-ozzo/ozzo-validation/v4"
+)
+
+// validAddress is a well-formed address reused across the request tests so each
+// case varies only the field under test.
+func validAddress() Address {
+	return Address{
+		CEP:        "01311-902",
+		Logradouro: "Av Paulista",
+		Numero:     "1000",
+		Cidade:     "São Paulo",
+		UF:         "SP",
+	}
+}
+
+func validRequest() UpdateOrgProfileRequest {
+	return UpdateOrgProfileRequest{
+		CNPJ:      "12.345.678/0001-95",
+		LegalName: "Escritório LTDA",
+		TradeName: "Escritório",
+		Address:   validAddress(),
+	}
+}
+
+func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*UpdateOrgProfileRequest)
+		wantErr bool
+		// field is the json key expected in the validation.Errors map on failure.
+		field string
+	}{
+		{name: "masked cnpj is accepted", mutate: func(*UpdateOrgProfileRequest) {}, wantErr: false},
+		{
+			name:    "bare 14-digit cnpj is accepted",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.CNPJ = "12345678000195" },
+			wantErr: false,
+		},
+		{
+			name:    "cnpj with too few digits is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.CNPJ = "12.345.678/0001" },
+			wantErr: true,
+			field:   "cnpj",
+		},
+		{
+			name:    "cnpj with letters strips short and is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.CNPJ = "12A45678000195XY" },
+			wantErr: true,
+			field:   "cnpj",
+		},
+		{
+			name:    "empty cnpj is required",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.CNPJ = "" },
+			wantErr: true,
+			field:   "cnpj",
+		},
+		{
+			name:    "missing legal_name is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.LegalName = "" },
+			wantErr: true,
+			field:   "legal_name",
+		},
+		{
+			name:    "missing trade_name is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.TradeName = "" },
+			wantErr: true,
+			field:   "trade_name",
+		},
+		{
+			name:    "address missing cep is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Address.CEP = "" },
+			wantErr: true,
+			field:   "address",
+		},
+		{
+			name:    "address missing uf is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Address.UF = "" },
+			wantErr: true,
+			field:   "address",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := validRequest()
+			tt.mutate(&req)
+
+			err := req.Validate()
+			if tt.wantErr == (err == nil) {
+				t.Fatalf("Validate() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if !tt.wantErr {
+				return
+			}
+			verrs, ok := err.(validation.Errors)
+			if !ok {
+				t.Fatalf("error type = %T, want validation.Errors", err)
+			}
+			if _, has := verrs[tt.field]; !has {
+				t.Fatalf("validation.Errors = %v, want a %q entry", verrs, tt.field)
+			}
+		})
+	}
+}
+
+func TestToOrgProfile_NormalizesCNPJ(t *testing.T) {
+	req := validRequest() // CNPJ carries the mask "12.345.678/0001-95"
+
+	got := req.toOrgProfile()
+	if got.CNPJ != "12345678000195" {
+		t.Fatalf("CNPJ = %q, want the 14 bare digits", got.CNPJ)
+	}
+	if got.LegalName != req.LegalName || got.TradeName != req.TradeName || got.Address != req.Address {
+		t.Fatalf("toOrgProfile() dropped a field: %+v", got)
+	}
+}
