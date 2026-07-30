@@ -274,14 +274,15 @@ func (q *Queries) MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecord
 	return err
 }
 
-const updateSyncRun = `-- name: UpdateSyncRun :exec
+const updateSyncRun = `-- name: UpdateSyncRun :one
 UPDATE sync_run
 SET status = $2,
     items_new = $3,
     items_deduped = $4,
     finished_at = $5,
     error = $6
-WHERE id = $1
+WHERE id = $1 AND status = 'RUNNING'
+RETURNING id
 `
 
 type UpdateSyncRunParams struct {
@@ -293,10 +294,15 @@ type UpdateSyncRunParams struct {
 	Error        []byte             `json:"error"`
 }
 
-// Close a sync run: OK carries the item tallies and a NULL error; FAILED carries
-// the error jsonb and zero tallies. finished_at is set by the caller's clock.
-func (q *Queries) UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) error {
-	_, err := q.db.Exec(ctx, updateSyncRun,
+// Close a sync run, but ONLY from RUNNING: the status guard makes this the single
+// winning transition (compare-and-swap), so a redelivery that resumes a run
+// another execution already closed affects zero rows. OK carries the item tallies
+// and a NULL error; FAILED carries the error jsonb and zero tallies. finished_at
+// is set by the caller's clock. RETURNING id lets the caller learn whether this
+// close won (a row) or lost the race (pgx.ErrNoRows) — the signal to publish the
+// terminal event exactly once. Mirrors FinalizeBackfillJob's RUNNING-only guard.
+func (q *Queries) UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, updateSyncRun,
 		arg.ID,
 		arg.Status,
 		arg.ItemsNew,
@@ -304,5 +310,7 @@ func (q *Queries) UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) er
 		arg.FinishedAt,
 		arg.Error,
 	)
-	return err
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }

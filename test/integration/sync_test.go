@@ -10,7 +10,9 @@ package integration_test
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -315,6 +317,150 @@ func TestSync_RLS_TenantIsolation(t *testing.T) {
 				t.Errorf("sync_run count under RLS = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// I8: the sync_run close is a compare-and-swap on status=RUNNING, proven against
+// real Postgres. Two sequential closes of the SAME run simulate the race: the
+// first flips RUNNING → OK and reports closed=true; the second finds the run no
+// longer RUNNING, affects zero rows, and reports closed=false without overwriting
+// the winner's outcome. This is the guard that keeps the terminal event exactly
+// once — the caller publishes only when closed is true.
+func TestSync_UpdateSyncRun_CompareAndSwapGuard(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-sync-cas", 0)
+	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+
+	// A run left RUNNING by a crashed/in-flight attempt.
+	var runID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO sync_run (tenant_id, integration_id, connector_id, connector_version, started_at, status)
+		 VALUES ($1, $2, 'stub', 'v0', now(), 'RUNNING') RETURNING id::text`,
+		tenantID, integID).Scan(&runID); err != nil {
+		t.Fatalf("seed running sync_run: %v", err)
+	}
+
+	repo := acquisition.NewRepository(pool)
+	uow := database.NewUnitOfWork(pool)
+	closeRun := func(status string, itemsNew int) bool {
+		var closed bool
+		if err := uow.Do(ctx, tenantID, func(tx database.Tx) error {
+			var derr error
+			closed, derr = repo.UpdateSyncRun(ctx, tx, acquisition.SyncRunOutcome{
+				ID: runID, Status: status, ItemsNew: itemsNew, FinishedAt: time.Now(),
+			})
+			return derr
+		}); err != nil {
+			t.Fatalf("UpdateSyncRun(%s): %v", status, err)
+		}
+		return closed
+	}
+
+	if !closeRun(acquisition.SyncStatusOK, 7) {
+		t.Fatal("first close returned closed=false, want true (RUNNING → OK won the CAS)")
+	}
+	if closeRun(acquisition.SyncStatusFailed, 0) {
+		t.Fatal("second close returned closed=true, want false (run already closed)")
+	}
+
+	// The run reflects only the winning (first) close — the loser did not overwrite.
+	var status string
+	var itemsNew int
+	if err := pool.QueryRow(ctx,
+		`SELECT status, items_new FROM sync_run WHERE id=$1`, runID).Scan(&status, &itemsNew); err != nil {
+		t.Fatalf("read sync_run: %v", err)
+	}
+	if status != acquisition.SyncStatusOK || itemsNew != 7 {
+		t.Fatalf("sync_run = {status:%q items_new:%d}, want {OK 7}", status, itemsNew)
+	}
+}
+
+// I9: end-to-end, two truly concurrent redeliveries of the same run publish
+// sync_completed exactly once. The pre-state is a crash mid-cycle: a RUNNING run
+// tagged with the event id plus its committed dedup mark, so BOTH deliveries
+// resume the same run and race to close it. The status=RUNNING CAS lets exactly
+// one win — one sync_completed (and one of each observed event) in the outbox,
+// never two, so the backfill slice it drives is counted exactly once. The court
+// record is pre-seeded so the race isolates to the sync_run close.
+func TestSync_ConcurrentRedelivery_PublishesCompletedOnce(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-sync-concurrent", 0)
+	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+
+	ev := syncEvent(tenantID, integID)
+
+	// Pre-seed the fixture's court record so both executions take the find (not
+	// create) path — the record's own create-concurrency is a separate concern.
+	const cnj = "0000001-11.2024.8.26.0100"
+	var caseID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO court_case (tenant_id) VALUES ($1) RETURNING id::text`, tenantID).Scan(&caseID); err != nil {
+		t.Fatalf("seed court_case: %v", err)
+	}
+	mustExec(t, pool,
+		`INSERT INTO court_record (tenant_id, case_id, cnj_number, degree, court, completeness)
+		 VALUES ($1, $2, $3, 'G1', 'TJSP', 0.5)`, tenantID, caseID, cnj)
+
+	// The crash/in-flight pre-state: a RUNNING run tagged with the event id, plus
+	// the dedup mark committed in UoW-1 — so BOTH deliveries resume the same run.
+	var runID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO sync_run (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id)
+		 VALUES ($1, $2, 'stub', 'v0', now(), 'RUNNING', $3) RETURNING id::text`,
+		tenantID, integID, ev.EventID).Scan(&runID); err != nil {
+		t.Fatalf("seed running sync_run: %v", err)
+	}
+	mustExec(t, pool,
+		`INSERT INTO processed_event (consumer, event_id) VALUES ('acquisition.sync', $1)`, ev.EventID)
+
+	uc := newSyncUC(pool)
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = uc.OnSyncRequested(ctx, ev)
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("execution %d error = %v", i, err)
+		}
+	}
+
+	// No second run opened; the stuck run closed OK exactly once.
+	if n := countRows(t, pool, `SELECT count(*) FROM sync_run WHERE integration_id=$1`, integID); n != 1 {
+		t.Fatalf("sync_run rows = %d, want 1", n)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM sync_run WHERE id=$1`, runID).Scan(&status); err != nil {
+		t.Fatalf("read sync_run: %v", err)
+	}
+	if status != acquisition.SyncStatusOK {
+		t.Fatalf("sync_run status = %q, want OK", status)
+	}
+
+	// Exactly one sync_completed and one of each observed event — only the winner published.
+	completed := countRows(t, pool,
+		`SELECT count(*) FROM outbox WHERE type=$1 AND payload->>'sync_run_id'=$2`,
+		acquisition.TypeSyncCompleted, runID)
+	if completed != 1 {
+		t.Fatalf("sync_completed outbox rows = %d, want 1 (published once despite the concurrent race)", completed)
+	}
+	observedRecords := countRows(t, pool,
+		`SELECT count(*) FROM outbox WHERE type=$1 AND payload->>'sync_run_id'=$2`,
+		acquisition.TypeCourtRecordObserved, runID)
+	observedDocket := countRows(t, pool,
+		`SELECT count(*) FROM outbox WHERE type=$1 AND payload->>'sync_run_id'=$2`,
+		acquisition.TypeDocketEntryObserved, runID)
+	if observedRecords != 1 || observedDocket != 2 {
+		t.Fatalf("observed events = {court_record:%d docket:%d}, want {1 2}", observedRecords, observedDocket)
 	}
 }
 

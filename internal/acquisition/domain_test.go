@@ -89,8 +89,8 @@ func (m *mockRepo) FindSyncRunByEventID(_ context.Context, _ database.Tx, _ stri
 	return nil, nil
 }
 
-func (m *mockRepo) UpdateSyncRun(_ context.Context, _ database.Tx, _ SyncRunOutcome) error {
-	return nil
+func (m *mockRepo) UpdateSyncRun(_ context.Context, _ database.Tx, _ SyncRunOutcome) (bool, error) {
+	return true, nil
 }
 
 func (m *mockRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, _ FindOrCreateCourtRecordParams) (*CourtRecord, error) {

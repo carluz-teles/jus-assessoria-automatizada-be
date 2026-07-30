@@ -28,16 +28,22 @@ SELECT id, tenant_id, court_record_id, integration_id, connector_id,
 FROM sync_run
 WHERE event_id = $1;
 
--- name: UpdateSyncRun :exec
--- Close a sync run: OK carries the item tallies and a NULL error; FAILED carries
--- the error jsonb and zero tallies. finished_at is set by the caller's clock.
+-- name: UpdateSyncRun :one
+-- Close a sync run, but ONLY from RUNNING: the status guard makes this the single
+-- winning transition (compare-and-swap), so a redelivery that resumes a run
+-- another execution already closed affects zero rows. OK carries the item tallies
+-- and a NULL error; FAILED carries the error jsonb and zero tallies. finished_at
+-- is set by the caller's clock. RETURNING id lets the caller learn whether this
+-- close won (a row) or lost the race (pgx.ErrNoRows) — the signal to publish the
+-- terminal event exactly once. Mirrors FinalizeBackfillJob's RUNNING-only guard.
 UPDATE sync_run
 SET status = $2,
     items_new = $3,
     items_deduped = $4,
     finished_at = $5,
     error = $6
-WHERE id = $1;
+WHERE id = $1 AND status = 'RUNNING'
+RETURNING id;
 
 -- name: GetCourtRecordByKey :one
 -- Resolve a court record by its natural key inside the caller's tx. A miss

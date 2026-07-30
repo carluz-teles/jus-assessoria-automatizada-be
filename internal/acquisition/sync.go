@@ -107,7 +107,7 @@ type IntimationParams struct {
 type syncRepo interface {
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
-	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error
+	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
@@ -256,16 +256,23 @@ func (uc *SyncUseCase) resolveSeenRun(ctx context.Context, tx database.Tx, ev Sy
 }
 
 // failRun is the UoW-2 for a fetch/parse fault: mark the run FAILED with the
-// reason and emit sync_failed in the same transaction.
+// reason and emit sync_failed in the same transaction. The close is a
+// compare-and-swap (UpdateSyncRun guards on status=RUNNING): if a concurrent
+// execution already closed this run, closed is false and sync_failed is NOT
+// re-published — the winning execution already emitted the terminal event.
 func (uc *SyncUseCase) failRun(ctx context.Context, ev SyncRequested, syncRunID string, cause error) error {
 	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
-		if err := uc.repo.UpdateSyncRun(ctx, tx, SyncRunOutcome{
+		closed, err := uc.repo.UpdateSyncRun(ctx, tx, SyncRunOutcome{
 			ID:         syncRunID,
 			Status:     SyncStatusFailed,
 			FinishedAt: uc.now(),
 			Error:      cause.Error(),
-		}); err != nil {
+		})
+		if err != nil {
 			return err
+		}
+		if !closed {
+			return nil
 		}
 		return uc.outbox.Publish(ctx, tx, newSyncFailed(ev, syncRunID, cause.Error()))
 	})
@@ -320,14 +327,22 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		itemsNew := len(newDocket)
 		itemsDeduped := len(docketParams) - itemsNew
 
-		if err := uc.repo.UpdateSyncRun(ctx, tx, SyncRunOutcome{
+		closed, err := uc.repo.UpdateSyncRun(ctx, tx, SyncRunOutcome{
 			ID:           syncRunID,
 			Status:       SyncStatusOK,
 			ItemsNew:     itemsNew,
 			ItemsDeduped: itemsDeduped,
 			FinishedAt:   uc.now(),
-		}); err != nil {
+		})
+		if err != nil {
 			return err
+		}
+		if !closed {
+			// A concurrent execution already closed this run (its status is no longer
+			// RUNNING, so the CAS affected zero rows). The upserts above were idempotent
+			// no-ops against the effect it committed; skip the observed/completed events
+			// so they — and the backfill slice count they drive — fire exactly once.
+			return nil
 		}
 
 		return uc.publishObserved(ctx, tx, ev, syncRunID, ordered, newDocket, itemsNew, itemsDeduped)

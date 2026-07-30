@@ -80,9 +80,14 @@ type Querier interface {
 	// Record that a sync touched this court record: refresh its completeness and
 	// schedule the next sweep (next_sync_at drives the scheduler slice later).
 	MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecordSyncedParams) error
-	// Close a sync run: OK carries the item tallies and a NULL error; FAILED carries
-	// the error jsonb and zero tallies. finished_at is set by the caller's clock.
-	UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) error
+	// Close a sync run, but ONLY from RUNNING: the status guard makes this the single
+	// winning transition (compare-and-swap), so a redelivery that resumes a run
+	// another execution already closed affects zero rows. OK carries the item tallies
+	// and a NULL error; FAILED carries the error jsonb and zero tallies. finished_at
+	// is set by the caller's clock. RETURNING id lets the caller learn whether this
+	// close won (a row) or lost the race (pgx.ErrNoRows) — the signal to publish the
+	// terminal event exactly once. Mirrors FinalizeBackfillJob's RUNNING-only guard.
+	UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) (uuid.UUID, error)
 	// acquisition slice queries (integration).
 	// The upsert is keyed by (tenant_id, source) so re-activating a source is
 	// idempotent at the row level; credential_ref is never written from here (it
