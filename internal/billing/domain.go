@@ -27,23 +27,51 @@ type deduper interface {
 	SeenOrMark(ctx context.Context, tx database.Tx, consumer, eventID string) (seen bool, err error)
 }
 
+// CheckoutConfig carries the tenant-facing redirect URLs and trial window the
+// checkout/portal use cases need. It comes from process config (env), injected via
+// WithCheckoutConfig — the webhook path (fatia 4-A) leaves it zero, the endpoints
+// (fatia 4-B) set it. TrialDays 0 means no trial.
+type CheckoutConfig struct {
+	SuccessURL string
+	CancelURL  string
+	ReturnURL  string
+	TrialDays  int
+}
+
 // UseCase carries the billing use cases: projecting the Stripe subscription state
-// from verified webhooks (idempotent, at-least-once) and emitting the domain
-// events downstream slices consume. It depends on the Repository, StripeGateway,
-// outbox publisher, deduper and UnitOfWork interfaces — never on a concrete
-// implementation (docs §2.5).
+// from verified webhooks (idempotent, at-least-once), emitting the domain events
+// downstream slices consume, and driving the tenant-facing checkout/portal/plans
+// endpoints. It depends on the Repository, StripeGateway, outbox publisher, deduper
+// and UnitOfWork interfaces — never on a concrete implementation (docs §2.5).
 type UseCase struct {
-	repo    Repository
-	gateway StripeGateway
-	outbox  publisher
-	dedup   deduper
-	uow     database.UnitOfWork
+	repo     Repository
+	gateway  StripeGateway
+	outbox   publisher
+	dedup    deduper
+	uow      database.UnitOfWork
+	checkout CheckoutConfig
+}
+
+// Option configures optional UseCase collaborators. Kept variadic so the webhook
+// wiring (fatia 4-A) constructs the use case unchanged while the api adds the
+// checkout config for the endpoints (fatia 4-B).
+type Option func(*UseCase)
+
+// WithCheckoutConfig injects the redirect URLs and trial window the checkout and
+// portal use cases redirect through.
+func WithCheckoutConfig(c CheckoutConfig) Option {
+	return func(uc *UseCase) { uc.checkout = c }
 }
 
 // NewUseCase wires the use cases to their repository, Stripe gateway, outbox
-// publisher, dedup guard and unit of work.
-func NewUseCase(repo Repository, gateway StripeGateway, outbox publisher, dedup deduper, uow database.UnitOfWork) *UseCase {
-	return &UseCase{repo: repo, gateway: gateway, outbox: outbox, dedup: dedup, uow: uow}
+// publisher, dedup guard and unit of work. Optional collaborators (the checkout
+// config) arrive through Options so existing callers stay source-compatible.
+func NewUseCase(repo Repository, gateway StripeGateway, outbox publisher, dedup deduper, uow database.UnitOfWork, opts ...Option) *UseCase {
+	uc := &UseCase{repo: repo, gateway: gateway, outbox: outbox, dedup: dedup, uow: uow}
+	for _, opt := range opts {
+		opt(uc)
+	}
+	return uc
 }
 
 // HandleWebhook verifies a raw Stripe webhook and projects its effect. It is the
@@ -208,6 +236,78 @@ func (uc *UseCase) resolveInvoiceTenant(ctx context.Context, ev StripeEvent) (st
 		return "", err
 	}
 	return sub.TenantID, nil
+}
+
+// StartCheckout opens a hosted Stripe Checkout for the tenant and returns its
+// redirect URL. It refuses (409 ErrAlreadySubscribed) when the tenant already
+// holds a live subscription (active/trialing) — a plan change goes through the
+// portal, not a second checkout. It reuses the customer id stored on the tenant's
+// subscription when present (e.g. re-subscribing after a cancellation) and only
+// provisions a fresh Stripe Customer otherwise. No DB write happens here: the
+// subscription row is projected later by the webhook, which reads the tenant_id
+// this checkout stamps on the subscription metadata.
+func (uc *UseCase) StartCheckout(ctx context.Context, tenantID, priceID string) (string, error) {
+	sub, err := uc.repo.FindByTenant(ctx, tenantID)
+	if err != nil && !errors.Is(err, ErrSubscriptionNotFound) {
+		return "", err
+	}
+	if sub != nil && (sub.Status == StatusActive || sub.Status == StatusTrialing) {
+		return "", ErrAlreadySubscribed
+	}
+
+	customerID := ""
+	if sub != nil {
+		customerID = sub.StripeCustomerID
+	}
+	if customerID == "" {
+		customerID, err = uc.gateway.EnsureCustomer(ctx, tenantID)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return uc.gateway.CreateCheckoutSession(ctx, CheckoutParams{
+		CustomerID: customerID,
+		PriceID:    priceID,
+		TenantID:   tenantID,
+		SuccessURL: uc.checkout.SuccessURL,
+		CancelURL:  uc.checkout.CancelURL,
+		TrialDays:  uc.checkout.TrialDays,
+	})
+}
+
+// OpenPortal opens a Stripe Billing Portal session for the tenant and returns its
+// redirect URL. The tenant must already have a Stripe customer (a subscription
+// with a stored customer id); otherwise there is nothing to manage and it returns
+// 404 ErrNoStripeCustomer.
+func (uc *UseCase) OpenPortal(ctx context.Context, tenantID string) (string, error) {
+	sub, err := uc.repo.FindByTenant(ctx, tenantID)
+	if errors.Is(err, ErrSubscriptionNotFound) {
+		return "", ErrNoStripeCustomer
+	}
+	if err != nil {
+		return "", err
+	}
+	if sub.StripeCustomerID == "" {
+		return "", ErrNoStripeCustomer
+	}
+
+	return uc.gateway.CreatePortalSession(ctx, sub.StripeCustomerID, uc.checkout.ReturnURL)
+}
+
+// GetSubscription returns the tenant's local subscription projection for the
+// read-model endpoint. It reads the mirror this slice keeps — no Stripe call at
+// request time (Stripe is the source of truth, the webhook keeps the mirror
+// fresh). A tenant that never checked out gets ErrSubscriptionNotFound (→ 404).
+func (uc *UseCase) GetSubscription(ctx context.Context, tenantID string) (*Subscription, error) {
+	return uc.repo.FindByTenant(ctx, tenantID)
+}
+
+// ListPlans returns the active plan catalog from Stripe. It is a thin pass-through
+// to the gateway today (the catalog lives in Stripe), kept as a use case so the
+// handler never touches the gateway and future filtering has a home.
+func (uc *UseCase) ListPlans(ctx context.Context) ([]Plan, error) {
+	return uc.gateway.ListPlans(ctx)
 }
 
 // normalizeStatus maps a raw Stripe subscription status onto the product's v0

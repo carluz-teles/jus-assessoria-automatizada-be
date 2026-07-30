@@ -41,6 +41,10 @@ type Repository interface {
 	// customer id, on the pool. A missing row is ErrSubscriptionNotFound, never
 	// (nil, nil).
 	FindByStripeCustomer(ctx context.Context, stripeCustomerID string) (*Subscription, error)
+	// FindByTenant reads the tenant's own subscription projection on the pool —
+	// backs the read-model endpoint and the checkout/portal flows. A missing row is
+	// ErrSubscriptionNotFound, never (nil, nil).
+	FindByTenant(ctx context.Context, tenantID string) (*Subscription, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -94,6 +98,24 @@ func (r *pgRepository) UpdateSubscriptionStatus(ctx context.Context, tx database
 		TenantID: tid,
 		Status:   string(status),
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSubscriptionNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return subscriptionToEntity(row), nil
+}
+
+// FindByTenant reads the tenant's subscription on the pool. A missing row is the
+// typed ErrSubscriptionNotFound (the tenant never checked out), never (nil, nil).
+func (r *pgRepository) FindByTenant(ctx context.Context, tenantID string) (*Subscription, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	row, err := r.q.FindByTenant(ctx, tid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrSubscriptionNotFound
 	}

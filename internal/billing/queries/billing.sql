@@ -35,6 +35,14 @@ UPDATE subscription
  WHERE tenant_id = $1
 RETURNING *;
 
+-- name: FindByTenant :one
+-- Read the tenant's own subscription projection (Stripe Customer = tenant, one row
+-- per tenant). Backs the read-model endpoint (GET /v1/billing/subscription) and the
+-- checkout/portal flows that need the stored stripe_customer_id. Scoped by tenant_id
+-- (WHERE + RLS). No row → the caller maps pgx.ErrNoRows to a typed not-found.
+SELECT * FROM subscription
+WHERE tenant_id = $1;
+
 -- name: FindByStripeCustomer :one
 -- Resolve the stored subscription (and thus its tenant) by Stripe customer id.
 -- Used to recover the tenant for an invoice.payment_failed whose object carries no

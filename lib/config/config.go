@@ -47,6 +47,15 @@ type Config struct {
 	StripeSecretKey     string `env:"STRIPE_SECRET_KEY"`
 	StripeWebhookSecret string `env:"STRIPE_WEBHOOK_SECRET"`
 
+	// Billing checkout/portal redirects + trial (só o api os consome, nos endpoints
+	// /v1/billing/checkout|portal). Opcionais: um destino vazio só produz um Checkout
+	// sem redirect útil, não quebra o boot dos demais binários. STRIPE_TRIAL_DAYS
+	// default 0 = sem trial.
+	BillingSuccessURL string `env:"APP_BILLING_SUCCESS_URL"`
+	BillingCancelURL  string `env:"APP_BILLING_CANCEL_URL"`
+	BillingReturnURL  string `env:"APP_BILLING_RETURN_URL"`
+	StripeTrialDays   int    `env:"STRIPE_TRIAL_DAYS" envDefault:"0"`
+
 	// Resend — provedor de e-mail transacional (só o worker que roda o listener de
 	// notifications os consome). Opcionais no agregado pelo mesmo motivo do Stripe/S3:
 	// mantê-los opcionais preserva o boot dos demais binários (api/scheduler/relay),

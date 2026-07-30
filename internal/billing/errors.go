@@ -32,4 +32,12 @@ var (
 	// active_process_limit in its Stripe metadata (→ 400). The catalog is
 	// misconfigured; refuse rather than project a zero entitlement silently.
 	ErrPlanUnresolved = apperr.NewInvalid("stripe product metadata missing active_process_limit")
+	// ErrAlreadySubscribed — the tenant already holds a live subscription
+	// (active/trialing), so a new checkout would double-bill (→ 409). The tenant
+	// changes plans through the billing portal, not a second checkout.
+	ErrAlreadySubscribed = apperr.NewConflict("tenant already has an active subscription")
+	// ErrNoStripeCustomer — the tenant has no Stripe customer to open a portal for
+	// (no subscription yet, or one stored without a customer id) (→ 404). Checkout
+	// creates the customer; until then there is nothing to manage.
+	ErrNoStripeCustomer = apperr.NewNotFound("no stripe customer for tenant")
 )

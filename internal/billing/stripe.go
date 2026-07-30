@@ -113,6 +113,117 @@ func (g *stripeGateway) ResolvePlan(ctx context.Context, priceID string) (string
 	return plan, limit, nil
 }
 
+// EnsureCustomer creates a Stripe Customer stamped with metadata.tenant_id (the
+// key the webhook reads the tenant back from). It always creates: the reuse of an
+// existing customer is the caller's decision (StartCheckout passes the stored id
+// instead of calling this), so the gateway stays a thin, DB-unaware Stripe port.
+func (g *stripeGateway) EnsureCustomer(ctx context.Context, tenantID string) (string, error) {
+	params := &stripe.CustomerCreateParams{
+		Metadata: map[string]string{metadataTenantID: tenantID},
+	}
+	c, err := g.client.V1Customers.Create(ctx, params)
+	if err != nil {
+		return "", apperr.NewUnavailable("create stripe customer", err)
+	}
+	return c.ID, nil
+}
+
+// CreateCheckoutSession opens a hosted Checkout in subscription mode for the
+// customer/price and returns its redirect URL. tenant_id is stamped on
+// subscription_data.metadata so the resulting subscription — and thus the 4-A
+// webhook (customer.subscription.created) — carries the tenant scope; a positive
+// TrialDays starts the subscription on a trial.
+func (g *stripeGateway) CreateCheckoutSession(ctx context.Context, p CheckoutParams) (string, error) {
+	subData := &stripe.CheckoutSessionCreateSubscriptionDataParams{
+		Metadata: map[string]string{metadataTenantID: p.TenantID},
+	}
+	if p.TrialDays > 0 {
+		subData.TrialPeriodDays = stripe.Int64(int64(p.TrialDays))
+	}
+
+	params := &stripe.CheckoutSessionCreateParams{
+		Mode:       stripe.String(string(stripe.CheckoutSessionModeSubscription)),
+		Customer:   stripe.String(p.CustomerID),
+		SuccessURL: stripe.String(p.SuccessURL),
+		CancelURL:  stripe.String(p.CancelURL),
+		LineItems: []*stripe.CheckoutSessionCreateLineItemParams{
+			{Price: stripe.String(p.PriceID), Quantity: stripe.Int64(1)},
+		},
+		SubscriptionData: subData,
+	}
+
+	session, err := g.client.V1CheckoutSessions.Create(ctx, params)
+	if err != nil {
+		return "", apperr.NewUnavailable("create stripe checkout session", err)
+	}
+	return session.URL, nil
+}
+
+// CreatePortalSession opens a Billing Portal session for the customer and returns
+// its redirect URL (where the tenant manages its subscription and invoices).
+func (g *stripeGateway) CreatePortalSession(ctx context.Context, customerID, returnURL string) (string, error) {
+	params := &stripe.BillingPortalSessionCreateParams{
+		Customer:  stripe.String(customerID),
+		ReturnURL: stripe.String(returnURL),
+	}
+	session, err := g.client.V1BillingPortalSessions.Create(ctx, params)
+	if err != nil {
+		return "", apperr.NewUnavailable("create stripe portal session", err)
+	}
+	return session.URL, nil
+}
+
+// ListPlans reads the active plan catalog: active recurring prices with their
+// product expanded in one round-trip. A price is a Plan only when its product is
+// active and carries a usable active_process_limit — a misconfigured product is
+// skipped (not fatal) so one bad catalog entry never hides the rest. The list
+// auto-paginates via V1List.All.
+func (g *stripeGateway) ListPlans(ctx context.Context) ([]Plan, error) {
+	params := &stripe.PriceListParams{Active: stripe.Bool(true)}
+	params.AddExpand("data.product")
+
+	plans := []Plan{}
+	for price, err := range g.client.V1Prices.List(ctx, params).All(ctx) {
+		if err != nil {
+			return nil, apperr.NewUnavailable("list stripe prices", err)
+		}
+		plan, ok := toPlan(price)
+		if !ok {
+			continue
+		}
+		plans = append(plans, plan)
+	}
+	return plans, nil
+}
+
+// toPlan absorbs a Stripe price+product into a Plan, reporting ok=false for a
+// catalog entry the checkout cannot use: no expanded/active product, no recurring
+// interval, or a missing/zero active_process_limit. The name is the product's
+// `plan` metadata, falling back to its display name (mirrors ResolvePlan).
+func toPlan(price *stripe.Price) (Plan, bool) {
+	prod := price.Product
+	if prod == nil || !prod.Active || price.Recurring == nil {
+		return Plan{}, false
+	}
+
+	limit, err := strconv.Atoi(prod.Metadata[productMetaActiveProcessLimit])
+	if err != nil || limit <= 0 {
+		return Plan{}, false
+	}
+
+	name := prod.Metadata[productMetaPlan]
+	if name == "" {
+		name = prod.Name
+	}
+	return Plan{
+		PriceID:            price.ID,
+		Name:               name,
+		Amount:             price.UnitAmount,
+		Interval:           string(price.Recurring.Interval),
+		ActiveProcessLimit: limit,
+	}, true
+}
+
 // toStripeSubscription absorbs the SDK subscription shape into the neutral type:
 // the customer id off the expandable Customer, and the price id + paid-through
 // window off the first subscription item (v82+ moved current_period_end onto the
