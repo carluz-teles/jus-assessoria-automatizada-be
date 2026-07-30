@@ -1,9 +1,9 @@
 -- sync cycle queries (acquisition slice).
 -- The sync listener reacts to sync_requested: it opens a sync_run (RUNNING),
--- fetches+parses a window, then upserts the observed records/entries/notifications
+-- fetches+parses a window, then upserts the observed records/entries/intimations
 -- and closes the run (OK/FAILED) — all keyed off the court_record's natural key
 -- (tenant_id, cnj_number, degree). Idempotency lives in the schema: docket_entry
--- and notification carry UNIQUE constraints, so a re-sync of the same window
+-- and intimation carry UNIQUE constraints, so a re-sync of the same window
 -- inserts nothing new (ON CONFLICT DO NOTHING) and the RETURNING clause tells the
 -- caller which rows were actually new.
 
@@ -66,10 +66,10 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (court_record_id, hash) DO NOTHING
 RETURNING id;
 
--- name: InsertNotification :one
+-- name: InsertIntimation :one
 -- Append one intimação, idempotent on (tenant_id, case_id, hash). Same
 -- conflict-as-dedup contract as docket entries; recipients defaults to '[]'.
-INSERT INTO notification
+INSERT INTO intimation
     (tenant_id, case_id, court_record_id, hash, made_available_at, published_at, deadline_start_at, content, source)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (tenant_id, case_id, hash) DO NOTHING

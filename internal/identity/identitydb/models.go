@@ -145,18 +145,7 @@ type Integration struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
-type Membership struct {
-	ID                uuid.UUID          `json:"id"`
-	TenantID          uuid.UUID          `json:"tenant_id"`
-	AppUserID         uuid.UUID          `json:"app_user_id"`
-	ClerkMembershipID *string            `json:"clerk_membership_id"`
-	Role              string             `json:"role"`
-	Status            string             `json:"status"`
-	JoinedAt          pgtype.Timestamptz `json:"joined_at"`
-	RemovedAt         pgtype.Timestamptz `json:"removed_at"`
-}
-
-type Notification struct {
+type Intimation struct {
 	ID              uuid.UUID   `json:"id"`
 	TenantID        uuid.UUID   `json:"tenant_id"`
 	CaseID          uuid.UUID   `json:"case_id"`
@@ -168,6 +157,17 @@ type Notification struct {
 	Content         string      `json:"content"`
 	Source          string      `json:"source"`
 	Recipients      []byte      `json:"recipients"`
+}
+
+type Membership struct {
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	AppUserID         uuid.UUID          `json:"app_user_id"`
+	ClerkMembershipID *string            `json:"clerk_membership_id"`
+	Role              string             `json:"role"`
+	Status            string             `json:"status"`
+	JoinedAt          pgtype.Timestamptz `json:"joined_at"`
+	RemovedAt         pgtype.Timestamptz `json:"removed_at"`
 }
 
 type Outbox struct {

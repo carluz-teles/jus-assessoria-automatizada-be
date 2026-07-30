@@ -50,7 +50,7 @@ func (c *StubConnector) Fetch(_ context.Context, _ FetchRequest) (RawPayload, er
 }
 
 // StubParser satisfies Parser: it accepts any stub payload and returns a fixed
-// ParsedResult (one court record, two docket entries, one notification) so the
+// ParsedResult (one court record, two docket entries, one intimation) so the
 // upsert and dedup paths have real data to work on.
 type StubParser struct{}
 
@@ -66,7 +66,7 @@ func (StubParser) Parse(p RawPayload) (ParsedResult, error) {
 }
 
 // stubFixture is the deterministic parsed result: one G1 court record with two
-// docket entries and one notification, all keyed to the same CNJ so the use
+// docket entries and one intimation, all keyed to the same CNJ so the use
 // case's record→entry resolution is exercised. The hashes are stable, so a
 // re-sync of the same window deduplicates to zero new items.
 func stubFixture(source string) ParsedResult {
@@ -109,7 +109,7 @@ func stubFixture(source string) ParsedResult {
 				Text:       "Concluso para despacho",
 			},
 		},
-		Notifications: []ParsedNotification{{
+		Intimations: []ParsedIntimation{{
 			CNJNumber:       cnj,
 			Degree:          DegreeG1,
 			Hash:            "stub-notif-1",

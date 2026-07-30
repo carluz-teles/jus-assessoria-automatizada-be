@@ -39,7 +39,7 @@ type Repository interface {
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
-	UpsertNotifications(ctx context.Context, tx database.Tx, params []NotificationParams) (newCount int, err error)
+	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -297,7 +297,7 @@ func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcom
 // FindOrCreateCourtRecord resolves a court record by its natural key inside the
 // caller's tx, creating the case+record on a miss, then marks it synced
 // (completeness + next_sync_at) whether new or found. It returns the entity the
-// cycle keys its docket/notification upserts and observed events on.
+// cycle keys its docket/intimation upserts and observed events on.
 func (r *pgRepository) FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error) {
 	tid, err := uuid.Parse(params.TenantID)
 	if err != nil {
@@ -401,11 +401,11 @@ func (r *pgRepository) UpsertDocketEntries(ctx context.Context, tx database.Tx, 
 	return newEntries, nil
 }
 
-// UpsertNotifications inserts each intimação ON CONFLICT DO NOTHING inside the
+// UpsertIntimations inserts each intimação ON CONFLICT DO NOTHING inside the
 // caller's tx and returns how many were new (same conflict-as-dedup contract as
-// docket entries). This slice emits no notification-observed event, so only the
+// docket entries). This slice emits no intimation-observed event, so only the
 // count is returned.
-func (r *pgRepository) UpsertNotifications(ctx context.Context, tx database.Tx, params []NotificationParams) (int, error) {
+func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error) {
 	q := acquisitiondb.New(tx)
 	newCount := 0
 	for _, p := range params {
@@ -421,7 +421,7 @@ func (r *pgRepository) UpsertNotifications(ctx context.Context, tx database.Tx, 
 		if err != nil {
 			return 0, database.WrapInfra(err)
 		}
-		_, err = q.InsertNotification(ctx, acquisitiondb.InsertNotificationParams{
+		_, err = q.InsertIntimation(ctx, acquisitiondb.InsertIntimationParams{
 			TenantID:        tid,
 			CaseID:          caseID,
 			CourtRecordID:   crid,

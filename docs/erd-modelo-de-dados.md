@@ -14,7 +14,7 @@
 | Processo (a lide) | `court_case` (tabela) · `Case` (tipo Go) |
 | Tramitação | `court_record` |
 | Movimento | `docket_entry` |
-| Intimação | `notification` |
+| Intimação | `intimation` |
 | Prazo | `deadline` |
 | Documento | `document` |
 | Minuta | `draft` |
@@ -35,7 +35,7 @@
 ```
 IDENTITY        tenant · app_user · membership
 ACQUISITION     integration · sync_run
-CONSOLIDATION   court_case · court_record · docket_entry · notification · case_link
+CONSOLIDATION   court_case · court_record · docket_entry · intimation · case_link
 DOCUMENTS       document · chunk
 ADVISORY        draft · review · petition
 DEADLINES       deadline
@@ -55,8 +55,8 @@ erDiagram
     tenant       ||--o{ court_case : owns
     court_case   ||--o{ court_record : groups
     court_record ||--o{ docket_entry : logs
-    court_record ||--o{ notification : receives
-    notification ||--o| deadline : opens
+    court_record ||--o{ intimation : receives
+    intimation ||--o| deadline : opens
     court_record ||--o{ document : holds
     document     ||--o{ chunk : split_into
     court_case   ||--o{ case_link : links
@@ -244,11 +244,13 @@ CREATE INDEX ON docket_entry (tpu_code);
 ```
 As **duas datas** são o ponto mais importante do schema. Particionar por range de `occurred_at` quando passar de ~20M linhas.
 
-## notification [v0]
-Intimação — aviso que abre prazo. Dedup no escopo do **case** (chega por várias fontes).
+## intimation [v0]
+Intimação — aviso judicial que abre prazo. Dedup no escopo do **case** (chega por várias fontes).
+Criada como `notification` na 0001 e **renomeada para `intimation` na 0006** (o nome `notification`
+passou a ser do domínio de avisos ao usuário — `internal/notifications`).
 
 ```sql
-CREATE TABLE notification (
+CREATE TABLE intimation (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id         uuid NOT NULL REFERENCES tenant(id),
   case_id           uuid NOT NULL REFERENCES court_case(id),
@@ -384,13 +386,13 @@ CREATE INDEX ON petition (court_record_id) WHERE observed_result IS NULL;  -- ca
 # 7. Deadlines
 
 ## deadline [v0 (reduzido)]
-Prazo — conta-regressiva derivada de notification. Ancora na **court_record**.
+Prazo — conta-regressiva derivada de intimation. Ancora na **court_record**.
 
 ```sql
 CREATE TABLE deadline (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   court_record_id  uuid NOT NULL REFERENCES court_record(id),
-  notification_id  uuid NOT NULL UNIQUE REFERENCES notification(id),
+  notification_id  uuid NOT NULL UNIQUE REFERENCES intimation(id),  -- coluna mantém o nome; FK aponta p/ intimation
   start_date       date NOT NULL,
   end_date         date NOT NULL,
   days             int NOT NULL,
@@ -499,7 +501,7 @@ O `UPDATE ... RETURNING` atômico sobre `slices_ok` é o que evita corrida na co
 | `court_case` | Consolidation | ✅ | não | a lide, magra |
 | `court_record` | Consolidation | ✅ | sim | centro de gravidade |
 | `docket_entry` | Consolidation | ✅ | **muito** | particionar em ~20M |
-| `notification` | Consolidation | ✅ | sim | dedup no case |
+| `intimation` | Consolidation | ✅ | sim | dedup no case (era `notification` até a 0006) |
 | `case_link` | Consolidation | ✅ | não | só DETERMINISTIC na v0 |
 | `document` | Documents | ✅ | sim | origin COURT/UPLOAD |
 | `chunk` | Documents | ✅ | **muito** | pgvector |

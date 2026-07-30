@@ -79,7 +79,7 @@ type SyncRun struct {
 
 // CourtRecord is what the court knows about a process at one degree — the
 // FindOrCreate result the sync cycle keys everything else on. ID and CaseID are
-// what downstream upserts (docket entries, notifications) and the
+// what downstream upserts (docket entries, intimations) and the
 // court_record_observed event need; the rest of the schema's columns are not
 // materialized into the entity in this slice.
 type CourtRecord struct {
@@ -105,11 +105,11 @@ type DocketEntry struct {
 	Text          string
 }
 
-// Notification is one intimação persisted by the sync cycle, deduped within the
-// (tenant, case) scope. This slice does not emit a notification-observed event
+// Intimation is one intimação persisted by the sync cycle, deduped within the
+// (tenant, case) scope. This slice does not emit an intimation-observed event
 // (the deadline slice owns that), so the entity is the persisted shape, not an
 // event carrier.
-type Notification struct {
+type Intimation struct {
 	ID              string
 	TenantID        string
 	CaseID          string

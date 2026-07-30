@@ -62,14 +62,14 @@ type Connector interface {
 
 // ParsedResult is the connector-agnostic view a parser produces from a
 // RawPayload: the court records observed in this window, their docket entries,
-// and any notifications. The sync use case upserts each list and emits the
+// and any intimations. The sync use case upserts each list and emits the
 // observed events. The lists are keyed to each other by (CNJNumber, Degree):
-// a docket entry/notification names the record it belongs to, which the use case
+// a docket entry/intimation names the record it belongs to, which the use case
 // resolves to a court_record id after FindOrCreateCourtRecord.
 type ParsedResult struct {
 	CourtRecords  []ParsedCourtRecord
 	DocketEntries []ParsedDocketEntry
-	Notifications []ParsedNotification
+	Intimations   []ParsedIntimation
 }
 
 // ParsedCourtRecord is one court record as the source reports it. CNJNumber and
@@ -99,10 +99,10 @@ type ParsedDocketEntry struct {
 	Text       string
 }
 
-// ParsedNotification is one intimação. Hash dedups within the (tenant, case)
+// ParsedIntimation is one intimação. Hash dedups within the (tenant, case)
 // scope; the three dates are already derived by the parser (the deadline slice
 // consumes them later). It belongs to the record named by (CNJNumber, Degree).
-type ParsedNotification struct {
+type ParsedIntimation struct {
 	CNJNumber       string
 	Degree          string
 	Hash            string

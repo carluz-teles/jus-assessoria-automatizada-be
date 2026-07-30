@@ -1,0 +1,12 @@
+-- 0006_rename_intimation — the judicial "notification" table is an INTIMAÇÃO
+-- (a court notice that opens a prazo), not a user-facing aviso. Rename it to
+-- `intimation` so the name `notification` is free for the avisos domain
+-- (internal/notifications, a later slice).
+--
+-- Pure rename: in Postgres the RLS policy (tenant_isolation) and the deadline FK
+-- (deadline.notification_id REFERENCES ...(id)) follow the table automatically.
+-- The deadline.notification_id COLUMN name is intentionally kept — it is internal
+-- and renaming it would widen the blast for no gain. The auto-named UNIQUE
+-- constraint keeps its notification_* name (cosmetic; ON CONFLICT keys on the
+-- columns, not the constraint name).
+ALTER TABLE notification RENAME TO intimation;

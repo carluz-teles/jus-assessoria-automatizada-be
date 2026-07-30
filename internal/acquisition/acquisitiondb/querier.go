@@ -54,13 +54,13 @@ type Querier interface {
 	InsertDocketEntry(ctx context.Context, arg InsertDocketEntryParams) (uuid.UUID, error)
 	// Append one intimação, idempotent on (tenant_id, case_id, hash). Same
 	// conflict-as-dedup contract as docket entries; recipients defaults to '[]'.
-	InsertNotification(ctx context.Context, arg InsertNotificationParams) (uuid.UUID, error)
+	InsertIntimation(ctx context.Context, arg InsertIntimationParams) (uuid.UUID, error)
 	// sync cycle queries (acquisition slice).
 	// The sync listener reacts to sync_requested: it opens a sync_run (RUNNING),
-	// fetches+parses a window, then upserts the observed records/entries/notifications
+	// fetches+parses a window, then upserts the observed records/entries/intimations
 	// and closes the run (OK/FAILED) — all keyed off the court_record's natural key
 	// (tenant_id, cnj_number, degree). Idempotency lives in the schema: docket_entry
-	// and notification carry UNIQUE constraints, so a re-sync of the same window
+	// and intimation carry UNIQUE constraints, so a re-sync of the same window
 	// inserts nothing new (ON CONFLICT DO NOTHING) and the RETURNING clause tells the
 	// caller which rows were actually new.
 	// Open a sync run. court_record_id is left NULL (OAB window discovery is not yet

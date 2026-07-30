@@ -97,7 +97,7 @@ func (m *mockRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, _ []Doc
 	return nil, nil
 }
 
-func (m *mockRepo) UpsertNotifications(_ context.Context, _ database.Tx, _ []NotificationParams) (int, error) {
+func (m *mockRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []IntimationParams) (int, error) {
 	return 0, nil
 }
 

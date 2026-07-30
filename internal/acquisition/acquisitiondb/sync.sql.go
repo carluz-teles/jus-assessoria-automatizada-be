@@ -125,15 +125,15 @@ func (q *Queries) InsertDocketEntry(ctx context.Context, arg InsertDocketEntryPa
 	return id, err
 }
 
-const insertNotification = `-- name: InsertNotification :one
-INSERT INTO notification
+const insertIntimation = `-- name: InsertIntimation :one
+INSERT INTO intimation
     (tenant_id, case_id, court_record_id, hash, made_available_at, published_at, deadline_start_at, content, source)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (tenant_id, case_id, hash) DO NOTHING
 RETURNING id
 `
 
-type InsertNotificationParams struct {
+type InsertIntimationParams struct {
 	TenantID        uuid.UUID   `json:"tenant_id"`
 	CaseID          uuid.UUID   `json:"case_id"`
 	CourtRecordID   uuid.UUID   `json:"court_record_id"`
@@ -147,8 +147,8 @@ type InsertNotificationParams struct {
 
 // Append one intimação, idempotent on (tenant_id, case_id, hash). Same
 // conflict-as-dedup contract as docket entries; recipients defaults to '[]'.
-func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotificationParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, insertNotification,
+func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertIntimation,
 		arg.TenantID,
 		arg.CaseID,
 		arg.CourtRecordID,
@@ -183,10 +183,10 @@ type InsertSyncRunParams struct {
 
 // sync cycle queries (acquisition slice).
 // The sync listener reacts to sync_requested: it opens a sync_run (RUNNING),
-// fetches+parses a window, then upserts the observed records/entries/notifications
+// fetches+parses a window, then upserts the observed records/entries/intimations
 // and closes the run (OK/FAILED) — all keyed off the court_record's natural key
 // (tenant_id, cnj_number, degree). Idempotency lives in the schema: docket_entry
-// and notification carry UNIQUE constraints, so a re-sync of the same window
+// and intimation carry UNIQUE constraints, so a re-sync of the same window
 // inserts nothing new (ON CONFLICT DO NOTHING) and the RETURNING clause tells the
 // caller which rows were actually new.
 // Open a sync run. court_record_id is left NULL (OAB window discovery is not yet

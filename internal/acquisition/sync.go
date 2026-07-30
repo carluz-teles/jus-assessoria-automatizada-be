@@ -81,8 +81,8 @@ type DocketEntryParams struct {
 	Text          string
 }
 
-// NotificationParams is one intimação to upsert (idempotent on tenant+case+hash).
-type NotificationParams struct {
+// IntimationParams is one intimação to upsert (idempotent on tenant+case+hash).
+type IntimationParams struct {
 	TenantID        string
 	CaseID          string
 	CourtRecordID   string
@@ -105,7 +105,7 @@ type syncRepo interface {
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) error
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
-	UpsertNotifications(ctx context.Context, tx database.Tx, params []NotificationParams) (newCount int, err error)
+	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
 }
 
 // SyncUseCase reacts to sync_requested by running one fetch→parse→upsert cycle.
@@ -231,7 +231,7 @@ func (uc *SyncUseCase) failRun(ctx context.Context, ev SyncRequested, syncRunID 
 }
 
 // applyResult is the UoW-2 for a successful sync: find-or-create each observed
-// court record, upsert its docket entries and notifications (dedup by unique
+// court record, upsert its docket entries and intimations (dedup by unique
 // constraint), close the run OK with the tallies, and emit the observed events —
 // all atomically. court_record_observed fires per observed record;
 // docket_entry_observed only for entries that were actually new.
@@ -268,11 +268,11 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			return err
 		}
 
-		notifParams, err := notificationParamsFor(ev.TenantID, parsed.Notifications, records)
+		intimParams, err := intimationParamsFor(ev.TenantID, parsed.Intimations, records)
 		if err != nil {
 			return err
 		}
-		if _, err := uc.repo.UpsertNotifications(ctx, tx, notifParams); err != nil {
+		if _, err := uc.repo.UpsertIntimations(ctx, tx, intimParams); err != nil {
 			return err
 		}
 
@@ -333,17 +333,17 @@ func docketParamsFor(entries []ParsedDocketEntry, records map[string]*CourtRecor
 	return params, nil
 }
 
-// notificationParamsFor resolves each parsed notification to its case/record ids
+// intimationParamsFor resolves each parsed intimation to its case/record ids
 // via the find-or-create map, under the event's tenant. Same fail-closed rule as
 // docket entries.
-func notificationParamsFor(tenantID string, notifs []ParsedNotification, records map[string]*CourtRecord) ([]NotificationParams, error) {
-	params := make([]NotificationParams, 0, len(notifs))
-	for _, pn := range notifs {
+func intimationParamsFor(tenantID string, intims []ParsedIntimation, records map[string]*CourtRecord) ([]IntimationParams, error) {
+	params := make([]IntimationParams, 0, len(intims))
+	for _, pn := range intims {
 		cr, ok := records[recordKey(pn.CNJNumber, pn.Degree)]
 		if !ok {
-			return nil, fmt.Errorf("notification %q references unknown court record %s/%s", pn.Hash, pn.CNJNumber, pn.Degree)
+			return nil, fmt.Errorf("intimation %q references unknown court record %s/%s", pn.Hash, pn.CNJNumber, pn.Degree)
 		}
-		params = append(params, NotificationParams{
+		params = append(params, IntimationParams{
 			TenantID:        tenantID,
 			CaseID:          cr.CaseID,
 			CourtRecordID:   cr.ID,
@@ -370,7 +370,7 @@ func fetchRequestFromEvent(ev SyncRequested) FetchRequest {
 }
 
 // recordKey is the in-memory join key between a parsed record and its docket
-// entries/notifications: the natural key (cnj, degree) with a NUL separator so
+// entries/intimations: the natural key (cnj, degree) with a NUL separator so
 // no two distinct pairs ever collide.
 func recordKey(cnjNumber, degree string) string {
 	return cnjNumber + "\x00" + degree

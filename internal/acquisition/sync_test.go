@@ -59,8 +59,8 @@ func (p *stubParser) Parse(RawPayload) (ParsedResult, error) {
 
 // stubSyncRepo records every sync-cycle call and answers from preset knobs.
 // docketNewCount is how many of the upserted docket entries it reports as new
-// (the rest are deduped by the unique constraint); notifNew is the analog for
-// notifications.
+// (the rest are deduped by the unique constraint); intimNew is the analog for
+// intimations.
 type stubSyncRepo struct {
 	syncRunID string
 
@@ -74,9 +74,9 @@ type stubSyncRepo struct {
 	docketParams   []DocketEntryParams
 	docketNewCount int
 
-	notifCalls  int
-	notifParams []NotificationParams
-	notifNew    int
+	intimCalls  int
+	intimParams []IntimationParams
+	intimNew    int
 
 	updates []SyncRunOutcome
 }
@@ -130,10 +130,10 @@ func (s *stubSyncRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, par
 	return out, nil
 }
 
-func (s *stubSyncRepo) UpsertNotifications(_ context.Context, _ database.Tx, params []NotificationParams) (int, error) {
-	s.notifCalls++
-	s.notifParams = params
-	return s.notifNew, nil
+func (s *stubSyncRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) (int, error) {
+	s.intimCalls++
+	s.intimParams = params
+	return s.intimNew, nil
 }
 
 // syncRequestedEvent builds a valid sync_requested event for the default tenant.
@@ -161,7 +161,7 @@ func countByType(published []events.Event) map[string]int {
 // --- use case tests ----------------------------------------------------------
 
 // U3: the first delivery runs the full cycle — sync_run RUNNING→OK, one
-// find-or-create, both docket entries upserted, one notification upserted, and
+// find-or-create, both docket entries upserted, one intimation upserted, and
 // the outbox carries court_record_observed×1, docket_entry_observed×2,
 // sync_completed×1. The whole cycle is scoped to the event's tenant.
 func TestSyncUseCase_FirstDelivery_RunsFullCycle(t *testing.T) {
@@ -198,8 +198,8 @@ func TestSyncUseCase_FirstDelivery_RunsFullCycle(t *testing.T) {
 	if repo.docketCalls != 1 || len(repo.docketParams) != 2 {
 		t.Fatalf("docket upsert = {calls:%d entries:%d}, want {1 2}", repo.docketCalls, len(repo.docketParams))
 	}
-	if repo.notifCalls != 1 || len(repo.notifParams) != 1 {
-		t.Fatalf("notification upsert = {calls:%d entries:%d}, want {1 1}", repo.notifCalls, len(repo.notifParams))
+	if repo.intimCalls != 1 || len(repo.intimParams) != 1 {
+		t.Fatalf("intimation upsert = {calls:%d entries:%d}, want {1 1}", repo.intimCalls, len(repo.intimParams))
 	}
 
 	counts := countByType(outbox.published)

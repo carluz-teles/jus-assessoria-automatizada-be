@@ -5,7 +5,7 @@
 // court records and docket entries upsert idempotently by their natural keys, the
 // sync_completed event is committed in the same transaction as the OK run, and
 // the run is tenant-isolated by RLS. Connector and parser are the slice's stubs
-// (fixture: one G1 court record, two docket entries, one notification).
+// (fixture: one G1 court record, two docket entries, one intimation).
 package integration_test
 
 import (
