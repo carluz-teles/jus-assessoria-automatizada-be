@@ -147,6 +147,7 @@ func (h *WebhookHandler) dispatch(ctx context.Context, ev clerkEvent) error {
 			ctx,
 			d.PublicUserData.UserID,
 			d.Organization.ID,
+			d.Organization.Name,
 			d.ID,
 			d.PublicUserData.Identifier,
 			fullName(d.PublicUserData.FirstName, d.PublicUserData.LastName),

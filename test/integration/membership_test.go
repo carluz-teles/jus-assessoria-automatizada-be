@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,7 +100,7 @@ func TestIdentity_OnMembershipCreated_PersistsAndOutboxSameTx(t *testing.T) {
 	uc := newIdentityUC(pool)
 	const clerkUser = org + "-user-1"
 
-	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, "orgmem-1", "ana@b.com", "Ana", identity.RoleAdmin)
+	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, org, "orgmem-1", "ana@b.com", "Ana", identity.RoleAdmin)
 	if err != nil {
 		t.Fatalf("OnMembershipCreated: %v", err)
 	}
@@ -166,7 +167,7 @@ func TestIdentity_OnMembershipCreated_PersistsAndOutboxSameTx(t *testing.T) {
 	}
 
 	// Replay: the same membership.created must NOT duplicate the row nor republish.
-	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, "orgmem-1", "ana@b.com", "Ana", identity.RoleAdmin); err != nil {
+	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, org, "orgmem-1", "ana@b.com", "Ana", identity.RoleAdmin); err != nil {
 		t.Fatalf("replay OnMembershipCreated: %v", err)
 	}
 	if n := countMemberships(t, pool, tenantID); n != 1 {
@@ -197,7 +198,7 @@ func TestIdentity_OnMembershipCreated_PublishFailRollsBackAll(t *testing.T) {
 	)
 
 	const clerkUser = org + "-user-1"
-	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, "orgmem-1", "ana@b.com", "Ana", identity.RoleLawyer); err == nil {
+	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, org, "orgmem-1", "ana@b.com", "Ana", identity.RoleLawyer); err == nil {
 		t.Fatal("OnMembershipCreated() error = nil, want the publish failure")
 	}
 
@@ -211,6 +212,129 @@ func TestIdentity_OnMembershipCreated_PublishFailRollsBackAll(t *testing.T) {
 	if users != 0 {
 		t.Fatalf("app_user rows after rollback = %d, want 0 (join is one tx)", users)
 	}
+}
+
+// AC1/AC3: order-tolerance against a real Postgres. An organizationMembership.created
+// whose tenant does NOT exist yet (it raced ahead of organization.created)
+// provisions the tenant from the org id+name the event carries, then persists user +
+// membership + the join events — WITHOUT any pre-seeded tenant and without depending
+// on a retry. A later organization.created (ProvisionTenant) is then an idempotent
+// no-op: no duplicate tenant, and the row keeps its identity.
+func TestIdentity_OnMembershipCreated_ProvisionsTenantOutOfOrder(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	const org = "org-out-of-order"
+	const orgName = "Escritório Fora de Ordem"
+
+	uc := newIdentityUC(pool)
+	const clerkUser = org + "-user-1"
+
+	// No seedTenant: the tenant must be born from the membership event alone.
+	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, orgName, org+"-mem-1", "ana@b.com", "Ana", identity.RoleAdmin)
+	if err != nil {
+		t.Fatalf("OnMembershipCreated (tenant absent): %v", err)
+	}
+
+	// Exactly one tenant now exists for the org, carrying the name from the event.
+	tenantID, name := readTenant(t, pool, org)
+	if name != orgName {
+		t.Fatalf("provisioned tenant name = %q, want %q (from the membership event)", name, orgName)
+	}
+	if n := countTenants(t, pool, org); n != 1 {
+		t.Fatalf("tenant rows = %d, want 1", n)
+	}
+
+	// The user + ACTIVE membership landed under that freshly provisioned tenant.
+	if user.TenantID != tenantID {
+		t.Fatalf("user tenant = %q, want the provisioned tenant %q", user.TenantID, tenantID)
+	}
+	if row := readMembership(t, pool, clerkUser); row.status != string(identity.MembershipActive) || row.role != string(identity.RoleAdmin) {
+		t.Fatalf("membership row = %+v, want ACTIVE ADMIN", row)
+	}
+	// AC5: the join emitted its two events exactly once.
+	if n := countMemberJoinedOutbox(t, pool, tenantID); n != 1 {
+		t.Fatalf("member_joined outbox rows = %d, want 1", n)
+	}
+	if n := countOutboxByType(t, pool, notifications.TypeNotificationRequested, tenantID); n != 1 {
+		t.Fatalf("notification.requested outbox rows = %d, want 1", n)
+	}
+
+	// AC3: organization.created arriving late is idempotent — same tenant, no dup.
+	late, err := uc.ProvisionTenant(ctx, org, orgName)
+	if err != nil {
+		t.Fatalf("late ProvisionTenant: %v", err)
+	}
+	if late.ID != tenantID {
+		t.Fatalf("late organization.created minted a new tenant %q, want the existing %q", late.ID, tenantID)
+	}
+	if n := countTenants(t, pool, org); n != 1 {
+		t.Fatalf("tenant rows after late organization.created = %d, want 1 (no duplicate)", n)
+	}
+}
+
+// AC4: two organizationMembership.created for the SAME brand-new org race
+// concurrently (each provisions the tenant). The UpsertTenant ON CONFLICT resolves
+// the loser to the existing row, so exactly one tenant is minted and BOTH joins
+// succeed with their own membership — no duplicate tenant, no fatal unique violation.
+func TestIdentity_OnMembershipCreated_ConcurrentProvisionRacesToOneTenant(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	const org = "org-concurrent-provision"
+	const orgName = "Escritório Concorrente"
+
+	uc := newIdentityUC(pool)
+
+	// Two distinct users joining the same not-yet-existing org, at the same time.
+	users := []string{org + "-user-a", org + "-user-b"}
+	errs := make([]error, len(users))
+	var wg sync.WaitGroup
+	for i, clerkUser := range users {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = uc.OnMembershipCreated(ctx, clerkUser, org, orgName, clerkUser+"-mem", clerkUser+"@b.com", "Ana", identity.RoleLawyer)
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent OnMembershipCreated[%s] error = %v, want nil (race must resolve, not fail)", users[i], err)
+		}
+	}
+
+	// Exactly one tenant for the org despite two concurrent provisioners.
+	if n := countTenants(t, pool, org); n != 1 {
+		t.Fatalf("tenant rows after concurrent provisioning = %d, want 1", n)
+	}
+	tenantID, _ := readTenant(t, pool, org)
+	// Both users joined it: two ACTIVE memberships under the single tenant.
+	if n := countMemberships(t, pool, tenantID); n != 2 {
+		t.Fatalf("membership rows = %d, want 2 (one per concurrent join)", n)
+	}
+}
+
+// readTenant returns the internal id and name of the tenant for a Clerk org id, as
+// the owner (RLS bypassed — the tenant table has no RLS policy anyway).
+func readTenant(t *testing.T, pool *pgxpool.Pool, org string) (id, name string) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(),
+		`SELECT id::text, name FROM tenant WHERE clerk_org_id = $1`, org).Scan(&id, &name); err != nil {
+		t.Fatalf("read tenant: %v", err)
+	}
+	return id, name
+}
+
+// countTenants counts tenant rows for a Clerk org id — the proof that a find-or-create
+// under contention (or a late organization.created) never duplicates the tenant.
+func countTenants(t *testing.T, pool *pgxpool.Pool, org string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM tenant WHERE clerk_org_id = $1`, org).Scan(&n); err != nil {
+		t.Fatalf("count tenants: %v", err)
+	}
+	return n
 }
 
 // AC1/AC2: organizationMembership.deleted soft-removes an ACTIVE membership
@@ -231,7 +355,7 @@ func TestIdentity_OnMembershipRemoved_SoftDeletesAndOutboxSameTx(t *testing.T) {
 	const clerkMemID = org + "-mem-1"
 
 	// Join first (ACTIVE membership + app_user), then remove.
-	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, clerkMemID, "ana@b.com", "Ana", identity.RoleLawyer)
+	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, org, clerkMemID, "ana@b.com", "Ana", identity.RoleLawyer)
 	if err != nil {
 		t.Fatalf("OnMembershipCreated: %v", err)
 	}
@@ -299,7 +423,7 @@ func TestIdentity_OnMembershipUpdated_SyncsBothRoles(t *testing.T) {
 	const clerkMemID = org + "-mem-1" // globally UNIQUE — namespace by org
 
 	// Join as LAWYER (org:member), then promote to ADMIN (org:admin).
-	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, clerkMemID, "ana@b.com", "Ana", identity.RoleLawyer); err != nil {
+	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, org, clerkMemID, "ana@b.com", "Ana", identity.RoleLawyer); err != nil {
 		t.Fatalf("OnMembershipCreated: %v", err)
 	}
 	if err := uc.OnMembershipUpdated(ctx, org, clerkMemID, identity.RoleAdmin); err != nil {
@@ -336,7 +460,7 @@ func TestIdentity_ResolvePrincipal_RequiresActiveMembership(t *testing.T) {
 	const clerkUser = org + "-user-1"
 	const clerkMemID = org + "-mem-1" // globally UNIQUE — namespace by org
 
-	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, clerkMemID, "ana@b.com", "Ana", identity.RoleAdmin)
+	user, err := uc.OnMembershipCreated(ctx, clerkUser, org, org, clerkMemID, "ana@b.com", "Ana", identity.RoleAdmin)
 	if err != nil {
 		t.Fatalf("OnMembershipCreated: %v", err)
 	}
