@@ -49,6 +49,28 @@ func (uc *UseCase) ProvisionTenant(ctx context.Context, clerkOrgID, name string)
 	return tenant, nil
 }
 
+// resolveOrProvisionTenant returns the tenant behind clerkOrgID, provisioning it
+// from the org id+name the membership event carries when it does not exist yet.
+// This is the order-tolerance the onboarding depends on: an
+// organizationMembership.created that races ahead of organization.created (Clerk
+// delivers them unordered/concurrently) provisions the tenant on its own instead of
+// failing for Svix to retry — so the membership event alone yields tenant+user+
+// membership. It reuses ProvisionTenant (the very path organization.created takes),
+// whose UpsertTenant is INSERT ... ON CONFLICT (clerk_org_id) DO UPDATE: a create
+// racing a concurrent create (or a late organization.created) resolves to the
+// existing row rather than a duplicate or a fatal unique violation. A non-not-found
+// read error propagates unchanged (fail fast, no blind provisioning).
+func (uc *UseCase) resolveOrProvisionTenant(ctx context.Context, clerkOrgID, orgName string) (*Tenant, error) {
+	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
+	if err == nil {
+		return tenant, nil
+	}
+	if !errors.Is(err, ErrTenantNotFound) {
+		return nil, err
+	}
+	return uc.ProvisionTenant(ctx, clerkOrgID, orgName)
+}
+
 // SyncUser resyncs an existing app_user's email, name and phone from a Clerk
 // user.updated webhook. Role and tenant are immutable here — membership decides
 // those, not a profile edit — so it reuses the stored values and lets UpsertUser's
@@ -79,17 +101,19 @@ func (uc *UseCase) SyncUser(ctx context.Context, clerkUserID, email, name, phone
 // time the user genuinely joins (a new or reactivated membership) — never on an
 // at-least-once replay of an already-active one.
 //
-// The tenant must already exist (ErrTenantNotFound propagates so Clerk retries a
-// membership event that raced ahead of organization.created). Multi-org is refused
-// up front (1 user = 1 escritório in v0): a Clerk user already living under another
-// tenant yields ErrMembershipConflict rather than a blind upsert that would strand
-// a membership under the wrong tenant.
-func (uc *UseCase) OnMembershipCreated(ctx context.Context, clerkUserID, clerkOrgID, clerkMembershipID, email, name string, role Role) (*AppUser, error) {
+// Order-tolerant: when the tenant does not exist yet — the membership event raced
+// ahead of organization.created — it is provisioned here and now from the org
+// id+name the event carries (resolveOrProvisionTenant), so the membership alone
+// yields tenant+user+membership and a late organization.created is then an
+// idempotent no-op. Multi-org is refused up front (1 user = 1 escritório in v0): a
+// Clerk user already living under another tenant yields ErrMembershipConflict rather
+// than a blind upsert that would strand a membership under the wrong tenant.
+func (uc *UseCase) OnMembershipCreated(ctx context.Context, clerkUserID, clerkOrgID, orgName, clerkMembershipID, email, name string, role Role) (*AppUser, error) {
 	if !role.Valid() {
 		return nil, ErrInvalidRole
 	}
 
-	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
+	tenant, err := uc.resolveOrProvisionTenant(ctx, clerkOrgID, orgName)
 	if err != nil {
 		return nil, err
 	}

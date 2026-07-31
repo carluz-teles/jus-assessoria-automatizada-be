@@ -57,7 +57,7 @@ func TestIdentity_Phone_RoundTrip(t *testing.T) {
 	// Membership provisioning creates the user without a phone → NULL. This goes
 	// through OnMembershipCreated — the real webhook path — which runs the same
 	// app_user upsert (passing an empty phone).
-	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, clerkUser+"-mem", "ana@b.com", "Ana", identity.RoleLawyer); err != nil {
+	if _, err := uc.OnMembershipCreated(ctx, clerkUser, org, org, clerkUser+"-mem", "ana@b.com", "Ana", identity.RoleLawyer); err != nil {
 		t.Fatalf("OnMembershipCreated: %v", err)
 	}
 	if got := appUserPhone(t, pool, clerkUser); got != nil {

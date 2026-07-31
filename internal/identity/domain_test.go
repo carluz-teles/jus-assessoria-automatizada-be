@@ -286,7 +286,7 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		outbox := &recordingOutbox{}
 		uow := &fakeUOW{}
 
-		got, err := NewUseCase(repo, outbox, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		got, err := NewUseCase(repo, outbox, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "Escritório", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
 		if err != nil {
 			t.Fatalf("OnMembershipCreated() error = %v", err)
 		}
@@ -370,7 +370,7 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		}
 		outbox := &recordingOutbox{}
 
-		got, err := NewUseCase(repo, outbox, &fakeUOW{}).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		got, err := NewUseCase(repo, outbox, &fakeUOW{}).OnMembershipCreated(ctx, "user_xyz", "org_abc", "Escritório", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
 		if err != nil {
 			t.Fatalf("OnMembershipCreated() error = %v", err)
 		}
@@ -390,7 +390,7 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "Escritório", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
 		if !errors.Is(err, ErrMembershipConflict) {
 			t.Fatalf("error = %v, want ErrMembershipConflict", err)
 		}
@@ -399,18 +399,79 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		}
 	})
 
-	t.Run("missing tenant propagates ErrTenantNotFound without opening a tx", func(t *testing.T) {
+	// AC1: an organizationMembership.created that races ahead of organization.created
+	// (the tenant does not exist yet) provisions the tenant from the org id+name the
+	// event carries, then creates user + membership and emits the join events — no
+	// error, no dependence on a Svix retry.
+	t.Run("membership racing ahead of organization.created provisions the tenant then user + membership", func(t *testing.T) {
+		provisioned := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc", Name: "Escritório"}
+		var upsertTenantArgs struct{ clerkOrgID, name string }
+		var upsertUTenantID string
+		var upsertMCalled bool
 		repo := &mockRepo{
+			// Tenant not there yet — the membership event won the race.
 			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+			// ProvisionTenant's UpsertTenant provisions it now, from the event's org data.
+			upsertTenant: func(_ context.Context, _ database.Tx, clerkOrgID, name string) (*Tenant, error) {
+				upsertTenantArgs.clerkOrgID, upsertTenantArgs.name = clerkOrgID, name
+				return provisioned, nil
+			},
+			findUser: func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
+			upsertUser: func(_ context.Context, _ database.Tx, _, tenantID, _, _, _ string, _ Role) (*AppUser, error) {
+				upsertUTenantID = tenantID
+				return user, nil
+			},
+			upsertMembership: func(_ context.Context, _ database.Tx, _, _, _ string, _ Role) (*Membership, bool, error) {
+				upsertMCalled = true
+				return membership, true, nil // a real join
+			},
+		}
+		outbox := &recordingOutbox{}
+
+		got, err := NewUseCase(repo, outbox, &fakeUOW{}).OnMembershipCreated(ctx, "user_xyz", "org_abc", "Escritório", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		if err != nil {
+			t.Fatalf("OnMembershipCreated() error = %v", err)
+		}
+		if got != user {
+			t.Fatalf("OnMembershipCreated() = %+v, want %+v", got, user)
+		}
+		// The tenant was provisioned from the org id+name carried by the membership event.
+		if upsertTenantArgs.clerkOrgID != "org_abc" || upsertTenantArgs.name != "Escritório" {
+			t.Fatalf("UpsertTenant args = %+v, want the org id+name from the membership event", upsertTenantArgs)
+		}
+		// user + membership were then created under the freshly provisioned tenant.
+		if upsertUTenantID != provisioned.ID {
+			t.Fatalf("UpsertUser tenantID = %q, want the provisioned tenant %q", upsertUTenantID, provisioned.ID)
+		}
+		if !upsertMCalled {
+			t.Fatal("membership was not upserted after provisioning the tenant")
+		}
+		// AC5: the join still emits its two events exactly once (member_joined + notification).
+		if len(outbox.published) != 2 {
+			t.Fatalf("published %d events, want 2 (member_joined + notification.requested)", len(outbox.published))
+		}
+	})
+
+	// A read error that is NOT ErrTenantNotFound (an infra fault) must propagate
+	// unchanged — the use case provisions only on a genuine "not there yet", never
+	// blindly on any failure.
+	t.Run("a non-not-found tenant read error propagates without provisioning", func(t *testing.T) {
+		boom := errors.New("db down")
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, boom },
+			upsertTenant: func(context.Context, database.Tx, string, string) (*Tenant, error) {
+				t.Fatal("UpsertTenant must not run when the tenant read fails with a non-not-found error")
+				return nil, nil
+			},
 		}
 		uow := &fakeUOW{}
 
-		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
-		if !errors.Is(err, ErrTenantNotFound) {
-			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "Escritório", "orgmem_1", "ana@b.com", "Ana", RoleLawyer)
+		if !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
 		}
 		if uow.called {
-			t.Fatal("unit of work opened despite the missing tenant")
+			t.Fatal("unit of work opened despite the tenant read failure")
 		}
 	})
 
@@ -423,7 +484,7 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		}
 		uow := &fakeUOW{}
 
-		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "orgmem_1", "a@b.com", "Ana", "MEMBER")
+		_, err := NewUseCase(repo, noopOutbox{}, uow).OnMembershipCreated(ctx, "user_xyz", "org_abc", "Escritório", "orgmem_1", "a@b.com", "Ana", "MEMBER")
 		if !errors.Is(err, ErrInvalidRole) {
 			t.Fatalf("error = %v, want ErrInvalidRole", err)
 		}
