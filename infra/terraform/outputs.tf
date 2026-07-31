@@ -1,0 +1,25 @@
+# outputs.tf — o que inspecionar depois do apply.
+output "project_id" {
+  description = "ID do projeto court-legal."
+  value       = railway_project.court_legal.id
+}
+
+output "stg_environment_id" {
+  description = "ID do environment stg (onde este TF deploya)."
+  value       = railway_environment.stg.id
+}
+
+output "api_url" {
+  description = "URL auto-gerada da Railway pro api no stg."
+  value       = "https://${railway_service_domain.api.domain}"
+}
+
+output "app_service_ids" {
+  description = "Mapa nome->id dos serviços de app."
+  value       = { for k, s in railway_service.app : k => s.id }
+}
+
+output "image_tag_deployed" {
+  description = "Tag de imagem fixada nos serviços de app (github.sha em CI)."
+  value       = var.image_tag
+}

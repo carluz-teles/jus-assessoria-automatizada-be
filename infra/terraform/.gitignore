@@ -1,0 +1,13 @@
+# Estado e artefatos locais do Terraform — NUNCA commitar (o state carrega segredos).
+# (o .terraform.lock.hcl NÃO é ignorado de propósito: pina o provider em v0.6.2 p/ reprodutibilidade.)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.env.railway
