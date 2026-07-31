@@ -102,12 +102,12 @@ func seedTenant(t *testing.T, pool *pgxpool.Pool, tenantID, org string, n int) {
 //
 // It opens a DEDICATED connection (not a pooled one) on purpose: the first
 // set_config('app.tenant_id', …) on a session registers a custom-GUC
-// placeholder that persists as an empty string ('') after the tx ends. On a
-// reused pooled connection the "no tenant" probe would then read '' — and
-// ''::uuid raises 22P02 instead of yielding SQL NULL. A pristine connection has
+// placeholder that persists as an empty string (”) after the tx ends. On a
+// reused pooled connection the "no tenant" probe would then read ” — and
+// ”::uuid raises 22P02 instead of yielding SQL NULL. A pristine connection has
 // never referenced the GUC, so current_setting(…, true) is NULL and the policy
 // correctly denies all rows. (A production hardening would wrap the policy in
-// NULLIF(current_setting('app.tenant_id', true), '') — noted, out of scope for
+// NULLIF(current_setting('app.tenant_id', true), ”) — noted, out of scope for
 // this slice which does not touch the schema.)
 func countAppUsersAsRLSRole(t *testing.T, tenantID string) int {
 	t.Helper()
