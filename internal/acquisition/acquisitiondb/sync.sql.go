@@ -12,6 +12,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActiveCourtRecordsByTenant = `-- name: CountActiveCourtRecordsByTenant :one
+SELECT count(*) FROM court_record
+WHERE tenant_id = $1 AND lifecycle = 'ACTIVE'
+`
+
+// Count the tenant's ACTIVE court records inside the caller's tx. The entitlement
+// gate reads this against the subscription's active_process_limit before creating a
+// BRAND-NEW record (the MISS path of FindOrCreateCourtRecord only — a reobservation
+// of an existing record is never gated). It runs in the SAME tx as the pending
+// INSERT so the count is consistent with what is about to be created. lifecycle is
+// the schema's process-liveness flag; only ACTIVE records count against the ceiling.
+func (q *Queries) CountActiveCourtRecordsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveCourtRecordsByTenant, tenantID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const findSyncRunByEventID = `-- name: FindSyncRunByEventID :one
 SELECT id, tenant_id, court_record_id, integration_id, connector_id,
        connector_version, status, items_new, items_deduped, started_at, finished_at

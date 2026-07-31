@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/hibiken/asynq"
 
@@ -84,6 +85,15 @@ type stubSyncRepo struct {
 	findCalls  int
 	findParams []FindOrCreateCourtRecordParams
 
+	// Entitlement gating knobs (fatia 5-A). existingKeys are treated as a HIT
+	// (reobservation) — returned regardless of the limit, mirroring the real repo's
+	// err==nil branch. Every other record is a MISS, gated against
+	// params.ActiveProcessLimit using activeCount as the tenant's simulated ACTIVE
+	// tally: count >= limit ⇒ ErrProcessLimitReached, else the record is created and
+	// activeCount bumped — exactly the repo's MISS-branch count-and-compare.
+	activeCount  int
+	existingKeys map[string]bool
+
 	docketCalls    int
 	docketParams   []DocketEntryParams
 	docketNewCount int
@@ -132,6 +142,20 @@ func (s *stubSyncRepo) UpdateSyncRun(_ context.Context, _ database.Tx, o SyncRun
 func (s *stubSyncRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, p FindOrCreateCourtRecordParams) (*CourtRecord, error) {
 	s.findCalls++
 	s.findParams = append(s.findParams, p)
+
+	if s.existingKeys[recordKey(p.CNJNumber, p.Degree)] {
+		return stubCourtRecord(p), nil // HIT — reobservation, never gated.
+	}
+	if s.activeCount >= p.ActiveProcessLimit {
+		return nil, ErrProcessLimitReached // MISS at/over the ceiling — gated.
+	}
+	s.activeCount++
+	return stubCourtRecord(p), nil
+}
+
+// stubCourtRecord builds the CourtRecord the stub returns for a resolved record,
+// keyed deterministically off the natural key so tests can predict ids.
+func stubCourtRecord(p FindOrCreateCourtRecordParams) *CourtRecord {
 	return &CourtRecord{
 		ID:        "rec-" + p.CNJNumber + "-" + p.Degree,
 		TenantID:  p.TenantID,
@@ -139,7 +163,7 @@ func (s *stubSyncRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx,
 		CNJNumber: p.CNJNumber,
 		Degree:    p.Degree,
 		Court:     p.Court,
-	}, nil
+	}
 }
 
 func (s *stubSyncRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, params []DocketEntryParams) ([]DocketEntry, error) {
@@ -203,6 +227,71 @@ func countByType(published []events.Event) map[string]int {
 		counts[ev.Type()]++
 	}
 	return counts
+}
+
+// stubEntitlementChecker is the EntitlementChecker under the test's control: it
+// answers limit (or err) for every tenant and records how it was called so a test
+// proves the cycle consults it exactly once, scoped to the event's tenant.
+type stubEntitlementChecker struct {
+	limit      int
+	err        error
+	calls      int
+	lastTenant string
+}
+
+func (c *stubEntitlementChecker) ActiveProcessLimit(_ context.Context, tenantID string) (int, error) {
+	c.calls++
+	c.lastTenant = tenantID
+	if c.err != nil {
+		return 0, c.err
+	}
+	return c.limit, nil
+}
+
+// twoRecordFixture is a parsed result naming TWO distinct court records (A and B),
+// each with its own docket entry and intimation. It lets a gating test create one
+// record and block the other, then assert the blocked record's children are dropped
+// while the created one's are still folded in.
+func twoRecordFixture(source string) ParsedResult {
+	const cnjA = "0000001-11.2024.8.26.0100"
+	const cnjB = "0000002-22.2024.8.26.0100"
+	occurred := time.Date(2024, 1, 10, 12, 0, 0, 0, time.UTC)
+	observed := time.Date(2024, 1, 11, 8, 0, 0, 0, time.UTC)
+	made := time.Date(2024, 1, 12, 0, 0, 0, 0, time.UTC)
+
+	record := func(cnj string) ParsedCourtRecord {
+		return ParsedCourtRecord{CNJNumber: cnj, Degree: DegreeG1, Court: "TJSP", Completeness: 0.5}
+	}
+	docket := func(cnj, hash string) ParsedDocketEntry {
+		return ParsedDocketEntry{
+			CNJNumber:  cnj,
+			Degree:     DegreeG1,
+			Hash:       hash,
+			OccurredAt: occurred,
+			ObservedAt: observed,
+			Source:     source,
+			Fidelity:   100,
+			Text:       "andamento",
+		}
+	}
+	intim := func(cnj, hash string) ParsedIntimation {
+		return ParsedIntimation{
+			CNJNumber:       cnj,
+			Degree:          DegreeG1,
+			Hash:            hash,
+			MadeAvailableAt: made,
+			PublishedAt:     made,
+			DeadlineStartAt: made,
+			Content:         "intimação",
+			Source:          source,
+		}
+	}
+
+	return ParsedResult{
+		CourtRecords:  []ParsedCourtRecord{record(cnjA), record(cnjB)},
+		DocketEntries: []ParsedDocketEntry{docket(cnjA, "docket-A"), docket(cnjB, "docket-B")},
+		Intimations:   []ParsedIntimation{intim(cnjA, "notif-A"), intim(cnjB, "notif-B")},
+	}
 }
 
 // --- use case tests ----------------------------------------------------------
@@ -633,5 +722,160 @@ func TestSyncUseCase_UnknownSource_TypedError(t *testing.T) {
 	}
 	if repo.insertCalls != 0 || conn.fetchCalls != 0 {
 		t.Fatalf("unknown source opened work: insert=%d fetch=%d, want 0 0", repo.insertCalls, conn.fetchCalls)
+	}
+}
+
+// --- entitlement gating tests (fatia 5-A) -----------------------------------
+
+// AC1: below the limit, every brand-new court record is created — the current
+// behavior is preserved. The checker is consulted exactly once per cycle, scoped to
+// the event's tenant (not once per record).
+func TestSyncUseCase_BelowLimit_CreatesAllRecords(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 2}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: twoRecordFixture(SourceDJEN)}
+	checker := &stubEntitlementChecker{limit: 10}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
+		WithEntitlementChecker(checker))
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	if checker.calls != 1 || checker.lastTenant != testTenant {
+		t.Fatalf("checker = {calls:%d tenant:%q}, want {1 %q} (resolved once, scoped to the event tenant)",
+			checker.calls, checker.lastTenant, testTenant)
+	}
+	if repo.findCalls != 2 || repo.activeCount != 2 {
+		t.Fatalf("find/create = {calls:%d active:%d}, want {2 2} (both records created under the limit)",
+			repo.findCalls, repo.activeCount)
+	}
+	if len(repo.updates) != 1 || repo.updates[0].Status != SyncStatusOK {
+		t.Fatalf("sync_run updates = %+v, want one OK", repo.updates)
+	}
+	if len(repo.docketParams) != 2 || len(repo.intimParams) != 2 {
+		t.Fatalf("children = {docket:%d intim:%d}, want {2 2} (no record blocked)", len(repo.docketParams), len(repo.intimParams))
+	}
+	counts := countByType(outbox.published)
+	if counts[TypeCourtRecordObserved] != 2 || counts[TypeSyncCompleted] != 1 {
+		t.Fatalf("outbox = %v, want court_record_observed:2 sync_completed:1", counts)
+	}
+}
+
+// AC2: at the limit, a brand-new record (a MISS) is NOT created — the cycle logs,
+// skips it AND its docket/intimation children, folds the rest of the batch, and the
+// sync_run still closes OK (a block is expected, never an abort).
+func TestSyncUseCase_AtLimit_BlocksNewRecordAndClosesOK(t *testing.T) {
+	t.Parallel()
+
+	// limit 1, no records yet: the first new record (A) is created and pushes the
+	// tally to 1; the second (B) is at the ceiling and is blocked.
+	repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 2}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: twoRecordFixture(SourceDJEN)}
+	checker := &stubEntitlementChecker{limit: 1}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
+		WithEntitlementChecker(checker))
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v, want nil (a block is expected, not a failure)", err)
+	}
+
+	// Both records were attempted, but only one created.
+	if repo.findCalls != 2 || repo.activeCount != 1 {
+		t.Fatalf("find/create = {calls:%d active:%d}, want {2 1} (B blocked at the ceiling)", repo.findCalls, repo.activeCount)
+	}
+	// The run still closes OK — the cycle is not aborted.
+	if len(repo.updates) != 1 || repo.updates[0].Status != SyncStatusOK {
+		t.Fatalf("sync_run updates = %+v, want one OK (a block must not abort the run)", repo.updates)
+	}
+	// Only the created record's children are folded; the blocked record's docket
+	// entry and intimation are dropped (NOT treated as a parser-invariant abort).
+	if len(repo.docketParams) != 1 || len(repo.intimParams) != 1 {
+		t.Fatalf("children = {docket:%d intim:%d}, want {1 1} (blocked record's children dropped)", len(repo.docketParams), len(repo.intimParams))
+	}
+	if repo.docketParams[0].Hash != "docket-A" || repo.intimParams[0].Hash != "notif-A" {
+		t.Fatalf("kept children = {docket:%q intim:%q}, want the created record A's", repo.docketParams[0].Hash, repo.intimParams[0].Hash)
+	}
+	counts := countByType(outbox.published)
+	if counts[TypeCourtRecordObserved] != 1 || counts[TypeSyncCompleted] != 1 {
+		t.Fatalf("outbox = %v, want court_record_observed:1 sync_completed:1 (only the created record observed)", counts)
+	}
+}
+
+// AC4: a reobservation (a HIT — the CNJ+degree already exists) is NEVER gated, even
+// when the tenant is already at (or over) its limit: the record is returned and its
+// docket entries are processed. Only the brand-new record in the same batch is blocked.
+func TestSyncUseCase_Reobservation_NotGatedEvenAtLimit(t *testing.T) {
+	t.Parallel()
+
+	// Ceiling reached (limit 0). Record A is already known (a HIT), record B is new.
+	repo := &stubSyncRepo{
+		syncRunID:      "run-1",
+		docketNewCount: 2,
+		existingKeys:   map[string]bool{recordKey("0000001-11.2024.8.26.0100", DegreeG1): true},
+	}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: twoRecordFixture(SourceDJEN)}
+	checker := &stubEntitlementChecker{limit: 0}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
+		WithEntitlementChecker(checker))
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	// A (reobservation) is processed despite the ceiling; B (new) is blocked.
+	if len(repo.docketParams) != 1 || repo.docketParams[0].Hash != "docket-A" {
+		t.Fatalf("docket params = %+v, want only the reobserved record A's docket entry", repo.docketParams)
+	}
+	if len(repo.intimParams) != 1 || repo.intimParams[0].Hash != "notif-A" {
+		t.Fatalf("intim params = %+v, want only the reobserved record A's intimation", repo.intimParams)
+	}
+	counts := countByType(outbox.published)
+	if counts[TypeCourtRecordObserved] != 1 {
+		t.Fatalf("court_record_observed = %d, want 1 (the reobserved record, not the blocked new one)", counts[TypeCourtRecordObserved])
+	}
+	if len(repo.updates) != 1 || repo.updates[0].Status != SyncStatusOK {
+		t.Fatalf("sync_run updates = %+v, want one OK", repo.updates)
+	}
+}
+
+// AC6: a genuine checker error (NOT ErrSubscriptionNotFound, which the adapter folds
+// to limit 0) is a real fault — it propagates, never silenced: the cycle reaches no
+// record, closes no run (it stays RUNNING for a later resume), and publishes nothing.
+func TestSyncUseCase_CheckerError_FailsCycle(t *testing.T) {
+	t.Parallel()
+
+	billingDown := errors.New("billing unavailable")
+	repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 2}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: twoRecordFixture(SourceDJEN)}
+	checker := &stubEntitlementChecker{err: billingDown}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
+		WithEntitlementChecker(checker))
+
+	err := uc.OnSyncRequested(context.Background(), syncRequestedEvent())
+	if !errors.Is(err, billingDown) {
+		t.Fatalf("error = %v, want it to wrap the checker failure (a genuine checker error must not be silenced)", err)
+	}
+	if repo.findCalls != 0 {
+		t.Fatalf("FindOrCreateCourtRecord called %d times after a checker fault, want 0", repo.findCalls)
+	}
+	if len(repo.updates) != 0 {
+		t.Fatalf("sync_run updates = %+v, want none (the run stays RUNNING for a resume)", repo.updates)
+	}
+	if outbox.calls != 0 {
+		t.Fatalf("checker fault published %d events, want 0", outbox.calls)
 	}
 }

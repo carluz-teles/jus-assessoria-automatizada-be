@@ -15,6 +15,7 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
@@ -95,7 +96,14 @@ func run(logger *slog.Logger) error {
 	orchestrator := acquisition.NewOrchestrator()
 	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewStubConnector(acquisition.SourceDJEN))
 	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewStubConnector(acquisition.SourceDATAJUD))
-	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, acquisition.NewStubParser())
+
+	// Billing entitlement: the sync cycle gates a NEW court record against the
+	// tenant's active_process_limit. acquisition owns the port (EntitlementChecker);
+	// billing supplies the adapter over its own repository; this composition root is
+	// the ONLY place that knows both slices (they never import each other).
+	entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
+	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, acquisition.NewStubParser(),
+		acquisition.WithEntitlementChecker(entitlement))
 
 	acquisition.NewListener(backfill, sync).Register(mux)
 

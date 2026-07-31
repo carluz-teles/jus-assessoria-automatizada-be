@@ -23,4 +23,14 @@ var (
 	// of an already-marked event the sync use case treats it defensively as a
 	// closed/absent run: a no-op ack, never a reopen.
 	ErrSyncRunNotFound = apperr.NewNotFound("sync run not found")
+
+	// ErrProcessLimitReached — the tenant is already at its plan's
+	// active_process_limit (the v0 billing entitlement), so the sync cycle must not
+	// create a NEW court record (→ 403). It surfaces ONLY on the MISS path of
+	// FindOrCreateCourtRecord; a reobservation of an existing ACTIVE record is never
+	// gated. The sync use case catches it, logs, and skips that item — the cycle
+	// still closes OK (the block is expected, not a failure). A tenant with no
+	// subscription resolves to limit 0 upstream (fail-closed), so this fires for it
+	// on the first new record.
+	ErrProcessLimitReached = apperr.NewForbidden("active process limit reached")
 )

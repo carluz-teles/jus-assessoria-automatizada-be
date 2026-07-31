@@ -21,6 +21,13 @@ type Querier interface {
 	// listener uses it as the first-activation guard: a re-activation must not
 	// re-dispatch a backfill.
 	BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error)
+	// Count the tenant's ACTIVE court records inside the caller's tx. The entitlement
+	// gate reads this against the subscription's active_process_limit before creating a
+	// BRAND-NEW record (the MISS path of FindOrCreateCourtRecord only — a reobservation
+	// of an existing record is never gated). It runs in the SAME tx as the pending
+	// INSERT so the count is consistent with what is about to be created. lifecycle is
+	// the schema's process-liveness flag; only ACTIVE records count against the ceiling.
+	CountActiveCourtRecordsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// Flip the job to its terminal status, but ONLY from RUNNING: the WHERE guard
 	// makes this the single winning transition, so a late or over-count delivery that
 	// reaches here cannot re-finalize. Scoped by tenant_id (isolation barrier 1).
