@@ -40,9 +40,12 @@ type ErrorBody struct {
 //
 // A non-AppError is treated as a bug: it is wrapped as INFRA (500) so an
 // unclassified error never escapes as anything softer than a server error. For
-// status >= 500 the cause is logged with the request context (the trace_id
-// rides along) and the client receives a generic message — internals never
-// leak. For status < 500 the AppError.Message is safe to expose.
+// status >= 500 the cause is logged at Error with the request context (the
+// trace_id rides along) and the client receives a generic message — internals
+// never leak. For 400 <= status < 500 the AppError.Message is safe to expose and
+// the failure is logged at Warn: 4xx used to vanish silently, so an edge failure
+// (a webhook's "invalid signature", a malformed payload, an auth rejection) left
+// no trace. Only the log is added — the client-facing envelope is unchanged.
 func WriteError(c *fiber.Ctx, err error) error {
 	ae, ok := apperr.From(err)
 	if !ok {
@@ -66,6 +69,21 @@ func WriteError(c *fiber.Ctx, err error) error {
 			Kind:    string(ae.Kind),
 			Message: "internal error",
 		})
+	}
+
+	// A 4xx is a client-side failure that was historically silent. Log it at Warn
+	// — symmetric with the 5xx branch above — so it leaves a trace with the
+	// trace_id riding on the context. causeOf surfaces the wrapped cause (e.g. the
+	// svix "invalid signature") when present, or the AppError itself otherwise.
+	if status >= fiber.StatusBadRequest {
+		slog.WarnContext(
+			c.UserContext(),
+			"client error",
+			"status", status,
+			"kind", string(ae.Kind),
+			"message", ae.Message,
+			"cause", causeOf(ae),
+		)
 	}
 
 	return c.Status(status).JSON(ErrorBody{
@@ -92,8 +110,9 @@ func WriteValidationError(c *fiber.Ctx, err error) error {
 	})
 }
 
-// causeOf returns the underlying cause the edge logs for a 5xx. It falls back to
-// the AppError itself when nothing was wrapped, so the log line is never empty.
+// causeOf returns the underlying cause the edge logs for a failure (5xx at Error,
+// 4xx at Warn). It falls back to the AppError itself when nothing was wrapped, so
+// the log line is never empty.
 func causeOf(ae *apperr.AppError) error {
 	if cause := ae.Unwrap(); cause != nil {
 		return cause

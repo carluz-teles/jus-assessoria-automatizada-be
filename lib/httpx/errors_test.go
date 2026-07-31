@@ -1,13 +1,16 @@
 package httpx_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
@@ -51,6 +54,57 @@ func runHandler(t *testing.T, h fiber.Handler) (int, decodedBody, string) {
 	}
 
 	return resp.StatusCode, body, string(raw)
+}
+
+// capturingHandler records every slog.Record it handles so a test can assert on
+// the exact log lines WriteError emits. Tests inspect the structured record
+// directly, so assertions are immune to any handler's serialization quirks.
+type capturingHandler struct {
+	mu      *sync.Mutex
+	records *[]slog.Record
+}
+
+func (h capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.records = append(*h.records, r.Clone()) // Clone: attrs may share backing storage.
+	return nil
+}
+
+func (h capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+// captureLogs swaps the default slog logger for one that records every line,
+// restoring the previous logger on cleanup. WriteError logs via the package-level
+// slog functions, which target the default logger — so callers MUST run serially
+// (no t.Parallel), since the default logger is process-global.
+func captureLogs(t *testing.T) *[]slog.Record {
+	t.Helper()
+
+	records := &[]slog.Record{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(capturingHandler{mu: &sync.Mutex{}, records: records}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	return records
+}
+
+// attrValue returns the value of the named attribute on a record, or ok=false.
+func attrValue(r slog.Record, key string) (slog.Value, bool) {
+	var (
+		val   slog.Value
+		found bool
+	)
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			val, found = a.Value, true
+			return false
+		}
+		return true
+	})
+	return val, found
 }
 
 func TestWriteError_KindMapsToStatus(t *testing.T) {
@@ -186,6 +240,112 @@ func TestWriteError_UnavailableHidesUpstreamCause(t *testing.T) {
 	}
 }
 
+// TestWriteError_Warns4xx guards AC1: the very bug that motivated this slice —
+// the Clerk webhook rejecting a bad svix signature with a 401 — used to leave no
+// trace. It MUST now emit exactly one Warn line carrying status, kind, message
+// and cause, while the client-facing response stays byte-for-byte the same.
+func TestWriteError_Warns4xx(t *testing.T) {
+	records := captureLogs(t)
+
+	status, body, _ := runHandler(t, func(c *fiber.Ctx) error {
+		return httpx.WriteError(c, apperr.NewUnauthorized("invalid signature"))
+	})
+
+	// Client-facing behavior is unchanged: same status, same envelope.
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if body.Kind != string(apperr.KindUnauthorized) {
+		t.Errorf("body kind = %q, want %q", body.Kind, apperr.KindUnauthorized)
+	}
+	if body.Message != "invalid signature" {
+		t.Errorf("body message = %q, want %q", body.Message, "invalid signature")
+	}
+
+	if len(*records) != 1 {
+		t.Fatalf("emitted %d log lines, want exactly 1", len(*records))
+	}
+	rec := (*records)[0]
+	if rec.Level != slog.LevelWarn {
+		t.Errorf("level = %v, want WARN", rec.Level)
+	}
+
+	if v, ok := attrValue(rec, "status"); !ok || v.Int64() != int64(http.StatusUnauthorized) {
+		t.Errorf("status attr = %v (ok=%v), want 401", v, ok)
+	}
+	if v, ok := attrValue(rec, "kind"); !ok || v.String() != string(apperr.KindUnauthorized) {
+		t.Errorf("kind attr = %v (ok=%v), want %q", v, ok, apperr.KindUnauthorized)
+	}
+	if v, ok := attrValue(rec, "message"); !ok || v.String() != "invalid signature" {
+		t.Errorf("message attr = %v (ok=%v), want %q", v, ok, "invalid signature")
+	}
+
+	// cause comes from causeOf(ae): with no wrapped cause it is the AppError
+	// itself, whose Error() names the kind and message — enough to diagnose.
+	v, ok := attrValue(rec, "cause")
+	if !ok {
+		t.Fatalf("cause attr missing")
+	}
+	cause, ok := v.Any().(error)
+	if !ok {
+		t.Fatalf("cause attr = %v, want an error value", v.Any())
+	}
+	if !strings.Contains(cause.Error(), "invalid signature") {
+		t.Errorf("cause = %q, want it to mention the signature failure", cause.Error())
+	}
+}
+
+// TestWriteError_5xxStillLogsError guards AC2: adding the 4xx Warn must not
+// regress the 5xx branch — it keeps logging at Error with kind and the wrapped
+// cause.
+func TestWriteError_5xxStillLogsError(t *testing.T) {
+	records := captureLogs(t)
+
+	const upstream = "svix verify: connection refused"
+	status, _, _ := runHandler(t, func(c *fiber.Ctx) error {
+		return httpx.WriteError(c, apperr.NewInfra("boom", errors.New(upstream)))
+	})
+
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", status)
+	}
+	if len(*records) != 1 {
+		t.Fatalf("emitted %d log lines, want exactly 1", len(*records))
+	}
+	rec := (*records)[0]
+	if rec.Level != slog.LevelError {
+		t.Errorf("level = %v, want ERROR (5xx must not regress to Warn)", rec.Level)
+	}
+	if v, ok := attrValue(rec, "kind"); !ok || v.String() != string(apperr.KindInfra) {
+		t.Errorf("kind attr = %v (ok=%v), want %q", v, ok, apperr.KindInfra)
+	}
+	v, ok := attrValue(rec, "cause")
+	if !ok {
+		t.Fatalf("cause attr missing on 5xx log")
+	}
+	cause, _ := v.Any().(error)
+	if cause == nil || !strings.Contains(cause.Error(), upstream) {
+		t.Errorf("cause = %v, want it to carry %q", v.Any(), upstream)
+	}
+}
+
+// TestWriteError_SuccessDoesNotLog guards AC3: the success path (2xx) emits no
+// log line at all — WriteError only fires on failure.
+func TestWriteError_SuccessDoesNotLog(t *testing.T) {
+	records := captureLogs(t)
+
+	status, _, _ := runHandler(t, func(c *fiber.Ctx) error {
+		return c.Status(http.StatusOK).JSON(fiber.Map{"ok": true})
+	})
+
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if len(*records) != 0 {
+		t.Fatalf("success path emitted %d log lines, want 0", len(*records))
+	}
+}
+
 // sampleReq mirrors a slice Request with an ozzo Validate method.
 type sampleReq struct {
 	Title string `json:"title"`
@@ -239,6 +399,31 @@ func TestWriteValidationError_FallsBackToWriteError(t *testing.T) {
 	}
 	if body.Kind != string(apperr.KindConflict) {
 		t.Errorf("kind = %q, want %q", body.Kind, apperr.KindConflict)
+	}
+}
+
+// TestWriteValidationError_DoesNotLog locks the chosen behavior: only WriteError
+// logs 4xx. WriteValidationError's validation path writes straight to the client
+// without a Warn, so high-volume, expected client input mistakes don't drown the
+// signal we actually added (auth/svix/malformed-payload failures). Its fallback
+// path still logs, because it delegates to WriteError.
+func TestWriteValidationError_DoesNotLog(t *testing.T) {
+	records := captureLogs(t)
+
+	verr := sampleReq{}.validate()
+	if verr == nil {
+		t.Fatal("expected validation to fail on empty title")
+	}
+
+	status, _, _ := runHandler(t, func(c *fiber.Ctx) error {
+		return httpx.WriteValidationError(c, verr)
+	})
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if len(*records) != 0 {
+		t.Fatalf("validation path emitted %d log lines, want 0", len(*records))
 	}
 }
 
