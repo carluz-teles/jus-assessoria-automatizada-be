@@ -1,26 +1,24 @@
-# main.tf — infra de STAGING do BE na Railway via Terraform.
+# main.tf — infra do BE (court-legal, PRODUÇÃO) na Railway via Terraform, substituindo o
+# provision.sh. (Staging fica pra depois — por ora movemos só com prod.)
 #
-# PROJETO SEPARADO: este módulo CRIA um projeto NOVO `court-legal-stg` do zero (não importa,
-# não toca o court-legal de produção). Isolamento total — imagem, volume, dados e domínio
-# próprios. Escolhido em vez do modelo "environment stg dentro do court-legal" porque o
-# provider community não isola `source_image` por-environment (é project-level), então um
-# env stg no mesmo projeto compartilharia a imagem com o prod. Projeto separado = zero risco.
+# ADOÇÃO SOBRE INFRA EXISTENTE: o court-legal e seus 8 serviços JÁ EXISTEM. Rode o import.sh
+# UMA vez (traz projeto+serviços pro state) antes do 1º apply — senão o apply tentaria recriar.
+# As variable collections NÃO se importam: o apply as cria via upsert, reconciliando (e
+# adicionando as vars de billing/notifications que o provision.sh não tinha). O domínio do
+# api (auto-gerado pelo provision.sh) NÃO é gerenciado aqui — fica como está (follow-up).
 #
 # Decisões (travadas com o dono):
 #  - THROTTLE: apply.sh usa `-parallelism=1` (serial). Ataca o erro de "criar muita
 #    estrutura ao mesmo tempo".
 #  - CONVERGÊNCIA (não "atômico one-shot"): o apply da Railway é lossy/assíncrono (upserts de
 #    variável se perdem, serviço some) e reporta falso sucesso. Então o apply.sh re-aplica até
-#    `plan` limpar. SEM destroy-on-failure.
+#    `plan` limpar. SEM destroy-on-failure (catastrófico num update de infra existente).
 #  - O serviço `web` do FE vive NESTE projeto mas é gerenciado pelo TF do repo FE (state
 #    separado); este módulo NÃO o declara.
 #  - VARIÁVEIS POR SERVIÇO: cada binário recebe SÓ o que consome. Como o config.Load()
 #    é monolítico e exige 5 vars `required` em todo binário (DATABASE_URL, REDIS_URL,
 #    CLERK_SECRET_KEY, ANTHROPIC_API_KEY, OTEL_EXPORTER_OTLP_ENDPOINT), essas formam a
 #    base_vars compartilhada; os extras são por serviço (o que cada cmd/*/main.go lê).
-#
-# Domínio auto-gerado da Railway no api (sem domínio próprio ainda). Tudo no environment
-# default do projeto stg.
 
 locals {
   # DATABASE_URL com a senha url-encoded (idêntico ao build_env_json do provision.sh).
@@ -81,26 +79,20 @@ locals {
     PGDATA            = "/var/lib/postgresql/data/pgdata"
   }
 
-  # Environment default do projeto stg (o projeto INTEIRO é o staging).
+  # Environment production (default) do court-legal — onde os serviços rodam.
   environment_id = railway_project.court_legal.default_environment.id
 }
 
-# ===== Projeto court-legal-stg (CRIADO do zero — projeto de staging separado) =====
+# ===== Projeto court-legal (IMPORTADO — já existe, criado pelo provision.sh) =====
+# Renomear/mudar workspace = recriar = perder tudo. Trazido pro state via import.sh.
 resource "railway_project" "court_legal" {
-  name         = var.project_name # court-legal-stg
-  description  = "jus-assessoria STAGING — BE + web do FE (FE gerenciado pelo TF do repo FE)."
+  name         = var.project_name # court-legal
+  description  = "jus-assessoria — BE + web do FE (FE gerenciado pelo TF do repo FE)."
   workspace_id = var.railway_workspace_id
 
   default_environment = {
-    name = "production" # nome do env default; o projeto ser -stg é o que marca staging
+    name = "production"
   }
-}
-
-# ===== Domínio auto-gerado da Railway pro api (não é custom domain) =====
-resource "railway_service_domain" "api" {
-  subdomain      = var.api_subdomain
-  environment_id = local.environment_id
-  service_id     = railway_service.app["api"].id
 }
 
 # ===== Postgres COM volume =====

@@ -11,20 +11,14 @@ variable "railway_workspace_id" {
 
 variable "project_name" {
   type        = string
-  description = "Nome do projeto Railway de STAGING (criado do zero, separado do court-legal de prod)."
-  default     = "court-legal-stg"
+  description = "Nome do projeto Railway (o court-legal de produção, já existente e importado)."
+  default     = "court-legal"
 }
 
 variable "app_env" {
   type        = string
-  description = "Valor de APP_ENV nos serviços. Este módulo deploya no stg, então 'staging'."
-  default     = "staging"
-}
-
-variable "api_subdomain" {
-  type        = string
-  description = "Subdomínio auto-gerado da Railway pro api no stg (railway.app). Deve ser único."
-  default     = "autojus-court-legal-stg"
+  description = "Valor de APP_ENV nos serviços."
+  default     = "production"
 }
 
 # ---- Imagens (versionamento por SHA) ----
