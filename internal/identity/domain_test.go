@@ -494,6 +494,183 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 	})
 }
 
+func TestUseCase_Sync(t *testing.T) {
+	ctx := context.Background()
+	const (
+		clerkUser = "user_xyz"
+		clerkOrg  = "org_abc"
+		orgName   = "Escritório"
+	)
+	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: clerkOrg, Name: orgName}
+	user := &AppUser{ID: "user-uuid", ClerkUserID: clerkUser, TenantID: tenant.ID, Role: RoleAdmin}
+	membership := &Membership{ID: "m-1", TenantID: tenant.ID, AppUserID: user.ID, Role: RoleAdmin, Status: MembershipActive}
+
+	// AC1: the very first sync (the owner) with no tenant yet provisions
+	// tenant+user+membership and returns Me with tenant_id set — no webhook. The JWT
+	// carries no membership id, so the membership is provisioned with an empty clerk
+	// id (→ NULL); the join events fire once.
+	t.Run("first owner sync provisions tenant+user+membership and returns Me with tenant_id", func(t *testing.T) {
+		var gotClerkMemID string
+		var findTenantCalls int
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				findTenantCalls++
+				return nil, ErrTenantNotFound // absent on the first read
+			},
+			upsertTenant: func(_ context.Context, _ database.Tx, clerkOrgID, name string) (*Tenant, error) {
+				if clerkOrgID != clerkOrg || name != orgName {
+					t.Fatalf("UpsertTenant args = (%q, %q), want the token's org id + name", clerkOrgID, name)
+				}
+				return tenant, nil
+			},
+			findUser: func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, _ string, _ Role) (*AppUser, error) {
+				return user, nil
+			},
+			upsertMembership: func(_ context.Context, _ database.Tx, _, _, clerkMembershipID string, _ Role) (*Membership, bool, error) {
+				gotClerkMemID = clerkMembershipID
+				return membership, true, nil // a real join
+			},
+			getMe: func(_ context.Context, gotUser string) (*Me, error) {
+				if gotUser != clerkUser {
+					t.Fatalf("GetMe clerk user = %q, want %q", gotUser, clerkUser)
+				}
+				tid := tenant.ID
+				return &Me{TenantID: &tid}, nil
+			},
+		}
+		outbox := &recordingOutbox{}
+
+		me, err := NewUseCase(repo, outbox, &fakeUOW{}).Sync(ctx, clerkUser, clerkOrg, orgName, "ana@b.com", "Ana", RoleAdmin)
+		if err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+		if me.UserID != clerkUser {
+			t.Fatalf("Me.UserID = %q, want the clerk id %q", me.UserID, clerkUser)
+		}
+		if me.TenantID == nil || *me.TenantID != tenant.ID {
+			t.Fatalf("Me.TenantID = %v, want %q provisioned without a webhook", me.TenantID, tenant.ID)
+		}
+		if findTenantCalls != 1 {
+			t.Fatalf("FindTenantByClerkOrg calls = %d, want 1", findTenantCalls)
+		}
+		// The JWT carries no membership id: JIT provisioning passes empty (→ NULL),
+		// leaving the real id for the webhook to backfill.
+		if gotClerkMemID != "" {
+			t.Fatalf("JIT membership clerk id = %q, want empty (NULL)", gotClerkMemID)
+		}
+		// The join still emits its two events exactly once (member_joined + notification).
+		if len(outbox.published) != 2 {
+			t.Fatalf("published %d events, want 2 (member_joined + notification.requested)", len(outbox.published))
+		}
+	})
+
+	// AC2: a second sync is idempotent — the membership is already ACTIVE, so no join
+	// events are re-emitted and Me still carries the same tenant_id.
+	t.Run("replay sync re-emits nothing and returns the same tenant", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return user, nil },
+			upsertUser: func(_ context.Context, _ database.Tx, _, _, _, _, _ string, _ Role) (*AppUser, error) {
+				return user, nil
+			},
+			upsertMembership: func(_ context.Context, _ database.Tx, _, _, _ string, _ Role) (*Membership, bool, error) {
+				return membership, false, nil // already ACTIVE — replay, not a join
+			},
+			getMe: func(context.Context, string) (*Me, error) {
+				tid := tenant.ID
+				return &Me{TenantID: &tid}, nil
+			},
+		}
+		outbox := &recordingOutbox{}
+
+		me, err := NewUseCase(repo, outbox, &fakeUOW{}).Sync(ctx, clerkUser, clerkOrg, orgName, "ana@b.com", "Ana", RoleAdmin)
+		if err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+		if me.TenantID == nil || *me.TenantID != tenant.ID {
+			t.Fatalf("Me.TenantID = %v, want %q on replay", me.TenantID, tenant.ID)
+		}
+		if len(outbox.published) != 0 {
+			t.Fatalf("published %d events on replay, want 0", len(outbox.published))
+		}
+	})
+
+	// AC3: an invited member (multi-user tenant) — the tenant already exists, the user
+	// is new with the member role — creates user+membership under the existing tenant
+	// and returns Me with that tenant_id.
+	t.Run("invited member joins the existing tenant as LAWYER", func(t *testing.T) {
+		var upsertUTenantID string
+		var upsertMRole Role
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return nil, ErrUserNotFound },
+			upsertUser: func(_ context.Context, _ database.Tx, _, tenantID, _, _, _ string, _ Role) (*AppUser, error) {
+				upsertUTenantID = tenantID
+				return &AppUser{ID: "u-2", ClerkUserID: clerkUser, TenantID: tenant.ID, Role: RoleLawyer}, nil
+			},
+			upsertMembership: func(_ context.Context, _ database.Tx, _, _, _ string, role Role) (*Membership, bool, error) {
+				upsertMRole = role
+				return &Membership{ID: "m-2", TenantID: tenant.ID, Role: RoleLawyer, Status: MembershipActive}, true, nil
+			},
+			getMe: func(context.Context, string) (*Me, error) {
+				tid := tenant.ID
+				return &Me{TenantID: &tid}, nil
+			},
+		}
+
+		me, err := NewUseCase(repo, &recordingOutbox{}, &fakeUOW{}).Sync(ctx, clerkUser, clerkOrg, orgName, "bob@b.com", "Bob", RoleLawyer)
+		if err != nil {
+			t.Fatalf("Sync() error = %v", err)
+		}
+		if upsertUTenantID != tenant.ID || upsertMRole != RoleLawyer {
+			t.Fatalf("invited join wired to (tenant=%q, role=%v), want the existing tenant as LAWYER", upsertUTenantID, upsertMRole)
+		}
+		if me.TenantID == nil || *me.TenantID != tenant.ID {
+			t.Fatalf("Me.TenantID = %v, want the existing tenant %q", me.TenantID, tenant.ID)
+		}
+	})
+
+	// AC6: the multi-org guard is preserved — a user already under another tenant is
+	// refused with ErrMembershipConflict, and no read model is returned.
+	t.Run("user already in another tenant is refused with a conflict", func(t *testing.T) {
+		other := &AppUser{ID: "user-uuid", ClerkUserID: clerkUser, TenantID: "different-tenant", Role: RoleAdmin}
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findUser:   func(context.Context, string) (*AppUser, error) { return other, nil },
+			getMe: func(context.Context, string) (*Me, error) {
+				t.Fatal("GetMe must not run when provisioning is refused")
+				return nil, nil
+			},
+		}
+
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).Sync(ctx, clerkUser, clerkOrg, orgName, "ana@b.com", "Ana", RoleAdmin)
+		if !errors.Is(err, ErrMembershipConflict) {
+			t.Fatalf("Sync() error = %v, want ErrMembershipConflict", err)
+		}
+	})
+
+	// An invalid role short-circuits inside the reused provisioning flow before any
+	// tenant is touched (ErrInvalidRole), and GetMe never runs.
+	t.Run("invalid role short-circuits with ErrInvalidRole", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				t.Fatal("FindTenantByClerkOrg must not run on an invalid role")
+				return nil, nil
+			},
+			getMe: func(context.Context, string) (*Me, error) {
+				t.Fatal("GetMe must not run on an invalid role")
+				return nil, nil
+			},
+		}
+
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).Sync(ctx, clerkUser, clerkOrg, orgName, "ana@b.com", "Ana", "MEMBER")
+		if !errors.Is(err, ErrInvalidRole) {
+			t.Fatalf("Sync() error = %v, want ErrInvalidRole", err)
+		}
+	})
+}
+
 func TestUseCase_OnMembershipRemoved(t *testing.T) {
 	ctx := context.Background()
 	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}

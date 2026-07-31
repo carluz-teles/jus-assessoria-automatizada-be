@@ -12,9 +12,10 @@ import (
 )
 
 // handlerUC is the narrow port the Handler uses from the identity use case —
-// exactly the two onboarding methods the HTTP surface exposes.
+// exactly the onboarding methods the HTTP surface exposes.
 type handlerUC interface {
 	GetMe(ctx context.Context, clerkUserID string) (Me, error)
+	Sync(ctx context.Context, clerkUserID, clerkOrgID, orgName, email, name string, role Role) (Me, error)
 	UpdateOrgProfile(ctx context.Context, tenantID string, profile OrgProfile) (*Tenant, error)
 }
 
@@ -32,11 +33,15 @@ func NewHandler(uc handlerUC) *Handler {
 	return &Handler{uc: uc}
 }
 
-// RegisterMe mounts GET /identity/me. It belongs to the AuthUser subtree (verified
-// user, no tenant required) so a freshly-signed-up user mid-onboarding can read
-// their state; the api routes this path through AuthUser in its /v1 dispatch.
+// RegisterMe mounts the tenant-less onboarding routes: GET /identity/me (read the
+// onboarding state before an escritório exists) and POST /identity/sync (provision
+// tenant+user+membership just-in-time from the verified token). Both belong to the
+// AuthUser subtree — verified user, no tenant required — so a freshly-signed-up user
+// mid-onboarding reaches them; the api routes these paths through AuthUser in its
+// /v1 dispatch.
 func (h *Handler) RegisterMe(r fiber.Router) {
 	r.Get("/identity/me", h.me)
+	r.Post("/identity/sync", h.sync)
 }
 
 // RegisterV1 mounts the tenant-authenticated onboarding routes on the /v1 group.
@@ -80,6 +85,40 @@ func (h *Handler) me(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(newMeView(got))
+}
+
+// sync handles POST /v1/identity/sync: it provisions tenant+user+membership
+// synchronously (JIT) from the verified token and returns the same read model as
+// GET /identity/me, tenant_id already populated — so the onboarding wizard gets its
+// tenant back in one request instead of polling /me for the webhook. Identity comes
+// from the token, never the body: the Clerk user id and the org id + role are read
+// from the AuthUser markers (both required — no org means nothing to provision, a
+// 401), and the org role maps to the product role. The body carries only display
+// attributes (email/name/org_name), validated before provisioning.
+func (h *Handler) sync(c *fiber.Ctx) error {
+	clerkUserID, ok := httpx.ClerkUserIDFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing authenticated user"))
+	}
+	clerkOrgID, clerkRole, ok := httpx.ClerkOrgFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing organization in token"))
+	}
+
+	var req SyncRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	me, err := h.uc.Sync(c.UserContext(), clerkUserID, clerkOrgID, req.OrgName, req.Email, req.Name, mapClerkRole(clerkRole))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(newMeView(me))
 }
 
 // updateOrgProfile handles PUT /v1/organization/profile: it validates the body,

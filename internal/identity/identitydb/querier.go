@@ -48,12 +48,16 @@ type Querier interface {
 	// tenant table has no tenant_id of its own and therefore no RLS policy).
 	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (Tenant, error)
 	// Provision or reactivate a membership from an organizationMembership.created
-	// webhook. Idempotent for at-least-once delivery: ON CONFLICT re-asserts the
-	// ACTIVE link (role/clerk id refreshed, removed_at cleared). The `joined` flag
-	// tells the use case whether this is a genuine join (a brand-new row, or a REMOVED
-	// one reactivated) versus a replay of an already-ACTIVE membership — so the
-	// member_joined event fires once per real join, not on every retry. prev captures
-	// the pre-upsert status: NULL (no row) or 'REMOVED' both differ from 'ACTIVE'.
+	// webhook OR the JIT POST /identity/sync. Idempotent for at-least-once delivery:
+	// ON CONFLICT re-asserts the ACTIVE link (role refreshed, removed_at cleared). The
+	// clerk id is COALESCEd, never overwritten with NULL: the JIT sync carries no
+	// membership id and passes NULL, while the webhook carries the real one — COALESCE
+	// keeps a JIT replay (NULL) from erasing the id the webhook backfilled, and lets the
+	// webhook fill it in when it lands. The `joined` flag tells the use case whether this
+	// is a genuine join (a brand-new row, or a REMOVED one reactivated) versus a replay
+	// of an already-ACTIVE membership — so member_joined fires once per real join, not on
+	// every retry. prev captures the pre-upsert status: NULL (no row) or 'REMOVED' both
+	// differ from 'ACTIVE'.
 	UpsertMembership(ctx context.Context, arg UpsertMembershipParams) (UpsertMembershipRow, error)
 	// identity slice queries (tenant + app_user).
 	// Upserts are idempotent so the Clerk webhook (at-least-once) can replay safely.
