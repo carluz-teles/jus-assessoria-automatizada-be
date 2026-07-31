@@ -20,6 +20,10 @@ import (
 // verification with 401 — enough to prove the route reaches Handle through Register.
 const testWebhookSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
 
+// testCORSOrigin is the single allowed browser origin the router fixture is built
+// with — the CORS preflight tests assert the api echoes exactly this origin.
+const testCORSOrigin = "https://fe.test"
+
 // fakeVerifier and fakeResolver stand in for the Clerk-backed implementations so
 // the router builds without any network or database. The /health test never
 // reaches the /v1 group, so their behaviour is irrelevant here — they exist only
@@ -38,9 +42,10 @@ func (fakeResolver) Resolve(context.Context, string, string) (httpx.Principal, e
 
 func newTestRouterDeps() routerDeps {
 	return routerDeps{
-		logger:   telemetry.NewLogger(io.Discard, nil),
-		verifier: fakeVerifier{},
-		resolver: fakeResolver{},
+		logger:      telemetry.NewLogger(io.Discard, nil),
+		corsOrigins: testCORSOrigin,
+		verifier:    fakeVerifier{},
+		resolver:    fakeResolver{},
 		// webhook is never invoked by these tests; a nil handler is safe because
 		// no route below reaches Handle. Left nil deliberately to keep the fixture
 		// free of a real UseCase.
@@ -132,6 +137,50 @@ func TestNewRouter_V1_RequiresAuth(t *testing.T) {
 
 	if resp.StatusCode != 401 {
 		t.Fatalf("GET /v1/ping without token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// CORS preflight: the OPTIONS the browser sends before a cross-origin POST carries
+// no token, so it must be answered by CORS (204 + echoed origin) BEFORE the /v1
+// auth dispatch — otherwise it is 401'd and the browser blocks the real request.
+func TestNewRouter_CORS_PreflightNotBlockedByAuth(t *testing.T) {
+	app := newRouter(newTestRouterDeps())
+
+	req := httptest.NewRequest("OPTIONS", "/v1/identity/sync", nil)
+	req.Header.Set("Origin", testCORSOrigin)
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	req.Header.Set("Access-Control-Request-Headers", "authorization,content-type")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	// fiber's cors short-circuits a valid preflight with 204 No Content.
+	if resp.StatusCode != 204 {
+		t.Fatalf("OPTIONS preflight status = %d, want 204 (not 401)", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != testCORSOrigin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, testCORSOrigin)
+	}
+}
+
+// The real cross-origin response must carry Access-Control-Allow-Origin so the
+// browser exposes it to JS. The header is stamped before auth runs, so even a 401
+// (no token) rides with it — which is what lets the FE read the api's answer at all.
+func TestNewRouter_CORS_HeaderOnActualResponse(t *testing.T) {
+	app := newRouter(newTestRouterDeps())
+
+	req := httptest.NewRequest("GET", "/v1/identity/me", nil)
+	req.Header.Set("Origin", testCORSOrigin)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != testCORSOrigin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, testCORSOrigin)
 	}
 }
 

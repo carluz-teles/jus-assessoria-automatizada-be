@@ -36,6 +36,7 @@ const identitySyncPath = "/v1/identity/sync"
 // dependencies — the test builds it with fakes and never touches the network.
 type routerDeps struct {
 	logger               *slog.Logger
+	corsOrigins          string
 	verifier             middleware.TokenVerifier
 	resolver             middleware.PrincipalResolver
 	webhook              *identity.WebhookHandler
@@ -74,6 +75,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	for _, h := range middleware.Base(deps.logger) {
 		app.Use(h)
 	}
+
+	// CORS: the FE calls the api cross-origin with a bearer token (a non-simple
+	// request), so the browser preflights and blocks any response missing
+	// Access-Control-Allow-Origin. Mounted here — after Base, before the /v1 auth
+	// dispatch below — so the unauthenticated OPTIONS preflight is answered (204),
+	// not 401'd, and the CORS headers ride on every /v1 response.
+	app.Use(middleware.CORS(deps.corsOrigins))
 
 	// Public: liveness probe. The readiness probe that reports per-dependency
 	// status arrives with the docker slice; here a fixed 200 is enough for load
