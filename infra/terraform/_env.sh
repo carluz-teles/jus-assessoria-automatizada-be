@@ -22,7 +22,7 @@ export TF_CLOUD_ORGANIZATION
 export TF_WORKSPACE="${TF_WORKSPACE:-autojus-terraform}"
 
 export TF_VAR_railway_workspace_id="$RAILWAY_WORKSPACE_ID"
-export TF_VAR_project_name="${PROJECT_NAME:-court-legal}"
+export TF_VAR_project_name="${PROJECT_NAME:-court-legal-stg}"
 export TF_VAR_image_registry="${IMAGE_REGISTRY:-ghcr.io/carluz-teles}"
 export TF_VAR_image_tag="${IMAGE_TAG:-latest}" # em CI = github.sha (versionado)
 export TF_VAR_postgres_user="${POSTGRES_USER:-jus}"

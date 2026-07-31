@@ -11,8 +11,8 @@ variable "railway_workspace_id" {
 
 variable "project_name" {
   type        = string
-  description = "Nome do projeto Railway (o court-legal, já existente e importado)."
-  default     = "court-legal"
+  description = "Nome do projeto Railway de STAGING (criado do zero, separado do court-legal de prod)."
+  default     = "court-legal-stg"
 }
 
 variable "app_env" {

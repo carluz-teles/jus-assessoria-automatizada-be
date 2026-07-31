@@ -1,53 +1,44 @@
-# infra/terraform — provisionamento do court-legal (BE) na Railway
+# infra/terraform — STAGING do BE (court-legal-stg) na Railway
 
-Substitui o `infra/railway/provision.sh`/`redeploy.sh`. Gerencia o projeto **court-legal** e
-seus 8 serviços (postgres+volume, redis, api, 6 workers). O serviço **`web` (FE)** vive no
-mesmo projeto mas é gerenciado pelo Terraform do **repo do FE** (state separado) — este
-módulo NÃO o declara.
+Cria um projeto Railway **court-legal-stg** do zero (separado do court-legal de produção),
+com os 8 serviços (postgres+volume, redis, api, 6 workers), variable collections POR SERVIÇO,
+e domínio auto-gerado no api. O serviço **`web` (FE)** vive no mesmo projeto stg mas é
+gerenciado pelo Terraform do **repo do FE** (state separado).
 
-## Modelo (provado no sandbox 2026-07-30)
+## Por que projeto separado (e não env stg dentro do court-legal)
 
-- **Converge-loop, não one-shot:** o backend da Railway é assíncrono/lossy (um apply pode ter
-  falso sucesso — env some, serviço some). `apply.sh` re-aplica até `plan` limpar
-  (`MAX_ATTEMPTS`). **Sem destroy-on-failure** (catastrófico em prod).
+O provider community não isola `source_image` por-environment (é project-level) — um env stg
+no mesmo projeto compartilharia a imagem com a produção. Projeto separado = **isolamento
+total** (imagem, volume, dados, domínio) e **zero risco** pro court-legal de prod.
+
+## Modelo (provado no sandbox)
+
+- **Converge-loop:** o backend da Railway é async/lossy; `apply.sh` re-aplica até `plan` limpar
+  (`MAX_ATTEMPTS`). **Sem destroy-on-failure.**
 - **Throttle:** `-parallelism=1`.
-- **Variáveis por serviço:** cada binário recebe só o que consome (base dos 5 `required` do
-  `config.Load` + extras por serviço). Ver `local.service_vars` em `main.tf`.
+- **Variáveis por serviço:** base dos 5 `required` do `config.Load` + extras por serviço.
 - **Imagens versionadas:** `var.image_tag` (=`github.sha` em CI) fixa `jus-<svc>:<sha>`.
 
-## Arquivos
+## State remoto (Terraform Cloud)
 
-| Arquivo | Papel |
-|---|---|
-| `versions.tf` `variables.tf` `main.tf` `outputs.tf` | a config |
-| `_env.sh` | mapeia env do projeto → `TF_VAR_*` (fonte única; sourced pelos scripts) |
-| `import.sh` | **adoção**: traz projeto+8 serviços existentes pro state (uma vez). Só escreve state |
-| `apply.sh` | converge-loop serial |
-| `destroy.sh` | ⚠️ derruba tudo (só p/ sandbox, NUNCA prod) |
+Org `Autojus`, workspace `autojus-terraform` (por env: `TF_CLOUD_ORGANIZATION`, `TF_WORKSPACE`).
+Auth: `TF_TOKEN_app_terraform_io`. Terraform **1.15.8**.
 
-## Ordem de adoção (uma vez)
+## Rodar (local)
 
 ```bash
 cd infra/terraform
-set -a; source .env.railway; set +a         # mesmos secrets do GitHub Actions (REAIS)
+set -a; source .env.railway; set +a          # secrets reais (os mesmos do GitHub Actions)
 export RAILWAY_TOKEN=... RAILWAY_WORKSPACE_ID=27838c17-0a9b-4799-9c59-fab7c6dbff19
-
-./import.sh          # traz court-legal + 8 serviços pro state (NÃO muda infra)
-terraform plan       # revise: deve mostrar só as variable collections a criar +
-                     # as vars novas de billing/notifications que o provision.sh não tinha
-./apply.sh           # converge-loop: cria as collections, reconcilia (redeploya o que mudou)
+export TF_TOKEN_app_terraform_io=... TF_CLOUD_ORGANIZATION=Autojus
+export IMAGE_TAG=$(git rev-parse HEAD)
+./apply.sh          # converge-loop: cria o court-legal-stg e tudo dentro
 ```
 
-Depois disso o deploy do dia-a-dia é o `apply.sh` com `IMAGE_TAG=github.sha` (no CD).
+Depois do 1º apply, pegue o output **`stg_environment_id`** e passe pro FE (GH var
+`STG_ENVIRONMENT_ID`) — o web do FE deploya no mesmo environment.
 
-## ⚠️ ABERTO: onde vive o state remoto (necessário pro CI/CD)
+## IDs
 
-State local NÃO serve pro CI (cada run começa do zero → tentaria recriar tudo). Precisa de
-backend remoto compartilhado. Opções: Terraform Cloud (precedente no repo) ou backend
-S3-compat no R2 (já usamos R2). **Decisão pendente** — o `import.sh`/`apply.sh` acima usam
-state local até isso ser definido; a adoção real espera o backend.
-
-## IDs (conta autosjus / workspace AutosJusAi's Projects)
-
-- workspace `27838c17-0a9b-4799-9c59-fab7c6dbff19` · court-legal project `0f0790a9-235b-499d-af63-c8f83b5dba0b`
-- env production `04d181f3-b54e-48ac-8804-2719fd76f525`
+- workspace `27838c17-0a9b-4799-9c59-fab7c6dbff19` (conta autosjus) · o court-legal-stg é criado
+  (id sai no output). O court-legal de PRODUÇÃO (`0f0790a9-…`) NÃO é tocado por este módulo.

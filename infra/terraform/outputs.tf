@@ -1,16 +1,17 @@
 # outputs.tf — o que inspecionar depois do apply.
 output "project_id" {
-  description = "ID do projeto court-legal."
+  description = "ID do projeto court-legal-stg."
   value       = railway_project.court_legal.id
 }
 
+# O FE (repo separado) consome este id como STG_ENVIRONMENT_ID.
 output "stg_environment_id" {
-  description = "ID do environment stg (onde este TF deploya)."
-  value       = railway_environment.stg.id
+  description = "ID do environment default do court-legal-stg (onde o web do FE também deploya)."
+  value       = railway_project.court_legal.default_environment.id
 }
 
 output "api_url" {
-  description = "URL auto-gerada da Railway pro api no stg."
+  description = "URL auto-gerada da Railway pro api."
   value       = "https://${railway_service_domain.api.domain}"
 }
 

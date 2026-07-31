@@ -8,8 +8,8 @@
 # limpar (teto MAX_ATTEMPTS). SEM destroy-on-failure — num update de infra existente,
 # destruir por não-convergência seria catastrófico; se não convergir, ALERTA e sai != 0.
 #
-# ⚠️ PRÉ-REQUISITO na 1ª vez: rode ./import.sh ANTES (traz o court-legal existente pro state).
-# THROTTLE: -parallelism=1. Envs: via _env.sh (mesmos secrets do GitHub Actions).
+# Projeto court-legal-stg é CRIADO do zero (sem import). THROTTLE: -parallelism=1.
+# Envs: via _env.sh (mesmos secrets do GitHub Actions).
 set -euo pipefail
 cd "$(dirname "$0")"
 
