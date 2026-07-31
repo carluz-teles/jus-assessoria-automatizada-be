@@ -26,11 +26,6 @@ const lookupPrefix = "/v1/lookup/"
 // Matched exactly (it is a single route, not a subtree) so no sibling is exempted.
 const identityMePath = "/v1/identity/me"
 
-// identitySyncPath is the JIT provisioning route: the wizard calls it right after
-// Clerk setActive to create tenant+user+membership synchronously, so it too runs
-// under AuthUser (verified user + org, no resolved tenant yet). Matched exactly.
-const identitySyncPath = "/v1/identity/sync"
-
 // routerDeps carries everything newRouter wires into the Fiber app. Assembling
 // the graph here (not inside newRouter) keeps the router a pure function of its
 // dependencies — the test builds it with fakes and never touches the network.
@@ -119,7 +114,7 @@ func newRouter(deps routerDeps) *fiber.App {
 
 	v1 := app.Group("/v1")
 	v1.Use(func(c *fiber.Ctx) error {
-		if strings.HasPrefix(c.Path(), lookupPrefix) || c.Path() == identityMePath || c.Path() == identitySyncPath {
+		if strings.HasPrefix(c.Path(), lookupPrefix) || c.Path() == identityMePath {
 			return userAuth(c)
 		}
 		return tenantAuth(c)

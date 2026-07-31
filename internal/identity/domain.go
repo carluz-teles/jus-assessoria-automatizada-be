@@ -162,29 +162,6 @@ func (uc *UseCase) OnMembershipCreated(ctx context.Context, clerkUserID, clerkOr
 	return user, nil
 }
 
-// Sync provisions tenant+user+membership synchronously (JIT) from a verified Clerk
-// token, so the onboarding wizard gets its tenant back in the SAME request instead
-// of polling GET /identity/me for the async webhook to land. Clerk Org is still the
-// tenant; this only removes the dependency on the webhook's timing.
-//
-// It is not a second provisioning path: it REUSES OnMembershipCreated — the exact
-// find-or-create tenant + upsert user + upsert membership + join-events flow the
-// organizationMembership.created webhook takes — passing an EMPTY clerk membership id
-// (the JWT carries no membership id). That empty id is written as SQL NULL, and the
-// webhook backfills the real id later without this JIT replay ever clearing it (the
-// UpsertMembership upsert COALESCEs the incoming NULL against the stored id). Reusing
-// that flow means the multi-org guard (ErrMembershipConflict), idempotency (a second
-// sync neither duplicates rows nor re-emits member_joined), the invalid-role check
-// (ErrInvalidRole) and the member_joined/notification.requested emission all hold for
-// free. It then returns the same read model GET /identity/me serves, with tenant_id
-// already populated.
-func (uc *UseCase) Sync(ctx context.Context, clerkUserID, clerkOrgID, orgName, email, name string, role Role) (Me, error) {
-	if _, err := uc.OnMembershipCreated(ctx, clerkUserID, clerkOrgID, orgName, "", email, name, role); err != nil {
-		return Me{}, err
-	}
-	return uc.GetMe(ctx, clerkUserID)
-}
-
 // OnMembershipRemoved soft-deletes a user's membership from an
 // organizationMembership.deleted webhook: it flips the ACTIVE membership to REMOVED
 // (stamping removed_at) and emits identity.member_removed in the SAME transaction —

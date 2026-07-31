@@ -25,15 +25,6 @@ func (stubVerifier) Verify(context.Context, string) (userID, orgID, role string,
 	return "clerk-user", "clerk-org", "", nil
 }
 
-// noOrgVerifier verifies the token but carries NO org — a signed-in user who
-// belongs to no organization yet. AuthUser then leaves ClerkOrgFromCtx reporting
-// absent, so the sync handler answers 401 (nothing to provision).
-type noOrgVerifier struct{}
-
-func (noOrgVerifier) Verify(context.Context, string) (userID, orgID, role string, err error) {
-	return "clerk-user", "", "", nil
-}
-
 // stubResolver returns a principal with the configured role and tenant, standing
 // in for the identity slice's own resolver on the tenant-strict routes.
 type stubResolver struct {
@@ -51,14 +42,6 @@ type fakeHandlerUC struct {
 	meErr          error
 	gotClerkUserID string
 
-	syncMe         Me
-	syncErr        error
-	gotSyncOrgID   string
-	gotSyncOrgName string
-	gotSyncEmail   string
-	gotSyncName    string
-	gotSyncRole    Role
-
 	profile     *Tenant
 	gotTenantID string
 	gotProfile  OrgProfile
@@ -68,16 +51,6 @@ type fakeHandlerUC struct {
 func (f *fakeHandlerUC) GetMe(_ context.Context, clerkUserID string) (Me, error) {
 	f.gotClerkUserID = clerkUserID
 	return f.me, f.meErr
-}
-
-func (f *fakeHandlerUC) Sync(_ context.Context, clerkUserID, clerkOrgID, orgName, email, name string, role Role) (Me, error) {
-	f.gotClerkUserID = clerkUserID
-	f.gotSyncOrgID = clerkOrgID
-	f.gotSyncOrgName = orgName
-	f.gotSyncEmail = email
-	f.gotSyncName = name
-	f.gotSyncRole = role
-	return f.syncMe, f.syncErr
 }
 
 func (f *fakeHandlerUC) UpdateOrgProfile(_ context.Context, tenantID string, profile OrgProfile) (*Tenant, error) {
@@ -93,18 +66,6 @@ func newMeApp(uc handlerUC) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.AuthUser(stubVerifier{}))
-	NewHandler(uc).RegisterMe(v1)
-	return app
-}
-
-// newSyncApp mounts the tenant-less onboarding routes (RegisterMe, which includes
-// POST /identity/sync) under AuthUser with the given verifier, mirroring the
-// production dispatch for the JIT provisioning endpoint.
-func newSyncApp(uc handlerUC, v middleware.TokenVerifier) *fiber.App {
-	app := fiber.New(fiber.Config{
-		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
-	})
-	v1 := app.Group("/v1", middleware.AuthUser(v))
 	NewHandler(uc).RegisterMe(v1)
 	return app
 }
@@ -207,106 +168,6 @@ func TestHandler_Me_NoToken_401(t *testing.T) {
 	}
 	if uc.gotClerkUserID != "" {
 		t.Fatal("GetMe ran despite a missing token")
-	}
-}
-
-// --- POST /identity/sync -----------------------------------------------------
-
-// AC5: a valid token + valid body provisions and returns 200 with the read model —
-// tenant_id populated. Identity (user/org/role) comes from the token, never the body.
-func TestHandler_Sync_Provisions_200(t *testing.T) {
-	t.Parallel()
-
-	tenantID := "tenant-jit"
-	uc := &fakeHandlerUC{syncMe: Me{UserID: "clerk-user", TenantID: &tenantID}}
-	app := newSyncApp(uc, stubVerifier{})
-
-	body := `{"email":"ana@b.com","name":"Ana","org_name":"Escritório"}`
-	status, respBody := do(t, app, http.MethodPost, "/v1/identity/sync", body, "jwt")
-	if status != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", status, respBody)
-	}
-	// Identity is taken from the token markers, never the body.
-	if uc.gotClerkUserID != "clerk-user" || uc.gotSyncOrgID != "clerk-org" {
-		t.Fatalf("uc got (user=%q, org=%q), want the token's clerk-user/clerk-org", uc.gotClerkUserID, uc.gotSyncOrgID)
-	}
-	// stubVerifier returns an empty org role → mapped to LAWYER (never silently admin).
-	if uc.gotSyncRole != RoleLawyer {
-		t.Fatalf("mapped role = %q, want LAWYER for an empty org role", uc.gotSyncRole)
-	}
-	if uc.gotSyncEmail != "ana@b.com" || uc.gotSyncName != "Ana" || uc.gotSyncOrgName != "Escritório" {
-		t.Fatalf("display attrs = (%q,%q,%q), want the body values", uc.gotSyncEmail, uc.gotSyncName, uc.gotSyncOrgName)
-	}
-	if !strings.Contains(respBody, `"tenant_id":"tenant-jit"`) || strings.Contains(respBody, `"tenant_id":null`) {
-		t.Fatalf("response must carry the provisioned tenant_id: %s", respBody)
-	}
-}
-
-// AC5: no bearer token → 401 at the AuthUser boundary; the use case never runs.
-func TestHandler_Sync_NoToken_401(t *testing.T) {
-	t.Parallel()
-
-	uc := &fakeHandlerUC{}
-	app := newSyncApp(uc, stubVerifier{})
-
-	status, _ := do(t, app, http.MethodPost, "/v1/identity/sync", `{"email":"a@b.com"}`, "")
-	if status != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", status)
-	}
-	if uc.gotClerkUserID != "" {
-		t.Fatal("Sync ran despite a missing token")
-	}
-}
-
-// AC5: a verified token that carries NO org → 401 (nothing to provision), before the
-// use case runs.
-func TestHandler_Sync_NoOrgInToken_401(t *testing.T) {
-	t.Parallel()
-
-	uc := &fakeHandlerUC{}
-	app := newSyncApp(uc, noOrgVerifier{})
-
-	status, body := do(t, app, http.MethodPost, "/v1/identity/sync", `{"email":"a@b.com"}`, "jwt")
-	if status != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401; body=%s", status, body)
-	}
-	if uc.gotSyncOrgID != "" {
-		t.Fatal("Sync ran despite no org in the token")
-	}
-}
-
-// AC5: an invalid body is a 400 in the {kind,message,details} envelope; the use case
-// never runs.
-func TestHandler_Sync_InvalidBody_400(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		body string
-	}{
-		{name: "missing email", body: `{"name":"Ana"}`},
-		{name: "malformed email", body: `{"email":"not-an-email"}`},
-		{name: "malformed json", body: `{not json`},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			uc := &fakeHandlerUC{}
-			app := newSyncApp(uc, stubVerifier{})
-
-			status, body := do(t, app, http.MethodPost, "/v1/identity/sync", tt.body, "jwt")
-			if status != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400; body=%s", status, body)
-			}
-			if !strings.Contains(body, `"kind":`) {
-				t.Fatalf("error must use the {kind,message,details} envelope: %s", body)
-			}
-			if uc.gotSyncEmail != "" || uc.gotSyncOrgID != "" {
-				t.Fatal("Sync ran on an invalid body")
-			}
-		})
 	}
 }
 

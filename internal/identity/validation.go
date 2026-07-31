@@ -5,7 +5,6 @@ import (
 	"regexp"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
-	"github.com/go-ozzo/ozzo-validation/v4/is"
 )
 
 // nonDigit matches everything that is not a digit, used to strip a CNPJ mask
@@ -26,26 +25,6 @@ type UpdateOrgProfileRequest struct {
 	LegalName string  `json:"legal_name"`
 	TradeName string  `json:"trade_name"`
 	Address   Address `json:"address"`
-}
-
-// SyncRequest is the POST /identity/sync body: the display attributes the JIT
-// provisioning needs beyond what the verified token already carries. tenant_id and
-// role are NOT here — they come from the token (org id + org role), never the body.
-// Only email is required (an app_user needs an address); name and org_name are
-// optional display fields the provisioning falls back on.
-type SyncRequest struct {
-	Email   string `json:"email"`
-	Name    string `json:"name"`
-	OrgName string `json:"org_name"`
-}
-
-// Validate enforces the one boundary rule the token cannot supply: a well-formed
-// email (format only — no DNS lookup, which would make the write path flaky). A
-// failure here is a 400 at the edge (KindInvalid → 400).
-func (r SyncRequest) Validate() error {
-	return validation.ValidateStruct(&r,
-		validation.Field(&r.Email, validation.Required, is.EmailFormat),
-	)
 }
 
 // Validate enforces the boundary rules via ozzo (method-based, not struct tags):

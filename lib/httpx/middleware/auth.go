@@ -67,19 +67,15 @@ func Auth(v TokenVerifier, r PrincipalResolver) fiber.Handler {
 }
 
 // AuthUser is the tenant-less authentication middleware for the onboarding
-// endpoints the wizard hits BEFORE an escritório (tenant) exists — the CNPJ/CEP
-// lookups in step 2 and the JIT provisioning POST /identity/sync. It verifies the
-// Clerk JWT with the SAME TokenVerifier as Auth, but stops there: it does NOT call
-// Resolve and does NOT require a tenant, so a freshly-signed-up user with no org
-// still passes. A missing or invalid token is a 401, exactly like Auth; a valid one
-// injects the Clerk user id (ClerkUserIDFromCtx) AND — additively — the verified org
-// id + role (ClerkOrgFromCtx) as session markers, then continues.
+// endpoints the wizard hits BEFORE an escritório (tenant) exists — e.g. the
+// CNPJ/CEP lookups in step 2. It verifies the Clerk JWT with the SAME
+// TokenVerifier as Auth, but stops there: it does NOT call Resolve and does NOT
+// require a tenant, so a freshly-signed-up user with no org still passes. A
+// missing or invalid token is a 401, exactly like Auth; a valid one injects the
+// Clerk user id as a session marker (ClerkUserIDFromCtx) and continues.
 //
-// The org context is what makes JIT sync possible before a Principal exists: it
-// provisions the tenant from the token's org id right there. The /me read and the
-// lookups simply ignore it, so this addition changes nothing for them. It shares
-// bearerToken and the 401 semantics with Auth on purpose; the only difference is the
-// absent principal resolution.
+// It shares bearerToken and the 401 semantics with Auth on purpose; the only
+// difference is the absent principal resolution.
 func AuthUser(v TokenVerifier) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		bearer := bearerToken(c)
@@ -87,13 +83,12 @@ func AuthUser(v TokenVerifier) fiber.Handler {
 			return httpx.WriteError(c, apperr.NewUnauthorized("missing bearer token"))
 		}
 
-		userID, orgID, role, err := v.Verify(c.UserContext(), bearer)
+		userID, _, _, err := v.Verify(c.UserContext(), bearer)
 		if err != nil {
 			return httpx.WriteError(c, apperr.NewUnauthorized("invalid token"))
 		}
 
 		httpx.SetClerkUserID(c, userID)
-		httpx.SetClerkOrg(c, orgID, role)
 		return c.Next()
 	}
 }

@@ -74,31 +74,6 @@ func (stubRegistry) LookupCEP(context.Context, string) (lookup.Address, error) {
 	return lookup.Address{CEP: "01311902"}, nil
 }
 
-// okVerifier returns a verified user + org so AuthUser passes and the JIT sync
-// handler can run; stands in for the Clerk-backed verifier on the tenant-less subtree.
-type okVerifier struct{}
-
-func (okVerifier) Verify(context.Context, string) (userID, orgID, role string, err error) {
-	return "clerk-user", "clerk-org", "org:admin", nil
-}
-
-// stubIdentityUC is a handlerUC double (satisfied structurally): Sync/GetMe return a
-// fixed onboarding read model, UpdateOrgProfile a bare tenant. It lets the router
-// test wire a real identity.Handler without a database.
-type stubIdentityUC struct{ tenantID string }
-
-func (s stubIdentityUC) GetMe(context.Context, string) (identity.Me, error) {
-	return identity.Me{UserID: "clerk-user", TenantID: &s.tenantID}, nil
-}
-
-func (s stubIdentityUC) Sync(context.Context, string, string, string, string, string, identity.Role) (identity.Me, error) {
-	return identity.Me{UserID: "clerk-user", TenantID: &s.tenantID}, nil
-}
-
-func (stubIdentityUC) UpdateOrgProfile(context.Context, string, identity.OrgProfile) (*identity.Tenant, error) {
-	return &identity.Tenant{}, nil
-}
-
 func TestNewRouter_Health_Returns200(t *testing.T) {
 	app := newRouter(newTestRouterDeps())
 
@@ -146,7 +121,7 @@ func TestNewRouter_V1_RequiresAuth(t *testing.T) {
 func TestNewRouter_CORS_PreflightNotBlockedByAuth(t *testing.T) {
 	app := newRouter(newTestRouterDeps())
 
-	req := httptest.NewRequest("OPTIONS", "/v1/identity/sync", nil)
+	req := httptest.NewRequest("OPTIONS", "/v1/billing/checkout", nil)
 	req.Header.Set("Origin", testCORSOrigin)
 	req.Header.Set("Access-Control-Request-Method", "POST")
 	req.Header.Set("Access-Control-Request-Headers", "authorization,content-type")
@@ -204,43 +179,6 @@ func TestNewRouter_Lookup_AuthenticatesWithoutTenant(t *testing.T) {
 	defer respLookup.Body.Close()
 	if respLookup.StatusCode != 200 {
 		t.Fatalf("GET /v1/lookup/cnpj with token status = %d, want 200", respLookup.StatusCode)
-	}
-
-	// Same token on a tenant route → tenant Auth runs, resolver fails → 401.
-	reqPing := httptest.NewRequest("GET", "/v1/ping", nil)
-	reqPing.Header.Set("Authorization", "Bearer any.jwt.here")
-	respPing, err := app.Test(reqPing)
-	if err != nil {
-		t.Fatalf("app.Test(ping): %v", err)
-	}
-	defer respPing.Body.Close()
-	if respPing.StatusCode != 401 {
-		t.Fatalf("GET /v1/ping with unresolvable tenant status = %d, want 401", respPing.StatusCode)
-	}
-}
-
-// POST /v1/identity/sync runs on the tenant-less AuthUser subtree. With a resolver
-// that would 401 any tenant route, a valid-token sync still reaches the handler
-// (200), while a tenant route (/v1/ping) with the same token is 401 — proof the
-// dispatch routes /identity/sync through AuthUser, not tenant Auth.
-func TestNewRouter_IdentitySync_AuthenticatesWithoutTenant(t *testing.T) {
-	deps := newTestRouterDeps()
-	deps.verifier = okVerifier{}
-	deps.resolver = erroringResolver{}
-	deps.identity = identity.NewHandler(stubIdentityUC{tenantID: "tenant-jit"})
-	app := newRouter(deps)
-
-	// Valid token, no resolvable tenant → sync still succeeds.
-	reqSync := httptest.NewRequest("POST", "/v1/identity/sync", strings.NewReader(`{"email":"ana@b.com"}`))
-	reqSync.Header.Set("Authorization", "Bearer any.jwt.here")
-	reqSync.Header.Set("Content-Type", "application/json")
-	respSync, err := app.Test(reqSync)
-	if err != nil {
-		t.Fatalf("app.Test(sync): %v", err)
-	}
-	defer respSync.Body.Close()
-	if respSync.StatusCode != 200 {
-		t.Fatalf("POST /v1/identity/sync with token status = %d, want 200", respSync.StatusCode)
 	}
 
 	// Same token on a tenant route → tenant Auth runs, resolver fails → 401.
