@@ -53,12 +53,16 @@ WHERE id = $1;
 
 -- name: UpsertMembership :one
 -- Provision or reactivate a membership from an organizationMembership.created
--- webhook. Idempotent for at-least-once delivery: ON CONFLICT re-asserts the
--- ACTIVE link (role/clerk id refreshed, removed_at cleared). The `joined` flag
--- tells the use case whether this is a genuine join (a brand-new row, or a REMOVED
--- one reactivated) versus a replay of an already-ACTIVE membership — so the
--- member_joined event fires once per real join, not on every retry. prev captures
--- the pre-upsert status: NULL (no row) or 'REMOVED' both differ from 'ACTIVE'.
+-- webhook OR the JIT POST /identity/sync. Idempotent for at-least-once delivery:
+-- ON CONFLICT re-asserts the ACTIVE link (role refreshed, removed_at cleared). The
+-- clerk id is COALESCEd, never overwritten with NULL: the JIT sync carries no
+-- membership id and passes NULL, while the webhook carries the real one — COALESCE
+-- keeps a JIT replay (NULL) from erasing the id the webhook backfilled, and lets the
+-- webhook fill it in when it lands. The `joined` flag tells the use case whether this
+-- is a genuine join (a brand-new row, or a REMOVED one reactivated) versus a replay
+-- of an already-ACTIVE membership — so member_joined fires once per real join, not on
+-- every retry. prev captures the pre-upsert status: NULL (no row) or 'REMOVED' both
+-- differ from 'ACTIVE'.
 WITH prev AS (
     SELECT status FROM membership WHERE tenant_id = $1 AND app_user_id = $2
 )
@@ -66,7 +70,7 @@ INSERT INTO membership (tenant_id, app_user_id, clerk_membership_id, role, statu
 VALUES ($1, $2, $3, $4, 'ACTIVE')
 ON CONFLICT (tenant_id, app_user_id) DO UPDATE
    SET role                = EXCLUDED.role,
-       clerk_membership_id = EXCLUDED.clerk_membership_id,
+       clerk_membership_id = COALESCE(EXCLUDED.clerk_membership_id, membership.clerk_membership_id),
        status              = 'ACTIVE',
        removed_at          = NULL
 RETURNING *, coalesce((SELECT status FROM prev), '') <> 'ACTIVE' AS joined;
