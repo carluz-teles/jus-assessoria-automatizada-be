@@ -32,6 +32,7 @@ func tenantToEntity(r identitydb.Tenant) (*Tenant, error) {
 		TradeName:             derefString(r.TradeName),
 		Address:               address,
 		Phone:                 derefString(r.Phone),
+		Email:                 derefString(r.Email),
 		OnboardingCompletedAt: timeToPtr(r.OnboardingCompletedAt),
 	}, nil
 }

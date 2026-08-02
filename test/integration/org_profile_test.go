@@ -160,6 +160,47 @@ func TestIdentity_UpdateOrgProfile_ColumnsAndOutboxSameTx(t *testing.T) {
 	}
 }
 
+// AC2/AC3: an optional email persists to the tenant.email column, and an address
+// left entirely blank is accepted — the profile is saved with no address fields, so
+// the org can complete onboarding without an address (it is optional as a whole).
+func TestIdentity_UpdateOrgProfile_EmailAndEmptyAddress(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-profile-email", 0)
+
+	profile := identity.OrgProfile{
+		CNPJ:      "12345678000195",
+		LegalName: "Escritório LTDA",
+		TradeName: "Escritório",
+		Email:     "contato@escritorio.com.br",
+		// Address left as the zero struct: the org saved no address.
+	}
+
+	saved, err := newIdentityUC(pool).UpdateOrgProfile(ctx, tenantID, profile)
+	if err != nil {
+		t.Fatalf("UpdateOrgProfile() error = %v", err)
+	}
+	if saved.Email != "contato@escritorio.com.br" {
+		t.Fatalf("saved email = %q, want the address the PUT carried", saved.Email)
+	}
+	if saved.OnboardingCompletedAt == nil {
+		t.Fatal("onboarding gate not stamped for an address-less profile")
+	}
+	if saved.Address != nil && *saved.Address != (identity.Address{}) {
+		t.Fatalf("saved address = %+v, want no address fields", saved.Address)
+	}
+
+	// The email column actually landed on the row.
+	var email *string
+	if err := pool.QueryRow(ctx, `SELECT email FROM tenant WHERE id = $1`, tenantID).Scan(&email); err != nil {
+		t.Fatalf("read tenant email: %v", err)
+	}
+	if email == nil || *email != "contato@escritorio.com.br" {
+		t.Fatalf("persisted email = %v, want contato@escritorio.com.br", email)
+	}
+}
+
 // AC7 (atomicity): if the publish fails, the whole unit of work rolls back — no
 // column is written and no event survives.
 func TestIdentity_UpdateOrgProfile_PublishFailRollsBackAll(t *testing.T) {

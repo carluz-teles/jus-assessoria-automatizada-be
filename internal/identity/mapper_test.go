@@ -41,15 +41,19 @@ func TestTenantToEntity(t *testing.T) {
 		if got.OnboardingCompletedAt != nil {
 			t.Errorf("OnboardingCompletedAt = %v, want nil", *got.OnboardingCompletedAt)
 		}
-		// A null phone column collapses to an empty string, not a stray value.
+		// A null phone/email column collapses to an empty string, not a stray value.
 		if got.Phone != "" {
 			t.Errorf("Phone = %q, want empty for an unset column", got.Phone)
+		}
+		if got.Email != "" {
+			t.Errorf("Email = %q, want empty for an unset column", got.Email)
 		}
 	})
 
 	t.Run("onboarded tenant: profile columns and address jsonb decode", func(t *testing.T) {
 		cnpj, legal, trade := "12345678000195", "Escritório LTDA", "Escritório"
 		phone := "11987654321"
+		email := "contato@escritorio.com.br"
 		got, err := tenantToEntity(identitydb.Tenant{
 			ID:                    id,
 			ClerkOrgID:            "org_abc",
@@ -60,6 +64,7 @@ func TestTenantToEntity(t *testing.T) {
 			TradeName:             &trade,
 			Address:               []byte(`{"cep":"01311902","logradouro":"Av Paulista","cidade":"São Paulo","uf":"SP"}`),
 			Phone:                 &phone,
+			Email:                 &email,
 			OnboardingCompletedAt: pgtype.Timestamptz{Time: onboarded, Valid: true},
 		})
 		if err != nil {
@@ -70,6 +75,9 @@ func TestTenantToEntity(t *testing.T) {
 		}
 		if got.Phone != phone {
 			t.Errorf("Phone = %q, want %q", got.Phone, phone)
+		}
+		if got.Email != email {
+			t.Errorf("Email = %q, want %q", got.Email, email)
 		}
 		if got.Address == nil || got.Address.CEP != "01311902" || got.Address.UF != "SP" {
 			t.Errorf("Address = %+v, want decoded", got.Address)

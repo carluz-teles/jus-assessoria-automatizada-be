@@ -270,4 +270,5 @@ type Tenant struct {
 	Address               []byte             `json:"address"`
 	OnboardingCompletedAt pgtype.Timestamptz `json:"onboarding_completed_at"`
 	Phone                 *string            `json:"phone"`
+	Email                 *string            `json:"email"`
 }

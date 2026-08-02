@@ -229,6 +229,71 @@ func TestHandler_UpdateProfile_EchoesPhone(t *testing.T) {
 	}
 }
 
+// AC2: an optional email in the body is validated, forwarded to the use case and
+// echoed back in the profile view.
+func TestHandler_UpdateProfile_EchoesEmail(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{profile: &Tenant{
+		CNPJ:      "12345678000195",
+		LegalName: "Escritório LTDA",
+		TradeName: "Escritório",
+		Email:     "contato@escritorio.com.br",
+	}}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	body := `{"cnpj":"12.345.678/0001-95","legal_name":"Escritório LTDA","trade_name":"Escritório","email":"contato@escritorio.com.br","address":{"cep":"01311-902","logradouro":"Av Paulista","numero":"1000","cidade":"São Paulo","uf":"SP"}}`
+	status, resp := do(t, app, http.MethodPut, "/v1/organization/profile", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, resp)
+	}
+	if uc.gotProfile.Email != "contato@escritorio.com.br" {
+		t.Fatalf("email forwarded to uc = %q, want contato@escritorio.com.br", uc.gotProfile.Email)
+	}
+	if !strings.Contains(resp, `"email":"contato@escritorio.com.br"`) {
+		t.Fatalf("response missing echoed email: %s", resp)
+	}
+}
+
+// AC3: the address is optional as a whole — a body with NO address is a 200 and the
+// use case runs (the profile is saved without an address).
+func TestHandler_UpdateProfile_NoAddress_200(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{profile: &Tenant{CNPJ: "12345678000195", LegalName: "L", TradeName: "T"}}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	body := `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T"}`
+	status, resp := do(t, app, http.MethodPut, "/v1/organization/profile", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, resp)
+	}
+	if uc.gotTenantID != "tenant-42" {
+		t.Fatal("use case did not run for an address-less profile")
+	}
+	if uc.gotProfile.Address != (Address{}) {
+		t.Fatalf("address forwarded = %+v, want the zero struct", uc.gotProfile.Address)
+	}
+}
+
+// AC3: a partial address (any field filled but the required ones missing) is still a
+// 400 — the address is all-or-nothing; the use case never runs.
+func TestHandler_UpdateProfile_PartialAddress_400(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-1")
+
+	body := `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","address":{"cidade":"São Paulo"}}`
+	status, resp := do(t, app, http.MethodPut, "/v1/organization/profile", body, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, resp)
+	}
+	if uc.gotTenantID != "" {
+		t.Fatal("use case ran on a partial address")
+	}
+}
+
 // AC2: a phone that is present but malformed (not 10–11 digits) is a 400; the use
 // case never runs. An absent phone stays valid (covered by the Admin_200 case).
 func TestHandler_UpdateProfile_InvalidPhone_400(t *testing.T) {
@@ -286,6 +351,7 @@ func TestHandler_UpdateProfile_InvalidBody_400(t *testing.T) {
 		{name: "cnpj wrong length", body: `{"cnpj":"123","legal_name":"L","trade_name":"T","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
 		{name: "missing legal_name", body: `{"cnpj":"12345678000195","legal_name":"","trade_name":"T","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
 		{name: "missing address cep", body: `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","address":{"cep":"","logradouro":"L","cidade":"C","uf":"SP"}}`},
+		{name: "malformed email", body: `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","email":"not-an-email","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
 		{name: "malformed json", body: `{not json`},
 	}
 

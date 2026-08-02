@@ -24,8 +24,8 @@ func (r Role) Valid() bool {
 // Tenant mirrors a Clerk Organization (the escritório). Its ID is the internal
 // uuid used by every FK in the system; ClerkOrgID is only the bridge to Clerk.
 //
-// The company-profile fields (CNPJ, LegalName, TradeName, Address, Phone) and the
-// onboarding gate are captured during onboarding (fatia B) and left zero until
+// The company-profile fields (CNPJ, LegalName, TradeName, Address, Phone, Email)
+// and the onboarding gate are captured during onboarding (fatia B) and left zero until
 // then: a tenant is provisioned from the Clerk webhook before its profile is
 // filled in. Address is a pointer because the whole jsonb column may be absent;
 // OnboardingCompletedAt is nil until the org profile is first saved.
@@ -41,7 +41,11 @@ type Tenant struct {
 	// Phone is the escritório's phone number, captured during onboarding — it is
 	// the company's phone, not the user's (that lives on AppUser.Phone). Optional:
 	// an empty string stands in for SQL NULL when the org has no phone.
-	Phone                 string
+	Phone string
+	// Email is the escritório's e-mail, captured during onboarding — it is the
+	// company's e-mail, not the user's (that lives on AppUser.Email). Optional:
+	// an empty string stands in for SQL NULL when the org has no e-mail.
+	Email                 string
 	OnboardingCompletedAt *time.Time
 }
 
@@ -69,6 +73,9 @@ type OrgProfile struct {
 	// Phone is the escritório's phone, already validated to 10–11 digits when
 	// present; empty means the org left it blank (a valid, optional field).
 	Phone string
+	// Email is the escritório's e-mail, already validated to a well-formed address
+	// when present; empty means the org left it blank (a valid, optional field).
+	Email string
 }
 
 // Me is the onboarding read model for GET /identity/me: who the caller is and how

@@ -84,6 +84,33 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 			field:   "address",
 		},
 		{
+			name:    "empty address is valid (optional as a whole)",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Address = Address{} },
+			wantErr: false,
+		},
+		{
+			name:    "partial address (only cidade) is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Address = Address{Cidade: "São Paulo"} },
+			wantErr: true,
+			field:   "address",
+		},
+		{
+			name:    "empty email is valid (optional)",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Email = "" },
+			wantErr: false,
+		},
+		{
+			name:    "well-formed email is accepted",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Email = "contato@escritorio.com.br" },
+			wantErr: false,
+		},
+		{
+			name:    "malformed email is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Email = "not-an-email" },
+			wantErr: true,
+			field:   "email",
+		},
+		{
 			name:    "empty phone is valid (optional)",
 			mutate:  func(r *UpdateOrgProfileRequest) { r.Phone = "" },
 			wantErr: false,
@@ -146,6 +173,7 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 func TestToOrgProfile_NormalizesCNPJ(t *testing.T) {
 	req := validRequest() // CNPJ carries the mask "12.345.678/0001-95"
 	req.Phone = "11987654321"
+	req.Email = "contato@escritorio.com.br"
 
 	got := req.toOrgProfile()
 	if got.CNPJ != "12345678000195" {
@@ -154,8 +182,11 @@ func TestToOrgProfile_NormalizesCNPJ(t *testing.T) {
 	if got.LegalName != req.LegalName || got.TradeName != req.TradeName || got.Address != req.Address {
 		t.Fatalf("toOrgProfile() dropped a field: %+v", got)
 	}
-	// Phone passes through unchanged (bare digits, no mask stripping like CNPJ).
+	// Phone and email pass through unchanged (no mask stripping like CNPJ).
 	if got.Phone != req.Phone {
 		t.Fatalf("Phone = %q, want %q passed through", got.Phone, req.Phone)
+	}
+	if got.Email != req.Email {
+		t.Fatalf("Email = %q, want %q passed through", got.Email, req.Email)
 	}
 }

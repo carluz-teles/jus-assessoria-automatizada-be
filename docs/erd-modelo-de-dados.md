@@ -90,6 +90,7 @@ CREATE TABLE tenant (
   trade_name              text,                   -- nome fantasia
   address                 jsonb,                  -- {cep,logradouro,numero,complemento,bairro,cidade,uf}
   phone                   text,                   -- telefone do escritório (opcional); é da empresa, não do user
+  email                   text,                   -- e-mail do escritório (opcional); é da empresa, não do user
   onboarding_completed_at timestamptz,            -- setado ao concluir o passo 2 (gate do shell)
   created_at              timestamptz NOT NULL DEFAULT now()
 );

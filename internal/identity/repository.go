@@ -224,6 +224,7 @@ func (r *pgRepository) UpdateOrgProfile(ctx context.Context, tx database.Tx, ten
 		TradeName: &profile.TradeName,
 		Address:   address,
 		Phone:     textToNull(profile.Phone),
+		Email:     textToNull(profile.Email),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrTenantNotFound
