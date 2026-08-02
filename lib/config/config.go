@@ -43,9 +43,9 @@ type Config struct {
 	// CORS — origens de browser permitidas (comma-separated), só o api consome. O FE
 	// (Next.js em outra origem) chama o api com header Authorization, o que torna todo
 	// request "não-simples" e dispara preflight: sem Access-Control-Allow-Origin o
-	// browser descarta a resposta. O default cobre o FE de prod (Railway) + o dev
-	// local; produção pode sobrescrever via env sem recompilar.
-	CORSAllowedOrigins string `env:"CORS_ALLOWED_ORIGINS" envDefault:"https://autojus-web.up.railway.app,http://localhost:3000"`
+	// browser descarta a resposta. O default cobre o domínio de prod (app.atjud.com.br),
+	// o subdomínio Railway (legado) e o dev local; produção pode sobrescrever via env.
+	CORSAllowedOrigins string `env:"CORS_ALLOWED_ORIGINS" envDefault:"https://app.atjud.com.br,https://autojus-web.up.railway.app,http://localhost:3000"`
 
 	// Stripe billing (só o api os consome, no webhook /webhooks/stripe). Opcionais
 	// pelo mesmo motivo do ClerkWebhookSecret: um segredo vazio só quebra ao
