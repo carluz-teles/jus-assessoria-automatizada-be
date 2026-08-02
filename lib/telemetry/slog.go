@@ -2,9 +2,11 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 
+	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -14,6 +16,10 @@ const (
 	traceIDKey = "trace_id"
 	spanIDKey  = "span_id"
 )
+
+// instrumentationScope names this module as the instrumentation scope on the
+// OTel log bridge, so records exported via OTLP carry a stable scope name.
+const instrumentationScope = "github.com/jusassessoria/platform"
 
 // TraceHandler decorates a slog.Handler, stamping the active span's trace_id
 // and span_id onto each record so logs correlate with traces. When the context
@@ -66,12 +72,91 @@ func (h *TraceHandler) WithGroup(name string) slog.Handler {
 	return &TraceHandler{base: h.base.WithGroup(name)}
 }
 
-// NewLogger returns a JSON logger writing to w at the given level, wrapped in a
-// TraceHandler so every record emitted within a span carries trace_id/span_id.
+// fanoutHandler dispatches every record to several base handlers. It backs the
+// dual-handler logger: the same log line goes to stdout JSON (for Railway/debug)
+// AND to the OTel bridge (for OTLP export), so New Relic correlates logs with
+// traces on the trace_id/span_id the stdout side already stamps.
+//
+// It never clones or mutates the record: the slog.Handler contract forbids
+// Handle from modifying the record it receives, and each base that needs to
+// mutate (TraceHandler) clones on its own. The same record is passed to every
+// base unchanged.
+type fanoutHandler struct {
+	bases []slog.Handler
+}
+
+// compile-time check: fanoutHandler satisfies the handler interface.
+var _ slog.Handler = (*fanoutHandler)(nil)
+
+// newFanoutHandler aggregates bases into a single handler that fans out to all.
+func newFanoutHandler(bases ...slog.Handler) *fanoutHandler {
+	return &fanoutHandler{bases: bases}
+}
+
+// Enabled reports true as soon as ANY base is enabled for the level, so no base
+// misses a record it would have processed. Handle re-checks each base, so a
+// level a subset of bases care about still reaches only those bases.
+func (h *fanoutHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	for _, b := range h.bases {
+		if b.Enabled(ctx, level) {
+			return true
+		}
+	}
+	return false
+}
+
+// Handle delivers the same record to every base that is Enabled for its level
+// and joins their errors, so one base failing neither hides another's failure
+// nor stops the others. The per-base Enabled guard preserves each base's own
+// level filtering even though the outer logger only checked the OR (Enabled).
+func (h *fanoutHandler) Handle(ctx context.Context, rec slog.Record) error {
+	var errs []error
+	for _, b := range h.bases {
+		if !b.Enabled(ctx, rec.Level) {
+			continue
+		}
+		if err := b.Handle(ctx, rec); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// WithAttrs returns a fanout whose bases each carry attrs, so derived loggers
+// keep fanning out to every destination.
+func (h *fanoutHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	bases := make([]slog.Handler, len(h.bases))
+	for i, b := range h.bases {
+		bases[i] = b.WithAttrs(attrs)
+	}
+	return &fanoutHandler{bases: bases}
+}
+
+// WithGroup returns a fanout whose bases each opened the group, so derived
+// loggers keep fanning out to every destination.
+func (h *fanoutHandler) WithGroup(name string) slog.Handler {
+	bases := make([]slog.Handler, len(h.bases))
+	for i, b := range h.bases {
+		bases[i] = b.WithGroup(name)
+	}
+	return &fanoutHandler{bases: bases}
+}
+
+// NewLogger returns a dual-destination JSON logger writing to w at the given
+// level. Every record fans out to two handlers: (1) stdout JSON wrapped in a
+// TraceHandler, so each record in a span carries trace_id/span_id (unchanged);
+// and (2) an OTel bridge that exports the record over OTLP.
+//
+// The bridge uses the GLOBAL LoggerProvider (no WithLoggerProvider): it is a
+// no-op until Setup calls global.SetLoggerProvider, then begins emitting. This
+// late delegation is deliberate — the logger is built at the boot logger step,
+// before Setup installs the provider, and must not force a boot reorder.
+//
 // Never log secrets or PII (see TraceHandler).
 func NewLogger(w io.Writer, level slog.Leveler) *slog.Logger {
-	base := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})
-	return slog.New(NewTraceHandler(base))
+	stdout := NewTraceHandler(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level}))
+	bridge := otelslog.NewHandler(instrumentationScope)
+	return slog.New(newFanoutHandler(stdout, bridge))
 }
 
 // SetupDefault builds a trace-correlating JSON logger and installs it as

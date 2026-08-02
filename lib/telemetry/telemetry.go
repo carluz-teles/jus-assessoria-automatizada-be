@@ -1,13 +1,16 @@
-// Package telemetry wires OpenTelemetry for every binary: traces and metrics
-// exported over OTLP/gRPC, plus a slog handler (see slog.go) that stamps the
+// Package telemetry wires OpenTelemetry for every binary: traces, metrics and
+// logs exported over OTLP/gRPC, plus a slog handler (see slog.go) that stamps the
 // active trace_id/span_id onto log records so logs correlate with traces.
 //
 // Setup runs once per process, at the "pools/asynq/otel" boot step (docs
-// erd-backend §6). It installs the global TracerProvider, MeterProvider and a
-// W3C propagator, then returns a shutdown closure the graceful-shutdown path
-// invokes during drain. The OTLP/gRPC exporters are lazy — New does not dial —
-// so Setup returns fast even when the collector is unreachable; export failures
-// surface later on the batch/periodic path, not here.
+// erd-backend §6). It installs the global TracerProvider, MeterProvider,
+// LoggerProvider and a W3C propagator, then returns a shutdown closure the
+// graceful-shutdown path invokes during drain. The OTLP/gRPC exporters are lazy
+// — New does not dial — so Setup returns fast even when the collector is
+// unreachable; export failures surface later on the batch/periodic path, not
+// here. The slog OTel bridge is built earlier (at the boot logger step) and
+// delegates to the global LoggerProvider, so it stays a no-op until Setup
+// installs one — no boot reorder needed.
 //
 // The W3C traceparent propagator is deliberate: the outbox relay carries
 // trace_context in the event payload so a trace spans the async hop from
@@ -24,9 +27,12 @@ import (
 	"github.com/jusassessoria/platform/lib/config"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -78,6 +84,24 @@ func Setup(ctx context.Context, cfg config.Config, serviceName string) (shutdown
 		return nil, apperr.NewInfra("telemetry: build metric exporter", err)
 	}
 
+	// Log exporter: same OTLP/gRPC endpoint, the SAME security decision (sec) and
+	// the same generic otlpOptions as trace/metric — the app's logs reach New
+	// Relic over the channel it already uses, so logs correlate with traces.
+	logExp, err := otlploggrpc.New(ctx, otlpOptions(
+		cfg.OTELEndpoint, sec,
+		otlploggrpc.WithEndpoint,
+		otlploggrpc.WithInsecure,
+		otlploggrpc.WithTLSCredentials,
+		otlploggrpc.WithHeaders,
+	)...)
+	if err != nil {
+		// traceExp and metricExp are lazy and never dialed; shut both down so we
+		// do not leak clients if this rare config error fires.
+		_ = traceExp.Shutdown(ctx)
+		_ = metricExp.Shutdown(ctx)
+		return nil, apperr.NewInfra("telemetry: build log exporter", err)
+	}
+
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(traceExp),
 		sdktrace.WithResource(res),
@@ -86,18 +110,26 @@ func Setup(ctx context.Context, cfg config.Config, serviceName string) (shutdown
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp)),
 		sdkmetric.WithResource(res),
 	)
+	lp := sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExp)),
+		sdklog.WithResource(res),
+	)
 
 	otel.SetTracerProvider(tp)
 	otel.SetMeterProvider(mp)
+	// Install the LoggerProvider on the log GLOBAL: the slog OTel bridge, built at
+	// the earlier boot logger step, delegates to this global and was a no-op until
+	// now — so it starts emitting without a boot reorder (see slog.go NewLogger).
+	global.SetLoggerProvider(lp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
 	))
 
 	shutdown = func(ctx context.Context) error {
-		// Join both shutdowns so a failure in one still stops the other; the
+		// Join all three shutdowns so a failure in one still stops the others; the
 		// caller sees a single typed infra error.
-		if err := errors.Join(tp.Shutdown(ctx), mp.Shutdown(ctx)); err != nil {
+		if err := errors.Join(tp.Shutdown(ctx), mp.Shutdown(ctx), lp.Shutdown(ctx)); err != nil {
 			return apperr.NewInfra("telemetry: shutdown providers", err)
 		}
 		return nil

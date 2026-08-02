@@ -9,6 +9,8 @@ import (
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/config"
+
+	"go.opentelemetry.io/otel/log/global"
 )
 
 // TestSetup is a smoke test of the wiring, with no live collector. The core
@@ -17,12 +19,15 @@ import (
 // are exercised — insecure (local collector) and TLS (authenticated backend like
 // New Relic, with an api-key header) — and both must return fast without error.
 //
-// Shutdown is bounded but not asserted error-free: the metric reader performs a
-// final flush on shutdown, which does dial the (dead) endpoint and returns an
-// infra error. What we require is that shutdown returns promptly within the
-// deadline — no hang, no panic — and that any error is a typed apperr infra
-// error, never a raw leak. Against a live collector the flush succeeds and
-// shutdown returns nil.
+// Shutdown is bounded but not asserted error-free: the metric reader and the log
+// batch processor perform a final flush on shutdown, which does dial the (dead)
+// endpoint and returns an infra error. What we require is that shutdown returns
+// promptly within the deadline — no hang, no panic — and that any error is a
+// typed apperr infra error, never a raw leak. Against a live collector the flush
+// succeeds and shutdown returns nil.
+//
+// Setup also installs the global LoggerProvider (the slog OTel bridge delegates
+// to it), asserted non-nil below.
 //
 // Not parallel: Setup installs the global otel TracerProvider/MeterProvider, so
 // concurrent subtests would race on that process-wide state.
@@ -51,6 +56,11 @@ func TestSetup(t *testing.T) {
 			}
 			if shutdown == nil {
 				t.Fatal("Setup returned nil shutdown")
+			}
+			// Setup must install a LoggerProvider on the log global so the slog
+			// OTel bridge (built earlier at the boot logger step) starts emitting.
+			if global.GetLoggerProvider() == nil {
+				t.Fatal("Setup did not install a global LoggerProvider")
 			}
 
 			// Short deadline bounds the flush attempt so the test cannot hang.
