@@ -49,7 +49,18 @@ type ErrorBody struct {
 func WriteError(c *fiber.Ctx, err error) error {
 	ae, ok := apperr.From(err)
 	if !ok {
-		ae = apperr.NewInfra("internal error", err)
+		// Fiber's router emits its own *fiber.Error for conditions it handles
+		// before any of our handlers run — most notably a 404 "Cannot GET /x" for
+		// an unmatched route (the steady drip of bots probing /.well-known/*).
+		// Honor that status instead of blanketing every non-AppError to INFRA 500:
+		// an unmatched route is a client 404, not a server bug, and must not log as
+		// "internal error". Only a truly unclassified error is a bug → INFRA 500.
+		var fe *fiber.Error
+		if errors.As(err, &fe) {
+			ae = &apperr.AppError{Kind: kindByStatus(fe.Code), Message: fe.Message}
+		} else {
+			ae = apperr.NewInfra("internal error", err)
+		}
 	}
 
 	status, known := statusByKind[ae.Kind]
@@ -108,6 +119,30 @@ func WriteValidationError(c *fiber.Ctx, err error) error {
 		Message: "validation failed",
 		Details: verrs,
 	})
+}
+
+// kindByStatus maps an HTTP status carried by a *fiber.Error (Fiber's built-in
+// router/parse failures) back to an apperr.Kind, so it flows through the same
+// envelope + log-level policy as a domain error. It is the narrow inverse of
+// statusByKind for the statuses Fiber itself produces; anything unlisted collapses
+// to Invalid (4xx) or Infra (5xx) by class.
+func kindByStatus(status int) apperr.Kind {
+	switch status {
+	case fiber.StatusNotFound:
+		return apperr.KindNotFound
+	case fiber.StatusUnauthorized:
+		return apperr.KindUnauthorized
+	case fiber.StatusForbidden:
+		return apperr.KindForbidden
+	case fiber.StatusConflict:
+		return apperr.KindConflict
+	case fiber.StatusServiceUnavailable:
+		return apperr.KindUnavailable
+	}
+	if status >= fiber.StatusInternalServerError {
+		return apperr.KindInfra
+	}
+	return apperr.KindInvalid
 }
 
 // causeOf returns the underlying cause the edge logs for a failure (5xx at Error,

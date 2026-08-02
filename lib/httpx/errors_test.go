@@ -215,6 +215,27 @@ func TestWriteError_PlainErrorIsGeneric500(t *testing.T) {
 	}
 }
 
+func TestWriteError_FiberNotFoundIsClean404(t *testing.T) {
+	t.Parallel()
+
+	// Fiber's router hands an unmatched route straight to the ErrorHandler as a
+	// *fiber.Error{404,"Cannot GET /x"} (the bot drip on /.well-known/*). It must
+	// surface as a clean 404, NOT collapse into an INFRA 500 "internal error".
+	status, body, _ := runHandler(t, func(c *fiber.Ctx) error {
+		return httpx.WriteError(c, fiber.NewError(fiber.StatusNotFound, "Cannot GET /.well-known/agent.json"))
+	})
+
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", status)
+	}
+	if body.Kind != string(apperr.KindNotFound) {
+		t.Errorf("kind = %q, want %q", body.Kind, apperr.KindNotFound)
+	}
+	if body.Message == "internal error" {
+		t.Errorf("message = %q, must not be the generic 5xx message", body.Message)
+	}
+}
+
 func TestWriteError_UnavailableHidesUpstreamCause(t *testing.T) {
 	t.Parallel()
 
