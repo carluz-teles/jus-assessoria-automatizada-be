@@ -83,6 +83,39 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 			wantErr: true,
 			field:   "address",
 		},
+		{
+			name:    "empty phone is valid (optional)",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Phone = "" },
+			wantErr: false,
+		},
+		{
+			name:    "10-digit phone is accepted",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Phone = "1133334444" },
+			wantErr: false,
+		},
+		{
+			name:    "11-digit phone is accepted",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Phone = "11987654321" },
+			wantErr: false,
+		},
+		{
+			name:    "9-digit phone is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Phone = "119876543" },
+			wantErr: true,
+			field:   "phone",
+		},
+		{
+			name:    "phone with letters is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Phone = "11ABCDE4321" },
+			wantErr: true,
+			field:   "phone",
+		},
+		{
+			name:    "masked phone is rejected (bare digits only)",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Phone = "(11) 98765-4321" },
+			wantErr: true,
+			field:   "phone",
+		},
 	}
 
 	for _, tt := range tests {
@@ -112,6 +145,7 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 
 func TestToOrgProfile_NormalizesCNPJ(t *testing.T) {
 	req := validRequest() // CNPJ carries the mask "12.345.678/0001-95"
+	req.Phone = "11987654321"
 
 	got := req.toOrgProfile()
 	if got.CNPJ != "12345678000195" {
@@ -119,5 +153,9 @@ func TestToOrgProfile_NormalizesCNPJ(t *testing.T) {
 	}
 	if got.LegalName != req.LegalName || got.TradeName != req.TradeName || got.Address != req.Address {
 		t.Fatalf("toOrgProfile() dropped a field: %+v", got)
+	}
+	// Phone passes through unchanged (bare digits, no mask stripping like CNPJ).
+	if got.Phone != req.Phone {
+		t.Fatalf("Phone = %q, want %q passed through", got.Phone, req.Phone)
 	}
 }

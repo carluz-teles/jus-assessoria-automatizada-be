@@ -269,4 +269,5 @@ type Tenant struct {
 	TradeName             *string            `json:"trade_name"`
 	Address               []byte             `json:"address"`
 	OnboardingCompletedAt pgtype.Timestamptz `json:"onboarding_completed_at"`
+	Phone                 *string            `json:"phone"`
 }

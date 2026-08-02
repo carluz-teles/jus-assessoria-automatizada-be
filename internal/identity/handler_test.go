@@ -203,6 +203,50 @@ func TestHandler_UpdateProfile_Admin_200(t *testing.T) {
 	}
 }
 
+// AC2: an optional phone in the body is validated, forwarded to the use case and
+// echoed back in the profile view.
+func TestHandler_UpdateProfile_EchoesPhone(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{profile: &Tenant{
+		CNPJ:      "12345678000195",
+		LegalName: "Escritório LTDA",
+		TradeName: "Escritório",
+		Phone:     "11987654321",
+	}}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	body := `{"cnpj":"12.345.678/0001-95","legal_name":"Escritório LTDA","trade_name":"Escritório","phone":"11987654321","address":{"cep":"01311-902","logradouro":"Av Paulista","numero":"1000","cidade":"São Paulo","uf":"SP"}}`
+	status, resp := do(t, app, http.MethodPut, "/v1/organization/profile", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, resp)
+	}
+	if uc.gotProfile.Phone != "11987654321" {
+		t.Fatalf("phone forwarded to uc = %q, want 11987654321", uc.gotProfile.Phone)
+	}
+	if !strings.Contains(resp, `"phone":"11987654321"`) {
+		t.Fatalf("response missing echoed phone: %s", resp)
+	}
+}
+
+// AC2: a phone that is present but malformed (not 10–11 digits) is a 400; the use
+// case never runs. An absent phone stays valid (covered by the Admin_200 case).
+func TestHandler_UpdateProfile_InvalidPhone_400(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-1")
+
+	body := `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","phone":"119876543","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`
+	status, resp := do(t, app, http.MethodPut, "/v1/organization/profile", body, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, resp)
+	}
+	if uc.gotTenantID != "" {
+		t.Fatal("use case ran on an invalid phone")
+	}
+}
+
 // AC5: a non-ADMIN (LAWYER) → 403; the use case never runs.
 func TestHandler_UpdateProfile_Lawyer_403(t *testing.T) {
 	t.Parallel()

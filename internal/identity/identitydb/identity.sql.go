@@ -65,7 +65,7 @@ func (q *Queries) GetMeByClerkUser(ctx context.Context, clerkUserID string) (Get
 }
 
 const getTenantByClerkOrg = `-- name: GetTenantByClerkOrg :one
-SELECT id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at FROM tenant
+SELECT id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at, phone FROM tenant
 WHERE clerk_org_id = $1
 `
 
@@ -82,12 +82,13 @@ func (q *Queries) GetTenantByClerkOrg(ctx context.Context, clerkOrgID string) (T
 		&i.TradeName,
 		&i.Address,
 		&i.OnboardingCompletedAt,
+		&i.Phone,
 	)
 	return i, err
 }
 
 const getTenantByID = `-- name: GetTenantByID :one
-SELECT id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at FROM tenant
+SELECT id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at, phone FROM tenant
 WHERE id = $1
 `
 
@@ -104,6 +105,7 @@ func (q *Queries) GetTenantByID(ctx context.Context, id uuid.UUID) (Tenant, erro
 		&i.TradeName,
 		&i.Address,
 		&i.OnboardingCompletedAt,
+		&i.Phone,
 	)
 	return i, err
 }
@@ -215,9 +217,10 @@ UPDATE tenant
        legal_name = $3,
        trade_name = $4,
        address = $5,
+       phone = $6,
        onboarding_completed_at = COALESCE(onboarding_completed_at, now())
 WHERE id = $1
-RETURNING id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at
+RETURNING id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at, phone
 `
 
 type UpdateOrgProfileParams struct {
@@ -226,13 +229,16 @@ type UpdateOrgProfileParams struct {
 	LegalName *string   `json:"legal_name"`
 	TradeName *string   `json:"trade_name"`
 	Address   []byte    `json:"address"`
+	Phone     *string   `json:"phone"`
 }
 
 // Persist the escritório's company profile during onboarding and stamp the
 // onboarding gate exactly once: COALESCE keeps the first completion time across
 // replays (idempotent — a second PUT does not move onboarding_completed_at).
-// WHERE id scopes the write to the caller's own tenant (app-level barrier; the
-// tenant table has no tenant_id of its own and therefore no RLS policy).
+// phone is optional (the company's phone, not the user's) and written straight —
+// an absent phone arrives as SQL NULL and simply clears the column. WHERE id
+// scopes the write to the caller's own tenant (app-level barrier; the tenant
+// table has no tenant_id of its own and therefore no RLS policy).
 func (q *Queries) UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (Tenant, error) {
 	row := q.db.QueryRow(ctx, updateOrgProfile,
 		arg.ID,
@@ -240,6 +246,7 @@ func (q *Queries) UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfilePara
 		arg.LegalName,
 		arg.TradeName,
 		arg.Address,
+		arg.Phone,
 	)
 	var i Tenant
 	err := row.Scan(
@@ -252,6 +259,7 @@ func (q *Queries) UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfilePara
 		&i.TradeName,
 		&i.Address,
 		&i.OnboardingCompletedAt,
+		&i.Phone,
 	)
 	return i, err
 }
@@ -324,7 +332,7 @@ INSERT INTO tenant (clerk_org_id, name)
 VALUES ($1, $2)
 ON CONFLICT (clerk_org_id) DO UPDATE
    SET name = EXCLUDED.name
-RETURNING id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at
+RETURNING id, clerk_org_id, name, created_at, cnpj, legal_name, trade_name, address, onboarding_completed_at, phone
 `
 
 type UpsertTenantParams struct {
@@ -348,6 +356,7 @@ func (q *Queries) UpsertTenant(ctx context.Context, arg UpsertTenantParams) (Ten
 		&i.TradeName,
 		&i.Address,
 		&i.OnboardingCompletedAt,
+		&i.Phone,
 	)
 	return i, err
 }

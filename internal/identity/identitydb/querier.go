@@ -44,8 +44,10 @@ type Querier interface {
 	// Persist the escritório's company profile during onboarding and stamp the
 	// onboarding gate exactly once: COALESCE keeps the first completion time across
 	// replays (idempotent — a second PUT does not move onboarding_completed_at).
-	// WHERE id scopes the write to the caller's own tenant (app-level barrier; the
-	// tenant table has no tenant_id of its own and therefore no RLS policy).
+	// phone is optional (the company's phone, not the user's) and written straight —
+	// an absent phone arrives as SQL NULL and simply clears the column. WHERE id
+	// scopes the write to the caller's own tenant (app-level barrier; the tenant
+	// table has no tenant_id of its own and therefore no RLS policy).
 	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (Tenant, error)
 	// Provision or reactivate a membership from an organizationMembership.created
 	// webhook. Idempotent for at-least-once delivery: ON CONFLICT re-asserts the

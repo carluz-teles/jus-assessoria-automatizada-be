@@ -117,13 +117,16 @@ WHERE u.clerk_user_id = $1;
 -- Persist the escritório's company profile during onboarding and stamp the
 -- onboarding gate exactly once: COALESCE keeps the first completion time across
 -- replays (idempotent — a second PUT does not move onboarding_completed_at).
--- WHERE id scopes the write to the caller's own tenant (app-level barrier; the
--- tenant table has no tenant_id of its own and therefore no RLS policy).
+-- phone is optional (the company's phone, not the user's) and written straight —
+-- an absent phone arrives as SQL NULL and simply clears the column. WHERE id
+-- scopes the write to the caller's own tenant (app-level barrier; the tenant
+-- table has no tenant_id of its own and therefore no RLS policy).
 UPDATE tenant
    SET cnpj = $2,
        legal_name = $3,
        trade_name = $4,
        address = $5,
+       phone = $6,
        onboarding_completed_at = COALESCE(onboarding_completed_at, now())
 WHERE id = $1
 RETURNING *;

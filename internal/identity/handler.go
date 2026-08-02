@@ -62,6 +62,7 @@ type profileView struct {
 	LegalName             string     `json:"legal_name"`
 	TradeName             string     `json:"trade_name"`
 	Address               *Address   `json:"address"`
+	Phone                 string     `json:"phone"`
 	OnboardingCompletedAt *time.Time `json:"onboarding_completed_at"`
 }
 
@@ -120,6 +121,7 @@ func newProfileView(tenant *Tenant) profileView {
 		LegalName:             tenant.LegalName,
 		TradeName:             tenant.TradeName,
 		Address:               tenant.Address,
+		Phone:                 tenant.Phone,
 		OnboardingCompletedAt: tenant.OnboardingCompletedAt,
 	}
 }

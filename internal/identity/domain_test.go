@@ -790,6 +790,7 @@ func TestUseCase_UpdateOrgProfile(t *testing.T) {
 		LegalName: "Escritório LTDA",
 		TradeName: "Escritório",
 		Address:   Address{CEP: "01311902", Logradouro: "Av Paulista", Cidade: "São Paulo", UF: "SP"},
+		Phone:     "11987654321",
 	}
 	saved := &Tenant{ID: tenantID, CNPJ: profile.CNPJ, LegalName: profile.LegalName, TradeName: profile.TradeName}
 
