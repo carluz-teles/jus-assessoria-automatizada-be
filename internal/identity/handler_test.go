@@ -46,11 +46,22 @@ type fakeHandlerUC struct {
 	gotTenantID string
 	gotProfile  OrgProfile
 	profileErr  error
+
+	orgProfile         *Tenant
+	gotReadTenantID    string
+	orgProfileErr      error
+	orgProfileReadFlag bool
 }
 
 func (f *fakeHandlerUC) GetMe(_ context.Context, clerkUserID string) (Me, error) {
 	f.gotClerkUserID = clerkUserID
 	return f.me, f.meErr
+}
+
+func (f *fakeHandlerUC) GetOrgProfile(_ context.Context, tenantID string) (*Tenant, error) {
+	f.gotReadTenantID = tenantID
+	f.orgProfileReadFlag = true
+	return f.orgProfile, f.orgProfileErr
 }
 
 func (f *fakeHandlerUC) UpdateOrgProfile(_ context.Context, tenantID string, profile OrgProfile) (*Tenant, error) {
@@ -168,6 +179,94 @@ func TestHandler_Me_NoToken_401(t *testing.T) {
 	}
 	if uc.gotClerkUserID != "" {
 		t.Fatal("GetMe ran despite a missing token")
+	}
+}
+
+// --- GET /organization/profile ----------------------------------------------
+
+// AC1: an authenticated member → 200 with the full profile envelope
+// (cnpj/legal/trade/phone/email/address/onboarding_completed_at); tenant comes from
+// the principal, never the request.
+func TestHandler_GetOrgProfile_200(t *testing.T) {
+	t.Parallel()
+
+	onboarded := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	uc := &fakeHandlerUC{orgProfile: &Tenant{
+		CNPJ:                  "12345678000195",
+		LegalName:             "Escritório LTDA",
+		TradeName:             "Escritório",
+		Address:               &Address{CEP: "01311902", Logradouro: "Av Paulista", Cidade: "São Paulo", UF: "SP"},
+		Phone:                 "11987654321",
+		Email:                 "contato@escritorio.com.br",
+		OnboardingCompletedAt: &onboarded,
+	}}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	status, body := do(t, app, http.MethodGet, "/v1/organization/profile", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if uc.gotReadTenantID != "tenant-42" {
+		t.Fatalf("tenant passed to uc = %q, want tenant-42 (from principal)", uc.gotReadTenantID)
+	}
+	for _, want := range []string{
+		`"cnpj":"12345678000195"`,
+		`"legal_name":"Escritório LTDA"`,
+		`"trade_name":"Escritório"`,
+		`"phone":"11987654321"`,
+		`"email":"contato@escritorio.com.br"`,
+		`"cep":"01311902"`,
+		`"onboarding_completed_at":"2026-07-30T12:00:00Z"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("response missing %s: %s", want, body)
+		}
+	}
+}
+
+// AC3: the read is NOT admin-gated — a LAWYER opening the /organization page gets a
+// 200, unlike the ADMIN-only write.
+func TestHandler_GetOrgProfile_Lawyer_200(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{orgProfile: &Tenant{CNPJ: "12345678000195", LegalName: "L", TradeName: "T"}}
+	app := newProfileApp(uc, string(RoleLawyer), "tenant-42")
+
+	status, body := do(t, app, http.MethodGet, "/v1/organization/profile", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a LAWYER read; body=%s", status, body)
+	}
+	if !uc.orgProfileReadFlag {
+		t.Fatal("use case did not run for a LAWYER read")
+	}
+}
+
+// AC2: a tenant that does not exist → ErrTenantNotFound mapped to 404 at the edge.
+func TestHandler_GetOrgProfile_NotFound_404(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{orgProfileErr: ErrTenantNotFound}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	status, body := do(t, app, http.MethodGet, "/v1/organization/profile", "", "jwt")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", status, body)
+	}
+}
+
+// AC3: no bearer token → 401 at the Auth boundary; the handler never runs.
+func TestHandler_GetOrgProfile_NoToken_401(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/organization/profile", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if uc.orgProfileReadFlag {
+		t.Fatal("use case ran despite a missing token")
 	}
 }
 

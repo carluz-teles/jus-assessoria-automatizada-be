@@ -16,6 +16,7 @@ import (
 type mockRepo struct {
 	upsertTenant     func(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
 	findTenant       func(ctx context.Context, clerkOrgID string) (*Tenant, error)
+	findTenantByID   func(ctx context.Context, tenantID string) (*Tenant, error)
 	upsertUser       func(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	upsertMembership func(ctx context.Context, tx database.Tx, tenantID, appUserID, clerkMembershipID string, role Role) (*Membership, bool, error)
 	softRemoveMember func(ctx context.Context, tx database.Tx, clerkMembershipID string) (*Membership, bool, error)
@@ -32,6 +33,10 @@ func (m *mockRepo) UpsertTenant(ctx context.Context, tx database.Tx, clerkOrgID,
 
 func (m *mockRepo) FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error) {
 	return m.findTenant(ctx, clerkOrgID)
+}
+
+func (m *mockRepo) FindTenantByID(ctx context.Context, tenantID string) (*Tenant, error) {
+	return m.findTenantByID(ctx, tenantID)
 }
 
 func (m *mockRepo) UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error) {
@@ -776,6 +781,76 @@ func TestUseCase_GetMe(t *testing.T) {
 		}
 
 		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).GetMe(ctx, clerkUser)
+		if !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
+		}
+	})
+}
+
+func TestUseCase_GetOrgProfile(t *testing.T) {
+	ctx := context.Background()
+	const tenantID = "tenant-uuid"
+
+	// AC1: the saved tenant is read by its internal id and returned as-is — the
+	// full profile the handler maps to the envelope. No tx is opened (a pool read).
+	t.Run("returns the tenant read by its internal id, opening no tx", func(t *testing.T) {
+		onboarded := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+		want := &Tenant{
+			ID:                    tenantID,
+			CNPJ:                  "12345678000195",
+			LegalName:             "Escritório LTDA",
+			TradeName:             "Escritório",
+			Phone:                 "11987654321",
+			Email:                 "contato@escritorio.com.br",
+			OnboardingCompletedAt: &onboarded,
+		}
+		var gotTenantID string
+		repo := &mockRepo{
+			findTenantByID: func(_ context.Context, tid string) (*Tenant, error) {
+				gotTenantID = tid
+				return want, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		got, err := NewUseCase(repo, noopOutbox{}, uow).GetOrgProfile(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("GetOrgProfile() error = %v", err)
+		}
+		if got != want {
+			t.Fatalf("GetOrgProfile() = %+v, want %+v", got, want)
+		}
+		if gotTenantID != tenantID {
+			t.Fatalf("repo read tenant id = %q, want %q (from the principal)", gotTenantID, tenantID)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened for a pool read")
+		}
+	})
+
+	// AC2: an unknown tenant surfaces ErrTenantNotFound (→ 404 at the edge), never
+	// (nil, nil).
+	t.Run("missing tenant propagates ErrTenantNotFound", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenantByID: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+		}
+
+		got, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).GetOrgProfile(ctx, tenantID)
+		if !errors.Is(err, ErrTenantNotFound) {
+			t.Fatalf("error = %v, want ErrTenantNotFound", err)
+		}
+		if got != nil {
+			t.Fatalf("tenant = %+v, want nil on not-found", got)
+		}
+	})
+
+	t.Run("an infra error from the repo propagates", func(t *testing.T) {
+		boom := errors.New("db down")
+		repo := &mockRepo{
+			findTenantByID: func(context.Context, string) (*Tenant, error) { return nil, boom },
+		}
+
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).GetOrgProfile(ctx, tenantID)
 		if !errors.Is(err, boom) {
 			t.Fatalf("error = %v, want %v", err, boom)
 		}

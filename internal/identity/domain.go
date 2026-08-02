@@ -268,6 +268,16 @@ func (uc *UseCase) GetMe(ctx context.Context, clerkUserID string) (Me, error) {
 	return *me, nil
 }
 
+// GetOrgProfile reads the escritório's saved company profile — the read model
+// behind GET /organization/profile that the /organization page renders. It is a
+// plain pool read (no tx): any authenticated member of the tenant may read it,
+// while the write (UpdateOrgProfile) stays ADMIN-only. tenantID comes from the
+// verified principal, never the request; a missing tenant surfaces the repo's
+// typed ErrTenantNotFound (→ 404), never (nil, nil).
+func (uc *UseCase) GetOrgProfile(ctx context.Context, tenantID string) (*Tenant, error) {
+	return uc.repo.FindTenantByID(ctx, tenantID)
+}
+
 // UpdateOrgProfile persists the escritório's company profile and emits
 // identity.org_profile_updated in the SAME transaction (transactional outbox): the
 // tenant write and the event commit together or not at all. The onboarding gate is

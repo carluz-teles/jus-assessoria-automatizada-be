@@ -15,6 +15,7 @@ import (
 // exactly the two onboarding methods the HTTP surface exposes.
 type handlerUC interface {
 	GetMe(ctx context.Context, clerkUserID string) (Me, error)
+	GetOrgProfile(ctx context.Context, tenantID string) (*Tenant, error)
 	UpdateOrgProfile(ctx context.Context, tenantID string, profile OrgProfile) (*Tenant, error)
 }
 
@@ -39,10 +40,12 @@ func (h *Handler) RegisterMe(r fiber.Router) {
 	r.Get("/identity/me", h.me)
 }
 
-// RegisterV1 mounts the tenant-authenticated onboarding routes on the /v1 group.
-// The profile write is guarded by RequireRole(ADMIN): completing the escritório's
-// profile is an admin action, so a LAWYER gets 403.
+// RegisterV1 mounts the tenant-authenticated organization routes on the /v1 group.
+// The profile READ is open to any authenticated member (the /organization page a
+// LAWYER also opens); the WRITE is guarded by RequireRole(ADMIN), so completing or
+// editing the escritório's profile stays an admin action and a LAWYER gets 403.
 func (h *Handler) RegisterV1(r fiber.Router) {
+	r.Get("/organization/profile", h.getOrgProfile)
 	r.Put("/organization/profile", middleware.RequireRole(string(RoleAdmin)), h.updateOrgProfile)
 }
 
@@ -82,6 +85,21 @@ func (h *Handler) me(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(newMeView(got))
+}
+
+// getOrgProfile handles GET /v1/organization/profile: it reads the principal's
+// tenant and returns its saved company profile in the same envelope the PUT echoes.
+// No RequireRole — any authenticated member of the tenant may read it; tenant_id
+// comes from the verified principal, never the path or body. A tenant that does not
+// exist surfaces as ErrTenantNotFound (404) at the edge.
+func (h *Handler) getOrgProfile(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	tenant, err := h.uc.GetOrgProfile(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(newProfileView(tenant))
 }
 
 // updateOrgProfile handles PUT /v1/organization/profile: it validates the body,

@@ -17,6 +17,10 @@ import (
 type Repository interface {
 	UpsertTenant(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error)
 	FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error)
+	// FindTenantByID reads the tenant behind an internal tenant id — the read model
+	// for GET /organization/profile. Runs on the pool (a screen read, no tx). A
+	// missing row is the typed ErrTenantNotFound, never (nil, nil).
+	FindTenantByID(ctx context.Context, tenantID string) (*Tenant, error)
 	UpsertUser(ctx context.Context, tx database.Tx, clerkUserID, tenantID, email, name, phone string, role Role) (*AppUser, error)
 	FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error)
 	// FindActiveUserByClerkUser resolves the app_user behind a Clerk user only while
@@ -78,6 +82,25 @@ func (r *pgRepository) UpsertTenant(ctx context.Context, tx database.Tx, clerkOr
 
 func (r *pgRepository) FindTenantByClerkOrg(ctx context.Context, clerkOrgID string) (*Tenant, error) {
 	row, err := r.q.GetTenantByClerkOrg(ctx, clerkOrgID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTenantNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return tenantToEntity(row)
+}
+
+// FindTenantByID reads on the pool (a screen read, no tx). tenantID is the
+// internal uuid (a string on the entity), parsed back to uuid.UUID here. A missing
+// row is the typed ErrTenantNotFound — the caller distinguishes an unknown tenant
+// from an infra fault by that sentinel, never by (nil, nil).
+func (r *pgRepository) FindTenantByID(ctx context.Context, tenantID string) (*Tenant, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	row, err := r.q.GetTenantByID(ctx, tid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrTenantNotFound
 	}
