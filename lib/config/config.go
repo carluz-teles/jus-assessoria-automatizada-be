@@ -83,6 +83,11 @@ type Config struct {
 	S3Bucket    string `env:"S3_BUCKET"`
 	S3AccessKey string `env:"S3_ACCESS_KEY"`
 	S3SecretKey string `env:"S3_SECRET_KEY"`
+
+	// Calendário de prazos.
+	// HolidaySeedYearsAhead — quantos anos ALÉM do corrente o seeder nacional de
+	// feriados pré-carrega no boot do api (via BrasilAPI). 2 = ano corrente + 2.
+	HolidaySeedYearsAhead int `env:"HOLIDAY_SEED_YEARS_AHEAD" envDefault:"2"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do

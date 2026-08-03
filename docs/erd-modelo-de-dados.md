@@ -38,7 +38,7 @@ ACQUISITION     integration · sync_run
 CONSOLIDATION   court_case · court_record · docket_entry · intimation · case_link
 DOCUMENTS       document · chunk
 ADVISORY        draft · review · petition
-DEADLINES       deadline
+DEADLINES       deadline · holiday
 RISK     [v1+]  risk_assessment
 INFRA           outbox · processed_event · backfill_job
 ```
@@ -209,6 +209,8 @@ CREATE TABLE court_record (
   court          text NOT NULL,
   class          text,
   subject        text,
+  filed_at       date,                    -- ajuizamento (DATAJUD dataAjuizamento) [0012]
+  judging_body   text,                    -- órgão julgador (DATAJUD orgaoJulgador / DJEN nomeOrgao) [0012]
   claim_value    numeric(15,2),
   secrecy        text NOT NULL DEFAULT 'PUBLIC',    -- PUBLIC|RESTRICTED|SECRET
   lifecycle      text NOT NULL DEFAULT 'ACTIVE',    -- ACTIVE|SUSPENDED|ARCHIVED|SUPERSEDED
@@ -222,6 +224,8 @@ CREATE INDEX ON court_record (next_sync_at) WHERE lifecycle = 'ACTIVE';  -- a qu
 CREATE INDEX ON court_record (tenant_id, case_id);
 ```
 A chave é a tripla — nenhum campo sozinho identifica. O índice parcial serve o scheduler (roda a cada 60s).
+
+**Descoberta por DJEN aterrissa `degree=UNKNOWN`** (o DJEN não informa o grau). Quando o DATAJUD revela o grau, a consolidação faz *placeholder+merge*: acha/cria o `court_record` do grau real no mesmo `court_case`, re-aponta `intimation`/`docket_entry` pra ele e marca o UNKNOWN `lifecycle=SUPERSEDED`. Como a unicidade de `intimation` é `(tenant, case_id, hash)`, trocar o `court_record_id` não quebra dedup. (decisão dos conectores DJEN/DATAJUD, 0012)
 
 ## docket_entry [v0]
 A linha do log de andamentos. A tabela que mais cresce (~10M linhas/ano em escala).
@@ -263,10 +267,16 @@ CREATE TABLE intimation (
   deadline_start_at date NOT NULL,        -- derivado: 1º dia útil após publicação
   content           text NOT NULL,        -- teor
   source            text NOT NULL,
+  source_url        text,                 -- link profundo no tribunal (DJEN 'link') [0012]
+  type              text,                 -- INTIMACAO|CITACAO|COMUNICACAO (DJEN tipoComunicacao) [0012]
+  status            text NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE|CANCELLED|SUPERSEDED [0012]
+  cancelled_at      date,                 -- DJEN data_cancelamento [0012]
+  cancel_reason     text,                 -- DJEN motivo_cancelamento [0012]
   recipients        jsonb NOT NULL DEFAULT '[]',
   UNIQUE (tenant_id, case_id, hash)
 );
 ```
+As três datas são derivadas no parser via `lib/calendar` (`published_at` = 1º dia útil após a disponibilização; `deadline_start_at` = 1º dia útil após a publicação, CPC 224). **`status` torna o upsert `DO UPDATE`**: quando o DJEN cancela/retifica (`data_cancelamento`), a intimação vira `CANCELLED` e emite `intimation.cancelled` para a slice de prazos **revogar** o `deadline` — sem isso, prazo fantasma. `type` alimenta a regra de contagem (citação × intimação). (conectores DJEN/DATAJUD, 0012)
 
 ## case_link [v0 (só DETERMINISTIC)]
 Liga duas court_records da mesma lide. Registra **por que**; não é o mecanismo de agrupamento (isso é `court_record.case_id`).
@@ -407,6 +417,24 @@ CREATE INDEX ON deadline (end_date) WHERE status = 'OPEN';   -- varredura de ven
 ```
 `holidays_applied` guardado porque quando o advogado discordar da data, a resposta tem que estar aqui.
 
+## holiday [v0 (referência)]
+Calendário de dias não úteis — insumo de `lib/calendar` para derivar `published_at`/`deadline_start_at` (intimation) e `end_date` (deadline). É dado de **referência** (não é por-tenant).
+
+```sql
+CREATE TABLE holiday (
+  id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  scope    text NOT NULL,          -- NATIONAL | STATE | COURT
+  scope_id text,                   -- null p/ NATIONAL; UF p/ STATE; sigla do tribunal p/ COURT
+  date     date NOT NULL,
+  name     text NOT NULL,
+  UNIQUE (scope, scope_id, date)
+);
+CREATE INDEX ON holiday (scope, scope_id, date);
+```
+Cobertura completa (Nacional + Estadual + Tribunal), **semeada progressivamente**: a estrutura já suporta os três níveis; as linhas entram por seed/carga sem mudar código. O **recesso forense (20/12–20/01, CPC 220)** é regra fixa em `lib/calendar`, não linhas. (conectores DJEN/DATAJUD, 0012)
+
+Fontes por nível: **NATIONAL** — semeado em runtime no boot do api via BrasilAPI (`lib/calendar.SeedNational`), não fica em migration. **STATE** — seed estático na migration **0013**, gerado por `scripts/gen_state_holidays.py` (interseção `vacanza/holidays` ∩ `workalendar`; viés seguro p/ prazo: só datas corroboradas pelas 2 libs, senão o prazo poderia ficar longo demais). Divergências ficam em `scripts/holiday_state_review.txt` p/ revisão jurídica; refresh anual = re-rodar o script → nova migration. **COURT** — sem API oficial; pipeline futuro (portaria/manual) sob demanda, e é a autoridade real que refina o STATE.
+
 ---
 
 # 8. Risk [v1+]
@@ -511,6 +539,7 @@ O `UPDATE ... RETURNING` atômico sobre `slices_ok` é o que evita corrida na co
 | `review` | Advisory | ✅ | sim | coverage declarada |
 | `petition` | Advisory | ✅ | sim | fecha o loop |
 | `deadline` | Deadlines | ✅ | sim | ancora na court_record |
+| `holiday` | Deadlines | ✅ | não | referência (não por-tenant); insumo de lib/calendar |
 | `risk_assessment` | Risk | ⛔ v1+ | sim | append-only |
 | `outbox` | Infra | ✅ | **muito** | purgar publicados |
 | `processed_event` | Infra | ✅ | **muito** | purgar antigos |

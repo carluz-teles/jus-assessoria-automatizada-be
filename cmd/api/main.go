@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/hibiken/asynq"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
+	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -80,6 +82,17 @@ func run(logger *slog.Logger) error {
 	pool, err := database.NewPool(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("open database pool: %w", err)
+	}
+
+	// Seed the national holiday calendar (BrasilAPI) for the current year plus
+	// cfg.HolidaySeedYearsAhead, so lib/calendar can derive deadline dates. Fail-
+	// soft: a BrasilAPI outage must never block boot — the seeder logs and
+	// self-heals on the next boot once the provider recovers.
+	if err := calendar.SeedNational(
+		ctx, calendar.NewStore(pool), calendar.NewBrasilAPIFetcher(), logger,
+		time.Now().UTC().Year(), cfg.HolidaySeedYearsAhead,
+	); err != nil {
+		logger.Warn("national holiday seed failed", "error", err)
 	}
 
 	redisOpt, err := asynq.ParseRedisURI(cfg.RedisURL)

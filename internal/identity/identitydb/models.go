@@ -134,6 +134,14 @@ type Draft struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type Holiday struct {
+	ID      uuid.UUID   `json:"id"`
+	Scope   string      `json:"scope"`
+	ScopeID *string     `json:"scope_id"`
+	Date    pgtype.Date `json:"date"`
+	Name    string      `json:"name"`
+}
+
 type Integration struct {
 	ID            uuid.UUID          `json:"id"`
 	TenantID      uuid.UUID          `json:"tenant_id"`

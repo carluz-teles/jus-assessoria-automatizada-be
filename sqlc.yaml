@@ -84,6 +84,27 @@ sql:
               import: "github.com/google/uuid"
               type: "UUID"
 
+  # ── calendar (lib de infra): holiday (reference data, cross-slice) ──────────
+  # Exceção consciente ao "um bloco por slice": holiday é dado de referência
+  # compartilhado (consumido por acquisition + deadlines), então vive em lib/, não
+  # num slice — mas segue o mesmo padrão sqlc para manter as queries type-safe.
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "lib/calendar/queries"
+    gen:
+      go:
+        package: "calendardb"
+        out: "lib/calendar/calendardb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
   # Bloco-modelo (copiar ao criar o próximo slice, ex.: draft):
   # - engine: "postgresql"
   #   schema: "migrations"
