@@ -91,7 +91,7 @@ func do(t *testing.T, app *fiber.App, method, path, body, bearer string) (int, s
 	return resp.StatusCode, string(raw)
 }
 
-const validBody = `{"sources":["DJEN","DATAJUD"],"scope":{"oab":["SP123456"]}}`
+const validBody = `{"sources":["DJEN"],"scope":{"oab":["SP123456"]}}`
 
 // --- tests -------------------------------------------------------------------
 
@@ -124,7 +124,6 @@ func TestHandler_Activate_Admin_201(t *testing.T) {
 
 	uc := &fakeHandlerUC{activateResp: []*Integration{
 		{ID: "i1", Source: SourceDJEN, Scope: Scope{OAB: []string{"SP123456"}}, Status: StatusActive},
-		{ID: "i2", Source: SourceDATAJUD, Scope: Scope{OAB: []string{"SP123456"}}, Status: StatusActive},
 	}}
 	app := newApp(uc, roleAdmin, "tenant-42")
 
@@ -135,8 +134,8 @@ func TestHandler_Activate_Admin_201(t *testing.T) {
 	if uc.gotTenantID != "tenant-42" {
 		t.Fatalf("tenant passed to uc = %q, want tenant-42 (from principal)", uc.gotTenantID)
 	}
-	if len(uc.gotSources) != 2 {
-		t.Fatalf("sources passed = %v, want 2", uc.gotSources)
+	if len(uc.gotSources) != 1 || uc.gotSources[0] != SourceDJEN {
+		t.Fatalf("sources passed = %v, want [DJEN]", uc.gotSources)
 	}
 	// AC10: credential_ref must never surface in the response.
 	if strings.Contains(body, "credential_ref") {

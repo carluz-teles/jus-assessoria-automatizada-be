@@ -92,20 +92,22 @@ func run(logger *slog.Logger) error {
 	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow)
 
 	// The sync use case resolves its connector per event from the orchestrator, by
-	// the event's source. DJEN is the REAL Comunica API connector (national OAB
-	// discovery, no auth); DATAJUD stays a stub until its enrichment slice lands.
+	// the event's source. Both connectors are REAL now: DJEN discovers nationally by
+	// OAB (no auth); DATAJUD enriches one process by number from the tribunal's index
+	// (public API key). DATAJUD never discovers, so it is not an activatable
+	// integration — it runs only through the enrichment listener below.
 	orchestrator := acquisition.NewOrchestrator()
 	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewDJENConnector())
-	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewStubConnector(acquisition.SourceDATAJUD))
+	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewDATAJUDConnector())
 
 	// Parsers are resolved by CanParse: the DJEN parser claims DJEN payloads and
 	// derives the CPC-224 publication/deadline dates through the judicial calendar
-	// (holiday table); the stub parser handles the DATAJUD stub payloads. The DJEN
-	// parser goes first so it wins its source.
+	// (holiday table); the DATAJUD parser claims DATAJUD payloads and maps the graded
+	// process + its movimentos.
 	cal := calendar.New(calendar.NewStore(pool))
 	parser := acquisition.ParserSet{
 		acquisition.NewDJENParser(cal),
-		acquisition.NewStubParser(),
+		acquisition.NewDATAJUDParser(),
 	}
 
 	// Billing entitlement: the sync cycle gates a NEW court record against the
@@ -116,7 +118,12 @@ func run(logger *slog.Logger) error {
 	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser,
 		acquisition.WithEntitlementChecker(entitlement))
 
-	acquisition.NewListener(backfill, sync).Register(mux)
+	// DATAJUD enrichment reacts to court_record_observed (a DJEN placeholder,
+	// degree=UNKNOWN): it fetches the process by number to reveal the grau and does
+	// the placeholder+merge. It shares the orchestrator and the ParserSet.
+	enrichment := acquisition.NewEnrichmentUseCase(repo, outbox, uow, orchestrator, parser)
+
+	acquisition.NewListener(backfill, sync, enrichment).Register(mux)
 
 	// notifications: consume notification.requested and deliver by e-mail (Resend).
 	// The provider config is required here (this worker runs the listener), so a

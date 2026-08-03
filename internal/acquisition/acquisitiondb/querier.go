@@ -66,6 +66,8 @@ type Querier interface {
 	// Append one andamento, idempotent on (court_record_id, hash). On conflict the
 	// row is left untouched and no id is returned (pgx.ErrNoRows), which the caller
 	// reads as "deduped" — so a re-sync emits no docket_entry_observed for it.
+	// tpu_code (Tabela Processual Unificada) and complements are DATAJUD movimento
+	// classification; NULL for sources that do not classify the entry.
 	InsertDocketEntry(ctx context.Context, arg InsertDocketEntryParams) (uuid.UUID, error)
 	// Append or reconcile one intimação, keyed on (tenant_id, case_id, hash). Unlike
 	// docket entries, this is ON CONFLICT DO UPDATE (not DO NOTHING): when the DJEN
@@ -99,6 +101,14 @@ type Querier interface {
 	// órgão julgador (NULL) keeps the value a prior sync learned — DATAJUD reveals it
 	// after a DJEN discovery landed the record without it (placeholder+merge).
 	MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecordSyncedParams) error
+	// Move the placeholder's intimations onto the graded record. Unicidade de
+	// intimation é (tenant, case_id, hash), so swapping court_record_id never breaks
+	// dedup (same case). Returns the number of rows moved.
+	RepointIntimations(ctx context.Context, arg RepointIntimationsParams) (int64, error)
+	// Retire the UNKNOWN placeholder after its children moved: it no longer represents
+	// a live process (the graded record does), so it drops out of the ACTIVE count and
+	// the scheduler (next_sync_at NULL).
+	SupersedeCourtRecord(ctx context.Context, arg SupersedeCourtRecordParams) error
 	// Close a sync run, but ONLY from RUNNING: the status guard makes this the single
 	// winning transition (compare-and-swap), so a redelivery that resumes a run
 	// another execution already closed affects zero rows. OK carries the item tallies
@@ -107,6 +117,21 @@ type Querier interface {
 	// close won (a row) or lost the race (pgx.ErrNoRows) — the signal to publish the
 	// terminal event exactly once. Mirrors FinalizeBackfillJob's RUNNING-only guard.
 	UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) (uuid.UUID, error)
+	// enrichment cycle queries (acquisition slice).
+	// DATAJUD enrichment reacts to court_record_observed for a DJEN placeholder
+	// (degree=UNKNOWN): it fetches the process by number, reveals the grau, and does
+	// the placeholder+merge — find/create the GRADED court_record in the same case,
+	// re-point the placeholder's intimations onto it, and mark the placeholder
+	// SUPERSEDED. DJEN discovery produces no docket entries, so the placeholder never
+	// has any to re-point; DATAJUD's movimentos attach directly to the graded record
+	// (InsertDocketEntry, sync.sql).
+	// Find-or-create the graded court_record on its natural key (tenant, cnj, degree)
+	// and refresh the fields DATAJUD is authoritative for. Unlike the discovery path
+	// this is NOT gated by the entitlement limit: the process is already tracked (the
+	// UNKNOWN placeholder counted against the plan), so grading it must not consume a
+	// second slot. case_id is only written on insert (a pre-existing graded record
+	// keeps its case); RETURNING carries both so the caller re-points onto this row.
+	UpsertGradedCourtRecord(ctx context.Context, arg UpsertGradedCourtRecordParams) (UpsertGradedCourtRecordRow, error)
 	// acquisition slice queries (integration).
 	// The upsert is keyed by (tenant_id, source) so re-activating a source is
 	// idempotent at the row level; credential_ref is never written from here (it

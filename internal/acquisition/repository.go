@@ -42,6 +42,12 @@ type Repository interface {
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
+
+	// DATAJUD enrichment — the placeholder+merge grade reconciliation. The
+	// enrichment use case depends on the narrow enrichRepo view of these.
+	UpsertGradedCourtRecord(ctx context.Context, tx database.Tx, params GradedRecordParams) (*CourtRecord, error)
+	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
+	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -434,6 +440,8 @@ func (r *pgRepository) UpsertDocketEntries(ctx context.Context, tx database.Tx, 
 			ObservedAt:    pgtype.Timestamptz{Time: p.ObservedAt, Valid: true},
 			Source:        p.Source,
 			Fidelity:      int32(p.Fidelity),
+			TpuCode:       nullInt32(p.TPUCode),
+			Complements:   complementsOrNil(p.Complements),
 			Text:          p.Text,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -506,6 +514,91 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 	return newCount, nil
 }
 
+// UpsertGradedCourtRecord find-or-creates the graded court record inside the
+// caller's tx (natural key tenant+cnj+degree, in the given case) and refreshes the
+// DATAJUD-authoritative fields, returning the entity the enrichment re-points onto.
+// It is NOT entitlement-gated: grading an already-tracked process must not consume
+// a second plan slot.
+func (r *pgRepository) UpsertGradedCourtRecord(ctx context.Context, tx database.Tx, params GradedRecordParams) (*CourtRecord, error) {
+	tid, err := uuid.Parse(params.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	caseID, err := uuid.Parse(params.CaseID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	row, err := acquisitiondb.New(tx).UpsertGradedCourtRecord(ctx, acquisitiondb.UpsertGradedCourtRecordParams{
+		TenantID:     tid,
+		CaseID:       caseID,
+		CnjNumber:    params.CNJNumber,
+		Degree:       params.Degree,
+		Court:        params.Court,
+		Class:        nullString(params.Class),
+		Subject:      nullString(params.Subject),
+		JudgingBody:  nullString(params.JudgingBody),
+		FiledAt:      nullDate(params.FiledAt),
+		Secrecy:      params.Secrecy,
+		Completeness: params.Completeness,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return &CourtRecord{
+		ID:        row.ID.String(),
+		TenantID:  params.TenantID,
+		CaseID:    row.CaseID.String(),
+		CNJNumber: params.CNJNumber,
+		Degree:    params.Degree,
+		Court:     params.Court,
+	}, nil
+}
+
+// RepointIntimations moves the placeholder's intimations onto the graded record
+// inside the caller's tx and returns how many moved. Scoped by tenant_id (RLS
+// barrier 1); dedup (tenant, case_id, hash) is unaffected by the court_record_id swap.
+func (r *pgRepository) RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	from, err := uuid.Parse(fromRecordID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	to, err := uuid.Parse(toRecordID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	moved, err := acquisitiondb.New(tx).RepointIntimations(ctx, acquisitiondb.RepointIntimationsParams{
+		TenantID:          tid,
+		FromCourtRecordID: from,
+		ToCourtRecordID:   to,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(moved), nil
+}
+
+// SupersedeCourtRecord retires the UNKNOWN placeholder inside the caller's tx,
+// scoped by tenant_id. It is a no-op if the row is invisible (RLS) or gone.
+func (r *pgRepository) SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	rid, err := uuid.Parse(recordID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	err = acquisitiondb.New(tx).SupersedeCourtRecord(ctx, acquisitiondb.SupersedeCourtRecordParams{
+		TenantID: tid,
+		ID:       rid,
+	})
+	return database.WrapInfra(err)
+}
+
 // newCourtRecordEntity assembles the CourtRecord the use case works with from the
 // resolved ids and the request's natural-key fields.
 func newCourtRecordEntity(id, caseID uuid.UUID, params FindOrCreateCourtRecordParams) *CourtRecord {
@@ -542,6 +635,25 @@ func nullDate(t time.Time) pgtype.Date {
 func recipientsOrEmpty(raw json.RawMessage) []byte {
 	if len(raw) == 0 {
 		return []byte("[]")
+	}
+	return raw
+}
+
+// nullInt32 maps a zero TPU code to SQL NULL (nil *int32) for the nullable
+// tpu_code column; a real code is written as-is.
+func nullInt32(n int) *int32 {
+	if n == 0 {
+		return nil
+	}
+	v := int32(n)
+	return &v
+}
+
+// complementsOrNil maps an absent complements blob to SQL NULL (the column is
+// nullable jsonb), leaving a present blob as-is.
+func complementsOrNil(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return nil
 	}
 	return raw
 }

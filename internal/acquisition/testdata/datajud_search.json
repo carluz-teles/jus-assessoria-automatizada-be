@@ -1,0 +1,129 @@
+{
+ "took": 2519,
+ "timed_out": false,
+ "hits": {
+  "total": {
+   "value": 1,
+   "relation": "eq"
+  },
+  "hits": [
+   {
+    "_index": "api_publica_tjrs",
+    "_id": "TJRS_G1_50007978720168210156",
+    "_score": 1.0,
+    "_source": {
+     "id": "TJRS_G1_50007978720168210156",
+     "tribunal": "TJRS",
+     "grau": "G1",
+     "numeroProcesso": "50007978720168210156",
+     "dataAjuizamento": "20161125000000",
+     "nivelSigilo": 0,
+     "orgaoJulgador": {
+      "codigo": 3085,
+      "nome": "1ª Vara Cível da Comarca de Charqueadas",
+      "codigoMunicipioIBGE": 4305355
+     },
+     "classe": {
+      "codigo": 1112,
+      "nome": "Execução de Alimentos"
+     },
+     "sistema": {
+      "codigo": 4,
+      "nome": "Projudi"
+     },
+     "formato": {
+      "codigo": 1,
+      "nome": "Eletrônico"
+     },
+     "dataHoraUltimaAtualizacao": "2026-08-03T15:18:12.742000Z",
+     "@timestamp": "2026-08-03T15:18:12.742000Z",
+     "movimentos": [
+      {
+       "codigo": 1061,
+       "dataHora": "2026-07-30T02:25:10.000Z",
+       "nome": "Disponibilização no Diário da Justiça Eletrônico",
+       "orgaoJulgador": {
+        "codigo": "3085",
+        "nome": "1ª Vara Cível da Comarca de Charqueadas"
+       }
+      },
+      {
+       "codigo": 51,
+       "dataHora": "2026-07-15T12:10:26.000Z",
+       "nome": "Conclusão",
+       "complementosTabelados": [
+        {
+         "codigo": 3,
+         "descricao": "tipo_de_conclusao",
+         "valor": 5,
+         "nome": "para despacho"
+        }
+       ],
+       "orgaoJulgador": {
+        "codigo": "3085",
+        "nome": "1ª Vara Cível da Comarca de Charqueadas"
+       }
+      },
+      {
+       "codigo": 51,
+       "dataHora": "2026-05-18T18:52:51.000Z",
+       "nome": "Conclusão",
+       "complementosTabelados": [
+        {
+         "codigo": 3,
+         "descricao": "tipo_de_conclusao",
+         "valor": 5,
+         "nome": "para despacho"
+        }
+       ],
+       "orgaoJulgador": {
+        "codigo": "3085",
+        "nome": "1ª Vara Cível da Comarca de Charqueadas"
+       }
+      },
+      {
+       "codigo": 581,
+       "dataHora": "2026-04-27T16:22:49.000Z",
+       "nome": "Documento",
+       "complementosTabelados": [
+        {
+         "codigo": 4,
+         "descricao": "tipo_de_documento",
+         "valor": 107,
+         "nome": "Certidão"
+        }
+       ],
+       "orgaoJulgador": {
+        "codigo": "3085",
+        "nome": "1ª Vara Cível da Comarca de Charqueadas"
+       }
+      },
+      {
+       "codigo": 581,
+       "dataHora": "2026-04-27T15:46:34.000Z",
+       "nome": "Documento",
+       "complementosTabelados": [
+        {
+         "codigo": 4,
+         "descricao": "tipo_de_documento",
+         "valor": 107,
+         "nome": "Certidão"
+        }
+       ],
+       "orgaoJulgador": {
+        "codigo": "3085",
+        "nome": "1ª Vara Cível da Comarca de Charqueadas"
+       }
+      }
+     ],
+     "assuntos": [
+      {
+       "codigo": 5779,
+       "nome": "Alimentos"
+      }
+     ]
+    }
+   }
+  ]
+ }
+}

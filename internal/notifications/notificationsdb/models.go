@@ -81,6 +81,7 @@ type CourtRecord struct {
 	NextSyncAt   pgtype.Timestamptz `json:"next_sync_at"`
 	LastSyncedAt []byte             `json:"last_synced_at"`
 	JudgingBody  *string            `json:"judging_body"`
+	FiledAt      pgtype.Date        `json:"filed_at"`
 }
 
 type Deadline struct {

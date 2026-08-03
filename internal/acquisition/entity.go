@@ -61,6 +61,22 @@ const (
 	DegreeUnknown  = "UNKNOWN"
 )
 
+// Secrecy constants — a court_record's disclosure level (schema default PUBLIC).
+// DATAJUD's nivelSigilo (0..N) maps onto these; DJEN discovery never sets it.
+const (
+	SecrecyPublic     = "PUBLIC"
+	SecrecyRestricted = "RESTRICTED"
+	SecrecySecret     = "SECRET"
+)
+
+// Lifecycle constants — a court_record's process-liveness flag. Only ACTIVE counts
+// against the plan ceiling; SUPERSEDED is the UNKNOWN placeholder after a DATAJUD
+// grade reveal re-pointed its children to the graded record (placeholder+merge).
+const (
+	LifecycleActive     = "ACTIVE"
+	LifecycleSuperseded = "SUPERSEDED"
+)
+
 // SyncRun is the auditable record of one sync execution: which connector ran,
 // under which integration, and its outcome. It lands RUNNING at the start of the
 // cycle and transitions to OK (with the item counters) or FAILED (with the

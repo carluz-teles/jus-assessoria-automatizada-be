@@ -73,7 +73,7 @@ func TestListener_HandleIntegrationActivated_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil)
+	l := NewListener(spy, nil, nil)
 	task := asynq.NewTask(TypeIntegrationActivated, payload)
 
 	if err := l.handleIntegrationActivated(context.Background(), task); err != nil {
@@ -93,7 +93,7 @@ func TestListener_HandleIntegrationActivated_BadPayloadSkipsRetry(t *testing.T) 
 	t.Parallel()
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil)
+	l := NewListener(spy, nil, nil)
 	task := asynq.NewTask(TypeIntegrationActivated, []byte("{not json"))
 
 	err := l.handleIntegrationActivated(context.Background(), task)
@@ -128,7 +128,7 @@ func TestListener_HandleSyncRequested_Dispatches(t *testing.T) {
 	}
 
 	spy := &spySyncUC{}
-	l := NewListener(nil, spy)
+	l := NewListener(nil, spy, nil)
 	task := asynq.NewTask(TypeSyncRequested, payload)
 
 	if err := l.handleSyncRequested(context.Background(), task); err != nil {
@@ -148,7 +148,7 @@ func TestListener_HandleSyncRequested_BadPayloadSkipsRetry(t *testing.T) {
 	t.Parallel()
 
 	spy := &spySyncUC{}
-	l := NewListener(nil, spy)
+	l := NewListener(nil, spy, nil)
 	task := asynq.NewTask(TypeSyncRequested, []byte("{not json"))
 
 	err := l.handleSyncRequested(context.Background(), task)
@@ -182,7 +182,7 @@ func TestListener_HandleSyncCompleted_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil)
+	l := NewListener(spy, nil, nil)
 	task := asynq.NewTask(TypeSyncCompleted, payload)
 
 	if err := l.handleSyncCompleted(context.Background(), task); err != nil {
@@ -215,7 +215,7 @@ func TestListener_HandleSyncFailed_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil)
+	l := NewListener(spy, nil, nil)
 	task := asynq.NewTask(TypeSyncFailed, payload)
 
 	if err := l.handleSyncFailed(context.Background(), task); err != nil {
@@ -235,7 +235,7 @@ func TestListener_HandleSyncCompleted_BadPayloadSkipsRetry(t *testing.T) {
 	t.Parallel()
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil)
+	l := NewListener(spy, nil, nil)
 	task := asynq.NewTask(TypeSyncCompleted, []byte("{not json"))
 
 	err := l.handleSyncCompleted(context.Background(), task)
@@ -255,7 +255,7 @@ func TestListener_HandleSyncFailed_BadPayloadSkipsRetry(t *testing.T) {
 	t.Parallel()
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil)
+	l := NewListener(spy, nil, nil)
 	task := asynq.NewTask(TypeSyncFailed, []byte("{not json"))
 
 	err := l.handleSyncFailed(context.Background(), task)

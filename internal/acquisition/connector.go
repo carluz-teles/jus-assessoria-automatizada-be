@@ -46,6 +46,11 @@ type FetchRequest struct {
 	WindowFrom    string
 	WindowTo      string
 	OABs          []OABEntry
+	// CNJNumber and Court drive FETCH_BY_NUMBER (DATAJUD enrichment): the process to
+	// pull and the tribunal whose index holds it (the DATAJUD alias is per-tribunal).
+	// Both are empty for DISCOVER_BY_OAB.
+	CNJNumber string
+	Court     string
 }
 
 // RawPayload is a connector's opaque output and the parser's input: the raw
@@ -98,6 +103,11 @@ type ParsedCourtRecord struct {
 	// JudgingBody is the órgão julgador the source disclosed (DJEN nomeOrgao /
 	// DATAJUD orgaoJulgador); empty when it did not.
 	JudgingBody string
+	// FiledAt (DATAJUD dataAjuizamento) and Secrecy (from nivelSigilo) are disclosed
+	// only by DATAJUD enrichment; FiledAt is the zero time and Secrecy is empty when
+	// the source (DJEN discovery) does not carry them.
+	FiledAt time.Time
+	Secrecy string
 }
 
 // ParsedDocketEntry is one andamento. Hash is the source-computed dedup key
@@ -112,6 +122,11 @@ type ParsedDocketEntry struct {
 	Source     string
 	Fidelity   int
 	Text       string
+	// TPUCode is the movimento's code in the Tabela Processual Unificada (DATAJUD
+	// movimento.codigo); Complements carries its complementosTabelados as raw jsonb.
+	// Zero/empty when the source does not classify the entry.
+	TPUCode     int
+	Complements json.RawMessage
 }
 
 // ParsedIntimation is one intimação. Hash dedups within the (tenant, case)

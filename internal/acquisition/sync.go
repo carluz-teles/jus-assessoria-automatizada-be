@@ -88,6 +88,8 @@ type FindOrCreateCourtRecordParams struct {
 }
 
 // DocketEntryParams is one andamento to upsert (idempotent on court_record+hash).
+// TPUCode/Complements are the DATAJUD movimento classification (zero/empty for
+// sources that do not classify the entry).
 type DocketEntryParams struct {
 	CourtRecordID string
 	Hash          string
@@ -96,6 +98,8 @@ type DocketEntryParams struct {
 	Source        string
 	Fidelity      int
 	Text          string
+	TPUCode       int
+	Complements   json.RawMessage
 }
 
 // IntimationParams is one intimação to upsert (ON CONFLICT DO UPDATE on
@@ -576,6 +580,7 @@ func newCourtRecordObserved(ev SyncRequested, syncRunID string, cr *CourtRecord)
 		CaseID:        cr.CaseID,
 		CNJNumber:     cr.CNJNumber,
 		Degree:        cr.Degree,
+		Court:         cr.Court,
 	}
 }
 

@@ -105,6 +105,18 @@ func (m *mockRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []Intim
 	return 0, nil
 }
 
+func (m *mockRepo) UpsertGradedCourtRecord(_ context.Context, _ database.Tx, _ GradedRecordParams) (*CourtRecord, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) RepointIntimations(_ context.Context, _ database.Tx, _, _, _ string) (int, error) {
+	return 0, nil
+}
+
+func (m *mockRepo) SupersedeCourtRecord(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {

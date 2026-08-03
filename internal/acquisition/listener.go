@@ -28,17 +28,25 @@ type syncListenerUC interface {
 	OnSyncRequested(ctx context.Context, ev SyncRequested) error
 }
 
-// Listener is acquisition's asynq consumer. It holds no transport state; the use
-// cases own persistence and the transaction boundary. It drives two use cases —
-// backfill (reacts to integration_activated) and sync (reacts to sync_requested).
-type Listener struct {
-	backfill backfillListenerUC
-	sync     syncListenerUC
+// enrichmentListenerUC is the port for the court_record_observed consumer (DATAJUD
+// enrichment).
+type enrichmentListenerUC interface {
+	OnCourtRecordObserved(ctx context.Context, ev CourtRecordObserved) error
 }
 
-// NewListener wires the listener to the backfill and sync use cases.
-func NewListener(backfill backfillListenerUC, sync syncListenerUC) *Listener {
-	return &Listener{backfill: backfill, sync: sync}
+// Listener is acquisition's asynq consumer. It holds no transport state; the use
+// cases own persistence and the transaction boundary. It drives three use cases —
+// backfill (reacts to integration_activated), sync (reacts to sync_requested), and
+// enrichment (reacts to court_record_observed).
+type Listener struct {
+	backfill   backfillListenerUC
+	sync       syncListenerUC
+	enrichment enrichmentListenerUC
+}
+
+// NewListener wires the listener to the backfill, sync, and enrichment use cases.
+func NewListener(backfill backfillListenerUC, sync syncListenerUC, enrichment enrichmentListenerUC) *Listener {
+	return &Listener{backfill: backfill, sync: sync, enrichment: enrichment}
 }
 
 // Register mounts the slice's task handlers on the asynq mux — the async analog
@@ -49,6 +57,7 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeSyncRequested, l.handleSyncRequested)
 	mux.HandleFunc(TypeSyncCompleted, l.handleSyncCompleted)
 	mux.HandleFunc(TypeSyncFailed, l.handleSyncFailed)
+	mux.HandleFunc(TypeCourtRecordObserved, l.handleCourtRecordObserved)
 }
 
 // handleIntegrationActivated is the asynq.HandlerFunc for
@@ -101,4 +110,18 @@ func (l *Listener) handleSyncFailed(ctx context.Context, t *asynq.Task) error {
 		return err
 	}
 	return l.backfill.OnSyncFailed(ctx, ev)
+}
+
+// handleCourtRecordObserved is the asynq.HandlerFunc for
+// acquisition.court_record_observed. It continues the trace, decodes the payload,
+// and hands off to the DATAJUD enrichment use case. A decode fault is SkipRetry;
+// the use case returns SkipRetry on a parse fault, a retryable error on a fetch
+// fault, and nil (ack) when there is nothing to enrich.
+func (l *Listener) handleCourtRecordObserved(ctx context.Context, t *asynq.Task) error {
+	ctx = events.ExtractTrace(ctx, t)
+	ev, err := events.Decode[CourtRecordObserved](t)
+	if err != nil {
+		return err
+	}
+	return l.enrichment.OnCourtRecordObserved(ctx, ev)
 }

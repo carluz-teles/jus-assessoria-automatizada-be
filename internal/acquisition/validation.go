@@ -21,14 +21,16 @@ type ActivateIntegrationRequest struct {
 }
 
 // Validate enforces the boundary rules via ozzo (method-based, not struct tags):
-// sources must be non-empty and a subset of the activatable sources (DJEN,
-// DATAJUD — UPLOAD/MNI and anything else are rejected), and the scope must be
-// valid. A failure here is a 400 at the edge (KindInvalid → 400).
+// sources must be non-empty and a subset of the activatable sources, and the scope
+// must be valid. Only DJEN is activatable: it is the sole source that DISCOVERS a
+// process (nationally, by OAB). DATAJUD only ENRICHES an already-discovered process
+// (by number), triggered by court_record_observed — never activated — so it is
+// rejected here alongside UPLOAD/MNI. A failure is a 400 at the edge (KindInvalid).
 func (r ActivateIntegrationRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Sources,
 			validation.Required,
-			validation.Each(validation.In(SourceDJEN, SourceDATAJUD)),
+			validation.Each(validation.In(SourceDJEN)),
 		),
 		validation.Field(&r.Scope),
 	)

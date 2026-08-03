@@ -12,8 +12,8 @@ func req(sources []string, oab []string) ActivateIntegrationRequest {
 }
 
 // TestActivateIntegrationRequest_Validate covers ACs 2, 3 and 4: the boundary
-// rejects an empty/malformed scope and any source outside {DJEN, DATAJUD}, and
-// accepts a well-formed request.
+// rejects an empty/malformed scope and any source outside {DJEN} — DATAJUD is
+// enrichment-only, not activatable — and accepts a well-formed request.
 func TestActivateIntegrationRequest_Validate(t *testing.T) {
 	t.Parallel()
 
@@ -28,9 +28,9 @@ func TestActivateIntegrationRequest_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "valid two sources",
+			name:    "DATAJUD is not activatable (enrichment-only)",
 			request: req([]string{SourceDJEN, SourceDATAJUD}, []string{"SP1", "RJ654321"}),
-			wantErr: false,
+			wantErr: true,
 		},
 		// AC4: sources empty / unsupported.
 		{

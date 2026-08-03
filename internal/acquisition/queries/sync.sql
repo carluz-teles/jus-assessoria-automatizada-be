@@ -95,9 +95,11 @@ WHERE id = $1;
 -- Append one andamento, idempotent on (court_record_id, hash). On conflict the
 -- row is left untouched and no id is returned (pgx.ErrNoRows), which the caller
 -- reads as "deduped" — so a re-sync emits no docket_entry_observed for it.
+-- tpu_code (Tabela Processual Unificada) and complements are DATAJUD movimento
+-- classification; NULL for sources that do not classify the entry.
 INSERT INTO docket_entry
-    (court_record_id, hash, occurred_at, observed_at, source, fidelity, text)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+    (court_record_id, hash, occurred_at, observed_at, source, fidelity, tpu_code, complements, text)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (court_record_id, hash) DO NOTHING
 RETURNING id;
 

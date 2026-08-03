@@ -158,8 +158,8 @@ func (q *Queries) InsertCourtRecord(ctx context.Context, arg InsertCourtRecordPa
 
 const insertDocketEntry = `-- name: InsertDocketEntry :one
 INSERT INTO docket_entry
-    (court_record_id, hash, occurred_at, observed_at, source, fidelity, text)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+    (court_record_id, hash, occurred_at, observed_at, source, fidelity, tpu_code, complements, text)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (court_record_id, hash) DO NOTHING
 RETURNING id
 `
@@ -171,12 +171,16 @@ type InsertDocketEntryParams struct {
 	ObservedAt    pgtype.Timestamptz `json:"observed_at"`
 	Source        string             `json:"source"`
 	Fidelity      int32              `json:"fidelity"`
+	TpuCode       *int32             `json:"tpu_code"`
+	Complements   []byte             `json:"complements"`
 	Text          string             `json:"text"`
 }
 
 // Append one andamento, idempotent on (court_record_id, hash). On conflict the
 // row is left untouched and no id is returned (pgx.ErrNoRows), which the caller
 // reads as "deduped" — so a re-sync emits no docket_entry_observed for it.
+// tpu_code (Tabela Processual Unificada) and complements are DATAJUD movimento
+// classification; NULL for sources that do not classify the entry.
 func (q *Queries) InsertDocketEntry(ctx context.Context, arg InsertDocketEntryParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertDocketEntry,
 		arg.CourtRecordID,
@@ -185,6 +189,8 @@ func (q *Queries) InsertDocketEntry(ctx context.Context, arg InsertDocketEntryPa
 		arg.ObservedAt,
 		arg.Source,
 		arg.Fidelity,
+		arg.TpuCode,
+		arg.Complements,
 		arg.Text,
 	)
 	var id uuid.UUID

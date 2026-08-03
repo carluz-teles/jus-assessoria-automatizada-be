@@ -96,6 +96,9 @@ type CourtRecordObserved struct {
 	CaseID        string `json:"case_id"`
 	CNJNumber     string `json:"cnj_number"`
 	Degree        string `json:"degree"`
+	// Court is the tribunal sigla — the DATAJUD enrichment consumer needs it to pick
+	// the per-tribunal index (api_publica_<sigla>) when it fetches by number.
+	Court string `json:"court"`
 }
 
 var _ events.Event = CourtRecordObserved{}
