@@ -94,6 +94,14 @@ func (u *fakeUOW) Do(ctx context.Context, tenantID string, fn func(tx database.T
 	return fn(nil)
 }
 
+func (u *fakeUOW) DoSystem(_ context.Context, fn func(tx database.Tx) error) error {
+	u.called = true
+	if u.err != nil {
+		return u.err
+	}
+	return fn(nil)
+}
+
 // recordingOutbox captures what a use case publishes (and can inject a publish
 // failure) so tests assert the right event is emitted in the same unit of work.
 type recordingOutbox struct {

@@ -50,6 +50,33 @@ func TestUnitOfWork_Do_CommitsWithTenantScope(t *testing.T) {
 	}
 }
 
+// DoSystem: Begin → set_config('app.system','on') → fn runs → Commit. The system
+// flag is bound literally (no tenant), the cross-tenant read path for the scheduler.
+func TestUnitOfWork_DoSystem_CommitsWithSystemScope(t *testing.T) {
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	mock.
+		ExpectExec("set_config").
+		WithArgs().
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectCommit()
+
+	ran := false
+	err := NewUnitOfWork(mock).DoSystem(context.Background(), func(tx Tx) error {
+		ran = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DoSystem() error = %v, want nil", err)
+	}
+	if !ran {
+		t.Fatal("fn was not run")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // fn error: the transaction rolls back, never commits, and the original error is
 // propagated unwrapped so its domain Kind survives to the caller.
 func TestUnitOfWork_Do_RollsBackOnError(t *testing.T) {

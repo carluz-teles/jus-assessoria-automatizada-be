@@ -86,6 +86,14 @@ func (u *fakeUOW) Do(_ context.Context, tenantID string, fn func(tx database.Tx)
 	return fn(nil)
 }
 
+func (u *fakeUOW) DoSystem(_ context.Context, fn func(tx database.Tx) error) error {
+	u.scopes = append(u.scopes, "system")
+	if u.err != nil {
+		return u.err
+	}
+	return fn(nil)
+}
+
 // fakeDedup reports every event as first-seen by default; set seen=true to model an
 // at-least-once replay. It records the ids it was asked to mark.
 type fakeDedup struct {

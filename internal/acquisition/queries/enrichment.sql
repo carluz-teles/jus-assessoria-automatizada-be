@@ -14,9 +14,12 @@
 -- UNKNOWN placeholder counted against the plan), so grading it must not consume a
 -- second slot. case_id is only written on insert (a pre-existing graded record
 -- keeps its case); RETURNING carries both so the caller re-points onto this row.
+-- next_sync_at is seeded on the INSERT only (the record enters the re-poll
+-- schedule when first graded); a refresh (DO UPDATE) leaves it untouched, so the
+-- scheduler owns re-scheduling via its claim.
 INSERT INTO court_record
-    (tenant_id, case_id, cnj_number, degree, court, class, subject, judging_body, filed_at, secrecy, completeness)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, judging_body, filed_at, secrecy, completeness, next_sync_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (tenant_id, cnj_number, degree) DO UPDATE SET
     class = EXCLUDED.class,
     subject = EXCLUDED.subject,

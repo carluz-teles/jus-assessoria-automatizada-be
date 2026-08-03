@@ -132,6 +132,11 @@ func (u *stubBackfillUoW) Do(_ context.Context, tenantID string, fn func(databas
 	return fn(u.tx)
 }
 
+func (u *stubBackfillUoW) DoSystem(_ context.Context, fn func(database.Tx) error) error {
+	u.calls++
+	return fn(u.tx)
+}
+
 // stubBackfillRepo answers the guard from a preset flag and records the insert.
 // For the completion-counter tests it also holds a mutable job state: each
 // increment bumps a counter and returns the post-bump tallies (mirroring the

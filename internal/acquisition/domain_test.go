@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -23,6 +24,11 @@ type fakeUoW struct {
 func (f *fakeUoW) Do(ctx context.Context, tenantID string, fn func(tx database.Tx) error) error {
 	f.calls++
 	f.tenantID = tenantID
+	return fn(nil)
+}
+
+func (f *fakeUoW) DoSystem(_ context.Context, fn func(tx database.Tx) error) error {
+	f.calls++
 	return fn(nil)
 }
 
@@ -114,6 +120,14 @@ func (m *mockRepo) RepointIntimations(_ context.Context, _ database.Tx, _, _, _ 
 }
 
 func (m *mockRepo) SupersedeCourtRecord(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
+}
+
+func (m *mockRepo) DueCourtRecordsForResync(_ context.Context, _ database.Tx, _ int) ([]DueRecord, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) ClaimCourtRecordResync(_ context.Context, _ database.Tx, _ string, _ time.Time) error {
 	return nil
 }
 

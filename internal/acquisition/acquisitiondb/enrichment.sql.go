@@ -57,8 +57,8 @@ func (q *Queries) SupersedeCourtRecord(ctx context.Context, arg SupersedeCourtRe
 const upsertGradedCourtRecord = `-- name: UpsertGradedCourtRecord :one
 
 INSERT INTO court_record
-    (tenant_id, case_id, cnj_number, degree, court, class, subject, judging_body, filed_at, secrecy, completeness)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, judging_body, filed_at, secrecy, completeness, next_sync_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (tenant_id, cnj_number, degree) DO UPDATE SET
     class = EXCLUDED.class,
     subject = EXCLUDED.subject,
@@ -70,17 +70,18 @@ RETURNING id, case_id
 `
 
 type UpsertGradedCourtRecordParams struct {
-	TenantID     uuid.UUID   `json:"tenant_id"`
-	CaseID       uuid.UUID   `json:"case_id"`
-	CnjNumber    string      `json:"cnj_number"`
-	Degree       string      `json:"degree"`
-	Court        string      `json:"court"`
-	Class        *string     `json:"class"`
-	Subject      *string     `json:"subject"`
-	JudgingBody  *string     `json:"judging_body"`
-	FiledAt      pgtype.Date `json:"filed_at"`
-	Secrecy      string      `json:"secrecy"`
-	Completeness float32     `json:"completeness"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CaseID       uuid.UUID          `json:"case_id"`
+	CnjNumber    string             `json:"cnj_number"`
+	Degree       string             `json:"degree"`
+	Court        string             `json:"court"`
+	Class        *string            `json:"class"`
+	Subject      *string            `json:"subject"`
+	JudgingBody  *string            `json:"judging_body"`
+	FiledAt      pgtype.Date        `json:"filed_at"`
+	Secrecy      string             `json:"secrecy"`
+	Completeness float32            `json:"completeness"`
+	NextSyncAt   pgtype.Timestamptz `json:"next_sync_at"`
 }
 
 type UpsertGradedCourtRecordRow struct {
@@ -102,6 +103,9 @@ type UpsertGradedCourtRecordRow struct {
 // UNKNOWN placeholder counted against the plan), so grading it must not consume a
 // second slot. case_id is only written on insert (a pre-existing graded record
 // keeps its case); RETURNING carries both so the caller re-points onto this row.
+// next_sync_at is seeded on the INSERT only (the record enters the re-poll
+// schedule when first graded); a refresh (DO UPDATE) leaves it untouched, so the
+// scheduler owns re-scheduling via its claim.
 func (q *Queries) UpsertGradedCourtRecord(ctx context.Context, arg UpsertGradedCourtRecordParams) (UpsertGradedCourtRecordRow, error) {
 	row := q.db.QueryRow(ctx, upsertGradedCourtRecord,
 		arg.TenantID,
@@ -115,6 +119,7 @@ func (q *Queries) UpsertGradedCourtRecord(ctx context.Context, arg UpsertGradedC
 		arg.FiledAt,
 		arg.Secrecy,
 		arg.Completeness,
+		arg.NextSyncAt,
 	)
 	var i UpsertGradedCourtRecordRow
 	err := row.Scan(&i.ID, &i.CaseID)

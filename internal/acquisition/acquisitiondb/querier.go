@@ -21,6 +21,10 @@ type Querier interface {
 	// listener uses it as the first-activation guard: a re-activation must not
 	// re-dispatch a backfill.
 	BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error)
+	// Push a record's next_sync_at forward as its re-poll is enqueued, so the next tick
+	// does not re-enqueue it; if the resync never lands, it falls due again after the
+	// interval (at-least-once).
+	ClaimCourtRecordResync(ctx context.Context, arg ClaimCourtRecordResyncParams) error
 	// Count the tenant's ACTIVE court records inside the caller's tx. The entitlement
 	// gate reads this against the subscription's active_process_limit before creating a
 	// BRAND-NEW record (the MISS path of FindOrCreateCourtRecord only — a reobservation
@@ -28,6 +32,17 @@ type Querier interface {
 	// INSERT so the count is consistent with what is about to be created. lifecycle is
 	// the schema's process-liveness flag; only ACTIVE records count against the ceiling.
 	CountActiveCourtRecordsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// scheduler (re-poll) queries (acquisition slice).
+	// The re-poll scheduler runs system-scoped (DoSystem sets app.system='on', so the
+	// court_record RLS system escape hatch from migration 0016 exposes every tenant's
+	// rows). Each tick it finds records whose next_sync_at is due, enqueues a fresh
+	// court_record_observed for each (the enrichment consumer refreshes the DATAJUD
+	// movimentos), and claims them by pushing next_sync_at forward so a later tick does
+	// not re-enqueue the same record before the resync lands.
+	// Records due for a DATAJUD re-poll: ACTIVE only (SUPERSEDED placeholders and
+	// archived processes drop out) with a past next_sync_at. Served by the partial
+	// index on next_sync_at WHERE lifecycle='ACTIVE'.
+	DueCourtRecordsForResync(ctx context.Context, limit int32) ([]DueCourtRecordsForResyncRow, error)
 	// Flip the job to its terminal status, but ONLY from RUNNING: the WHERE guard
 	// makes this the single winning transition, so a late or over-count delivery that
 	// reaches here cannot re-finalize. Scoped by tenant_id (isolation barrier 1).
@@ -131,6 +146,9 @@ type Querier interface {
 	// UNKNOWN placeholder counted against the plan), so grading it must not consume a
 	// second slot. case_id is only written on insert (a pre-existing graded record
 	// keeps its case); RETURNING carries both so the caller re-points onto this row.
+	// next_sync_at is seeded on the INSERT only (the record enters the re-poll
+	// schedule when first graded); a refresh (DO UPDATE) leaves it untouched, so the
+	// scheduler owns re-scheduling via its claim.
 	UpsertGradedCourtRecord(ctx context.Context, arg UpsertGradedCourtRecordParams) (UpsertGradedCourtRecordRow, error)
 	// acquisition slice queries (integration).
 	// The upsert is keyed by (tenant_id, source) so re-activating a source is

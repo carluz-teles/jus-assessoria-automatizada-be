@@ -48,6 +48,11 @@ type Repository interface {
 	UpsertGradedCourtRecord(ctx context.Context, tx database.Tx, params GradedRecordParams) (*CourtRecord, error)
 	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
 	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
+
+	// Re-poll scheduler — the system-scoped due scan and claim. The scheduler use
+	// case depends on the narrow schedulerRepo view of these.
+	DueCourtRecordsForResync(ctx context.Context, tx database.Tx, limit int) ([]DueRecord, error)
+	ClaimCourtRecordResync(ctx context.Context, tx database.Tx, recordID string, nextSyncAt time.Time) error
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -540,6 +545,7 @@ func (r *pgRepository) UpsertGradedCourtRecord(ctx context.Context, tx database.
 		FiledAt:      nullDate(params.FiledAt),
 		Secrecy:      params.Secrecy,
 		Completeness: params.Completeness,
+		NextSyncAt:   pgtype.Timestamptz{Time: params.NextSyncAt, Valid: !params.NextSyncAt.IsZero()},
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -595,6 +601,42 @@ func (r *pgRepository) SupersedeCourtRecord(ctx context.Context, tx database.Tx,
 	err = acquisitiondb.New(tx).SupersedeCourtRecord(ctx, acquisitiondb.SupersedeCourtRecordParams{
 		TenantID: tid,
 		ID:       rid,
+	})
+	return database.WrapInfra(err)
+}
+
+// DueCourtRecordsForResync reads the ACTIVE records whose next_sync_at is due,
+// across every tenant, inside the caller's SYSTEM tx (app.system='on'). The
+// scheduler runs it under DoSystem; the partial next_sync_at index serves it.
+func (r *pgRepository) DueCourtRecordsForResync(ctx context.Context, tx database.Tx, limit int) ([]DueRecord, error) {
+	rows, err := acquisitiondb.New(tx).DueCourtRecordsForResync(ctx, int32(limit))
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]DueRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, DueRecord{
+			ID:        row.ID.String(),
+			TenantID:  row.TenantID.String(),
+			CaseID:    row.CaseID.String(),
+			CNJNumber: row.CnjNumber,
+			Degree:    row.Degree,
+			Court:     row.Court,
+		})
+	}
+	return out, nil
+}
+
+// ClaimCourtRecordResync pushes a record's next_sync_at forward inside the caller's
+// SYSTEM tx as its re-poll is enqueued, so a later tick does not re-enqueue it.
+func (r *pgRepository) ClaimCourtRecordResync(ctx context.Context, tx database.Tx, recordID string, nextSyncAt time.Time) error {
+	rid, err := uuid.Parse(recordID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	err = acquisitiondb.New(tx).ClaimCourtRecordResync(ctx, acquisitiondb.ClaimCourtRecordResyncParams{
+		ID:         rid,
+		NextSyncAt: pgtype.Timestamptz{Time: nextSyncAt, Valid: true},
 	})
 	return database.WrapInfra(err)
 }

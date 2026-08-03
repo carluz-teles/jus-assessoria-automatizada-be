@@ -21,8 +21,15 @@ type Tx interface {
 // its outbox row commit together or not at all (transactional outbox). tenantID,
 // when non-empty, is bound to the transaction-local RLS setting so every query
 // fn issues is filtered to that tenant (second isolation barrier, docs 4d.4).
+//
+// DoSystem is the cross-tenant counterpart for system processes (the re-poll
+// scheduler): it sets app.system='on' instead of a tenant, so RLS policies with a
+// system escape hatch (court_record, migration 0016) expose every tenant's rows.
+// Use it ONLY for trusted system work that legitimately spans tenants — never on a
+// request path.
 type UnitOfWork interface {
 	Do(ctx context.Context, tenantID string, fn func(tx Tx) error) error
+	DoSystem(ctx context.Context, fn func(tx Tx) error) error
 }
 
 // beginner is the slice of the pool the unit of work actually needs. Depending
@@ -67,6 +74,33 @@ func (u *unitOfWork) Do(ctx context.Context, tenantID string, fn func(tx Tx) err
 		if _, err := tx.Exec(ctx, setTenant, tenantID); err != nil {
 			return WrapInfra(err)
 		}
+	}
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return WrapInfra(err)
+	}
+
+	return nil
+}
+
+// DoSystem opens a transaction, marks it system-scoped (app.system='on'), runs fn,
+// and commits — the same lifecycle and error contract as Do, minus the tenant
+// binding. It is the read/enqueue path for the re-poll scheduler, which spans every
+// tenant's court records.
+func (u *unitOfWork) DoSystem(ctx context.Context, fn func(tx Tx) error) error {
+	tx, err := u.pool.Begin(ctx)
+	if err != nil {
+		return WrapInfra(err)
+	}
+	defer tx.Rollback(ctx)
+
+	const setSystem = "SELECT set_config('app.system', 'on', true)"
+	if _, err := tx.Exec(ctx, setSystem); err != nil {
+		return WrapInfra(err)
 	}
 
 	if err := fn(tx); err != nil {

@@ -114,9 +114,9 @@ func TestEnrichment_PlaceholderMerge(t *testing.T) {
 	}
 }
 
-// TestEnrichment_SkipsNonPlaceholder proves the guard: an already-graded (or
-// key-less) observation triggers no fetch and no persistence.
-func TestEnrichment_SkipsNonPlaceholder(t *testing.T) {
+// TestEnrichment_SkipsMissingKeys proves the guard: an observation without the
+// number/court a by-number fetch needs triggers no fetch and no persistence.
+func TestEnrichment_SkipsMissingKeys(t *testing.T) {
 	t.Parallel()
 
 	repo := &fakeEnrichRepo{}
@@ -126,13 +126,68 @@ func TestEnrichment_SkipsNonPlaceholder(t *testing.T) {
 	uc := NewEnrichmentUseCase(repo, &fakeOutbox{}, &stubBackfillUoW{tx: stubTx{rows: 1}}, orch, NewDATAJUDParser())
 
 	ev := placeholderObserved()
-	ev.Degree = DegreeG1 // already graded → nothing to enrich
+	ev.Court = "" // missing tribunal → cannot fetch
 
 	if err := uc.OnCourtRecordObserved(context.Background(), ev); err != nil {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
 	if conn.fetchCalls != 0 || repo.gradedCalls != 0 {
 		t.Errorf("guard failed: fetches=%d gradedCalls=%d, want 0/0", conn.fetchCalls, repo.gradedCalls)
+	}
+}
+
+// TestEnrichment_SkipsGradeMismatch proves a re-poll whose DATAJUD top hit is a
+// DIFFERENT grade than the record (multi-instance, v0 out of scope) is fetched but
+// not merged — no spurious grade/supersede.
+func TestEnrichment_SkipsGradeMismatch(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{}
+	conn := &stubConnector{id: "datajud", payload: RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}}
+	orch := NewOrchestrator()
+	orch.Register(SourceDATAJUD, conn)
+	uc := NewEnrichmentUseCase(repo, &fakeOutbox{}, &stubBackfillUoW{tx: stubTx{rows: 1}}, orch, NewDATAJUDParser())
+
+	ev := placeholderObserved()
+	ev.Degree = DegreeG2 // record is G2, but the fixture's hit is G1 → mismatch
+
+	if err := uc.OnCourtRecordObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnCourtRecordObserved: %v", err)
+	}
+	if conn.fetchCalls != 1 {
+		t.Errorf("expected a fetch before the mismatch check, got %d", conn.fetchCalls)
+	}
+	if repo.gradedCalls != 0 {
+		t.Errorf("grade mismatch still merged (gradedCalls=%d), want 0", repo.gradedCalls)
+	}
+}
+
+// TestEnrichment_ResyncRefresh proves the re-poll path: a graded record observed
+// again (same grade) refreshes its movimentos WITHOUT re-pointing or superseding
+// (the graded record is itself the target).
+func TestEnrichment_ResyncRefresh(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
+
+	ev := placeholderObserved()
+	ev.Degree = "G1"              // already graded
+	ev.CourtRecordID = "graded-1" // and IS the record the fake upsert returns
+
+	if err := enrichmentUnderTest(repo, outbox, uow, payload).OnCourtRecordObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnCourtRecordObserved: %v", err)
+	}
+	if repo.gradedCalls != 1 {
+		t.Errorf("graded refresh = %d, want 1", repo.gradedCalls)
+	}
+	if repo.repointCalls != 0 || repo.supersedeCall != 0 {
+		t.Errorf("resync must not re-point/supersede: repoint=%d supersede=%d", repo.repointCalls, repo.supersedeCall)
+	}
+	if len(repo.docketParams) == 0 {
+		t.Error("resync should refresh movimentos as docket entries")
 	}
 }
 

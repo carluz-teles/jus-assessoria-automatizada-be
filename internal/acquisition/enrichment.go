@@ -3,6 +3,7 @@ package acquisition
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/hibiken/asynq"
@@ -41,6 +42,10 @@ type GradedRecordParams struct {
 	FiledAt      time.Time
 	Secrecy      string
 	Completeness float32
+	// NextSyncAt seeds the re-poll schedule; it is written only when the graded
+	// record is first created (the query ignores it on a refresh), so the scheduler
+	// owns re-scheduling thereafter.
+	NextSyncAt time.Time
 }
 
 // enrichRepo is the narrow persistence port the enrichment use case drives:
@@ -62,6 +67,7 @@ type EnrichmentUseCase struct {
 	uow          database.UnitOfWork
 	orchestrator *Orchestrator
 	parser       Parser
+	now          func() time.Time
 }
 
 // NewEnrichmentUseCase wires the enrichment use case.
@@ -72,19 +78,21 @@ func NewEnrichmentUseCase(repo enrichRepo, outbox publisher, uow database.UnitOf
 		uow:          uow,
 		orchestrator: orchestrator,
 		parser:       parser,
+		now:          time.Now,
 	}
 }
 
-// OnCourtRecordObserved enriches one observed placeholder. It acts ONLY on DJEN
-// placeholders (degree=UNKNOWN) that carry the number and court a by-number fetch
-// needs — every other observation (a re-observation of an already-graded record,
-// or one missing keys) is a no-op ack. It fetches and parses outside any
-// transaction, then commits the merge in one unit of work. A fetch fault is
+// OnCourtRecordObserved enriches one observed court record via DATAJUD. It serves
+// two triggers with one path: a fresh DJEN discovery (degree=UNKNOWN → grade +
+// placeholder+merge) and a scheduler re-poll of an already-graded record
+// (degree=G1/G2/… → refresh its movimentos). Both fetch and parse outside any
+// transaction, then commit in one unit of work; the merge-vs-refresh split falls
+// out of whether the graded record differs from the observed one. An observation
+// missing the keys a by-number fetch needs is a no-op ack. A fetch fault is
 // retryable (asynq re-delivers — a DATAJUD rate-limit is transient); a parse fault
-// archives the task (SkipRetry); a process not yet in DATAJUD is a no-op ack (a
-// re-poll retries later).
+// archives the task (SkipRetry); a process not yet in DATAJUD is a no-op ack.
 func (uc *EnrichmentUseCase) OnCourtRecordObserved(ctx context.Context, ev CourtRecordObserved) error {
-	if ev.Degree != DegreeUnknown || ev.CNJNumber == "" || ev.Court == "" {
+	if ev.CNJNumber == "" || ev.Court == "" {
 		return nil
 	}
 
@@ -109,13 +117,21 @@ func (uc *EnrichmentUseCase) OnCourtRecordObserved(ctx context.Context, ev Court
 	}
 	if len(parsed.CourtRecords) == 0 {
 		// The process is not (yet) indexed by DATAJUD — nothing to grade. Ack; a
-		// scheduler re-poll (next_sync_at, future) retries the enrichment.
+		// scheduler re-poll (next_sync_at) retries the enrichment later.
 		return nil
 	}
 
 	graded := parsed.CourtRecords[0]
 	if graded.Degree == DegreeUnknown {
-		// DATAJUD did not disclose a grade either — no merge to do. Ack.
+		// DATAJUD did not disclose a grade either — nothing to do. Ack.
+		return nil
+	}
+	if ev.Degree != DegreeUnknown && graded.Degree != ev.Degree {
+		// Re-poll of a graded record, but DATAJUD's top hit is a DIFFERENT grade (a
+		// multi-instance process, e.g. G1 + G2). v0 tracks one grade per record; skip
+		// to avoid a spurious supersede. Multi-instance is a v1 concern (case_link).
+		slog.WarnContext(ctx, "acquisition: datajud top hit grade differs from record; skipping resync",
+			"court_record_id", ev.CourtRecordID, "record_degree", ev.Degree, "hit_degree", graded.Degree)
 		return nil
 	}
 
@@ -148,6 +164,9 @@ func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecord
 			FiledAt:      graded.FiledAt,
 			Secrecy:      graded.Secrecy,
 			Completeness: graded.Completeness,
+			// Seeds the re-poll schedule on the FIRST grade (ignored by the query on a
+			// refresh, so the scheduler's claim owns re-scheduling afterward).
+			NextSyncAt: uc.now().Add(defaultSyncInterval),
 		})
 		if err != nil {
 			return err

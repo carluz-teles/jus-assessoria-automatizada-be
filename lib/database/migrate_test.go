@@ -74,8 +74,9 @@ func TestEmbeddedSource(t *testing.T) {
 	// tenant-email slice adds 11 (tenant.email).
 	// The holiday slice adds 12 (the holiday table) and 13 (the state-holiday
 	// seed); the DJEN connector adds 14 (intimation DJEN fields + court_record
-	// judging_body); the DATAJUD enrichment adds 15 (court_record.filed_at).
-	// So 1→…→14→15 and 15 is the last — nothing follows it.
+	// judging_body); the DATAJUD enrichment adds 15 (court_record.filed_at); the
+	// re-poll scheduler adds 16 (court_record RLS system escape hatch).
+	// So 1→…→15→16 and 16 is the last — nothing follows it.
 	if next, err := src.Next(1); err != nil || next != 2 {
 		t.Fatalf("Next(1) = (%d, %v), want (2, nil)", next, err)
 	}
@@ -118,8 +119,11 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(14); err != nil || next != 15 {
 		t.Fatalf("Next(14) = (%d, %v), want (15, nil)", next, err)
 	}
-	if _, err := src.Next(15); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(15) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(15); err != nil || next != 16 {
+		t.Fatalf("Next(15) = (%d, %v), want (16, nil)", next, err)
+	}
+	if _, err := src.Next(16); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(16) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

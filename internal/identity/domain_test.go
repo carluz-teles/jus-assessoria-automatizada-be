@@ -89,6 +89,14 @@ func (u *fakeUOW) Do(ctx context.Context, tenantID string, fn func(tx database.T
 	return fn(nil)
 }
 
+func (u *fakeUOW) DoSystem(_ context.Context, fn func(tx database.Tx) error) error {
+	u.called = true
+	if u.err != nil {
+		return u.err
+	}
+	return fn(nil)
+}
+
 // noopOutbox is a publisher that drops every event — used by the provisioning and
 // resolution use cases, which emit nothing, so their tests do not care about it.
 type noopOutbox struct{}
