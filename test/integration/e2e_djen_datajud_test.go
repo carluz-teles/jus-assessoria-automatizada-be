@@ -18,6 +18,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/google/uuid"
@@ -43,6 +44,13 @@ const (
 )
 
 func TestE2E_DJEN_DATAJUD(t *testing.T) {
+	// This test hits the LIVE CNJ APIs (DJEN + DATAJUD), so it is opt-in: CI runs
+	// `-tags=integration` but must NOT depend on external gov endpoints (WAF/IP
+	// blocks would flake the pipeline). Run it locally with E2E_LIVE=1.
+	if os.Getenv("E2E_LIVE") == "" {
+		t.Skip("live-API e2e — set E2E_LIVE=1 to run (kept out of CI)")
+	}
+
 	pool := newPool(t)
 	ctx := context.Background()
 	tenantID := uuid.NewString()
