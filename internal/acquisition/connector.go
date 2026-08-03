@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -25,15 +26,26 @@ const (
 	CapabilityDiscoverByOAB Capability = "DISCOVER_BY_OAB"
 )
 
+// OABEntry is one OAB registration in a connector's discovery scope: the bare
+// number and the two-letter UF (seccional) it belongs to. The DJEN discovers a
+// tenant's processes per (number, UF), so the pair — not a combined string — is
+// what a fetch drives.
+type OABEntry struct {
+	Number string
+	UF     string
+}
+
 // FetchRequest is everything a connector needs to fetch one window of history:
-// which capability to exercise, which integration it serves, and the date bounds
-// (bare dates, matching the sync_requested payload). It carries no credentials —
-// the connector resolves those from its own configuration (credential_ref).
+// which capability to exercise, which integration it serves, the date bounds
+// (bare dates, matching the sync_requested payload), and — for OAB discovery —
+// the OAB registrations to query. It carries no credentials — the connector
+// resolves those from its own configuration (credential_ref).
 type FetchRequest struct {
 	Capability    Capability
 	IntegrationID string
 	WindowFrom    string
 	WindowTo      string
+	OABs          []OABEntry
 }
 
 // RawPayload is a connector's opaque output and the parser's input: the raw
@@ -83,6 +95,9 @@ type ParsedCourtRecord struct {
 	Class        string
 	Subject      string
 	Completeness float32
+	// JudgingBody is the órgão julgador the source disclosed (DJEN nomeOrgao /
+	// DATAJUD orgaoJulgador); empty when it did not.
+	JudgingBody string
 }
 
 // ParsedDocketEntry is one andamento. Hash is the source-computed dedup key
@@ -102,6 +117,11 @@ type ParsedDocketEntry struct {
 // ParsedIntimation is one intimação. Hash dedups within the (tenant, case)
 // scope; the three dates are already derived by the parser (the deadline slice
 // consumes them later). It belongs to the record named by (CNJNumber, Degree).
+// Type/Status/SourceURL/CancelledAt/CancelReason are the DJEN fields (0014):
+// Status is ACTIVE on a fresh publication and CANCELLED when the source retracts
+// it (then CancelledAt/CancelReason are set). Recipients is the jsonb list of
+// every addressee with a matched flag on the tenant's OAB, carried verbatim to
+// the column. Type/SourceURL/CancelReason are empty when the source omits them.
 type ParsedIntimation struct {
 	CNJNumber       string
 	Degree          string
@@ -111,6 +131,12 @@ type ParsedIntimation struct {
 	DeadlineStartAt time.Time
 	Content         string
 	Source          string
+	Type            string
+	Status          string
+	SourceURL       string
+	CancelledAt     time.Time
+	CancelReason    string
+	Recipients      json.RawMessage
 }
 
 // Parser is the port that turns a RawPayload into a ParsedResult. CanParse lets

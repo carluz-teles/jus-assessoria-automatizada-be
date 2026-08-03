@@ -73,6 +73,10 @@ type SyncRequested struct {
 	SliceIndex    int    `json:"slice_index"`
 	WindowFrom    string `json:"window_from"`
 	WindowTo      string `json:"window_to"`
+	// Scope denormalizes the integration's watch scope (the OABs) onto the event,
+	// so the sync consumer builds the connector's discovery FetchRequest without
+	// reading back the integration row.
+	Scope Scope `json:"scope"`
 }
 
 var _ events.Event = SyncRequested{}

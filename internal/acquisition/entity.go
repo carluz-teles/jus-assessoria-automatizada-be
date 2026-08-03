@@ -5,7 +5,10 @@
 // downstream slices (sync, backfill — future) learn a source went live.
 package acquisition
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Source constants — the data sources a tenant can subscribe to. Only DJEN and
 // DATAJUD are activatable in v0; UPLOAD exists in the schema but is not an
@@ -105,10 +108,31 @@ type DocketEntry struct {
 	Text          string
 }
 
+// Intimation type constants — the DJEN communication kind (tipoComunicacao). The
+// deadline slice's counting rule branches on it (a citação and an intimação count
+// differently). Text validated on the app, per the CHECK-on-app convention.
+const (
+	IntimationTypeIntimacao   = "INTIMACAO"
+	IntimationTypeCitacao     = "CITACAO"
+	IntimationTypeComunicacao = "COMUNICACAO"
+)
+
+// Intimation status constants — its cancellation lifecycle. A publication lands
+// ACTIVE; when the DJEN retracts it (data_cancelamento) the same hash re-arrives
+// as CANCELLED and the upsert flips the row, so the deadline slice revokes the
+// derived prazo. The column default is ACTIVE.
+const (
+	IntimationStatusActive    = "ACTIVE"
+	IntimationStatusCancelled = "CANCELLED"
+)
+
 // Intimation is one intimação persisted by the sync cycle, deduped within the
 // (tenant, case) scope. This slice does not emit an intimation-observed event
 // (the deadline slice owns that), so the entity is the persisted shape, not an
-// event carrier.
+// event carrier. Type/Status/SourceURL/CancelledAt/CancelReason are the DJEN
+// fields (0014); Recipients is the jsonb list of every addressee with a matched
+// flag on the tenant's OAB. Type/SourceURL/CancelReason are empty when the source
+// does not disclose them; CancelledAt is the zero time unless status is CANCELLED.
 type Intimation struct {
 	ID              string
 	TenantID        string
@@ -120,4 +144,10 @@ type Intimation struct {
 	DeadlineStartAt time.Time
 	Content         string
 	Source          string
+	Type            string
+	Status          string
+	SourceURL       string
+	CancelledAt     time.Time
+	CancelReason    string
+	Recipients      json.RawMessage
 }

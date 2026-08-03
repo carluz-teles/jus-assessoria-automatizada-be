@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -74,6 +75,10 @@ type FindOrCreateCourtRecordParams struct {
 	Subject      string
 	Completeness float32
 	NextSyncAt   time.Time
+	// JudgingBody is the órgão julgador the source disclosed (empty when it did
+	// not). It is refreshed on every sync, but COALESCEd in the repo so a sync that
+	// omits it keeps the value a prior sync learned.
+	JudgingBody string
 	// ActiveProcessLimit is the tenant's ceiling on ACTIVE processes (the billing
 	// entitlement), resolved by the use case and passed down so the repo can gate a
 	// NEW record against it. The repo only compares the count to this number; it
@@ -93,7 +98,11 @@ type DocketEntryParams struct {
 	Text          string
 }
 
-// IntimationParams is one intimação to upsert (idempotent on tenant+case+hash).
+// IntimationParams is one intimação to upsert (ON CONFLICT DO UPDATE on
+// tenant+case+hash). Type/Status/SourceURL/CancelledAt/CancelReason are the DJEN
+// fields; Status defaults to ACTIVE (intimationParamsFor fills it) and drives the
+// upsert's DO UPDATE when the source retracts a publication. Recipients is the
+// jsonb addressee list carried verbatim to the column (empty → the '[]' default).
 type IntimationParams struct {
 	TenantID        string
 	CaseID          string
@@ -104,6 +113,12 @@ type IntimationParams struct {
 	DeadlineStartAt time.Time
 	Content         string
 	Source          string
+	Type            string
+	Status          string
+	SourceURL       string
+	CancelledAt     time.Time
+	CancelReason    string
+	Recipients      json.RawMessage
 }
 
 // syncRepo is the narrow persistence port the sync use case drives.
@@ -355,6 +370,7 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 				Class:              pr.Class,
 				Subject:            pr.Subject,
 				Completeness:       pr.Completeness,
+				JudgingBody:        pr.JudgingBody,
 				NextSyncAt:         nextSync,
 				ActiveProcessLimit: limit,
 			})
@@ -481,6 +497,12 @@ func intimationParamsFor(tenantID string, intims []ParsedIntimation, records map
 		if !ok {
 			return nil, fmt.Errorf("intimation %q references unknown court record %s/%s", pn.Hash, pn.CNJNumber, pn.Degree)
 		}
+		status := pn.Status
+		if status == "" {
+			// The source did not disclose a status: a fresh publication is ACTIVE (the
+			// column default). Filling it here keeps the upsert's EXCLUDED.status honest.
+			status = IntimationStatusActive
+		}
 		params = append(params, IntimationParams{
 			TenantID:        tenantID,
 			CaseID:          cr.CaseID,
@@ -491,20 +513,44 @@ func intimationParamsFor(tenantID string, intims []ParsedIntimation, records map
 			DeadlineStartAt: pn.DeadlineStartAt,
 			Content:         pn.Content,
 			Source:          pn.Source,
+			Type:            pn.Type,
+			Status:          status,
+			SourceURL:       pn.SourceURL,
+			CancelledAt:     pn.CancelledAt,
+			CancelReason:    pn.CancelReason,
+			Recipients:      pn.Recipients,
 		})
 	}
 	return params, nil
 }
 
 // fetchRequestFromEvent maps a sync_requested window to a connector FetchRequest.
-// Onboarding syncs discover a tenant's processes by OAB over the window.
+// Onboarding syncs discover a tenant's processes by OAB over the window, so the
+// event's denormalized scope is split into the (number, UF) pairs the connector
+// queries.
 func fetchRequestFromEvent(ev SyncRequested) FetchRequest {
 	return FetchRequest{
 		Capability:    CapabilityDiscoverByOAB,
 		IntegrationID: ev.IntegrationID,
 		WindowFrom:    ev.WindowFrom,
 		WindowTo:      ev.WindowTo,
+		OABs:          oabEntriesFromScope(ev.Scope),
 	}
+}
+
+// oabEntriesFromScope splits each scope OAB — a validated "UF+number" string
+// (e.g. "SP123456", regex ^[A-Z]{2}\d{1,6}$) — into its (number, UF) parts, the
+// shape the connector's OAB discovery drives. A malformed entry (too short to
+// carry both parts) is skipped rather than yielding a bogus pair.
+func oabEntriesFromScope(scope Scope) []OABEntry {
+	entries := make([]OABEntry, 0, len(scope.OAB))
+	for _, oab := range scope.OAB {
+		if len(oab) < 3 {
+			continue
+		}
+		entries = append(entries, OABEntry{UF: oab[:2], Number: oab[2:]})
+	}
+	return entries
 }
 
 // recordKey is the in-memory join key between a parsed record and its docket

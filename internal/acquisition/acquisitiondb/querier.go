@@ -60,14 +60,23 @@ type Querier interface {
 	InsertCourtCase(ctx context.Context, tenantID uuid.UUID) (uuid.UUID, error)
 	// Create a court record under a case. The natural key (tenant, cnj, degree) is
 	// UNIQUE, so a racing double-create fails loudly rather than duplicating.
+	// judging_body (órgão julgador) comes from the source when disclosed (DJEN
+	// nomeOrgao / DATAJUD orgaoJulgador), NULL when it does not.
 	InsertCourtRecord(ctx context.Context, arg InsertCourtRecordParams) (uuid.UUID, error)
 	// Append one andamento, idempotent on (court_record_id, hash). On conflict the
 	// row is left untouched and no id is returned (pgx.ErrNoRows), which the caller
 	// reads as "deduped" — so a re-sync emits no docket_entry_observed for it.
 	InsertDocketEntry(ctx context.Context, arg InsertDocketEntryParams) (uuid.UUID, error)
-	// Append one intimação, idempotent on (tenant_id, case_id, hash). Same
-	// conflict-as-dedup contract as docket entries; recipients defaults to '[]'.
-	InsertIntimation(ctx context.Context, arg InsertIntimationParams) (uuid.UUID, error)
+	// Append or reconcile one intimação, keyed on (tenant_id, case_id, hash). Unlike
+	// docket entries, this is ON CONFLICT DO UPDATE (not DO NOTHING): when the DJEN
+	// retracts a publication (data_cancelamento) the SAME hash re-arrives carrying
+	// status=CANCELLED + cancelled_at/cancel_reason, and the existing row MUST be
+	// updated so the deadline slice revokes the derived prazo — a DO NOTHING would
+	// leave a phantom deadline. type/source_url are refreshed alongside. recipients is
+	// written on insert and left untouched on update (the matched-OAB flag is stable
+	// per hash). (xmax = 0) tells the caller whether THIS upsert inserted a fresh row
+	// (true) or updated an existing one (false), so it can still tally new vs. deduped.
+	InsertIntimation(ctx context.Context, arg InsertIntimationParams) (InsertIntimationRow, error)
 	// sync cycle queries (acquisition slice).
 	// The sync listener reacts to sync_requested: it opens a sync_run (RUNNING),
 	// fetches+parses a window, then upserts the observed records/entries/intimations
@@ -86,6 +95,9 @@ type Querier interface {
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)
 	// Record that a sync touched this court record: refresh its completeness and
 	// schedule the next sweep (next_sync_at drives the scheduler slice later).
+	// judging_body is COALESCEd, not overwritten: a sync that does not disclose the
+	// órgão julgador (NULL) keeps the value a prior sync learned — DATAJUD reveals it
+	// after a DJEN discovery landed the record without it (placeholder+merge).
 	MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecordSyncedParams) error
 	// Close a sync run, but ONLY from RUNNING: the status guard makes this the single
 	// winning transition (compare-and-swap), so a redelivery that resumes a run

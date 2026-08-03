@@ -72,17 +72,23 @@ RETURNING id;
 -- name: InsertCourtRecord :one
 -- Create a court record under a case. The natural key (tenant, cnj, degree) is
 -- UNIQUE, so a racing double-create fails loudly rather than duplicating.
+-- judging_body (órgão julgador) comes from the source when disclosed (DJEN
+-- nomeOrgao / DATAJUD orgaoJulgador), NULL when it does not.
 INSERT INTO court_record
-    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING id;
 
 -- name: MarkCourtRecordSynced :exec
 -- Record that a sync touched this court record: refresh its completeness and
 -- schedule the next sweep (next_sync_at drives the scheduler slice later).
+-- judging_body is COALESCEd, not overwritten: a sync that does not disclose the
+-- órgão julgador (NULL) keeps the value a prior sync learned — DATAJUD reveals it
+-- after a DJEN discovery landed the record without it (placeholder+merge).
 UPDATE court_record
 SET completeness = $2,
-    next_sync_at = $3
+    next_sync_at = $3,
+    judging_body = COALESCE($4, judging_body)
 WHERE id = $1;
 
 -- name: InsertDocketEntry :one
@@ -96,10 +102,24 @@ ON CONFLICT (court_record_id, hash) DO NOTHING
 RETURNING id;
 
 -- name: InsertIntimation :one
--- Append one intimação, idempotent on (tenant_id, case_id, hash). Same
--- conflict-as-dedup contract as docket entries; recipients defaults to '[]'.
+-- Append or reconcile one intimação, keyed on (tenant_id, case_id, hash). Unlike
+-- docket entries, this is ON CONFLICT DO UPDATE (not DO NOTHING): when the DJEN
+-- retracts a publication (data_cancelamento) the SAME hash re-arrives carrying
+-- status=CANCELLED + cancelled_at/cancel_reason, and the existing row MUST be
+-- updated so the deadline slice revokes the derived prazo — a DO NOTHING would
+-- leave a phantom deadline. type/source_url are refreshed alongside. recipients is
+-- written on insert and left untouched on update (the matched-OAB flag is stable
+-- per hash). (xmax = 0) tells the caller whether THIS upsert inserted a fresh row
+-- (true) or updated an existing one (false), so it can still tally new vs. deduped.
 INSERT INTO intimation
-    (tenant_id, case_id, court_record_id, hash, made_available_at, published_at, deadline_start_at, content, source)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-ON CONFLICT (tenant_id, case_id, hash) DO NOTHING
-RETURNING id;
+    (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
+     deadline_start_at, content, source, type, status, source_url, cancelled_at,
+     cancel_reason, recipients)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
+    status        = EXCLUDED.status,
+    cancelled_at  = EXCLUDED.cancelled_at,
+    cancel_reason = EXCLUDED.cancel_reason,
+    type          = EXCLUDED.type,
+    source_url    = EXCLUDED.source_url
+RETURNING id, (xmax = 0) AS inserted;

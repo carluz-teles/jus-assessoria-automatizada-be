@@ -72,7 +72,10 @@ func TestEmbeddedSource(t *testing.T) {
 	// adds 8 (notification + notification_delivery); the sync hardening adds 9
 	// (sync_run.event_id); the tenant-phone slice adds 10 (tenant.phone); the
 	// tenant-email slice adds 11 (tenant.email).
-	// So 1→2→3→4→5→6→7→8→9→10→11 and 11 is the last — nothing follows it.
+	// The holiday slice adds 12 (the holiday table) and 13 (the state-holiday
+	// seed); the DJEN connector adds 14 (intimation DJEN fields + court_record
+	// judging_body).
+	// So 1→…→13→14 and 14 is the last — nothing follows it.
 	if next, err := src.Next(1); err != nil || next != 2 {
 		t.Fatalf("Next(1) = (%d, %v), want (2, nil)", next, err)
 	}
@@ -109,8 +112,11 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(12); err != nil || next != 13 {
 		t.Fatalf("Next(12) = (%d, %v), want (13, nil)", next, err)
 	}
-	if _, err := src.Next(13); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(13) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(13); err != nil || next != 14 {
+		t.Fatalf("Next(13) = (%d, %v), want (14, nil)", next, err)
+	}
+	if _, err := src.Next(14); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(14) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

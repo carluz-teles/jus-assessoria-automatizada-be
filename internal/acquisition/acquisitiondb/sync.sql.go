@@ -118,8 +118,8 @@ func (q *Queries) InsertCourtCase(ctx context.Context, tenantID uuid.UUID) (uuid
 
 const insertCourtRecord = `-- name: InsertCourtRecord :one
 INSERT INTO court_record
-    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING id
 `
 
@@ -132,10 +132,13 @@ type InsertCourtRecordParams struct {
 	Class        *string   `json:"class"`
 	Subject      *string   `json:"subject"`
 	Completeness float32   `json:"completeness"`
+	JudgingBody  *string   `json:"judging_body"`
 }
 
 // Create a court record under a case. The natural key (tenant, cnj, degree) is
 // UNIQUE, so a racing double-create fails loudly rather than duplicating.
+// judging_body (órgão julgador) comes from the source when disclosed (DJEN
+// nomeOrgao / DATAJUD orgaoJulgador), NULL when it does not.
 func (q *Queries) InsertCourtRecord(ctx context.Context, arg InsertCourtRecordParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertCourtRecord,
 		arg.TenantID,
@@ -146,6 +149,7 @@ func (q *Queries) InsertCourtRecord(ctx context.Context, arg InsertCourtRecordPa
 		arg.Class,
 		arg.Subject,
 		arg.Completeness,
+		arg.JudgingBody,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)
@@ -190,10 +194,17 @@ func (q *Queries) InsertDocketEntry(ctx context.Context, arg InsertDocketEntryPa
 
 const insertIntimation = `-- name: InsertIntimation :one
 INSERT INTO intimation
-    (tenant_id, case_id, court_record_id, hash, made_available_at, published_at, deadline_start_at, content, source)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-ON CONFLICT (tenant_id, case_id, hash) DO NOTHING
-RETURNING id
+    (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
+     deadline_start_at, content, source, type, status, source_url, cancelled_at,
+     cancel_reason, recipients)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
+    status        = EXCLUDED.status,
+    cancelled_at  = EXCLUDED.cancelled_at,
+    cancel_reason = EXCLUDED.cancel_reason,
+    type          = EXCLUDED.type,
+    source_url    = EXCLUDED.source_url
+RETURNING id, (xmax = 0) AS inserted
 `
 
 type InsertIntimationParams struct {
@@ -206,11 +217,29 @@ type InsertIntimationParams struct {
 	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
 	Content         string      `json:"content"`
 	Source          string      `json:"source"`
+	Type            *string     `json:"type"`
+	Status          string      `json:"status"`
+	SourceUrl       *string     `json:"source_url"`
+	CancelledAt     pgtype.Date `json:"cancelled_at"`
+	CancelReason    *string     `json:"cancel_reason"`
+	Recipients      []byte      `json:"recipients"`
 }
 
-// Append one intimação, idempotent on (tenant_id, case_id, hash). Same
-// conflict-as-dedup contract as docket entries; recipients defaults to '[]'.
-func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationParams) (uuid.UUID, error) {
+type InsertIntimationRow struct {
+	ID       uuid.UUID `json:"id"`
+	Inserted bool      `json:"inserted"`
+}
+
+// Append or reconcile one intimação, keyed on (tenant_id, case_id, hash). Unlike
+// docket entries, this is ON CONFLICT DO UPDATE (not DO NOTHING): when the DJEN
+// retracts a publication (data_cancelamento) the SAME hash re-arrives carrying
+// status=CANCELLED + cancelled_at/cancel_reason, and the existing row MUST be
+// updated so the deadline slice revokes the derived prazo — a DO NOTHING would
+// leave a phantom deadline. type/source_url are refreshed alongside. recipients is
+// written on insert and left untouched on update (the matched-OAB flag is stable
+// per hash). (xmax = 0) tells the caller whether THIS upsert inserted a fresh row
+// (true) or updated an existing one (false), so it can still tally new vs. deduped.
+func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationParams) (InsertIntimationRow, error) {
 	row := q.db.QueryRow(ctx, insertIntimation,
 		arg.TenantID,
 		arg.CaseID,
@@ -221,10 +250,16 @@ func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationPara
 		arg.DeadlineStartAt,
 		arg.Content,
 		arg.Source,
+		arg.Type,
+		arg.Status,
+		arg.SourceUrl,
+		arg.CancelledAt,
+		arg.CancelReason,
+		arg.Recipients,
 	)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
+	var i InsertIntimationRow
+	err := row.Scan(&i.ID, &i.Inserted)
+	return i, err
 }
 
 const insertSyncRun = `-- name: InsertSyncRun :one
@@ -275,7 +310,8 @@ func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (u
 const markCourtRecordSynced = `-- name: MarkCourtRecordSynced :exec
 UPDATE court_record
 SET completeness = $2,
-    next_sync_at = $3
+    next_sync_at = $3,
+    judging_body = COALESCE($4, judging_body)
 WHERE id = $1
 `
 
@@ -283,12 +319,21 @@ type MarkCourtRecordSyncedParams struct {
 	ID           uuid.UUID          `json:"id"`
 	Completeness float32            `json:"completeness"`
 	NextSyncAt   pgtype.Timestamptz `json:"next_sync_at"`
+	JudgingBody  *string            `json:"judging_body"`
 }
 
 // Record that a sync touched this court record: refresh its completeness and
 // schedule the next sweep (next_sync_at drives the scheduler slice later).
+// judging_body is COALESCEd, not overwritten: a sync that does not disclose the
+// órgão julgador (NULL) keeps the value a prior sync learned — DATAJUD reveals it
+// after a DJEN discovery landed the record without it (placeholder+merge).
 func (q *Queries) MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecordSyncedParams) error {
-	_, err := q.db.Exec(ctx, markCourtRecordSynced, arg.ID, arg.Completeness, arg.NextSyncAt)
+	_, err := q.db.Exec(ctx, markCourtRecordSynced,
+		arg.ID,
+		arg.Completeness,
+		arg.NextSyncAt,
+		arg.JudgingBody,
+	)
 	return err
 }
 

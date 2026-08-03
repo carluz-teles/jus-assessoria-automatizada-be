@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -391,6 +392,7 @@ func (r *pgRepository) createCourtRecord(ctx context.Context, q *acquisitiondb.Q
 		Class:        nullString(params.Class),
 		Subject:      nullString(params.Subject),
 		Completeness: params.Completeness,
+		JudgingBody:  nullString(params.JudgingBody),
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -407,6 +409,7 @@ func (r *pgRepository) markCourtRecordSynced(ctx context.Context, q *acquisition
 		ID:           id,
 		Completeness: params.Completeness,
 		NextSyncAt:   pgtype.Timestamptz{Time: params.NextSyncAt, Valid: true},
+		JudgingBody:  nullString(params.JudgingBody),
 	})
 	return database.WrapInfra(err)
 }
@@ -453,10 +456,13 @@ func (r *pgRepository) UpsertDocketEntries(ctx context.Context, tx database.Tx, 
 	return newEntries, nil
 }
 
-// UpsertIntimations inserts each intimação ON CONFLICT DO NOTHING inside the
-// caller's tx and returns how many were new (same conflict-as-dedup contract as
-// docket entries). This slice emits no intimation-observed event, so only the
-// count is returned.
+// UpsertIntimations inserts-or-updates each intimação ON CONFLICT DO UPDATE inside
+// the caller's tx and returns how many were ACTUALLY new. The DO UPDATE always
+// returns a row (unlike the docket entries' DO NOTHING), so newness is read from
+// the query's `inserted` flag (xmax = 0) rather than a pgx.ErrNoRows miss: an
+// existing intimation retracted by the source is updated in place (so the deadline
+// slice can revoke its prazo), counting as deduped, not new. This slice emits no
+// intimation-observed event, so only the count is returned.
 func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error) {
 	q := acquisitiondb.New(tx)
 	newCount := 0
@@ -473,7 +479,7 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 		if err != nil {
 			return 0, database.WrapInfra(err)
 		}
-		_, err = q.InsertIntimation(ctx, acquisitiondb.InsertIntimationParams{
+		row, err := q.InsertIntimation(ctx, acquisitiondb.InsertIntimationParams{
 			TenantID:        tid,
 			CaseID:          caseID,
 			CourtRecordID:   crid,
@@ -483,14 +489,19 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 			DeadlineStartAt: pgtype.Date{Time: p.DeadlineStartAt, Valid: true},
 			Content:         p.Content,
 			Source:          p.Source,
+			Type:            nullString(p.Type),
+			Status:          p.Status,
+			SourceUrl:       nullString(p.SourceURL),
+			CancelledAt:     nullDate(p.CancelledAt),
+			CancelReason:    nullString(p.CancelReason),
+			Recipients:      recipientsOrEmpty(p.Recipients),
 		})
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
 		if err != nil {
 			return 0, database.WrapInfra(err)
 		}
-		newCount++
+		if row.Inserted {
+			newCount++
+		}
 	}
 	return newCount, nil
 }
@@ -515,6 +526,24 @@ func nullString(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// nullDate maps the zero time to a SQL NULL date (Valid:false) for the nullable
+// date columns (cancelled_at); a real instant is written as a valid date.
+func nullDate(t time.Time) pgtype.Date {
+	if t.IsZero() {
+		return pgtype.Date{}
+	}
+	return pgtype.Date{Time: t, Valid: true}
+}
+
+// recipientsOrEmpty defaults an absent recipients list to the jsonb empty array
+// the column stores, so the NOT NULL recipients column is never handed a nil.
+func recipientsOrEmpty(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return []byte("[]")
+	}
+	return raw
 }
 
 // encodeSyncError serializes a failure reason to the sync_run.error jsonb, or nil

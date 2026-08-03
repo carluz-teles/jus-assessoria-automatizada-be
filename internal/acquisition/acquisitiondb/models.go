@@ -80,6 +80,7 @@ type CourtRecord struct {
 	SyncPolicy   []byte             `json:"sync_policy"`
 	NextSyncAt   pgtype.Timestamptz `json:"next_sync_at"`
 	LastSyncedAt []byte             `json:"last_synced_at"`
+	JudgingBody  *string            `json:"judging_body"`
 }
 
 type Deadline struct {
@@ -165,6 +166,11 @@ type Intimation struct {
 	Content         string      `json:"content"`
 	Source          string      `json:"source"`
 	Recipients      []byte      `json:"recipients"`
+	Type            *string     `json:"type"`
+	Status          string      `json:"status"`
+	SourceUrl       *string     `json:"source_url"`
+	CancelledAt     pgtype.Date `json:"cancelled_at"`
+	CancelReason    *string     `json:"cancel_reason"`
 }
 
 type Membership struct {
