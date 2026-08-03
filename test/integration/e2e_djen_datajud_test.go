@@ -169,6 +169,52 @@ func TestE2E_DJEN_DATAJUD(t *testing.T) {
 	} else {
 		t.Log("no DATAJUD hits this run (processes not yet indexed) — merge assertions skipped")
 	}
+
+	// ── Phase 3: the screen reads (what the FE renders) ────────────────────────
+	readUC := acquisition.NewReadUseCase(repo)
+
+	procs, _, err := readUC.Processos(ctx, acquisition.ProcessosQuery{
+		TenantID: tenantID, LastCNJ: "", LastID: "00000000-0000-0000-0000-000000000000", Limit: 5,
+	})
+	if err != nil {
+		t.Fatalf("read Processos: %v", err)
+	}
+	if len(procs) == 0 {
+		t.Error("Processos read returned nothing, but records were discovered")
+	}
+	t.Logf("── Phase 3: GET /v1/processos → %d rows (first %d shown)", discovered, len(procs))
+	for _, p := range procs {
+		last := "—"
+		if p.LastMovementAt != nil {
+			last = p.LastMovementAt.Format("2006-01-02") + " " + truncate(p.LastMovementText, 40)
+		}
+		t.Logf("   • %s [%s] %s — classe=%q · último andamento: %s", p.CNJNumber, p.Degree, p.Court, p.Class, last)
+	}
+
+	intims, _, err := readUC.Intimacoes(ctx, acquisition.IntimacoesQuery{
+		TenantID: tenantID, LastMadeAvailable: "9999-12-31", LastID: "ffffffff-ffff-ffff-ffff-ffffffffffff", Limit: 5,
+	})
+	if err != nil {
+		t.Fatalf("read Intimacoes: %v", err)
+	}
+	if len(intims) == 0 {
+		t.Error("Intimacoes read returned nothing, but intimations were discovered")
+	}
+	t.Logf("── GET /v1/intimacoes → %d rows (first %d shown)", intimations, len(intims))
+	for _, in := range intims {
+		t.Logf("   • %s [%s] %s tipo=%s status=%s · disp=%s prazo_início=%s",
+			in.CNJNumber, in.Degree, in.Court, in.Type, in.Status,
+			in.MadeAvailableAt.Format("2006-01-02"), in.DeadlineStartAt.Format("2006-01-02"))
+	}
+}
+
+// truncate shortens s to n runes for the log trace.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // sampleIntimationInvariants checks one discovered intimation carries a derived

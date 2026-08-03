@@ -131,6 +131,14 @@ func (m *mockRepo) ClaimCourtRecordResync(_ context.Context, _ database.Tx, _ st
 	return nil
 }
 
+func (m *mockRepo) ListProcessos(_ context.Context, _ ProcessosQuery) ([]ProcessoView, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) ListIntimacoes(_ context.Context, _ IntimacoesQuery) ([]IntimacaoView, error) {
+	return nil, nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {

@@ -110,6 +110,21 @@ type Querier interface {
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)
+	// The intimações inbox: the tenant's intimations, newest availability first, with
+	// the court record's number/court/degree joined in. Descending keyset on
+	// (made_available_at, id); the first page passes the max sentinel
+	// ('9999-12-31', max-uuid).
+	ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error)
+	// read-model queries (acquisition slice) — the screen reads, kept OFF the write
+	// path (docs: "leitura de tela usa read model, DTO por query dedicada"). Each is
+	// tenant-scoped (barrier 1) and keyset-paginated on a stable (sort_key, id) pair
+	// so paging is offset-free and stable under concurrent inserts. The caller passes
+	// a sentinel cursor for the first page, so there is no conditional WHERE.
+	// The consolidated processes screen: the tenant's live court records (SUPERSEDED
+	// placeholders drop out), each with its most recent andamento for the "last
+	// movement" column. Ordered by cnj_number then id (ascending keyset): the first
+	// page passes ('', zero-uuid).
+	ListProcessos(ctx context.Context, arg ListProcessosParams) ([]ListProcessosRow, error)
 	// Record that a sync touched this court record: refresh its completeness and
 	// schedule the next sweep (next_sync_at drives the scheduler slice later).
 	// judging_body is COALESCEd, not overwritten: a sync that does not disclose the

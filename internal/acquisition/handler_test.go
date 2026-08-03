@@ -54,6 +54,18 @@ func (f *fakeHandlerUC) ListIntegrations(_ context.Context, tenantID string) ([]
 	return f.listResp, nil
 }
 
+// fakeReader is a no-op read port for the write-path handler tests (the read
+// routes have their own coverage).
+type fakeReader struct{}
+
+func (fakeReader) Processos(context.Context, ProcessosQuery) ([]ProcessoView, bool, error) {
+	return nil, false, nil
+}
+
+func (fakeReader) Intimacoes(context.Context, IntimacoesQuery) ([]IntimacaoView, bool, error) {
+	return nil, false, nil
+}
+
 // newApp builds an app whose /v1 group mirrors production: Auth resolves a
 // principal with the given role/tenant, then the acquisition routes mount under
 // it. An empty role/tenant still yields a valid principal (used by role tests).
@@ -62,7 +74,7 @@ func newApp(uc handlerUC, role, tenant string) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: role, tenant: tenant}))
-	NewHandler(uc).RegisterV1(v1)
+	NewHandler(uc, fakeReader{}).RegisterV1(v1)
 	return app
 }
 

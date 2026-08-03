@@ -53,6 +53,11 @@ type Repository interface {
 	// case depends on the narrow schedulerRepo view of these.
 	DueCourtRecordsForResync(ctx context.Context, tx database.Tx, limit int) ([]DueRecord, error)
 	ClaimCourtRecordResync(ctx context.Context, tx database.Tx, recordID string, nextSyncAt time.Time) error
+
+	// Screen reads — the keyset-paginated read models (off the write path). The read
+	// use case depends on the narrow readRepo view of these.
+	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
+	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -641,6 +646,93 @@ func (r *pgRepository) ClaimCourtRecordResync(ctx context.Context, tx database.T
 	return database.WrapInfra(err)
 }
 
+// ListProcessos reads the tenant's live processes (keyset-paginated) on the pool,
+// filtered by tenant_id (isolation barrier 1) like the other screen reads. The
+// caller passes a sentinel cursor for the first page.
+func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastID, err := uuid.Parse(q.LastID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListProcessos(ctx, acquisitiondb.ListProcessosParams{
+		TenantID: tid,
+		Limit:    int32(q.Limit),
+		LastCnj:  q.LastCNJ,
+		LastID:   lastID,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]ProcessoView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ProcessoView{
+			ID:               row.ID.String(),
+			CaseID:           row.CaseID.String(),
+			CNJNumber:        row.CnjNumber,
+			Court:            row.Court,
+			Degree:           row.Degree,
+			Class:            deref(row.Class),
+			Subject:          deref(row.Subject),
+			JudgingBody:      deref(row.JudgingBody),
+			FiledAt:          datePtr(row.FiledAt),
+			Secrecy:          row.Secrecy,
+			Lifecycle:        row.Lifecycle,
+			Completeness:     row.Completeness,
+			LastMovementText: row.LastMovementText,
+			LastMovementAt:   timestampPtr(row.LastMovementAt),
+		})
+	}
+	return out, nil
+}
+
+// ListIntimacoes reads the tenant's intimation inbox (keyset-paginated, newest
+// availability first) on the pool, filtered by tenant_id.
+func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastID, err := uuid.Parse(q.LastID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastMade, err := time.Parse(time.DateOnly, q.LastMadeAvailable)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListIntimacoes(ctx, acquisitiondb.ListIntimacoesParams{
+		TenantID:          tid,
+		Limit:             int32(q.Limit),
+		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
+		LastID:            lastID,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]IntimacaoView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, IntimacaoView{
+			ID:              row.ID.String(),
+			CNJNumber:       row.CnjNumber,
+			Court:           row.Court,
+			Degree:          row.Degree,
+			Type:            deref(row.Type),
+			Status:          row.Status,
+			Source:          row.Source,
+			SourceURL:       deref(row.SourceUrl),
+			MadeAvailableAt: row.MadeAvailableAt.Time,
+			PublishedAt:     row.PublishedAt.Time,
+			DeadlineStartAt: row.DeadlineStartAt.Time,
+			ContentPreview:  contentPreview(row.Content),
+		})
+	}
+	return out, nil
+}
+
 // newCourtRecordEntity assembles the CourtRecord the use case works with from the
 // resolved ids and the request's natural-key fields.
 func newCourtRecordEntity(id, caseID uuid.UUID, params FindOrCreateCourtRecordParams) *CourtRecord {
@@ -661,6 +753,37 @@ func nullString(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// datePtr / timestampPtr lift a nullable driver date/timestamp to a *time.Time for
+// a read model — nil when the column was NULL, so it serializes as JSON null.
+func datePtr(d pgtype.Date) *time.Time {
+	if !d.Valid {
+		return nil
+	}
+	t := d.Time
+	return &t
+}
+
+func timestampPtr(ts pgtype.Timestamptz) *time.Time {
+	if !ts.Valid {
+		return nil
+	}
+	t := ts.Time
+	return &t
+}
+
+// contentPreviewLen bounds the intimation teor preview the inbox list carries; the
+// full (often long, HTML) content is a detail-screen concern.
+const contentPreviewLen = 500
+
+// contentPreview truncates the teor to contentPreviewLen runes for the inbox list.
+func contentPreview(content string) string {
+	runes := []rune(content)
+	if len(runes) <= contentPreviewLen {
+		return content
+	}
+	return string(runes[:contentPreviewLen])
 }
 
 // nullDate maps the zero time to a SQL NULL date (Valid:false) for the nullable

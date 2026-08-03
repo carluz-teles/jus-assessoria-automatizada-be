@@ -112,9 +112,12 @@ func run(logger *slog.Logger) error {
 	identityHandler := identity.NewHandler(uc)
 
 	// Acquisition wiring: the slice owns the domain; the binary only assembles it
-	// (repo + shared outbox + unit of work → use case → handler).
+	// (repo + shared outbox + unit of work → write use case; the same repo backs the
+	// read use case for the processos/intimações screen reads).
+	acquisitionRepo := acquisition.NewRepository(pool)
 	acquisitionHandler := acquisition.NewHandler(
-		acquisition.NewUseCase(acquisition.NewRepository(pool), events.NewOutbox(), uow),
+		acquisition.NewUseCase(acquisitionRepo, events.NewOutbox(), uow),
+		acquisition.NewReadUseCase(acquisitionRepo),
 	)
 
 	// Billing wiring: the slice owns the domain; the binary only assembles it
