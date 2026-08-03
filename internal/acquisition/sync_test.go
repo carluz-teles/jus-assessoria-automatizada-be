@@ -58,7 +58,7 @@ type stubParser struct {
 
 func (p *stubParser) CanParse(RawPayload) bool { return true }
 
-func (p *stubParser) Parse(RawPayload) (ParsedResult, error) {
+func (p *stubParser) Parse(context.Context, RawPayload) (ParsedResult, error) {
 	p.parseCalls++
 	if p.parseErr != nil {
 		return ParsedResult{}, p.parseErr

@@ -140,10 +140,45 @@ type ParsedIntimation struct {
 }
 
 // Parser is the port that turns a RawPayload into a ParsedResult. CanParse lets
-// the orchestrator match a payload to the parser that understands it; a Parse
-// failure is terminal (a malformed payload never parses on retry), so the sync
-// use case records FAILED and archives the task (asynq.SkipRetry).
+// a ParserSet match a payload to the parser that understands it; a Parse failure
+// is terminal (a malformed payload never parses on retry), so the sync use case
+// records FAILED and archives the task (asynq.SkipRetry). Parse takes a context
+// because a real parser may need I/O to finish the mapping — the DJEN parser
+// derives the publication/deadline dates through lib/calendar (holiday lookups),
+// outside the sync transaction.
 type Parser interface {
 	CanParse(p RawPayload) bool
-	Parse(p RawPayload) (ParsedResult, error)
+	Parse(ctx context.Context, p RawPayload) (ParsedResult, error)
+}
+
+// ParserSet is the parser counterpart of the Orchestrator: it resolves the first
+// registered parser that CanParse a payload and delegates to it. It is itself a
+// Parser, so the sync use case still depends on the single Parser port while the
+// composition wires one parser per source (a real DJEN parser next to a stub for
+// the sources not yet built). Order is significant — the first match wins — so
+// register the specific parsers before any catch-all.
+type ParserSet []Parser
+
+var _ Parser = ParserSet(nil)
+
+// CanParse reports whether any member can parse the payload.
+func (s ParserSet) CanParse(p RawPayload) bool {
+	for _, parser := range s {
+		if parser.CanParse(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Parse delegates to the first member that CanParse the payload, or returns the
+// typed ErrParserNotFound when none claims it (a misconfigured composition — the
+// sync use case treats it like any parse fault).
+func (s ParserSet) Parse(ctx context.Context, p RawPayload) (ParsedResult, error) {
+	for _, parser := range s {
+		if parser.CanParse(p) {
+			return parser.Parse(ctx, p)
+		}
+	}
+	return ParsedResult{}, ErrParserNotFound
 }

@@ -61,7 +61,7 @@ func NewStubParser() StubParser { return StubParser{} }
 
 func (StubParser) CanParse(p RawPayload) bool { return p.ConnectorID == stubConnectorID }
 
-func (StubParser) Parse(p RawPayload) (ParsedResult, error) {
+func (StubParser) Parse(_ context.Context, p RawPayload) (ParsedResult, error) {
 	return stubFixture(p.Source), nil
 }
 

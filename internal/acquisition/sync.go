@@ -212,11 +212,12 @@ func NewSyncUseCase(repo syncRepo, outbox publisher, uow database.UnitOfWork, or
 }
 
 // OnSyncRequested runs the cycle for one window. It opens a sync_run (deduped in
-// UoW-1), fetches and parses outside any transaction (no DB, pure connector I/O),
-// then commits the effect in UoW-2. A duplicate delivery no-ops after the dedup
-// mark. A fetch fault records a FAILED run and acks (the scheduler re-syncs
-// later); a parse fault records FAILED and archives the task (SkipRetry — a
-// malformed payload never parses on retry).
+// UoW-1), fetches and parses outside the sync transaction (the parser may read
+// shared reference data — the DJEN parser derives CPC-224 dates from the holiday
+// calendar — but never the sync tables), then commits the effect in UoW-2. A
+// duplicate delivery no-ops after the dedup mark. A fetch fault records a FAILED
+// run and acks (the scheduler re-syncs later); a parse fault records FAILED and
+// archives the task (SkipRetry — a malformed payload never parses on retry).
 //
 // tenantID comes from the event payload (a trusted internal producer, no Clerk
 // token on the worker) and scopes every transaction's RLS. The connector is
@@ -246,7 +247,7 @@ func (uc *SyncUseCase) OnSyncRequested(ctx context.Context, ev SyncRequested) er
 		return nil
 	}
 
-	parsed, err := uc.parser.Parse(raw)
+	parsed, err := uc.parser.Parse(ctx, raw)
 	if err != nil {
 		if ferr := uc.failRun(ctx, ev, syncRunID, err); ferr != nil {
 			return ferr

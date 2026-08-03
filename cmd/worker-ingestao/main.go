@@ -17,6 +17,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/notifications"
+	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -91,18 +92,28 @@ func run(logger *slog.Logger) error {
 	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow)
 
 	// The sync use case resolves its connector per event from the orchestrator, by
-	// the event's source. Until the real DJEN/DataJud connectors land, a stub is
-	// registered per source and paired with the stub parser (no network I/O).
+	// the event's source. DJEN is the REAL Comunica API connector (national OAB
+	// discovery, no auth); DATAJUD stays a stub until its enrichment slice lands.
 	orchestrator := acquisition.NewOrchestrator()
-	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewStubConnector(acquisition.SourceDJEN))
+	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewDJENConnector())
 	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewStubConnector(acquisition.SourceDATAJUD))
+
+	// Parsers are resolved by CanParse: the DJEN parser claims DJEN payloads and
+	// derives the CPC-224 publication/deadline dates through the judicial calendar
+	// (holiday table); the stub parser handles the DATAJUD stub payloads. The DJEN
+	// parser goes first so it wins its source.
+	cal := calendar.New(calendar.NewStore(pool))
+	parser := acquisition.ParserSet{
+		acquisition.NewDJENParser(cal),
+		acquisition.NewStubParser(),
+	}
 
 	// Billing entitlement: the sync cycle gates a NEW court record against the
 	// tenant's active_process_limit. acquisition owns the port (EntitlementChecker);
 	// billing supplies the adapter over its own repository; this composition root is
 	// the ONLY place that knows both slices (they never import each other).
 	entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
-	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, acquisition.NewStubParser(),
+	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser,
 		acquisition.WithEntitlementChecker(entitlement))
 
 	acquisition.NewListener(backfill, sync).Register(mux)

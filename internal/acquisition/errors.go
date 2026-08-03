@@ -14,6 +14,11 @@ var (
 	// source. Surfaces at composition time (a misconfigured worker), not per event.
 	ErrConnectorNotFound = apperr.NewNotFound("no connector registered for source")
 
+	// ErrParserNotFound — no registered parser CanParse a fetched payload (a
+	// ParserSet with no member for that source). Like ErrConnectorNotFound it is a
+	// misconfigured composition; the sync use case handles it as a parse fault.
+	ErrParserNotFound = apperr.NewNotFound("no parser registered for payload")
+
 	// ErrBackfillJobNotFound — no backfill_job matched the (tenant, id) of a slice
 	// increment: the row is invisible under this tenant (RLS/tenant mismatch) or no
 	// longer exists. The completion counter treats it as a no-op ack, never a retry.
