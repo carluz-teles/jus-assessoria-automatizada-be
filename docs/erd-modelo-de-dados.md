@@ -426,10 +426,13 @@ CREATE TABLE holiday (
   scope    text NOT NULL,          -- NATIONAL | STATE | COURT
   scope_id text,                   -- null p/ NATIONAL; UF p/ STATE; sigla do tribunal p/ COURT
   date     date NOT NULL,
-  name     text NOT NULL,
-  UNIQUE (scope, scope_id, date)
+  name     text NOT NULL
 );
-CREATE INDEX ON holiday (scope, scope_id, date);
+-- dedup por expressão: coalesce(scope_id,'') faz linhas NATIONAL (scope_id NULL)
+-- deduparem por (scope, date). UNIQUE simples trataria cada NULL como distinto e
+-- deixaria o seeder nacional inserir duplicatas. Também é o alvo do ON CONFLICT.
+CREATE UNIQUE INDEX holiday_scope_scopeid_date_key ON holiday (scope, coalesce(scope_id, ''), date);
+CREATE INDEX holiday_date_idx ON holiday (date);   -- hot path: lookup por date
 ```
 Cobertura completa (Nacional + Estadual + Tribunal), **semeada progressivamente**: a estrutura já suporta os três níveis; as linhas entram por seed/carga sem mudar código. O **recesso forense (20/12–20/01, CPC 220)** é regra fixa em `lib/calendar`, não linhas. (conectores DJEN/DATAJUD, 0012)
 

@@ -114,9 +114,16 @@ func (c *Calendar) AddBusinessDays(ctx context.Context, start time.Time, n int, 
 	return d, skipped, nil
 }
 
-// dateOnly strips any time-of-day and location, collapsing to a civil calendar
-// date in UTC. Judicial dates are location-agnostic; normalizing here keeps
-// weekday/recess/equality checks stable regardless of the caller's Location.
+// dateOnly pins a value to midnight UTC, taking the year/month/day from the
+// value's OWN components. The Calendar works on CIVIL dates, not instants: the
+// contract is that callers pass a date whose Y/M/D already are the intended
+// judicial date — a `date` column (pgx decodes it at UTC midnight) or a
+// wall-clock time in the correct zone. A zoned instant that crosses midnight
+// versus its civil date (e.g. a São Paulo evening stored as next-day UTC) must
+// be normalized by the caller BEFORE it reaches the Calendar; dateOnly does not
+// guess a timezone. In practice the sources are date-only (DJEN
+// data_disponibilizacao, the `date` columns), so this is a no-op that just drops
+// any stray time-of-day and keeps weekday/recess/equality checks stable.
 func dateOnly(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }

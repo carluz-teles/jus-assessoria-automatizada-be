@@ -52,8 +52,11 @@ type seedStore interface {
 // year ending up with no national holidays, which would silently yield wrong
 // deadlines — is logged at Error (alarmable) but still does not fail boot; it
 // self-heals on the next boot once BrasilAPI recovers. A genuine persistence
-// failure (reading seeded years, upserting) IS returned, since that signals a
-// broken database, not a flaky upstream.
+// failure (reading seeded years, upserting) is RETURNED so the caller can
+// decide — it signals a broken database, not a flaky upstream. The api caller
+// (cmd/api) logs it at Warn and continues rather than aborting boot: migrations
+// ran against the same pool moments earlier, so a seed-time DB fault is treated
+// as non-fatal there (seeding never blocks boot).
 func SeedNational(ctx context.Context, store seedStore, fetcher Fetcher, logger *slog.Logger, currentYear, yearsAhead int) error {
 	if yearsAhead < 0 {
 		return fmt.Errorf("SeedNational: yearsAhead must be >= 0, got %d", yearsAhead)
