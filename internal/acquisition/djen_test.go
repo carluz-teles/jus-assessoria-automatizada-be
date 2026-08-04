@@ -60,7 +60,7 @@ func TestDJENConnectorFetch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewDJENConnector(WithDJENBaseURL(srv.URL), WithDJENPageSize(2))
+	c := NewDJENConnector(WithDJENBaseURL(srv.URL), WithDJENRatePerMinute(6000000), WithDJENPageSize(2))
 	raw, err := c.Fetch(context.Background(), FetchRequest{
 		Capability: CapabilityDiscoverByOAB,
 		WindowFrom: "2024-01-01",
@@ -124,7 +124,7 @@ func TestDJENConnectorFetchErrors(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		c := NewDJENConnector(WithDJENBaseURL(srv.URL))
+		c := NewDJENConnector(WithDJENBaseURL(srv.URL), WithDJENRatePerMinute(6000000))
 		_, err := c.Fetch(context.Background(), FetchRequest{
 			Capability: CapabilityDiscoverByOAB,
 			OABs:       []OABEntry{{Number: "1", UF: "SP"}},
@@ -141,7 +141,7 @@ func TestDJENConnectorFetchErrors(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		c := NewDJENConnector(WithDJENBaseURL(srv.URL))
+		c := NewDJENConnector(WithDJENBaseURL(srv.URL), WithDJENRatePerMinute(6000000))
 		_, err := c.Fetch(context.Background(), FetchRequest{
 			Capability: CapabilityDiscoverByOAB,
 			OABs:       []OABEntry{{Number: "1", UF: "SP"}},

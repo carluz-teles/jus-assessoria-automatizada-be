@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/jusassessoria/platform/lib/apperr"
 )
 
@@ -32,11 +34,20 @@ const (
 	// its reported count at 10000 and paginates; a page shorter than this ends the walk.
 	djenDefaultPageSize = 100
 
-	// djenUserAgent is a browser-like UA: the Comunica API sits behind a WAF that
-	// intermittently 403s bot-looking clients. A transient 403 is a retryable fetch
-	// fault (the sync cycle records FAILED and the scheduler re-syncs later), but a
-	// realistic UA keeps the block rate low.
-	djenUserAgent = "Mozilla/5.0 (compatible; jusassessoria-acquisition)"
+	// The Comunica API sits behind a WAF that 403s bot-looking clients — from a
+	// datacenter IP (prod) consistently, and it also rate-blocks bursts. So the
+	// connector presents a FULL, current browser fingerprint (real Chrome UA +
+	// Referer to the public consulta site + Accept-Language) and paces itself
+	// (djenDefaultRatePerMinute). A 403 that still slips through is a retryable
+	// fetch fault — asynq re-delivers with backoff.
+	djenUserAgent      = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+	djenReferer        = "https://comunica.pje.jus.br/"
+	djenAcceptLanguage = "pt-BR,pt;q=0.9,en;q=0.8"
+
+	// djenDefaultRatePerMinute paces requests so the backfill's burst of windows does
+	// not trip the WAF's rate block. The limiter is shared across the connector, so it
+	// caps the total request rate even under concurrent syncs.
+	djenDefaultRatePerMinute = 60
 
 	// djenMaxPages bounds the pagination walk defensively (200 pages × default size
 	// spans the API's 10000-count cap twice over) so a misbehaving endpoint can never
@@ -55,6 +66,7 @@ type DJENConnector struct {
 	baseURL    string
 	httpClient *http.Client
 	pageSize   int
+	limiter    *rate.Limiter
 }
 
 // DJENOption tunes a DJENConnector at construction.
@@ -90,6 +102,16 @@ func WithDJENPageSize(n int) DJENOption {
 	}
 }
 
+// WithDJENRatePerMinute overrides the request pace (WAF avoidance). A non-positive
+// value keeps the default.
+func WithDJENRatePerMinute(n int) DJENOption {
+	return func(c *DJENConnector) {
+		if n > 0 {
+			c.limiter = rate.NewLimiter(rate.Every(time.Minute/time.Duration(n)), 1)
+		}
+	}
+}
+
 // NewDJENConnector builds the connector with production defaults, then applies the
 // options.
 func NewDJENConnector(opts ...DJENOption) *DJENConnector {
@@ -97,6 +119,7 @@ func NewDJENConnector(opts ...DJENOption) *DJENConnector {
 		baseURL:    djenDefaultBaseURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		pageSize:   djenDefaultPageSize,
+		limiter:    rate.NewLimiter(rate.Every(time.Minute/time.Duration(djenDefaultRatePerMinute)), 1),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -204,12 +227,21 @@ func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to stri
 		"itensPorPagina":             {strconv.Itoa(c.pageSize)},
 	}.Encode()
 
+	// Pace requests so the backfill's burst does not trip the WAF's rate block.
+	if err := c.limiter.Wait(ctx); err != nil {
+		return djenResponse{}, apperr.NewInfra("djen: rate limiter wait", err)
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return djenResponse{}, apperr.NewInfra("djen: build request", err)
 	}
+	// Present a full, current browser fingerprint — the WAF 403s bot-looking clients.
 	httpReq.Header.Set("User-Agent", djenUserAgent)
-	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/plain, */*")
+	httpReq.Header.Set("Accept-Language", djenAcceptLanguage)
+	httpReq.Header.Set("Referer", djenReferer)
+	httpReq.Header.Set("Origin", "https://comunica.pje.jus.br")
 
 	res, err := c.httpClient.Do(httpReq)
 	if err != nil {

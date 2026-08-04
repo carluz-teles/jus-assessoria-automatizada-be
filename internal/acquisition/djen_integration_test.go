@@ -28,7 +28,7 @@ func TestDJENConnectorParserPipeline(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	connector := NewDJENConnector(WithDJENBaseURL(srv.URL))
+	connector := NewDJENConnector(WithDJENBaseURL(srv.URL), WithDJENRatePerMinute(6000000))
 	raw, err := connector.Fetch(context.Background(), FetchRequest{
 		Capability: CapabilityDiscoverByOAB,
 		WindowFrom: "2026-07-01",

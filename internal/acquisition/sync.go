@@ -245,6 +245,17 @@ func (uc *SyncUseCase) OnSyncRequested(ctx context.Context, ev SyncRequested) er
 
 	raw, err := connector.Fetch(ctx, fetchRequestFromEvent(ev))
 	if err != nil {
+		// A fetch fault is transient by nature (a DJEN WAF 403, a flaky court): retry
+		// via asynq with backoff while the retry budget remains, so a burst-triggered
+		// block heals on a later, spaced-out attempt. Only when retries are exhausted
+		// close the run FAILED (so the backfill counter still advances) and ack. In a
+		// unit test (no asynq context) both counters are 0, so it closes FAILED at
+		// once — the original behavior.
+		retry, _ := asynq.GetRetryCount(ctx)
+		maxRetry, _ := asynq.GetMaxRetry(ctx)
+		if retry < maxRetry {
+			return fmt.Errorf("djen fetch %q (retrying): %w", ev.Source, err)
+		}
 		if ferr := uc.failRun(ctx, ev, syncRunID, err); ferr != nil {
 			return ferr
 		}
