@@ -17,6 +17,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/notifications"
+	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -91,10 +92,11 @@ func run(logger *slog.Logger) error {
 	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow)
 
 	// The sync use case resolves its connector per event from the orchestrator, by
-	// the event's source. Until the real DJEN/DataJud connectors land, a stub is
-	// registered per source and paired with the stub parser (no network I/O).
+	// the event's source. DJEN is now the real connector (discovery by OAB over the
+	// Comunica API, self-sufficient on its built-in defaults); DATAJUD stays a stub
+	// until its own sub-slice lands.
 	orchestrator := acquisition.NewOrchestrator()
-	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewStubConnector(acquisition.SourceDJEN))
+	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewDJENConnector())
 	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewStubConnector(acquisition.SourceDATAJUD))
 
 	// Billing entitlement: the sync cycle gates a NEW court record against the
@@ -102,7 +104,17 @@ func run(logger *slog.Logger) error {
 	// billing supplies the adapter over its own repository; this composition root is
 	// the ONLY place that knows both slices (they never import each other).
 	entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
-	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, acquisition.NewStubParser(),
+
+	// The real DJEN parser derives deadline dates over the business-day calendar,
+	// reading holidays the api seeded into the shared store. A MultiParser routes
+	// each payload by source: real DJEN payloads to the DJEN parser, DATAJUD stub
+	// payloads to the stub parser (the sync use case consumes a single Parser port).
+	cal := calendar.New(calendar.NewStore(pool))
+	parser := acquisition.NewMultiParser(
+		acquisition.NewDJENParser(cal),
+		acquisition.NewStubParser(),
+	)
+	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser,
 		acquisition.WithEntitlementChecker(entitlement))
 
 	acquisition.NewListener(backfill, sync).Register(mux)
