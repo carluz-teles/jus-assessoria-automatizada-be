@@ -58,10 +58,13 @@ locals {
       APP_BILLING_CANCEL_URL  = var.billing_cancel_url
       APP_BILLING_RETURN_URL  = var.billing_return_url
     })
-    # worker-ingestao: roda o listener de notifications (envia e-mail via Resend).
+    # worker-ingestao: roda o listener de notifications (envia e-mail via Resend) e
+    # o backfill/sync do DJEN — que sai pelo proxy residencial (DJEN_PROXY_URL) p/
+    # contornar o WAF que 403 o IP de datacenter.
     "worker-ingestao" = merge(local.base_vars, {
       RESEND_API_KEY    = var.resend_api_key
       RESEND_FROM_EMAIL = var.resend_from_email
+      DJEN_PROXY_URL    = var.djen_proxy_url
     })
     # Skeletons por ora — só a base (config.Load exige os 5 required).
     "worker-ai"           = local.base_vars

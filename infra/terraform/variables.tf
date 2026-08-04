@@ -128,6 +128,16 @@ variable "resend_webhook_secret" {
   default   = ""
 }
 
+# ---- Conector DJEN — proxy de saída (só o worker-ingestao consome) ----
+# WAF do Comunica 403 o IP de datacenter da Railway; um proxy residencial/BR dá
+# um IP de saída limpo. Sensível (traz credencial). Default vazio = conexão direta
+# (no-op) — assim um apply sem o secret não quebra nada.
+variable "djen_proxy_url" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
 # ---- Storage (R2/S3) ----
 variable "s3_endpoint" {
   type = string
