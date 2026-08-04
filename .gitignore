@@ -11,6 +11,7 @@
 /worker-documents
 /worker-ai
 /worker-outbox-relay
+/seed
 
 # Env & secrets — NUNCA commitar
 .env
