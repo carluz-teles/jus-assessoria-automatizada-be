@@ -176,6 +176,8 @@ func TestQueueFor(t *testing.T) {
 		want string
 	}{
 		{"ingestao.movimento.observed", "ingestao"},
+		{"acquisition.integration_activated", "ingestao"},
+		{"acquisition.court_record_observed", "ingestao"},
 		{"documents.file.extracted", "documents"},
 		{"ai.revisao.requested", "ai"},
 		{"notification.requested", "notifications"},
@@ -198,6 +200,7 @@ func TestMaxRetryFor(t *testing.T) {
 		want int
 	}{
 		{"ingestao.movimento.observed", 25},
+		{"acquisition.sync_requested", 25},
 		{"documents.file.extracted", 10},
 		{"ai.revisao.requested", 3},
 		{"minuta.revised", 5},

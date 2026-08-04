@@ -156,7 +156,12 @@ func ExtractTrace(ctx context.Context, t *asynq.Task) context.Context {
 // work (docs erd-backend §4c.2).
 func queueFor(typ string) string {
 	switch prefix(typ) {
-	case "ingestao":
+	case "ingestao", "acquisition":
+		// The acquisition slice's events (integration_activated, sync_requested,
+		// court_record_observed, …) are the ingestion work: worker-ingestao consumes
+		// the "ingestao" queue, so route the acquisition domain there. Without this
+		// they land in "default", which no worker consumes — the whole async
+		// discovery/enrichment chain silently stalls.
 		return "ingestao"
 	case "documents":
 		return "documents"
@@ -174,7 +179,7 @@ func queueFor(typ string) string {
 // erd-backend §4c.4).
 func maxRetryFor(typ string) int {
 	switch prefix(typ) {
-	case "ingestao":
+	case "ingestao", "acquisition":
 		return 25
 	case "documents":
 		return 10
