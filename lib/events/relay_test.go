@@ -76,8 +76,8 @@ func TestRelay_Tick_PublishesBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tick() error = %v", err)
 	}
-	if published != 2 {
-		t.Errorf("published = %d, want 2", published)
+	if len(published) != 2 {
+		t.Errorf("published = %d, want 2", len(published))
 	}
 	if len(fake.calls) != 2 {
 		t.Fatalf("enqueue calls = %d, want 2", len(fake.calls))
@@ -95,17 +95,29 @@ func TestRelay_Tick_PublishesBatch(t *testing.T) {
 	if got := c0.task.Headers()[traceparentKey]; got != wantTraceparent {
 		t.Errorf("call[0] traceparent header = %q, want %q", got, wantTraceparent)
 	}
+	// Event identity travels as headers so the consumer middleware attributes its
+	// span/log without decoding the payload.
+	if got := c0.task.Headers()[eventIDHeader]; got != "idem-1" {
+		t.Errorf("call[0] %s header = %q, want idem-1", eventIDHeader, got)
+	}
+	if got := c0.task.Headers()[aggregateIDHeader]; got != "agg-1" {
+		t.Errorf("call[0] %s header = %q, want agg-1", aggregateIDHeader, got)
+	}
 	if c0.task.Type() != "ingestao.movimento.observed" {
 		t.Errorf("call[0] type = %q", c0.task.Type())
 	}
 
-	// Row 2 → ai queue, small retry; empty trace_context means no trace header.
+	// Row 2 → ai queue, small retry; empty trace_context means no trace header, but
+	// the event-identity headers are still present.
 	c1 := fake.calls[1]
 	if c1.queue != "ai" || c1.maxRetry != 3 {
 		t.Errorf("call[1] queue/maxRetry = %q/%d, want ai/3", c1.queue, c1.maxRetry)
 	}
 	if got := c1.task.Headers()[traceparentKey]; got != "" {
 		t.Errorf("call[1] traceparent header = %q, want empty", got)
+	}
+	if got := c1.task.Headers()[aggregateIDHeader]; got != "agg-2" {
+		t.Errorf("call[1] %s header = %q, want agg-2", aggregateIDHeader, got)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -129,8 +141,8 @@ func TestRelay_Tick_EnqueueError_RollsBack(t *testing.T) {
 	if err == nil {
 		t.Fatal("Tick() error = nil, want error")
 	}
-	if published != 0 {
-		t.Errorf("published = %d, want 0", published)
+	if len(published) != 0 {
+		t.Errorf("published = %d, want 0", len(published))
 	}
 	if len(fake.calls) != 1 {
 		t.Errorf("enqueue calls = %d, want 1 (stopped after failure)", len(fake.calls))
@@ -162,8 +174,8 @@ func TestRelay_Tick_TaskIDConflict_MarksPublished(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tick() error = %v", err)
 	}
-	if published != 1 {
-		t.Errorf("published = %d, want 1", published)
+	if len(published) != 1 {
+		t.Errorf("published = %d, want 1", len(published))
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)

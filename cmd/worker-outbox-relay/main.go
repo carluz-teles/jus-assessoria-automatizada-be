@@ -19,6 +19,7 @@ import (
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
+	"github.com/jusassessoria/platform/lib/obs"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
@@ -31,7 +32,7 @@ const (
 )
 
 func main() {
-	logger := telemetry.SetupDefault(os.Stdout, slog.LevelInfo)
+	logger := telemetry.SetupDefault(os.Stdout, config.LogLevelFromEnv())
 	if err := run(logger); err != nil {
 		logger.Error("relay boot failed", "error", err)
 		os.Exit(1)
@@ -102,8 +103,11 @@ func run(logger *slog.Logger) error {
 
 // runRelayLoop ticks until ctx is cancelled, publishing one outbox batch per
 // tick. A Tick failure is logged and the loop continues — the unpublished rows
-// stay put and are retried next tick (at-least-once, §4c.2). A single log line
-// per non-empty batch keeps the output quiet when the outbox is idle.
+// stay put and are retried next tick (at-least-once, §4c.2). An idle tick logs
+// nothing; a non-empty tick logs one INFO summary broken down by event type
+// (which events went out, low cardinality) plus, at DEBUG, one line per event
+// correlated to that event's own trace (turn on with LOG_LEVEL=debug to trace a
+// single event outbox→consumer without drowning a big backfill in INFO lines).
 func runRelayLoop(ctx context.Context, logger *slog.Logger, relay *events.Relay) {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -118,9 +122,27 @@ func runRelayLoop(ctx context.Context, logger *slog.Logger, relay *events.Relay)
 				logger.Error("relay tick failed", "error", err)
 				continue
 			}
-			if published > 0 {
-				logger.Info("relay published events", "count", published)
+			if len(published) == 0 {
+				continue
 			}
+
+			byType := make(map[string]int, len(published))
+			for _, ev := range published {
+				byType[ev.Type]++
+				// DEBUG line under the event's own trace, so trace_id/span_id match the
+				// producer and the eventual consumer span.
+				logger.DebugContext(events.CtxWithTraceContext(ctx, ev.TraceContext),
+					"relay published event",
+					obs.KeyEventType, ev.Type,
+					obs.KeyEventID, ev.ID,
+					obs.KeyAggregateID, ev.AggregateID,
+				)
+			}
+			logger.Info("relay published events",
+				obs.KeyOutcome, obs.OutcomeOK,
+				"count", len(published),
+				"by_type", byType,
+			)
 		}
 	}
 }

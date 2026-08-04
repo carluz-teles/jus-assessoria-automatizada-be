@@ -11,9 +11,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // sync.go is the consumer of acquisition.sync_requested: one window of an
@@ -235,6 +238,11 @@ func (uc *SyncUseCase) OnSyncRequested(ctx context.Context, ev SyncRequested) er
 		return fmt.Errorf("resolve connector for source %q: %w", ev.Source, err)
 	}
 
+	// Stamp the flow's identity onto the consumer span (opened by events.Observe) so
+	// EVERY sync — success or failure — is filterable by tenant/integration/source/
+	// window in New Relic. Domain keys on the span, generic ones on the middleware.
+	enrichSyncSpan(ctx, ev)
+
 	syncRunID, seen, err := uc.startRun(ctx, ev, connector)
 	if err != nil {
 		return err
@@ -256,6 +264,11 @@ func (uc *SyncUseCase) OnSyncRequested(ctx context.Context, ev SyncRequested) er
 		if retry < maxRetry {
 			return fmt.Errorf("djen fetch %q (retrying): %w", ev.Source, err)
 		}
+		// Retries exhausted: this failure is HANDLED here (run marked FAILED, sync_failed
+		// emitted, task ack'd) — so it is logged HERE, once, with the keys to find it. The
+		// generic middleware "event failed" line does not fire because we ack (return nil).
+		slog.WarnContext(ctx, "acquisition: sync fetch exhausted retries; run marked FAILED",
+			append(syncLogArgs(ev, syncRunID), "error", err.Error())...)
 		if ferr := uc.failRun(ctx, ev, syncRunID, err); ferr != nil {
 			return ferr
 		}
@@ -371,7 +384,11 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		return fmt.Errorf("resolve active process limit for tenant %s: %w", ev.TenantID, err)
 	}
 
-	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+	var (
+		tally     syncTally
+		committed bool // this execution is the one that closed the run OK
+	)
+	err = uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		records := make(map[string]*CourtRecord, len(parsed.CourtRecords))
 		ordered := make([]*CourtRecord, 0, len(parsed.CourtRecords))
 		blocked := make(map[string]bool)
@@ -449,8 +466,83 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			return nil
 		}
 
+		tally = syncTally{
+			CourtRecords: len(ordered),
+			Intimations:  len(intimParams),
+			DocketNew:    itemsNew,
+			Deduped:      itemsDeduped,
+			Blocked:      len(blocked),
+		}
+		committed = true
 		return uc.publishObserved(ctx, tx, ev, syncRunID, ordered, newDocket, itemsNew, itemsDeduped)
 	})
+	if err != nil {
+		return err
+	}
+	// Milestone, only for the execution that actually closed the run (spans tell the
+	// happy-path flow; this one INFO per closed slice gives the counts at a glance).
+	if committed {
+		uc.logSyncCompleted(ctx, ev, syncRunID, tally)
+	}
+	return nil
+}
+
+// syncTally is what one successful sync slice produced, for the completion span
+// attributes and the milestone log.
+type syncTally struct {
+	CourtRecords int
+	Intimations  int
+	DocketNew    int
+	Deduped      int
+	Blocked      int
+}
+
+// syncLogArgs are the correlation keys every sync log carries so a failure is
+// findable — filter by tenant, integration, source, window or run and you land on
+// it. trace_id/span_id ride along automatically (the consumer span is active).
+func syncLogArgs(ev SyncRequested, syncRunID string) []any {
+	return []any{
+		obs.KeyTenantID, ev.TenantID,
+		"integration_id", ev.IntegrationID,
+		"source", ev.Source,
+		"sync_run_id", syncRunID,
+		"window_from", ev.WindowFrom,
+		"window_to", ev.WindowTo,
+	}
+}
+
+// enrichSyncSpan stamps the flow's identity onto the active consumer span so every
+// sync (success or failure) is filterable by these dimensions in the backend.
+func enrichSyncSpan(ctx context.Context, ev SyncRequested) {
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(obs.KeyTenantID, ev.TenantID),
+		attribute.String("integration_id", ev.IntegrationID),
+		attribute.String("source", ev.Source),
+		attribute.String("window_from", ev.WindowFrom),
+		attribute.String("window_to", ev.WindowTo),
+		attribute.Int("slice_index", ev.SliceIndex),
+		attribute.Int("oab_count", len(ev.Scope.OAB)),
+	)
+}
+
+// logSyncCompleted records the completion counts on the span and emits the one
+// milestone INFO line for a closed sync slice.
+func (uc *SyncUseCase) logSyncCompleted(ctx context.Context, ev SyncRequested, syncRunID string, t syncTally) {
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.Int("court_records", t.CourtRecords),
+		attribute.Int("intimations", t.Intimations),
+		attribute.Int("docket_new", t.DocketNew),
+		attribute.Int("deduped", t.Deduped),
+		attribute.Int("blocked", t.Blocked),
+	)
+	slog.InfoContext(ctx, "acquisition: sync completed",
+		append(syncLogArgs(ev, syncRunID),
+			"court_records", t.CourtRecords,
+			"intimations", t.Intimations,
+			"docket_new", t.DocketNew,
+			"deduped", t.Deduped,
+			"blocked", t.Blocked,
+		)...)
 }
 
 // publishObserved emits, within the caller's tx, one court_record_observed per

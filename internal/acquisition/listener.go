@@ -10,10 +10,12 @@ import (
 
 // listener.go is the slice's async surface — the consumer counterpart of
 // handler.go. It owns its task-type registration (Register); the worker only
-// composes. The pattern per task is uniform: extract the producer's trace,
-// decode the event with the shared codec, delegate to the use case, and let the
-// error kind decide retry vs. archive (a decode fault is SkipRetry, infra is
-// retryable). One Listener consumes every event this slice reacts to.
+// composes. The pattern per task is uniform: decode the event with the shared
+// codec, delegate to the use case, and let the error kind decide retry vs.
+// archive (a decode fault is SkipRetry, infra is retryable). Trace continuation
+// and the consumer span are handled once by the events.Observe middleware, so a
+// handler receives a ctx that already carries them. One Listener consumes every
+// event this slice reacts to.
 
 // backfillListenerUC is the port for the backfill consumers: onboarding
 // (integration_activated) and the completion counter (sync_completed/failed).
@@ -61,12 +63,11 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 }
 
 // handleIntegrationActivated is the asynq.HandlerFunc for
-// acquisition.integration_activated. It continues the producer's trace, decodes
-// the payload, and hands off to the backfill use case. A decode error is
+// acquisition.integration_activated. It decodes the payload, and hands off to
+// the backfill use case. A decode error is
 // returned as-is (it wraps asynq.SkipRetry, so the task is archived, not
 // retried); an infra error from the use case stays retryable.
 func (l *Listener) handleIntegrationActivated(ctx context.Context, t *asynq.Task) error {
-	ctx = events.ExtractTrace(ctx, t)
 	ev, err := events.Decode[IntegrationActivated](t)
 	if err != nil {
 		return err
@@ -79,7 +80,6 @@ func (l *Listener) handleIntegrationActivated(ctx context.Context, t *asynq.Task
 // decode fault is SkipRetry; the use case itself returns SkipRetry on a parse
 // fault and nil (ack) on a fetch fault (see OnSyncRequested).
 func (l *Listener) handleSyncRequested(ctx context.Context, t *asynq.Task) error {
-	ctx = events.ExtractTrace(ctx, t)
 	ev, err := events.Decode[SyncRequested](t)
 	if err != nil {
 		return err
@@ -92,7 +92,6 @@ func (l *Listener) handleSyncRequested(ctx context.Context, t *asynq.Task) error
 // completion counter. A decode fault wraps asynq.SkipRetry (archived, not
 // retried); an infra error from the use case stays retryable.
 func (l *Listener) handleSyncCompleted(ctx context.Context, t *asynq.Task) error {
-	ctx = events.ExtractTrace(ctx, t)
 	ev, err := events.Decode[SyncCompleted](t)
 	if err != nil {
 		return err
@@ -104,7 +103,6 @@ func (l *Listener) handleSyncCompleted(ctx context.Context, t *asynq.Task) error
 // failure-side counterpart of handleSyncCompleted, dispatching to the same
 // completion counter so a failed slice still advances the job toward finish.
 func (l *Listener) handleSyncFailed(ctx context.Context, t *asynq.Task) error {
-	ctx = events.ExtractTrace(ctx, t)
 	ev, err := events.Decode[SyncFailed](t)
 	if err != nil {
 		return err
@@ -113,12 +111,11 @@ func (l *Listener) handleSyncFailed(ctx context.Context, t *asynq.Task) error {
 }
 
 // handleCourtRecordObserved is the asynq.HandlerFunc for
-// acquisition.court_record_observed. It continues the trace, decodes the payload,
+// acquisition.court_record_observed. It decodes the payload,
 // and hands off to the DATAJUD enrichment use case. A decode fault is SkipRetry;
 // the use case returns SkipRetry on a parse fault, a retryable error on a fetch
 // fault, and nil (ack) when there is nothing to enrich.
 func (l *Listener) handleCourtRecordObserved(ctx context.Context, t *asynq.Task) error {
-	ctx = events.ExtractTrace(ctx, t)
 	ev, err := events.Decode[CourtRecordObserved](t)
 	if err != nil {
 		return err

@@ -30,7 +30,7 @@ const (
 )
 
 func main() {
-	logger := telemetry.SetupDefault(os.Stdout, slog.LevelInfo)
+	logger := telemetry.SetupDefault(os.Stdout, config.LogLevelFromEnv())
 	if err := run(logger); err != nil {
 		logger.Error("scheduler boot failed", "error", err)
 		os.Exit(1)

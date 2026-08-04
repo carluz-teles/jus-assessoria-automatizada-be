@@ -17,9 +17,10 @@ const (
 	spanIDKey  = "span_id"
 )
 
-// instrumentationScope names this module as the instrumentation scope on the
-// OTel log bridge, so records exported via OTLP carry a stable scope name.
-const instrumentationScope = "github.com/jusassessoria/platform"
+// InstrumentationScope names this module as the instrumentation scope on the
+// OTel log bridge AND the tracer (lib/obs), so records and spans exported via
+// OTLP carry one stable scope name across every binary.
+const InstrumentationScope = "github.com/jusassessoria/platform"
 
 // TraceHandler decorates a slog.Handler, stamping the active span's trace_id
 // and span_id onto each record so logs correlate with traces. When the context
@@ -155,7 +156,7 @@ func (h *fanoutHandler) WithGroup(name string) slog.Handler {
 // Never log secrets or PII (see TraceHandler).
 func NewLogger(w io.Writer, level slog.Leveler) *slog.Logger {
 	stdout := NewTraceHandler(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level}))
-	bridge := otelslog.NewHandler(instrumentationScope)
+	bridge := otelslog.NewHandler(InstrumentationScope)
 	return slog.New(newFanoutHandler(stdout, bridge))
 }
 
