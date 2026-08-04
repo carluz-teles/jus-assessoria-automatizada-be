@@ -82,16 +82,16 @@ func writeDJENPage(w http.ResponseWriter, n int) {
 	})
 }
 
-// aggregatedItems unmarshals the RawPayload body back into the raw item list so a
-// test can count what the connector collected across pages/OABs.
+// aggregatedItems unmarshals the RawPayload body's items back into the raw item
+// list so a test can count what the connector collected across pages/OABs.
 func aggregatedItems(t *testing.T, p RawPayload) []json.RawMessage {
 	t.Helper()
 
-	var items []json.RawMessage
-	if err := json.Unmarshal(p.Body, &items); err != nil {
+	var agg djenAggregate
+	if err := json.Unmarshal(p.Body, &agg); err != nil {
 		t.Fatalf("unmarshal aggregated body: %v", err)
 	}
-	return items
+	return agg.Items
 }
 
 func oneOAB() []OABEntry { return []OABEntry{{Number: "123456", UF: "SP"}} }
@@ -263,6 +263,78 @@ func TestDJENConnector_Fetch_MultipleOABs(t *testing.T) {
 	}
 	if !queried["111"] || !queried["222"] {
 		t.Errorf("queried OABs = %v, want both 111 and 222", queried)
+	}
+}
+
+// TestDJENConnector_Fetch_RoundTripsThroughParser guards the connector→parser
+// seam that the per-file unit tests each only half-cover: the connector test
+// asserts what it marshals, the parser test hand-builds what it decodes, and
+// nothing ran one into the other. The body Fetch produces MUST decode as the
+// parser's own djenEnvelope — carrying the queried scope so matched lawyers
+// resolve — and the real parser must map it end to end. Regression guard for
+// BLOCKER-01 (flat array vs {scope,items} envelope; scope never populated).
+func TestDJENConnector_Fetch_RoundTripsThroughParser(t *testing.T) {
+	t.Parallel()
+
+	// One real comunicação so Parse maps it end to end (baseItem's lawyer is in
+	// the queried scope below, so its recipient must come back matched).
+	item := baseItem()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"count":  1,
+			"items":  []wireItem{item},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewDJENConnector(WithBaseURL(srv.URL))
+	got, err := c.Fetch(context.Background(), FetchRequest{
+		Capability: CapabilityDiscoverByOAB,
+		WindowFrom: "2026-08-01",
+		WindowTo:   "2026-08-31",
+		OABs:       []OABEntry{{Number: "123456", UF: "SP"}},
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	// The body decodes as the parser's own envelope, scope carrying the queried OABs.
+	var env djenEnvelope
+	if err := json.Unmarshal(got.Body, &env); err != nil {
+		t.Fatalf("connector body does not decode as djenEnvelope: %v", err)
+	}
+	if len(env.Scope.OABs) != 1 || env.Scope.OABs[0].Number != "123456" || env.Scope.OABs[0].UF != "SP" {
+		t.Errorf("env.Scope.OABs = %+v, want [{123456 SP}]", env.Scope.OABs)
+	}
+	if len(env.Items) != 1 || env.Items[0].Hash != item.Hash {
+		t.Errorf("env.Items = %+v, want one item with hash %q", env.Items, item.Hash)
+	}
+
+	// The real parser maps that body, and the in-scope lawyer comes back matched —
+	// which only holds if the scope round-tripped (the secondary half of BLOCKER-01).
+	p, _ := newParser()
+	res, err := p.Parse(got)
+	if err != nil {
+		t.Fatalf("Parse(connector output): %v", err)
+	}
+	if len(res.Intimations) != 1 {
+		t.Fatalf("intimations = %d, want 1", len(res.Intimations))
+	}
+
+	var recipients []djenRecipient
+	if err := json.Unmarshal(res.Intimations[0].Recipients, &recipients); err != nil {
+		t.Fatalf("unmarshal recipients: %v", err)
+	}
+	var matchedLawyer bool
+	for _, r := range recipients {
+		if r.Kind == recipientKindLawyer && r.OABNumber == "123456" && r.OABUF == "SP" {
+			matchedLawyer = r.Matched
+		}
+	}
+	if !matchedLawyer {
+		t.Error("in-scope lawyer matched = false, want true (scope must round-trip through the envelope)")
 	}
 }
 

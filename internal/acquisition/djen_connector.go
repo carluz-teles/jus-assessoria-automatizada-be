@@ -109,13 +109,18 @@ func (c *DJENConnector) Capabilities() []Capability {
 }
 
 // Fetch pages every OAB in the request over the window and aggregates all raw
-// items into one RawPayload. The item bytes are carried verbatim (json.RawMessage)
-// so the parser sub-slice — not this connector — owns the DJEN schema. A failure
-// on any page aborts the whole fetch: a partial payload would parse into a
-// partial window and silently drop intimations.
+// items into one RawPayload, wrapped in the {scope, items} envelope the parser
+// decodes. The item bytes are carried verbatim (json.RawMessage) so the parser
+// sub-slice — not this connector — owns the DJEN item schema; the scope carries
+// the queried OABs so the parser can flag matched lawyers. A failure on any page
+// aborts the whole fetch: a partial payload would parse into a partial window and
+// silently drop intimations.
 func (c *DJENConnector) Fetch(ctx context.Context, req FetchRequest) (RawPayload, error) {
+	scope := djenScope{OABs: make([]djenOAB, 0, len(req.OABs))}
 	items := []json.RawMessage{}
 	for _, oab := range req.OABs {
+		scope.OABs = append(scope.OABs, djenOAB{Number: oab.Number, UF: oab.UF})
+
 		collected, err := c.fetchOAB(ctx, oab, req.WindowFrom, req.WindowTo)
 		if err != nil {
 			return RawPayload{}, err
@@ -123,7 +128,7 @@ func (c *DJENConnector) Fetch(ctx context.Context, req FetchRequest) (RawPayload
 		items = append(items, collected...)
 	}
 
-	body, err := json.Marshal(items)
+	body, err := json.Marshal(djenAggregate{Scope: scope, Items: items})
 	if err != nil {
 		return RawPayload{}, apperr.NewUnavailable("marshal djen payload", err)
 	}
@@ -134,6 +139,16 @@ func (c *DJENConnector) Fetch(ctx context.Context, req FetchRequest) (RawPayload
 		Source:           SourceDJEN,
 		Body:             body,
 	}, nil
+}
+
+// djenAggregate is the envelope the connector marshals: the queried scope plus
+// every raw comunicação, verbatim. It shares djenScope/djenOAB with the parser
+// (one wire contract for the scope, no drift) but keeps Items as raw bytes — the
+// connector aggregates bytes and leaves the item field schema to the parser. Its
+// JSON is byte-for-byte what the parser's djenEnvelope decodes.
+type djenAggregate struct {
+	Scope djenScope         `json:"scope"`
+	Items []json.RawMessage `json:"items"`
 }
 
 // fetchOAB pages one OAB from page 1 until a short page (fewer than itensPorPagina
