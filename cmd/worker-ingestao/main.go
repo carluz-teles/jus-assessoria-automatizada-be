@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 
 	"github.com/hibiken/asynq"
@@ -97,7 +98,20 @@ func run(logger *slog.Logger) error {
 	// (public API key). DATAJUD never discovers, so it is not an activatable
 	// integration — it runs only through the enrichment listener below.
 	orchestrator := acquisition.NewOrchestrator()
-	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewDJENConnector())
+
+	// DJEN's Comunica WAF 403s the datacenter egress IP; when DJEN_PROXY_URL is set,
+	// route the connector through a residential/BR proxy for a clean IP. Unset = a
+	// direct connection (dev local passes without it). A malformed URL fails the boot.
+	djenOpts := []acquisition.DJENOption{}
+	if cfg.DJENProxyURL != "" {
+		proxyURL, perr := url.Parse(cfg.DJENProxyURL)
+		if perr != nil {
+			return fmt.Errorf("parse DJEN_PROXY_URL: %w", perr)
+		}
+		djenOpts = append(djenOpts, acquisition.WithDJENProxy(proxyURL))
+		logger.Info("DJEN outbound proxy enabled", "service", serviceName, "proxy_host", proxyURL.Host)
+	}
+	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewDJENConnector(djenOpts...))
 	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewDATAJUDConnector())
 
 	// Parsers are resolved by CanParse: the DJEN parser claims DJEN payloads and

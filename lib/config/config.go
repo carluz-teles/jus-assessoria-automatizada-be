@@ -88,6 +88,12 @@ type Config struct {
 	// HolidaySeedYearsAhead — quantos anos ALÉM do corrente o seeder nacional de
 	// feriados pré-carrega no boot do api (via BrasilAPI). 2 = ano corrente + 2.
 	HolidaySeedYearsAhead int `env:"HOLIDAY_SEED_YEARS_AHEAD" envDefault:"2"`
+
+	// Conector DJEN — proxy de saída. O WAF do Comunica (DJEN) 403 o IP de
+	// datacenter do Railway; um proxy residencial/BR dá um IP de saída limpo.
+	// Opcional: vazio = conexão direta (o dev local, cujo IP já passa no WAF, não
+	// precisa). Só o worker-ingestao — onde o DJENConnector roda o backfill — o consome.
+	DJENProxyURL string `env:"DJEN_PROXY_URL"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do

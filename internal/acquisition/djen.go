@@ -112,6 +112,21 @@ func WithDJENRatePerMinute(n int) DJENOption {
 	}
 }
 
+// WithDJENProxy routes outbound requests through an HTTP/SOCKS proxy — the
+// production fix for the Comunica WAF, which 403s the Railway datacenter egress IP
+// even with browser headers + pacing (the block is IP/geo-based). A residential/BR
+// proxy presents a clean egress IP. It sets the Transport on the existing client,
+// preserving its timeout; a nil URL keeps the direct connection (dev local passes
+// without it).
+func WithDJENProxy(proxyURL *url.URL) DJENOption {
+	return func(c *DJENConnector) {
+		if proxyURL == nil {
+			return
+		}
+		c.httpClient.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+	}
+}
+
 // NewDJENConnector builds the connector with production defaults, then applies the
 // options.
 func NewDJENConnector(opts ...DJENOption) *DJENConnector {

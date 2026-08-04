@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -22,6 +23,45 @@ func djenEnvelope(t *testing.T, items ...json.RawMessage) []byte {
 		t.Fatalf("marshal envelope: %v", err)
 	}
 	return body
+}
+
+// TestWithDJENProxy asserts the proxy option routes the connector's outbound
+// requests through the configured proxy — the WAF egress-IP fix. The client's
+// Transport resolver must return the proxy URL for any request.
+func TestWithDJENProxy(t *testing.T) {
+	t.Parallel()
+
+	proxyURL, err := url.Parse("http://user:pass@proxy.br.example:8080")
+	if err != nil {
+		t.Fatalf("parse proxy url: %v", err)
+	}
+
+	c := NewDJENConnector(WithDJENProxy(proxyURL))
+
+	transport, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("httpClient.Transport = %T, want *http.Transport", c.httpClient.Transport)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://comunicaapi.pje.jus.br/api/v1/comunicacao", nil)
+	got, err := transport.Proxy(req)
+	if err != nil {
+		t.Fatalf("Proxy resolver: %v", err)
+	}
+	if got == nil || got.String() != proxyURL.String() {
+		t.Errorf("proxy = %v, want %v", got, proxyURL)
+	}
+}
+
+// TestWithDJENProxy_Nil keeps the direct connection (nil Transport → the client
+// falls back to http.DefaultTransport) when no proxy is configured.
+func TestWithDJENProxy_Nil(t *testing.T) {
+	t.Parallel()
+
+	c := NewDJENConnector(WithDJENProxy(nil))
+	if c.httpClient.Transport != nil {
+		t.Errorf("Transport = %v, want nil (direct connection)", c.httpClient.Transport)
+	}
 }
 
 // TestDJENConnectorFetch walks two OABs with pagination and cross-OAB overlap and
