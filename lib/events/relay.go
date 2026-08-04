@@ -6,8 +6,11 @@ import (
 	"strings"
 
 	"github.com/hibiken/asynq"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // selectUnpublished drains one batch of undelivered outbox rows in publication
@@ -53,8 +56,19 @@ type pendingEvent struct {
 	aggregateID    string
 }
 
-// Tick drains one batch of unpublished outbox rows into asynq and returns how many
-// it published. It runs in one transaction with an empty tenantID: the relay is
+// PublishedEvent is the identity of one event the relay drained this tick — the
+// dimensions its logging needs (which events went out, under which trace), never
+// the payload. The relay returns these so the loop can log a per-type summary and
+// a per-event DEBUG line correlated to the event's own trace.
+type PublishedEvent struct {
+	Type         string // dotted event type (the asynq task type)
+	ID           string // idempotency key = the event id
+	AggregateID  string // the aggregate the event is about
+	TraceContext string // W3C traceparent of the producing span
+}
+
+// Tick drains one batch of unpublished outbox rows into asynq and returns what it
+// published. It runs in one transaction with an empty tenantID: the relay is
 // system-level and reads across tenants (the outbox carries no tenant scope).
 //
 // For each row it enqueues the task, then marks the row published in the SAME tx.
@@ -62,22 +76,43 @@ type pendingEvent struct {
 // this batch is marked — the rows are retried next Tick. That is the at-least-once
 // contract: a crash between enqueue and mark republishes, and the consumer dedups
 // (docs erd-backend §4c.2, §4c.3).
-func (r *Relay) Tick(ctx context.Context) (published int, err error) {
+//
+// A non-empty batch runs under a PRODUCER span so the per-row UPDATEs correlate
+// and the outbox→publish drain is visible; idle ticks open no span (no one empty
+// span per second).
+func (r *Relay) Tick(ctx context.Context) (published []PublishedEvent, err error) {
 	err = r.uow.Do(ctx, "", func(tx database.Tx) error {
 		batch, err := readPending(ctx, tx)
 		if err != nil {
 			return err
 		}
+		if len(batch) == 0 {
+			return nil
+		}
+
+		spanCtx, span := obs.Start(ctx, "outbox relay publish",
+			trace.WithSpanKind(trace.SpanKindProducer),
+			trace.WithAttributes(attribute.Int("batch.size", len(batch))),
+		)
+		defer span.End()
+
 		for _, ev := range batch {
-			if err := r.publish(ctx, tx, ev); err != nil {
+			if err := r.publish(spanCtx, tx, ev); err != nil {
+				obs.Record(span, err)
 				return err
 			}
-			published++
+			published = append(published, PublishedEvent{
+				Type:         ev.typ,
+				ID:           ev.idempotencyKey,
+				AggregateID:  ev.aggregateID,
+				TraceContext: ev.traceContext,
+			})
 		}
+		obs.Record(span, nil)
 		return nil
 	})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	return published, nil
 }
@@ -117,9 +152,15 @@ func readPending(ctx context.Context, tx database.Tx) ([]pendingEvent, error) {
 // the event IS enqueued — mark it published so the row does not spin every Tick.
 // Any other enqueue error propagates, rolling the batch back for a later retry.
 func (r *Relay) publish(ctx context.Context, tx database.Tx, ev pendingEvent) error {
-	var headers map[string]string
+	// Carry the event identity on the task so the consumer middleware can attribute
+	// its span/log without decoding the payload; traceparent joins the consumer span
+	// to the producer's (empty when the producer ran with no active span).
+	headers := map[string]string{
+		eventIDHeader:     ev.idempotencyKey,
+		aggregateIDHeader: ev.aggregateID,
+	}
 	if ev.traceContext != "" {
-		headers = map[string]string{traceparentKey: ev.traceContext}
+		headers[traceparentKey] = ev.traceContext
 	}
 	task := asynq.NewTaskWithHeaders(ev.typ, ev.payload, headers)
 

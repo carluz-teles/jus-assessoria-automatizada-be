@@ -4,8 +4,12 @@ import (
 	"context"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // scheduler.go is the re-poll driver: on each tick the scheduler binary calls
@@ -96,9 +100,18 @@ func NewSchedulerUseCase(repo schedulerRepo, outbox publisher, uow database.Unit
 // claim it (push next_sync_at forward). The outbox write and the claim commit
 // together, so a record is enqueued exactly when it is claimed. It returns how many
 // records were enqueued this tick.
-func (uc *SchedulerUseCase) RunDuePoll(ctx context.Context) (int, error) {
-	enqueued := 0
-	err := uc.uow.DoSystem(ctx, func(tx database.Tx) error {
+func (uc *SchedulerUseCase) RunDuePoll(ctx context.Context) (enqueued int, err error) {
+	// This loop has no upstream request, so it is its own trace root: a span per tick
+	// gives the cross-tenant scan + claims a parent (otherwise otelpgx emits orphan
+	// query spans) and records the outcome + how much was enqueued.
+	ctx, span := obs.Start(ctx, "scheduler run_due_poll", trace.WithSpanKind(trace.SpanKindInternal))
+	defer func() {
+		span.SetAttributes(attribute.Int("enqueued", enqueued))
+		obs.Record(span, err)
+		span.End()
+	}()
+
+	err = uc.uow.DoSystem(ctx, func(tx database.Tx) error {
 		due, err := uc.repo.DueCourtRecordsForResync(ctx, tx, uc.batchSize)
 		if err != nil {
 			return err

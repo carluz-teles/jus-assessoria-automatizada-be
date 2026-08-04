@@ -39,7 +39,7 @@ const (
 )
 
 func main() {
-	logger := telemetry.SetupDefault(os.Stdout, slog.LevelInfo)
+	logger := telemetry.SetupDefault(os.Stdout, config.LogLevelFromEnv())
 	if err := run(logger); err != nil {
 		logger.Error("worker boot failed", "service", serviceName, "error", err)
 		os.Exit(1)
@@ -73,17 +73,23 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("parse redis uri: %w", err)
 	}
 
+	// asynq's own logs go through slog (structured, OTLP); LogLevel=ErrorLevel keeps
+	// its per-task retry Warns from duplicating the Observe middleware's failure log.
 	srv := asynq.NewServer(redisOpt, asynq.Config{
 		Concurrency: concurrency,
 		Queues: map[string]int{
 			queueName:          concurrency,
 			notificationsQueue: concurrency,
 		},
+		Logger:   events.NewAsynqLogger(logger),
+		LogLevel: asynq.ErrorLevel,
 	})
 
 	// Feature slices register their listeners on this mux. Each slice owns its
 	// task-type registration via a Register(mux) call; the worker only composes.
+	// Observe wraps EVERY handler: consumer span + failure log, one place.
 	mux := asynq.NewServeMux()
+	mux.Use(events.Observe(logger))
 
 	repo := acquisition.NewRepository(pool)
 	outbox := events.NewOutbox()

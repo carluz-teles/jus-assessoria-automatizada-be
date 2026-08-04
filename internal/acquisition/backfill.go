@@ -3,12 +3,14 @@ package acquisition
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // Backfill onboarding constants. The horizon is how far back the first sync
@@ -227,6 +229,18 @@ func (uc *BackfillUseCase) createBackfill(ctx context.Context, tx database.Tx, e
 			return err
 		}
 	}
+
+	// Milestone: this is what fans the activation into N sync slices (the burst of
+	// sync_requested events) — logging total_slices here explains that volume.
+	slog.InfoContext(ctx, "acquisition: backfill started",
+		obs.KeyTenantID, ev.TenantID,
+		"integration_id", ev.IntegrationID,
+		"source", ev.Source,
+		"backfill_job_id", jobID,
+		"total_slices", totalSlices,
+		"window_from", from.Format(dateLayout),
+		"window_to", to.Format(dateLayout),
+	)
 	return nil
 }
 
@@ -347,6 +361,17 @@ func (uc *BackfillUseCase) finalizeIfComplete(ctx context.Context, tx database.T
 	if err := uc.repo.FinalizeBackfillJob(ctx, tx, c.tenantID, c.backfillJobID, status); err != nil {
 		return err
 	}
+
+	// Milestone: the whole onboarding backfill is done. PARTIAL (some slice failed)
+	// is expected under a flaky WAF and is not itself an error — the counts say how much.
+	slog.InfoContext(ctx, "acquisition: backfill finished",
+		obs.KeyTenantID, c.tenantID,
+		"backfill_job_id", c.backfillJobID,
+		"status", status,
+		"slices_ok", counters.SlicesOK,
+		"slices_error", counters.SlicesError,
+		"total_slices", counters.TotalSlices,
+	)
 	return uc.outbox.Publish(ctx, tx, newBackfillFinished(c, counters, status))
 }
 

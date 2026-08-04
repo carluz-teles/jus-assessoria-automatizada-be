@@ -10,8 +10,9 @@ import (
 
 // listener.go is the slice's async surface (there is no HTTP handler — this domain
 // is driven entirely by events). It owns its task-type registration (Register); the
-// worker only composes. Per task: continue the producer's trace, decode with the
-// shared codec (a decode fault is SkipRetry), and delegate to the use case.
+// worker only composes. Per task: decode with the shared codec (a decode fault is
+// SkipRetry) and delegate to the use case. Trace continuation and the consumer span
+// are handled once by the events.Observe middleware, not here.
 
 // notifyUC is the port the listener drives — the use case's single entry point.
 type notifyUC interface {
@@ -35,11 +36,11 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 }
 
 // handleNotificationRequested is the asynq.HandlerFunc for notification.requested. It
-// continues the producer's trace, decodes the payload, and hands off to the use case.
-// A decode error is returned as-is (it wraps asynq.SkipRetry, so the task is archived,
-// not retried); an infra error from the use case stays retryable.
+// decodes the payload and hands off to the use case. A decode error is returned as-is
+// (it wraps asynq.SkipRetry, so the task is archived, not retried); an infra error from
+// the use case stays retryable. The ctx already carries the producer's trace and the
+// consumer span (events.Observe middleware).
 func (l *Listener) handleNotificationRequested(ctx context.Context, t *asynq.Task) error {
-	ctx = events.ExtractTrace(ctx, t)
 	ev, err := events.Decode[NotificationRequested](t)
 	if err != nil {
 		return err

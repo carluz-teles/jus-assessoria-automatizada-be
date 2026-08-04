@@ -6,7 +6,13 @@
 // Fonte de verdade da struct: docs/erd-backend.md §5b.4.
 package config
 
-import "github.com/caarlos0/env/v11"
+import (
+	"log/slog"
+	"os"
+	"strings"
+
+	"github.com/caarlos0/env/v11"
+)
 
 // Config é a configuração tipada do processo. Segredos (ClerkSecret,
 // AnthropicKey) chegam só pelo ambiente — nunca no código nem no repositório.
@@ -31,6 +37,12 @@ type Config struct {
 	// New Relic); o dev local com collector sem TLS seta INSECURE=true.
 	OTELHeaders  string `env:"OTEL_EXPORTER_OTLP_HEADERS"`
 	OTELInsecure bool   `env:"OTEL_EXPORTER_OTLP_INSECURE" envDefault:"false"`
+
+	// LogLevel — nível mínimo de log do processo (todos os binários). Default "info";
+	// "debug" liga os logs por-evento do relay e o diagnóstico geral sem redeploy de
+	// código. Valores: debug|info|warn|error (case-insensitive); um valor desconhecido
+	// cai em info — um nível mal digitado nunca deve derrubar o boot. Ver SlogLevel().
+	LogLevel string `env:"LOG_LEVEL" envDefault:"info"`
 
 	// HTTP + Clerk auth (só o api os consome). Port tem default; o issuer e o
 	// segredo do webhook são opcionais — issuer vazio deixa o ClerkVerifier
@@ -106,6 +118,29 @@ func Load() (Config, error) {
 // IsProduction indica se o processo roda em produção (APP_ENV=production).
 func (c Config) IsProduction() bool {
 	return c.Env == "production"
+}
+
+// LogLevelFromEnv lê SÓ a LOG_LEVEL do ambiente (sem o Load completo) para o
+// boot-logger de cada binário nascer já no nível certo — o logger é criado em
+// main(), antes de Load validar o resto do ambiente. Reusa a mesma tabela de
+// SlogLevel (uma fonte de verdade), então default/desconhecido = info.
+func LogLevelFromEnv() slog.Level {
+	return Config{LogLevel: os.Getenv("LOG_LEVEL")}.SlogLevel()
+}
+
+// SlogLevel converte LogLevel na slog.Level correspondente. Um valor desconhecido
+// (ou vazio) cai em info: o boot nunca deve morrer por um nível mal digitado.
+func (c Config) SlogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // S3Enabled informa se o storage de objetos está totalmente configurado. O api
