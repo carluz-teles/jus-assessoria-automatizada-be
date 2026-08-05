@@ -309,12 +309,21 @@ func TestNotifications_RLS_TenantIsolation(t *testing.T) {
 	}
 }
 
-// newInAppUC wires the in-app use case (slice 1a) against the real container.
+// nopPublisher stands in for the Redis push (slice 2b): these tests assert what the
+// in-app use case PERSISTS against the real schema, not the best-effort real-time
+// push (that has its own roundtrip test in lib/pubsub). It records nothing and never
+// fails, so the publish-after-commit step is a no-op here.
+type nopPublisher struct{}
+
+func (nopPublisher) Publish(context.Context, string, []byte) error { return nil }
+
+// newInAppUC wires the in-app use case (slice 1a/2b) against the real container.
 func newInAppUC(pool *pgxpool.Pool) *notifications.InAppUseCase {
 	return notifications.NewInAppUseCase(
 		notifications.NewRepository(pool),
 		notifications.NewDedup(),
 		database.NewUnitOfWork(pool),
+		nopPublisher{},
 	)
 }
 

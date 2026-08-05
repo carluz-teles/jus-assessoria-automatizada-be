@@ -2,9 +2,11 @@ package notifications
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/lib/database"
@@ -20,6 +22,15 @@ const consumerNotifications = "notifications"
 // events.Dedup bound to the tx.
 type deduper interface {
 	SeenOrMark(ctx context.Context, tx database.Tx, consumer, eventID string) (seen bool, err error)
+}
+
+// publisher is the best-effort real-time push port. The in-app use case calls it
+// AFTER the write commits, so the SSE endpoint (a later slice) can deliver a fresh
+// aviso the moment it lands. It is NOT the transactional outbox: a publish failure
+// is logged and swallowed (the aviso is already persisted — the client picks it up
+// on the next load). The slice adapter is lib/pubsub over Redis.
+type publisher interface {
+	Publish(ctx context.Context, channel string, payload []byte) error
 }
 
 // NotifyUseCase turns a `notification.requested` event into a persisted aviso and a
@@ -221,13 +232,29 @@ type InAppUseCase struct {
 	repo  Repository
 	dedup deduper
 	uow   database.UnitOfWork
+	pub   publisher
 }
 
-// NewInAppUseCase wires the in-app use case to its repository, dedup guard and unit of
-// work.
-func NewInAppUseCase(repo Repository, dedup deduper, uow database.UnitOfWork) *InAppUseCase {
-	return &InAppUseCase{repo: repo, dedup: dedup, uow: uow}
+// NewInAppUseCase wires the in-app use case to its repository, dedup guard, unit of
+// work and the best-effort push publisher (used only after a fresh aviso commits).
+func NewInAppUseCase(repo Repository, dedup deduper, uow database.UnitOfWork, pub publisher) *InAppUseCase {
+	return &InAppUseCase{repo: repo, dedup: dedup, uow: uow, pub: pub}
 }
+
+// inAppPush is the JSON envelope the SSE endpoint (a later slice) relays to the
+// browser. It carries exactly what the in-app inbox needs to render the new aviso
+// without a refetch — the full row is still the source of truth in Postgres.
+type inAppPush struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// pushChannel is the per-tenant Redis channel an aviso is published on, so a
+// subscriber only ever sees its own tenant's pushes (isolation at the fan-out too).
+func pushChannel(tenantID string) string { return "notif:" + tenantID }
 
 // OnBackfillFinished handles one acquisition.backfill_finished: in the event's tenant
 // scope it dedups (a replay marks nothing new and returns before any write), then
@@ -235,7 +262,8 @@ func NewInAppUseCase(repo Repository, dedup deduper, uow database.UnitOfWork) *I
 // or a PARTIAL naming how many windows failed). The dedup mark and the aviso commit
 // together — a crash never leaves the event marked-but-unrecorded.
 func (uc *InAppUseCase) OnBackfillFinished(ctx context.Context, ev BackfillFinished) error {
-	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerBackfill, ev.EventID)
 		if err != nil {
 			return err
@@ -245,7 +273,7 @@ func (uc *InAppUseCase) OnBackfillFinished(ctx context.Context, ev BackfillFinis
 		}
 
 		title, body := renderImportFinished(ev)
-		return uc.record(ctx, tx, ev.TenantID, TypeImportFinished, title, body, map[string]any{
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeImportFinished, title, body, map[string]any{
 			"backfill_job_id": ev.BackfillJobID,
 			"integration_id":  ev.IntegrationID,
 			"status":          ev.Status,
@@ -253,7 +281,19 @@ func (uc *InAppUseCase) OnBackfillFinished(ctx context.Context, ev BackfillFinis
 			"slices_ok":       ev.SlicesOK,
 			"slices_error":    ev.SlicesError,
 		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// Push only a genuinely new aviso, and only after the commit so the row the SSE
+	// endpoint fetches is already visible. A replay (created == nil) pushes nothing.
+	uc.publish(ctx, ev.TenantID, TypeBackfillFinished, created)
+	return nil
 }
 
 // OnDocketEntryObserved handles one acquisition.docket_entry_observed. In the event's
@@ -264,7 +304,8 @@ func (uc *InAppUseCase) OnBackfillFinished(ctx context.Context, ev BackfillFinis
 // makes the silence permanent: a redelivery after the backfill closes is a dedup
 // no-op, not a late aviso. Otherwise it records a new_andamento aviso.
 func (uc *InAppUseCase) OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error {
-	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDocket, ev.EventID)
 		if err != nil {
 			return err
@@ -281,19 +322,31 @@ func (uc *InAppUseCase) OnDocketEntryObserved(ctx context.Context, ev DocketEntr
 			return nil // suppressed during onboarding — the dedup mark above stands
 		}
 
-		return uc.record(ctx, tx, ev.TenantID, TypeNewAndamento, newAndamentoTitle, newAndamentoBody, map[string]any{
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeNewAndamento, newAndamentoTitle, newAndamentoBody, map[string]any{
 			"court_record_id": ev.CourtRecordID,
 			"docket_entry_id": ev.DocketEntryID,
 			"sync_run_id":     ev.SyncRunID,
 		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// Push only outside the backfill window and only for a fresh aviso: a suppressed
+	// or replayed event leaves created == nil, so nothing is pushed.
+	uc.publish(ctx, ev.TenantID, TypeDocketEntryObserved, created)
+	return nil
 }
 
 // record writes the tenant-level aviso fact (CREATED) and its single IN_APP delivery
 // (QUEUED) in the caller's tx — the in-app analog of the email use case's create phase,
 // minus the external send. title/body are materialized here; the payload carries the
 // source ids for the in-app UI to link back.
-func (uc *InAppUseCase) record(ctx context.Context, tx database.Tx, tenantID, notifType, title, body string, payload map[string]any) error {
+func (uc *InAppUseCase) record(ctx context.Context, tx database.Tx, tenantID, notifType, title, body string, payload map[string]any) (*Notification, error) {
 	notif, err := uc.repo.InsertNotification(ctx, tx, InsertNotificationParams{
 		TenantID: tenantID,
 		Type:     notifType,
@@ -303,7 +356,7 @@ func (uc *InAppUseCase) record(ctx context.Context, tx database.Tx, tenantID, no
 		Status:   StatusCreated,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	_, err = uc.repo.InsertDelivery(ctx, tx, InsertDeliveryParams{
@@ -312,7 +365,47 @@ func (uc *InAppUseCase) record(ctx context.Context, tx database.Tx, tenantID, no
 		Channel:        ChannelInApp,
 		Status:         DeliveryQueued,
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return notif, nil
+}
+
+// publish fires the best-effort real-time push for a freshly-created aviso. It is a
+// no-op when notif is nil (a replay or a suppressed docket entry created nothing).
+// Both a marshal fault and a publish fault are LOGGED and swallowed (single-handling
+// rule): the aviso is already committed, so a failed push must not fail the handler
+// and make asynq retry — the client just gets the aviso on its next fetch instead.
+func (uc *InAppUseCase) publish(ctx context.Context, tenantID, eventType string, notif *Notification) {
+	if notif == nil {
+		return
+	}
+
+	payload, err := json.Marshal(inAppPush{
+		ID:        notif.ID,
+		Type:      notif.Type,
+		Title:     notif.Title,
+		Body:      notif.Body,
+		CreatedAt: notif.CreatedAt,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "notifications: in-app push marshal failed",
+			"tenant_id", tenantID,
+			"notification_id", notif.ID,
+			"event_type", eventType,
+			"error", err,
+		)
+		return
+	}
+
+	if err := uc.pub.Publish(ctx, pushChannel(tenantID), payload); err != nil {
+		slog.ErrorContext(ctx, "notifications: in-app push publish failed",
+			"tenant_id", tenantID,
+			"notification_id", notif.ID,
+			"event_type", eventType,
+			"error", err,
+		)
+	}
 }
 
 // renderImportFinished materializes the title/body for an import_finished aviso. The

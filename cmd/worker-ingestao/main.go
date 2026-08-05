@@ -14,6 +14,7 @@ import (
 	"os"
 
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -22,6 +23,7 @@ import (
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
+	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
@@ -160,10 +162,20 @@ func run(logger *slog.Logger) error {
 	// which turns acquisition's backfill_finished/docket_entry_observed into IN_APP
 	// avisos. Registering the in-app handlers here is what lets acquisition drop its
 	// drainUnconsumed placeholder for those two types (one handler per type on the mux).
+	// A dedicated redis client for the best-effort in-app push (slice 2b): when the
+	// in-app consumer persists an aviso it publishes it on notif:<tenant> for the SSE
+	// endpoint (a later slice) to relay in real time. It shares the same Redis as asynq
+	// but its own client, closed in the graceful shutdown below.
+	redisClientOpt, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return fmt.Errorf("parse redis url for pub/sub: %w", err)
+	}
+	pubsubClient := redis.NewClient(redisClientOpt)
+
 	notifRepo := notifications.NewRepository(pool)
 	notifDedup := notifications.NewDedup()
 	notifyUC := notifications.NewNotifyUseCase(notifRepo, emailChannel, notifDedup, uow)
-	inAppUC := notifications.NewInAppUseCase(notifRepo, notifDedup, uow)
+	inAppUC := notifications.NewInAppUseCase(notifRepo, notifDedup, uow, pubsub.NewRedisPubSub(pubsubClient))
 	notifications.NewListener(notifyUC, inAppUC).Register(mux)
 
 	if err := srv.Start(mux); err != nil {
@@ -182,6 +194,9 @@ func run(logger *slog.Logger) error {
 		func(shutdownCtx context.Context) error {
 			srv.Shutdown() // drains in-flight tasks before returning
 			close(stopped)
+			if err := pubsubClient.Close(); err != nil {
+				logger.Warn("close pub/sub redis client", "service", serviceName, "error", err)
+			}
 			pool.Close()
 			if err := telemetryShutdown(shutdownCtx); err != nil {
 				return fmt.Errorf("shutdown telemetry: %w", err)

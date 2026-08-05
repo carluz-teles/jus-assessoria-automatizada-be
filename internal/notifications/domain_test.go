@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -137,6 +138,21 @@ func (d *fakeDedup) SeenOrMark(_ context.Context, _ database.Tx, consumer, event
 	d.consumers = append(d.consumers, consumer)
 	d.marked = append(d.marked, eventID)
 	return d.seen, d.err
+}
+
+// fakePublisher captures every best-effort push so a test can assert the channel and
+// payload, and can be told to fail (err) to model a dropped push (the aviso is still
+// persisted; the failure is logged and swallowed, not propagated).
+type fakePublisher struct {
+	err      error
+	channels []string
+	payloads [][]byte
+}
+
+func (p *fakePublisher) Publish(_ context.Context, channel string, payload []byte) error {
+	p.channels = append(p.channels, channel)
+	p.payloads = append(p.payloads, payload)
+	return p.err
 }
 
 // --- fixtures ---------------------------------------------------------------
@@ -386,7 +402,8 @@ func TestInAppUseCase_OnBackfillFinished_CreatesImportFinished(t *testing.T) {
 	repo := repoInApp()
 	dedup := &fakeDedup{}
 	uow := &fakeUOW{}
-	uc := NewInAppUseCase(repo, dedup, uow)
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, dedup, uow, pub)
 
 	if err := uc.OnBackfillFinished(context.Background(), backfillFinished("evt-bf-1", acquisition.BackfillStatusCompleted, 0)); err != nil {
 		t.Fatalf("OnBackfillFinished: %v", err)
@@ -411,13 +428,38 @@ func TestInAppUseCase_OnBackfillFinished_CreatesImportFinished(t *testing.T) {
 	if len(dedup.marked) != 1 || dedup.marked[0] != "evt-bf-1" || dedup.consumers[0] != consumerBackfill {
 		t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-bf-1] under %q", dedup.marked, dedup.consumers, consumerBackfill)
 	}
+	// AC1: a fresh aviso is pushed once, on the tenant's channel, carrying the aviso.
+	push := assertPushedOnce(t, pub)
+	if push["id"] != notifID || push["type"] != TypeImportFinished {
+		t.Fatalf("push id/type = %v/%v, want %q/%q", push["id"], push["type"], notifID, TypeImportFinished)
+	}
+	if push["title"] != importFinishedTitle || push["body"] != importFinishedCompletedBody {
+		t.Fatalf("push title/body = %v/%v, want the COMPLETED strings", push["title"], push["body"])
+	}
+}
+
+// assertPushedOnce asserts exactly one push landed on the fixture tenant's channel
+// and returns its decoded JSON payload for field assertions.
+func assertPushedOnce(t *testing.T, pub *fakePublisher) map[string]any {
+	t.Helper()
+	if len(pub.channels) != 1 {
+		t.Fatalf("publishes = %d, want 1", len(pub.channels))
+	}
+	if want := "notif:" + tenantID; pub.channels[0] != want {
+		t.Fatalf("push channel = %q, want %q", pub.channels[0], want)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(pub.payloads[0], &got); err != nil {
+		t.Fatalf("push payload is not JSON: %v", err)
+	}
+	return got
 }
 
 // AC3: a PARTIAL backfill_finished names how many windows failed (slices_error) in the
 // body, so the aviso says the import is incomplete without opening the job.
 func TestInAppUseCase_OnBackfillFinished_PartialMentionsErrorsInBody(t *testing.T) {
 	repo := repoInApp()
-	uc := NewInAppUseCase(repo, &fakeDedup{}, &fakeUOW{})
+	uc := NewInAppUseCase(repo, &fakeDedup{}, &fakeUOW{}, &fakePublisher{})
 
 	if err := uc.OnBackfillFinished(context.Background(), backfillFinished("evt-bf-partial", acquisition.BackfillStatusPartial, 3)); err != nil {
 		t.Fatalf("OnBackfillFinished: %v", err)
@@ -439,13 +481,18 @@ func TestInAppUseCase_OnBackfillFinished_ReplayIsNoOp(t *testing.T) {
 		t.Fatal("insert notification ran on a replay")
 		return nil, nil
 	}
-	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{})
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{}, pub)
 
 	if err := uc.OnBackfillFinished(context.Background(), backfillFinished("evt-bf-dup", acquisition.BackfillStatusCompleted, 0)); err != nil {
 		t.Fatalf("OnBackfillFinished: %v", err)
 	}
 	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
 		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	// AC2: a replay creates no aviso, so it pushes nothing.
+	if len(pub.channels) != 0 {
+		t.Fatalf("replay pushed %d times, want 0", len(pub.channels))
 	}
 }
 
@@ -460,7 +507,8 @@ func TestInAppUseCase_OnDocketEntryObserved_SuppressedDuringBackfill(t *testing.
 		return nil, nil
 	}
 	dedup := &fakeDedup{}
-	uc := NewInAppUseCase(repo, dedup, &fakeUOW{})
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, dedup, &fakeUOW{}, pub)
 
 	if err := uc.OnDocketEntryObserved(context.Background(), docketEntryObserved("evt-dk-suppressed")); err != nil {
 		t.Fatalf("OnDocketEntryObserved: %v", err)
@@ -473,6 +521,10 @@ func TestInAppUseCase_OnDocketEntryObserved_SuppressedDuringBackfill(t *testing.
 	if len(dedup.marked) != 1 || dedup.marked[0] != "evt-dk-suppressed" || dedup.consumers[0] != consumerDocket {
 		t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-dk-suppressed] under %q", dedup.marked, dedup.consumers, consumerDocket)
 	}
+	// AC2: a suppressed docket entry creates no aviso, so it pushes nothing.
+	if len(pub.channels) != 0 {
+		t.Fatalf("suppressed event pushed %d times, want 0", len(pub.channels))
+	}
 }
 
 // AC6: with no backfill running, a docket_entry_observed creates a new_andamento aviso
@@ -481,7 +533,8 @@ func TestInAppUseCase_OnDocketEntryObserved_CreatesNewAndamento(t *testing.T) {
 	repo := repoInApp()
 	dedup := &fakeDedup{}
 	uow := &fakeUOW{}
-	uc := NewInAppUseCase(repo, dedup, uow)
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, dedup, uow, pub)
 
 	if err := uc.OnDocketEntryObserved(context.Background(), docketEntryObserved("evt-dk-1")); err != nil {
 		t.Fatalf("OnDocketEntryObserved: %v", err)
@@ -503,6 +556,11 @@ func TestInAppUseCase_OnDocketEntryObserved_CreatesNewAndamento(t *testing.T) {
 	if len(dedup.marked) != 1 || dedup.consumers[0] != consumerDocket {
 		t.Fatalf("dedup = {marked:%v consumers:%v}, want one under %q", dedup.marked, dedup.consumers, consumerDocket)
 	}
+	// AC3: an incremental andamento (no backfill) is pushed once, carrying the aviso.
+	push := assertPushedOnce(t, pub)
+	if push["id"] != notifID || push["type"] != TypeNewAndamento || push["title"] != newAndamentoTitle {
+		t.Fatalf("push = %v, want the new_andamento aviso", push)
+	}
 }
 
 // AC7: a replay of a docket_entry_observed is a no-op — the backfill check never runs
@@ -517,13 +575,40 @@ func TestInAppUseCase_OnDocketEntryObserved_ReplayIsNoOp(t *testing.T) {
 		t.Fatal("insert notification ran on a replay")
 		return nil, nil
 	}
-	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{})
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{}, pub)
 
 	if err := uc.OnDocketEntryObserved(context.Background(), docketEntryObserved("evt-dk-dup")); err != nil {
 		t.Fatalf("OnDocketEntryObserved: %v", err)
 	}
 	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
 		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	// AC2: a replay creates no aviso, so it pushes nothing.
+	if len(pub.channels) != 0 {
+		t.Fatalf("replay pushed %d times, want 0", len(pub.channels))
+	}
+}
+
+// AC4: a push that fails does not fail the handler — the aviso is already persisted,
+// so the publish error is logged and swallowed (OnBackfillFinished returns nil). The
+// use case still attempted the push exactly once (best-effort, no retry).
+func TestInAppUseCase_OnBackfillFinished_PublishFailureIsSwallowed(t *testing.T) {
+	repo := repoInApp()
+	pub := &fakePublisher{err: errors.New("redis unreachable")}
+	uc := NewInAppUseCase(repo, &fakeDedup{}, &fakeUOW{}, pub)
+
+	if err := uc.OnBackfillFinished(context.Background(), backfillFinished("evt-bf-pub-fail", acquisition.BackfillStatusCompleted, 0)); err != nil {
+		t.Fatalf("OnBackfillFinished should not propagate a push failure: %v", err)
+	}
+
+	// The aviso was still persisted (the push is best-effort, after the commit).
+	if len(repo.insertedNotif) != 1 || len(repo.insertedDelivery) != 1 {
+		t.Fatalf("aviso not persisted despite the push failure: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	// The push was attempted exactly once — a failure is not retried in the handler.
+	if len(pub.channels) != 1 {
+		t.Fatalf("publish attempts = %d, want 1 (no retry)", len(pub.channels))
 	}
 }
 
