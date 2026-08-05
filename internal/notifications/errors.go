@@ -16,6 +16,11 @@ var (
 	// (an id from another tenant, or a deleted delivery). Typed, never (nil, nil).
 	ErrDeliveryNotFound = apperr.NewNotFound("notification delivery not found")
 
+	// ErrNotificationNotFound — a mark-read targeted an aviso that is not visible to
+	// the caller in the tenant (an id from another tenant, one addressed to a
+	// different user, or a garbage id). The read handler maps it to 404.
+	ErrNotificationNotFound = apperr.NewNotFound("notification not found")
+
 	// ErrTemplateNotFound — no email template is registered for the notification
 	// type, so nothing can be rendered. A configuration fault, surfaced (not silently
 	// sent empty) so the missing template is fixed.

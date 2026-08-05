@@ -17,7 +17,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -320,20 +319,20 @@ func newInAppUC(pool *pgxpool.Pool) *notifications.InAppUseCase {
 }
 
 // notificationRow is an aviso read directly (RLS bypassed as owner), carrying the
-// in-app columns (nullable title/body/read_at).
+// in-app materialized columns (nullable title/body). Read state moved off the row to
+// the per-user notification_read table (migration 0018), so it is no longer read here.
 type notificationRow struct {
-	typ    string
-	title  *string
-	body   *string
-	readAt *time.Time
+	typ   string
+	title *string
+	body  *string
 }
 
 func readNotification(t *testing.T, pool *pgxpool.Pool, tenantID string) (notificationRow, bool) {
 	t.Helper()
 	var row notificationRow
 	err := pool.QueryRow(context.Background(),
-		`SELECT type, title, body, read_at FROM notification WHERE tenant_id = $1`, tenantID,
-	).Scan(&row.typ, &row.title, &row.body, &row.readAt)
+		`SELECT type, title, body FROM notification WHERE tenant_id = $1`, tenantID,
+	).Scan(&row.typ, &row.title, &row.body)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return notificationRow{}, false
 	}
@@ -396,9 +395,6 @@ func TestNotifications_InApp_BackfillFinished_PersistsImportFinished(t *testing.
 	}
 	if row.title == nil || *row.title == "" || row.body == nil || *row.body == "" {
 		t.Fatalf("title/body = %v / %v, want both materialized", row.title, row.body)
-	}
-	if row.readAt != nil {
-		t.Fatalf("read_at = %v, want NULL (unread)", row.readAt)
 	}
 
 	delivery, ok := readDelivery(t, pool, tenantID)

@@ -138,14 +138,17 @@ func run(logger *slog.Logger) error {
 	billingWebhook := billing.NewWebhookHandler(billingUC)
 	billingHandler := billing.NewHandler(billingUC)
 
-	// Notifications wiring: the api only mounts the provider (Resend) webhook — the
-	// bounce/complaint callback. The listener that sends e-mail lives in the worker;
-	// here the slice owns just the public webhook, verified by its svix signature and
-	// backed by a pool-only use case (locate a delivery by provider id → flip status).
+	// Notifications wiring: the api mounts two surfaces off one repo — the public
+	// provider (Resend) webhook (bounce/complaint callback, svix-verified, pool-only
+	// use case: locate a delivery by provider id → flip status), and the authenticated
+	// in-app inbox handler (slice 2a: list/badge/mark-read, read state per user). The
+	// e-mail-sending listener lives in the worker, not here.
+	notificationsRepo := notifications.NewRepository(pool)
 	notificationsWebhook := notifications.NewWebhookHandler(
 		notifications.NewSvixVerifier(cfg.ResendWebhookSecret),
-		notifications.NewWebhookUseCase(notifications.NewRepository(pool), uow),
+		notifications.NewWebhookUseCase(notificationsRepo, uow),
 	)
+	notificationsHandler := notifications.NewHandler(notifications.NewReadUseCase(notificationsRepo, uow))
 
 	// Lookup wiring: a stateless proxy over the BrasilAPI registry. No pool, no
 	// outbox — the slice owns only an HTTP port; the binary just injects the
@@ -177,6 +180,7 @@ func run(logger *slog.Logger) error {
 		webhook:              webhook,
 		billingWebhook:       billingWebhook,
 		notificationsWebhook: notificationsWebhook,
+		notifications:        notificationsHandler,
 		billing:              billingHandler,
 		identity:             identityHandler,
 		acquisition:          acquisitionHandler,

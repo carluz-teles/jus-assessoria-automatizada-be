@@ -11,6 +11,9 @@ import (
 )
 
 type Querier interface {
+	// The unread-badge count: how many avisos visible to the user carry no read receipt
+	// from them. tenant_id ($1) is barrier 1; RLS is barrier 2.
+	CountUnread(ctx context.Context, arg CountUnreadParams) (int64, error)
 	// Locate a delivery by the provider's message id (the Resend email id), on the
 	// pool. A provider bounce/complaint webhook carries no tenant, so this read crosses
 	// tenants (the owner bypasses RLS) to recover the delivery AND its tenant; the
@@ -41,6 +44,26 @@ type Querier interface {
 	// at send); payload is the template data. status starts CREATED — the delivery rows
 	// carry the per-channel lifecycle.
 	InsertNotification(ctx context.Context, arg InsertNotificationParams) (Notification, error)
+	// The in-app inbox for ONE user: the avisos visible to them — tenant-level
+	// (recipient_user_id IS NULL) OR addressed to them — newest first, keyset-paginated
+	// on (created_at, id) descending. `read` is per-user: EXISTS a receipt for THIS user
+	// in notification_read. @unread_only filters to the ones this user has not read. The
+	// caller passes the max sentinel cursor ('9999-…', max-uuid) for the first page, so
+	// there is no conditional WHERE. tenant_id ($1) is barrier 1; RLS is barrier 2.
+	ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error)
+	// Record read receipts for every aviso visible to the user that they have not read
+	// yet, in the caller's tx. Idempotent: a re-run inserts nothing (the NOT EXISTS
+	// filter plus the ON CONFLICT floor).
+	MarkAllNotificationsRead(ctx context.Context, arg MarkAllNotificationsReadParams) error
+	// Record the user's read receipt for one aviso, in the caller's tx. Idempotent: a
+	// second call is a no-op via the (notification_id, user_id) PK. Visibility is
+	// asserted separately (NotificationVisibleTo), so an unknown/cross-tenant id 404s.
+	MarkNotificationRead(ctx context.Context, arg MarkNotificationReadParams) error
+	// Assert an aviso exists AND is visible to the user in the tenant (tenant-level or
+	// addressed to them). mark-read uses it to 404 an id from another tenant / addressed
+	// to someone else, distinct from the idempotent receipt insert below (which cannot
+	// tell "unknown aviso" from "already read" on its own). Runs in the caller's tx.
+	NotificationVisibleTo(ctx context.Context, arg NotificationVisibleToParams) (bool, error)
 	// Record the outcome of a send: SENT with the provider's message id, or FAILED
 	// with the reason. Scoped by id AND tenant_id (app-layer barrier) on top of RLS.
 	// No row (a delivery from another tenant) → the mapper maps pgx.ErrNoRows to a

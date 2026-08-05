@@ -63,6 +63,29 @@ func (m *mockRepo) HasRunningBackfillForTenant(ctx context.Context, tx database.
 	return m.hasRunningBackfill(ctx, tx, tenantID)
 }
 
+// The in-app inbox read side (slice 2a) is exercised by ReadUseCase's own tests
+// (read_test.go, which drives the narrow readRepo). These write-path tests never
+// reach them, so the mock leaves them unimplemented (a call would panic loudly).
+func (m *mockRepo) ListNotifications(context.Context, ListNotificationsQuery) ([]NotificationView, error) {
+	panic("mockRepo.ListNotifications: not expected on the write path")
+}
+
+func (m *mockRepo) CountUnread(context.Context, string, string) (int, error) {
+	panic("mockRepo.CountUnread: not expected on the write path")
+}
+
+func (m *mockRepo) NotificationVisibleTo(context.Context, database.Tx, string, string, string) (bool, error) {
+	panic("mockRepo.NotificationVisibleTo: not expected on the write path")
+}
+
+func (m *mockRepo) MarkRead(context.Context, database.Tx, string, string, string) error {
+	panic("mockRepo.MarkRead: not expected on the write path")
+}
+
+func (m *mockRepo) MarkAllRead(context.Context, database.Tx, string, string) error {
+	panic("mockRepo.MarkAllRead: not expected on the write path")
+}
+
 // spyChannel records the message it was asked to send and returns a preset id/error.
 type spyChannel struct {
 	sent []EmailMessage

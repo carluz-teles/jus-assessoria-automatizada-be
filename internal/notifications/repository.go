@@ -3,9 +3,11 @@ package notifications
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jusassessoria/platform/internal/notifications/notificationsdb"
 	"github.com/jusassessoria/platform/lib/database"
@@ -68,6 +70,17 @@ type Repository interface {
 	// it to the event's tenant — the in-app use case suppresses per-andamento avisos
 	// while the onboarding import is in flight.
 	HasRunningBackfillForTenant(ctx context.Context, tx database.Tx, tenantID string) (bool, error)
+
+	// In-app inbox read side (slice 2a). The list and count run on the pool (barrier
+	// 1 = the tenant+user filter, read state per user); the receipt writes take the
+	// caller's tx so they commit in the tenant's RLS scope. Kept on the one Repository
+	// so the slice shares a single repo across write and read use cases; readRepo is
+	// the narrow subset the ReadUseCase depends on for testability.
+	ListNotifications(ctx context.Context, q ListNotificationsQuery) ([]NotificationView, error)
+	CountUnread(ctx context.Context, tenantID, userID string) (int, error)
+	NotificationVisibleTo(ctx context.Context, tx database.Tx, notificationID, tenantID, userID string) (bool, error)
+	MarkRead(ctx context.Context, tx database.Tx, notificationID, tenantID, userID string) error
+	MarkAllRead(ctx context.Context, tx database.Tx, tenantID, userID string) error
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for the
@@ -77,7 +90,10 @@ type pgRepository struct {
 	q *notificationsdb.Queries
 }
 
-var _ Repository = (*pgRepository)(nil)
+var (
+	_ Repository = (*pgRepository)(nil)
+	_ readRepo   = (*pgRepository)(nil)
+)
 
 // NewRepository binds the resolution read to pool (used only by the provider
 // webhook). Inject a *pgxpool.Pool in production; both it and a mock satisfy
@@ -231,4 +247,147 @@ func (r *pgRepository) HasRunningBackfillForTenant(ctx context.Context, tx datab
 		return false, database.WrapInfra(err)
 	}
 	return running, nil
+}
+
+// ListNotifications reads the user's in-app inbox (keyset-paginated, newest first) on
+// the pool, filtered by tenant_id + per-user visibility (barrier 1). The caller
+// passes the max sentinel cursor for the first page.
+func (r *pgRepository) ListNotifications(ctx context.Context, q ListNotificationsQuery) ([]NotificationView, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(q.UserID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastID, err := uuid.Parse(q.LastID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastCreated, err := time.Parse(time.RFC3339Nano, q.LastCreated)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	rows, err := r.q.ListNotifications(ctx, notificationsdb.ListNotificationsParams{
+		TenantID:    tid,
+		Limit:       int32(q.Limit),
+		UserID:      uid,
+		UnreadOnly:  q.UnreadOnly,
+		LastCreated: pgtype.Timestamptz{Time: lastCreated, Valid: true},
+		LastID:      lastID,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]NotificationView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, NotificationView{
+			ID:        row.ID.String(),
+			Type:      row.Type,
+			Title:     derefString(row.Title),
+			Body:      derefString(row.Body),
+			Payload:   unmarshalPayload(row.Payload),
+			Read:      row.Read,
+			CreatedAt: row.CreatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
+// CountUnread returns how many avisos visible to the user carry no read receipt from
+// them, on the pool, filtered by tenant_id (barrier 1).
+func (r *pgRepository) CountUnread(ctx context.Context, tenantID, userID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+
+	n, err := r.q.CountUnread(ctx, notificationsdb.CountUnreadParams{TenantID: tid, UserID: uid})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(n), nil
+}
+
+// NotificationVisibleTo reports whether the aviso exists and is visible to the user
+// in the tenant, inside the caller's tx (RLS in force). A non-uuid id references no
+// aviso, so it is simply "not visible" — the use case turns that into 404 like any
+// unknown id, never a 500.
+func (r *pgRepository) NotificationVisibleTo(ctx context.Context, tx database.Tx, notificationID, tenantID, userID string) (bool, error) {
+	nid, err := uuid.Parse(notificationID)
+	if err != nil {
+		return false, nil
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+
+	visible, err := notificationsdb.New(tx).NotificationVisibleTo(ctx, notificationsdb.NotificationVisibleToParams{
+		NotificationID: nid,
+		TenantID:       tid,
+		UserID:         uid,
+	})
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	return visible, nil
+}
+
+// MarkRead records the user's read receipt for one aviso inside the caller's tx.
+// Idempotent (ON CONFLICT DO NOTHING) — a repeat is a no-op, not an error.
+func (r *pgRepository) MarkRead(ctx context.Context, tx database.Tx, notificationID, tenantID, userID string) error {
+	nid, err := uuid.Parse(notificationID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+
+	if err := notificationsdb.New(tx).MarkNotificationRead(ctx, notificationsdb.MarkNotificationReadParams{
+		NotificationID: nid,
+		UserID:         uid,
+		TenantID:       tid,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// MarkAllRead records read receipts for every aviso visible to the user that they
+// have not read yet, inside the caller's tx. Idempotent — a re-run inserts nothing.
+func (r *pgRepository) MarkAllRead(ctx context.Context, tx database.Tx, tenantID, userID string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+
+	if err := notificationsdb.New(tx).MarkAllNotificationsRead(ctx, notificationsdb.MarkAllNotificationsReadParams{
+		UserID:   uid,
+		TenantID: tid,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }

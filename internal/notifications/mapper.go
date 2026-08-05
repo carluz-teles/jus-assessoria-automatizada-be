@@ -2,7 +2,6 @@ package notifications
 
 import (
 	"encoding/json"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -27,7 +26,6 @@ func notificationToEntity(r notificationsdb.Notification) *Notification {
 		Body:            derefString(r.Body),
 		Payload:         unmarshalPayload(r.Payload),
 		Status:          NotificationStatus(r.Status),
-		ReadAt:          timestamptzToTimePtr(r.ReadAt),
 		CreatedAt:       r.CreatedAt.Time,
 	}
 }
@@ -78,16 +76,6 @@ func derefString(s *string) string {
 		return ""
 	}
 	return *s
-}
-
-// timestamptzToTimePtr collapses a nullable timestamptz column to *time.Time, nil
-// standing in for SQL NULL — an unread in-app aviso has no read_at.
-func timestamptzToTimePtr(t pgtype.Timestamptz) *time.Time {
-	if !t.Valid {
-		return nil
-	}
-	v := t.Time
-	return &v
 }
 
 // textToNull is the inverse: an empty string is written as SQL NULL, not "".

@@ -37,6 +37,7 @@ type routerDeps struct {
 	webhook              *identity.WebhookHandler
 	billingWebhook       *billing.WebhookHandler
 	notificationsWebhook *notifications.WebhookHandler
+	notifications        *notifications.Handler
 	billing              *billing.Handler
 	identity             *identity.Handler
 	acquisition          *acquisition.Handler
@@ -140,6 +141,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// domain use cases) still builds.
 	if deps.acquisition != nil {
 		deps.acquisition.RegisterV1(v1)
+	}
+
+	// notifications owns its authenticated /v1 in-app inbox routes (list/badge/
+	// mark-read) and mounts them via Register — the api only composes. Its public
+	// Resend webhook is a separate handler mounted off the root above. Nil-guarded so
+	// the router test fixture builds without a use case, like the others.
+	if deps.notifications != nil {
+		deps.notifications.Register(v1)
 	}
 
 	// billing owns its authenticated /v1 routes (checkout/portal/subscription/plans)

@@ -195,7 +195,6 @@ type Notification struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	Title           *string            `json:"title"`
 	Body            *string            `json:"body"`
-	ReadAt          pgtype.Timestamptz `json:"read_at"`
 }
 
 type NotificationDelivery struct {
@@ -208,6 +207,13 @@ type NotificationDelivery struct {
 	Error             *string            `json:"error"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type NotificationRead struct {
+	NotificationID uuid.UUID          `json:"notification_id"`
+	UserID         uuid.UUID          `json:"user_id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	ReadAt         pgtype.Timestamptz `json:"read_at"`
 }
 
 type Outbox struct {

@@ -56,6 +56,78 @@ SELECT EXISTS (
     WHERE tenant_id = $1 AND status = 'RUNNING'
 ) AS running;
 
+-- name: ListNotifications :many
+-- The in-app inbox for ONE user: the avisos visible to them — tenant-level
+-- (recipient_user_id IS NULL) OR addressed to them — newest first, keyset-paginated
+-- on (created_at, id) descending. `read` is per-user: EXISTS a receipt for THIS user
+-- in notification_read. @unread_only filters to the ones this user has not read. The
+-- caller passes the max sentinel cursor ('9999-…', max-uuid) for the first page, so
+-- there is no conditional WHERE. tenant_id ($1) is barrier 1; RLS is barrier 2.
+SELECT n.id, n.type, n.title, n.body, n.payload, n.created_at,
+       EXISTS (
+           SELECT 1 FROM notification_read r
+           WHERE r.notification_id = n.id AND r.user_id = @user_id::uuid
+       ) AS read
+FROM notification n
+WHERE n.tenant_id = $1
+  AND (n.recipient_user_id IS NULL OR n.recipient_user_id = @user_id::uuid)
+  AND (
+      NOT @unread_only::boolean
+      OR NOT EXISTS (
+          SELECT 1 FROM notification_read r
+          WHERE r.notification_id = n.id AND r.user_id = @user_id::uuid
+      )
+  )
+  AND (n.created_at, n.id) < (@last_created::timestamptz, @last_id::uuid)
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT $2;
+
+-- name: CountUnread :one
+-- The unread-badge count: how many avisos visible to the user carry no read receipt
+-- from them. tenant_id ($1) is barrier 1; RLS is barrier 2.
+SELECT count(*) FROM notification n
+WHERE n.tenant_id = $1
+  AND (n.recipient_user_id IS NULL OR n.recipient_user_id = @user_id::uuid)
+  AND NOT EXISTS (
+      SELECT 1 FROM notification_read r
+      WHERE r.notification_id = n.id AND r.user_id = @user_id::uuid
+  );
+
+-- name: NotificationVisibleTo :one
+-- Assert an aviso exists AND is visible to the user in the tenant (tenant-level or
+-- addressed to them). mark-read uses it to 404 an id from another tenant / addressed
+-- to someone else, distinct from the idempotent receipt insert below (which cannot
+-- tell "unknown aviso" from "already read" on its own). Runs in the caller's tx.
+SELECT EXISTS (
+    SELECT 1 FROM notification n
+    WHERE n.id = @notification_id::uuid
+      AND n.tenant_id = @tenant_id::uuid
+      AND (n.recipient_user_id IS NULL OR n.recipient_user_id = @user_id::uuid)
+) AS visible;
+
+-- name: MarkNotificationRead :exec
+-- Record the user's read receipt for one aviso, in the caller's tx. Idempotent: a
+-- second call is a no-op via the (notification_id, user_id) PK. Visibility is
+-- asserted separately (NotificationVisibleTo), so an unknown/cross-tenant id 404s.
+INSERT INTO notification_read (notification_id, user_id, tenant_id)
+VALUES (@notification_id::uuid, @user_id::uuid, @tenant_id::uuid)
+ON CONFLICT (notification_id, user_id) DO NOTHING;
+
+-- name: MarkAllNotificationsRead :exec
+-- Record read receipts for every aviso visible to the user that they have not read
+-- yet, in the caller's tx. Idempotent: a re-run inserts nothing (the NOT EXISTS
+-- filter plus the ON CONFLICT floor).
+INSERT INTO notification_read (notification_id, user_id, tenant_id)
+SELECT n.id, @user_id::uuid, @tenant_id::uuid
+FROM notification n
+WHERE n.tenant_id = @tenant_id::uuid
+  AND (n.recipient_user_id IS NULL OR n.recipient_user_id = @user_id::uuid)
+  AND NOT EXISTS (
+      SELECT 1 FROM notification_read r
+      WHERE r.notification_id = n.id AND r.user_id = @user_id::uuid
+  )
+ON CONFLICT (notification_id, user_id) DO NOTHING;
+
 -- name: FindDeliveryByProviderMessageID :one
 -- Locate a delivery by the provider's message id (the Resend email id), on the
 -- pool. A provider bounce/complaint webhook carries no tenant, so this read crosses

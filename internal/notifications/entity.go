@@ -85,9 +85,8 @@ type Notification struct {
 	Body    string
 	Payload map[string]any
 	Status  NotificationStatus
-	// ReadAt is nil until the recipient reads the in-app aviso (a later slice flips
-	// it); nil for EMAIL avisos, which have no in-app read state.
-	ReadAt    *time.Time
+	// ReadAt lived here in slice 1a as a tenant-wide flag; read state is now per-user
+	// (the notification_read table, migration 0018), so it is off the aggregate.
 	CreatedAt time.Time
 }
 

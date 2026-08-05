@@ -12,6 +12,30 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countUnread = `-- name: CountUnread :one
+SELECT count(*) FROM notification n
+WHERE n.tenant_id = $1
+  AND (n.recipient_user_id IS NULL OR n.recipient_user_id = $2::uuid)
+  AND NOT EXISTS (
+      SELECT 1 FROM notification_read r
+      WHERE r.notification_id = n.id AND r.user_id = $2::uuid
+  )
+`
+
+type CountUnreadParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+}
+
+// The unread-badge count: how many avisos visible to the user carry no read receipt
+// from them. tenant_id ($1) is barrier 1; RLS is barrier 2.
+func (q *Queries) CountUnread(ctx context.Context, arg CountUnreadParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countUnread, arg.TenantID, arg.UserID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const findDeliveryByProviderMessageID = `-- name: FindDeliveryByProviderMessageID :one
 SELECT id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at FROM notification_delivery
 WHERE provider_message_id = $1
@@ -128,7 +152,7 @@ const insertNotification = `-- name: InsertNotification :one
 INSERT INTO notification (
     tenant_id, recipient_user_id, type, title, body, payload, status
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, tenant_id, recipient_user_id, type, payload, status, created_at, title, body, read_at
+RETURNING id, tenant_id, recipient_user_id, type, payload, status, created_at, title, body
 `
 
 type InsertNotificationParams struct {
@@ -171,9 +195,161 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		&i.CreatedAt,
 		&i.Title,
 		&i.Body,
-		&i.ReadAt,
 	)
 	return i, err
+}
+
+const listNotifications = `-- name: ListNotifications :many
+SELECT n.id, n.type, n.title, n.body, n.payload, n.created_at,
+       EXISTS (
+           SELECT 1 FROM notification_read r
+           WHERE r.notification_id = n.id AND r.user_id = $3::uuid
+       ) AS read
+FROM notification n
+WHERE n.tenant_id = $1
+  AND (n.recipient_user_id IS NULL OR n.recipient_user_id = $3::uuid)
+  AND (
+      NOT $4::boolean
+      OR NOT EXISTS (
+          SELECT 1 FROM notification_read r
+          WHERE r.notification_id = n.id AND r.user_id = $3::uuid
+      )
+  )
+  AND (n.created_at, n.id) < ($5::timestamptz, $6::uuid)
+ORDER BY n.created_at DESC, n.id DESC
+LIMIT $2
+`
+
+type ListNotificationsParams struct {
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	Limit       int32              `json:"limit"`
+	UserID      uuid.UUID          `json:"user_id"`
+	UnreadOnly  bool               `json:"unread_only"`
+	LastCreated pgtype.Timestamptz `json:"last_created"`
+	LastID      uuid.UUID          `json:"last_id"`
+}
+
+type ListNotificationsRow struct {
+	ID        uuid.UUID          `json:"id"`
+	Type      string             `json:"type"`
+	Title     *string            `json:"title"`
+	Body      *string            `json:"body"`
+	Payload   []byte             `json:"payload"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	Read      bool               `json:"read"`
+}
+
+// The in-app inbox for ONE user: the avisos visible to them — tenant-level
+// (recipient_user_id IS NULL) OR addressed to them — newest first, keyset-paginated
+// on (created_at, id) descending. `read` is per-user: EXISTS a receipt for THIS user
+// in notification_read. @unread_only filters to the ones this user has not read. The
+// caller passes the max sentinel cursor ('9999-…', max-uuid) for the first page, so
+// there is no conditional WHERE. tenant_id ($1) is barrier 1; RLS is barrier 2.
+func (q *Queries) ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error) {
+	rows, err := q.db.Query(ctx, listNotifications,
+		arg.TenantID,
+		arg.Limit,
+		arg.UserID,
+		arg.UnreadOnly,
+		arg.LastCreated,
+		arg.LastID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListNotificationsRow
+	for rows.Next() {
+		var i ListNotificationsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Type,
+			&i.Title,
+			&i.Body,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.Read,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markAllNotificationsRead = `-- name: MarkAllNotificationsRead :exec
+INSERT INTO notification_read (notification_id, user_id, tenant_id)
+SELECT n.id, $1::uuid, $2::uuid
+FROM notification n
+WHERE n.tenant_id = $2::uuid
+  AND (n.recipient_user_id IS NULL OR n.recipient_user_id = $1::uuid)
+  AND NOT EXISTS (
+      SELECT 1 FROM notification_read r
+      WHERE r.notification_id = n.id AND r.user_id = $1::uuid
+  )
+ON CONFLICT (notification_id, user_id) DO NOTHING
+`
+
+type MarkAllNotificationsReadParams struct {
+	UserID   uuid.UUID `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Record read receipts for every aviso visible to the user that they have not read
+// yet, in the caller's tx. Idempotent: a re-run inserts nothing (the NOT EXISTS
+// filter plus the ON CONFLICT floor).
+func (q *Queries) MarkAllNotificationsRead(ctx context.Context, arg MarkAllNotificationsReadParams) error {
+	_, err := q.db.Exec(ctx, markAllNotificationsRead, arg.UserID, arg.TenantID)
+	return err
+}
+
+const markNotificationRead = `-- name: MarkNotificationRead :exec
+INSERT INTO notification_read (notification_id, user_id, tenant_id)
+VALUES ($1::uuid, $2::uuid, $3::uuid)
+ON CONFLICT (notification_id, user_id) DO NOTHING
+`
+
+type MarkNotificationReadParams struct {
+	NotificationID uuid.UUID `json:"notification_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	TenantID       uuid.UUID `json:"tenant_id"`
+}
+
+// Record the user's read receipt for one aviso, in the caller's tx. Idempotent: a
+// second call is a no-op via the (notification_id, user_id) PK. Visibility is
+// asserted separately (NotificationVisibleTo), so an unknown/cross-tenant id 404s.
+func (q *Queries) MarkNotificationRead(ctx context.Context, arg MarkNotificationReadParams) error {
+	_, err := q.db.Exec(ctx, markNotificationRead, arg.NotificationID, arg.UserID, arg.TenantID)
+	return err
+}
+
+const notificationVisibleTo = `-- name: NotificationVisibleTo :one
+SELECT EXISTS (
+    SELECT 1 FROM notification n
+    WHERE n.id = $1::uuid
+      AND n.tenant_id = $2::uuid
+      AND (n.recipient_user_id IS NULL OR n.recipient_user_id = $3::uuid)
+) AS visible
+`
+
+type NotificationVisibleToParams struct {
+	NotificationID uuid.UUID `json:"notification_id"`
+	TenantID       uuid.UUID `json:"tenant_id"`
+	UserID         uuid.UUID `json:"user_id"`
+}
+
+// Assert an aviso exists AND is visible to the user in the tenant (tenant-level or
+// addressed to them). mark-read uses it to 404 an id from another tenant / addressed
+// to someone else, distinct from the idempotent receipt insert below (which cannot
+// tell "unknown aviso" from "already read" on its own). Runs in the caller's tx.
+func (q *Queries) NotificationVisibleTo(ctx context.Context, arg NotificationVisibleToParams) (bool, error) {
+	row := q.db.QueryRow(ctx, notificationVisibleTo, arg.NotificationID, arg.TenantID, arg.UserID)
+	var visible bool
+	err := row.Scan(&visible)
+	return visible, err
 }
 
 const updateDeliveryStatus = `-- name: UpdateDeliveryStatus :one
