@@ -45,10 +45,31 @@ func (s DeliveryStatus) Valid() bool {
 		s == DeliveryBounced || s == DeliveryComplained
 }
 
-// ChannelEmail is the channel value stored on a delivery and returned by the email
-// Channel's Kind(). v0's only channel; kept a plain string const (not a type) so it
-// does not clash with the Channel port interface.
-const ChannelEmail = "EMAIL"
+// Channel values stored on a delivery. ChannelEmail is the async-send channel (the
+// EmailChannel port's Kind()); ChannelInApp is the in-app inbox channel (slice 1a),
+// which persists a QUEUED delivery with no external send (real-time push is a later
+// slice). Plain string consts (not a type) so they do not clash with the Channel port.
+const (
+	ChannelEmail = "EMAIL"
+	ChannelInApp = "IN_APP"
+)
+
+// ValidChannel reports whether c is a known delivery channel. The empty string is
+// invalid on purpose, so an unset channel never silently passes as a real one.
+func ValidChannel(c string) bool {
+	return c == ChannelEmail || c == ChannelInApp
+}
+
+// Notification type selectors materialized by the in-app use case (slice 1a). Each
+// picks the fixed PT title/body the use case renders at write time; they are the
+// aviso's `type` column, not an events.Event type.
+const (
+	// TypeImportFinished — the onboarding backfill closed (acquisition.backfill_finished).
+	TypeImportFinished = "import_finished"
+	// TypeNewAndamento — a new andamento was observed outside the backfill window
+	// (acquisition.docket_entry_observed).
+	TypeNewAndamento = "new_andamento"
+)
 
 // Notification is the local aviso: someone (RecipientUserID, empty for a
 // tenant-level aviso) should be told something (Type selects the template, Payload
@@ -58,9 +79,16 @@ type Notification struct {
 	TenantID        string
 	RecipientUserID string // "" when the aviso is tenant-level (no single recipient)
 	Type            string
-	Payload         map[string]any
-	Status          NotificationStatus
-	CreatedAt       time.Time
+	// Title and Body are the materialized in-app text (slice 1a): set for IN_APP
+	// avisos, "" (SQL NULL) for EMAIL avisos, whose channel renders text at send.
+	Title   string
+	Body    string
+	Payload map[string]any
+	Status  NotificationStatus
+	// ReadAt is nil until the recipient reads the in-app aviso (a later slice flips
+	// it); nil for EMAIL avisos, which have no in-app read state.
+	ReadAt    *time.Time
+	CreatedAt time.Time
 }
 
 // NotificationDelivery is one channel's attempt to deliver a Notification.

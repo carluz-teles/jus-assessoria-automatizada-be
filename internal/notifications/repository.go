@@ -18,6 +18,8 @@ type InsertNotificationParams struct {
 	TenantID        string
 	RecipientUserID string // "" → SQL NULL
 	Type            string
+	Title           string // "" → SQL NULL (EMAIL avisos render text at send, not here)
+	Body            string // "" → SQL NULL
 	Payload         map[string]any
 	Status          NotificationStatus
 }
@@ -61,6 +63,11 @@ type Repository interface {
 	// id, on the pool (a resolution read, no tx — the webhook has no tenant). A
 	// missing row is ErrDeliveryNotFound, never (nil, nil).
 	FindDeliveryByProviderMessageID(ctx context.Context, providerMessageID string) (*NotificationDelivery, error)
+	// HasRunningBackfillForTenant reports whether the tenant has a backfill_job still
+	// RUNNING. Runs inside the caller's tx so RLS (plus the explicit tenant_id) scopes
+	// it to the event's tenant — the in-app use case suppresses per-andamento avisos
+	// while the onboarding import is in flight.
+	HasRunningBackfillForTenant(ctx context.Context, tx database.Tx, tenantID string) (bool, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for the
@@ -103,6 +110,8 @@ func (r *pgRepository) InsertNotification(ctx context.Context, tx database.Tx, p
 		TenantID:        tid,
 		RecipientUserID: recipient,
 		Type:            params.Type,
+		Title:           textToNull(params.Title),
+		Body:            textToNull(params.Body),
 		Payload:         payload,
 		Status:          string(params.Status),
 	})
@@ -205,4 +214,21 @@ func (r *pgRepository) FindDeliveryByProviderMessageID(ctx context.Context, prov
 		return nil, database.WrapInfra(err)
 	}
 	return deliveryToEntity(row), nil
+}
+
+// HasRunningBackfillForTenant reports whether the tenant has a RUNNING backfill_job,
+// inside the caller's tx (so RLS scopes the read to the tenant, alongside the explicit
+// tenant_id). A driver fault is wrapped infra; the query itself never returns no-row
+// (EXISTS always yields a bool).
+func (r *pgRepository) HasRunningBackfillForTenant(ctx context.Context, tx database.Tx, tenantID string) (bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+
+	running, err := notificationsdb.New(tx).HasRunningBackfillForTenant(ctx, tid)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	return running, nil
 }

@@ -17,11 +17,13 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -305,6 +307,212 @@ func TestNotifications_RLS_TenantIsolation(t *testing.T) {
 				t.Errorf("notification count under RLS = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// newInAppUC wires the in-app use case (slice 1a) against the real container.
+func newInAppUC(pool *pgxpool.Pool) *notifications.InAppUseCase {
+	return notifications.NewInAppUseCase(
+		notifications.NewRepository(pool),
+		notifications.NewDedup(),
+		database.NewUnitOfWork(pool),
+	)
+}
+
+// notificationRow is an aviso read directly (RLS bypassed as owner), carrying the
+// in-app columns (nullable title/body/read_at).
+type notificationRow struct {
+	typ    string
+	title  *string
+	body   *string
+	readAt *time.Time
+}
+
+func readNotification(t *testing.T, pool *pgxpool.Pool, tenantID string) (notificationRow, bool) {
+	t.Helper()
+	var row notificationRow
+	err := pool.QueryRow(context.Background(),
+		`SELECT type, title, body, read_at FROM notification WHERE tenant_id = $1`, tenantID,
+	).Scan(&row.typ, &row.title, &row.body, &row.readAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return notificationRow{}, false
+	}
+	if err != nil {
+		t.Fatalf("read notification: %v", err)
+	}
+	return row, true
+}
+
+// backfillFinished builds an acquisition.backfill_finished for a tenant with a terminal
+// status and error tally.
+func backfillFinished(eventID, tenantID, status string, slicesError int) notifications.BackfillFinished {
+	return notifications.BackfillFinished{
+		Base:          events.Base{EventID: eventID, Aggregate: tenantID},
+		TenantID:      tenantID,
+		BackfillJobID: uuid.NewString(),
+		IntegrationID: uuid.NewString(),
+		TotalSlices:   10,
+		SlicesOK:      10 - slicesError,
+		SlicesError:   slicesError,
+		Status:        status,
+	}
+}
+
+// docketEntryObserved builds an acquisition.docket_entry_observed for a tenant.
+func docketEntryObserved(eventID, tenantID string) notifications.DocketEntryObserved {
+	return notifications.DocketEntryObserved{
+		Base:          events.Base{EventID: eventID, Aggregate: tenantID},
+		TenantID:      tenantID,
+		SyncRunID:     uuid.NewString(),
+		CourtRecordID: uuid.NewString(),
+		DocketEntryID: uuid.NewString(),
+		Hash:          "hash-int-1",
+	}
+}
+
+// CA8: a backfill_finished (COMPLETED) persists one import_finished aviso with its
+// materialized title/body and a NULL read_at, plus one IN_APP/QUEUED delivery — read
+// back through a real round-trip. A replay (same event id) creates nothing more.
+func TestNotifications_InApp_BackfillFinished_PersistsImportFinished(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-inapp-import", 0)
+
+	uc := newInAppUC(pool)
+	if err := uc.OnBackfillFinished(ctx, backfillFinished("evt_inapp_bf_1", tenantID, acquisition.BackfillStatusCompleted, 0)); err != nil {
+		t.Fatalf("OnBackfillFinished: %v", err)
+	}
+
+	if n := countNotifications(t, pool, tenantID); n != 1 {
+		t.Fatalf("notification rows = %d, want 1", n)
+	}
+	row, ok := readNotification(t, pool, tenantID)
+	if !ok {
+		t.Fatal("notification row was not created")
+	}
+	if row.typ != notifications.TypeImportFinished {
+		t.Fatalf("type = %q, want import_finished", row.typ)
+	}
+	if row.title == nil || *row.title == "" || row.body == nil || *row.body == "" {
+		t.Fatalf("title/body = %v / %v, want both materialized", row.title, row.body)
+	}
+	if row.readAt != nil {
+		t.Fatalf("read_at = %v, want NULL (unread)", row.readAt)
+	}
+
+	delivery, ok := readDelivery(t, pool, tenantID)
+	if !ok {
+		t.Fatal("delivery row was not created")
+	}
+	if delivery.channel != notifications.ChannelInApp || delivery.status != string(notifications.DeliveryQueued) {
+		t.Fatalf("delivery = %+v, want IN_APP/QUEUED", delivery)
+	}
+	if got := countBillingProcessedEvent(t, pool, "notifications.backfill", "evt_inapp_bf_1"); got != 1 {
+		t.Fatalf("processed_event rows = %d, want 1", got)
+	}
+
+	// Replay: the same event id creates nothing more.
+	if err := uc.OnBackfillFinished(ctx, backfillFinished("evt_inapp_bf_1", tenantID, acquisition.BackfillStatusCompleted, 0)); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if n := countNotifications(t, pool, tenantID); n != 1 {
+		t.Fatalf("notification rows after replay = %d, want 1", n)
+	}
+}
+
+// CA5: a docket_entry_observed is suppressed while a backfill is RUNNING — no aviso is
+// persisted — but the event is dedup-marked, so a redelivery stays suppressed.
+func TestNotifications_InApp_DocketEntry_SuppressedDuringBackfill(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-inapp-suppress", 0)
+	integrationID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+	seedBackfillJob(t, pool, tenantID, integrationID, 10) // RUNNING
+
+	uc := newInAppUC(pool)
+	if err := uc.OnDocketEntryObserved(ctx, docketEntryObserved("evt_inapp_dk_suppressed", tenantID)); err != nil {
+		t.Fatalf("OnDocketEntryObserved: %v", err)
+	}
+
+	if n := countNotifications(t, pool, tenantID); n != 0 {
+		t.Fatalf("notification rows = %d, want 0 (suppressed during backfill)", n)
+	}
+	if got := countBillingProcessedEvent(t, pool, "notifications.docket", "evt_inapp_dk_suppressed"); got != 1 {
+		t.Fatalf("processed_event rows = %d, want 1 (marked before suppressing)", got)
+	}
+}
+
+// CA6: with no backfill running, a docket_entry_observed persists a new_andamento aviso
+// plus one IN_APP/QUEUED delivery.
+func TestNotifications_InApp_DocketEntry_CreatesNewAndamento(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-inapp-andamento", 0)
+
+	uc := newInAppUC(pool)
+	if err := uc.OnDocketEntryObserved(ctx, docketEntryObserved("evt_inapp_dk_1", tenantID)); err != nil {
+		t.Fatalf("OnDocketEntryObserved: %v", err)
+	}
+
+	row, ok := readNotification(t, pool, tenantID)
+	if !ok {
+		t.Fatal("notification row was not created")
+	}
+	if row.typ != notifications.TypeNewAndamento {
+		t.Fatalf("type = %q, want new_andamento", row.typ)
+	}
+	delivery, ok := readDelivery(t, pool, tenantID)
+	if !ok {
+		t.Fatal("delivery row was not created")
+	}
+	if delivery.channel != notifications.ChannelInApp || delivery.status != string(notifications.DeliveryQueued) {
+		t.Fatalf("delivery = %+v, want IN_APP/QUEUED", delivery)
+	}
+}
+
+// HasRunningBackfillForTenant reflects the tenant's backfill state through a real tx
+// (RLS in force): true while a job is RUNNING, false once COMPLETED, and false for a
+// different tenant's RUNNING job (isolation).
+func TestNotifications_InApp_HasRunningBackfillForTenant(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+
+	tenantA := uuid.NewString()
+	tenantB := uuid.NewString()
+	seedTenant(t, pool, tenantA, "org-hasrun-a", 0)
+	seedTenant(t, pool, tenantB, "org-hasrun-b", 0)
+	integA := seedIntegration(t, pool, tenantA, acquisition.SourceDJEN)
+	jobA := seedBackfillJob(t, pool, tenantA, integA, 10) // RUNNING
+
+	repo := notifications.NewRepository(pool)
+	uow := database.NewUnitOfWork(pool)
+	hasRunning := func(tenantID string) bool {
+		t.Helper()
+		var running bool
+		if err := uow.Do(ctx, tenantID, func(tx database.Tx) error {
+			var e error
+			running, e = repo.HasRunningBackfillForTenant(ctx, tx, tenantID)
+			return e
+		}); err != nil {
+			t.Fatalf("HasRunningBackfillForTenant(%s): %v", tenantID, err)
+		}
+		return running
+	}
+
+	if !hasRunning(tenantA) {
+		t.Fatal("tenant A with a RUNNING job: got false, want true")
+	}
+	// Tenant B has no job of its own — A's RUNNING job must not leak across the tenant.
+	if hasRunning(tenantB) {
+		t.Fatal("tenant B (no job): got true, want false — RUNNING job leaked across tenants")
+	}
+	// Close A's job → no longer running.
+	mustExec(t, pool, `UPDATE backfill_job SET status='COMPLETED' WHERE id=$1`, jobA)
+	if hasRunning(tenantA) {
+		t.Fatal("tenant A after COMPLETED: got true, want false")
 	}
 }
 

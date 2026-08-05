@@ -3,8 +3,10 @@ package notifications
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
@@ -22,11 +24,12 @@ func baseWithID(eventID string) events.Base {
 // params it saw so tests assert what was written. Unset fields fail loudly (nil
 // call) if a test reaches a path it did not expect.
 type mockRepo struct {
-	insertNotif      func(ctx context.Context, tx database.Tx, p InsertNotificationParams) (*Notification, error)
-	insertDelivery   func(ctx context.Context, tx database.Tx, p InsertDeliveryParams) (*NotificationDelivery, error)
-	updateStatus     func(ctx context.Context, tx database.Tx, p UpdateDeliveryStatusParams) (*NotificationDelivery, error)
-	findEmail        func(ctx context.Context, tx database.Tx, tenantID, appUserID string) (string, error)
-	findByProviderID func(ctx context.Context, providerMessageID string) (*NotificationDelivery, error)
+	insertNotif        func(ctx context.Context, tx database.Tx, p InsertNotificationParams) (*Notification, error)
+	insertDelivery     func(ctx context.Context, tx database.Tx, p InsertDeliveryParams) (*NotificationDelivery, error)
+	updateStatus       func(ctx context.Context, tx database.Tx, p UpdateDeliveryStatusParams) (*NotificationDelivery, error)
+	findEmail          func(ctx context.Context, tx database.Tx, tenantID, appUserID string) (string, error)
+	findByProviderID   func(ctx context.Context, providerMessageID string) (*NotificationDelivery, error)
+	hasRunningBackfill func(ctx context.Context, tx database.Tx, tenantID string) (bool, error)
 
 	insertedNotif    []InsertNotificationParams
 	insertedDelivery []InsertDeliveryParams
@@ -54,6 +57,10 @@ func (m *mockRepo) FindRecipientEmail(ctx context.Context, tx database.Tx, tenan
 
 func (m *mockRepo) FindDeliveryByProviderMessageID(ctx context.Context, providerMessageID string) (*NotificationDelivery, error) {
 	return m.findByProviderID(ctx, providerMessageID)
+}
+
+func (m *mockRepo) HasRunningBackfillForTenant(ctx context.Context, tx database.Tx, tenantID string) (bool, error) {
+	return m.hasRunningBackfill(ctx, tx, tenantID)
 }
 
 // spyChannel records the message it was asked to send and returns a preset id/error.
@@ -97,12 +104,14 @@ func (u *fakeUOW) DoSystem(_ context.Context, fn func(tx database.Tx) error) err
 // fakeDedup reports every event as first-seen by default; set seen=true to model an
 // at-least-once replay. It records the ids it was asked to mark.
 type fakeDedup struct {
-	seen   bool
-	err    error
-	marked []string
+	seen      bool
+	err       error
+	marked    []string
+	consumers []string
 }
 
-func (d *fakeDedup) SeenOrMark(_ context.Context, _ database.Tx, _ /*consumer*/, eventID string) (bool, error) {
+func (d *fakeDedup) SeenOrMark(_ context.Context, _ database.Tx, consumer, eventID string) (bool, error) {
+	d.consumers = append(d.consumers, consumer)
 	d.marked = append(d.marked, eventID)
 	return d.seen, d.err
 }
@@ -144,6 +153,48 @@ func repoHappy() *mockRepo {
 		updateStatus: func(_ context.Context, _ database.Tx, p UpdateDeliveryStatusParams) (*NotificationDelivery, error) {
 			return &NotificationDelivery{ID: p.DeliveryID, Status: p.Status, ProviderMessageID: p.ProviderMessageID, Error: p.Error}, nil
 		},
+	}
+}
+
+// repoInApp returns a mockRepo for the in-app use case: the create paths mint the
+// fixture ids (echoing title/body/type back so tests can assert what was written) and
+// no backfill is running by default (docket avisos are not suppressed).
+func repoInApp() *mockRepo {
+	return &mockRepo{
+		insertNotif: func(_ context.Context, _ database.Tx, p InsertNotificationParams) (*Notification, error) {
+			return &Notification{ID: notifID, TenantID: p.TenantID, Type: p.Type, Title: p.Title, Body: p.Body, Status: p.Status}, nil
+		},
+		insertDelivery: func(_ context.Context, _ database.Tx, p InsertDeliveryParams) (*NotificationDelivery, error) {
+			return &NotificationDelivery{ID: deliveryID, NotificationID: p.NotificationID, TenantID: p.TenantID, Channel: p.Channel, Status: p.Status}, nil
+		},
+		hasRunningBackfill: func(context.Context, database.Tx, string) (bool, error) { return false, nil },
+	}
+}
+
+// backfillFinished builds an acquisition.backfill_finished for the fixture tenant with
+// a given terminal status and error tally (SlicesOK fills the remainder of ten slices).
+func backfillFinished(eventID, status string, slicesError int) BackfillFinished {
+	return BackfillFinished{
+		Base:          baseWithID(eventID),
+		TenantID:      tenantID,
+		BackfillJobID: "job-uuid",
+		IntegrationID: "integration-uuid",
+		TotalSlices:   10,
+		SlicesOK:      10 - slicesError,
+		SlicesError:   slicesError,
+		Status:        status,
+	}
+}
+
+// docketEntryObserved builds an acquisition.docket_entry_observed for the fixture tenant.
+func docketEntryObserved(eventID string) DocketEntryObserved {
+	return DocketEntryObserved{
+		Base:          baseWithID(eventID),
+		TenantID:      tenantID,
+		SyncRunID:     "sync-uuid",
+		CourtRecordID: "record-uuid",
+		DocketEntryID: "entry-uuid",
+		Hash:          "hash-1",
 	}
 }
 
@@ -303,6 +354,175 @@ func TestNotifyUseCase_OnNotificationRequested_DedupErrorPropagates(t *testing.T
 	}
 	if len(repo.insertedNotif) != 0 || len(channel.sent) != 0 {
 		t.Fatal("wrote or sent despite a dedup fault")
+	}
+}
+
+// AC2: acquisition.backfill_finished (COMPLETED) → an import_finished aviso with the
+// fixed title/COMPLETED body, plus one IN_APP delivery QUEUED, in the tenant-scoped tx.
+func TestInAppUseCase_OnBackfillFinished_CreatesImportFinished(t *testing.T) {
+	repo := repoInApp()
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	uc := NewInAppUseCase(repo, dedup, uow)
+
+	if err := uc.OnBackfillFinished(context.Background(), backfillFinished("evt-bf-1", acquisition.BackfillStatusCompleted, 0)); err != nil {
+		t.Fatalf("OnBackfillFinished: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 1 {
+		t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+	}
+	notif := repo.insertedNotif[0]
+	if notif.Type != TypeImportFinished || notif.Status != StatusCreated || notif.RecipientUserID != "" {
+		t.Fatalf("notification = %+v, want import_finished/CREATED/tenant-level", notif)
+	}
+	if notif.Title != importFinishedTitle || notif.Body != importFinishedCompletedBody {
+		t.Fatalf("title/body = %q / %q, want the COMPLETED strings", notif.Title, notif.Body)
+	}
+	if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Channel != ChannelInApp || repo.insertedDelivery[0].Status != DeliveryQueued {
+		t.Fatalf("inserted delivery = %+v, want one IN_APP/QUEUED", repo.insertedDelivery)
+	}
+	if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+		t.Fatalf("uow scopes = %v, want one %q", uow.scopes, tenantID)
+	}
+	if len(dedup.marked) != 1 || dedup.marked[0] != "evt-bf-1" || dedup.consumers[0] != consumerBackfill {
+		t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-bf-1] under %q", dedup.marked, dedup.consumers, consumerBackfill)
+	}
+}
+
+// AC3: a PARTIAL backfill_finished names how many windows failed (slices_error) in the
+// body, so the aviso says the import is incomplete without opening the job.
+func TestInAppUseCase_OnBackfillFinished_PartialMentionsErrorsInBody(t *testing.T) {
+	repo := repoInApp()
+	uc := NewInAppUseCase(repo, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnBackfillFinished(context.Background(), backfillFinished("evt-bf-partial", acquisition.BackfillStatusPartial, 3)); err != nil {
+		t.Fatalf("OnBackfillFinished: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 1 {
+		t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+	}
+	body := repo.insertedNotif[0].Body
+	if body == importFinishedCompletedBody || !strings.Contains(body, "3") {
+		t.Fatalf("PARTIAL body = %q, want it to cite the 3 failed windows", body)
+	}
+}
+
+// AC4: a replay (dedup already seen) is a pure no-op — no notification, no delivery.
+func TestInAppUseCase_OnBackfillFinished_ReplayIsNoOp(t *testing.T) {
+	repo := repoInApp()
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran on a replay")
+		return nil, nil
+	}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{})
+
+	if err := uc.OnBackfillFinished(context.Background(), backfillFinished("evt-bf-dup", acquisition.BackfillStatusCompleted, 0)); err != nil {
+		t.Fatalf("OnBackfillFinished: %v", err)
+	}
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+}
+
+// AC5: a docket_entry_observed is SUPPRESSED while a backfill is RUNNING — no aviso is
+// created — but the event is still dedup-marked FIRST, so a redelivery after the
+// backfill closes stays suppressed (the silence is permanent, not a race on state).
+func TestInAppUseCase_OnDocketEntryObserved_SuppressedDuringBackfill(t *testing.T) {
+	repo := repoInApp()
+	repo.hasRunningBackfill = func(context.Context, database.Tx, string) (bool, error) { return true, nil }
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran while a backfill was RUNNING")
+		return nil, nil
+	}
+	dedup := &fakeDedup{}
+	uc := NewInAppUseCase(repo, dedup, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), docketEntryObserved("evt-dk-suppressed")); err != nil {
+		t.Fatalf("OnDocketEntryObserved: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("suppressed event wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	// The dedup mark landed BEFORE the suppression check — the event is consumed.
+	if len(dedup.marked) != 1 || dedup.marked[0] != "evt-dk-suppressed" || dedup.consumers[0] != consumerDocket {
+		t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-dk-suppressed] under %q", dedup.marked, dedup.consumers, consumerDocket)
+	}
+}
+
+// AC6: with no backfill running, a docket_entry_observed creates a new_andamento aviso
+// + one IN_APP delivery QUEUED, tenant-level, in the tenant-scoped tx.
+func TestInAppUseCase_OnDocketEntryObserved_CreatesNewAndamento(t *testing.T) {
+	repo := repoInApp()
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	uc := NewInAppUseCase(repo, dedup, uow)
+
+	if err := uc.OnDocketEntryObserved(context.Background(), docketEntryObserved("evt-dk-1")); err != nil {
+		t.Fatalf("OnDocketEntryObserved: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 1 {
+		t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+	}
+	notif := repo.insertedNotif[0]
+	if notif.Type != TypeNewAndamento || notif.Status != StatusCreated || notif.RecipientUserID != "" {
+		t.Fatalf("notification = %+v, want new_andamento/CREATED/tenant-level", notif)
+	}
+	if notif.Title != newAndamentoTitle || notif.Body != newAndamentoBody {
+		t.Fatalf("title/body = %q / %q, want the new_andamento strings", notif.Title, notif.Body)
+	}
+	if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Channel != ChannelInApp || repo.insertedDelivery[0].Status != DeliveryQueued {
+		t.Fatalf("inserted delivery = %+v, want one IN_APP/QUEUED", repo.insertedDelivery)
+	}
+	if len(dedup.marked) != 1 || dedup.consumers[0] != consumerDocket {
+		t.Fatalf("dedup = {marked:%v consumers:%v}, want one under %q", dedup.marked, dedup.consumers, consumerDocket)
+	}
+}
+
+// AC7: a replay of a docket_entry_observed is a no-op — the backfill check never runs
+// (dedup short-circuits before it) and nothing is written.
+func TestInAppUseCase_OnDocketEntryObserved_ReplayIsNoOp(t *testing.T) {
+	repo := repoInApp()
+	repo.hasRunningBackfill = func(context.Context, database.Tx, string) (bool, error) {
+		t.Fatal("backfill check ran on a replay")
+		return false, nil
+	}
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran on a replay")
+		return nil, nil
+	}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), docketEntryObserved("evt-dk-dup")); err != nil {
+		t.Fatalf("OnDocketEntryObserved: %v", err)
+	}
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+}
+
+// AC9: ValidChannel accepts the two known channels and rejects everything else,
+// including the empty string.
+func TestValidChannel(t *testing.T) {
+	tests := []struct {
+		name    string
+		channel string
+		want    bool
+	}{
+		{name: "EMAIL", channel: ChannelEmail, want: true},
+		{name: "IN_APP", channel: ChannelInApp, want: true},
+		{name: "unknown", channel: "SMS", want: false},
+		{name: "empty", channel: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ValidChannel(tt.channel); got != tt.want {
+				t.Errorf("ValidChannel(%q) = %v, want %v", tt.channel, got, tt.want)
+			}
+		})
 	}
 }
 

@@ -155,13 +155,16 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("build email channel: %w", err)
 	}
-	notifyUC := notifications.NewNotifyUseCase(
-		notifications.NewRepository(pool),
-		emailChannel,
-		notifications.NewDedup(),
-		uow,
-	)
-	notifications.NewListener(notifyUC).Register(mux)
+	// The two notifications use cases share a pool-backed repo and the stateless dedup:
+	// the email consumer (notification.requested) and the in-app consumer (slice 1a),
+	// which turns acquisition's backfill_finished/docket_entry_observed into IN_APP
+	// avisos. Registering the in-app handlers here is what lets acquisition drop its
+	// drainUnconsumed placeholder for those two types (one handler per type on the mux).
+	notifRepo := notifications.NewRepository(pool)
+	notifDedup := notifications.NewDedup()
+	notifyUC := notifications.NewNotifyUseCase(notifRepo, emailChannel, notifDedup, uow)
+	inAppUC := notifications.NewInAppUseCase(notifRepo, notifDedup, uow)
+	notifications.NewListener(notifyUC, inAppUC).Register(mux)
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)

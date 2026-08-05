@@ -61,21 +61,13 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeSyncFailed, l.handleSyncFailed)
 	mux.HandleFunc(TypeCourtRecordObserved, l.handleCourtRecordObserved)
 
-	// docket_entry_observed (novo andamento) e backfill_finished (aviso de fim) são
-	// PRODUZIDOS para consumers futuros (notificações/documentos) que ainda não
-	// existem. Como o relay os roteia pela fila "ingestao" (prefixo acquisition),
-	// sem um handler o asynq levanta "handler not found" e retenta 25× — um flood de
-	// ERROR por evento. Enquanto o consumer real não chega, dá-se ACK (drainUnconsumed)
-	// para não retentar; ao construir o consumer, trocar o drain pelo handler de verdade.
-	mux.HandleFunc(TypeDocketEntryObserved, drainUnconsumed)
-	mux.HandleFunc(TypeBackfillFinished, drainUnconsumed)
+	// docket_entry_observed (novo andamento) e backfill_finished (aviso de fim) agora
+	// têm consumer real: o slice notifications os transforma em avisos IN_APP e
+	// registra os handlers no MESMO mux (worker-ingestao). Um pattern é registrado uma
+	// única vez no mux, então este slice NÃO os registra — o antigo drainUnconsumed foi
+	// removido junto com o registro em notifications (senão: só-remover=flood volta,
+	// só-adicionar=panic de pattern duplicado no boot).
 }
-
-// drainUnconsumed dá ACK num evento produzido que ainda não tem consumer, evitando
-// o retry-até-arquivar (e o flood de "handler not found"). NÃO faz trabalho: é um
-// placeholder consciente até o consumer real do tipo existir. A entrega é
-// at-least-once, então trocar por um handler real depois não perde eventos novos.
-func drainUnconsumed(context.Context, *asynq.Task) error { return nil }
 
 // handleIntegrationActivated is the asynq.HandlerFunc for
 // acquisition.integration_activated. It decodes the payload, and hands off to

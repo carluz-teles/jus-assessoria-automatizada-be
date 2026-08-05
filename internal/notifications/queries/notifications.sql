@@ -6,11 +6,12 @@
 -- name: InsertNotification :one
 -- Record the aviso itself (the fact that a user should be told something), inside
 -- the caller's tx. recipient_user_id is nullable (some avisos are tenant-level);
--- payload is the template data. status starts CREATED — the delivery rows carry
--- the per-channel lifecycle.
+-- title/body are the materialized in-app text (NULL for EMAIL avisos, which render
+-- at send); payload is the template data. status starts CREATED — the delivery rows
+-- carry the per-channel lifecycle.
 INSERT INTO notification (
-    tenant_id, recipient_user_id, type, payload, status
-) VALUES ($1, $2, $3, $4, $5)
+    tenant_id, recipient_user_id, type, title, body, payload, status
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: InsertDelivery :one
@@ -44,6 +45,16 @@ RETURNING *;
 SELECT email FROM app_user
 WHERE id = $1
   AND tenant_id = $2;
+
+-- name: HasRunningBackfillForTenant :one
+-- Report whether the tenant has a backfill_job still RUNNING. The in-app use case
+-- suppresses a per-andamento aviso while the onboarding import is in flight (the
+-- import_finished aviso covers that window). Runs inside the caller's tx, so RLS and
+-- the explicit tenant_id are the two isolation barriers.
+SELECT EXISTS (
+    SELECT 1 FROM backfill_job
+    WHERE tenant_id = $1 AND status = 'RUNNING'
+) AS running;
 
 -- name: FindDeliveryByProviderMessageID :one
 -- Locate a delivery by the provider's message id (the Resend email id), on the

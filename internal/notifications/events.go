@@ -1,6 +1,25 @@
 package notifications
 
-import "github.com/jusassessoria/platform/lib/events"
+import (
+	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/lib/events"
+)
+
+// The two acquisition-produced events this slice ALSO consumes (slice 1a). Vertical
+// slice: slices talk only by event contract (docs §2.5), so notifications imports the
+// contract — never acquisition's entity/repo — as a type alias. The import is acyclic
+// (acquisition does not import notifications). The alias keeps the listener/use case
+// speaking in notifications' own names while the shape and dotted id stay
+// single-sourced in acquisition (no drift).
+type (
+	BackfillFinished    = acquisition.BackfillFinished
+	DocketEntryObserved = acquisition.DocketEntryObserved
+)
+
+const (
+	TypeBackfillFinished    = acquisition.TypeBackfillFinished
+	TypeDocketEntryObserved = acquisition.TypeDocketEntryObserved
+)
 
 // TypeNotificationRequested is the dotted id this slice consumes. Its "notification"
 // prefix routes it to the "notifications" work queue at the relay (lib/events'

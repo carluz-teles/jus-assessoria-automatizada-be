@@ -14,25 +14,40 @@ import (
 // SkipRetry) and delegate to the use case. Trace continuation and the consumer span
 // are handled once by the events.Observe middleware, not here.
 
-// notifyUC is the port the listener drives — the use case's single entry point.
+// notifyUC is the port for the email consumer (notification.requested).
 type notifyUC interface {
 	OnNotificationRequested(ctx context.Context, ev NotificationRequested) error
 }
 
-// Listener is notifications' asynq consumer. It holds no transport state; the use
-// case owns persistence and the transaction boundary.
-type Listener struct {
-	uc notifyUC
+// inAppUC is the port for the in-app consumers (slice 1a): the two acquisition events
+// this slice turns into IN_APP avisos.
+type inAppUC interface {
+	OnBackfillFinished(ctx context.Context, ev BackfillFinished) error
+	OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error
 }
 
-// NewListener wires the listener to the notify use case.
-func NewListener(uc notifyUC) *Listener { return &Listener{uc: uc} }
+// Listener is notifications' asynq consumer. It holds no transport state; the use
+// cases own persistence and the transaction boundary. It drives the email use case
+// (notification.requested) and the in-app use case (backfill_finished, docket_entry_observed).
+type Listener struct {
+	notify notifyUC
+	inApp  inAppUC
+}
 
-// Register mounts the slice's task handler on the asynq mux — the async analog of a
+// NewListener wires the listener to the notify (email) and in-app use cases.
+func NewListener(notify notifyUC, inApp inAppUC) *Listener {
+	return &Listener{notify: notify, inApp: inApp}
+}
+
+// Register mounts the slice's task handlers on the asynq mux — the async analog of a
 // Handler.Register. Adding a consumed event = one HandleFunc here plus one Register
-// call in the worker's composition root.
+// call in the worker's composition root. The backfill_finished/docket_entry_observed
+// handlers replace acquisition's drainUnconsumed placeholder (a pattern is registered
+// exactly once across the shared mux, so the drain there is removed in lockstep).
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeNotificationRequested, l.handleNotificationRequested)
+	mux.HandleFunc(TypeBackfillFinished, l.handleBackfillFinished)
+	mux.HandleFunc(TypeDocketEntryObserved, l.handleDocketEntryObserved)
 }
 
 // handleNotificationRequested is the asynq.HandlerFunc for notification.requested. It
@@ -45,5 +60,28 @@ func (l *Listener) handleNotificationRequested(ctx context.Context, t *asynq.Tas
 	if err != nil {
 		return err
 	}
-	return l.uc.OnNotificationRequested(ctx, ev)
+	return l.notify.OnNotificationRequested(ctx, ev)
+}
+
+// handleBackfillFinished is the asynq.HandlerFunc for acquisition.backfill_finished. It
+// decodes the payload and hands off to the in-app use case (→ an import_finished aviso).
+// A decode error wraps asynq.SkipRetry (archived, not retried); an infra error from the
+// use case stays retryable.
+func (l *Listener) handleBackfillFinished(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[BackfillFinished](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnBackfillFinished(ctx, ev)
+}
+
+// handleDocketEntryObserved is the asynq.HandlerFunc for acquisition.docket_entry_observed.
+// It decodes the payload and hands off to the in-app use case (→ a new_andamento aviso,
+// suppressed during onboarding). Same error contract as the other handlers.
+func (l *Listener) handleDocketEntryObserved(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DocketEntryObserved](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnDocketEntryObserved(ctx, ev)
 }

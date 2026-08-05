@@ -193,6 +193,9 @@ type Notification struct {
 	Payload         []byte             `json:"payload"`
 	Status          string             `json:"status"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	Title           *string            `json:"title"`
+	Body            *string            `json:"body"`
+	ReadAt          pgtype.Timestamptz `json:"read_at"`
 }
 
 type NotificationDelivery struct {

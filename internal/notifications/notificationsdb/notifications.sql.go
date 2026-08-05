@@ -61,6 +61,24 @@ func (q *Queries) FindRecipientEmail(ctx context.Context, arg FindRecipientEmail
 	return email, err
 }
 
+const hasRunningBackfillForTenant = `-- name: HasRunningBackfillForTenant :one
+SELECT EXISTS (
+    SELECT 1 FROM backfill_job
+    WHERE tenant_id = $1 AND status = 'RUNNING'
+) AS running
+`
+
+// Report whether the tenant has a backfill_job still RUNNING. The in-app use case
+// suppresses a per-andamento aviso while the onboarding import is in flight (the
+// import_finished aviso covers that window). Runs inside the caller's tx, so RLS and
+// the explicit tenant_id are the two isolation barriers.
+func (q *Queries) HasRunningBackfillForTenant(ctx context.Context, tenantID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasRunningBackfillForTenant, tenantID)
+	var running bool
+	err := row.Scan(&running)
+	return running, err
+}
+
 const insertDelivery = `-- name: InsertDelivery :one
 INSERT INTO notification_delivery (
     notification_id, tenant_id, channel, status, provider_message_id, error
@@ -108,15 +126,17 @@ func (q *Queries) InsertDelivery(ctx context.Context, arg InsertDeliveryParams) 
 const insertNotification = `-- name: InsertNotification :one
 
 INSERT INTO notification (
-    tenant_id, recipient_user_id, type, payload, status
-) VALUES ($1, $2, $3, $4, $5)
-RETURNING id, tenant_id, recipient_user_id, type, payload, status, created_at
+    tenant_id, recipient_user_id, type, title, body, payload, status
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, tenant_id, recipient_user_id, type, payload, status, created_at, title, body, read_at
 `
 
 type InsertNotificationParams struct {
 	TenantID        uuid.UUID   `json:"tenant_id"`
 	RecipientUserID pgtype.UUID `json:"recipient_user_id"`
 	Type            string      `json:"type"`
+	Title           *string     `json:"title"`
+	Body            *string     `json:"body"`
 	Payload         []byte      `json:"payload"`
 	Status          string      `json:"status"`
 }
@@ -127,13 +147,16 @@ type InsertNotificationParams struct {
 // to the event's tenant. Absence is a typed error at the mapper, never (nil, nil).
 // Record the aviso itself (the fact that a user should be told something), inside
 // the caller's tx. recipient_user_id is nullable (some avisos are tenant-level);
-// payload is the template data. status starts CREATED — the delivery rows carry
-// the per-channel lifecycle.
+// title/body are the materialized in-app text (NULL for EMAIL avisos, which render
+// at send); payload is the template data. status starts CREATED — the delivery rows
+// carry the per-channel lifecycle.
 func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotificationParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, insertNotification,
 		arg.TenantID,
 		arg.RecipientUserID,
 		arg.Type,
+		arg.Title,
+		arg.Body,
 		arg.Payload,
 		arg.Status,
 	)
@@ -146,6 +169,9 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		&i.Payload,
 		&i.Status,
 		&i.CreatedAt,
+		&i.Title,
+		&i.Body,
+		&i.ReadAt,
 	)
 	return i, err
 }

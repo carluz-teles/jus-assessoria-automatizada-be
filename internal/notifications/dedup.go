@@ -7,6 +7,15 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 )
 
+// processed_event consumer names for the in-app consumers (slice 1a). Dedup is
+// per-consumer (docs §4c.3), so each consumed event type gets its own name —
+// distinct from consumerNotifications (the email path) and from each other, so
+// marking one event never blocks another consumer.
+const (
+	consumerBackfill = "notifications.backfill"
+	consumerDocket   = "notifications.docket"
+)
+
 // txDeduper adapts lib/events' Dedup to the deduper port. events.Dedup binds its
 // executor at construction, so this builds a fresh one bound to the caller's tx per
 // call — that is what marks the event in the SAME transaction as the notification it

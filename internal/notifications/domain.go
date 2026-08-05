@@ -3,8 +3,10 @@ package notifications
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
+	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/lib/database"
 )
 
@@ -194,6 +196,133 @@ func (uc *NotifyUseCase) deliver(ctx context.Context, p pendingSend) error {
 		})
 		return err
 	})
+}
+
+// Materialized PT text for the in-app avisos (slice 1a). The in-app channel has no
+// render step (unlike EMAIL), so the use case writes these strings straight onto the
+// notification. The import_finished body varies by outcome; the others are fixed.
+const (
+	importFinishedTitle         = "Importação de processos concluída"
+	importFinishedCompletedBody = "A importação inicial dos seus processos foi concluída com sucesso."
+	importFinishedPartialBody   = "A importação inicial dos seus processos foi concluída, mas %d janela(s) não puderam ser sincronizadas e serão retentadas automaticamente."
+
+	newAndamentoTitle = "Novo andamento processual"
+	newAndamentoBody  = "Um novo andamento foi identificado em um dos seus processos."
+)
+
+// InAppUseCase turns two acquisition events into IN_APP avisos (slice 1a): a
+// backfill_finished becomes one import_finished aviso; a docket_entry_observed becomes
+// one new_andamento aviso, UNLESS the tenant's onboarding backfill is still RUNNING (the
+// bulk import's single import_finished aviso covers that window). It records the aviso
+// fact plus one QUEUED IN_APP delivery in the event's tenant scope — no external send
+// (real-time push is a later slice). It depends on the Repository, deduper and
+// UnitOfWork interfaces, never a concrete implementation (docs §2.5).
+type InAppUseCase struct {
+	repo  Repository
+	dedup deduper
+	uow   database.UnitOfWork
+}
+
+// NewInAppUseCase wires the in-app use case to its repository, dedup guard and unit of
+// work.
+func NewInAppUseCase(repo Repository, dedup deduper, uow database.UnitOfWork) *InAppUseCase {
+	return &InAppUseCase{repo: repo, dedup: dedup, uow: uow}
+}
+
+// OnBackfillFinished handles one acquisition.backfill_finished: in the event's tenant
+// scope it dedups (a replay marks nothing new and returns before any write), then
+// records an import_finished aviso whose body reports the outcome (a clean COMPLETED,
+// or a PARTIAL naming how many windows failed). The dedup mark and the aviso commit
+// together — a crash never leaves the event marked-but-unrecorded.
+func (uc *InAppUseCase) OnBackfillFinished(ctx context.Context, ev BackfillFinished) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerBackfill, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		title, body := renderImportFinished(ev)
+		return uc.record(ctx, tx, ev.TenantID, TypeImportFinished, title, body, map[string]any{
+			"backfill_job_id": ev.BackfillJobID,
+			"integration_id":  ev.IntegrationID,
+			"status":          ev.Status,
+			"total_slices":    ev.TotalSlices,
+			"slices_ok":       ev.SlicesOK,
+			"slices_error":    ev.SlicesError,
+		})
+	})
+}
+
+// OnDocketEntryObserved handles one acquisition.docket_entry_observed. In the event's
+// tenant scope it dedups FIRST (so the event is consumed exactly once regardless of
+// what follows), then SUPPRESSES the aviso when a backfill is still RUNNING for the
+// tenant — the onboarding import's import_finished aviso already stands in for that
+// burst of andamentos, so a per-entry aviso would be noise. Marking before suppressing
+// makes the silence permanent: a redelivery after the backfill closes is a dedup
+// no-op, not a late aviso. Otherwise it records a new_andamento aviso.
+func (uc *InAppUseCase) OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDocket, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		running, err := uc.repo.HasRunningBackfillForTenant(ctx, tx, ev.TenantID)
+		if err != nil {
+			return err
+		}
+		if running {
+			return nil // suppressed during onboarding — the dedup mark above stands
+		}
+
+		return uc.record(ctx, tx, ev.TenantID, TypeNewAndamento, newAndamentoTitle, newAndamentoBody, map[string]any{
+			"court_record_id": ev.CourtRecordID,
+			"docket_entry_id": ev.DocketEntryID,
+			"sync_run_id":     ev.SyncRunID,
+		})
+	})
+}
+
+// record writes the tenant-level aviso fact (CREATED) and its single IN_APP delivery
+// (QUEUED) in the caller's tx — the in-app analog of the email use case's create phase,
+// minus the external send. title/body are materialized here; the payload carries the
+// source ids for the in-app UI to link back.
+func (uc *InAppUseCase) record(ctx context.Context, tx database.Tx, tenantID, notifType, title, body string, payload map[string]any) error {
+	notif, err := uc.repo.InsertNotification(ctx, tx, InsertNotificationParams{
+		TenantID: tenantID,
+		Type:     notifType,
+		Title:    title,
+		Body:     body,
+		Payload:  payload,
+		Status:   StatusCreated,
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = uc.repo.InsertDelivery(ctx, tx, InsertDeliveryParams{
+		NotificationID: notif.ID,
+		TenantID:       tenantID,
+		Channel:        ChannelInApp,
+		Status:         DeliveryQueued,
+	})
+	return err
+}
+
+// renderImportFinished materializes the title/body for an import_finished aviso. The
+// title is fixed; the body is the clean COMPLETED text, or the PARTIAL text naming how
+// many windows failed (slices_error) so the user sees the import is incomplete.
+func renderImportFinished(ev BackfillFinished) (title, body string) {
+	if ev.Status == acquisition.BackfillStatusPartial {
+		return importFinishedTitle, fmt.Sprintf(importFinishedPartialBody, ev.SlicesError)
+	}
+	return importFinishedTitle, importFinishedCompletedBody
 }
 
 // WebhookUseCase records a provider-callback outcome (a Resend bounce/complaint) onto

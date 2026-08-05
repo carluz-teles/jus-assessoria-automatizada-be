@@ -6,6 +6,8 @@ package notificationsdb
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 type Querier interface {
@@ -19,6 +21,11 @@ type Querier interface {
 	// (WHERE + RLS). No row → the mapper maps pgx.ErrNoRows to a typed not-found, and
 	// the use case records a FAILED delivery rather than dropping the aviso.
 	FindRecipientEmail(ctx context.Context, arg FindRecipientEmailParams) (string, error)
+	// Report whether the tenant has a backfill_job still RUNNING. The in-app use case
+	// suppresses a per-andamento aviso while the onboarding import is in flight (the
+	// import_finished aviso covers that window). Runs inside the caller's tx, so RLS and
+	// the explicit tenant_id are the two isolation barriers.
+	HasRunningBackfillForTenant(ctx context.Context, tenantID uuid.UUID) (bool, error)
 	// Open a per-channel delivery attempt for a notification, inside the caller's tx.
 	// UNIQUE(notification_id, channel) is the idempotency floor: at most one delivery
 	// per channel per notification. The consumer-side event dedup (processed_event)
@@ -30,8 +37,9 @@ type Querier interface {
 	// to the event's tenant. Absence is a typed error at the mapper, never (nil, nil).
 	// Record the aviso itself (the fact that a user should be told something), inside
 	// the caller's tx. recipient_user_id is nullable (some avisos are tenant-level);
-	// payload is the template data. status starts CREATED — the delivery rows carry
-	// the per-channel lifecycle.
+	// title/body are the materialized in-app text (NULL for EMAIL avisos, which render
+	// at send); payload is the template data. status starts CREATED — the delivery rows
+	// carry the per-channel lifecycle.
 	InsertNotification(ctx context.Context, arg InsertNotificationParams) (Notification, error)
 	// Record the outcome of a send: SENT with the provider's message id, or FAILED
 	// with the reason. Scoped by id AND tenant_id (app-layer barrier) on top of RLS.

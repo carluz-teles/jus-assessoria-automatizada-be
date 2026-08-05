@@ -25,6 +25,29 @@ func (s *spyNotifyUC) OnNotificationRequested(_ context.Context, ev Notification
 	return s.err
 }
 
+// spyInAppUC records the decoded events and returns a preset error, so the two in-app
+// handlers can be asserted in isolation from the use case.
+type spyInAppUC struct {
+	backfill    BackfillFinished
+	docket      DocketEntryObserved
+	backfillN   int
+	docketN     int
+	backfillErr error
+	docketErr   error
+}
+
+func (s *spyInAppUC) OnBackfillFinished(_ context.Context, ev BackfillFinished) error {
+	s.backfillN++
+	s.backfill = ev
+	return s.backfillErr
+}
+
+func (s *spyInAppUC) OnDocketEntryObserved(_ context.Context, ev DocketEntryObserved) error {
+	s.docketN++
+	s.docket = ev
+	return s.docketErr
+}
+
 // A well-formed notification.requested task is decoded and dispatched to the use case
 // with its payload intact.
 func TestListener_HandleNotificationRequested_Dispatches(t *testing.T) {
@@ -43,7 +66,7 @@ func TestListener_HandleNotificationRequested_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyNotifyUC{}
-	l := NewListener(spy)
+	l := NewListener(spy, &spyInAppUC{})
 	if err := l.handleNotificationRequested(context.Background(), asynq.NewTask(TypeNotificationRequested, payload)); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -65,7 +88,7 @@ func TestListener_HandleNotificationRequested_BadPayloadSkipsRetry(t *testing.T)
 	t.Parallel()
 
 	spy := &spyNotifyUC{}
-	l := NewListener(spy)
+	l := NewListener(spy, &spyInAppUC{})
 
 	err := l.handleNotificationRequested(context.Background(), asynq.NewTask(TypeNotificationRequested, []byte("{not json")))
 	if !errors.Is(err, asynq.SkipRetry) {
@@ -82,13 +105,107 @@ func TestListener_HandleNotificationRequested_UseCaseErrorPropagates(t *testing.
 
 	sentinel := errors.New("boom")
 	spy := &spyNotifyUC{err: sentinel}
-	l := NewListener(spy)
+	l := NewListener(spy, &spyInAppUC{})
 
 	payload, err := json.Marshal(NotificationRequested{Base: events.Base{EventID: "e"}})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	if err := l.handleNotificationRequested(context.Background(), asynq.NewTask(TypeNotificationRequested, payload)); !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the use-case error", err)
+	}
+}
+
+// A well-formed backfill_finished task is decoded and dispatched to the in-app use case
+// with its tally intact.
+func TestListener_HandleBackfillFinished_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := BackfillFinished{
+		Base:          events.Base{EventID: "evt-bf", Aggregate: "job-1"},
+		TenantID:      "tenant-1",
+		BackfillJobID: "job-1",
+		Status:        "PARTIAL",
+		SlicesError:   2,
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+	if err := l.handleBackfillFinished(context.Background(), asynq.NewTask(TypeBackfillFinished, payload)); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if inApp.backfillN != 1 {
+		t.Fatalf("use case called %d times, want 1", inApp.backfillN)
+	}
+	if inApp.backfill.TenantID != "tenant-1" || inApp.backfill.Status != "PARTIAL" || inApp.backfill.SlicesError != 2 {
+		t.Fatalf("dispatched event = %+v", inApp.backfill)
+	}
+}
+
+// A malformed backfill_finished payload wraps asynq.SkipRetry (archived), and the use
+// case is never called.
+func TestListener_HandleBackfillFinished_BadPayloadSkipsRetry(t *testing.T) {
+	t.Parallel()
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+
+	err := l.handleBackfillFinished(context.Background(), asynq.NewTask(TypeBackfillFinished, []byte("{bad")))
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("err = %v, want it to wrap asynq.SkipRetry", err)
+	}
+	if inApp.backfillN != 0 {
+		t.Fatalf("use case called %d times on a decode fault, want 0", inApp.backfillN)
+	}
+}
+
+// A well-formed docket_entry_observed task is decoded and dispatched to the in-app use case.
+func TestListener_HandleDocketEntryObserved_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := DocketEntryObserved{
+		Base:          events.Base{EventID: "evt-dk", Aggregate: "entry-1"},
+		TenantID:      "tenant-2",
+		DocketEntryID: "entry-1",
+		CourtRecordID: "record-1",
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+	if err := l.handleDocketEntryObserved(context.Background(), asynq.NewTask(TypeDocketEntryObserved, payload)); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if inApp.docketN != 1 {
+		t.Fatalf("use case called %d times, want 1", inApp.docketN)
+	}
+	if inApp.docket.TenantID != "tenant-2" || inApp.docket.DocketEntryID != "entry-1" {
+		t.Fatalf("dispatched event = %+v", inApp.docket)
+	}
+}
+
+// A use-case error from the docket handler propagates unchanged (retryable infra stays retryable).
+func TestListener_HandleDocketEntryObserved_UseCaseErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("boom")
+	inApp := &spyInAppUC{docketErr: sentinel}
+	l := NewListener(&spyNotifyUC{}, inApp)
+
+	payload, err := json.Marshal(DocketEntryObserved{Base: events.Base{EventID: "e"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := l.handleDocketEntryObserved(context.Background(), asynq.NewTask(TypeDocketEntryObserved, payload)); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the use-case error", err)
 	}
 }
