@@ -11,6 +11,7 @@ package pubsub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/redis/go-redis/v9"
@@ -70,8 +71,7 @@ func (r *redisPubSub) Subscribe(ctx context.Context, channel string) (<-chan []b
 	// Block until Redis confirms the subscription, so a message published right
 	// after Subscribe returns cannot slip in before we are actually listening.
 	if _, err := sub.Receive(ctx); err != nil {
-		_ = sub.Close()
-		return nil, fmt.Errorf("subscribe to %s: %w", channel, err)
+		return nil, errors.Join(fmt.Errorf("subscribe to %s: %w", channel, err), sub.Close())
 	}
 
 	out := make(chan []byte)
