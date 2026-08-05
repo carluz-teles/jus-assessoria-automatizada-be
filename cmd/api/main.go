@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
@@ -26,6 +27,7 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
+	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/storage"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
@@ -101,6 +103,16 @@ func run(logger *slog.Logger) error {
 	}
 	asynqClient := asynq.NewClient(redisOpt)
 
+	// A raw redis client (separate from the asynq client) backs the SSE stream's
+	// subscribe side: the browser stream joins notif:<tenant> to receive the in-app
+	// pushes the worker publishes (slice 2b). Same Redis, its own client, closed at
+	// shutdown below.
+	pubsubOpt, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return fmt.Errorf("parse redis url for pub/sub: %w", err)
+	}
+	pubsubClient := redis.NewClient(pubsubOpt)
+
 	// Identity wiring: the slice owns the domain; the binary only assembles it
 	// (repo + shared outbox + unit of work → use case → resolver/webhook/handler).
 	uow := database.NewUnitOfWork(pool)
@@ -148,7 +160,10 @@ func run(logger *slog.Logger) error {
 		notifications.NewSvixVerifier(cfg.ResendWebhookSecret),
 		notifications.NewWebhookUseCase(notificationsRepo, uow),
 	)
-	notificationsHandler := notifications.NewHandler(notifications.NewReadUseCase(notificationsRepo, uow))
+	notificationsHandler := notifications.NewHandler(
+		notifications.NewReadUseCase(notificationsRepo, uow),
+		pubsub.NewRedisPubSub(pubsubClient),
+	)
 
 	// Lookup wiring: a stateless proxy over the BrasilAPI registry. No pool, no
 	// outbox — the slice owns only an HTTP port; the binary just injects the
@@ -206,6 +221,9 @@ func run(logger *slog.Logger) error {
 			pool.Close()
 			if err := asynqClient.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("close asynq client: %w", err))
+			}
+			if err := pubsubClient.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close pub/sub redis client: %w", err))
 			}
 			if err := telemetryShutdown(shutdownCtx); err != nil {
 				errs = append(errs, fmt.Errorf("shutdown telemetry: %w", err))

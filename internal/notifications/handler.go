@@ -31,15 +31,41 @@ type reader interface {
 	MarkAllRead(ctx context.Context, tenantID, userID string) error
 }
 
-// Handler is the notifications HTTP surface (the in-app inbox). It owns its routing;
-// the api only composes by calling Register.
-type Handler struct {
-	reader reader
+// subscriber is the narrow port the SSE stream drives: join a tenant's push channel
+// and range its raw payloads until the context ends. The slice adapter is lib/pubsub
+// over Redis — the same channel the in-app consumer publishes on (slice 2b), reused
+// on the subscribe side. It mirrors pubsub.Subscriber structurally so the slice stays
+// decoupled from the infra package (the same pattern as the domain's publisher port).
+type subscriber interface {
+	Subscribe(ctx context.Context, channel string) (<-chan []byte, error)
 }
 
-// NewHandler wires the handler to the read use case.
-func NewHandler(reader reader) *Handler {
-	return &Handler{reader: reader}
+// Handler is the notifications HTTP surface (the in-app inbox plus the real-time SSE
+// stream). It owns its routing; the api only composes by calling Register.
+type Handler struct {
+	reader    reader
+	sub       subscriber
+	heartbeat time.Duration
+}
+
+// Option configures the Handler at construction. The one knob today is the SSE
+// heartbeat interval, injected so tests drive it deterministically.
+type Option func(*Handler)
+
+// WithHeartbeat overrides the SSE keep-alive ping interval (default
+// defaultHeartbeat). Production keeps the default; tests inject a controlled value.
+func WithHeartbeat(d time.Duration) Option {
+	return func(h *Handler) { h.heartbeat = d }
+}
+
+// NewHandler wires the handler to the read use case and the pub/sub subscriber that
+// backs the SSE stream, applying any options over the defaults.
+func NewHandler(reader reader, sub subscriber, opts ...Option) *Handler {
+	h := &Handler{reader: reader, sub: sub, heartbeat: defaultHeartbeat}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // unreadCountResponse is the badge payload: {"count": N}.
@@ -51,6 +77,7 @@ type unreadCountResponse struct {
 // is scoped to the caller's tenant AND user, both read from the verified principal.
 func (h *Handler) Register(r fiber.Router) {
 	r.Get("/notifications", h.list)
+	r.Get("/notifications/stream", h.stream)
 	r.Get("/notifications/unread-count", h.unreadCount)
 	r.Post("/notifications/:id/read", h.markRead)
 	r.Post("/notifications/read-all", h.markAllRead)

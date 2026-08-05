@@ -80,7 +80,7 @@ func newApp(r reader, user, tenant string) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{user: user, tenant: tenant}))
-	NewHandler(r).Register(v1)
+	NewHandler(r, closedSubscriber{}).Register(v1)
 	return app
 }
 
