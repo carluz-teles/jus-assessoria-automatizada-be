@@ -29,6 +29,7 @@ type handlerUC interface {
 type reader interface {
 	Processos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, bool, error)
 	Intimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, bool, error)
+	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 }
 
 // Handler is the acquisition HTTP surface. It owns its routing; the api only
@@ -49,6 +50,7 @@ func NewHandler(uc handlerUC, reader reader) *Handler {
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/acquisition/integrations", middleware.RequireRole(roleAdmin), h.activate)
 	r.Get("/acquisition/integrations", h.list)
+	r.Get("/acquisition/import-status", h.importStatus)
 	r.Get("/processos", h.listProcessos)
 	r.Get("/intimacoes", h.listIntimacoes)
 }
@@ -114,6 +116,19 @@ func (h *Handler) list(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(newListEnvelope(integrations))
+}
+
+// importStatus handles GET /v1/acquisition/import-status: the tenant's onboarding
+// backfill state ({importing, status, total/ok/error slices}) for the FE banner
+// "importando seus processos…". tenant_id comes from the principal; a tenant with no
+// backfill_job gets status NONE (banner hidden).
+func (h *Handler) importStatus(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	status, err := h.reader.ImportStatus(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(status)
 }
 
 // listProcessos handles GET /v1/processos: the tenant's live processes, keyset

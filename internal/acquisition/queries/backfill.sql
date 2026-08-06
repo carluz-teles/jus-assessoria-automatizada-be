@@ -48,3 +48,14 @@ RETURNING total_slices, slices_ok, slices_error, status;
 UPDATE backfill_job
 SET status = $3
 WHERE id = $1 AND tenant_id = $2 AND status = 'RUNNING';
+
+-- name: GetLatestBackfillStatus :one
+-- The tenant's most recent backfill job — status + tallies — for the import-status
+-- read (the FE banner "importando seus processos…"). Newest job wins (a re-activation
+-- opens a new job). No job ever → no row; the read use case maps that to NONE (not
+-- importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
+SELECT status, total_slices, slices_ok, slices_error
+FROM backfill_job
+WHERE tenant_id = $1
+ORDER BY created_at DESC
+LIMIT 1;

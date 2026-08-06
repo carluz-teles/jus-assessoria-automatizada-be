@@ -55,6 +55,37 @@ func (q *Queries) FinalizeBackfillJob(ctx context.Context, arg FinalizeBackfillJ
 	return err
 }
 
+const getLatestBackfillStatus = `-- name: GetLatestBackfillStatus :one
+SELECT status, total_slices, slices_ok, slices_error
+FROM backfill_job
+WHERE tenant_id = $1
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+type GetLatestBackfillStatusRow struct {
+	Status      string `json:"status"`
+	TotalSlices int32  `json:"total_slices"`
+	SlicesOk    int32  `json:"slices_ok"`
+	SlicesError int32  `json:"slices_error"`
+}
+
+// The tenant's most recent backfill job — status + tallies — for the import-status
+// read (the FE banner "importando seus processos…"). Newest job wins (a re-activation
+// opens a new job). No job ever → no row; the read use case maps that to NONE (not
+// importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
+func (q *Queries) GetLatestBackfillStatus(ctx context.Context, tenantID uuid.UUID) (GetLatestBackfillStatusRow, error) {
+	row := q.db.QueryRow(ctx, getLatestBackfillStatus, tenantID)
+	var i GetLatestBackfillStatusRow
+	err := row.Scan(
+		&i.Status,
+		&i.TotalSlices,
+		&i.SlicesOk,
+		&i.SlicesError,
+	)
+	return i, err
+}
+
 const incrementBackfillSlicesError = `-- name: IncrementBackfillSlicesError :one
 UPDATE backfill_job
 SET slices_error = slices_error + 1

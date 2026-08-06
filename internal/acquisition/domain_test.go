@@ -61,6 +61,10 @@ func (m *mockRepo) List(_ context.Context, _ string) ([]*Integration, error) {
 	return m.listResp, nil
 }
 
+func (m *mockRepo) GetImportStatus(_ context.Context, _ string) (ImportStatusView, error) {
+	return ImportStatusView{}, nil
+}
+
 // The backfill methods satisfy the widened Repository interface; the activation
 // use case under test here never calls them (they are exercised by the backfill
 // use case's own stub in backfill_test.go).

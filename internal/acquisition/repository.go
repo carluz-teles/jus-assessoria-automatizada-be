@@ -58,6 +58,7 @@ type Repository interface {
 	// use case depends on the narrow readRepo view of these.
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -139,6 +140,31 @@ func (r *pgRepository) List(ctx context.Context, tenantID string) ([]*Integratio
 		out = append(out, ent)
 	}
 	return out, nil
+}
+
+// GetImportStatus returns the tenant's most recent backfill state for the FE banner,
+// a plain read on the pool scoped by tenant_id (isolation barrier 1). No job ever →
+// pgx.ErrNoRows, mapped to the NONE sentinel (not importing) rather than an error, so
+// a tenant that never onboarded a source simply gets a hidden banner.
+func (r *pgRepository) GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return ImportStatusView{}, database.WrapInfra(err)
+	}
+	row, err := r.q.GetLatestBackfillStatus(ctx, tid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ImportStatusView{Status: importStatusNone}, nil
+	}
+	if err != nil {
+		return ImportStatusView{}, database.WrapInfra(err)
+	}
+	return ImportStatusView{
+		Importing:   row.Status == BackfillStatusRunning,
+		Status:      row.Status,
+		TotalSlices: int(row.TotalSlices),
+		SlicesOK:    int(row.SlicesOk),
+		SlicesError: int(row.SlicesError),
+	}, nil
 }
 
 // BackfillJobExistsByIntegration reports whether any backfill_job already exists

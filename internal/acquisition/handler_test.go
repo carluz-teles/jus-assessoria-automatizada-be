@@ -66,6 +66,10 @@ func (fakeReader) Intimacoes(context.Context, IntimacoesQuery) ([]IntimacaoView,
 	return nil, false, nil
 }
 
+func (fakeReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
+	return ImportStatusView{}, nil
+}
+
 // newApp builds an app whose /v1 group mirrors production: Auth resolves a
 // principal with the given role/tenant, then the acquisition routes mount under
 // it. An empty role/tenant still yields a valid principal (used by role tests).

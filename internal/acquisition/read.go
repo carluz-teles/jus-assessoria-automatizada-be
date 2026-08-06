@@ -65,11 +65,27 @@ type IntimacoesQuery struct {
 	Limit             int
 }
 
-// readRepo is the narrow read port the ReadUseCase drives — the keyset list reads,
-// off the write path.
+// ImportStatusView is the onboarding backfill state for the FE banner ("importando
+// seus processos…"): whether an import is running for the tenant, plus the slice
+// tallies for a progress hint. Status NONE (no job ever) keeps the banner hidden.
+type ImportStatusView struct {
+	Importing   bool   `json:"importing"` // status == RUNNING
+	Status      string `json:"status"`    // RUNNING | COMPLETED | PARTIAL | NONE
+	TotalSlices int    `json:"total_slices"`
+	SlicesOK    int    `json:"slices_ok"`
+	SlicesError int    `json:"slices_error"`
+}
+
+// importStatusNone is the read-side sentinel for a tenant with no backfill_job — the
+// FE banner treats it as "not importing" (never shown). It is NOT a DB status value.
+const importStatusNone = "NONE"
+
+// readRepo is the narrow read port the ReadUseCase drives — the keyset list reads
+// and the import-status read, off the write path.
 type readRepo interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 }
 
 // ReadUseCase serves the screen reads. It is a pagination policy over readRepo: it
@@ -96,6 +112,12 @@ func (uc *ReadUseCase) Processos(ctx context.Context, q ProcessosQuery) (items [
 		return rows[:limit], true, nil
 	}
 	return rows, false, nil
+}
+
+// ImportStatus returns the tenant's latest backfill state — the FE banner reads it
+// on load (so it survives a page refresh) and hides on the import_finished push.
+func (uc *ReadUseCase) ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error) {
+	return uc.repo.GetImportStatus(ctx, tenantID)
 }
 
 // Intimacoes returns up to q.Limit intimations (newest availability first) and

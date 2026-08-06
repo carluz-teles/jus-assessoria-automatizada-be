@@ -57,6 +57,11 @@ type Querier interface {
 	// (pgx.ErrNoRows) is how FindOrCreateCourtRecord learns it must create one.
 	GetCourtRecordByKey(ctx context.Context, arg GetCourtRecordByKeyParams) (GetCourtRecordByKeyRow, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
+	// The tenant's most recent backfill job — status + tallies — for the import-status
+	// read (the FE banner "importando seus processos…"). Newest job wins (a re-activation
+	// opens a new job). No job ever → no row; the read use case maps that to NONE (not
+	// importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
+	GetLatestBackfillStatus(ctx context.Context, tenantID uuid.UUID) (GetLatestBackfillStatusRow, error)
 	// Count one failed slice; same atomic lock-and-read-back contract as
 	// IncrementBackfillSlicesOK. A job with any failed slice finalizes PARTIAL.
 	IncrementBackfillSlicesError(ctx context.Context, arg IncrementBackfillSlicesErrorParams) (IncrementBackfillSlicesErrorRow, error)
