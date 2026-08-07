@@ -373,22 +373,29 @@ func (uc *SyncUseCase) failRun(ctx context.Context, ev SyncRequested, syncRunID 
 // all atomically. court_record_observed fires per observed record;
 // docket_entry_observed only for entries that were actually new.
 func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRunID string, parsed ParsedResult) error {
-	// Resolve the tenant's entitlement ONCE per cycle (not per record), OUTSIDE the
-	// tx — it is a read on the billing pool that must not hold this tx's connection,
-	// and a small overshoot under concurrent syncs is accepted (v0). A real error
-	// here fails the whole cycle (the run stays RUNNING; asynq re-delivers and
-	// resolveSeenRun resumes it); only ErrSubscriptionNotFound is folded to limit 0,
-	// and that folding is the adapter's job, never surfaced here.
-	limit, err := uc.checker.ActiveProcessLimit(ctx, ev.TenantID)
-	if err != nil {
-		return fmt.Errorf("resolve active process limit for tenant %s: %w", ev.TenantID, err)
+	// The onboarding backfill (BackfillJobID set) is NOT gated by the active-process
+	// ceiling — a product decision: a high-volume OAB must import its whole history,
+	// and gating would silently drop most of it, arbitrarily by slice ordering. The
+	// gate still guards any non-backfill discovery (BackfillJobID ""). When it applies,
+	// resolve the entitlement ONCE per cycle (not per record), OUTSIDE the tx — a read
+	// on the billing pool that must not hold this tx's connection; a small overshoot
+	// under concurrent syncs is accepted (v0). A real error fails the whole cycle (the
+	// run stays RUNNING; asynq re-delivers and resolveSeenRun resumes it); only
+	// ErrSubscriptionNotFound is folded to limit 0 by the adapter, never surfaced here.
+	limit := math.MaxInt
+	if ev.BackfillJobID == "" {
+		resolved, err := uc.checker.ActiveProcessLimit(ctx, ev.TenantID)
+		if err != nil {
+			return fmt.Errorf("resolve active process limit for tenant %s: %w", ev.TenantID, err)
+		}
+		limit = resolved
 	}
 
 	var (
 		tally     syncTally
 		committed bool // this execution is the one that closed the run OK
 	)
-	err = uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		records := make(map[string]*CourtRecord, len(parsed.CourtRecords))
 		ordered := make([]*CourtRecord, 0, len(parsed.CourtRecords))
 		blocked := make(map[string]bool)

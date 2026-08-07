@@ -212,6 +212,16 @@ func syncRequestedEvent() SyncRequested {
 	}
 }
 
+// nonBackfillSyncEvent is a sync_requested that is NOT part of a backfill (empty
+// BackfillJobID) — the only kind the active-process gate applies to. The onboarding
+// backfill itself is exempt (see applyResult), so the gating tests drive the gate
+// through this variant to keep exercising the ceiling logic.
+func nonBackfillSyncEvent() SyncRequested {
+	ev := syncRequestedEvent()
+	ev.BackfillJobID = ""
+	return ev
+}
+
 // orchestratorWith registers a single connector under source — the minimal
 // orchestrator the sync use case needs so ConnectorFor(source) resolves it.
 func orchestratorWith(source string, c Connector) *Orchestrator {
@@ -742,7 +752,7 @@ func TestSyncUseCase_BelowLimit_CreatesAllRecords(t *testing.T) {
 	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
 		WithEntitlementChecker(checker))
 
-	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+	if err := uc.OnSyncRequested(context.Background(), nonBackfillSyncEvent()); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v", err)
 	}
 
@@ -783,7 +793,7 @@ func TestSyncUseCase_AtLimit_BlocksNewRecordAndClosesOK(t *testing.T) {
 	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
 		WithEntitlementChecker(checker))
 
-	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+	if err := uc.OnSyncRequested(context.Background(), nonBackfillSyncEvent()); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v, want nil (a block is expected, not a failure)", err)
 	}
 
@@ -829,7 +839,7 @@ func TestSyncUseCase_Reobservation_NotGatedEvenAtLimit(t *testing.T) {
 	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
 		WithEntitlementChecker(checker))
 
-	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+	if err := uc.OnSyncRequested(context.Background(), nonBackfillSyncEvent()); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v", err)
 	}
 
@@ -865,7 +875,7 @@ func TestSyncUseCase_CheckerError_FailsCycle(t *testing.T) {
 	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
 		WithEntitlementChecker(checker))
 
-	err := uc.OnSyncRequested(context.Background(), syncRequestedEvent())
+	err := uc.OnSyncRequested(context.Background(), nonBackfillSyncEvent())
 	if !errors.Is(err, billingDown) {
 		t.Fatalf("error = %v, want it to wrap the checker failure (a genuine checker error must not be silenced)", err)
 	}
@@ -877,5 +887,41 @@ func TestSyncUseCase_CheckerError_FailsCycle(t *testing.T) {
 	}
 	if outbox.calls != 0 {
 		t.Fatalf("checker fault published %d events, want 0", outbox.calls)
+	}
+}
+
+// Product decision: the onboarding backfill (BackfillJobID set) is NEVER gated — a
+// high-volume OAB must import its whole history. Even at limit 0 (which would block
+// everything for a non-backfill sync) every brand-new record is created, and the
+// entitlement checker is not even consulted.
+func TestSyncUseCase_Backfill_NotGatedEvenAtLimit(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 2}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: twoRecordFixture(SourceDJEN)}
+	checker := &stubEntitlementChecker{limit: 0} // ceiling reached — would block all if consulted
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser,
+		WithEntitlementChecker(checker))
+
+	// syncRequestedEvent() carries BackfillJobID "job-1" → a backfill slice.
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	if checker.calls != 0 {
+		t.Fatalf("checker.calls = %d, want 0 (the backfill must not consult the entitlement gate)", checker.calls)
+	}
+	if repo.findCalls != 2 || repo.activeCount != 2 {
+		t.Fatalf("find/create = {calls:%d active:%d}, want {2 2} (both records created, ungated)", repo.findCalls, repo.activeCount)
+	}
+	if len(repo.docketParams) != 2 || len(repo.intimParams) != 2 {
+		t.Fatalf("children = {docket:%d intim:%d}, want {2 2} (nothing blocked in a backfill)", len(repo.docketParams), len(repo.intimParams))
+	}
+	counts := countByType(outbox.published)
+	if counts[TypeCourtRecordObserved] != 2 || counts[TypeSyncCompleted] != 1 {
+		t.Fatalf("outbox = %v, want court_record_observed:2 sync_completed:1", counts)
 	}
 }
