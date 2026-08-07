@@ -15,6 +15,9 @@ import (
 const countUnread = `-- name: CountUnread :one
 SELECT count(*) FROM notification n
 WHERE n.tenant_id = $1
+  -- Same in-app filter as ListNotifications: EMAIL avisos (title NULL) never
+  -- count toward the in-app unread badge.
+  AND n.title IS NOT NULL
   AND (n.recipient_user_id IS NULL OR n.recipient_user_id = $2::uuid)
   AND NOT EXISTS (
       SELECT 1 FROM notification_read r
@@ -207,6 +210,10 @@ SELECT n.id, n.type, n.title, n.body, n.payload, n.created_at,
        ) AS read
 FROM notification n
 WHERE n.tenant_id = $1
+  -- In-app inbox: only avisos with materialized in-app text. EMAIL avisos leave
+  -- title NULL (they render at send), so excluding them keeps an empty-text row
+  -- out of the bell and off the unread badge.
+  AND n.title IS NOT NULL
   AND (n.recipient_user_id IS NULL OR n.recipient_user_id = $3::uuid)
   AND (
       NOT $4::boolean

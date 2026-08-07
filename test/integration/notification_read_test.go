@@ -64,6 +64,30 @@ func seedNotification(t *testing.T, pool *pgxpool.Pool, tenantID, recipientUserI
 	return id
 }
 
+// seedEmailNotification inserts one EMAIL-only aviso (owner insert): title/body stay
+// NULL — an email aviso materializes its text at send, not on the notification row —
+// plus its EMAIL delivery, mirroring the Phase-1 email path. It must NEVER surface in
+// the in-app inbox (else it renders as an empty-text row in the bell).
+func seedEmailNotification(t *testing.T, pool *pgxpool.Pool, tenantID, typ string) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(context.Background(),
+		`INSERT INTO notification (tenant_id, type, status)
+		 VALUES ($1, $2, 'CREATED') RETURNING id::text`,
+		tenantID, typ,
+	).Scan(&id); err != nil {
+		t.Fatalf("seed email notification: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO notification_delivery (notification_id, tenant_id, channel, status)
+		 VALUES ($1, $2, 'EMAIL', 'QUEUED')`,
+		id, tenantID,
+	); err != nil {
+		t.Fatalf("seed email delivery: %v", err)
+	}
+	return id
+}
+
 // readUnread is the unread badge count for a (tenant, user) via the use case.
 func readUnread(t *testing.T, uc *notifications.ReadUseCase, tenantID, userID string) int {
 	t.Helper()
@@ -158,6 +182,36 @@ func TestNotifications_Read_PerUserReadState(t *testing.T) {
 	}
 	if got := readUnread(t, uc, tenantID, userB); got != 2 {
 		t.Fatalf("userB unread = %d, want 2 (unaffected by A's mark-all)", got)
+	}
+}
+
+// Bug fix (texto vazio no sino): the in-app inbox lists ONLY in-app avisos. An EMAIL
+// aviso (title NULL — its text renders at send) must not appear in the list nor count
+// toward the unread badge, so it never shows up as an empty-text row in the bell.
+func TestNotifications_Read_ExcludesEmailAvisos(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-read-email-excl", 0)
+	userA := seedUser(t, pool, tenantID, "read-email-a")
+
+	inApp := seedNotification(t, pool, tenantID, "", notifications.TypeImportFinished)
+	seedEmailNotification(t, pool, tenantID, "member_joined")
+
+	uc := newReadUC(pool)
+
+	// The badge counts only the in-app aviso — the email one is invisible in-app.
+	if got := readUnread(t, uc, tenantID, userA); got != 1 {
+		t.Fatalf("unread = %d, want 1 (email aviso must not count)", got)
+	}
+
+	// The list returns only the in-app aviso, never the empty-text email one.
+	items, _, err := uc.List(ctx, readListQ(tenantID, userA, false))
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != inApp {
+		t.Fatalf("list = %+v, want only the in-app aviso %s", items, inApp)
 	}
 }
 
