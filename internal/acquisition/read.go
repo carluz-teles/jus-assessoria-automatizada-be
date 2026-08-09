@@ -80,12 +80,50 @@ type ImportStatusView struct {
 // FE banner treats it as "not importing" (never shown). It is NOT a DB status value.
 const importStatusNone = "NONE"
 
+// ReconciliationRunView is one row of the reconciliations screen: a sync_run with
+// its integration's source and the failure reason (error jsonb message) lifted to
+// a nullable string. Window bounds use the wire date format (2006-01-02).
+type ReconciliationRunView struct {
+	ID           string     `json:"id"`
+	Source       string     `json:"source"`
+	WindowFrom   string     `json:"window_from"`
+	WindowTo     string     `json:"window_to"`
+	Status       string     `json:"status"` // RUNNING | OK | FAILED
+	ItemsNew     int        `json:"items_new"`
+	ItemsDeduped int        `json:"items_deduped"`
+	Error        *string    `json:"error"`
+	StartedAt    time.Time  `json:"started_at"`
+	FinishedAt   *time.Time `json:"finished_at"`
+}
+
+// ReconciliationTotals is the tenant's acquired-so-far tally shown in the
+// reconciliations summary (and during an import, its progress line).
+type ReconciliationTotals struct {
+	CourtRecords int `json:"court_records"`
+	Intimations  int `json:"intimations"`
+}
+
+// ReconciliationsView is the whole reconciliations read: the import (backfill)
+// state, the acquired totals and the recent executions, newest first.
+type ReconciliationsView struct {
+	Import ImportStatusView        `json:"import"`
+	Totals ReconciliationTotals    `json:"totals"`
+	Runs   []ReconciliationRunView `json:"runs"`
+}
+
+// reconciliationRunsLimit caps the executions list: the 53 weekly backfill slices
+// plus headroom for the continuous captures — one screenful of audit, not the
+// whole history (an eventual "ver mais" pages beyond it).
+const reconciliationRunsLimit = 60
+
 // readRepo is the narrow read port the ReadUseCase drives — the keyset list reads
-// and the import-status read, off the write path.
+// and the import-status/reconciliations reads, off the write path.
 type readRepo interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
+	ListRecentSyncRuns(ctx context.Context, tenantID string, limit int) ([]ReconciliationRunView, error)
+	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 }
 
 // ReadUseCase serves the screen reads. It is a pagination policy over readRepo: it
@@ -118,6 +156,25 @@ func (uc *ReadUseCase) Processos(ctx context.Context, q ProcessosQuery) (items [
 // on load (so it survives a page refresh) and hides on the import_finished push.
 func (uc *ReadUseCase) ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error) {
 	return uc.repo.GetImportStatus(ctx, tenantID)
+}
+
+// Reconciliations returns the reconciliations screen read: import state + acquired
+// totals + the recent executions. Three pool reads, no tx — a read model, not an
+// aggregate; a small skew between them under concurrent syncs is acceptable.
+func (uc *ReadUseCase) Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error) {
+	imp, err := uc.repo.GetImportStatus(ctx, tenantID)
+	if err != nil {
+		return ReconciliationsView{}, err
+	}
+	totals, err := uc.repo.GetReconciliationTotals(ctx, tenantID)
+	if err != nil {
+		return ReconciliationsView{}, err
+	}
+	runs, err := uc.repo.ListRecentSyncRuns(ctx, tenantID, reconciliationRunsLimit)
+	if err != nil {
+		return ReconciliationsView{}, err
+	}
+	return ReconciliationsView{Import: imp, Totals: totals, Runs: runs}, nil
 }
 
 // Intimacoes returns up to q.Limit intimations (newest availability first) and

@@ -11,10 +11,11 @@
 -- Open a sync run. court_record_id is left NULL (OAB window discovery is not yet
 -- tied to one record); finished_at/error stay NULL until the run closes. event_id
 -- records the sync_requested event that opened it, so a re-delivery can find and
--- resume a run that never closed (FindSyncRunByEventID).
+-- resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
+-- slice's date window so the reconciliations read can show it (NULL when absent).
 INSERT INTO sync_run
-    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING id;
 
 -- name: FindSyncRunByEventID :one

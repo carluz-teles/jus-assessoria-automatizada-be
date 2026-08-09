@@ -281,6 +281,8 @@ type SyncRun struct {
 	RawPayloadRefs   []byte             `json:"raw_payload_refs"`
 	Error            []byte             `json:"error"`
 	EventID          *string            `json:"event_id"`
+	WindowFrom       pgtype.Date        `json:"window_from"`
+	WindowTo         pgtype.Date        `json:"window_to"`
 }
 
 type Tenant struct {

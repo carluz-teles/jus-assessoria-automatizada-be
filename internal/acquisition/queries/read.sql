@@ -40,3 +40,22 @@ WHERE i.tenant_id = $1
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
+
+-- name: ListRecentSyncRuns :many
+-- The reconciliations screen: the tenant's most recent sync executions, newest
+-- first, with the integration's source joined in and the failure reason lifted
+-- out of the error jsonb ({"message": …} → text, NULL on success).
+SELECT s.id, i.source, s.window_from, s.window_to, s.status,
+       s.items_new, s.items_deduped,
+       COALESCE(s.error->>'message', '')::text AS error_message,
+       s.started_at, s.finished_at
+FROM sync_run s
+JOIN integration i ON i.id = s.integration_id
+WHERE s.tenant_id = $1
+ORDER BY s.started_at DESC, s.id DESC
+LIMIT $2;
+
+-- name: CountIntimationsByTenant :one
+-- The reconciliations totals: how many intimations the tenant holds (paired with
+-- CountActiveCourtRecordsByTenant for the processes side).
+SELECT count(*) FROM intimation WHERE tenant_id = $1;

@@ -65,6 +65,14 @@ func (m *mockRepo) GetImportStatus(_ context.Context, _ string) (ImportStatusVie
 	return ImportStatusView{}, nil
 }
 
+func (m *mockRepo) ListRecentSyncRuns(_ context.Context, _ string, _ int) ([]ReconciliationRunView, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) GetReconciliationTotals(_ context.Context, _ string) (ReconciliationTotals, error) {
+	return ReconciliationTotals{}, nil
+}
+
 // The backfill methods satisfy the widened Repository interface; the activation
 // use case under test here never calls them (they are exercised by the backfill
 // use case's own stub in backfill_test.go).

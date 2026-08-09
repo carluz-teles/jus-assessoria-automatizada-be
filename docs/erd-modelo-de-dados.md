@@ -171,7 +171,9 @@ CREATE TABLE sync_run (
   items_new         int NOT NULL DEFAULT 0,
   items_deduped     int NOT NULL DEFAULT 0,
   raw_payload_refs  jsonb NOT NULL DEFAULT '[]',
-  error             jsonb
+  error             jsonb,
+  window_from       date,                 -- janela da fatia sincronizada (null quando não há) [0019]
+  window_to         date                  -- exibida na tela de reconciliações [0019]
 );
 CREATE INDEX ON sync_run (tenant_id, started_at);
 ```

@@ -12,6 +12,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countIntimationsByTenant = `-- name: CountIntimationsByTenant :one
+SELECT count(*) FROM intimation WHERE tenant_id = $1
+`
+
+// The reconciliations totals: how many intimations the tenant holds (paired with
+// CountActiveCourtRecordsByTenant for the processes side).
+func (q *Queries) CountIntimationsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countIntimationsByTenant, tenantID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const listIntimacoes = `-- name: ListIntimacoes :many
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.source, i.source_url,
@@ -170,6 +183,70 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 			&i.Completeness,
 			&i.LastMovementText,
 			&i.LastMovementAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRecentSyncRuns = `-- name: ListRecentSyncRuns :many
+SELECT s.id, i.source, s.window_from, s.window_to, s.status,
+       s.items_new, s.items_deduped,
+       COALESCE(s.error->>'message', '')::text AS error_message,
+       s.started_at, s.finished_at
+FROM sync_run s
+JOIN integration i ON i.id = s.integration_id
+WHERE s.tenant_id = $1
+ORDER BY s.started_at DESC, s.id DESC
+LIMIT $2
+`
+
+type ListRecentSyncRunsParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Limit    int32     `json:"limit"`
+}
+
+type ListRecentSyncRunsRow struct {
+	ID           uuid.UUID          `json:"id"`
+	Source       string             `json:"source"`
+	WindowFrom   pgtype.Date        `json:"window_from"`
+	WindowTo     pgtype.Date        `json:"window_to"`
+	Status       string             `json:"status"`
+	ItemsNew     int32              `json:"items_new"`
+	ItemsDeduped int32              `json:"items_deduped"`
+	ErrorMessage string             `json:"error_message"`
+	StartedAt    pgtype.Timestamptz `json:"started_at"`
+	FinishedAt   pgtype.Timestamptz `json:"finished_at"`
+}
+
+// The reconciliations screen: the tenant's most recent sync executions, newest
+// first, with the integration's source joined in and the failure reason lifted
+// out of the error jsonb ({"message": …} → text, NULL on success).
+func (q *Queries) ListRecentSyncRuns(ctx context.Context, arg ListRecentSyncRunsParams) ([]ListRecentSyncRunsRow, error) {
+	rows, err := q.db.Query(ctx, listRecentSyncRuns, arg.TenantID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRecentSyncRunsRow
+	for rows.Next() {
+		var i ListRecentSyncRunsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Source,
+			&i.WindowFrom,
+			&i.WindowTo,
+			&i.Status,
+			&i.ItemsNew,
+			&i.ItemsDeduped,
+			&i.ErrorMessage,
+			&i.StartedAt,
+			&i.FinishedAt,
 		); err != nil {
 			return nil, err
 		}

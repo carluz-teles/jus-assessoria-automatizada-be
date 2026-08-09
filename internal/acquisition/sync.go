@@ -44,7 +44,9 @@ const defaultSyncInterval = 24 * time.Hour
 
 // SyncRunParams is the insert payload for a sync_run opening in RUNNING. EventID
 // is the sync_requested event that opened it — persisted so a re-delivery can
-// locate and resume a run that never closed (FindSyncRunByEventID).
+// locate and resume a run that never closed (FindSyncRunByEventID). WindowFrom/To
+// stamp the slice's date window (wire format 2006-01-02; empty → NULL) so the
+// reconciliations read can show which window each execution covered.
 type SyncRunParams struct {
 	TenantID         string
 	IntegrationID    string
@@ -53,6 +55,8 @@ type SyncRunParams struct {
 	StartedAt        time.Time
 	Status           string
 	EventID          string
+	WindowFrom       string
+	WindowTo         string
 }
 
 // SyncRunOutcome closes a run. Error is empty on OK (the repo writes NULL) and
@@ -313,6 +317,8 @@ func (uc *SyncUseCase) startRun(ctx context.Context, ev SyncRequested, connector
 			StartedAt:        uc.now(),
 			Status:           SyncStatusRunning,
 			EventID:          ev.EventID,
+			WindowFrom:       ev.WindowFrom,
+			WindowTo:         ev.WindowTo,
 		})
 		if ierr != nil {
 			return ierr

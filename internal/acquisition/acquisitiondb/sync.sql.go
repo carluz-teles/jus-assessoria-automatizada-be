@@ -271,8 +271,8 @@ func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationPara
 const insertSyncRun = `-- name: InsertSyncRun :one
 
 INSERT INTO sync_run
-    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING id
 `
 
@@ -284,6 +284,8 @@ type InsertSyncRunParams struct {
 	StartedAt        pgtype.Timestamptz `json:"started_at"`
 	Status           string             `json:"status"`
 	EventID          *string            `json:"event_id"`
+	WindowFrom       pgtype.Date        `json:"window_from"`
+	WindowTo         pgtype.Date        `json:"window_to"`
 }
 
 // sync cycle queries (acquisition slice).
@@ -297,7 +299,8 @@ type InsertSyncRunParams struct {
 // Open a sync run. court_record_id is left NULL (OAB window discovery is not yet
 // tied to one record); finished_at/error stay NULL until the run closes. event_id
 // records the sync_requested event that opened it, so a re-delivery can find and
-// resume a run that never closed (FindSyncRunByEventID).
+// resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
+// slice's date window so the reconciliations read can show it (NULL when absent).
 func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertSyncRun,
 		arg.TenantID,
@@ -307,6 +310,8 @@ func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (u
 		arg.StartedAt,
 		arg.Status,
 		arg.EventID,
+		arg.WindowFrom,
+		arg.WindowTo,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)

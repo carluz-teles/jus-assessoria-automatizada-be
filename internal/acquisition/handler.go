@@ -30,6 +30,7 @@ type reader interface {
 	Processos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, bool, error)
 	Intimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, bool, error)
 	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
+	Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error)
 }
 
 // Handler is the acquisition HTTP surface. It owns its routing; the api only
@@ -51,6 +52,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/acquisition/integrations", middleware.RequireRole(roleAdmin), h.activate)
 	r.Get("/acquisition/integrations", h.list)
 	r.Get("/acquisition/import-status", h.importStatus)
+	r.Get("/acquisition/reconciliations", h.reconciliations)
 	r.Get("/processos", h.listProcessos)
 	r.Get("/intimacoes", h.listIntimacoes)
 }
@@ -129,6 +131,18 @@ func (h *Handler) importStatus(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(status)
+}
+
+// reconciliations serves the reconciliations screen: import state + acquired
+// totals + recent executions, straight from the read model (no envelope — the
+// view is already the whole payload).
+func (h *Handler) reconciliations(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.Reconciliations(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
 }
 
 // listProcessos handles GET /v1/processos: the tenant's live processes, keyset

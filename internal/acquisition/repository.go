@@ -59,6 +59,8 @@ type Repository interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
+	ListRecentSyncRuns(ctx context.Context, tenantID string, limit int) ([]ReconciliationRunView, error)
+	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -164,6 +166,73 @@ func (r *pgRepository) GetImportStatus(ctx context.Context, tenantID string) (Im
 		TotalSlices: int(row.TotalSlices),
 		SlicesOK:    int(row.SlicesOk),
 		SlicesError: int(row.SlicesError),
+	}, nil
+}
+
+// ListRecentSyncRuns returns the tenant's most recent sync executions for the
+// reconciliations screen — a pool read scoped by tenant_id (barrier 1). The mapper
+// absorbs the pgtype columns: NULL windows become empty strings, the COALESCEd
+// empty error message becomes a nil pointer (JSON null).
+func (r *pgRepository) ListRecentSyncRuns(ctx context.Context, tenantID string, limit int) ([]ReconciliationRunView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListRecentSyncRuns(ctx, acquisitiondb.ListRecentSyncRunsParams{
+		TenantID: tid,
+		Limit:    int32(limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	views := make([]ReconciliationRunView, 0, len(rows))
+	for _, row := range rows {
+		v := ReconciliationRunView{
+			ID:           row.ID.String(),
+			Source:       row.Source,
+			Status:       row.Status,
+			ItemsNew:     int(row.ItemsNew),
+			ItemsDeduped: int(row.ItemsDeduped),
+			StartedAt:    row.StartedAt.Time,
+		}
+		if row.WindowFrom.Valid {
+			v.WindowFrom = row.WindowFrom.Time.Format(dateLayout)
+		}
+		if row.WindowTo.Valid {
+			v.WindowTo = row.WindowTo.Time.Format(dateLayout)
+		}
+		if row.ErrorMessage != "" {
+			msg := row.ErrorMessage
+			v.Error = &msg
+		}
+		if row.FinishedAt.Valid {
+			finished := row.FinishedAt.Time
+			v.FinishedAt = &finished
+		}
+		views = append(views, v)
+	}
+	return views, nil
+}
+
+// GetReconciliationTotals counts the tenant's acquired acervo (ACTIVE processes +
+// intimations) for the reconciliations summary — two pool reads scoped by
+// tenant_id (barrier 1).
+func (r *pgRepository) GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return ReconciliationTotals{}, database.WrapInfra(err)
+	}
+	records, err := r.q.CountActiveCourtRecordsByTenant(ctx, tid)
+	if err != nil {
+		return ReconciliationTotals{}, database.WrapInfra(err)
+	}
+	intimations, err := r.q.CountIntimationsByTenant(ctx, tid)
+	if err != nil {
+		return ReconciliationTotals{}, database.WrapInfra(err)
+	}
+	return ReconciliationTotals{
+		CourtRecords: int(records),
+		Intimations:  int(intimations),
 	}, nil
 }
 
@@ -310,6 +379,8 @@ func (r *pgRepository) InsertSyncRun(ctx context.Context, tx database.Tx, params
 		StartedAt:        pgtype.Timestamptz{Time: params.StartedAt, Valid: true},
 		Status:           params.Status,
 		EventID:          nullString(params.EventID),
+		WindowFrom:       wireDateOrNull(params.WindowFrom),
+		WindowTo:         wireDateOrNull(params.WindowTo),
 	})
 	if err != nil {
 		return "", database.WrapInfra(err)
@@ -861,4 +932,14 @@ func encodeSyncError(reason string) ([]byte, error) {
 		return nil, database.WrapInfra(err)
 	}
 	return raw, nil
+}
+
+// wireDateOrNull lifts a wire-format date (2006-01-02) to pgtype.Date; empty or
+// malformed input becomes SQL NULL (the column is informational, never gating).
+func wireDateOrNull(s string) pgtype.Date {
+	t, err := time.Parse(dateLayout, s)
+	if err != nil {
+		return pgtype.Date{}
+	}
+	return pgtype.Date{Time: t, Valid: true}
 }

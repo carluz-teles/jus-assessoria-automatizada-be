@@ -32,6 +32,9 @@ type Querier interface {
 	// INSERT so the count is consistent with what is about to be created. lifecycle is
 	// the schema's process-liveness flag; only ACTIVE records count against the ceiling.
 	CountActiveCourtRecordsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// The reconciliations totals: how many intimations the tenant holds (paired with
+	// CountActiveCourtRecordsByTenant for the processes side).
+	CountIntimationsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// scheduler (re-poll) queries (acquisition slice).
 	// The re-poll scheduler runs system-scoped (DoSystem sets app.system='on', so the
 	// court_record RLS system escape hatch from migration 0016 exposes every tenant's
@@ -110,7 +113,8 @@ type Querier interface {
 	// Open a sync run. court_record_id is left NULL (OAB window discovery is not yet
 	// tied to one record); finished_at/error stay NULL until the run closes. event_id
 	// records the sync_requested event that opened it, so a re-delivery can find and
-	// resume a run that never closed (FindSyncRunByEventID).
+	// resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
+	// slice's date window so the reconciliations read can show it (NULL when absent).
 	InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
@@ -130,6 +134,10 @@ type Querier interface {
 	// movement" column. Ordered by cnj_number then id (ascending keyset): the first
 	// page passes ('', zero-uuid).
 	ListProcessos(ctx context.Context, arg ListProcessosParams) ([]ListProcessosRow, error)
+	// The reconciliations screen: the tenant's most recent sync executions, newest
+	// first, with the integration's source joined in and the failure reason lifted
+	// out of the error jsonb ({"message": …} → text, NULL on success).
+	ListRecentSyncRuns(ctx context.Context, arg ListRecentSyncRunsParams) ([]ListRecentSyncRunsRow, error)
 	// Record that a sync touched this court record: refresh its completeness and
 	// schedule the next sweep (next_sync_at drives the scheduler slice later).
 	// judging_body is COALESCEd, not overwritten: a sync that does not disclose the
