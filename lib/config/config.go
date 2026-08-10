@@ -106,6 +106,11 @@ type Config struct {
 	// Opcional: vazio = conexão direta (o dev local, cujo IP já passa no WAF, não
 	// precisa). Só o worker-ingestao — onde o DJENConnector roda o backfill — o consome.
 	DJENProxyURL string `env:"DJEN_PROXY_URL"`
+
+	// DJENRatePerMinute — teto de requisições/min do conector DJEN (shared limiter).
+	// 0 = mantém o default do conector (60/min). Alavanca de prod pra afrouxar o pace
+	// num sweep de OAB grande sem redeploy, quando o DJEN passa a 429 a captura.
+	DJENRatePerMinute int `env:"DJEN_RATE_PER_MINUTE" envDefault:"0"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do

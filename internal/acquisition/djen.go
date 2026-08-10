@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -46,8 +47,19 @@ const (
 
 	// djenDefaultRatePerMinute paces requests so the backfill's burst of windows does
 	// not trip the WAF's rate block. The limiter is shared across the connector, so it
-	// caps the total request rate even under concurrent syncs.
+	// caps the total request rate even under concurrent syncs. Override per env
+	// (DJEN_RATE_PER_MINUTE) via WithDJENRatePerMinute when a big OAB sweep needs a
+	// gentler pace than 1 req/s.
 	djenDefaultRatePerMinute = 60
+
+	// Cooldown (circuit-breaker) after a 429/503: the shared gate makes ALL concurrent
+	// slices pause together, so a rate-limited egress IP recovers instead of being
+	// hammered by 53 windows × their retries. The pause grows exponentially per
+	// consecutive rate-limit (djenCooldownBase << n), capped at djenCooldownMax, and
+	// resets on the first successful page. A server Retry-After (when present) wins,
+	// still capped so a worker slot is never held too long.
+	djenCooldownBase = 2 * time.Second
+	djenCooldownMax  = 30 * time.Second
 
 	// djenMaxPages bounds the pagination walk defensively (200 pages × default size
 	// spans the API's 10000-count cap twice over) so a misbehaving endpoint can never
@@ -67,6 +79,7 @@ type DJENConnector struct {
 	httpClient *http.Client
 	pageSize   int
 	limiter    *rate.Limiter
+	cooldown   *cooldownGate
 }
 
 // DJENOption tunes a DJENConnector at construction.
@@ -135,6 +148,7 @@ func NewDJENConnector(opts ...DJENOption) *DJENConnector {
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		pageSize:   djenDefaultPageSize,
 		limiter:    rate.NewLimiter(rate.Every(time.Minute/time.Duration(djenDefaultRatePerMinute)), 1),
+		cooldown:   newCooldownGate(),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -242,7 +256,11 @@ func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to stri
 		"itensPorPagina":             {strconv.Itoa(c.pageSize)},
 	}.Encode()
 
-	// Pace requests so the backfill's burst does not trip the WAF's rate block.
+	// Back off together with every other slice while a rate block is cooling down,
+	// then pace this request through the shared limiter.
+	if err := c.cooldown.wait(ctx); err != nil {
+		return djenResponse{}, apperr.NewInfra("djen: cooldown wait", err)
+	}
 	if err := c.limiter.Wait(ctx); err != nil {
 		return djenResponse{}, apperr.NewInfra("djen: rate limiter wait", err)
 	}
@@ -264,12 +282,25 @@ func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to stri
 	}
 	defer res.Body.Close()
 
+	// A 429 (or 503) is a rate block, not a fault: trip the shared cooldown so every
+	// slice backs off together, and surface a typed, retryable Unavailable carrying
+	// the server's Retry-After.
+	if res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusServiceUnavailable {
+		retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), c.cooldown.now())
+		c.cooldown.trip(retryAfter)
+		return djenResponse{}, apperr.NewUnavailable(
+			fmt.Sprintf("djen: comunicacao rate limited (oab %s/%s page %d)", oab.Number, oab.UF, page),
+			&RateLimitedError{Status: res.StatusCode, RetryAfter: retryAfter, OAB: oab.Number, UF: oab.UF, Page: page},
+		)
+	}
 	if res.StatusCode != http.StatusOK {
 		return djenResponse{}, apperr.NewInfra(
 			fmt.Sprintf("djen: comunicacao returned HTTP %d (oab %s/%s page %d)", res.StatusCode, oab.Number, oab.UF, page),
 			fmt.Errorf("unexpected status %d", res.StatusCode),
 		)
 	}
+	// A clean page means the egress IP is healthy again — clear the backoff streak.
+	c.cooldown.reset()
 
 	var envelope djenResponse
 	if err := json.NewDecoder(res.Body).Decode(&envelope); err != nil {
@@ -282,4 +313,116 @@ func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to stri
 		)
 	}
 	return envelope, nil
+}
+
+// RateLimitedError signals DJEN returned 429 (or 503) — a transient rate block, not a
+// bug in our code. It carries the server's suggested wait (Retry-After; 0 when absent)
+// so the cooldown and any retry policy can honor it. It rides as the cause of an
+// apperr.Unavailable, so errors.As can recover it while the outer error stays
+// HTTP-agnostic and retryable.
+type RateLimitedError struct {
+	Status     int
+	RetryAfter time.Duration
+	OAB        string
+	UF         string
+	Page       int
+}
+
+func (e *RateLimitedError) Error() string {
+	return fmt.Sprintf(
+		"djen rate limited: HTTP %d (oab %s/%s page %d), retry after %s",
+		e.Status, e.OAB, e.UF, e.Page, e.RetryAfter,
+	)
+}
+
+// cooldownGate is the shared circuit-breaker for the DJEN egress. On a rate block it
+// pushes forward a single deadline that EVERY concurrent slice waits on before its
+// next request — so the whole connector backs off together and the rate-limited IP
+// recovers, instead of 53 windows × their retries hammering it. The pause grows per
+// consecutive block (exponential, capped) and resets on the first clean page. Safe
+// for concurrent use.
+type cooldownGate struct {
+	mu          sync.Mutex
+	until       time.Time
+	consecutive int
+	now         func() time.Time
+}
+
+func newCooldownGate() *cooldownGate {
+	return &cooldownGate{now: time.Now}
+}
+
+// wait blocks until the current cooldown deadline passes or ctx is cancelled. It is a
+// no-op on the common path (no active cooldown).
+func (g *cooldownGate) wait(ctx context.Context) error {
+	g.mu.Lock()
+	d := g.until.Sub(g.now())
+	g.mu.Unlock()
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// trip extends the shared cooldown after a rate block and returns the pause applied.
+// A server Retry-After wins when present; otherwise the pause is exponential in the
+// consecutive-block count. Either way it is capped at djenCooldownMax so a worker slot
+// is never held too long. The shift is clamped so it can never overflow.
+func (g *cooldownGate) trip(retryAfter time.Duration) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	d := retryAfter
+	if d <= 0 {
+		shift := g.consecutive
+		if shift > 5 {
+			shift = 5
+		}
+		d = djenCooldownBase << shift
+	}
+	if d <= 0 || d > djenCooldownMax {
+		d = djenCooldownMax
+	}
+	g.consecutive++
+
+	if until := g.now().Add(d); until.After(g.until) {
+		g.until = until
+	}
+	return d
+}
+
+// reset clears the consecutive-block streak after a clean page, so the next block
+// starts its backoff from the base again.
+func (g *cooldownGate) reset() {
+	g.mu.Lock()
+	g.consecutive = 0
+	g.mu.Unlock()
+}
+
+// parseRetryAfter reads a Retry-After header (delta-seconds or HTTP-date) into a
+// duration, using now to turn a date into a delta. Returns 0 when absent, negative,
+// or unparseable — the caller then falls back to its exponential default.
+func parseRetryAfter(h string, now time.Time) time.Duration {
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(h); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

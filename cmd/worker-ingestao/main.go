@@ -118,6 +118,12 @@ func run(logger *slog.Logger) error {
 		djenOpts = append(djenOpts, acquisition.WithDJENProxy(proxyURL))
 		logger.Info("DJEN outbound proxy enabled", "service", serviceName, "proxy_host", proxyURL.Host)
 	}
+	// A gentler pace than the connector's 1 req/s default, dialable per env when a big
+	// OAB sweep 429s the DJEN egress (0 = keep the default).
+	if cfg.DJENRatePerMinute > 0 {
+		djenOpts = append(djenOpts, acquisition.WithDJENRatePerMinute(cfg.DJENRatePerMinute))
+		logger.Info("DJEN rate override", "service", serviceName, "rate_per_minute", cfg.DJENRatePerMinute)
+	}
 	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewDJENConnector(djenOpts...))
 	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewDATAJUDConnector())
 
