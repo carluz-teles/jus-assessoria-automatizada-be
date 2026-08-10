@@ -101,15 +101,15 @@ variable "stripe_trial_days" {
 }
 variable "billing_success_url" {
   type    = string
-  default = ""
+  default = "https://app.atjud.com.br/settings/billing?checkout=success"
 }
 variable "billing_cancel_url" {
   type    = string
-  default = ""
+  default = "https://app.atjud.com.br/settings/billing?checkout=canceled"
 }
 variable "billing_return_url" {
   type    = string
-  default = ""
+  default = "https://app.atjud.com.br/settings/billing?checkout=return"
 }
 
 # ---- Resend (notifications) — api usa o webhook secret; worker-ingestao envia e-mail ----
