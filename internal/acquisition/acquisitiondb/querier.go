@@ -66,8 +66,8 @@ type Querier interface {
 	// importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
 	GetLatestBackfillStatus(ctx context.Context, tenantID uuid.UUID) (GetLatestBackfillStatusRow, error)
 	// One import's guarda-chuva header (the detail screen), same shape/aggregation as
-	// ListReconciliationUmbrellas but for a single backfill_job.
-	GetReconciliationUmbrella(ctx context.Context, arg GetReconciliationUmbrellaParams) (GetReconciliationUmbrellaRow, error)
+	// ListReconciliations but for a single backfill_job.
+	GetReconciliation(ctx context.Context, arg GetReconciliationParams) (GetReconciliationRow, error)
 	// Count one failed slice; same atomic lock-and-read-back contract as
 	// IncrementBackfillSlicesOK. A job with any failed slice finalizes PARTIAL.
 	IncrementBackfillSlicesError(ctx context.Context, arg IncrementBackfillSlicesErrorParams) (IncrementBackfillSlicesErrorRow, error)
@@ -146,7 +146,7 @@ type Querier interface {
 	// the processes/intimations its windows discovered summed up, the job's overall
 	// date window (the janela de prazo geral) and slice tallies. finished_at is the
 	// last window close once the job is no longer RUNNING (NULL while running).
-	ListReconciliationUmbrellas(ctx context.Context, arg ListReconciliationUmbrellasParams) ([]ListReconciliationUmbrellasRow, error)
+	ListReconciliations(ctx context.Context, arg ListReconciliationsParams) ([]ListReconciliationsRow, error)
 	// The windows (sync_runs) of one import, chronological, with the failure reason
 	// lifted out of the error jsonb. Drives the detail screen's per-window table and
 	// the collapse (each row's id feeds ListProcessos/IntimacoesBySyncRun).

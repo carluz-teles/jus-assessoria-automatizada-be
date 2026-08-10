@@ -30,7 +30,7 @@ func findOrCreateCourtRecord(t *testing.T, pool *pgxpool.Pool, tenantID, cnj str
 
 	var got *acquisition.CourtRecord
 	err := uow.Do(context.Background(), tenantID, func(tx database.Tx) error {
-		cr, ferr := repo.FindOrCreateCourtRecord(context.Background(), tx, acquisition.FindOrCreateCourtRecordParams{
+		cr, _, ferr := repo.FindOrCreateCourtRecord(context.Background(), tx, acquisition.FindOrCreateCourtRecordParams{
 			TenantID:           tenantID,
 			CNJNumber:          cnj,
 			Degree:             acquisition.DegreeG1,

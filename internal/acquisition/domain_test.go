@@ -65,12 +65,12 @@ func (m *mockRepo) GetImportStatus(_ context.Context, _ string) (ImportStatusVie
 	return ImportStatusView{}, nil
 }
 
-func (m *mockRepo) ListReconciliationUmbrellas(_ context.Context, _ string, _ int) ([]ReconciliationUmbrellaView, error) {
+func (m *mockRepo) ListReconciliations(_ context.Context, _ string, _ int) ([]ReconciliationView, error) {
 	return nil, nil
 }
 
-func (m *mockRepo) GetReconciliationUmbrella(_ context.Context, _, _ string) (ReconciliationUmbrellaView, error) {
-	return ReconciliationUmbrellaView{}, nil
+func (m *mockRepo) GetReconciliation(_ context.Context, _, _ string) (ReconciliationView, error) {
+	return ReconciliationView{}, nil
 }
 
 func (m *mockRepo) ListSyncRunsByJob(_ context.Context, _, _ string) ([]ReconciliationRunView, error) {

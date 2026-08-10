@@ -41,8 +41,8 @@ WHERE i.tenant_id = $1
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
 
--- name: ListReconciliationUmbrellas :many
--- The reconciliations screen: one "guarda-chuva" per import (backfill_job), with
+-- name: ListReconciliations :many
+-- The reconciliations screen: one "reconciliação" per import (backfill_job), with
 -- the processes/intimations its windows discovered summed up, the job's overall
 -- date window (the janela de prazo geral) and slice tallies. finished_at is the
 -- last window close once the job is no longer RUNNING (NULL while running).
@@ -59,9 +59,9 @@ GROUP BY b.id, i.source
 ORDER BY b.created_at DESC, b.id DESC
 LIMIT $2;
 
--- name: GetReconciliationUmbrella :one
--- One import's guarda-chuva header (the detail screen), same shape/aggregation as
--- ListReconciliationUmbrellas but for a single backfill_job.
+-- name: GetReconciliation :one
+-- One import's reconciliação header (the detail screen), same shape/aggregation as
+-- ListReconciliations but for a single backfill_job.
 SELECT b.id, i.source, b.status, b.window_from, b.window_to,
        b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,
        COALESCE(SUM(s.court_records_new), 0)::bigint AS processos,

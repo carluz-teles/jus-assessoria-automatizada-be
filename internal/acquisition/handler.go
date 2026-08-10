@@ -150,7 +150,7 @@ func (h *Handler) reconciliations(c *fiber.Ctx) error {
 }
 
 // reconciliationDetail handles GET /v1/acquisition/reconciliations/:jobId: one
-// import's umbrella header + its per-window (sync_run) table. A miss is 404.
+// import's reconciliation header + its per-window (sync_run) table. A miss is 404.
 func (h *Handler) reconciliationDetail(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	view, err := h.reader.ReconciliationDetail(c.UserContext(), tenantID, c.Params("jobId"))

@@ -103,11 +103,11 @@ type ReconciliationTotals struct {
 	Intimations  int `json:"intimations"`
 }
 
-// ReconciliationUmbrellaView is one import (backfill_job) on the reconciliations
-// screen — the "guarda-chuva": the processes/intimations its windows discovered
+// ReconciliationView is one import (backfill_job) on the reconciliations
+// screen — the "reconciliação": the processes/intimations its windows discovered
 // (summed), the overall date window (janela de prazo geral), the slice tallies and
 // the lifecycle. The user drills into it for the per-window detail.
-type ReconciliationUmbrellaView struct {
+type ReconciliationView struct {
 	ID          string     `json:"id"`
 	Source      string     `json:"source"`
 	Status      string     `json:"status"` // RUNNING | COMPLETED | PARTIAL
@@ -123,18 +123,18 @@ type ReconciliationUmbrellaView struct {
 }
 
 // ReconciliationsView is the reconciliations screen read: the import banner state,
-// the tenant's acquired totals, and one card per import (umbrella), newest first.
+// the tenant's acquired totals, and one card per import (reconciliation), newest first.
 type ReconciliationsView struct {
-	Import    ImportStatusView             `json:"import"`
-	Totals    ReconciliationTotals         `json:"totals"`
-	Umbrellas []ReconciliationUmbrellaView `json:"umbrellas"`
+	Import          ImportStatusView     `json:"import"`
+	Totals          ReconciliationTotals `json:"totals"`
+	Reconciliations []ReconciliationView `json:"reconciliations"`
 }
 
-// ReconciliationDetailView is the deep view of one import: its umbrella header plus
+// ReconciliationDetailView is the deep view of one import: its reconciliation header plus
 // every window (sync_run), chronological — the detail screen's table.
 type ReconciliationDetailView struct {
-	Umbrella ReconciliationUmbrellaView `json:"umbrella"`
-	Windows  []ReconciliationRunView    `json:"windows"`
+	Reconciliation ReconciliationView      `json:"reconciliation"`
+	Windows        []ReconciliationRunView `json:"windows"`
 }
 
 // ProcessoLineView / IntimacaoLineView are the compact rows a window's collapse
@@ -164,7 +164,7 @@ type SyncRunItemsView struct {
 	Intimacoes []IntimacaoLineView `json:"intimacoes"`
 }
 
-// reconciliationRunsLimit caps the umbrella list: one screenful of imports, newest
+// reconciliationRunsLimit caps the reconciliation list: one screenful of imports, newest
 // first (an eventual "ver mais" pages beyond it).
 const reconciliationRunsLimit = 60
 
@@ -175,8 +175,8 @@ type readRepo interface {
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
-	ListReconciliationUmbrellas(ctx context.Context, tenantID string, limit int) ([]ReconciliationUmbrellaView, error)
-	GetReconciliationUmbrella(ctx context.Context, tenantID, jobID string) (ReconciliationUmbrellaView, error)
+	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
+	GetReconciliation(ctx context.Context, tenantID, jobID string) (ReconciliationView, error)
 	ListSyncRunsByJob(ctx context.Context, tenantID, jobID string) ([]ReconciliationRunView, error)
 	ListProcessosBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]ProcessoLineView, error)
 	ListIntimacoesBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]IntimacaoLineView, error)
@@ -215,7 +215,7 @@ func (uc *ReadUseCase) ImportStatus(ctx context.Context, tenantID string) (Impor
 }
 
 // Reconciliations returns the reconciliations screen read: import banner state +
-// acquired totals + one umbrella per import. Three pool reads, no tx — a read
+// acquired totals + one reconciliation per import. Three pool reads, no tx — a read
 // model, not an aggregate; a small skew between them under concurrent syncs is fine.
 func (uc *ReadUseCase) Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error) {
 	imp, err := uc.repo.GetImportStatus(ctx, tenantID)
@@ -226,18 +226,18 @@ func (uc *ReadUseCase) Reconciliations(ctx context.Context, tenantID string) (Re
 	if err != nil {
 		return ReconciliationsView{}, err
 	}
-	umbrellas, err := uc.repo.ListReconciliationUmbrellas(ctx, tenantID, reconciliationRunsLimit)
+	recons, err := uc.repo.ListReconciliations(ctx, tenantID, reconciliationRunsLimit)
 	if err != nil {
 		return ReconciliationsView{}, err
 	}
-	return ReconciliationsView{Import: imp, Totals: totals, Umbrellas: umbrellas}, nil
+	return ReconciliationsView{Import: imp, Totals: totals, Reconciliations: recons}, nil
 }
 
-// ReconciliationDetail returns one import's guarda-chuva header plus every window
+// ReconciliationDetail returns one import's reconciliação header plus every window
 // (sync_run) it fanned out, chronological — the detail screen. A miss on the
-// umbrella surfaces as the repo's typed not-found.
+// reconciliation surfaces as the repo's typed not-found.
 func (uc *ReadUseCase) ReconciliationDetail(ctx context.Context, tenantID, jobID string) (ReconciliationDetailView, error) {
-	umbrella, err := uc.repo.GetReconciliationUmbrella(ctx, tenantID, jobID)
+	reconciliation, err := uc.repo.GetReconciliation(ctx, tenantID, jobID)
 	if err != nil {
 		return ReconciliationDetailView{}, err
 	}
@@ -245,7 +245,7 @@ func (uc *ReadUseCase) ReconciliationDetail(ctx context.Context, tenantID, jobID
 	if err != nil {
 		return ReconciliationDetailView{}, err
 	}
-	return ReconciliationDetailView{Umbrella: umbrella, Windows: windows}, nil
+	return ReconciliationDetailView{Reconciliation: reconciliation, Windows: windows}, nil
 }
 
 // SyncRunItems returns a window's collapse payload: the processes and intimations it

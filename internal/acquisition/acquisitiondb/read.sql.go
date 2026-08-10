@@ -25,7 +25,7 @@ func (q *Queries) CountIntimationsByTenant(ctx context.Context, tenantID uuid.UU
 	return count, err
 }
 
-const getReconciliationUmbrella = `-- name: GetReconciliationUmbrella :one
+const getReconciliation = `-- name: GetReconciliation :one
 SELECT b.id, i.source, b.status, b.window_from, b.window_to,
        b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,
        COALESCE(SUM(s.court_records_new), 0)::bigint AS processos,
@@ -38,12 +38,12 @@ WHERE b.tenant_id = $1 AND b.id = $2
 GROUP BY b.id, i.source
 `
 
-type GetReconciliationUmbrellaParams struct {
+type GetReconciliationParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	ID       uuid.UUID `json:"id"`
 }
 
-type GetReconciliationUmbrellaRow struct {
+type GetReconciliationRow struct {
 	ID          uuid.UUID          `json:"id"`
 	Source      string             `json:"source"`
 	Status      string             `json:"status"`
@@ -59,10 +59,10 @@ type GetReconciliationUmbrellaRow struct {
 }
 
 // One import's guarda-chuva header (the detail screen), same shape/aggregation as
-// ListReconciliationUmbrellas but for a single backfill_job.
-func (q *Queries) GetReconciliationUmbrella(ctx context.Context, arg GetReconciliationUmbrellaParams) (GetReconciliationUmbrellaRow, error) {
-	row := q.db.QueryRow(ctx, getReconciliationUmbrella, arg.TenantID, arg.ID)
-	var i GetReconciliationUmbrellaRow
+// ListReconciliations but for a single backfill_job.
+func (q *Queries) GetReconciliation(ctx context.Context, arg GetReconciliationParams) (GetReconciliationRow, error) {
+	row := q.db.QueryRow(ctx, getReconciliation, arg.TenantID, arg.ID)
+	var i GetReconciliationRow
 	err := row.Scan(
 		&i.ID,
 		&i.Source,
@@ -352,7 +352,7 @@ func (q *Queries) ListProcessosBySyncRun(ctx context.Context, arg ListProcessosB
 	return items, nil
 }
 
-const listReconciliationUmbrellas = `-- name: ListReconciliationUmbrellas :many
+const listReconciliations = `-- name: ListReconciliations :many
 SELECT b.id, i.source, b.status, b.window_from, b.window_to,
        b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,
        COALESCE(SUM(s.court_records_new), 0)::bigint AS processos,
@@ -367,12 +367,12 @@ ORDER BY b.created_at DESC, b.id DESC
 LIMIT $2
 `
 
-type ListReconciliationUmbrellasParams struct {
+type ListReconciliationsParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	Limit    int32     `json:"limit"`
 }
 
-type ListReconciliationUmbrellasRow struct {
+type ListReconciliationsRow struct {
 	ID          uuid.UUID          `json:"id"`
 	Source      string             `json:"source"`
 	Status      string             `json:"status"`
@@ -391,15 +391,15 @@ type ListReconciliationUmbrellasRow struct {
 // the processes/intimations its windows discovered summed up, the job's overall
 // date window (the janela de prazo geral) and slice tallies. finished_at is the
 // last window close once the job is no longer RUNNING (NULL while running).
-func (q *Queries) ListReconciliationUmbrellas(ctx context.Context, arg ListReconciliationUmbrellasParams) ([]ListReconciliationUmbrellasRow, error) {
-	rows, err := q.db.Query(ctx, listReconciliationUmbrellas, arg.TenantID, arg.Limit)
+func (q *Queries) ListReconciliations(ctx context.Context, arg ListReconciliationsParams) ([]ListReconciliationsRow, error) {
+	rows, err := q.db.Query(ctx, listReconciliations, arg.TenantID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListReconciliationUmbrellasRow
+	var items []ListReconciliationsRow
 	for rows.Next() {
-		var i ListReconciliationUmbrellasRow
+		var i ListReconciliationsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Source,

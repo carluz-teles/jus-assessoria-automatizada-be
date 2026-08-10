@@ -61,8 +61,8 @@ type Repository interface {
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
-	ListReconciliationUmbrellas(ctx context.Context, tenantID string, limit int) ([]ReconciliationUmbrellaView, error)
-	GetReconciliationUmbrella(ctx context.Context, tenantID, jobID string) (ReconciliationUmbrellaView, error)
+	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
+	GetReconciliation(ctx context.Context, tenantID, jobID string) (ReconciliationView, error)
 	ListSyncRunsByJob(ctx context.Context, tenantID, jobID string) ([]ReconciliationRunView, error)
 	ListProcessosBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]ProcessoLineView, error)
 	ListIntimacoesBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]IntimacaoLineView, error)
@@ -219,24 +219,24 @@ func (r *pgRepository) ListSyncRunsByJob(ctx context.Context, tenantID, jobID st
 	return views, nil
 }
 
-// ListReconciliationUmbrellas returns one umbrella per import (backfill_job) for the
+// ListReconciliations returns one reconciliation per import (backfill_job) for the
 // reconciliations screen — a pool read scoped by tenant_id (barrier 1). Each row
 // aggregates its windows' processos/intimações; the mapper absorbs the pgtype cols.
-func (r *pgRepository) ListReconciliationUmbrellas(ctx context.Context, tenantID string, limit int) ([]ReconciliationUmbrellaView, error) {
+func (r *pgRepository) ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	rows, err := r.q.ListReconciliationUmbrellas(ctx, acquisitiondb.ListReconciliationUmbrellasParams{
+	rows, err := r.q.ListReconciliations(ctx, acquisitiondb.ListReconciliationsParams{
 		TenantID: tid,
 		Limit:    int32(limit),
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	views := make([]ReconciliationUmbrellaView, 0, len(rows))
+	views := make([]ReconciliationView, 0, len(rows))
 	for _, row := range rows {
-		views = append(views, ReconciliationUmbrellaView{
+		views = append(views, ReconciliationView{
 			ID:          row.ID.String(),
 			Source:      row.Source,
 			Status:      row.Status,
@@ -254,28 +254,28 @@ func (r *pgRepository) ListReconciliationUmbrellas(ctx context.Context, tenantID
 	return views, nil
 }
 
-// GetReconciliationUmbrella returns one import's umbrella header — the detail
+// GetReconciliation returns one import's reconciliation header — the detail
 // screen's card. A miss (unknown/other-tenant job) is the typed ENTITY_NOT_FOUND.
-func (r *pgRepository) GetReconciliationUmbrella(ctx context.Context, tenantID, jobID string) (ReconciliationUmbrellaView, error) {
+func (r *pgRepository) GetReconciliation(ctx context.Context, tenantID, jobID string) (ReconciliationView, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
-		return ReconciliationUmbrellaView{}, database.WrapInfra(err)
+		return ReconciliationView{}, database.WrapInfra(err)
 	}
 	jid, err := uuid.Parse(jobID)
 	if err != nil {
-		return ReconciliationUmbrellaView{}, apperr.NewNotFound("reconciliação não encontrada")
+		return ReconciliationView{}, apperr.NewNotFound("reconciliação não encontrada")
 	}
-	row, err := r.q.GetReconciliationUmbrella(ctx, acquisitiondb.GetReconciliationUmbrellaParams{
+	row, err := r.q.GetReconciliation(ctx, acquisitiondb.GetReconciliationParams{
 		TenantID: tid,
 		ID:       jid,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ReconciliationUmbrellaView{}, apperr.NewNotFound("reconciliação não encontrada")
+		return ReconciliationView{}, apperr.NewNotFound("reconciliação não encontrada")
 	}
 	if err != nil {
-		return ReconciliationUmbrellaView{}, database.WrapInfra(err)
+		return ReconciliationView{}, database.WrapInfra(err)
 	}
-	return ReconciliationUmbrellaView{
+	return ReconciliationView{
 		ID:          row.ID.String(),
 		Source:      row.Source,
 		Status:      row.Status,
