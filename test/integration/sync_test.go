@@ -42,10 +42,13 @@ func newSyncUC(pool *pgxpool.Pool) *acquisition.SyncUseCase {
 // syncEvent builds a valid sync_requested event with a fresh event id (so a
 // second call is a distinct delivery, not a dedup no-op). Source is DJEN so the
 // orchestrator resolves a connector.
-func syncEvent(tenantID, integrationID string) acquisition.SyncRequested {
+func syncEvent(t *testing.T, pool *pgxpool.Pool, tenantID, integrationID string) acquisition.SyncRequested {
 	return acquisition.SyncRequested{
-		Base:          events.Base{EventID: uuid.NewString(), Aggregate: integrationID},
-		BackfillJobID: uuid.NewString(),
+		Base: events.Base{EventID: uuid.NewString(), Aggregate: integrationID},
+		// A REAL backfill_job so sync_run.backfill_job_id's FK holds. Non-empty also
+		// keeps the cycle on the backfill path (unlimited — this UC wires no
+		// entitlement checker).
+		BackfillJobID: seedBackfillJob(t, pool, tenantID, integrationID, 1),
 		TenantID:      tenantID,
 		IntegrationID: integrationID,
 		Source:        acquisition.SourceDJEN,
@@ -72,7 +75,7 @@ func TestSync_FirstDelivery_RunOK(t *testing.T) {
 	seedTenant(t, pool, tenantID, "org-sync-1", 0)
 	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
 
-	if err := newSyncUC(pool).OnSyncRequested(context.Background(), syncEvent(tenantID, integID)); err != nil {
+	if err := newSyncUC(pool).OnSyncRequested(context.Background(), syncEvent(t, pool, tenantID, integID)); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v", err)
 	}
 
@@ -107,10 +110,10 @@ func TestSync_CourtRecordUpsert_Idempotent(t *testing.T) {
 
 	uc := newSyncUC(pool)
 	ctx := context.Background()
-	if err := uc.OnSyncRequested(ctx, syncEvent(tenantID, integID)); err != nil {
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
 		t.Fatalf("first delivery: %v", err)
 	}
-	if err := uc.OnSyncRequested(ctx, syncEvent(tenantID, integID)); err != nil {
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
 		t.Fatalf("second delivery: %v", err)
 	}
 
@@ -133,10 +136,10 @@ func TestSync_DocketEntry_OnConflictDoNothing(t *testing.T) {
 
 	uc := newSyncUC(pool)
 	ctx := context.Background()
-	if err := uc.OnSyncRequested(ctx, syncEvent(tenantID, integID)); err != nil {
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
 		t.Fatalf("first delivery: %v", err)
 	}
-	if err := uc.OnSyncRequested(ctx, syncEvent(tenantID, integID)); err != nil {
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
 		t.Fatalf("second delivery: %v", err)
 	}
 
@@ -170,7 +173,7 @@ func TestSync_SyncCompleted_SameTxAsRun(t *testing.T) {
 	seedTenant(t, pool, tenantID, "org-sync-4", 0)
 	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
 
-	if err := newSyncUC(pool).OnSyncRequested(context.Background(), syncEvent(tenantID, integID)); err != nil {
+	if err := newSyncUC(pool).OnSyncRequested(context.Background(), syncEvent(t, pool, tenantID, integID)); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v", err)
 	}
 
@@ -209,7 +212,7 @@ func TestSync_SyncRun_PersistsEventID(t *testing.T) {
 	seedTenant(t, pool, tenantID, "org-sync-evt", 0)
 	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
 
-	ev := syncEvent(tenantID, integID)
+	ev := syncEvent(t, pool, tenantID, integID)
 	if err := newSyncUC(pool).OnSyncRequested(context.Background(), ev); err != nil {
 		t.Fatalf("OnSyncRequested() error = %v", err)
 	}
@@ -236,7 +239,7 @@ func TestSync_RedeliveryRunningRun_ResumesAndCloses(t *testing.T) {
 	seedTenant(t, pool, tenantID, "org-sync-resume", 0)
 	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
 
-	ev := syncEvent(tenantID, integID)
+	ev := syncEvent(t, pool, tenantID, integID)
 
 	// The crashed prior attempt: a RUNNING run tagged with this event id ...
 	var stuckRunID string
@@ -298,7 +301,7 @@ func TestSync_RLS_TenantIsolation(t *testing.T) {
 	seedTenant(t, pool, tenantB, "org-sync-rls-b", 0)
 	integA := seedIntegration(t, pool, tenantA, acquisition.SourceDJEN)
 
-	if err := newSyncUC(pool).OnSyncRequested(context.Background(), syncEvent(tenantA, integA)); err != nil {
+	if err := newSyncUC(pool).OnSyncRequested(context.Background(), syncEvent(t, pool, tenantA, integA)); err != nil {
 		t.Fatalf("sync A: %v", err)
 	}
 
@@ -391,7 +394,7 @@ func TestSync_ConcurrentRedelivery_PublishesCompletedOnce(t *testing.T) {
 	seedTenant(t, pool, tenantID, "org-sync-concurrent", 0)
 	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
 
-	ev := syncEvent(tenantID, integID)
+	ev := syncEvent(t, pool, tenantID, integID)
 
 	// Pre-seed the fixture's court record so both executions take the find (not
 	// create) path — the record's own create-concurrency is a separate concern.
