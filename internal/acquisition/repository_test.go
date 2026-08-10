@@ -103,6 +103,7 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 					tt.wantCancel,    // cancelled_at
 					pgxmock.AnyArg(), // cancel_reason
 					pgxmock.AnyArg(), // recipients
+					pgxmock.AnyArg(), // sync_run_id
 				).
 				WillReturnRows(
 					pgxmock.NewRows([]string{"id", "inserted"}).

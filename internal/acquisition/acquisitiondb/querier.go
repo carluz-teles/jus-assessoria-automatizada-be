@@ -65,6 +65,9 @@ type Querier interface {
 	// opens a new job). No job ever → no row; the read use case maps that to NONE (not
 	// importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
 	GetLatestBackfillStatus(ctx context.Context, tenantID uuid.UUID) (GetLatestBackfillStatusRow, error)
+	// One import's guarda-chuva header (the detail screen), same shape/aggregation as
+	// ListReconciliationUmbrellas but for a single backfill_job.
+	GetReconciliationUmbrella(ctx context.Context, arg GetReconciliationUmbrellaParams) (GetReconciliationUmbrellaRow, error)
 	// Count one failed slice; same atomic lock-and-read-back contract as
 	// IncrementBackfillSlicesOK. A job with any failed slice finalizes PARTIAL.
 	IncrementBackfillSlicesError(ctx context.Context, arg IncrementBackfillSlicesErrorParams) (IncrementBackfillSlicesErrorRow, error)
@@ -124,6 +127,8 @@ type Querier interface {
 	// (made_available_at, id); the first page passes the max sentinel
 	// ('9999-12-31', max-uuid).
 	ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error)
+	// The intimations a window first discovered (collapse), newest availability first.
+	ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoesBySyncRunParams) ([]ListIntimacoesBySyncRunRow, error)
 	// read-model queries (acquisition slice) — the screen reads, kept OFF the write
 	// path (docs: "leitura de tela usa read model, DTO por query dedicada"). Each is
 	// tenant-scoped (barrier 1) and keyset-paginated on a stable (sort_key, id) pair
@@ -134,10 +139,18 @@ type Querier interface {
 	// movement" column. Ordered by cnj_number then id (ascending keyset): the first
 	// page passes ('', zero-uuid).
 	ListProcessos(ctx context.Context, arg ListProcessosParams) ([]ListProcessosRow, error)
-	// The reconciliations screen: the tenant's most recent sync executions, newest
-	// first, with the integration's source joined in and the failure reason lifted
-	// out of the error jsonb ({"message": …} → text, NULL on success).
-	ListRecentSyncRuns(ctx context.Context, arg ListRecentSyncRunsParams) ([]ListRecentSyncRunsRow, error)
+	// The court records a window first discovered (collapse). Scoped by tenant (RLS +
+	// filter) and the discovering sync_run_id; bounded defensively.
+	ListProcessosBySyncRun(ctx context.Context, arg ListProcessosBySyncRunParams) ([]ListProcessosBySyncRunRow, error)
+	// The reconciliations screen: one "guarda-chuva" per import (backfill_job), with
+	// the processes/intimations its windows discovered summed up, the job's overall
+	// date window (the janela de prazo geral) and slice tallies. finished_at is the
+	// last window close once the job is no longer RUNNING (NULL while running).
+	ListReconciliationUmbrellas(ctx context.Context, arg ListReconciliationUmbrellasParams) ([]ListReconciliationUmbrellasRow, error)
+	// The windows (sync_runs) of one import, chronological, with the failure reason
+	// lifted out of the error jsonb. Drives the detail screen's per-window table and
+	// the collapse (each row's id feeds ListProcessos/IntimacoesBySyncRun).
+	ListSyncRunsByJob(ctx context.Context, arg ListSyncRunsByJobParams) ([]ListSyncRunsByJobRow, error)
 	// Record that a sync touched this court record: refresh its completeness and
 	// schedule the next sweep (next_sync_at drives the scheduler slice later).
 	// judging_body is COALESCEd, not overwritten: a sync that does not disclose the

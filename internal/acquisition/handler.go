@@ -31,6 +31,8 @@ type reader interface {
 	Intimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, bool, error)
 	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error)
+	ReconciliationDetail(ctx context.Context, tenantID, jobID string) (ReconciliationDetailView, error)
+	SyncRunItems(ctx context.Context, tenantID, syncRunID string) (SyncRunItemsView, error)
 }
 
 // Handler is the acquisition HTTP surface. It owns its routing; the api only
@@ -53,6 +55,8 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/acquisition/integrations", h.list)
 	r.Get("/acquisition/import-status", h.importStatus)
 	r.Get("/acquisition/reconciliations", h.reconciliations)
+	r.Get("/acquisition/reconciliations/:jobId", h.reconciliationDetail)
+	r.Get("/acquisition/sync-runs/:syncRunId/items", h.syncRunItems)
 	r.Get("/processos", h.listProcessos)
 	r.Get("/intimacoes", h.listIntimacoes)
 }
@@ -139,6 +143,28 @@ func (h *Handler) importStatus(c *fiber.Ctx) error {
 func (h *Handler) reconciliations(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	view, err := h.reader.Reconciliations(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// reconciliationDetail handles GET /v1/acquisition/reconciliations/:jobId: one
+// import's umbrella header + its per-window (sync_run) table. A miss is 404.
+func (h *Handler) reconciliationDetail(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.ReconciliationDetail(c.UserContext(), tenantID, c.Params("jobId"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// syncRunItems handles GET /v1/acquisition/sync-runs/:syncRunId/items: the collapse
+// payload for one window — the processes and intimations it first discovered.
+func (h *Handler) syncRunItems(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.SyncRunItems(c.UserContext(), tenantID, c.Params("syncRunId"))
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}

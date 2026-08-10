@@ -82,6 +82,7 @@ type CourtRecord struct {
 	LastSyncedAt []byte             `json:"last_synced_at"`
 	JudgingBody  *string            `json:"judging_body"`
 	FiledAt      pgtype.Date        `json:"filed_at"`
+	SyncRunID    pgtype.UUID        `json:"sync_run_id"`
 }
 
 type Deadline struct {
@@ -172,6 +173,7 @@ type Intimation struct {
 	SourceUrl       *string     `json:"source_url"`
 	CancelledAt     pgtype.Date `json:"cancelled_at"`
 	CancelReason    *string     `json:"cancel_reason"`
+	SyncRunID       pgtype.UUID `json:"sync_run_id"`
 }
 
 type Membership struct {
@@ -283,6 +285,9 @@ type SyncRun struct {
 	EventID          *string            `json:"event_id"`
 	WindowFrom       pgtype.Date        `json:"window_from"`
 	WindowTo         pgtype.Date        `json:"window_to"`
+	BackfillJobID    pgtype.UUID        `json:"backfill_job_id"`
+	CourtRecordsNew  int32              `json:"court_records_new"`
+	IntimationsNew   int32              `json:"intimations_new"`
 }
 
 type Tenant struct {

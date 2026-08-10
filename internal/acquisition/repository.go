@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jusassessoria/platform/internal/acquisition/acquisitiondb"
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 )
 
@@ -39,7 +40,7 @@ type Repository interface {
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
-	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
+	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (record *CourtRecord, created bool, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
 
@@ -59,8 +60,12 @@ type Repository interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
-	ListRecentSyncRuns(ctx context.Context, tenantID string, limit int) ([]ReconciliationRunView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
+	ListReconciliationUmbrellas(ctx context.Context, tenantID string, limit int) ([]ReconciliationUmbrellaView, error)
+	GetReconciliationUmbrella(ctx context.Context, tenantID, jobID string) (ReconciliationUmbrellaView, error)
+	ListSyncRunsByJob(ctx context.Context, tenantID, jobID string) ([]ReconciliationRunView, error)
+	ListProcessosBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]ProcessoLineView, error)
+	ListIntimacoesBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]IntimacaoLineView, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -169,18 +174,18 @@ func (r *pgRepository) GetImportStatus(ctx context.Context, tenantID string) (Im
 	}, nil
 }
 
-// ListRecentSyncRuns returns the tenant's most recent sync executions for the
-// reconciliations screen — a pool read scoped by tenant_id (barrier 1). The mapper
-// absorbs the pgtype columns: NULL windows become empty strings, the COALESCEd
-// empty error message becomes a nil pointer (JSON null).
-func (r *pgRepository) ListRecentSyncRuns(ctx context.Context, tenantID string, limit int) ([]ReconciliationRunView, error) {
+// ListSyncRunsByJob returns the windows (sync_runs) of one import, chronological,
+// for the reconciliation detail screen — a pool read scoped by tenant_id (barrier
+// 1). The mapper absorbs the pgtype columns: NULL windows become empty strings, the
+// COALESCEd empty error message becomes a nil pointer (JSON null).
+func (r *pgRepository) ListSyncRunsByJob(ctx context.Context, tenantID, jobID string) ([]ReconciliationRunView, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	rows, err := r.q.ListRecentSyncRuns(ctx, acquisitiondb.ListRecentSyncRunsParams{
-		TenantID: tid,
-		Limit:    int32(limit),
+	rows, err := r.q.ListSyncRunsByJob(ctx, acquisitiondb.ListSyncRunsByJobParams{
+		TenantID:      tid,
+		BackfillJobID: nullUUID(jobID),
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -188,12 +193,12 @@ func (r *pgRepository) ListRecentSyncRuns(ctx context.Context, tenantID string, 
 	views := make([]ReconciliationRunView, 0, len(rows))
 	for _, row := range rows {
 		v := ReconciliationRunView{
-			ID:           row.ID.String(),
-			Source:       row.Source,
-			Status:       row.Status,
-			ItemsNew:     int(row.ItemsNew),
-			ItemsDeduped: int(row.ItemsDeduped),
-			StartedAt:    row.StartedAt.Time,
+			ID:            row.ID.String(),
+			Source:        row.Source,
+			Status:        row.Status,
+			ProcessosNew:  int(row.CourtRecordsNew),
+			IntimacoesNew: int(row.IntimationsNew),
+			StartedAt:     row.StartedAt.Time,
 		}
 		if row.WindowFrom.Valid {
 			v.WindowFrom = row.WindowFrom.Time.Format(dateLayout)
@@ -210,6 +215,133 @@ func (r *pgRepository) ListRecentSyncRuns(ctx context.Context, tenantID string, 
 			v.FinishedAt = &finished
 		}
 		views = append(views, v)
+	}
+	return views, nil
+}
+
+// ListReconciliationUmbrellas returns one umbrella per import (backfill_job) for the
+// reconciliations screen — a pool read scoped by tenant_id (barrier 1). Each row
+// aggregates its windows' processos/intimações; the mapper absorbs the pgtype cols.
+func (r *pgRepository) ListReconciliationUmbrellas(ctx context.Context, tenantID string, limit int) ([]ReconciliationUmbrellaView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListReconciliationUmbrellas(ctx, acquisitiondb.ListReconciliationUmbrellasParams{
+		TenantID: tid,
+		Limit:    int32(limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	views := make([]ReconciliationUmbrellaView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, ReconciliationUmbrellaView{
+			ID:          row.ID.String(),
+			Source:      row.Source,
+			Status:      row.Status,
+			WindowFrom:  dateOrEmpty(row.WindowFrom),
+			WindowTo:    dateOrEmpty(row.WindowTo),
+			Processos:   int(row.Processos),
+			Intimacoes:  int(row.Intimacoes),
+			TotalSlices: int(row.TotalSlices),
+			SlicesOK:    int(row.SlicesOk),
+			SlicesError: int(row.SlicesError),
+			StartedAt:   row.StartedAt.Time,
+			FinishedAt:  timestampPtr(row.FinishedAt),
+		})
+	}
+	return views, nil
+}
+
+// GetReconciliationUmbrella returns one import's umbrella header — the detail
+// screen's card. A miss (unknown/other-tenant job) is the typed ENTITY_NOT_FOUND.
+func (r *pgRepository) GetReconciliationUmbrella(ctx context.Context, tenantID, jobID string) (ReconciliationUmbrellaView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return ReconciliationUmbrellaView{}, database.WrapInfra(err)
+	}
+	jid, err := uuid.Parse(jobID)
+	if err != nil {
+		return ReconciliationUmbrellaView{}, apperr.NewNotFound("reconciliação não encontrada")
+	}
+	row, err := r.q.GetReconciliationUmbrella(ctx, acquisitiondb.GetReconciliationUmbrellaParams{
+		TenantID: tid,
+		ID:       jid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ReconciliationUmbrellaView{}, apperr.NewNotFound("reconciliação não encontrada")
+	}
+	if err != nil {
+		return ReconciliationUmbrellaView{}, database.WrapInfra(err)
+	}
+	return ReconciliationUmbrellaView{
+		ID:          row.ID.String(),
+		Source:      row.Source,
+		Status:      row.Status,
+		WindowFrom:  dateOrEmpty(row.WindowFrom),
+		WindowTo:    dateOrEmpty(row.WindowTo),
+		Processos:   int(row.Processos),
+		Intimacoes:  int(row.Intimacoes),
+		TotalSlices: int(row.TotalSlices),
+		SlicesOK:    int(row.SlicesOk),
+		SlicesError: int(row.SlicesError),
+		StartedAt:   row.StartedAt.Time,
+		FinishedAt:  timestampPtr(row.FinishedAt),
+	}, nil
+}
+
+// ListProcessosBySyncRun / ListIntimacoesBySyncRun back the collapse: the processes
+// and intimations a window first discovered (court_record/intimation.sync_run_id),
+// scoped by tenant_id (barrier 1). Empty (never nil) when the window brought none.
+func (r *pgRepository) ListProcessosBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]ProcessoLineView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListProcessosBySyncRun(ctx, acquisitiondb.ListProcessosBySyncRunParams{
+		TenantID:  tid,
+		SyncRunID: nullUUID(syncRunID),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	views := make([]ProcessoLineView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, ProcessoLineView{
+			ID:        row.ID.String(),
+			CNJNumber: row.CnjNumber,
+			Court:     row.Court,
+			Degree:    row.Degree,
+			Class:     derefString(row.Class),
+		})
+	}
+	return views, nil
+}
+
+func (r *pgRepository) ListIntimacoesBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]IntimacaoLineView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListIntimacoesBySyncRun(ctx, acquisitiondb.ListIntimacoesBySyncRunParams{
+		TenantID:  tid,
+		SyncRunID: nullUUID(syncRunID),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	views := make([]IntimacaoLineView, 0, len(rows))
+	for _, row := range rows {
+		views = append(views, IntimacaoLineView{
+			ID:              row.ID.String(),
+			CNJNumber:       row.CnjNumber,
+			Court:           row.Court,
+			Degree:          row.Degree,
+			Type:            derefString(row.Type),
+			Status:          row.Status,
+			MadeAvailableAt: row.MadeAvailableAt.Time,
+		})
 	}
 	return views, nil
 }
@@ -381,6 +513,7 @@ func (r *pgRepository) InsertSyncRun(ctx context.Context, tx database.Tx, params
 		EventID:          nullString(params.EventID),
 		WindowFrom:       wireDateOrNull(params.WindowFrom),
 		WindowTo:         wireDateOrNull(params.WindowTo),
+		BackfillJobID:    nullUUID(params.BackfillJobID),
 	})
 	if err != nil {
 		return "", database.WrapInfra(err)
@@ -420,12 +553,14 @@ func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcom
 		return false, err
 	}
 	_, err = acquisitiondb.New(tx).UpdateSyncRun(ctx, acquisitiondb.UpdateSyncRunParams{
-		ID:           id,
-		Status:       outcome.Status,
-		ItemsNew:     int32(outcome.ItemsNew),
-		ItemsDeduped: int32(outcome.ItemsDeduped),
-		FinishedAt:   pgtype.Timestamptz{Time: outcome.FinishedAt, Valid: true},
-		Error:        errJSON,
+		ID:              id,
+		Status:          outcome.Status,
+		ItemsNew:        int32(outcome.ItemsNew),
+		ItemsDeduped:    int32(outcome.ItemsDeduped),
+		CourtRecordsNew: int32(outcome.CourtRecordsNew),
+		IntimationsNew:  int32(outcome.IntimationsNew),
+		FinishedAt:      pgtype.Timestamptz{Time: outcome.FinishedAt, Valid: true},
+		Error:           errJSON,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -440,10 +575,10 @@ func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcom
 // caller's tx, creating the case+record on a miss, then marks it synced
 // (completeness + next_sync_at) whether new or found. It returns the entity the
 // cycle keys its docket/intimation upserts and observed events on.
-func (r *pgRepository) FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error) {
+func (r *pgRepository) FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
 	tid, err := uuid.Parse(params.TenantID)
 	if err != nil {
-		return nil, database.WrapInfra(err)
+		return nil, false, database.WrapInfra(err)
 	}
 	q := acquisitiondb.New(tx)
 
@@ -455,21 +590,22 @@ func (r *pgRepository) FindOrCreateCourtRecord(ctx context.Context, tx database.
 	switch {
 	case err == nil:
 		// HIT — reobservation of a record already tracked. Never gated: mark it synced
-		// and return, regardless of the entitlement ceiling.
+		// and return created=false (the sync_run_id/count belong to its first discoverer).
 		if merr := r.markCourtRecordSynced(ctx, q, row.ID, params); merr != nil {
-			return nil, merr
+			return nil, false, merr
 		}
-		return newCourtRecordEntity(row.ID, row.CaseID, params), nil
+		return newCourtRecordEntity(row.ID, row.CaseID, params), false, nil
 	case errors.Is(err, pgx.ErrNoRows):
 		// MISS — a brand-new process. This is the ONLY place the billing entitlement
 		// gates a create: refuse with ErrProcessLimitReached when the tenant is already
 		// at its active_process_limit, in the same tx as the pending INSERT.
 		if gerr := r.enforceProcessLimit(ctx, q, tid, params.ActiveProcessLimit); gerr != nil {
-			return nil, gerr
+			return nil, false, gerr
 		}
-		return r.createCourtRecord(ctx, q, tid, params)
+		cr, cerr := r.createCourtRecord(ctx, q, tid, params)
+		return cr, cerr == nil, cerr
 	default:
-		return nil, database.WrapInfra(err)
+		return nil, false, database.WrapInfra(err)
 	}
 }
 
@@ -506,6 +642,7 @@ func (r *pgRepository) createCourtRecord(ctx context.Context, q *acquisitiondb.Q
 		Subject:      nullString(params.Subject),
 		Completeness: params.Completeness,
 		JudgingBody:  nullString(params.JudgingBody),
+		SyncRunID:    nullUUID(params.SyncRunID),
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -610,6 +747,7 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 			CancelledAt:     nullDate(p.CancelledAt),
 			CancelReason:    nullString(p.CancelReason),
 			Recipients:      recipientsOrEmpty(p.Recipients),
+			SyncRunID:       nullUUID(p.SyncRunID),
 		})
 		if err != nil {
 			return 0, database.WrapInfra(err)
@@ -850,6 +988,37 @@ func nullString(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// nullUUID maps a string id to a nullable pgtype.UUID: empty or unparseable → SQL
+// NULL (Valid:false), so an optional lineage FK (sync_run_id, backfill_job_id) is
+// written NULL when absent.
+func nullUUID(s string) pgtype.UUID {
+	if s == "" {
+		return pgtype.UUID{}
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return pgtype.UUID{}
+	}
+	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+// derefString lifts a nullable text column (*string) to a plain string — empty on
+// NULL, for the compact read-model rows.
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// dateOrEmpty formats a date column to the wire layout (2006-01-02), empty on NULL.
+func dateOrEmpty(d pgtype.Date) string {
+	if !d.Valid {
+		return ""
+	}
+	return d.Time.Format(dateLayout)
 }
 
 // datePtr / timestampPtr lift a nullable driver date/timestamp to a *time.Time for

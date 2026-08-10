@@ -41,19 +41,69 @@ WHERE i.tenant_id = $1
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
 
--- name: ListRecentSyncRuns :many
--- The reconciliations screen: the tenant's most recent sync executions, newest
--- first, with the integration's source joined in and the failure reason lifted
--- out of the error jsonb ({"message": …} → text, NULL on success).
+-- name: ListReconciliationUmbrellas :many
+-- The reconciliations screen: one "guarda-chuva" per import (backfill_job), with
+-- the processes/intimations its windows discovered summed up, the job's overall
+-- date window (the janela de prazo geral) and slice tallies. finished_at is the
+-- last window close once the job is no longer RUNNING (NULL while running).
+SELECT b.id, i.source, b.status, b.window_from, b.window_to,
+       b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,
+       COALESCE(SUM(s.court_records_new), 0)::bigint AS processos,
+       COALESCE(SUM(s.intimations_new), 0)::bigint AS intimacoes,
+       (CASE WHEN b.status = 'RUNNING' THEN NULL ELSE MAX(s.finished_at) END)::timestamptz AS finished_at
+FROM backfill_job b
+JOIN integration i ON i.id = b.integration_id
+LEFT JOIN sync_run s ON s.backfill_job_id = b.id
+WHERE b.tenant_id = $1
+GROUP BY b.id, i.source
+ORDER BY b.created_at DESC, b.id DESC
+LIMIT $2;
+
+-- name: GetReconciliationUmbrella :one
+-- One import's guarda-chuva header (the detail screen), same shape/aggregation as
+-- ListReconciliationUmbrellas but for a single backfill_job.
+SELECT b.id, i.source, b.status, b.window_from, b.window_to,
+       b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,
+       COALESCE(SUM(s.court_records_new), 0)::bigint AS processos,
+       COALESCE(SUM(s.intimations_new), 0)::bigint AS intimacoes,
+       (CASE WHEN b.status = 'RUNNING' THEN NULL ELSE MAX(s.finished_at) END)::timestamptz AS finished_at
+FROM backfill_job b
+JOIN integration i ON i.id = b.integration_id
+LEFT JOIN sync_run s ON s.backfill_job_id = b.id
+WHERE b.tenant_id = $1 AND b.id = $2
+GROUP BY b.id, i.source;
+
+-- name: ListSyncRunsByJob :many
+-- The windows (sync_runs) of one import, chronological, with the failure reason
+-- lifted out of the error jsonb. Drives the detail screen's per-window table and
+-- the collapse (each row's id feeds ListProcessos/IntimacoesBySyncRun).
 SELECT s.id, i.source, s.window_from, s.window_to, s.status,
-       s.items_new, s.items_deduped,
+       s.court_records_new, s.intimations_new,
        COALESCE(s.error->>'message', '')::text AS error_message,
        s.started_at, s.finished_at
 FROM sync_run s
 JOIN integration i ON i.id = s.integration_id
-WHERE s.tenant_id = $1
-ORDER BY s.started_at DESC, s.id DESC
-LIMIT $2;
+WHERE s.tenant_id = $1 AND s.backfill_job_id = $2
+ORDER BY s.window_from ASC, s.started_at ASC;
+
+-- name: ListProcessosBySyncRun :many
+-- The court records a window first discovered (collapse). Scoped by tenant (RLS +
+-- filter) and the discovering sync_run_id; bounded defensively.
+SELECT cr.id, cr.cnj_number, cr.court, cr.degree, cr.class
+FROM court_record cr
+WHERE cr.tenant_id = $1 AND cr.sync_run_id = $2
+ORDER BY cr.cnj_number
+LIMIT 1000;
+
+-- name: ListIntimacoesBySyncRun :many
+-- The intimations a window first discovered (collapse), newest availability first.
+SELECT i.id, i.made_available_at, i.type, i.status,
+       cr.cnj_number, cr.court, cr.degree
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.tenant_id = $1 AND i.sync_run_id = $2
+ORDER BY i.made_available_at DESC, i.id DESC
+LIMIT 1000;
 
 -- name: CountIntimationsByTenant :one
 -- The reconciliations totals: how many intimations the tenant holds (paired with

@@ -57,17 +57,25 @@ type SyncRunParams struct {
 	EventID          string
 	WindowFrom       string
 	WindowTo         string
+	// BackfillJobID ties the run to the onboarding import that fanned it out (the
+	// "guarda-chuva"), so the reconciliations read can group windows by job. Empty
+	// for a continuous/scheduler sync (stored NULL).
+	BackfillJobID string
 }
 
 // SyncRunOutcome closes a run. Error is empty on OK (the repo writes NULL) and
-// carries the failure reason on FAILED.
+// carries the failure reason on FAILED. CourtRecordsNew/IntimationsNew are the
+// processes/intimations THIS window first discovered (items_new counts docket
+// entries, a different axis — see 0020_reconciliation_lineage).
 type SyncRunOutcome struct {
-	ID           string
-	Status       string
-	ItemsNew     int
-	ItemsDeduped int
-	FinishedAt   time.Time
-	Error        string
+	ID              string
+	Status          string
+	ItemsNew        int
+	ItemsDeduped    int
+	CourtRecordsNew int
+	IntimationsNew  int
+	FinishedAt      time.Time
+	Error           string
 }
 
 // FindOrCreateCourtRecordParams resolves-or-creates a court record and marks it
@@ -92,6 +100,10 @@ type FindOrCreateCourtRecordParams struct {
 	// never decides where the number comes from. A create is refused with
 	// ErrProcessLimitReached when the tenant's ACTIVE count already meets it.
 	ActiveProcessLimit int
+	// SyncRunID is the window that is discovering this record; the repo stamps it on
+	// the court_record ONLY on create (a reobservation keeps the original discoverer),
+	// so the reconciliations collapse can list the processes each window brought.
+	SyncRunID string
 }
 
 // DocketEntryParams is one andamento to upsert (idempotent on court_record+hash).
@@ -130,6 +142,9 @@ type IntimationParams struct {
 	CancelledAt     time.Time
 	CancelReason    string
 	Recipients      json.RawMessage
+	// SyncRunID is the window discovering this intimation; stamped on the row only on
+	// insert (a retraction/update keeps the original discoverer).
+	SyncRunID string
 }
 
 // syncRepo is the narrow persistence port the sync use case drives.
@@ -142,7 +157,7 @@ type syncRepo interface {
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
-	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, error)
+	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (record *CourtRecord, created bool, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
 }
@@ -319,6 +334,7 @@ func (uc *SyncUseCase) startRun(ctx context.Context, ev SyncRequested, connector
 			EventID:          ev.EventID,
 			WindowFrom:       ev.WindowFrom,
 			WindowTo:         ev.WindowTo,
+			BackfillJobID:    ev.BackfillJobID,
 		})
 		if ierr != nil {
 			return ierr
@@ -405,10 +421,11 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		records := make(map[string]*CourtRecord, len(parsed.CourtRecords))
 		ordered := make([]*CourtRecord, 0, len(parsed.CourtRecords))
 		blocked := make(map[string]bool)
+		courtRecordsNew := 0
 		nextSync := uc.now().Add(defaultSyncInterval)
 
 		for _, pr := range parsed.CourtRecords {
-			cr, err := uc.repo.FindOrCreateCourtRecord(ctx, tx, FindOrCreateCourtRecordParams{
+			cr, created, err := uc.repo.FindOrCreateCourtRecord(ctx, tx, FindOrCreateCourtRecordParams{
 				TenantID:           ev.TenantID,
 				CNJNumber:          pr.CNJNumber,
 				Degree:             pr.Degree,
@@ -419,6 +436,7 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 				JudgingBody:        pr.JudgingBody,
 				NextSyncAt:         nextSync,
 				ActiveProcessLimit: limit,
+				SyncRunID:          syncRunID,
 			})
 			if errors.Is(err, ErrProcessLimitReached) {
 				// Expected, not a failure: the tenant is at its plan ceiling and this is a
@@ -439,6 +457,9 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			}
 			records[recordKey(pr.CNJNumber, pr.Degree)] = cr
 			ordered = append(ordered, cr)
+			if created {
+				courtRecordsNew++
+			}
 		}
 
 		docketParams, err := docketParamsFor(parsed.DocketEntries, records, blocked)
@@ -450,11 +471,12 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			return err
 		}
 
-		intimParams, err := intimationParamsFor(ev.TenantID, parsed.Intimations, records, blocked)
+		intimParams, err := intimationParamsFor(ev.TenantID, syncRunID, parsed.Intimations, records, blocked)
 		if err != nil {
 			return err
 		}
-		if _, err := uc.repo.UpsertIntimations(ctx, tx, intimParams); err != nil {
+		intimationsNew, err := uc.repo.UpsertIntimations(ctx, tx, intimParams)
+		if err != nil {
 			return err
 		}
 
@@ -462,11 +484,13 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		itemsDeduped := len(docketParams) - itemsNew
 
 		closed, err := uc.repo.UpdateSyncRun(ctx, tx, SyncRunOutcome{
-			ID:           syncRunID,
-			Status:       SyncStatusOK,
-			ItemsNew:     itemsNew,
-			ItemsDeduped: itemsDeduped,
-			FinishedAt:   uc.now(),
+			ID:              syncRunID,
+			Status:          SyncStatusOK,
+			ItemsNew:        itemsNew,
+			ItemsDeduped:    itemsDeduped,
+			CourtRecordsNew: courtRecordsNew,
+			IntimationsNew:  intimationsNew,
+			FinishedAt:      uc.now(),
 		})
 		if err != nil {
 			return err
@@ -480,11 +504,13 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		}
 
 		tally = syncTally{
-			CourtRecords: len(ordered),
-			Intimations:  len(intimParams),
-			DocketNew:    itemsNew,
-			Deduped:      itemsDeduped,
-			Blocked:      len(blocked),
+			CourtRecords:    len(ordered),
+			CourtRecordsNew: courtRecordsNew,
+			Intimations:     len(intimParams),
+			IntimationsNew:  intimationsNew,
+			DocketNew:       itemsNew,
+			Deduped:         itemsDeduped,
+			Blocked:         len(blocked),
 		}
 		committed = true
 		return uc.publishObserved(ctx, tx, ev, syncRunID, ordered, newDocket, itemsNew, itemsDeduped)
@@ -503,11 +529,13 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 // syncTally is what one successful sync slice produced, for the completion span
 // attributes and the milestone log.
 type syncTally struct {
-	CourtRecords int
-	Intimations  int
-	DocketNew    int
-	Deduped      int
-	Blocked      int
+	CourtRecords    int
+	CourtRecordsNew int
+	Intimations     int
+	IntimationsNew  int
+	DocketNew       int
+	Deduped         int
+	Blocked         int
 }
 
 // syncLogArgs are the correlation keys every sync log carries so a failure is
@@ -543,7 +571,9 @@ func enrichSyncSpan(ctx context.Context, ev SyncRequested) {
 func (uc *SyncUseCase) logSyncCompleted(ctx context.Context, ev SyncRequested, syncRunID string, t syncTally) {
 	trace.SpanFromContext(ctx).SetAttributes(
 		attribute.Int("court_records", t.CourtRecords),
+		attribute.Int("court_records_new", t.CourtRecordsNew),
 		attribute.Int("intimations", t.Intimations),
+		attribute.Int("intimations_new", t.IntimationsNew),
 		attribute.Int("docket_new", t.DocketNew),
 		attribute.Int("deduped", t.Deduped),
 		attribute.Int("blocked", t.Blocked),
@@ -551,7 +581,9 @@ func (uc *SyncUseCase) logSyncCompleted(ctx context.Context, ev SyncRequested, s
 	slog.InfoContext(ctx, "acquisition: sync completed",
 		append(syncLogArgs(ev, syncRunID),
 			"court_records", t.CourtRecords,
+			"court_records_new", t.CourtRecordsNew,
 			"intimations", t.Intimations,
+			"intimations_new", t.IntimationsNew,
 			"docket_new", t.DocketNew,
 			"deduped", t.Deduped,
 			"blocked", t.Blocked,
@@ -607,7 +639,7 @@ func docketParamsFor(entries []ParsedDocketEntry, records map[string]*CourtRecor
 // intimationParamsFor resolves each parsed intimation to its case/record ids
 // via the find-or-create map, under the event's tenant. Same blocked-drop and
 // fail-closed rules as docket entries.
-func intimationParamsFor(tenantID string, intims []ParsedIntimation, records map[string]*CourtRecord, blocked map[string]bool) ([]IntimationParams, error) {
+func intimationParamsFor(tenantID, syncRunID string, intims []ParsedIntimation, records map[string]*CourtRecord, blocked map[string]bool) ([]IntimationParams, error) {
 	params := make([]IntimationParams, 0, len(intims))
 	for _, pn := range intims {
 		key := recordKey(pn.CNJNumber, pn.Degree)
@@ -640,6 +672,7 @@ func intimationParamsFor(tenantID string, intims []ParsedIntimation, records map
 			CancelledAt:     pn.CancelledAt,
 			CancelReason:    pn.CancelReason,
 			Recipients:      pn.Recipients,
+			SyncRunID:       syncRunID,
 		})
 	}
 	return params, nil

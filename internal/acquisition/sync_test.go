@@ -139,18 +139,18 @@ func (s *stubSyncRepo) UpdateSyncRun(_ context.Context, _ database.Tx, o SyncRun
 	return true, nil
 }
 
-func (s *stubSyncRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, p FindOrCreateCourtRecordParams) (*CourtRecord, error) {
+func (s *stubSyncRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, p FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
 	s.findCalls++
 	s.findParams = append(s.findParams, p)
 
 	if s.existingKeys[recordKey(p.CNJNumber, p.Degree)] {
-		return stubCourtRecord(p), nil // HIT — reobservation, never gated.
+		return stubCourtRecord(p), false, nil // HIT — reobservation, never gated.
 	}
 	if s.activeCount >= p.ActiveProcessLimit {
-		return nil, ErrProcessLimitReached // MISS at/over the ceiling — gated.
+		return nil, false, ErrProcessLimitReached // MISS at/over the ceiling — gated.
 	}
 	s.activeCount++
-	return stubCourtRecord(p), nil
+	return stubCourtRecord(p), true, nil // MISS — a brand-new record was created.
 }
 
 // stubCourtRecord builds the CourtRecord the stub returns for a resolved record,
@@ -361,6 +361,57 @@ func TestSyncUseCase_FirstDelivery_RunsFullCycle(t *testing.T) {
 
 	if uow.tenantID != ev.TenantID {
 		t.Fatalf("uow tenantID = %q, want %q", uow.tenantID, ev.TenantID)
+	}
+}
+
+// U3b: a window tallies only the processes/intimations it actually DISCOVERED
+// (new), not reobservations — the axis the reconciliations screen shows (items_new
+// counts docket entries, a different thing) — and stamps the discovering sync_run
+// and its backfill_job onto the inserts so the collapse can list a window's items.
+func TestSyncUseCase_TalliesNewProcessosAndIntimacoes(t *testing.T) {
+	t.Parallel()
+
+	const cnjA = "0000001-11.2024.8.26.0100" // already tracked → a reobservation (HIT)
+	repo := &stubSyncRepo{
+		syncRunID:      "run-1",
+		docketNewCount: 2,
+		intimNew:       1,
+		existingKeys:   map[string]bool{recordKey(cnjA, DegreeG1): true},
+	}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: twoRecordFixture(SourceDJEN)}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	if len(repo.updates) != 1 || repo.updates[0].Status != SyncStatusOK {
+		t.Fatalf("sync_run updates = %+v, want one OK", repo.updates)
+	}
+	// cnjA was a reobservation, cnjB brand-new → exactly one new process.
+	if got := repo.updates[0].CourtRecordsNew; got != 1 {
+		t.Errorf("CourtRecordsNew = %d, want 1 (only the brand-new record counts)", got)
+	}
+	if got := repo.updates[0].IntimationsNew; got != 1 {
+		t.Errorf("IntimationsNew = %d, want 1 (the upsert's new count)", got)
+	}
+	// Lineage: the run carries its backfill job, and every insert is stamped with the
+	// discovering run.
+	if repo.lastInsert.BackfillJobID != "job-1" {
+		t.Errorf("sync_run backfill_job_id = %q, want job-1", repo.lastInsert.BackfillJobID)
+	}
+	for _, p := range repo.findParams {
+		if p.SyncRunID != "run-1" {
+			t.Errorf("FindOrCreate param SyncRunID = %q, want run-1", p.SyncRunID)
+		}
+	}
+	for _, p := range repo.intimParams {
+		if p.SyncRunID != "run-1" {
+			t.Errorf("intimation param SyncRunID = %q, want run-1", p.SyncRunID)
+		}
 	}
 }
 

@@ -25,6 +25,61 @@ func (q *Queries) CountIntimationsByTenant(ctx context.Context, tenantID uuid.UU
 	return count, err
 }
 
+const getReconciliationUmbrella = `-- name: GetReconciliationUmbrella :one
+SELECT b.id, i.source, b.status, b.window_from, b.window_to,
+       b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,
+       COALESCE(SUM(s.court_records_new), 0)::bigint AS processos,
+       COALESCE(SUM(s.intimations_new), 0)::bigint AS intimacoes,
+       (CASE WHEN b.status = 'RUNNING' THEN NULL ELSE MAX(s.finished_at) END)::timestamptz AS finished_at
+FROM backfill_job b
+JOIN integration i ON i.id = b.integration_id
+LEFT JOIN sync_run s ON s.backfill_job_id = b.id
+WHERE b.tenant_id = $1 AND b.id = $2
+GROUP BY b.id, i.source
+`
+
+type GetReconciliationUmbrellaParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+}
+
+type GetReconciliationUmbrellaRow struct {
+	ID          uuid.UUID          `json:"id"`
+	Source      string             `json:"source"`
+	Status      string             `json:"status"`
+	WindowFrom  pgtype.Date        `json:"window_from"`
+	WindowTo    pgtype.Date        `json:"window_to"`
+	TotalSlices int32              `json:"total_slices"`
+	SlicesOk    int32              `json:"slices_ok"`
+	SlicesError int32              `json:"slices_error"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	Processos   int64              `json:"processos"`
+	Intimacoes  int64              `json:"intimacoes"`
+	FinishedAt  pgtype.Timestamptz `json:"finished_at"`
+}
+
+// One import's guarda-chuva header (the detail screen), same shape/aggregation as
+// ListReconciliationUmbrellas but for a single backfill_job.
+func (q *Queries) GetReconciliationUmbrella(ctx context.Context, arg GetReconciliationUmbrellaParams) (GetReconciliationUmbrellaRow, error) {
+	row := q.db.QueryRow(ctx, getReconciliationUmbrella, arg.TenantID, arg.ID)
+	var i GetReconciliationUmbrellaRow
+	err := row.Scan(
+		&i.ID,
+		&i.Source,
+		&i.Status,
+		&i.WindowFrom,
+		&i.WindowTo,
+		&i.TotalSlices,
+		&i.SlicesOk,
+		&i.SlicesError,
+		&i.StartedAt,
+		&i.Processos,
+		&i.Intimacoes,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
 const listIntimacoes = `-- name: ListIntimacoes :many
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.source, i.source_url,
@@ -87,6 +142,60 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 			&i.Status,
 			&i.Source,
 			&i.SourceUrl,
+			&i.CnjNumber,
+			&i.Court,
+			&i.Degree,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listIntimacoesBySyncRun = `-- name: ListIntimacoesBySyncRun :many
+SELECT i.id, i.made_available_at, i.type, i.status,
+       cr.cnj_number, cr.court, cr.degree
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.tenant_id = $1 AND i.sync_run_id = $2
+ORDER BY i.made_available_at DESC, i.id DESC
+LIMIT 1000
+`
+
+type ListIntimacoesBySyncRunParams struct {
+	TenantID  uuid.UUID   `json:"tenant_id"`
+	SyncRunID pgtype.UUID `json:"sync_run_id"`
+}
+
+type ListIntimacoesBySyncRunRow struct {
+	ID              uuid.UUID   `json:"id"`
+	MadeAvailableAt pgtype.Date `json:"made_available_at"`
+	Type            *string     `json:"type"`
+	Status          string      `json:"status"`
+	CnjNumber       string      `json:"cnj_number"`
+	Court           string      `json:"court"`
+	Degree          string      `json:"degree"`
+}
+
+// The intimations a window first discovered (collapse), newest availability first.
+func (q *Queries) ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoesBySyncRunParams) ([]ListIntimacoesBySyncRunRow, error) {
+	rows, err := q.db.Query(ctx, listIntimacoesBySyncRun, arg.TenantID, arg.SyncRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListIntimacoesBySyncRunRow
+	for rows.Next() {
+		var i ListIntimacoesBySyncRunRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.MadeAvailableAt,
+			&i.Type,
+			&i.Status,
 			&i.CnjNumber,
 			&i.Court,
 			&i.Degree,
@@ -194,56 +303,176 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 	return items, nil
 }
 
-const listRecentSyncRuns = `-- name: ListRecentSyncRuns :many
-SELECT s.id, i.source, s.window_from, s.window_to, s.status,
-       s.items_new, s.items_deduped,
-       COALESCE(s.error->>'message', '')::text AS error_message,
-       s.started_at, s.finished_at
-FROM sync_run s
-JOIN integration i ON i.id = s.integration_id
-WHERE s.tenant_id = $1
-ORDER BY s.started_at DESC, s.id DESC
-LIMIT $2
+const listProcessosBySyncRun = `-- name: ListProcessosBySyncRun :many
+SELECT cr.id, cr.cnj_number, cr.court, cr.degree, cr.class
+FROM court_record cr
+WHERE cr.tenant_id = $1 AND cr.sync_run_id = $2
+ORDER BY cr.cnj_number
+LIMIT 1000
 `
 
-type ListRecentSyncRunsParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	Limit    int32     `json:"limit"`
+type ListProcessosBySyncRunParams struct {
+	TenantID  uuid.UUID   `json:"tenant_id"`
+	SyncRunID pgtype.UUID `json:"sync_run_id"`
 }
 
-type ListRecentSyncRunsRow struct {
-	ID           uuid.UUID          `json:"id"`
-	Source       string             `json:"source"`
-	WindowFrom   pgtype.Date        `json:"window_from"`
-	WindowTo     pgtype.Date        `json:"window_to"`
-	Status       string             `json:"status"`
-	ItemsNew     int32              `json:"items_new"`
-	ItemsDeduped int32              `json:"items_deduped"`
-	ErrorMessage string             `json:"error_message"`
-	StartedAt    pgtype.Timestamptz `json:"started_at"`
-	FinishedAt   pgtype.Timestamptz `json:"finished_at"`
+type ListProcessosBySyncRunRow struct {
+	ID        uuid.UUID `json:"id"`
+	CnjNumber string    `json:"cnj_number"`
+	Court     string    `json:"court"`
+	Degree    string    `json:"degree"`
+	Class     *string   `json:"class"`
 }
 
-// The reconciliations screen: the tenant's most recent sync executions, newest
-// first, with the integration's source joined in and the failure reason lifted
-// out of the error jsonb ({"message": …} → text, NULL on success).
-func (q *Queries) ListRecentSyncRuns(ctx context.Context, arg ListRecentSyncRunsParams) ([]ListRecentSyncRunsRow, error) {
-	rows, err := q.db.Query(ctx, listRecentSyncRuns, arg.TenantID, arg.Limit)
+// The court records a window first discovered (collapse). Scoped by tenant (RLS +
+// filter) and the discovering sync_run_id; bounded defensively.
+func (q *Queries) ListProcessosBySyncRun(ctx context.Context, arg ListProcessosBySyncRunParams) ([]ListProcessosBySyncRunRow, error) {
+	rows, err := q.db.Query(ctx, listProcessosBySyncRun, arg.TenantID, arg.SyncRunID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListRecentSyncRunsRow
+	var items []ListProcessosBySyncRunRow
 	for rows.Next() {
-		var i ListRecentSyncRunsRow
+		var i ListProcessosBySyncRunRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CnjNumber,
+			&i.Court,
+			&i.Degree,
+			&i.Class,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReconciliationUmbrellas = `-- name: ListReconciliationUmbrellas :many
+SELECT b.id, i.source, b.status, b.window_from, b.window_to,
+       b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,
+       COALESCE(SUM(s.court_records_new), 0)::bigint AS processos,
+       COALESCE(SUM(s.intimations_new), 0)::bigint AS intimacoes,
+       (CASE WHEN b.status = 'RUNNING' THEN NULL ELSE MAX(s.finished_at) END)::timestamptz AS finished_at
+FROM backfill_job b
+JOIN integration i ON i.id = b.integration_id
+LEFT JOIN sync_run s ON s.backfill_job_id = b.id
+WHERE b.tenant_id = $1
+GROUP BY b.id, i.source
+ORDER BY b.created_at DESC, b.id DESC
+LIMIT $2
+`
+
+type ListReconciliationUmbrellasParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Limit    int32     `json:"limit"`
+}
+
+type ListReconciliationUmbrellasRow struct {
+	ID          uuid.UUID          `json:"id"`
+	Source      string             `json:"source"`
+	Status      string             `json:"status"`
+	WindowFrom  pgtype.Date        `json:"window_from"`
+	WindowTo    pgtype.Date        `json:"window_to"`
+	TotalSlices int32              `json:"total_slices"`
+	SlicesOk    int32              `json:"slices_ok"`
+	SlicesError int32              `json:"slices_error"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	Processos   int64              `json:"processos"`
+	Intimacoes  int64              `json:"intimacoes"`
+	FinishedAt  pgtype.Timestamptz `json:"finished_at"`
+}
+
+// The reconciliations screen: one "guarda-chuva" per import (backfill_job), with
+// the processes/intimations its windows discovered summed up, the job's overall
+// date window (the janela de prazo geral) and slice tallies. finished_at is the
+// last window close once the job is no longer RUNNING (NULL while running).
+func (q *Queries) ListReconciliationUmbrellas(ctx context.Context, arg ListReconciliationUmbrellasParams) ([]ListReconciliationUmbrellasRow, error) {
+	rows, err := q.db.Query(ctx, listReconciliationUmbrellas, arg.TenantID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListReconciliationUmbrellasRow
+	for rows.Next() {
+		var i ListReconciliationUmbrellasRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Source,
+			&i.Status,
+			&i.WindowFrom,
+			&i.WindowTo,
+			&i.TotalSlices,
+			&i.SlicesOk,
+			&i.SlicesError,
+			&i.StartedAt,
+			&i.Processos,
+			&i.Intimacoes,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSyncRunsByJob = `-- name: ListSyncRunsByJob :many
+SELECT s.id, i.source, s.window_from, s.window_to, s.status,
+       s.court_records_new, s.intimations_new,
+       COALESCE(s.error->>'message', '')::text AS error_message,
+       s.started_at, s.finished_at
+FROM sync_run s
+JOIN integration i ON i.id = s.integration_id
+WHERE s.tenant_id = $1 AND s.backfill_job_id = $2
+ORDER BY s.window_from ASC, s.started_at ASC
+`
+
+type ListSyncRunsByJobParams struct {
+	TenantID      uuid.UUID   `json:"tenant_id"`
+	BackfillJobID pgtype.UUID `json:"backfill_job_id"`
+}
+
+type ListSyncRunsByJobRow struct {
+	ID              uuid.UUID          `json:"id"`
+	Source          string             `json:"source"`
+	WindowFrom      pgtype.Date        `json:"window_from"`
+	WindowTo        pgtype.Date        `json:"window_to"`
+	Status          string             `json:"status"`
+	CourtRecordsNew int32              `json:"court_records_new"`
+	IntimationsNew  int32              `json:"intimations_new"`
+	ErrorMessage    string             `json:"error_message"`
+	StartedAt       pgtype.Timestamptz `json:"started_at"`
+	FinishedAt      pgtype.Timestamptz `json:"finished_at"`
+}
+
+// The windows (sync_runs) of one import, chronological, with the failure reason
+// lifted out of the error jsonb. Drives the detail screen's per-window table and
+// the collapse (each row's id feeds ListProcessos/IntimacoesBySyncRun).
+func (q *Queries) ListSyncRunsByJob(ctx context.Context, arg ListSyncRunsByJobParams) ([]ListSyncRunsByJobRow, error) {
+	rows, err := q.db.Query(ctx, listSyncRunsByJob, arg.TenantID, arg.BackfillJobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListSyncRunsByJobRow
+	for rows.Next() {
+		var i ListSyncRunsByJobRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Source,
 			&i.WindowFrom,
 			&i.WindowTo,
 			&i.Status,
-			&i.ItemsNew,
-			&i.ItemsDeduped,
+			&i.CourtRecordsNew,
+			&i.IntimationsNew,
 			&i.ErrorMessage,
 			&i.StartedAt,
 			&i.FinishedAt,

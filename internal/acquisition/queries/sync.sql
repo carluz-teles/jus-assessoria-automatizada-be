@@ -14,8 +14,8 @@
 -- resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
 -- slice's date window so the reconciliations read can show it (NULL when absent).
 INSERT INTO sync_run
-    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to, backfill_job_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id;
 
 -- name: FindSyncRunByEventID :one
@@ -41,8 +41,10 @@ UPDATE sync_run
 SET status = $2,
     items_new = $3,
     items_deduped = $4,
-    finished_at = $5,
-    error = $6
+    court_records_new = $5,
+    intimations_new = $6,
+    finished_at = $7,
+    error = $8
 WHERE id = $1 AND status = 'RUNNING'
 RETURNING id;
 
@@ -76,8 +78,8 @@ RETURNING id;
 -- judging_body (órgão julgador) comes from the source when disclosed (DJEN
 -- nomeOrgao / DATAJUD orgaoJulgador), NULL when it does not.
 INSERT INTO court_record
-    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body, sync_run_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id;
 
 -- name: MarkCourtRecordSynced :exec
@@ -117,8 +119,8 @@ RETURNING id;
 INSERT INTO intimation
     (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
      deadline_start_at, content, source, type, status, source_url, cancelled_at,
-     cancel_reason, recipients)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     cancel_reason, recipients, sync_run_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
     status        = EXCLUDED.status,
     cancelled_at  = EXCLUDED.cancelled_at,

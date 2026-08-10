@@ -65,7 +65,23 @@ func (m *mockRepo) GetImportStatus(_ context.Context, _ string) (ImportStatusVie
 	return ImportStatusView{}, nil
 }
 
-func (m *mockRepo) ListRecentSyncRuns(_ context.Context, _ string, _ int) ([]ReconciliationRunView, error) {
+func (m *mockRepo) ListReconciliationUmbrellas(_ context.Context, _ string, _ int) ([]ReconciliationUmbrellaView, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) GetReconciliationUmbrella(_ context.Context, _, _ string) (ReconciliationUmbrellaView, error) {
+	return ReconciliationUmbrellaView{}, nil
+}
+
+func (m *mockRepo) ListSyncRunsByJob(_ context.Context, _, _ string) ([]ReconciliationRunView, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) ListProcessosBySyncRun(_ context.Context, _, _ string) ([]ProcessoLineView, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) ListIntimacoesBySyncRun(_ context.Context, _, _ string) ([]IntimacaoLineView, error) {
 	return nil, nil
 }
 
@@ -111,8 +127,8 @@ func (m *mockRepo) UpdateSyncRun(_ context.Context, _ database.Tx, _ SyncRunOutc
 	return true, nil
 }
 
-func (m *mockRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, _ FindOrCreateCourtRecordParams) (*CourtRecord, error) {
-	return nil, nil
+func (m *mockRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, _ FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
+	return nil, false, nil
 }
 
 func (m *mockRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, _ []DocketEntryParams) ([]DocketEntry, error) {

@@ -118,21 +118,22 @@ func (q *Queries) InsertCourtCase(ctx context.Context, tenantID uuid.UUID) (uuid
 
 const insertCourtRecord = `-- name: InsertCourtRecord :one
 INSERT INTO court_record
-    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body, sync_run_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id
 `
 
 type InsertCourtRecordParams struct {
-	TenantID     uuid.UUID `json:"tenant_id"`
-	CaseID       uuid.UUID `json:"case_id"`
-	CnjNumber    string    `json:"cnj_number"`
-	Degree       string    `json:"degree"`
-	Court        string    `json:"court"`
-	Class        *string   `json:"class"`
-	Subject      *string   `json:"subject"`
-	Completeness float32   `json:"completeness"`
-	JudgingBody  *string   `json:"judging_body"`
+	TenantID     uuid.UUID   `json:"tenant_id"`
+	CaseID       uuid.UUID   `json:"case_id"`
+	CnjNumber    string      `json:"cnj_number"`
+	Degree       string      `json:"degree"`
+	Court        string      `json:"court"`
+	Class        *string     `json:"class"`
+	Subject      *string     `json:"subject"`
+	Completeness float32     `json:"completeness"`
+	JudgingBody  *string     `json:"judging_body"`
+	SyncRunID    pgtype.UUID `json:"sync_run_id"`
 }
 
 // Create a court record under a case. The natural key (tenant, cnj, degree) is
@@ -150,6 +151,7 @@ func (q *Queries) InsertCourtRecord(ctx context.Context, arg InsertCourtRecordPa
 		arg.Subject,
 		arg.Completeness,
 		arg.JudgingBody,
+		arg.SyncRunID,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)
@@ -202,8 +204,8 @@ const insertIntimation = `-- name: InsertIntimation :one
 INSERT INTO intimation
     (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
      deadline_start_at, content, source, type, status, source_url, cancelled_at,
-     cancel_reason, recipients)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     cancel_reason, recipients, sync_run_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
     status        = EXCLUDED.status,
     cancelled_at  = EXCLUDED.cancelled_at,
@@ -229,6 +231,7 @@ type InsertIntimationParams struct {
 	CancelledAt     pgtype.Date `json:"cancelled_at"`
 	CancelReason    *string     `json:"cancel_reason"`
 	Recipients      []byte      `json:"recipients"`
+	SyncRunID       pgtype.UUID `json:"sync_run_id"`
 }
 
 type InsertIntimationRow struct {
@@ -262,6 +265,7 @@ func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationPara
 		arg.CancelledAt,
 		arg.CancelReason,
 		arg.Recipients,
+		arg.SyncRunID,
 	)
 	var i InsertIntimationRow
 	err := row.Scan(&i.ID, &i.Inserted)
@@ -271,8 +275,8 @@ func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationPara
 const insertSyncRun = `-- name: InsertSyncRun :one
 
 INSERT INTO sync_run
-    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to, backfill_job_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id
 `
 
@@ -286,6 +290,7 @@ type InsertSyncRunParams struct {
 	EventID          *string            `json:"event_id"`
 	WindowFrom       pgtype.Date        `json:"window_from"`
 	WindowTo         pgtype.Date        `json:"window_to"`
+	BackfillJobID    pgtype.UUID        `json:"backfill_job_id"`
 }
 
 // sync cycle queries (acquisition slice).
@@ -312,6 +317,7 @@ func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (u
 		arg.EventID,
 		arg.WindowFrom,
 		arg.WindowTo,
+		arg.BackfillJobID,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)
@@ -353,19 +359,23 @@ UPDATE sync_run
 SET status = $2,
     items_new = $3,
     items_deduped = $4,
-    finished_at = $5,
-    error = $6
+    court_records_new = $5,
+    intimations_new = $6,
+    finished_at = $7,
+    error = $8
 WHERE id = $1 AND status = 'RUNNING'
 RETURNING id
 `
 
 type UpdateSyncRunParams struct {
-	ID           uuid.UUID          `json:"id"`
-	Status       string             `json:"status"`
-	ItemsNew     int32              `json:"items_new"`
-	ItemsDeduped int32              `json:"items_deduped"`
-	FinishedAt   pgtype.Timestamptz `json:"finished_at"`
-	Error        []byte             `json:"error"`
+	ID              uuid.UUID          `json:"id"`
+	Status          string             `json:"status"`
+	ItemsNew        int32              `json:"items_new"`
+	ItemsDeduped    int32              `json:"items_deduped"`
+	CourtRecordsNew int32              `json:"court_records_new"`
+	IntimationsNew  int32              `json:"intimations_new"`
+	FinishedAt      pgtype.Timestamptz `json:"finished_at"`
+	Error           []byte             `json:"error"`
 }
 
 // Close a sync run, but ONLY from RUNNING: the status guard makes this the single
@@ -381,6 +391,8 @@ func (q *Queries) UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) (u
 		arg.Status,
 		arg.ItemsNew,
 		arg.ItemsDeduped,
+		arg.CourtRecordsNew,
+		arg.IntimationsNew,
 		arg.FinishedAt,
 		arg.Error,
 	)
