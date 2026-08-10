@@ -31,9 +31,13 @@ const (
 	// https://hcomunicaapi.cnj.jus.br/api/v1; override via WithDJENBaseURL.
 	djenDefaultBaseURL = "https://comunicaapi.pje.jus.br/api/v1"
 
-	// djenDefaultPageSize is how many communications to pull per page. The API caps
-	// its reported count at 10000 and paginates; a page shorter than this ends the walk.
-	djenDefaultPageSize = 100
+	// djenDefaultPageSize is how many communications to pull per page. The Comunica API
+	// honors itensPorPagina up to 1000 (verified) and caps its reported count at 10000;
+	// a page shorter than this ends the walk. At 1000 a weekly backfill window is
+	// usually ONE request instead of dozens — ~10× fewer calls against the 1 req/s
+	// pace, so a big-OAB sweep finishes in minutes, not hours. Override via
+	// WithDJENPageSize / DJEN_PAGE_SIZE.
+	djenDefaultPageSize = 1000
 
 	// The Comunica API sits behind a WAF that 403s bot-looking clients — from a
 	// datacenter IP (prod) consistently, and it also rate-blocks bursts. So the

@@ -111,6 +111,11 @@ type Config struct {
 	// 0 = mantém o default do conector (60/min). Alavanca de prod pra afrouxar o pace
 	// num sweep de OAB grande sem redeploy, quando o DJEN passa a 429 a captura.
 	DJENRatePerMinute int `env:"DJEN_RATE_PER_MINUTE" envDefault:"0"`
+
+	// DJENPageSize — itens por página na consulta DJEN. 0 = mantém o default do
+	// conector (1000, o teto que a Comunica honra). Página maior = menos requests por
+	// janela, então menos pressão no pace/429. Alavanca de tuning sem redeploy.
+	DJENPageSize int `env:"DJEN_PAGE_SIZE" envDefault:"0"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do
