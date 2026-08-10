@@ -116,13 +116,11 @@ func TestAcquisition_Reconciliations_View(t *testing.T) {
 	seedTenant(t, pool, otherTenant, "org-recon-other", 0)
 	otherIntegration := seedIntegration(t, pool, otherTenant, acquisition.SourceDJEN)
 
-	// Import banner: one RUNNING backfill_job → importing=true.
-	seedImportJob(t, pool, tenantID, integrationID, "RUNNING", 53, 19, 2, time.Now())
-
 	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 
-	// The umbrella under test: its own backfill_job with three windows (OK, FAILED,
-	// RUNNING). The OK window discovered 5 processos / 8 intimações.
+	// The tenant's single import (backfill_job): RUNNING, so it also drives the
+	// import banner (importing=true), with three windows (OK, FAILED, RUNNING). The
+	// OK window discovered 5 processos / 8 intimações.
 	jobID := seedReconJob(t, pool, tenantID, integrationID, "RUNNING", "2026-07-01", "2026-07-22", 53, 19, 2, base)
 	okRun := seedSyncRun(t, pool, tenantID, integrationID, jobID, "OK", "2026-07-01", "2026-07-08", "", 5, 8, base, true)
 	seedSyncRun(t, pool, tenantID, integrationID, jobID, "FAILED", "2026-07-08", "2026-07-15", "boom", 0, 0, base.Add(time.Hour), true)
