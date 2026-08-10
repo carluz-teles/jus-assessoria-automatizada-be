@@ -30,3 +30,5 @@ go.work.sum
 *.swp
 
 CODE_REVIEW.md
+docs/erd-*.md
+docs/fluxo-eventos-e-revisao-ia.md
