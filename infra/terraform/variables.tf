@@ -109,7 +109,7 @@ variable "billing_cancel_url" {
 }
 variable "billing_return_url" {
   type    = string
-  default = "https://app.atjud.com.br/settings/billing"
+  default = "https://app.atjud.com.br/settings/billing?checkout=return"
 }
 
 # ---- Resend (notifications) — api usa o webhook secret; worker-ingestao envia e-mail ----
