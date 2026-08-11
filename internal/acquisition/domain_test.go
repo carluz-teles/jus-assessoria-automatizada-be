@@ -147,6 +147,10 @@ func (m *mockRepo) InsertPublications(_ context.Context, _ database.Tx, _ []Publ
 	return 0, nil
 }
 
+func (m *mockRepo) ReplaceWatchedOABs(_ context.Context, _ database.Tx, _, _ string, _ []string) error {
+	return nil
+}
+
 func (m *mockRepo) UpsertGradedCourtRecord(_ context.Context, _ database.Tx, _ GradedRecordParams) (*CourtRecord, error) {
 	return nil, nil
 }

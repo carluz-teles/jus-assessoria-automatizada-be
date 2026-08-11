@@ -48,6 +48,13 @@ type Querier interface {
 	// race (our InsertCourtRecord hit ON CONFLICT DO NOTHING) — keeps cases 1:1 with
 	// records (v0 has no consolidation).
 	DeleteCourtCase(ctx context.Context, id uuid.UUID) error
+	// watched_oab queries (acquisition slice). The per-tenant index of watched OABs the
+	// national match joins against. Populated from the integration_activated event: the
+	// use case replaces an integration's set (delete + insert) so a scope change is
+	// reflected. Writes run per-tenant (RLS by app.tenant_id); the match reads system-wide.
+	// Clear an integration's watched OABs before re-populating, so a removed OAB stops
+	// matching. Scoped to the integration (the tenant is implied by the RLS tx).
+	DeleteWatchedOABsByIntegration(ctx context.Context, integrationID uuid.UUID) error
 	// scheduler (re-poll) queries (acquisition slice).
 	// The re-poll scheduler runs system-scoped (DoSystem sets app.system='on', so the
 	// court_record RLS system escape hatch from migration 0016 exposes every tenant's
@@ -144,6 +151,9 @@ type Querier interface {
 	// resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
 	// slice's date window so the reconciliations read can show it (NULL when absent).
 	InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error)
+	// Add one watched OAB for an integration, idempotent on (integration_id, oab_key):
+	// a re-activation with the same scope is a no-op. oab_key is the normalized "NUMBER|UF".
+	InsertWatchedOAB(ctx context.Context, arg InsertWatchedOABParams) error
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)

@@ -73,6 +73,10 @@ type Repository interface {
 	// Publication — the national DJEN firehose ingestion write (tenant-agnostic). The
 	// ingestion use case depends on the narrow ingestRepo view of this.
 	InsertPublications(ctx context.Context, tx database.Tx, params []PublicationParams) (newCount int, err error)
+
+	// watched_oab — replace an integration's watched OAB set (populate on activation),
+	// the per-tenant index the national match joins against.
+	ReplaceWatchedOABs(ctx context.Context, tx database.Tx, tenantID, integrationID string, oabKeys []string) error
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -790,6 +794,33 @@ func (r *pgRepository) InsertPublications(ctx context.Context, tx database.Tx, p
 		newCount++
 	}
 	return newCount, nil
+}
+
+// ReplaceWatchedOABs sets an integration's watched OAB set inside the caller's tx by
+// clearing it and re-inserting the given normalized keys — so a scope change (a
+// removed OAB) stops matching. Idempotent per key. Runs in the tenant's tx (RLS by
+// app.tenant_id), driven by the integration_activated event.
+func (r *pgRepository) ReplaceWatchedOABs(ctx context.Context, tx database.Tx, tenantID, integrationID string, oabKeys []string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	iid, err := uuid.Parse(integrationID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	q := acquisitiondb.New(tx)
+	if err := q.DeleteWatchedOABsByIntegration(ctx, iid); err != nil {
+		return database.WrapInfra(err)
+	}
+	for _, key := range oabKeys {
+		if err := q.InsertWatchedOAB(ctx, acquisitiondb.InsertWatchedOABParams{
+			TenantID: tid, IntegrationID: iid, OabKey: key,
+		}); err != nil {
+			return database.WrapInfra(err)
+		}
+	}
+	return nil
 }
 
 func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error) {

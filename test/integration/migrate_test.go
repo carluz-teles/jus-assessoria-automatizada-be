@@ -30,7 +30,7 @@ func TestMigrations_UpIsIdempotentAndCreatesSchema(t *testing.T) {
 		SELECT 1 FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = $1
 	)`
-	for _, table := range []string{"tenant", "court_record", "outbox", "publication"} {
+	for _, table := range []string{"tenant", "court_record", "outbox", "publication", "watched_oab"} {
 		t.Run(table, func(t *testing.T) {
 			var exists bool
 			if err := pool.QueryRow(ctx, existsQuery, table).Scan(&exists); err != nil {

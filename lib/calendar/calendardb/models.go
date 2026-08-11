@@ -314,3 +314,11 @@ type Tenant struct {
 	Phone                 *string            `json:"phone"`
 	Email                 *string            `json:"email"`
 }
+
+type WatchedOab struct {
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	IntegrationID uuid.UUID          `json:"integration_id"`
+	OabKey        string             `json:"oab_key"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
