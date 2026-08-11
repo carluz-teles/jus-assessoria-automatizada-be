@@ -35,12 +35,16 @@ const (
 	// shares this worker (the process where the async listeners live) but its own
 	// queue, so a slow e-mail send never blocks court sync.
 	notificationsQueue = "notifications"
-	// concurrency is deliberately LOW: the DJEN connector serializes fetches to ~1
-	// req/s via its shared limiter, so many in-flight sync jobs give no throughput —
-	// they only pile up concurrent big writes (a page-1000 window commits ~hundreds
-	// of court_records/intimations at once), which deadlock each other (40P01). A
-	// handful of workers keeps the pipe full without the contention.
-	concurrency = 4
+	// concurrency is 1 — a deliberate serialization. The DJEN connector serializes
+	// fetches to ~1 req/s via its shared limiter, so parallel sync jobs give ZERO
+	// fetch throughput; all they add is concurrent big writes (a page-1000 window
+	// commits ~hundreds of court_records/intimations in ONE tx), and two of those
+	// running at once deadlock each other on the court_record index/rows (40P01).
+	// A single worker removes the write contention entirely at no throughput cost
+	// (the 1 req/s pace is the real ceiling). If we later restore parallelism to
+	// pipeline fetch+write, gate the sync write tx behind a per-tenant advisory lock
+	// (pg_advisory_xact_lock) instead of raising this back up.
+	concurrency = 1
 )
 
 func main() {
