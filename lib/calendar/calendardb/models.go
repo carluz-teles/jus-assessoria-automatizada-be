@@ -245,6 +245,17 @@ type ProcessedEvent struct {
 	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
 }
 
+type Publication struct {
+	ID              uuid.UUID          `json:"id"`
+	Hash            string             `json:"hash"`
+	Court           string             `json:"court"`
+	CnjNumber       string             `json:"cnj_number"`
+	MadeAvailableAt pgtype.Date        `json:"made_available_at"`
+	RecipientOabs   []string           `json:"recipient_oabs"`
+	Payload         []byte             `json:"payload"`
+	IngestedAt      pgtype.Timestamptz `json:"ingested_at"`
+}
+
 type Review struct {
 	ID           uuid.UUID          `json:"id"`
 	DraftID      uuid.UUID          `json:"draft_id"`

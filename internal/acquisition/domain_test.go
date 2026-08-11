@@ -143,6 +143,10 @@ func (m *mockRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []Intim
 	return 0, nil
 }
 
+func (m *mockRepo) InsertPublications(_ context.Context, _ database.Tx, _ []PublicationParams) (int, error) {
+	return 0, nil
+}
+
 func (m *mockRepo) UpsertGradedCourtRecord(_ context.Context, _ database.Tx, _ GradedRecordParams) (*CourtRecord, error) {
 	return nil, nil
 }

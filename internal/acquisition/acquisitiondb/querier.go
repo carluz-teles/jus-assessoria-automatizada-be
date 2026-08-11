@@ -120,6 +120,16 @@ type Querier interface {
 	// per hash). (xmax = 0) tells the caller whether THIS upsert inserted a fresh row
 	// (true) or updated an existing one (false), so it can still tally new vs. deduped.
 	InsertIntimation(ctx context.Context, arg InsertIntimationParams) (InsertIntimationRow, error)
+	// publication store queries (acquisition slice). The national DJEN firehose: the
+	// ingestion sweeps the diário by tribunal/day and lands every communication here,
+	// to be matched to tenants' watched OABs locally. No tenant scope (national reference
+	// data, like holiday), so no RLS and no tenant filter.
+	// Land one national communication, idempotent on the DJEN hash (globally unique per
+	// communication). The daily lookback re-fetches recent days, so ON CONFLICT (hash)
+	// DO NOTHING makes a re-ingest a no-op: the loser gets no row (pgx.ErrNoRows), which
+	// the caller reads as "already ingested" to tally new vs. deduped. recipient_oabs is
+	// the normalized "NUMBER|UF" key set for the local OAB match; payload is the raw item.
+	InsertPublication(ctx context.Context, arg InsertPublicationParams) (uuid.UUID, error)
 	// sync cycle queries (acquisition slice).
 	// The sync listener reacts to sync_requested: it opens a sync_run (RUNNING),
 	// fetches+parses a window, then upserts the observed records/entries/intimations

@@ -69,6 +69,10 @@ type Repository interface {
 	ListSyncRunsByJob(ctx context.Context, tenantID, jobID string) ([]ReconciliationRunView, error)
 	ListProcessosBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]ProcessoLineView, error)
 	ListIntimacoesBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]IntimacaoLineView, error)
+
+	// Publication — the national DJEN firehose ingestion write (tenant-agnostic). The
+	// ingestion use case depends on the narrow ingestRepo view of this.
+	InsertPublications(ctx context.Context, tx database.Tx, params []PublicationParams) (newCount int, err error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -750,6 +754,42 @@ func (r *pgRepository) AcquireTenantWriteLock(ctx context.Context, tx database.T
 		return database.WrapInfra(err)
 	}
 	return nil
+}
+
+// InsertPublications lands national DJEN communications in the firehose store inside
+// the caller's tx, idempotent on the DJEN hash (ON CONFLICT DO NOTHING): a re-ingested
+// day (the daily lookback) is a no-op. Returns how many rows were ACTUALLY new — a
+// conflict yields pgx.ErrNoRows for that row, read as already-ingested. The store is
+// national reference data (no tenant scope), so the tx needs no tenant RLS.
+func (r *pgRepository) InsertPublications(ctx context.Context, tx database.Tx, params []PublicationParams) (int, error) {
+	q := acquisitiondb.New(tx)
+	newCount := 0
+	for _, p := range params {
+		oabs := p.RecipientOABs
+		if oabs == nil {
+			oabs = []string{} // NOT NULL text[]: a no-recipient item lands with an empty set
+		}
+		payload := []byte(p.Payload)
+		if len(payload) == 0 {
+			payload = []byte("{}") // NOT NULL jsonb guard
+		}
+		_, err := q.InsertPublication(ctx, acquisitiondb.InsertPublicationParams{
+			Hash:            p.Hash,
+			Court:           p.Court,
+			CnjNumber:       p.CNJNumber,
+			MadeAvailableAt: pgtype.Date{Time: p.MadeAvailableAt, Valid: true},
+			RecipientOabs:   oabs,
+			Payload:         payload,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue // already ingested — deduped, not new
+		}
+		if err != nil {
+			return 0, database.WrapInfra(err)
+		}
+		newCount++
+	}
+	return newCount, nil
 }
 
 func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error) {
