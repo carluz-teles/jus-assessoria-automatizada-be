@@ -177,12 +177,11 @@ func run(logger *slog.Logger) error {
 		logger.Info("backfill window override", "service", serviceName, "window_days", cfg.BackfillWindowDays)
 	}
 
-	// Sem gate de entitlement POR ENQUANTO: billing (Stripe) ainda não está
-	// implementado, então o ciclo de sync não impõe teto de active_process_limit — o
-	// SyncUseCase cai no default sem ceiling (unlimitedEntitlement). Quando o billing
-	// entrar, reinjetar o adapter aqui:
+	// TEMP (E2E do bulk): gate de entitlement DESLIGADO — o SyncUseCase cai no default
+	// sem ceiling (unlimitedEntitlement), pra o onboarding de teste rodar sem
+	// subscription. RESTAURAR depois do E2E:
 	//   entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
-	//   ... acquisition.WithEntitlementChecker(entitlement)
+	//   sync := acquisition.NewSyncUseCase(..., acquisition.WithEntitlementChecker(entitlement))
 	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser)
 
 	// DATAJUD enrichment reacts to court_record_observed (a DJEN placeholder,

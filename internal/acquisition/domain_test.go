@@ -37,6 +37,9 @@ type mockRepo struct {
 	existing    map[string]*Integration // by source; absent → ErrIntegrationNotFound
 	upsertedFor []string                // sources upserted, in order
 	listResp    []*Integration
+	// totals backs GetReconciliationTotals — the entitlement gate's active-count
+	// read. Defaults to the zero value (0 active records).
+	totals ReconciliationTotals
 }
 
 func (m *mockRepo) GetBySource(_ context.Context, _ database.Tx, _, source string) (*Integration, error) {
@@ -86,7 +89,7 @@ func (m *mockRepo) ListIntimacoesBySyncRun(_ context.Context, _, _ string) ([]In
 }
 
 func (m *mockRepo) GetReconciliationTotals(_ context.Context, _ string) (ReconciliationTotals, error) {
-	return ReconciliationTotals{}, nil
+	return m.totals, nil
 }
 
 // The backfill methods satisfy the widened Repository interface; the activation
@@ -334,6 +337,106 @@ func TestUseCase_ActivateIntegration_EventOnlyWhenChanged(t *testing.T) {
 				t.Fatalf("publishes = %d, want %d", outbox.calls, tt.wantPublish)
 			}
 		})
+	}
+}
+
+// --- entitlement gating tests (fatia 5, edge gate) ---------------------------
+
+// A tenant with no subscription resolves to limit 0 upstream (the adapter's
+// fail-closed contract, mirrored here by the stub): activation is blocked before
+// any upsert or publish, and the backfill-triggering event never fires.
+func TestUseCase_ActivateIntegration_NoSubscription_Blocked(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{existing: map[string]*Integration{}, totals: ReconciliationTotals{CourtRecords: 0}}
+	outbox := &fakeOutbox{}
+	uow := &fakeUoW{}
+	checker := &stubEntitlementChecker{limit: 0}
+	uc := NewUseCase(repo, outbox, uow, WithActivationEntitlementChecker(checker))
+
+	_, err := uc.ActivateIntegration(context.Background(), testTenant,
+		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}})
+	if !errors.Is(err, ErrActivationBlocked) {
+		t.Fatalf("ActivateIntegration() error = %v, want ErrActivationBlocked", err)
+	}
+	if len(repo.upsertedFor) != 0 {
+		t.Fatalf("upserts = %d, want 0 (blocked before touching the repo)", len(repo.upsertedFor))
+	}
+	if outbox.calls != 0 {
+		t.Fatalf("publishes = %d, want 0 (no backfill-triggering event)", outbox.calls)
+	}
+	if uow.calls != 0 {
+		t.Fatalf("unit of work runs = %d, want 0 (blocked before opening a tx)", uow.calls)
+	}
+}
+
+// A tenant within its plan's ceiling activates normally — the gate is
+// transparent, and the checker is consulted scoped to the event's tenant.
+func TestUseCase_ActivateIntegration_WithinLimit_Proceeds(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{existing: map[string]*Integration{}, totals: ReconciliationTotals{CourtRecords: 3}}
+	outbox := &fakeOutbox{}
+	uow := &fakeUoW{}
+	checker := &stubEntitlementChecker{limit: 10}
+	uc := NewUseCase(repo, outbox, uow, WithActivationEntitlementChecker(checker))
+
+	got, err := uc.ActivateIntegration(context.Background(), testTenant,
+		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}})
+	if err != nil {
+		t.Fatalf("ActivateIntegration() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("activated = %d, want 1", len(got))
+	}
+	if len(repo.upsertedFor) != 1 {
+		t.Fatalf("upserts = %d, want 1", len(repo.upsertedFor))
+	}
+	if outbox.calls != 1 {
+		t.Fatalf("publishes = %d, want 1", outbox.calls)
+	}
+	if checker.calls != 1 || checker.lastTenant != testTenant {
+		t.Fatalf("checker = {calls:%d tenant:%q}, want {1 %q}", checker.calls, checker.lastTenant, testTenant)
+	}
+}
+
+// A tenant already AT its ceiling (active count == limit) is blocked, same as a
+// tenant over it — the gate does not require crossing the line, just reaching it.
+func TestUseCase_ActivateIntegration_AtLimit_Blocked(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{existing: map[string]*Integration{}, totals: ReconciliationTotals{CourtRecords: 5}}
+	outbox := &fakeOutbox{}
+	uow := &fakeUoW{}
+	checker := &stubEntitlementChecker{limit: 5}
+	uc := NewUseCase(repo, outbox, uow, WithActivationEntitlementChecker(checker))
+
+	_, err := uc.ActivateIntegration(context.Background(), testTenant,
+		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}})
+	if !errors.Is(err, ErrActivationBlocked) {
+		t.Fatalf("ActivateIntegration() error = %v, want ErrActivationBlocked", err)
+	}
+	if len(repo.upsertedFor) != 0 {
+		t.Fatalf("upserts = %d, want 0 (blocked before touching the repo)", len(repo.upsertedFor))
+	}
+	if outbox.calls != 0 {
+		t.Fatalf("publishes = %d, want 0 (no backfill-triggering event)", outbox.calls)
+	}
+}
+
+// Without an injected checker (the default unlimitedEntitlement), activation is
+// never gated — mirrors every pre-existing test in this file that constructs
+// NewUseCase with no options.
+func TestUseCase_ActivateIntegration_NoCheckerInjected_Unlimited(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{existing: map[string]*Integration{}, totals: ReconciliationTotals{CourtRecords: 1_000_000}}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, outbox, &fakeUoW{})
+
+	if _, err := uc.ActivateIntegration(context.Background(), testTenant,
+		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}}); err != nil {
+		t.Fatalf("ActivateIntegration() error = %v, want nil (no checker injected → unlimited)", err)
 	}
 }
 

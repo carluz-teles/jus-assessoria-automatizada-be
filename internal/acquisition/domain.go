@@ -22,14 +22,34 @@ type publisher interface {
 // implementation. It has exactly two methods: ActivateIntegration and
 // ListIntegrations.
 type UseCase struct {
-	repo   Repository
-	outbox publisher
-	uow    database.UnitOfWork
+	repo    Repository
+	outbox  publisher
+	uow     database.UnitOfWork
+	checker EntitlementChecker
+}
+
+// useCaseOption tunes a UseCase at construction — the same option-pattern
+// SyncUseCase uses for its own checker (sync.go). It cannot share the name
+// WithEntitlementChecker (a Go package cannot declare two funcs with that name
+// returning different option types), so this one is named for what it gates.
+type useCaseOption func(*UseCase)
+
+// WithActivationEntitlementChecker injects the billing entitlement port
+// ActivateIntegration consults, at the edge, before activating a new source —
+// the ERD's "entitlements na borda" gate. Without it the use case imposes no
+// ceiling (unlimitedEntitlement, the same default sync.go falls back to);
+// cmd/api wires the real billing adapter here.
+func WithActivationEntitlementChecker(c EntitlementChecker) useCaseOption {
+	return func(uc *UseCase) { uc.checker = c }
 }
 
 // NewUseCase wires the acquisition use cases to their dependencies.
-func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork) *UseCase {
-	return &UseCase{repo: repo, outbox: outbox, uow: uow}
+func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork, opts ...useCaseOption) *UseCase {
+	uc := &UseCase{repo: repo, outbox: outbox, uow: uow, checker: unlimitedEntitlement{}}
+	for _, opt := range opts {
+		opt(uc)
+	}
+	return uc
 }
 
 // ActivateIntegration activates every requested source under one shared scope,
@@ -45,7 +65,18 @@ func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork) *Use
 //
 // Callers pass validated input (the handler runs Request.Validate first);
 // tenantID comes from the verified principal, never the body.
+//
+// Before any of that, it gates on the tenant's billing entitlement: a tenant
+// already at (or above) its active_process_limit is refused outright
+// (ErrActivationBlocked, → 403), so it never upserts a row, never publishes the
+// event, and never triggers the backfill listener — the ERD's edge-of-the-API
+// entitlement gate, distinct from the worker's own per-record gate in sync.go
+// (which lets a sync cycle continue past an individual blocked record).
 func (uc *UseCase) ActivateIntegration(ctx context.Context, tenantID string, sources []string, scope Scope) ([]*Integration, error) {
+	if err := uc.checkEntitlement(ctx, tenantID); err != nil {
+		return nil, err
+	}
+
 	activated := make([]*Integration, 0, len(sources))
 
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
@@ -81,6 +112,29 @@ func (uc *UseCase) ActivateIntegration(ctx context.Context, tenantID string, sou
 // is a plain read model scoped to the tenant; no transaction or event.
 func (uc *UseCase) ListIntegrations(ctx context.Context, tenantID string) ([]*Integration, error) {
 	return uc.repo.List(ctx, tenantID)
+}
+
+// checkEntitlement refuses activation when the tenant's ACTIVE court record count
+// already meets or exceeds its billing entitlement's active_process_limit. It
+// reuses GetReconciliationTotals — the same pool read the reconciliations screen
+// already runs to show the tenant's acquired acervo — rather than adding a second
+// count query for the same number. Both reads (checker + repo) happen OUTSIDE any
+// tx, same as sync.go's applyResult: a small overshoot under a concurrent
+// activation is accepted (v0). A tenant with no subscription resolves to limit 0
+// upstream (fail-closed), so it is blocked on its very first activation attempt.
+func (uc *UseCase) checkEntitlement(ctx context.Context, tenantID string) error {
+	limit, err := uc.checker.ActiveProcessLimit(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	totals, err := uc.repo.GetReconciliationTotals(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	if totals.CourtRecords >= limit {
+		return ErrActivationBlocked
+	}
+	return nil
 }
 
 // currentIntegration returns the pre-upsert integration for (tenant, source), or
