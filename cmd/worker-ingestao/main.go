@@ -35,6 +35,15 @@ const (
 	// shares this worker (the process where the async listeners live) but its own
 	// queue, so a slow e-mail send never blocks court sync.
 	notificationsQueue = "notifications"
+	// diarioQueue carries the national bulk ingestion (diario_requested). It is drained
+	// by a SEPARATE asynq server at diarioConcurrency=1 so the slow, globally-rate-limited
+	// DJEN diário fetch runs serialized — concurrency made the 429s WORSE (it trips the
+	// endpoint's cumulative cap faster) — and never competes with the enrichment/sync work
+	// on the "ingestao" queue. Must match lib/events.queueFor's routing of the event.
+	diarioQueue = "diario"
+	// diarioConcurrency is fixed at 1: the whole point is to serialize the national fetch
+	// against the DJEN global cap. Not env-tunable — a higher value reintroduces the storm.
+	diarioConcurrency = 1
 	// defaultConcurrency backs INGESTAO_CONCURRENCY when unset/invalid. Parallelism
 	// is the backfill's main lever: DJEN/DATAJUD fetches are LONG (~110s each, stuck
 	// on the residential proxy), so running many at once overlaps that wait and cuts
@@ -89,6 +98,8 @@ func run(logger *slog.Logger) error {
 
 	// asynq's own logs go through slog (structured, OTLP); LogLevel=ErrorLevel keeps
 	// its per-task retry Warns from duplicating the Observe middleware's failure log.
+	// The MAIN server drains the enrichment/sync ("ingestao") and avisos
+	// ("notifications") queues; the national bulk ingestion runs on its own server below.
 	srv := asynq.NewServer(redisOpt, asynq.Config{
 		Concurrency: concurrency,
 		Queues: map[string]int{
@@ -198,15 +209,11 @@ func run(logger *slog.Logger) error {
 	// the placeholder+merge. It shares the orchestrator and the ParserSet.
 	enrichment := acquisition.NewEnrichmentUseCase(repo, outbox, uow, orchestrator, parser)
 
-	// Wire the ingestion consumer only when it exists. Passing the typed-nil
-	// *IngestionUseCase straight into the interface param would hit Go's nil-interface
-	// trap (a non-nil interface wrapping a nil pointer), so the listener would register
-	// the handler and panic on dispatch. The explicit branch passes a real nil interface.
-	if ingestion != nil {
-		acquisition.NewListener(backfill, sync, enrichment, ingestion).Register(mux)
-	} else {
-		acquisition.NewListener(backfill, sync, enrichment, nil).Register(mux)
-	}
+	// The listener mounts the shared enrichment/sync/backfill handlers on the MAIN mux.
+	// diario_requested is NOT among them — it runs on the dedicated server below. Register
+	// never dereferences the ingestion dep, so a nil (pivot off) is harmless here.
+	listener := acquisition.NewListener(backfill, sync, enrichment, ingestion)
+	listener.Register(mux)
 
 	// notifications: consume notification.requested and deliver by e-mail (Resend).
 	// The provider config is required here (this worker runs the listener), so a
@@ -244,6 +251,28 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("start asynq server: %w", err)
 	}
 
+	// The DEDICATED national-ingestion server: one worker, its own "diario" queue, so the
+	// slow globally-rate-limited DJEN diário fetch runs serialized (never 3-way hammering
+	// the cumulative cap) and stays off the enrichment/sync queue. Built only when the
+	// pivot is on; its own mux carries just the diario_requested handler.
+	var diarioSrv *asynq.Server
+	if ingestion != nil {
+		diarioSrv = asynq.NewServer(redisOpt, asynq.Config{
+			Concurrency: diarioConcurrency,
+			Queues:      map[string]int{diarioQueue: diarioConcurrency},
+			Logger:      events.NewAsynqLogger(logger),
+			LogLevel:    asynq.ErrorLevel,
+		})
+		diarioMux := asynq.NewServeMux()
+		diarioMux.Use(events.Observe(logger))
+		listener.RegisterIngestion(diarioMux)
+		if err := diarioSrv.Start(diarioMux); err != nil {
+			return fmt.Errorf("start diario asynq server: %w", err)
+		}
+		logger.Info("national ingestion server started (dedicated, serialized)",
+			"service", serviceName, "queue", diarioQueue, "concurrency", diarioConcurrency)
+	}
+
 	// srv.Start is non-blocking; block serve until the shutdown hook stops the
 	// server, so the lifecycle owns the single signal handler (§5b.1).
 	stopped := make(chan struct{})
@@ -255,6 +284,9 @@ func run(logger *slog.Logger) error {
 		},
 		func(shutdownCtx context.Context) error {
 			srv.Shutdown() // drains in-flight tasks before returning
+			if diarioSrv != nil {
+				diarioSrv.Shutdown()
+			}
 			close(stopped)
 			if err := pubsubClient.Close(); err != nil {
 				logger.Warn("close pub/sub redis client", "service", serviceName, "error", err)

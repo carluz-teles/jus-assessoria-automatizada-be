@@ -196,6 +196,14 @@ func ExtractTrace(ctx context.Context, t *asynq.Task) context.Context {
 // slow queue (e.g. a 10-minute OCR in "documents") never blocks another kind of
 // work (docs erd-backend §4c.2).
 func queueFor(typ string) string {
+	// diario_requested (national bulk ingestion) gets its OWN queue, consumed by a
+	// dedicated concurrency-1 server: the DJEN diário fetch is slow and rate-limited by
+	// a GLOBAL cumulative cap, so running it serialized (one stream) rather than 3-way
+	// on "ingestao" both keeps it under the cap (concurrency made the 429s WORSE) and
+	// stops it from starving — or being starved by — the enrichment/sync work.
+	if typ == "acquisition.diario_requested" {
+		return "diario"
+	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":
 		// The acquisition slice's events (integration_activated, sync_requested,

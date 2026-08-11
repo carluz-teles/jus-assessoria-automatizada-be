@@ -71,13 +71,9 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeSyncFailed, l.handleSyncFailed)
 	mux.HandleFunc(TypeCourtRecordObserved, l.handleCourtRecordObserved)
 
-	// diario_requested (ingestão nacional) só tem consumer quando o pivot está ligado
-	// (INGESTION_ENABLED injeta a use case). Registrar condicionalmente mantém o worker
-	// inerte ao evento quando desligado — um pattern é registrado uma única vez no mux, e
-	// registrar com uma use case nil daria panic de nil no dispatch.
-	if l.ingestion != nil {
-		mux.HandleFunc(TypeDiarioRequested, l.handleDiarioRequested)
-	}
+	// diario_requested is NOT registered here: it lives on its OWN queue and is mounted
+	// on a dedicated concurrency-1 server via RegisterIngestion, so the national bulk
+	// fetch is serialized and isolated from this queue's enrichment/sync work.
 
 	// docket_entry_observed (novo andamento) e backfill_finished (aviso de fim) agora
 	// têm consumer real: o slice notifications os transforma em avisos IN_APP e
@@ -146,6 +142,14 @@ func (l *Listener) handleCourtRecordObserved(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	return l.enrichment.OnCourtRecordObserved(ctx, ev)
+}
+
+// RegisterIngestion mounts the diario_requested handler on a mux — meant for the
+// worker's DEDICATED concurrency-1 server (its own "diario" queue), so the national
+// bulk fetch runs serialized. Called only when the ingestion use case is wired
+// (INGESTION_ENABLED); the caller guards the nil so no nil handler is ever registered.
+func (l *Listener) RegisterIngestion(mux *asynq.ServeMux) {
+	mux.HandleFunc(TypeDiarioRequested, l.handleDiarioRequested)
 }
 
 // handleDiarioRequested is the asynq.HandlerFunc for acquisition.diario_requested. It

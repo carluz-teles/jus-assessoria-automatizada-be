@@ -334,25 +334,25 @@ func TestListener_HandleDiarioRequested_BadPayloadSkipsRetry(t *testing.T) {
 	}
 }
 
-// I3: the diario_requested handler is registered ONLY when the ingestion use case is
-// wired (INGESTION_ENABLED). A nil ingestion dep leaves the pattern unregistered, so the
-// worker ships inert to the event; a non-nil dep registers it.
-func TestListener_Register_DiarioRequestedGatedByIngestion(t *testing.T) {
+// I3: diario_requested is NOT on the main Register mux (it lives on the dedicated
+// concurrency-1 server), but IS mounted by RegisterIngestion. This keeps the national
+// bulk fetch serialized and isolated from the shared "ingestao" queue.
+func TestListener_DiarioRequestedOnlyViaRegisterIngestion(t *testing.T) {
 	t.Parallel()
 
 	task := asynq.NewTask(TypeDiarioRequested, nil)
 
 	// asynq's ServeMux.Handler returns an empty pattern (and a NotFoundHandler) when no
 	// route matches; the registered pattern otherwise.
-	muxOff := asynq.NewServeMux()
-	NewListener(&spyListenerUC{}, &spySyncUC{}, nil, nil).Register(muxOff)
-	if _, pattern := muxOff.Handler(task); pattern != "" {
-		t.Errorf("diario_requested registered with nil ingestion (pattern %q), want unregistered", pattern)
+	mainMux := asynq.NewServeMux()
+	NewListener(&spyListenerUC{}, &spySyncUC{}, nil, &spyIngestionUC{}).Register(mainMux)
+	if _, pattern := mainMux.Handler(task); pattern != "" {
+		t.Errorf("diario_requested on the main mux (pattern %q), want it only on the dedicated server", pattern)
 	}
 
-	muxOn := asynq.NewServeMux()
-	NewListener(&spyListenerUC{}, &spySyncUC{}, nil, &spyIngestionUC{}).Register(muxOn)
-	if _, pattern := muxOn.Handler(task); pattern != TypeDiarioRequested {
-		t.Errorf("diario_requested pattern = %q, want %q", pattern, TypeDiarioRequested)
+	diarioMux := asynq.NewServeMux()
+	NewListener(nil, nil, nil, &spyIngestionUC{}).RegisterIngestion(diarioMux)
+	if _, pattern := diarioMux.Handler(task); pattern != TypeDiarioRequested {
+		t.Errorf("RegisterIngestion pattern = %q, want %q", pattern, TypeDiarioRequested)
 	}
 }

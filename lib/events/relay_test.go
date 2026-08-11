@@ -190,6 +190,7 @@ func TestQueueFor(t *testing.T) {
 		{"ingestao.movimento.observed", "ingestao"},
 		{"acquisition.integration_activated", "ingestao"},
 		{"acquisition.court_record_observed", "ingestao"},
+		{"acquisition.diario_requested", "diario"}, // dedicated serialized queue, not "ingestao"
 		{"documents.file.extracted", "documents"},
 		{"ai.revisao.requested", "ai"},
 		{"notification.requested", "notifications"},
