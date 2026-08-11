@@ -58,7 +58,7 @@ type GetReconciliationRow struct {
 	FinishedAt  pgtype.Timestamptz `json:"finished_at"`
 }
 
-// One import's guarda-chuva header (the detail screen), same shape/aggregation as
+// One import's reconciliação header (the detail screen), same shape/aggregation as
 // ListReconciliations but for a single backfill_job.
 func (q *Queries) GetReconciliation(ctx context.Context, arg GetReconciliationParams) (GetReconciliationRow, error) {
 	row := q.db.QueryRow(ctx, getReconciliation, arg.TenantID, arg.ID)
@@ -387,7 +387,7 @@ type ListReconciliationsRow struct {
 	FinishedAt  pgtype.Timestamptz `json:"finished_at"`
 }
 
-// The reconciliations screen: one "guarda-chuva" per import (backfill_job), with
+// The reconciliations screen: one "reconciliação" per import (backfill_job), with
 // the processes/intimations its windows discovered summed up, the job's overall
 // date window (the janela de prazo geral) and slice tallies. finished_at is the
 // last window close once the job is no longer RUNNING (NULL while running).

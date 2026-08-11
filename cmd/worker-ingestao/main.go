@@ -35,9 +35,12 @@ const (
 	// shares this worker (the process where the async listeners live) but its own
 	// queue, so a slow e-mail send never blocks court sync.
 	notificationsQueue = "notifications"
-	// concurrency is generous: court sync is I/O-bound and tolerates many
-	// in-flight jobs. Tune per real load with the docker slice.
-	concurrency = 10
+	// concurrency is deliberately LOW: the DJEN connector serializes fetches to ~1
+	// req/s via its shared limiter, so many in-flight sync jobs give no throughput —
+	// they only pile up concurrent big writes (a page-1000 window commits ~hundreds
+	// of court_records/intimations at once), which deadlock each other (40P01). A
+	// handful of workers keeps the pipe full without the contention.
+	concurrency = 4
 )
 
 func main() {

@@ -35,6 +35,10 @@ type Querier interface {
 	// The reconciliations totals: how many intimations the tenant holds (paired with
 	// CountActiveCourtRecordsByTenant for the processes side).
 	CountIntimationsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// Drop a court_case orphaned when a concurrent sync won the court_record create
+	// race (our InsertCourtRecord hit ON CONFLICT DO NOTHING) — keeps cases 1:1 with
+	// records (v0 has no consolidation).
+	DeleteCourtCase(ctx context.Context, id uuid.UUID) error
 	// scheduler (re-poll) queries (acquisition slice).
 	// The re-poll scheduler runs system-scoped (DoSystem sets app.system='on', so the
 	// court_record RLS system escape hatch from migration 0016 exposes every tenant's
@@ -65,7 +69,7 @@ type Querier interface {
 	// opens a new job). No job ever → no row; the read use case maps that to NONE (not
 	// importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
 	GetLatestBackfillStatus(ctx context.Context, tenantID uuid.UUID) (GetLatestBackfillStatusRow, error)
-	// One import's guarda-chuva header (the detail screen), same shape/aggregation as
+	// One import's reconciliação header (the detail screen), same shape/aggregation as
 	// ListReconciliations but for a single backfill_job.
 	GetReconciliation(ctx context.Context, arg GetReconciliationParams) (GetReconciliationRow, error)
 	// Count one failed slice; same atomic lock-and-read-back contract as
@@ -85,7 +89,9 @@ type Querier interface {
 	// yet, so every new record gets its own case; merging is a later slice.
 	InsertCourtCase(ctx context.Context, tenantID uuid.UUID) (uuid.UUID, error)
 	// Create a court record under a case. The natural key (tenant, cnj, degree) is
-	// UNIQUE, so a racing double-create fails loudly rather than duplicating.
+	// UNIQUE; ON CONFLICT DO NOTHING makes a concurrent double-create idempotent (two
+	// backfill windows discovering the same process at once) — the loser gets no row
+	// (pgx.ErrNoRows) and the caller re-resolves the winner instead of a 23505 rollback.
 	// judging_body (órgão julgador) comes from the source when disclosed (DJEN
 	// nomeOrgao / DATAJUD orgaoJulgador), NULL when it does not.
 	InsertCourtRecord(ctx context.Context, arg InsertCourtRecordParams) (uuid.UUID, error)
@@ -142,7 +148,7 @@ type Querier interface {
 	// The court records a window first discovered (collapse). Scoped by tenant (RLS +
 	// filter) and the discovering sync_run_id; bounded defensively.
 	ListProcessosBySyncRun(ctx context.Context, arg ListProcessosBySyncRunParams) ([]ListProcessosBySyncRunRow, error)
-	// The reconciliations screen: one "guarda-chuva" per import (backfill_job), with
+	// The reconciliations screen: one "reconciliação" per import (backfill_job), with
 	// the processes/intimations its windows discovered summed up, the job's overall
 	// date window (the janela de prazo geral) and slice tallies. finished_at is the
 	// last window close once the job is no longer RUNNING (NULL while running).

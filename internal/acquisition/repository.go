@@ -602,8 +602,7 @@ func (r *pgRepository) FindOrCreateCourtRecord(ctx context.Context, tx database.
 		if gerr := r.enforceProcessLimit(ctx, q, tid, params.ActiveProcessLimit); gerr != nil {
 			return nil, false, gerr
 		}
-		cr, cerr := r.createCourtRecord(ctx, q, tid, params)
-		return cr, cerr == nil, cerr
+		return r.createCourtRecord(ctx, q, tid, params)
 	default:
 		return nil, false, database.WrapInfra(err)
 	}
@@ -627,10 +626,15 @@ func (r *pgRepository) enforceProcessLimit(ctx context.Context, q *acquisitiondb
 
 // createCourtRecord seeds a fresh case + record (v0 has no consolidation, so one
 // case per record) and marks it synced.
-func (r *pgRepository) createCourtRecord(ctx context.Context, q *acquisitiondb.Queries, tenantID uuid.UUID, params FindOrCreateCourtRecordParams) (*CourtRecord, error) {
+// createCourtRecord seeds a fresh case + record (v0 has no consolidation, so one
+// case per record) and marks it synced. Idempotent under the concurrent-discovery
+// race: if a rival window won the insert (ON CONFLICT DO NOTHING → no id back), it
+// drops the orphan case, re-resolves the winner, marks it synced and reports
+// created=false — so no 23505 rollback and the new-count is not double-attributed.
+func (r *pgRepository) createCourtRecord(ctx context.Context, q *acquisitiondb.Queries, tenantID uuid.UUID, params FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
 	caseID, err := q.InsertCourtCase(ctx, tenantID)
 	if err != nil {
-		return nil, database.WrapInfra(err)
+		return nil, false, database.WrapInfra(err)
 	}
 	recID, err := q.InsertCourtRecord(ctx, acquisitiondb.InsertCourtRecordParams{
 		TenantID:     tenantID,
@@ -644,13 +648,32 @@ func (r *pgRepository) createCourtRecord(ctx context.Context, q *acquisitiondb.Q
 		JudgingBody:  nullString(params.JudgingBody),
 		SyncRunID:    nullUUID(params.SyncRunID),
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Lost the create race — a concurrent window inserted this record first. Drop
+		// our now-orphan case and re-resolve the winner (mark synced, created=false).
+		if derr := q.DeleteCourtCase(ctx, caseID); derr != nil {
+			return nil, false, database.WrapInfra(derr)
+		}
+		row, gerr := q.GetCourtRecordByKey(ctx, acquisitiondb.GetCourtRecordByKeyParams{
+			TenantID:  tenantID,
+			CnjNumber: params.CNJNumber,
+			Degree:    params.Degree,
+		})
+		if gerr != nil {
+			return nil, false, database.WrapInfra(gerr)
+		}
+		if merr := r.markCourtRecordSynced(ctx, q, row.ID, params); merr != nil {
+			return nil, false, merr
+		}
+		return newCourtRecordEntity(row.ID, row.CaseID, params), false, nil
+	}
 	if err != nil {
-		return nil, database.WrapInfra(err)
+		return nil, false, database.WrapInfra(err)
 	}
 	if err := r.markCourtRecordSynced(ctx, q, recID, params); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return newCourtRecordEntity(recID, caseID, params), nil
+	return newCourtRecordEntity(recID, caseID, params), true, nil
 }
 
 // markCourtRecordSynced writes the post-sync completeness and next-sweep time.

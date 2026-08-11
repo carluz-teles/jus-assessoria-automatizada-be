@@ -30,6 +30,18 @@ func (q *Queries) CountActiveCourtRecordsByTenant(ctx context.Context, tenantID 
 	return count, err
 }
 
+const deleteCourtCase = `-- name: DeleteCourtCase :exec
+DELETE FROM court_case WHERE id = $1
+`
+
+// Drop a court_case orphaned when a concurrent sync won the court_record create
+// race (our InsertCourtRecord hit ON CONFLICT DO NOTHING) — keeps cases 1:1 with
+// records (v0 has no consolidation).
+func (q *Queries) DeleteCourtCase(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteCourtCase, id)
+	return err
+}
+
 const findSyncRunByEventID = `-- name: FindSyncRunByEventID :one
 SELECT id, tenant_id, court_record_id, integration_id, connector_id,
        connector_version, status, items_new, items_deduped, started_at, finished_at
@@ -120,6 +132,7 @@ const insertCourtRecord = `-- name: InsertCourtRecord :one
 INSERT INTO court_record
     (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body, sync_run_id)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (tenant_id, cnj_number, degree) DO NOTHING
 RETURNING id
 `
 
@@ -137,7 +150,9 @@ type InsertCourtRecordParams struct {
 }
 
 // Create a court record under a case. The natural key (tenant, cnj, degree) is
-// UNIQUE, so a racing double-create fails loudly rather than duplicating.
+// UNIQUE; ON CONFLICT DO NOTHING makes a concurrent double-create idempotent (two
+// backfill windows discovering the same process at once) — the loser gets no row
+// (pgx.ErrNoRows) and the caller re-resolves the winner instead of a 23505 rollback.
 // judging_body (órgão julgador) comes from the source when disclosed (DJEN
 // nomeOrgao / DATAJUD orgaoJulgador), NULL when it does not.
 func (q *Queries) InsertCourtRecord(ctx context.Context, arg InsertCourtRecordParams) (uuid.UUID, error) {

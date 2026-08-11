@@ -149,7 +149,9 @@ func WithDJENProxy(proxyURL *url.URL) DJENOption {
 func NewDJENConnector(opts ...DJENOption) *DJENConnector {
 	c := &DJENConnector{
 		baseURL:    djenDefaultBaseURL,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		// 60s (not 30): a page of 1000 items is a big response, and the WAF/proxy can be
+		// slow — a tight timeout turns a healthy fetch into a spurious retry.
+		httpClient: &http.Client{Timeout: 60 * time.Second},
 		pageSize:   djenDefaultPageSize,
 		limiter:    rate.NewLimiter(rate.Every(time.Minute/time.Duration(djenDefaultRatePerMinute)), 1),
 		cooldown:   newCooldownGate(),
