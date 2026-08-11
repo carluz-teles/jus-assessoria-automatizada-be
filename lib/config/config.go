@@ -132,6 +132,21 @@ type Config struct {
 	// escritas concorrentes que isso destravaria são serializadas pelo advisory-lock
 	// por tenant (sem deadlock 40P01). Alavanca de tuning sem redeploy.
 	IngestaoConcurrency int `env:"INGESTAO_CONCURRENCY" envDefault:"8"`
+
+	// IngestionEnabled liga a ingestão nacional por-tribunal no scheduler (a virada
+	// bulk). Default FALSE: o código pode ser deployado inerte, coexistindo com o
+	// per-OAB, e a gente vira a chave só quando quiser cortar. Só o scheduler lê.
+	IngestionEnabled bool `env:"INGESTION_ENABLED" envDefault:"false"`
+
+	// IngestionLookbackDays — quantos dias pra trás de "ontem" a ingestão diária
+	// re-varre a cada dia, pra pegar publicações atrasadas/retratadas (data_cancelamento).
+	// Idempotente (ON CONFLICT no hash), então re-varrer é seguro. Default 3.
+	IngestionLookbackDays int `env:"INGESTION_LOOKBACK_DAYS" envDefault:"3"`
+
+	// BootstrapDays — quando > 0, o scheduler ingere os últimos N dias do diário
+	// nacional UMA vez no boot, em background (o cold-start do store). Ops seta (ex.
+	// 90) pro primeiro carregamento e volta pra 0 depois. Default 0 = sem bootstrap.
+	BootstrapDays int `env:"BOOTSTRAP_DAYS" envDefault:"0"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do
