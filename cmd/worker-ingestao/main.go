@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
@@ -161,13 +162,13 @@ func run(logger *slog.Logger) error {
 		acquisition.NewDATAJUDParser(),
 	}
 
-	// Sem gate de entitlement POR ENQUANTO: billing (Stripe) ainda não está
-	// implementado, então o ciclo de sync não impõe teto de active_process_limit — o
-	// SyncUseCase cai no default sem ceiling (unlimitedEntitlement). Quando o billing
-	// entrar, reinjetar o adapter aqui:
-	//   entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
-	//   ... acquisition.WithEntitlementChecker(entitlement)
-	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser)
+	// Billing (Stripe) está em produção: o ciclo de sync impõe o teto de
+	// active_process_limit via o adapter de entitlement, lido sobre o pool de
+	// billing (nenhuma tx compartilhada — ver EntitlementChecker em sync.go). Um
+	// tenant sem subscription resolve limite 0 (fail-closed) dentro do adapter.
+	entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
+	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser,
+		acquisition.WithEntitlementChecker(entitlement))
 
 	// DATAJUD enrichment reacts to court_record_observed (a DJEN placeholder,
 	// degree=UNKNOWN): it fetches the process by number to reveal the grau and does
