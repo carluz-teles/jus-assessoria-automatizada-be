@@ -27,7 +27,9 @@ func djenEnvelope(t *testing.T, items ...json.RawMessage) []byte {
 
 // TestWithDJENProxy asserts the proxy option routes the connector's outbound
 // requests through the configured proxy — the WAF egress-IP fix. The client's
-// Transport resolver must return the proxy URL for any request.
+// WithDJENProxy records the CONNECT proxy on the connector; the uTLS transport tunnels
+// through it (the proxy is applied inside DialTLSContext, not Transport.Proxy, so the
+// Chrome handshake runs over the tunnel). The transport is always the uTLS one.
 func TestWithDJENProxy(t *testing.T) {
 	t.Parallel()
 
@@ -38,29 +40,38 @@ func TestWithDJENProxy(t *testing.T) {
 
 	c := NewDJENConnector(WithDJENProxy(proxyURL))
 
+	if c.proxyURL == nil || c.proxyURL.String() != proxyURL.String() {
+		t.Errorf("proxyURL = %v, want %v", c.proxyURL, proxyURL)
+	}
 	transport, ok := c.httpClient.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("httpClient.Transport = %T, want *http.Transport", c.httpClient.Transport)
 	}
-
-	req := httptest.NewRequest(http.MethodGet, "https://comunicaapi.pje.jus.br/api/v1/comunicacao", nil)
-	got, err := transport.Proxy(req)
-	if err != nil {
-		t.Fatalf("Proxy resolver: %v", err)
+	if transport.DialTLSContext == nil {
+		t.Error("DialTLSContext = nil, want the uTLS Chrome dialer")
 	}
-	if got == nil || got.String() != proxyURL.String() {
-		t.Errorf("proxy = %v, want %v", got, proxyURL)
+	// The Proxy field is intentionally unused: the tunnel is opened inside DialTLSContext.
+	if transport.Proxy != nil {
+		t.Error("Transport.Proxy set, want nil (CONNECT handled in DialTLSContext)")
 	}
 }
 
-// TestWithDJENProxy_Nil keeps the direct connection (nil Transport → the client
-// falls back to http.DefaultTransport) when no proxy is configured.
+// WithDJENProxy(nil) keeps the direct connection, but the transport is STILL the uTLS
+// one — the Chrome fingerprint is needed with or without the proxy (the JA3 throttle is
+// independent of the egress IP).
 func TestWithDJENProxy_Nil(t *testing.T) {
 	t.Parallel()
 
 	c := NewDJENConnector(WithDJENProxy(nil))
-	if c.httpClient.Transport != nil {
-		t.Errorf("Transport = %v, want nil (direct connection)", c.httpClient.Transport)
+	if c.proxyURL != nil {
+		t.Errorf("proxyURL = %v, want nil (direct)", c.proxyURL)
+	}
+	transport, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("httpClient.Transport = %T, want *http.Transport (uTLS)", c.httpClient.Transport)
+	}
+	if transport.DialTLSContext == nil {
+		t.Error("DialTLSContext = nil, want the uTLS Chrome dialer even without a proxy")
 	}
 }
 

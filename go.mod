@@ -20,6 +20,7 @@ require (
 	github.com/pashagolub/pgxmock/v4 v4.9.0
 	github.com/pgvector/pgvector-go v0.4.0
 	github.com/redis/go-redis/v9 v9.22.0
+	github.com/refraction-networking/utls v1.8.2
 	github.com/resend/resend-go/v2 v2.28.0
 	github.com/stripe/stripe-go/v86 v86.2.0
 	github.com/svix/svix-webhooks v1.99.1
