@@ -18,6 +18,14 @@ const TypeSyncRequested = "acquisition.sync_requested"
 // aggregate is the backfill_job.
 const TypeBackfillFinished = "acquisition.backfill_finished"
 
+// TypeDiarioRequested is the dotted id of the national-ingestion work event: one
+// tribunal's diário for one day. The scheduler (IngestionScheduler) fans a day into
+// one per tribunal; the ingestion consumer (IngestionUseCase) fetches and lands it.
+// Routing it through the outbox → relay → "ingestao" queue is what gives each
+// tribunal INDEPENDENT retry + DLQ, so a 429 on one court no longer truncates the
+// national sweep the way the old synchronous loop did.
+const TypeDiarioRequested = "acquisition.diario_requested"
+
 // Type ids of the events the sync cycle produces. sync_completed/sync_failed
 // bracket a run; court_record_observed/docket_entry_observed announce what the
 // sync saw so downstream slices (consolidation, deadlines, documents) can react.
@@ -37,6 +45,8 @@ const aggregateTypeSyncRun = "sync_run"
 const aggregateTypeCourtRecord = "court_record"
 
 const aggregateTypeDocketEntry = "docket_entry"
+
+const aggregateTypeDiario = "diario"
 
 // IntegrationActivated is emitted, in the same transaction as the upsert, when a
 // source is activated or its scope meaningfully changes. The payload carries
@@ -83,6 +93,26 @@ var _ events.Event = SyncRequested{}
 
 func (SyncRequested) Type() string          { return TypeSyncRequested }
 func (SyncRequested) AggregateType() string { return aggregateTypeBackfillJob }
+
+// DiarioRequested asks the ingestion consumer to fetch ONE tribunal's diário for
+// ONE day and land it in the publication store. The scheduler emits one per tribunal
+// per day (system-scoped, no tenant): the national firehose, fanned across the worker
+// fleet. Day is a bare date (2006-01-02), matching the publication window. Base carries
+// a fresh per-emission event id (the relay's enqueue-dedup TaskID) so a later day's
+// re-request of the same tribunal is a NEW task, not deduped — the daily self-heal.
+// There is no consumer dedup: the store insert is idempotent (ON CONFLICT hash), so a
+// redelivery re-fetches and re-lands harmlessly, which is exactly what lets a transient
+// fault retry.
+type DiarioRequested struct {
+	events.Base
+	Tribunal string `json:"tribunal"`
+	Day      string `json:"day"`
+}
+
+var _ events.Event = DiarioRequested{}
+
+func (DiarioRequested) Type() string          { return TypeDiarioRequested }
+func (DiarioRequested) AggregateType() string { return aggregateTypeDiario }
 
 // CourtRecordObserved announces that a sync saw a court record this run — a
 // brand-new one or a re-observation. It carries the record's identity and the

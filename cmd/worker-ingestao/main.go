@@ -140,7 +140,12 @@ func run(logger *slog.Logger) error {
 		djenOpts = append(djenOpts, acquisition.WithDJENPageSize(cfg.DJENPageSize))
 		logger.Info("DJEN page size override", "service", serviceName, "page_size", cfg.DJENPageSize)
 	}
-	orchestrator.Register(acquisition.SourceDJEN, acquisition.NewDJENConnector(djenOpts...))
+	// One DJEN connector instance backs both the per-OAB sync (via the orchestrator) and
+	// the national ingestion consumer (FetchDiario), so they share the same egress: proxy,
+	// rate limiter and page size. The national fetch is now the worker's job (it moved off
+	// the scheduler in the event-driven ingestion redesign).
+	djenConnector := acquisition.NewDJENConnector(djenOpts...)
+	orchestrator.Register(acquisition.SourceDJEN, djenConnector)
 	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewDATAJUDConnector())
 
 	// Parsers are resolved by CanParse: the DJEN parser claims DJEN payloads and
@@ -159,8 +164,12 @@ func run(logger *slog.Logger) error {
 	// firehose (MatchTenantSince over the retention window) — a new tenant sees its
 	// recent intimações immediately with zero per-OAB DJEN calls, and the scheduler's
 	// daily match covers everything forward. Off = the legacy per-OAB backfill.
+	// ingestion is the national bulk consumer (diario_requested → FetchDiario + land),
+	// built only when the pivot is on; nil keeps the listener inert to the event.
+	var ingestion *acquisition.IngestionUseCase
 	var backfill *acquisition.BackfillUseCase
 	if cfg.IngestionEnabled {
+		ingestion = acquisition.NewIngestionUseCase(djenConnector, repo, uow)
 		match := acquisition.NewMatchUseCase(repo, uow, parser)
 		backfill = acquisition.NewBackfillUseCase(repo, outbox, uow,
 			acquisition.WithBackfillWindowDays(cfg.BackfillWindowDays),
@@ -189,7 +198,15 @@ func run(logger *slog.Logger) error {
 	// the placeholder+merge. It shares the orchestrator and the ParserSet.
 	enrichment := acquisition.NewEnrichmentUseCase(repo, outbox, uow, orchestrator, parser)
 
-	acquisition.NewListener(backfill, sync, enrichment).Register(mux)
+	// Wire the ingestion consumer only when it exists. Passing the typed-nil
+	// *IngestionUseCase straight into the interface param would hit Go's nil-interface
+	// trap (a non-nil interface wrapping a nil pointer), so the listener would register
+	// the handler and panic on dispatch. The explicit branch passes a real nil interface.
+	if ingestion != nil {
+		acquisition.NewListener(backfill, sync, enrichment, ingestion).Register(mux)
+	} else {
+		acquisition.NewListener(backfill, sync, enrichment, nil).Register(mux)
+	}
 
 	// notifications: consume notification.requested and deliver by e-mail (Resend).
 	// The provider config is required here (this worker runs the listener), so a

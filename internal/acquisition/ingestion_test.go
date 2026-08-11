@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hibiken/asynq"
+
 	"github.com/jusassessoria/platform/lib/database"
 )
 
@@ -35,42 +37,148 @@ func (r *stubIngestRepo) InsertPublications(_ context.Context, _ database.Tx, pa
 	return len(params), nil
 }
 
-type stubDayMatcher struct{ days []time.Time }
-
-func (m *stubDayMatcher) MatchDay(_ context.Context, day time.Time) error {
-	m.days = append(m.days, day)
-	return nil
-}
-
-// TestIngestionUseCase_IngestDay sweeps every tribunal for a day: it fetches all of
-// them, lands only the ones with items (empty are skipped), tolerates a tribunal that
-// errors (logged + skipped, not fatal), and runs the match exactly once for the day.
-func TestIngestionUseCase_IngestDay(t *testing.T) {
+// TestIngestionScheduler_RequestDay proves the producer fans a day into one
+// diario_requested per tribunal, in one system transaction: every tribunal is covered
+// exactly once, each event carries the day and a distinct event id, and the count equals
+// the registry size.
+func TestIngestionScheduler_RequestDay(t *testing.T) {
 	t.Parallel()
 
 	day := time.Date(2025, 8, 8, 0, 0, 0, 0, time.UTC)
+	outbox := &fakeOutbox{}
+	uc := NewIngestionScheduler(outbox, &stubMatchUoW{})
+
+	n, err := uc.RequestDay(context.Background(), day)
+	if err != nil {
+		t.Fatalf("RequestDay: %v", err)
+	}
+	if n != len(tribunais) {
+		t.Fatalf("requested = %d, want %d (one per tribunal)", n, len(tribunais))
+	}
+	if len(outbox.published) != len(tribunais) {
+		t.Fatalf("published = %d events, want %d", len(outbox.published), len(tribunais))
+	}
+
+	seenTribunal := make(map[string]bool, len(tribunais))
+	seenEventID := make(map[string]bool, len(tribunais))
+	for _, ev := range outbox.published {
+		dr, ok := ev.(DiarioRequested)
+		if !ok {
+			t.Fatalf("published event type = %T, want DiarioRequested", ev)
+		}
+		if dr.Day != "2025-08-08" {
+			t.Errorf("event day = %q, want 2025-08-08", dr.Day)
+		}
+		if dr.EventID == "" || seenEventID[dr.EventID] {
+			t.Errorf("event id %q is empty or duplicated", dr.EventID)
+		}
+		seenEventID[dr.EventID] = true
+		seenTribunal[dr.Tribunal] = true
+	}
+	if len(seenTribunal) != len(tribunais) {
+		t.Errorf("distinct tribunais = %d, want %d", len(seenTribunal), len(tribunais))
+	}
+}
+
+// TestIngestionScheduler_RequestDay_PublishError proves the batch is all-or-nothing: a
+// publish fault aborts the whole day (error surfaced, zero reported) so the caller
+// retries the day cleanly rather than half-requesting it.
+func TestIngestionScheduler_RequestDay_PublishError(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("outbox down")
+	outbox := &fakeOutbox{failAt: 3, err: sentinel}
+	uc := NewIngestionScheduler(outbox, &stubMatchUoW{})
+
+	n, err := uc.RequestDay(context.Background(), time.Date(2025, 8, 8, 0, 0, 0, 0, time.UTC))
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want %v", err, sentinel)
+	}
+	if n != 0 {
+		t.Errorf("requested = %d, want 0 on abort", n)
+	}
+}
+
+// TestIngestionUseCase_OnDiarioRequested lands one tribunal's diário: it fetches the
+// requested tribunal/day, parses the items, and inserts them once. The match is NOT run
+// here — that is the scheduler's separate idempotent tick.
+func TestIngestionUseCase_OnDiarioRequested(t *testing.T) {
+	t.Parallel()
+
 	fetcher := &stubDiarioFetcher{
-		errOn: "TJRJ", // one tribunal outage — must not sink the day
 		byTribunal: map[string][]json.RawMessage{
 			"TJSP": {diarioItem("h1", "TJSP", "2025-08-08", [2]string{"347019", "SP"})},
 		},
 	}
 	repo := &stubIngestRepo{}
-	matcher := &stubDayMatcher{}
-	uc := NewIngestionUseCase(fetcher, repo, &stubMatchUoW{}, matcher)
+	uc := NewIngestionUseCase(fetcher, repo, &stubMatchUoW{})
 
-	if err := uc.IngestDay(context.Background(), day); err != nil {
-		t.Fatalf("IngestDay: %v", err)
+	ev := DiarioRequested{Tribunal: "TJSP", Day: "2025-08-08"}
+	if err := uc.OnDiarioRequested(context.Background(), ev); err != nil {
+		t.Fatalf("OnDiarioRequested: %v", err)
 	}
-
-	if len(fetcher.calls) != len(tribunais) {
-		t.Errorf("FetchDiario calls = %d, want %d (every tribunal swept)", len(fetcher.calls), len(tribunais))
+	if fetcher.calls[0] != "TJSP" || len(fetcher.calls) != 1 {
+		t.Errorf("fetch calls = %v, want [TJSP]", fetcher.calls)
 	}
-	// Only TJSP had items; the errored TJRJ and the empty rest land nothing.
 	if repo.batches != 1 || repo.inserted != 1 {
 		t.Errorf("inserts = {batches:%d rows:%d}, want {1 1}", repo.batches, repo.inserted)
 	}
-	if len(matcher.days) != 1 || !matcher.days[0].Equal(day) {
-		t.Errorf("MatchDay calls = %v, want [%v]", matcher.days, day)
+}
+
+// TestIngestionUseCase_OnDiarioRequested_Empty acks a tribunal that returns nothing
+// without touching the store.
+func TestIngestionUseCase_OnDiarioRequested_Empty(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &stubDiarioFetcher{byTribunal: map[string][]json.RawMessage{}}
+	repo := &stubIngestRepo{}
+	uc := NewIngestionUseCase(fetcher, repo, &stubMatchUoW{})
+
+	if err := uc.OnDiarioRequested(context.Background(), DiarioRequested{Tribunal: "TJSP", Day: "2025-08-08"}); err != nil {
+		t.Fatalf("OnDiarioRequested: %v", err)
+	}
+	if repo.batches != 0 {
+		t.Errorf("inserts = %d batches, want 0 for an empty diário", repo.batches)
+	}
+}
+
+// TestIngestionUseCase_OnDiarioRequested_FetchError_Retryable proves a fetch fault (a
+// 429/WAF/flaky court) is RETRYABLE: the error surfaces without SkipRetry, so asynq
+// retries with backoff (and archives to the DLQ only when the budget is exhausted).
+func TestIngestionUseCase_OnDiarioRequested_FetchError_Retryable(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &stubDiarioFetcher{errOn: "TJSP"}
+	uc := NewIngestionUseCase(fetcher, &stubIngestRepo{}, &stubMatchUoW{})
+
+	err := uc.OnDiarioRequested(context.Background(), DiarioRequested{Tribunal: "TJSP", Day: "2025-08-08"})
+	if err == nil {
+		t.Fatal("OnDiarioRequested: want error on fetch fault")
+	}
+	if errors.Is(err, asynq.SkipRetry) {
+		t.Errorf("fetch fault must be retryable, but wraps SkipRetry: %v", err)
+	}
+}
+
+// TestIngestionUseCase_OnDiarioRequested_ParseError_SkipRetry proves a parse fault (a
+// malformed item that never parses on retry) is PERMANENT: the error wraps SkipRetry so
+// asynq archives the task at once instead of burning the retry budget.
+func TestIngestionUseCase_OnDiarioRequested_ParseError_SkipRetry(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &stubDiarioFetcher{
+		byTribunal: map[string][]json.RawMessage{
+			"TJSP": {json.RawMessage("{ not valid json")},
+		},
+	}
+	repo := &stubIngestRepo{}
+	uc := NewIngestionUseCase(fetcher, repo, &stubMatchUoW{})
+
+	err := uc.OnDiarioRequested(context.Background(), DiarioRequested{Tribunal: "TJSP", Day: "2025-08-08"})
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("parse fault must wrap SkipRetry, got: %v", err)
+	}
+	if repo.batches != 0 {
+		t.Errorf("inserts = %d, want 0 when parse fails before the write", repo.batches)
 	}
 }

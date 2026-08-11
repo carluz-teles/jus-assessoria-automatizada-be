@@ -36,19 +36,29 @@ type enrichmentListenerUC interface {
 	OnCourtRecordObserved(ctx context.Context, ev CourtRecordObserved) error
 }
 
+// ingestionListenerUC is the port for the diario_requested consumer (national bulk
+// ingestion). It is OPTIONAL: nil when INGESTION_ENABLED is off, in which case the
+// diario_requested handler is not registered (the pivot ships inert).
+type ingestionListenerUC interface {
+	OnDiarioRequested(ctx context.Context, ev DiarioRequested) error
+}
+
 // Listener is acquisition's asynq consumer. It holds no transport state; the use
-// cases own persistence and the transaction boundary. It drives three use cases —
-// backfill (reacts to integration_activated), sync (reacts to sync_requested), and
-// enrichment (reacts to court_record_observed).
+// cases own persistence and the transaction boundary. It drives up to four use cases —
+// backfill (reacts to integration_activated), sync (reacts to sync_requested),
+// enrichment (reacts to court_record_observed), and — when the national pivot is on —
+// ingestion (reacts to diario_requested).
 type Listener struct {
 	backfill   backfillListenerUC
 	sync       syncListenerUC
 	enrichment enrichmentListenerUC
+	ingestion  ingestionListenerUC
 }
 
-// NewListener wires the listener to the backfill, sync, and enrichment use cases.
-func NewListener(backfill backfillListenerUC, sync syncListenerUC, enrichment enrichmentListenerUC) *Listener {
-	return &Listener{backfill: backfill, sync: sync, enrichment: enrichment}
+// NewListener wires the listener to the backfill, sync, and enrichment use cases, plus
+// the optional ingestion consumer (nil disables the diario_requested handler).
+func NewListener(backfill backfillListenerUC, sync syncListenerUC, enrichment enrichmentListenerUC, ingestion ingestionListenerUC) *Listener {
+	return &Listener{backfill: backfill, sync: sync, enrichment: enrichment, ingestion: ingestion}
 }
 
 // Register mounts the slice's task handlers on the asynq mux — the async analog
@@ -60,6 +70,14 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeSyncCompleted, l.handleSyncCompleted)
 	mux.HandleFunc(TypeSyncFailed, l.handleSyncFailed)
 	mux.HandleFunc(TypeCourtRecordObserved, l.handleCourtRecordObserved)
+
+	// diario_requested (ingestão nacional) só tem consumer quando o pivot está ligado
+	// (INGESTION_ENABLED injeta a use case). Registrar condicionalmente mantém o worker
+	// inerte ao evento quando desligado — um pattern é registrado uma única vez no mux, e
+	// registrar com uma use case nil daria panic de nil no dispatch.
+	if l.ingestion != nil {
+		mux.HandleFunc(TypeDiarioRequested, l.handleDiarioRequested)
+	}
 
 	// docket_entry_observed (novo andamento) e backfill_finished (aviso de fim) agora
 	// têm consumer real: o slice notifications os transforma em avisos IN_APP e
@@ -128,4 +146,17 @@ func (l *Listener) handleCourtRecordObserved(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	return l.enrichment.OnCourtRecordObserved(ctx, ev)
+}
+
+// handleDiarioRequested is the asynq.HandlerFunc for acquisition.diario_requested. It
+// decodes the payload and hands off to the ingestion use case. A decode fault is
+// SkipRetry (archived, never parses on retry); the use case returns a retryable error on
+// a fetch/DB fault (asynq retries with backoff, then archives to the DLQ) and SkipRetry
+// on a parse fault.
+func (l *Listener) handleDiarioRequested(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DiarioRequested](t)
+	if err != nil {
+		return err
+	}
+	return l.ingestion.OnDiarioRequested(ctx, ev)
 }

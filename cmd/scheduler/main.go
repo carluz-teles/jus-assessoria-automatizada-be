@@ -1,17 +1,19 @@
 // Command scheduler runs the acquisition slice's periodic loops: (1) the re-poll
 // trigger — on a fixed interval it scans court_record for records whose next_sync_at
 // is due (system-scoped, cross-tenant) and enqueues a re-poll onto the outbox; and,
-// when INGESTION_ENABLED, (2) the national bulk ingestion — once per day it sweeps
-// every DJEN tribunal into the publication store and matches it to tenants, plus a
-// one-time historical bootstrap (BOOTSTRAP_DAYS). config → health → pool → loops →
-// graceful shutdown. No migrations (§5b.3).
+// when INGESTION_ENABLED, (2) the national bulk ingestion producer — once per day it
+// fans every DJEN tribunal into a diario_requested event (worker-ingestao fetches and
+// lands each, with per-tribunal retry + DLQ), plus (3) a match tick that folds the
+// landed firehose into tenant intimações (idempotent), and a one-time historical
+// bootstrap (BOOTSTRAP_DAYS). The scheduler itself never hits DJEN — the fetch moved
+// to the worker consumer. config → health → pool → loops → graceful shutdown. No
+// migrations (§5b.3).
 package main
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -70,17 +72,19 @@ func run(logger *slog.Logger) error {
 	scheduler := acquisition.NewSchedulerUseCase(repo, events.NewOutbox(), uow)
 
 	// The national bulk ingestion (the DJEN pivot), built only when enabled so the
-	// binary can ship inert and coexist with the per-OAB path until we cut over.
-	var ingestion *acquisition.IngestionUseCase
+	// binary can ship inert and coexist with the per-OAB path until we cut over. The
+	// scheduler owns the PRODUCER (fan a day into diario_requested events) and the MATCH
+	// tick (fold the landed firehose into tenant intimações); the fetch is the worker's
+	// consumer, so no DJEN connector is wired here.
+	var requester *acquisition.IngestionScheduler
+	var matcher *acquisition.MatchUseCase
 	if cfg.IngestionEnabled {
-		connector, cerr := buildDJENConnector(cfg, logger)
-		if cerr != nil {
-			return cerr
-		}
+		requester = acquisition.NewIngestionScheduler(events.NewOutbox(), uow)
+		// The match re-parses matched payloads through the DJEN parser (holiday calendar
+		// for CPC-224 dates); no network egress.
 		cal := calendar.New(calendar.NewStore(pool))
 		parser := acquisition.ParserSet{acquisition.NewDJENParser(cal), acquisition.NewDATAJUDParser()}
-		match := acquisition.NewMatchUseCase(repo, uow, parser)
-		ingestion = acquisition.NewIngestionUseCase(connector, repo, uow, match)
+		matcher = acquisition.NewMatchUseCase(repo, uow, parser)
 		logger.Info("national ingestion enabled", "service", serviceName,
 			"lookback_days", cfg.IngestionLookbackDays, "bootstrap_days", cfg.BootstrapDays)
 	}
@@ -97,17 +101,22 @@ func run(logger *slog.Logger) error {
 			wg.Add(1)
 			go func() { defer wg.Done(); runSchedulerLoop(loopCtx, logger, scheduler) }()
 
-			if ingestion != nil {
+			if requester != nil {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					runIngestionLoop(loopCtx, logger, ingestion, cfg.IngestionLookbackDays)
+					runRequestLoop(loopCtx, logger, requester, cfg.IngestionLookbackDays)
+				}()
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					runMatchLoop(loopCtx, logger, matcher, cfg.IngestionLookbackDays)
 				}()
 				if cfg.BootstrapDays > 0 {
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
-						runBootstrap(loopCtx, logger, ingestion, cfg.BootstrapDays)
+						runBootstrap(loopCtx, logger, requester, cfg.BootstrapDays)
 					}()
 				}
 			}
@@ -124,28 +133,6 @@ func run(logger *slog.Logger) error {
 	)
 
 	return nil
-}
-
-// buildDJENConnector composes the DJEN connector from config — the same egress wiring
-// as worker-ingestao (residential proxy for the WAF, rate/page overrides). A malformed
-// proxy URL fails the boot rather than silently going direct.
-func buildDJENConnector(cfg config.Config, logger *slog.Logger) (*acquisition.DJENConnector, error) {
-	opts := []acquisition.DJENOption{}
-	if cfg.DJENProxyURL != "" {
-		proxyURL, perr := url.Parse(cfg.DJENProxyURL)
-		if perr != nil {
-			return nil, fmt.Errorf("parse DJEN_PROXY_URL: %w", perr)
-		}
-		opts = append(opts, acquisition.WithDJENProxy(proxyURL))
-		logger.Info("DJEN outbound proxy enabled", "service", serviceName, "proxy_host", proxyURL.Host)
-	}
-	if cfg.DJENRatePerMinute > 0 {
-		opts = append(opts, acquisition.WithDJENRatePerMinute(cfg.DJENRatePerMinute))
-	}
-	if cfg.DJENPageSize > 0 {
-		opts = append(opts, acquisition.WithDJENPageSize(cfg.DJENPageSize))
-	}
-	return acquisition.NewDJENConnector(opts...), nil
 }
 
 // duePoller is the re-poll behavior the loop drives — the acquisition use case
@@ -178,16 +165,23 @@ func runSchedulerLoop(ctx context.Context, logger *slog.Logger, scheduler duePol
 	}
 }
 
-// dayIngestor is the ingestion behavior the loops drive (IngestionUseCase).
-type dayIngestor interface {
-	IngestDay(ctx context.Context, day time.Time) error
+// dayRequester emits the national fetch work for a day (IngestionScheduler.RequestDay).
+type dayRequester interface {
+	RequestDay(ctx context.Context, day time.Time) (int, error)
 }
 
-// runIngestionLoop runs the national sweep once per calendar day: on the first wake of
-// a new day it (re-)ingests the lookback window (yesterday back through
-// IngestionLookbackDays, to catch late/retracted publications — idempotent). A day
-// that fails is not marked done, so the next tick retries the window.
-func runIngestionLoop(ctx context.Context, logger *slog.Logger, ingestion dayIngestor, lookback int) {
+// dayMatcher folds a day's landed firehose into tenant intimações (MatchUseCase.MatchDay).
+type dayMatcher interface {
+	MatchDay(ctx context.Context, day time.Time) error
+}
+
+// runRequestLoop emits the national fetch work once per calendar day: on the first wake
+// of a new day it (re-)requests the lookback window (yesterday back through
+// IngestionLookbackDays, to catch late/retracted publications — the events are
+// idempotent at the store). A day whose emission fails is not marked done, so the next
+// tick retries the whole window. The actual fetch happens asynchronously in the worker
+// consumer, so this loop is cheap and returns immediately after enqueueing.
+func runRequestLoop(ctx context.Context, logger *slog.Logger, requester dayRequester, lookback int) {
 	ticker := time.NewTicker(ingestionTickInterval)
 	defer ticker.Stop()
 
@@ -201,17 +195,17 @@ func runIngestionLoop(ctx context.Context, logger *slog.Logger, ingestion dayIng
 			if ctx.Err() != nil {
 				return
 			}
-			if err := ingestion.IngestDay(ctx, day); err != nil {
-				logger.ErrorContext(ctx, "ingestion: daily day failed",
+			if _, err := requester.RequestDay(ctx, day); err != nil {
+				logger.ErrorContext(ctx, "ingestion: request day failed",
 					"day", day.Format(dayLayout), "error", err)
 				return // leave lastRun unchanged → retry the whole window next tick
 			}
 		}
 		lastRun = today
-		logger.InfoContext(ctx, "ingestion: daily run complete", "through_day", today)
+		logger.InfoContext(ctx, "ingestion: daily request complete", "through_day", today)
 	}
 
-	runOnce() // ingest immediately at boot, not after the first tick
+	runOnce() // request immediately at boot, not after the first tick
 	for {
 		select {
 		case <-ctx.Done():
@@ -222,10 +216,45 @@ func runIngestionLoop(ctx context.Context, logger *slog.Logger, ingestion dayIng
 	}
 }
 
-// runBootstrap ingests the last `days` days of the national diário ONCE at boot (the
-// cold-start of the store), oldest first, in the background. A failed day is logged
-// and skipped — the daily lookback and a re-bootstrap self-heal it.
-func runBootstrap(ctx context.Context, logger *slog.Logger, ingestion dayIngestor, days int) {
+// runMatchLoop folds the landed firehose into tenant intimações on every tick (not
+// once/day): because the fetch is asynchronous, publications for a day trickle in over
+// minutes/hours behind their diario_requested, so the match re-runs the lookback window
+// each tick to pick up whatever has landed since. MatchDay is idempotent (dedup insert +
+// upsert), so re-running is safe and just no-ops on already-matched publications. A
+// failed day is logged and the loop continues — the next tick retries.
+func runMatchLoop(ctx context.Context, logger *slog.Logger, matcher dayMatcher, lookback int) {
+	ticker := time.NewTicker(ingestionTickInterval)
+	defer ticker.Stop()
+
+	runOnce := func() {
+		for _, day := range daysToIngest(time.Now().UTC(), lookback) {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := matcher.MatchDay(ctx, day); err != nil {
+				logger.ErrorContext(ctx, "ingestion: match day failed",
+					"day", day.Format(dayLayout), "error", err)
+			}
+		}
+	}
+
+	runOnce() // match immediately at boot, not after the first tick
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
+
+// runBootstrap requests the last `days` days of the national diário ONCE at boot (the
+// cold-start of the store), oldest first, in the background. It only EMITS the fetch
+// work (the worker lands it); a new tenant later matches against the landed history via
+// the onboarding cutover (MatchTenantSince). A failed day's emission is logged and
+// skipped — the daily lookback and a re-bootstrap self-heal it.
+func runBootstrap(ctx context.Context, logger *slog.Logger, requester dayRequester, days int) {
 	logger.InfoContext(ctx, "ingestion: bootstrap starting", "days", days)
 	now := time.Now().UTC()
 	for i := days; i >= 1; i-- {
@@ -233,7 +262,7 @@ func runBootstrap(ctx context.Context, logger *slog.Logger, ingestion dayIngesto
 			return
 		}
 		day := truncateDay(now.AddDate(0, 0, -i))
-		if err := ingestion.IngestDay(ctx, day); err != nil {
+		if _, err := requester.RequestDay(ctx, day); err != nil {
 			logger.ErrorContext(ctx, "ingestion: bootstrap day failed",
 				"day", day.Format(dayLayout), "error", err)
 		}

@@ -58,16 +58,18 @@ locals {
       APP_BILLING_CANCEL_URL  = var.billing_cancel_url
       APP_BILLING_RETURN_URL  = var.billing_return_url
     })
-    # worker-ingestao: roda o listener de notifications (envia e-mail via Resend) e
-    # o backfill/sync do DJEN — que sai pelo proxy residencial (DJEN_PROXY_URL) p/
-    # contornar o WAF que 403 o IP de datacenter.
+    # worker-ingestao: roda o listener de notifications (e-mail via Resend), o
+    # backfill/sync do DJEN E — com o redesign event-driven — o CONSUMER da ingestão
+    # nacional (diario_requested → FetchDiario → grava no store). Todo egress DJEN sai
+    # pelo proxy residencial (DJEN_PROXY_URL) p/ contornar o WAF que 403 o IP de datacenter.
     "worker-ingestao" = merge(local.base_vars, {
       RESEND_API_KEY    = var.resend_api_key
       RESEND_FROM_EMAIL = var.resend_from_email
       DJEN_PROXY_URL    = var.djen_proxy_url
       # DJEN pace/concorrência do sweet-spot (o teto do DJEN é ~2 req/s GLOBAL; acima
-      # disso = 429). Com INGESTION_ENABLED o cutover troca o backfill per-OAB por
-      # history-match contra o store (zero DJEN no worker) — a virada bulk.
+      # disso = 429). Com INGESTION_ENABLED: o cutover troca o backfill per-OAB por
+      # history-match contra o store, E o worker passa a fetchar o diário nacional
+      # (a fila "ingestao" dá retry 25×+DLQ por tribunal). Page size = default 1000.
       DJEN_RATE_PER_MINUTE = "120"
       INGESTAO_CONCURRENCY = "3"
       INGESTION_ENABLED    = "true"
@@ -76,14 +78,12 @@ locals {
     "worker-ai"           = local.base_vars
     "worker-documents"    = local.base_vars
     "worker-outbox-relay" = local.base_vars
-    # scheduler: re-poll + a INGESTÃO NACIONAL do diário DJEN (bulk). Sai pelo mesmo
-    # proxy residencial; é o ÚNICO consumidor do orçamento DJEN quando o cutover está
-    # ligado (o worker não bate mais no DJEN). BOOTSTRAP_DAYS=0 pula o cold-start
-    # histórico; o loop diário ingere ontem + lookback.
+    # scheduler: re-poll + o PRODUTOR da ingestão nacional. Com o redesign event-driven,
+    # o scheduler NÃO fetcha mais o DJEN — só emite um diario_requested por tribunal
+    # (worker-ingestao fetcha e grava, com retry+DLQ por tribunal) e roda o match tick.
+    # Logo NÃO recebe egress DJEN (proxy/rate/page): esses vivem no worker. BOOTSTRAP_DAYS=0
+    # pula o cold-start histórico; o loop diário requisita ontem + lookback.
     "scheduler" = merge(local.base_vars, {
-      DJEN_PROXY_URL          = var.djen_proxy_url
-      DJEN_RATE_PER_MINUTE    = "120"
-      DJEN_PAGE_SIZE          = "1000"
       INGESTION_ENABLED       = "true"
       INGESTION_LOOKBACK_DAYS = "1"
       BOOTSTRAP_DAYS          = "0"
