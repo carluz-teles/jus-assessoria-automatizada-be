@@ -45,6 +45,9 @@ type stubMatchRepo struct {
 func (r *stubMatchRepo) MatchPublicationsByDay(context.Context, database.Tx, time.Time) ([]PublicationMatch, error) {
 	return r.matches, nil
 }
+func (r *stubMatchRepo) MatchPublicationsForTenantSince(_ context.Context, _ database.Tx, _ string, _ time.Time) ([]PublicationMatch, error) {
+	return r.matches, nil
+}
 func (r *stubMatchRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, tenantID string) error {
 	r.lockTenants = append(r.lockTenants, tenantID)
 	return nil
@@ -118,5 +121,31 @@ func TestMatchUseCase_MatchDay(t *testing.T) {
 	slices.Sort(uow.tenants)
 	if !slices.Equal(uow.tenants, []string{"A", "B"}) {
 		t.Errorf("write txs for tenants = %v, want [A B]", uow.tenants)
+	}
+}
+
+// TestMatchUseCase_MatchTenantSince catches a single tenant up from the store: its
+// matched payloads parse to a record + intimação and get exactly one write tx.
+func TestMatchUseCase_MatchTenantSince(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubMatchRepo{matches: []PublicationMatch{
+		{TenantID: "A", OABKey: "1|SP", Payload: json.RawMessage(`{"hash":"P"}`)},
+	}}
+	parser := &fakeMatchParser{result: ParsedResult{
+		CourtRecords: []ParsedCourtRecord{{CNJNumber: "1", Degree: DegreeUnknown}},
+		Intimations:  []ParsedIntimation{{CNJNumber: "1", Degree: DegreeUnknown, Hash: "i1"}},
+	}}
+	uow := &stubMatchUoW{}
+	uc := NewMatchUseCase(repo, uow, parser)
+
+	if err := uc.MatchTenantSince(context.Background(), "A", time.Now()); err != nil {
+		t.Fatalf("MatchTenantSince: %v", err)
+	}
+	if repo.findCalls != 1 || repo.upsertCalls != 1 {
+		t.Errorf("writes = {find:%d upsert:%d}, want {1 1}", repo.findCalls, repo.upsertCalls)
+	}
+	if len(uow.tenants) != 1 || uow.tenants[0] != "A" {
+		t.Errorf("write tx tenants = %v, want [A]", uow.tenants)
 	}
 }

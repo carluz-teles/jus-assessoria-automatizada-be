@@ -81,6 +81,7 @@ type Repository interface {
 	// Match — the national join (publication.recipient_oabs ∩ watched_oab), read
 	// system-wide (uow.DoSystem). Drives the per-tenant fan-out to intimações.
 	MatchPublicationsByDay(ctx context.Context, tx database.Tx, day time.Time) ([]PublicationMatch, error)
+	MatchPublicationsForTenantSince(ctx context.Context, tx database.Tx, tenantID string, since time.Time) ([]PublicationMatch, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -820,6 +821,28 @@ func (r *pgRepository) MatchPublicationsByDay(ctx context.Context, tx database.T
 			OABKey:   row.OabKey,
 			Payload:  row.Payload,
 		})
+	}
+	return out, nil
+}
+
+// MatchPublicationsForTenantSince returns one tenant's matches from a date forward —
+// the onboarding history catch-up against the already-stored firehose. System tx.
+func (r *pgRepository) MatchPublicationsForTenantSince(ctx context.Context, tx database.Tx, tenantID string, since time.Time) ([]PublicationMatch, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	q := acquisitiondb.New(tx)
+	rows, err := q.MatchPublicationsForTenantSince(ctx, acquisitiondb.MatchPublicationsForTenantSinceParams{
+		TenantID:        tid,
+		MadeAvailableAt: pgtype.Date{Time: since, Valid: true},
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]PublicationMatch, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, PublicationMatch{TenantID: tenantID, OABKey: row.OabKey, Payload: row.Payload})
 	}
 	return out, nil
 }

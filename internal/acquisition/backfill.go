@@ -143,6 +143,18 @@ type BackfillUseCase struct {
 	horizonDays int
 	windowDays  int
 	now         func() time.Time
+	// history is the onboarding cutover: when set (INGESTION_ENABLED), a fresh
+	// activation catches the tenant up from the stored national firehose instead of
+	// firing the per-OAB backfill. nil keeps the legacy per-OAB path.
+	history     historyMatcher
+	historyDays int
+}
+
+// historyMatcher catches one tenant up from the already-stored firehose (the
+// MatchUseCase). The backfill use case depends on this narrow port so the cutover is
+// a swapped dependency, not a rewrite.
+type historyMatcher interface {
+	MatchTenantSince(ctx context.Context, tenantID string, since time.Time) error
 }
 
 // backfillOption tunes a BackfillUseCase at construction. Same-package tests
@@ -184,6 +196,16 @@ func WithBackfillWindowDays(days int) backfillOption {
 	}
 }
 
+// WithHistoryMatcher turns on the onboarding cutover: a fresh activation catches the
+// tenant up from the stored firehose over the last `days` days (the bootstrap window)
+// instead of firing the per-OAB backfill. Wired from the worker when INGESTION_ENABLED.
+func WithHistoryMatcher(m historyMatcher, days int) backfillOption {
+	return func(uc *BackfillUseCase) {
+		uc.history = m
+		uc.historyDays = days
+	}
+}
+
 // OnIntegrationActivated is the backfill use case invoked by the listener. In a
 // single unit of work it dedups the event (processed_event, committed with the
 // effect), guards against a re-activation (a job already exists for this
@@ -194,7 +216,8 @@ func WithBackfillWindowDays(days int) backfillOption {
 // tenantID comes from the event payload (a trusted producer inside the same
 // system, no Clerk token on the worker) and scopes the transaction's RLS.
 func (uc *BackfillUseCase) OnIntegrationActivated(ctx context.Context, ev IntegrationActivated) error {
-	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+	fresh := false // first activation → catch the tenant up from the stored firehose (cutover)
+	if err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		seen, err := events.NewDedup(tx).SeenOrMark(ctx, consumerBackfill, ev.EventID)
 		if err != nil {
 			return err
@@ -220,8 +243,26 @@ func (uc *BackfillUseCase) OnIntegrationActivated(ctx context.Context, ev Integr
 			return nil
 		}
 
+		// Cutover (history != nil): skip the per-OAB backfill entirely — the stored
+		// firehose already has the history, and the daily match covers forward. Flag
+		// the tenant for the post-commit catch-up. Legacy path fires the backfill.
+		if uc.history != nil {
+			fresh = true
+			return nil
+		}
 		return uc.createBackfill(ctx, tx, ev)
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Catch the new tenant up AFTER the watched_oab commit (the match reads system-wide
+	// and writes in its own tenant tx, so the just-committed OABs are visible). The
+	// write is idempotent; note it is gated by the activation dedup, so a transient
+	// failure here is best-effort — the daily match still covers everything forward.
+	if fresh {
+		return uc.history.MatchTenantSince(ctx, ev.TenantID, uc.now().AddDate(0, 0, -uc.historyDays))
+	}
+	return nil
 }
 
 // createBackfill inserts the backfill_job and publishes one sync_requested event

@@ -217,6 +217,47 @@ func activatedEvent() IntegrationActivated {
 	}
 }
 
+type stubHistoryMatcher struct {
+	calls  int
+	tenant string
+}
+
+func (m *stubHistoryMatcher) MatchTenantSince(_ context.Context, tenantID string, _ time.Time) error {
+	m.calls++
+	m.tenant = tenantID
+	return nil
+}
+
+// TestBackfillUseCase_CutoverMatchesHistory: with a history matcher wired (the bulk
+// cutover), a fresh activation populates watched_oab and catches the tenant up from
+// the store — and does NOT fire the per-OAB backfill (no job insert, no sync slices).
+func TestBackfillUseCase_CutoverMatchesHistory(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{exists: false}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	history := &stubHistoryMatcher{}
+	uc := NewBackfillUseCase(repo, outbox, uow, WithHistoryMatcher(history, 90))
+
+	if err := uc.OnIntegrationActivated(context.Background(), activatedEvent()); err != nil {
+		t.Fatalf("OnIntegrationActivated() error = %v", err)
+	}
+
+	if repo.insertCalls != 0 {
+		t.Errorf("backfill job inserts = %d, want 0 (cutover skips the per-OAB backfill)", repo.insertCalls)
+	}
+	if outbox.calls != 0 {
+		t.Errorf("sync_requested emitted = %d, want 0 (no per-OAB slices)", outbox.calls)
+	}
+	if len(repo.watchedKeys) != 2 {
+		t.Errorf("watched keys = %v, want 2 (still populated on cutover)", repo.watchedKeys)
+	}
+	if history.calls != 1 || history.tenant != testTenant {
+		t.Errorf("history catch-up = {calls:%d tenant:%q}, want {1 %q}", history.calls, history.tenant, testTenant)
+	}
+}
+
 // --- use case tests ----------------------------------------------------------
 
 // First activation of an integration: one RUNNING job with 53 total slices and

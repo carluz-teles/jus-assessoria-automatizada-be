@@ -202,6 +202,12 @@ type Querier interface {
 	// two rows; the match use case groups by tenant and dedups the payloads. payload is
 	// the raw DJEN item, re-parsed per matched tenant to create its court_record/intimação.
 	MatchPublicationsByDay(ctx context.Context, madeAvailableAt pgtype.Date) ([]MatchPublicationsByDayRow, error)
+	// One tenant's matches from a date forward — the onboarding history catch-up: a new
+	// integration's watched OABs are matched against the publications ALREADY stored (the
+	// 90-day bootstrap window), so the client sees its recent intimações immediately, with
+	// ZERO per-OAB DJEN calls. The forward daily match (MatchPublicationsByDay) covers
+	// everything from tomorrow on.
+	MatchPublicationsForTenantSince(ctx context.Context, arg MatchPublicationsForTenantSinceParams) ([]MatchPublicationsForTenantSinceRow, error)
 	// Move the placeholder's intimations onto the graded record. Unicidade de
 	// intimation é (tenant, case_id, hash), so swapping court_record_id never breaks
 	// dedup (same case). Returns the number of rows moved.

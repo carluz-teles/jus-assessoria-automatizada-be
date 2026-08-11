@@ -41,6 +41,9 @@ const (
 	// the wall clock ~N×. The concurrent writes this unlocks are serialized per tenant
 	// by the AcquireTenantWriteLock advisory lock, so there is no 40P01 deadlock.
 	defaultConcurrency = 8
+	// onboardingHistoryDays is how far back a new tenant is caught up from the stored
+	// firehose on the cutover — matched to the publication store's ~90d retention.
+	onboardingHistoryDays = 90
 )
 
 func main() {
@@ -106,17 +109,6 @@ func run(logger *slog.Logger) error {
 	outbox := events.NewOutbox()
 	uow := database.NewUnitOfWork(pool)
 
-	// The backfill window is dialed from BACKFILL_WINDOW_DAYS (default 30/monthly):
-	// fewer, wider slices mean fewer DJEN round-trips, and the per-request latency of
-	// the residential-proxy egress — not the item volume — is what dominates the
-	// backfill wall clock. 0 keeps the use case default.
-	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow,
-		acquisition.WithBackfillWindowDays(cfg.BackfillWindowDays),
-	)
-	if cfg.BackfillWindowDays > 0 {
-		logger.Info("backfill window override", "service", serviceName, "window_days", cfg.BackfillWindowDays)
-	}
-
 	// The sync use case resolves its connector per event from the orchestrator, by
 	// the event's source. Both connectors are REAL now: DJEN discovers nationally by
 	// OAB (no auth); DATAJUD enriches one process by number from the tribunal's index
@@ -159,6 +151,30 @@ func run(logger *slog.Logger) error {
 	parser := acquisition.ParserSet{
 		acquisition.NewDJENParser(cal),
 		acquisition.NewDATAJUDParser(),
+	}
+
+	// Backfill onboarding, built after the parser so the cutover can wire the match.
+	// The window is dialed from BACKFILL_WINDOW_DAYS. When INGESTION_ENABLED, the
+	// cutover swaps the per-OAB backfill for a history catch-up against the stored
+	// firehose (MatchTenantSince over the retention window) — a new tenant sees its
+	// recent intimações immediately with zero per-OAB DJEN calls, and the scheduler's
+	// daily match covers everything forward. Off = the legacy per-OAB backfill.
+	var backfill *acquisition.BackfillUseCase
+	if cfg.IngestionEnabled {
+		match := acquisition.NewMatchUseCase(repo, uow, parser)
+		backfill = acquisition.NewBackfillUseCase(repo, outbox, uow,
+			acquisition.WithBackfillWindowDays(cfg.BackfillWindowDays),
+			acquisition.WithHistoryMatcher(match, onboardingHistoryDays),
+		)
+		logger.Info("onboarding cutover enabled (history match, no per-OAB backfill)",
+			"service", serviceName, "history_days", onboardingHistoryDays)
+	} else {
+		backfill = acquisition.NewBackfillUseCase(repo, outbox, uow,
+			acquisition.WithBackfillWindowDays(cfg.BackfillWindowDays),
+		)
+	}
+	if cfg.BackfillWindowDays > 0 {
+		logger.Info("backfill window override", "service", serviceName, "window_days", cfg.BackfillWindowDays)
 	}
 
 	// Sem gate de entitlement POR ENQUANTO: billing (Stripe) ainda não está

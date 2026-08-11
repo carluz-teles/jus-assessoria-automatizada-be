@@ -15,6 +15,7 @@ import (
 // system-wide) plus the same per-tenant write the sync cycle uses.
 type matchRepo interface {
 	MatchPublicationsByDay(ctx context.Context, tx database.Tx, day time.Time) ([]PublicationMatch, error)
+	MatchPublicationsForTenantSince(ctx context.Context, tx database.Tx, tenantID string, since time.Time) ([]PublicationMatch, error)
 	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, bool, error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error)
@@ -55,6 +56,26 @@ func (uc *MatchUseCase) MatchDay(ctx context.Context, day time.Time) error {
 		}
 	}
 	return nil
+}
+
+// MatchTenantSince catches ONE tenant up against the already-stored firehose from a
+// date forward — the onboarding cutover: a new integration's watched OABs are matched
+// against the bootstrap history, so the client sees its recent intimações immediately
+// with zero per-OAB DJEN calls (the daily MatchDay covers everything from tomorrow).
+func (uc *MatchUseCase) MatchTenantSince(ctx context.Context, tenantID string, since time.Time) error {
+	var matches []PublicationMatch
+	if err := uc.uow.DoSystem(ctx, func(tx database.Tx) error {
+		var e error
+		matches, e = uc.repo.MatchPublicationsForTenantSince(ctx, tx, tenantID, since)
+		return e
+	}); err != nil {
+		return err
+	}
+	b := groupMatches(matches)[tenantID]
+	if b == nil {
+		return nil // nothing in the store matches this tenant's OABs yet
+	}
+	return uc.writeForTenant(ctx, tenantID, b.keys, b.items)
 }
 
 type tenantMatches struct {

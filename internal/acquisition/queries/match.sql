@@ -12,3 +12,14 @@ SELECT w.tenant_id, w.oab_key, p.payload
 FROM publication p
 JOIN watched_oab w ON w.oab_key = ANY (p.recipient_oabs)
 WHERE p.made_available_at = $1;
+
+-- name: MatchPublicationsForTenantSince :many
+-- One tenant's matches from a date forward — the onboarding history catch-up: a new
+-- integration's watched OABs are matched against the publications ALREADY stored (the
+-- 90-day bootstrap window), so the client sees its recent intimações immediately, with
+-- ZERO per-OAB DJEN calls. The forward daily match (MatchPublicationsByDay) covers
+-- everything from tomorrow on.
+SELECT w.oab_key, p.payload
+FROM publication p
+JOIN watched_oab w ON w.oab_key = ANY (p.recipient_oabs)
+WHERE w.tenant_id = $1 AND p.made_available_at >= $2;

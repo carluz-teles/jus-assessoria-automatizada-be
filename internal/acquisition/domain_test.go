@@ -155,6 +155,10 @@ func (m *mockRepo) MatchPublicationsByDay(_ context.Context, _ database.Tx, _ ti
 	return nil, nil
 }
 
+func (m *mockRepo) MatchPublicationsForTenantSince(_ context.Context, _ database.Tx, _ string, _ time.Time) ([]PublicationMatch, error) {
+	return nil, nil
+}
+
 func (m *mockRepo) UpsertGradedCourtRecord(_ context.Context, _ database.Tx, _ GradedRecordParams) (*CourtRecord, error) {
 	return nil, nil
 }

@@ -53,3 +53,45 @@ func (q *Queries) MatchPublicationsByDay(ctx context.Context, madeAvailableAt pg
 	}
 	return items, nil
 }
+
+const matchPublicationsForTenantSince = `-- name: MatchPublicationsForTenantSince :many
+SELECT w.oab_key, p.payload
+FROM publication p
+JOIN watched_oab w ON w.oab_key = ANY (p.recipient_oabs)
+WHERE w.tenant_id = $1 AND p.made_available_at >= $2
+`
+
+type MatchPublicationsForTenantSinceParams struct {
+	TenantID        uuid.UUID   `json:"tenant_id"`
+	MadeAvailableAt pgtype.Date `json:"made_available_at"`
+}
+
+type MatchPublicationsForTenantSinceRow struct {
+	OabKey  string `json:"oab_key"`
+	Payload []byte `json:"payload"`
+}
+
+// One tenant's matches from a date forward — the onboarding history catch-up: a new
+// integration's watched OABs are matched against the publications ALREADY stored (the
+// 90-day bootstrap window), so the client sees its recent intimações immediately, with
+// ZERO per-OAB DJEN calls. The forward daily match (MatchPublicationsByDay) covers
+// everything from tomorrow on.
+func (q *Queries) MatchPublicationsForTenantSince(ctx context.Context, arg MatchPublicationsForTenantSinceParams) ([]MatchPublicationsForTenantSinceRow, error) {
+	rows, err := q.db.Query(ctx, matchPublicationsForTenantSince, arg.TenantID, arg.MadeAvailableAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []MatchPublicationsForTenantSinceRow
+	for rows.Next() {
+		var i MatchPublicationsForTenantSinceRow
+		if err := rows.Scan(&i.OabKey, &i.Payload); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
