@@ -142,9 +142,9 @@ type BackfillUseCase struct {
 	now         func() time.Time
 }
 
-// backfillOption tunes a BackfillUseCase at construction. The options are
-// unexported: production callers take the defaults, only same-package tests
-// override the clock or horizon.
+// backfillOption tunes a BackfillUseCase at construction. Same-package tests
+// override the clock and horizon; production overrides the window size via the
+// exported WithBackfillWindowDays (wired from BACKFILL_WINDOW_DAYS).
 type backfillOption func(*BackfillUseCase)
 
 // NewBackfillUseCase wires the backfill use case with production defaults (a
@@ -162,6 +162,23 @@ func NewBackfillUseCase(repo backfillRepo, outbox publisher, uow database.UnitOf
 		opt(uc)
 	}
 	return uc
+}
+
+// WithBackfillWindowDays overrides how many days each backfill sync slice covers.
+// Production wires this from BACKFILL_WINDOW_DAYS so the window can be widened
+// without a rebuild; a non-positive value keeps the BackfillWindowDays default.
+// Wider windows tile the one-year horizon into FEWER slices, so the backfill
+// issues fewer DJEN round-trips — the dominant cost is the per-request latency of
+// the residential-proxy egress, not the item volume, so halving the request count
+// nearly halves the wall clock. The ceiling is DJEN's ~10000-count-per-query cap:
+// a window must not hold more than that for a single OAB (30 days keeps even a
+// high-volume OAB well under it).
+func WithBackfillWindowDays(days int) backfillOption {
+	return func(uc *BackfillUseCase) {
+		if days > 0 {
+			uc.windowDays = days
+		}
+	}
 }
 
 // OnIntegrationActivated is the backfill use case invoked by the listener. In a

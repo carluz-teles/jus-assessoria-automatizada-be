@@ -104,7 +104,16 @@ func run(logger *slog.Logger) error {
 	outbox := events.NewOutbox()
 	uow := database.NewUnitOfWork(pool)
 
-	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow)
+	// The backfill window is dialed from BACKFILL_WINDOW_DAYS (default 30/monthly):
+	// fewer, wider slices mean fewer DJEN round-trips, and the per-request latency of
+	// the residential-proxy egress — not the item volume — is what dominates the
+	// backfill wall clock. 0 keeps the use case default.
+	backfill := acquisition.NewBackfillUseCase(repo, outbox, uow,
+		acquisition.WithBackfillWindowDays(cfg.BackfillWindowDays),
+	)
+	if cfg.BackfillWindowDays > 0 {
+		logger.Info("backfill window override", "service", serviceName, "window_days", cfg.BackfillWindowDays)
+	}
 
 	// The sync use case resolves its connector per event from the orchestrator, by
 	// the event's source. Both connectors are REAL now: DJEN discovers nationally by

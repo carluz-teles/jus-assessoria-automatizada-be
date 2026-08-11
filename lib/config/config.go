@@ -116,6 +116,14 @@ type Config struct {
 	// conector (1000, o teto que a Comunica honra). Página maior = menos requests por
 	// janela, então menos pressão no pace/429. Alavanca de tuning sem redeploy.
 	DJENPageSize int `env:"DJEN_PAGE_SIZE" envDefault:"0"`
+
+	// BackfillWindowDays — quantos dias cada fatia do backfill cobre. Default 30
+	// (mensal): a fatia semanal antiga tilava o ano em 53 janelas, e como o custo
+	// dominante é a latência POR REQUEST no proxy residencial (não o volume), menos
+	// janelas ≈ menos wall-clock. Alavanca de tuning sem redeploy; subir com cautela
+	// (o DJEN capa a contagem em ~10000 por query de uma OAB). 0 ou negativo = mantém
+	// o default do use case (BackfillWindowDays=7). Só o worker-ingestao consome.
+	BackfillWindowDays int `env:"BACKFILL_WINDOW_DAYS" envDefault:"30"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do
