@@ -24,13 +24,13 @@ func TestMigrations_UpIsIdempotentAndCreatesSchema(t *testing.T) {
 
 	pool := newPool(t)
 
-	// One table from each of three concerns: identity (tenant), consolidation
-	// (court_record) and the infra outbox (outbox).
+	// One table from each concern: identity (tenant), consolidation (court_record),
+	// the infra outbox (outbox) and the national DJEN firehose (publication).
 	const existsQuery = `SELECT EXISTS (
 		SELECT 1 FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = $1
 	)`
-	for _, table := range []string{"tenant", "court_record", "outbox"} {
+	for _, table := range []string{"tenant", "court_record", "outbox", "publication"} {
 		t.Run(table, func(t *testing.T) {
 			var exists bool
 			if err := pool.QueryRow(ctx, existsQuery, table).Scan(&exists); err != nil {
@@ -41,4 +41,26 @@ func TestMigrations_UpIsIdempotentAndCreatesSchema(t *testing.T) {
 			}
 		})
 	}
+
+	// The publication store is only useful with its access-path indexes: the hash
+	// unique (dedup / ON CONFLICT target), the GIN over recipient_oabs (the local OAB
+	// match) and the made_available_at btree (retention prune + onboarding window).
+	t.Run("publication_indexes", func(t *testing.T) {
+		const idxQuery = `SELECT EXISTS (
+			SELECT 1 FROM pg_indexes WHERE tablename = 'publication' AND indexname = $1
+		)`
+		for _, idx := range []string{
+			"publication_hash_key",
+			"publication_recipient_oabs_gin",
+			"publication_made_available_at_idx",
+		} {
+			var exists bool
+			if err := pool.QueryRow(ctx, idxQuery, idx).Scan(&exists); err != nil {
+				t.Fatalf("checking index %q: %v", idx, err)
+			}
+			if !exists {
+				t.Errorf("expected index %q on publication after migration", idx)
+			}
+		}
+	})
 }
