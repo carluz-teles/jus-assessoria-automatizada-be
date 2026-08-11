@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/lib/database"
@@ -69,8 +70,17 @@ func TestIngestionScheduler_RequestDay(t *testing.T) {
 		if dr.Day != "2025-08-08" {
 			t.Errorf("event day = %q, want 2025-08-08", dr.Day)
 		}
-		if dr.EventID == "" || seenEventID[dr.EventID] {
-			t.Errorf("event id %q is empty or duplicated", dr.EventID)
+		// The outbox's event_id AND aggregate_id are both uuid columns; assert the
+		// invariant here so a non-uuid (e.g. the raw sigla) fails in the unit test
+		// instead of only at the DB insert in prod.
+		if _, err := uuid.Parse(dr.EventID); err != nil {
+			t.Errorf("event id %q not a uuid: %v", dr.EventID, err)
+		}
+		if _, err := uuid.Parse(dr.AggregateID()); err != nil {
+			t.Errorf("aggregate id %q not a uuid: %v", dr.AggregateID(), err)
+		}
+		if seenEventID[dr.EventID] {
+			t.Errorf("event id %q duplicated", dr.EventID)
 		}
 		seenEventID[dr.EventID] = true
 		seenTribunal[dr.Tribunal] = true

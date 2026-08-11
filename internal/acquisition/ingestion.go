@@ -7,11 +7,19 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
+
+// diarioNamespace namespaces the deterministic v5 aggregate id of a diario_requested.
+// The event has no persistent aggregate row, but the outbox's aggregate_id is uuid NOT
+// NULL, so we derive a STABLE uuid from the (tribunal, day) natural key: the same unit
+// of work always maps to the same aggregate id (across the daily re-request), while the
+// per-emission event id stays fresh. A fixed random namespace, minted once.
+var diarioNamespace = uuid.MustParse("6f1d3b2a-8c7e-4a5f-9b0d-2e4c6a8f1b3d")
 
 // ingestion.go is the national bulk ingestion — the DJEN pivot — split into the two
 // halves of an event-driven flow:
@@ -80,11 +88,13 @@ func (uc *IngestionScheduler) RequestDay(ctx context.Context, day time.Time) (re
 	return requested, nil
 }
 
-// newDiarioRequested builds one national fetch event, minting a fresh v7 event id (the
-// relay's enqueue-dedup TaskID) and hanging it on the tribunal aggregate.
+// newDiarioRequested builds one national fetch event: a fresh v7 event id (the relay's
+// enqueue-dedup TaskID) and a deterministic v5 aggregate id from (tribunal, day) — the
+// outbox's aggregate_id is a uuid, so the tribunal sigla cannot be used raw.
 func newDiarioRequested(tribunal, day string) DiarioRequested {
+	agg := uuid.NewSHA1(diarioNamespace, []byte(tribunal+"|"+day)).String()
 	return DiarioRequested{
-		Base:     events.Base{EventID: newEventID(), Aggregate: tribunal},
+		Base:     events.Base{EventID: newEventID(), Aggregate: agg},
 		Tribunal: tribunal,
 		Day:      day,
 	}
