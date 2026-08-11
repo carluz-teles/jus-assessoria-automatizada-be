@@ -65,12 +65,29 @@ locals {
       RESEND_API_KEY    = var.resend_api_key
       RESEND_FROM_EMAIL = var.resend_from_email
       DJEN_PROXY_URL    = var.djen_proxy_url
+      # DJEN pace/concorrência do sweet-spot (o teto do DJEN é ~2 req/s GLOBAL; acima
+      # disso = 429). Com INGESTION_ENABLED o cutover troca o backfill per-OAB por
+      # history-match contra o store (zero DJEN no worker) — a virada bulk.
+      DJEN_RATE_PER_MINUTE = "120"
+      INGESTAO_CONCURRENCY = "3"
+      INGESTION_ENABLED    = "true"
     })
     # Skeletons por ora — só a base (config.Load exige os 5 required).
     "worker-ai"           = local.base_vars
     "worker-documents"    = local.base_vars
     "worker-outbox-relay" = local.base_vars
-    "scheduler"           = local.base_vars
+    # scheduler: re-poll + a INGESTÃO NACIONAL do diário DJEN (bulk). Sai pelo mesmo
+    # proxy residencial; é o ÚNICO consumidor do orçamento DJEN quando o cutover está
+    # ligado (o worker não bate mais no DJEN). BOOTSTRAP_DAYS=0 pula o cold-start
+    # histórico; o loop diário ingere ontem + lookback.
+    "scheduler" = merge(local.base_vars, {
+      DJEN_PROXY_URL          = var.djen_proxy_url
+      DJEN_RATE_PER_MINUTE    = "120"
+      DJEN_PAGE_SIZE          = "1000"
+      INGESTION_ENABLED       = "true"
+      INGESTION_LOOKBACK_DAYS = "1"
+      BOOTSTRAP_DAYS          = "0"
+    })
   }
 
   # Variáveis do Postgres. PGDATA aponta p/ subdir do mount (o volume monta com
