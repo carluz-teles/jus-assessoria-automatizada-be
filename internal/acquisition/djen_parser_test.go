@@ -191,8 +191,12 @@ func TestUFFromTribunal(t *testing.T) {
 		{"TJRS", "RS"},
 		{"TJSP", "SP"},
 		{"tjmg", "MG"},
+		{"TJDFT", "DF"},  // DF via registry
+		{"TJMSP", "SP"},  // militar estadual → UF do estado (registry-backed)
+		{"TRE-SP", "SP"}, // eleitoral → UF do estado
 		{"TRF4", ""},
 		{"STJ", ""},
+		{"TJXX", ""}, // sigla desconhecida → "" (não deriva mais "XX")
 		{"", ""},
 	}
 	for _, tt := range tests {

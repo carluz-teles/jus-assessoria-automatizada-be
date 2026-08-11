@@ -255,16 +255,13 @@ func djenType(tipo string) string {
 	}
 }
 
-// ufFromTribunal best-effort derives the state UF from a tribunal sigla for the
-// state-holiday lookup: a state court is "TJ"+UF (TJSP → SP). Federal/superior
-// tribunals (TRF/TST/STJ/STF/…) have no single state, so it returns "" and the
-// calendar applies only national + court-scoped holidays.
+// ufFromTribunal resolves the state UF of a tribunal sigla for the state-holiday
+// lookup, from the tribunal registry (single source): state, electoral and state
+// military courts (TJSP → SP, TRE-SP → SP, TJMSP → SP) carry their UF, while region-
+// and nationally-scoped courts (TRF/TRT/STJ/…) and any unknown sigla resolve to ""
+// so the calendar applies only national + court-scoped holidays.
 func ufFromTribunal(sigla string) string {
-	s := strings.ToUpper(strings.TrimSpace(sigla))
-	if len(s) == 4 && strings.HasPrefix(s, "TJ") {
-		return s[2:]
-	}
-	return ""
+	return tribunalUF[strings.ToUpper(strings.TrimSpace(sigla))]
 }
 
 // parseDJENDate parses an optional ISO date, returning the zero time when it is
