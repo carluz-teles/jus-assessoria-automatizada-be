@@ -92,6 +92,9 @@ func buildSyncWindows(from, to time.Time, windowDays int) []syncWindow {
 type backfillRepo interface {
 	BackfillJobExistsByIntegration(ctx context.Context, tx database.Tx, integrationID string) (bool, error)
 	InsertBackfillJob(ctx context.Context, tx database.Tx, params BackfillJobParams) (id string, err error)
+	// ReplaceWatchedOABs populates the national-match index from the scope on every
+	// activation (before the backfill guard, so a scope change is reflected too).
+	ReplaceWatchedOABs(ctx context.Context, tx database.Tx, tenantID, integrationID string, oabKeys []string) error
 
 	// The completion-counter path: each closing slice atomically bumps one counter
 	// and reads back the job's tallies (a row lock serializes concurrent closes);
@@ -198,6 +201,13 @@ func (uc *BackfillUseCase) OnIntegrationActivated(ctx context.Context, ev Integr
 		}
 		if seen {
 			return nil
+		}
+
+		// Populate the national-match index from the current scope FIRST, so a scope
+		// change reflects even when the backfill guard below short-circuits. This is
+		// what lets the firehose match this integration's OABs to tenant intimations.
+		if err := uc.repo.ReplaceWatchedOABs(ctx, tx, ev.TenantID, ev.IntegrationID, watchedOABKeys(ev.Scope)); err != nil {
+			return err
 		}
 
 		exists, err := uc.repo.BackfillJobExistsByIntegration(ctx, tx, ev.IntegrationID)

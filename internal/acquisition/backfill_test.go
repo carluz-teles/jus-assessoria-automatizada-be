@@ -146,6 +146,7 @@ type stubBackfillRepo struct {
 	existsCalls int
 	insertCalls int
 	lastInsert  BackfillJobParams
+	watchedKeys []string // keys handed to ReplaceWatchedOABs on activation
 
 	// counter path
 	counters       BackfillCounters // current job tallies; increments mutate & return
@@ -165,6 +166,11 @@ func (s *stubBackfillRepo) InsertBackfillJob(_ context.Context, _ database.Tx, p
 	s.insertCalls++
 	s.lastInsert = p
 	return "job-1", nil
+}
+
+func (s *stubBackfillRepo) ReplaceWatchedOABs(_ context.Context, _ database.Tx, _, _ string, keys []string) error {
+	s.watchedKeys = keys
+	return nil
 }
 
 func (s *stubBackfillRepo) IncrementBackfillSlicesOK(context.Context, database.Tx, string, string) (BackfillCounters, error) {
@@ -207,6 +213,7 @@ func activatedEvent() IntegrationActivated {
 		IntegrationID: "integ-1",
 		TenantID:      testTenant,
 		Source:        SourceDJEN,
+		Scope:         Scope{OAB: []string{"SP347019", "MG198988"}},
 	}
 }
 
@@ -235,6 +242,10 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 	}
 	if repo.insertCalls != 1 {
 		t.Fatalf("inserts = %d, want 1", repo.insertCalls)
+	}
+	// Activation populates the national-match index from the scope (normalized keys).
+	if got := repo.watchedKeys; len(got) != 2 || got[0] != "347019|SP" || got[1] != "198988|MG" {
+		t.Fatalf("watched keys = %v, want [347019|SP 198988|MG]", got)
 	}
 	if repo.lastInsert.TotalSlices != 53 || repo.lastInsert.Status != BackfillStatusRunning {
 		t.Fatalf("job = {slices:%d status:%q}, want {53 RUNNING}", repo.lastInsert.TotalSlices, repo.lastInsert.Status)

@@ -717,6 +717,19 @@ func oabEntriesFromScope(scope Scope) []OABEntry {
 	return entries
 }
 
+// watchedOABKeys maps a scope to the normalized "NUMBER|UF" keys stored in
+// watched_oab. It reuses oabEntriesFromScope (the exact scope parsing) and oabKey (the
+// exact match normalization the recipient side uses), so a tenant's watched key equals
+// the publication's recipient key and the national match lines up.
+func watchedOABKeys(scope Scope) []string {
+	entries := oabEntriesFromScope(scope)
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		keys = append(keys, oabKey(e.Number, e.UF))
+	}
+	return keys
+}
+
 // recordKey is the in-memory join key between a parsed record and its docket
 // entries/intimations: the natural key (cnj, degree) with a NUL separator so
 // no two distinct pairs ever collide.
