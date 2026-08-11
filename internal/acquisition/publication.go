@@ -18,3 +18,12 @@ type PublicationParams struct {
 	RecipientOABs   []string
 	Payload         json.RawMessage
 }
+
+// PublicationMatch is one hit of the national match: a tenant watches OABKey, which is
+// a recipient of the publication whose raw item is Payload. The match use case groups
+// these by tenant and re-parses the payloads to create that tenant's intimações.
+type PublicationMatch struct {
+	TenantID string
+	OABKey   string
+	Payload  json.RawMessage
+}

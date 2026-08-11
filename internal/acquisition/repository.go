@@ -77,6 +77,10 @@ type Repository interface {
 	// watched_oab — replace an integration's watched OAB set (populate on activation),
 	// the per-tenant index the national match joins against.
 	ReplaceWatchedOABs(ctx context.Context, tx database.Tx, tenantID, integrationID string, oabKeys []string) error
+
+	// Match — the national join (publication.recipient_oabs ∩ watched_oab), read
+	// system-wide (uow.DoSystem). Drives the per-tenant fan-out to intimações.
+	MatchPublicationsByDay(ctx context.Context, tx database.Tx, day time.Time) ([]PublicationMatch, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -800,6 +804,26 @@ func (r *pgRepository) InsertPublications(ctx context.Context, tx database.Tx, p
 // clearing it and re-inserting the given normalized keys — so a scope change (a
 // removed OAB) stops matching. Idempotent per key. Runs in the tenant's tx (RLS by
 // app.tenant_id), driven by the integration_activated event.
+// MatchPublicationsByDay returns every (tenant, matched OAB, payload) for a day's
+// publications, joining the firehose against watched_oab. Runs inside a system tx
+// (uow.DoSystem) so the watched_oab RLS opens across tenants.
+func (r *pgRepository) MatchPublicationsByDay(ctx context.Context, tx database.Tx, day time.Time) ([]PublicationMatch, error) {
+	q := acquisitiondb.New(tx)
+	rows, err := q.MatchPublicationsByDay(ctx, pgtype.Date{Time: day, Valid: true})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]PublicationMatch, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, PublicationMatch{
+			TenantID: row.TenantID.String(),
+			OABKey:   row.OabKey,
+			Payload:  row.Payload,
+		})
+	}
+	return out, nil
+}
+
 func (r *pgRepository) ReplaceWatchedOABs(ctx context.Context, tx database.Tx, tenantID, integrationID string, oabKeys []string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {

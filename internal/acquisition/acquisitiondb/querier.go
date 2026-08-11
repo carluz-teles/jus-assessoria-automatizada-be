@@ -8,6 +8,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
@@ -192,6 +193,15 @@ type Querier interface {
 	// órgão julgador (NULL) keeps the value a prior sync learned — DATAJUD reveals it
 	// after a DJEN discovery landed the record without it (placeholder+merge).
 	MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecordSyncedParams) error
+	// match queries (acquisition slice). The join that turns the national publication
+	// firehose into per-tenant work: a watched_oab key ∈ a publication's recipient_oabs.
+	// Read system-wide (uow.DoSystem sets app.system='on' so the watched_oab RLS opens
+	// across tenants); publication is national and unscoped.
+	// Every (tenant, matched OAB, publication payload) for the communications made
+	// available on a day. One publication watched by two OABs of the same tenant yields
+	// two rows; the match use case groups by tenant and dedups the payloads. payload is
+	// the raw DJEN item, re-parsed per matched tenant to create its court_record/intimação.
+	MatchPublicationsByDay(ctx context.Context, madeAvailableAt pgtype.Date) ([]MatchPublicationsByDayRow, error)
 	// Move the placeholder's intimations onto the graded record. Unicidade de
 	// intimation é (tenant, case_id, hash), so swapping court_record_id never breaks
 	// dedup (same case). Returns the number of rows moved.
