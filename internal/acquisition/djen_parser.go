@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/jusassessoria/platform/lib/apperr"
 )
 
 // djen_parser.go turns a DJEN RawPayload (the djenPayload the connector emits)
@@ -215,6 +217,54 @@ func watchedOABSet(oabs []OABEntry) map[string]bool {
 
 func oabKey(number, uf string) string {
 	return number + "|" + strings.ToUpper(strings.TrimSpace(uf))
+}
+
+// publicationParamsFromItems maps raw DJEN diário items (from FetchDiario) to the
+// national publication store's write params: the dedup hash, the court + process, the
+// disponibilização date, the normalized recipient OAB keys for the local match, and
+// the raw item as payload — which the same djen parser later consumes for a matched
+// tenant. An item without its hash (the dedup key) is unusable and skipped.
+func publicationParamsFromItems(items []json.RawMessage) ([]PublicationParams, error) {
+	out := make([]PublicationParams, 0, len(items))
+	for _, raw := range items {
+		var item djenComunicacao
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return nil, apperr.NewInfra("djen: decode diário item", err)
+		}
+		if item.Hash == "" {
+			continue
+		}
+		out = append(out, PublicationParams{
+			Hash:            item.Hash,
+			Court:           item.SiglaTribunal,
+			CNJNumber:       item.NumeroProcesso,
+			MadeAvailableAt: parseDJENDate(item.DataDisponibilizacao),
+			RecipientOABs:   recipientOABKeys(item.Advogados),
+			Payload:         raw,
+		})
+	}
+	return out, nil
+}
+
+// recipientOABKeys extracts the unique normalized "NUMBER|UF" keys of an item's
+// advogado recipients — the set the local OAB match indexes. It uses the SAME oabKey
+// normalization as the per-OAB matched flag (watchedOABSet), so a tenant's watched OAB
+// keys identically here and the match lines up. Always a non-nil slice (never null).
+func recipientOABKeys(advs []djenAdvogadoLink) []string {
+	keys := make([]string, 0, len(advs))
+	seen := make(map[string]bool, len(advs))
+	for _, a := range advs {
+		if a.Advogado.NumeroOAB == "" {
+			continue
+		}
+		k := oabKey(a.Advogado.NumeroOAB, a.Advogado.UFOAB)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // djenRecipients maps every advogado addressee to a recipient, flagging the ones

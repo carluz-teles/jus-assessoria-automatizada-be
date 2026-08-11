@@ -250,17 +250,65 @@ func (c *DJENConnector) fetchOAB(ctx context.Context, oab OABEntry, from, to str
 	return nil
 }
 
-// getPage performs one consulta GET and returns the decoded envelope, failing on a
-// transport error, a non-200 status, or a non-success envelope.
+// FetchDiario walks one tribunal's diário over [from, to], paginating the consulta
+// filtered by siglaTribunal (no OAB), and returns every raw communication item. This
+// is the national-ingestion read: the caller lands the items in the publication store
+// and matches OABs locally. Unlike the per-OAB Fetch it needs no cross-query dedup (a
+// tribunal page's items are already unique), so a straight accumulate suffices. The
+// walk ends at the first short page or the defensive page cap.
+func (c *DJENConnector) FetchDiario(ctx context.Context, tribunal, from, to string) ([]json.RawMessage, error) {
+	items := make([]json.RawMessage, 0)
+	for page := 1; page <= djenMaxPages; page++ {
+		resp, err := c.getDiarioPage(ctx, tribunal, from, to, page)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, resp.Items...)
+		if len(resp.Items) < c.pageSize {
+			break
+		}
+	}
+	return items, nil
+}
+
+// getPage performs one per-OAB consulta GET (numeroOab/ufOab filter) and returns the
+// decoded envelope. The HTTP/rate machinery is shared with the diário read via
+// requestPage; the RateLimitedError carries the OAB identity for the backoff logs.
 func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to string, page int) (djenResponse, error) {
-	endpoint := c.baseURL + "/comunicacao?" + url.Values{
+	query := url.Values{
 		"numeroOab":                  {oab.Number},
 		"ufOab":                      {oab.UF},
 		"dataDisponibilizacaoInicio": {from},
 		"dataDisponibilizacaoFim":    {to},
 		"pagina":                     {strconv.Itoa(page)},
 		"itensPorPagina":             {strconv.Itoa(c.pageSize)},
-	}.Encode()
+	}
+	label := fmt.Sprintf("oab %s/%s page %d", oab.Number, oab.UF, page)
+	return c.requestPage(ctx, query, label, RateLimitedError{OAB: oab.Number, UF: oab.UF, Page: page})
+}
+
+// getDiarioPage performs one by-tribunal consulta GET (siglaTribunal filter, no OAB)
+// — the national ingestion read. Same shared machinery; the RateLimitedError carries
+// the page (the tribunal is in the error label).
+func (c *DJENConnector) getDiarioPage(ctx context.Context, tribunal, from, to string, page int) (djenResponse, error) {
+	query := url.Values{
+		"siglaTribunal":              {tribunal},
+		"dataDisponibilizacaoInicio": {from},
+		"dataDisponibilizacaoFim":    {to},
+		"pagina":                     {strconv.Itoa(page)},
+		"itensPorPagina":             {strconv.Itoa(c.pageSize)},
+	}
+	label := fmt.Sprintf("tribunal %s page %d", tribunal, page)
+	return c.requestPage(ctx, query, label, RateLimitedError{Page: page})
+}
+
+// requestPage does one consulta GET for a pre-built query and decodes the envelope,
+// sharing the cooldown/limiter/backoff machinery across the per-OAB and by-tribunal
+// reads. It fails on a transport error, a non-200 status, or a non-success envelope;
+// a 429/503 trips the shared cooldown and surfaces onBlock (with Status/RetryAfter
+// filled in) as a retryable Unavailable. label identifies the request in error text.
+func (c *DJENConnector) requestPage(ctx context.Context, query url.Values, label string, onBlock RateLimitedError) (djenResponse, error) {
+	endpoint := c.baseURL + "/comunicacao?" + query.Encode()
 
 	// Back off together with every other slice while a rate block is cooling down,
 	// then pace this request through the shared limiter.
@@ -284,7 +332,7 @@ func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to stri
 
 	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return djenResponse{}, apperr.NewInfra(fmt.Sprintf("djen: GET comunicacao (oab %s/%s page %d)", oab.Number, oab.UF, page), err)
+		return djenResponse{}, apperr.NewInfra(fmt.Sprintf("djen: GET comunicacao (%s)", label), err)
 	}
 	defer res.Body.Close()
 
@@ -294,14 +342,16 @@ func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to stri
 	if res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusServiceUnavailable {
 		retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), c.cooldown.now())
 		c.cooldown.trip(retryAfter)
+		onBlock.Status = res.StatusCode
+		onBlock.RetryAfter = retryAfter
 		return djenResponse{}, apperr.NewUnavailable(
-			fmt.Sprintf("djen: comunicacao rate limited (oab %s/%s page %d)", oab.Number, oab.UF, page),
-			&RateLimitedError{Status: res.StatusCode, RetryAfter: retryAfter, OAB: oab.Number, UF: oab.UF, Page: page},
+			fmt.Sprintf("djen: comunicacao rate limited (%s)", label),
+			&onBlock,
 		)
 	}
 	if res.StatusCode != http.StatusOK {
 		return djenResponse{}, apperr.NewInfra(
-			fmt.Sprintf("djen: comunicacao returned HTTP %d (oab %s/%s page %d)", res.StatusCode, oab.Number, oab.UF, page),
+			fmt.Sprintf("djen: comunicacao returned HTTP %d (%s)", res.StatusCode, label),
 			fmt.Errorf("unexpected status %d", res.StatusCode),
 		)
 	}
@@ -314,7 +364,7 @@ func (c *DJENConnector) getPage(ctx context.Context, oab OABEntry, from, to stri
 	}
 	if envelope.Status != djenStatusSuccess {
 		return djenResponse{}, apperr.NewInfra(
-			fmt.Sprintf("djen: consulta rejected (oab %s/%s): %s", oab.Number, oab.UF, envelope.Message),
+			fmt.Sprintf("djen: consulta rejected (%s): %s", label, envelope.Message),
 			fmt.Errorf("envelope status %q", envelope.Status),
 		)
 	}
