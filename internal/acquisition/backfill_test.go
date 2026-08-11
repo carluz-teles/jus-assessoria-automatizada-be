@@ -243,13 +243,16 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 		t.Fatalf("published = %d, want 53", outbox.calls)
 	}
 
-	// The slices are indexed 0..52 and carry the job id and dated bounds.
+	// Recent-first emission: slice_index stays chronological (0..52), but the NEWEST
+	// window is published FIRST so its live-deadline intimações land in the first
+	// parallel batch. So published[0] carries the highest index (52) and published[52]
+	// the oldest (0); every slice carries the job id and dated bounds.
 	first, ok := outbox.published[0].(SyncRequested)
 	if !ok {
 		t.Fatalf("published[0] type = %T, want SyncRequested", outbox.published[0])
 	}
-	if first.SliceIndex != 0 || first.BackfillJobID != "job-1" || first.Type() != TypeSyncRequested {
-		t.Fatalf("first slice = %+v, unexpected", first)
+	if first.SliceIndex != 52 || first.BackfillJobID != "job-1" || first.Type() != TypeSyncRequested {
+		t.Fatalf("first published slice = %+v, want newest (index 52) emitted first", first)
 	}
 	if first.Source != SourceDJEN {
 		t.Fatalf("first slice source = %q, want %q (carried through from the activation)", first.Source, SourceDJEN)
@@ -258,8 +261,8 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 		t.Fatalf("first slice has empty window bounds: %+v", first)
 	}
 	last := outbox.published[52].(SyncRequested)
-	if last.SliceIndex != 52 {
-		t.Fatalf("last slice index = %d, want 52", last.SliceIndex)
+	if last.SliceIndex != 0 {
+		t.Fatalf("last published slice index = %d, want 0 (oldest emitted last)", last.SliceIndex)
 	}
 }
 

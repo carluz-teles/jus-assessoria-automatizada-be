@@ -127,6 +127,10 @@ func (m *mockRepo) UpdateSyncRun(_ context.Context, _ database.Tx, _ SyncRunOutc
 	return true, nil
 }
 
+func (m *mockRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, _ string) error {
+	return nil
+}
+
 func (m *mockRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, _ FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
 	return nil, false, nil
 }

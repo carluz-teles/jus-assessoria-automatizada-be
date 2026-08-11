@@ -22,6 +22,10 @@ type fakeEnrichRepo struct {
 	docketParams  []DocketEntryParams
 }
 
+func (r *fakeEnrichRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, _ string) error {
+	return nil
+}
+
 func (r *fakeEnrichRepo) UpsertGradedCourtRecord(_ context.Context, _ database.Tx, p GradedRecordParams) (*CourtRecord, error) {
 	r.gradedCalls++
 	r.gradedParams = p

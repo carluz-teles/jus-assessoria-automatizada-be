@@ -117,13 +117,21 @@ type Config struct {
 	// janela, então menos pressão no pace/429. Alavanca de tuning sem redeploy.
 	DJENPageSize int `env:"DJEN_PAGE_SIZE" envDefault:"0"`
 
-	// BackfillWindowDays — quantos dias cada fatia do backfill cobre. Default 30
-	// (mensal): a fatia semanal antiga tilava o ano em 53 janelas, e como o custo
-	// dominante é a latência POR REQUEST no proxy residencial (não o volume), menos
-	// janelas ≈ menos wall-clock. Alavanca de tuning sem redeploy; subir com cautela
-	// (o DJEN capa a contagem em ~10000 por query de uma OAB). 0 ou negativo = mantém
-	// o default do use case (BackfillWindowDays=7). Só o worker-ingestao consome.
-	BackfillWindowDays int `env:"BACKFILL_WINDOW_DAYS" envDefault:"30"`
+	// BackfillWindowDays — quantos dias cada fatia do backfill cobre. Default 7
+	// (semanal, 53 fatias no ano): o benchmark mostrou que a latência do DJEN escala
+	// com o intervalo da janela, então alargar não reduz o total — só reempacota o
+	// mesmo scan em requests maiores. Com o fetch agora PARALELO, mais fatias menores
+	// paralelizam melhor e dão recent-first mais granular (as últimas semanas caem no
+	// 1º lote). Alavanca de tuning sem redeploy. 0/negativo = default do use case.
+	BackfillWindowDays int `env:"BACKFILL_WINDOW_DAYS" envDefault:"7"`
+
+	// IngestaoConcurrency — goroutines simultâneas do worker-ingestao. Default 8: os
+	// fetches DJEN/DATAJUD são LONGOS (~110s cada, presos no proxy residencial), então
+	// rodá-los em paralelo sobrepõe essa espera e derruba o wall-clock do backfill ~N×;
+	// o limiter de 1/s só espaça o INÍCIO dos requests, não impede vários em voo. As
+	// escritas concorrentes que isso destravaria são serializadas pelo advisory-lock
+	// por tenant (sem deadlock 40P01). Alavanca de tuning sem redeploy.
+	IngestaoConcurrency int `env:"INGESTAO_CONCURRENCY" envDefault:"8"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do

@@ -137,3 +137,14 @@ ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
     type          = EXCLUDED.type,
     source_url    = EXCLUDED.source_url
 RETURNING id, (xmax = 0) AS inserted;
+
+-- name: AcquireTenantWriteLock :exec
+-- Serialize the acquisition domain's WRITES per tenant. The sync and enrichment
+-- write transactions take this transaction-scoped advisory lock as their FIRST
+-- statement, so two concurrent slices never hold overlapping row/index locks on
+-- court_record and thus never deadlock (40P01) — while their slow DJEN/DATAJUD
+-- fetches (which run OUTSIDE the tx) still overlap freely. Postgres releases the
+-- lock automatically at commit/rollback. The key is hashed from the tenant, so
+-- different tenants never block each other; hashtext is int4, widened to the int8
+-- pg_advisory_xact_lock expects.
+SELECT pg_advisory_xact_lock(hashtext(@tenant_id::text)::bigint);

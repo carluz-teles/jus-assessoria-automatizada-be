@@ -51,6 +51,7 @@ type GradedRecordParams struct {
 // enrichRepo is the narrow persistence port the enrichment use case drives:
 // the grade merge (upsert graded + re-point + supersede) and the movimento upsert.
 type enrichRepo interface {
+	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
 	UpsertGradedCourtRecord(ctx context.Context, tx database.Tx, params GradedRecordParams) (*CourtRecord, error)
 	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
 	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
@@ -144,6 +145,13 @@ func (uc *EnrichmentUseCase) OnCourtRecordObserved(ctx context.Context, ev Court
 // emit docket_entry_observed for the new ones — all atomically.
 func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecordObserved, graded ParsedCourtRecord, movimentos []ParsedDocketEntry) error {
 	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		// Take the per-tenant write lock FIRST (before the dedup row write) so this
+		// graded-record merge never deadlocks against a concurrent sync slice writing
+		// the same tenant's court_records. The DATAJUD fetch already ran outside this tx.
+		if err := uc.repo.AcquireTenantWriteLock(ctx, tx, ev.TenantID); err != nil {
+			return err
+		}
+
 		already, err := events.NewDedup(tx).SeenOrMark(ctx, consumerEnrichment, ev.EventID)
 		if err != nil {
 			return err

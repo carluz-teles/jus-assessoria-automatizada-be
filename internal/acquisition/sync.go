@@ -154,6 +154,7 @@ type IntimationParams struct {
 // deduped by the unique constraint), so the use case can emit an observed event
 // for each new one and tally new vs. deduped.
 type syncRepo interface {
+	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
@@ -418,6 +419,15 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		committed bool // this execution is the one that closed the run OK
 	)
 	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		// Serialize this tenant's writes FIRST: with the worker running many slices
+		// in parallel (fetches overlap the slow proxy), two windows committing
+		// hundreds of court_records at once would deadlock on the index (40P01). The
+		// advisory lock lets exactly one write tx per tenant proceed at a time; the
+		// DJEN fetch already happened outside this tx, so nothing slow is serialized.
+		if err := uc.repo.AcquireTenantWriteLock(ctx, tx, ev.TenantID); err != nil {
+			return err
+		}
+
 		records := make(map[string]*CourtRecord, len(parsed.CourtRecords))
 		ordered := make([]*CourtRecord, 0, len(parsed.CourtRecords))
 		blocked := make(map[string]bool)

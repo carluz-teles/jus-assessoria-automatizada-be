@@ -35,16 +35,12 @@ const (
 	// shares this worker (the process where the async listeners live) but its own
 	// queue, so a slow e-mail send never blocks court sync.
 	notificationsQueue = "notifications"
-	// concurrency is 1 — a deliberate serialization. The DJEN connector serializes
-	// fetches to ~1 req/s via its shared limiter, so parallel sync jobs give ZERO
-	// fetch throughput; all they add is concurrent big writes (a page-1000 window
-	// commits ~hundreds of court_records/intimations in ONE tx), and two of those
-	// running at once deadlock each other on the court_record index/rows (40P01).
-	// A single worker removes the write contention entirely at no throughput cost
-	// (the 1 req/s pace is the real ceiling). If we later restore parallelism to
-	// pipeline fetch+write, gate the sync write tx behind a per-tenant advisory lock
-	// (pg_advisory_xact_lock) instead of raising this back up.
-	concurrency = 1
+	// defaultConcurrency backs INGESTAO_CONCURRENCY when unset/invalid. Parallelism
+	// is the backfill's main lever: DJEN/DATAJUD fetches are LONG (~110s each, stuck
+	// on the residential proxy), so running many at once overlaps that wait and cuts
+	// the wall clock ~N×. The concurrent writes this unlocks are serialized per tenant
+	// by the AcquireTenantWriteLock advisory lock, so there is no 40P01 deadlock.
+	defaultConcurrency = 8
 )
 
 func main() {
@@ -81,6 +77,12 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("parse redis uri: %w", err)
 	}
+
+	concurrency := cfg.IngestaoConcurrency
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+	logger.Info("worker concurrency", "service", serviceName, "concurrency", concurrency)
 
 	// asynq's own logs go through slog (structured, OTLP); LogLevel=ErrorLevel keeps
 	// its per-task retry Warns from duplicating the Observe middleware's failure log.

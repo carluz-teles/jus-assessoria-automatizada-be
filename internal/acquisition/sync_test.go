@@ -139,6 +139,10 @@ func (s *stubSyncRepo) UpdateSyncRun(_ context.Context, _ database.Tx, o SyncRun
 	return true, nil
 }
 
+func (s *stubSyncRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, _ string) error {
+	return nil
+}
+
 func (s *stubSyncRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, p FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
 	s.findCalls++
 	s.findParams = append(s.findParams, p)

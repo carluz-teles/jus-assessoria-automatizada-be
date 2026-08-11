@@ -37,6 +37,9 @@ type Repository interface {
 
 	// Sync cycle — the sync listener's run bookkeeping and consolidation upserts.
 	// The sync use case depends on the narrow syncRepo view of these methods.
+	// AcquireTenantWriteLock serializes concurrent write txs per tenant (no 40P01);
+	// both the sync and enrichment use cases take it as their first tx statement.
+	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
@@ -738,6 +741,17 @@ func (r *pgRepository) UpsertDocketEntries(ctx context.Context, tx database.Tx, 
 // existing intimation retracted by the source is updated in place (so the deadline
 // slice can revoke its prazo), counting as deduped, not new. This slice emits no
 // intimation-observed event, so only the count is returned.
+// AcquireTenantWriteLock takes the per-tenant advisory lock inside the caller's
+// tx so concurrent sync/enrichment write transactions serialize their court_record
+// writes (no 40P01 deadlock) while their fetches still overlap. Released at tx end.
+func (r *pgRepository) AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error {
+	q := acquisitiondb.New(tx)
+	if err := q.AcquireTenantWriteLock(ctx, tenantID); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
 func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error) {
 	q := acquisitiondb.New(tx)
 	newCount := 0

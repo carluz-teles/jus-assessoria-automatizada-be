@@ -240,8 +240,13 @@ func (uc *BackfillUseCase) createBackfill(ctx context.Context, tx database.Tx, e
 		return err
 	}
 
-	for i, w := range windows {
-		req := newSyncRequested(jobID, ev.TenantID, ev.IntegrationID, ev.Source, ev.Scope, i, w)
+	// Emit newest window first (recent-first). With the worker fetching many slices
+	// in parallel, the most recent windows — the ones carrying live deadlines — land
+	// in the first batch, so the lawyer sees current intimações within minutes while
+	// the older tail fills in behind. slice_index stays chronological (i); only the
+	// emission (and therefore processing) order is reversed.
+	for i := len(windows) - 1; i >= 0; i-- {
+		req := newSyncRequested(jobID, ev.TenantID, ev.IntegrationID, ev.Source, ev.Scope, i, windows[i])
 		if err := uc.outbox.Publish(ctx, tx, req); err != nil {
 			return err
 		}

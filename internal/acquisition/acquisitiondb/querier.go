@@ -11,6 +11,15 @@ import (
 )
 
 type Querier interface {
+	// Serialize the acquisition domain's WRITES per tenant. The sync and enrichment
+	// write transactions take this transaction-scoped advisory lock as their FIRST
+	// statement, so two concurrent slices never hold overlapping row/index locks on
+	// court_record and thus never deadlock (40P01) — while their slow DJEN/DATAJUD
+	// fetches (which run OUTSIDE the tx) still overlap freely. Postgres releases the
+	// lock automatically at commit/rollback. The key is hashed from the tenant, so
+	// different tenants never block each other; hashtext is int4, widened to the int8
+	// pg_advisory_xact_lock expects.
+	AcquireTenantWriteLock(ctx context.Context, tenantID string) error
 	// backfill_job queries (acquisition slice).
 	// The backfill listener reacts to integration_activated: on the FIRST activation
 	// of an integration it creates one backfill_job and emits the sync slices. These
