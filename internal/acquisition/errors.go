@@ -38,4 +38,16 @@ var (
 	// subscription resolves to limit 0 upstream (fail-closed), so this fires for it
 	// on the first new record.
 	ErrProcessLimitReached = apperr.NewForbidden("active process limit reached")
+
+	// ErrActivationBlocked — the tenant is already at (or above) its plan's
+	// active_process_limit at the moment it tries to ACTIVATE a source (→ 403). A
+	// sibling of ErrProcessLimitReached, not a reuse of it: that one blocks a single
+	// new court record mid-sync-cycle and lets the cycle close OK; this one blocks
+	// the WHOLE activation request up front, before any integration row is upserted
+	// or an integration_activated event (and the backfill it triggers) is ever
+	// published — the ERD's edge-of-the-API entitlement gate, so a maxed-out tenant
+	// never waits on a backfill of thousands of processes the worker's gate would
+	// mostly discard anyway. A tenant with no subscription resolves to limit 0
+	// upstream (fail-closed), so its very first activation is blocked.
+	ErrActivationBlocked = apperr.NewForbidden("tenant already at active process limit; upgrade the plan before activating a new source")
 )
