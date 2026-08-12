@@ -1060,7 +1060,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // escapeLike neutralizes ILIKE wildcards in a search term. An empty term stays empty,
-// so the queries' `@search = ''` short-circuit (no filter) is preserved.
+// so the queries keep their empty-search short-circuit (no filter) when the term is blank.
 func escapeLike(s string) string {
 	return likeEscaper.Replace(s)
 }
