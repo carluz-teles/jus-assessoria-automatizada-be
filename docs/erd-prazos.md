@@ -77,7 +77,8 @@ sugeridas"* do F2 (`erd-frontend.md §F2`, `erd-ai-advisory.md §4`) são **`tas
 ação acionável, com data e responsável próprios, ligada ao mesmo `deadline`. Assim a agenda tem os dois:
 o prazo legal (o que não pode ser perdido) e as tarefas (os passos até lá).
 
-`deadline` de `erd-modelo-de-dados.md §7` já serve; `task` é **DDL novo** (a confirmar no catálogo).
+`deadline` de `erd-modelo-de-dados.md §7` já serve (com os deltas da **0024**); `task` é **DDL novo**,
+já no catálogo (migration **0024**, fatia 2b).
 
 - **`deadline`** — o prazo legal. Ancora na `court_record` (FK), 1:1 com `intimation`. Campos que o slice
   preenche: `start_date` (= `intimation.deadline_start_at`), `end_date` (calculado), `days`, `counting`
@@ -287,12 +288,16 @@ Read models (envelope padrão `{data, page}`), todos `tenant_id` do principal + 
 - ✅ **Prazo × ação:** `deadline` = prazo legal (1:1); **`task` nova no v0** para as N ações do F2 (§4).
 - ✅ **Camada de regras:** **conservadora + confirmação humana** no v0 (poucas regras seguras; genérico
   nasce "confirme"); enriquece com `observed_result`.
+- ✅ **Schema (migration 0024, fatia 2b):** os **deltas de `deadline`** (`tenant_id`, `kind`, `source`,
+  `confirmed_by/at`, `doubled_reason`, `rules_version`) **e a tabela `task`** entraram no catálogo. A regra
+  conservadora é **tabela seed `deadline_rule`** (versionada por `rules_version`, referência global; override
+  por-tenant depois) — não arquivo em `/lib`. **Status inicial `PENDING`**: o prazo derivado pela regra nasce
+  `PENDING` (sugestão) e só vira `OPEN` na confirmação humana do F2 (2c); o set fechado
+  `PENDING|OPEN|MET|MISSED|CANCELLED` é garantido por `CHECK`. `deadline`/`task` per-tenant → RLS
+  `tenant_isolation`. A **resolução** da regra (type + court_prefix → regra, mais específico/priority ganha)
+  fica para a **fatia 2c** (o slice `internal/deadline`).
 
 **Decisões em aberto:**
-- Confirmar no catálogo os **deltas de `deadline`** (`kind`, `source`, `confirmed_by/at`, `doubled_reason`)
-  **e a tabela `task`**.
-- Formato da regra conservadora: tabela seed (`deadline_rule`, versionada, override por tenant depois) ou
-  arquivo em `/lib`? (recomendo tabela seed global.)
 - Marcar `MISSED` automaticamente na varredura (com carência) ou só manual? (recomendo automático D+1 com
   aviso, reversível.)
 - Export `.ics` no v0 vs OAuth Google Calendar depois.
