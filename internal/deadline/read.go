@@ -206,6 +206,7 @@ type readRepo interface {
 	ListPrazosByProcesso(ctx context.Context, q PrazosByProcessoQuery) ([]PrazoView, error)
 	CountPrazosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	ListPrazos(ctx context.Context, q PrazosQuery) ([]AgendaPrazoView, error)
+	ListPrazosByIntimacao(ctx context.Context, tenantID, intimationID string) ([]AgendaPrazoView, error)
 	CountPrazos(ctx context.Context, q PrazosQuery) (totalCount, total int64, err error)
 	GetPrazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
 	ListTasksByProcesso(ctx context.Context, q TasksByProcessoQuery) ([]TaskView, error)
@@ -267,6 +268,20 @@ func (uc *ReadUseCase) Prazos(ctx context.Context, q PrazosQuery) (PrazosResult,
 		return PrazosResult{}, err
 	}
 	return PrazosResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+}
+
+// PrazosByIntimacao returns the prazo derived from one intimação (the F2 lookup, GET
+// /v1/prazos?intimation_id=...), wrapped in the SAME agenda result shape so the handler
+// reuses the /prazos envelope. The deadline is 1:1 with the intimação (notification_id
+// UNIQUE), so this is 0 or 1 item — no over-fetch/keyset: HasMore is false and the "X de
+// Y" totals coincide with the item count.
+func (uc *ReadUseCase) PrazosByIntimacao(ctx context.Context, tenantID, intimationID string) (PrazosResult, error) {
+	rows, err := uc.repo.ListPrazosByIntimacao(ctx, tenantID, intimationID)
+	if err != nil {
+		return PrazosResult{}, err
+	}
+	n := int64(len(rows))
+	return PrazosResult{Items: rows, HasMore: false, TotalCount: n, Total: n}, nil
 }
 
 // Prazo returns one prazo's audit detail, or the repo's typed ErrDeadlineNotFound (→

@@ -166,6 +166,50 @@ func (r *pgReadRepository) ListPrazos(ctx context.Context, q PrazosQuery) ([]Age
 	return out, nil
 }
 
+// ListPrazosByIntimacao reads the prazo of one intimação on the pool, filtered by
+// tenant_id (barrier 1) and the 1:1 notification_id. It maps to the same AgendaPrazoView
+// as ListPrazos (the process context comes from the court_record join); the result is 0
+// or 1 row (notification_id is UNIQUE).
+func (r *pgReadRepository) ListPrazosByIntimacao(ctx context.Context, tenantID, intimationID string) ([]AgendaPrazoView, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	nid, err := parseUUID(intimationID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.q.ListPrazosByIntimacao(ctx, deadlinedb.ListPrazosByIntimacaoParams{
+		TenantID:     tid,
+		IntimationID: nid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]AgendaPrazoView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, AgendaPrazoView{
+			ID:              row.ID.String(),
+			Kind:            derefString(row.Kind),
+			EndDate:         row.EndDate.Time,
+			DaysLeft:        int(row.DaysLeft),
+			Counting:        row.Counting,
+			Doubled:         row.Doubled,
+			DoubledReason:   derefString(row.DoubledReason),
+			Status:          row.Status,
+			HolidaysApplied: holidaysFromJSON(row.HolidaysApplied),
+			IntimationID:    row.NotificationID.String(),
+			Confirmed:       confirmedBool(row.Confirmed),
+			CourtRecordID:   row.CourtRecordID.String(),
+			CNJNumber:       row.CnjNumber,
+			Court:           row.Court,
+		})
+	}
+	return out, nil
+}
+
 // CountPrazos returns the agenda's "X de Y": the filtered count (Status/window) and the
 // tenant-wide count. When no filter is active the two coincide, so a single tenant COUNT
 // fills both (mirrors the acquisition read model) — one query instead of two.

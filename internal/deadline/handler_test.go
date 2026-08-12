@@ -38,14 +38,17 @@ func (r stubResolver) Resolve(context.Context, string, string) (httpx.Principal,
 // recordingReader implements the handler's reader port, capturing the queries the
 // handler forwards and returning canned results/errors.
 type recordingReader struct {
-	byProcRes    PrazosByProcessoResult
-	gotByProcQ   PrazosByProcessoQuery
-	agendaRes    PrazosResult
-	gotAgendaQ   PrazosQuery
-	detailView   PrazoDetailView
-	detailErr    error
-	gotDetailTID string
-	gotDetailID  string
+	byProcRes     PrazosByProcessoResult
+	gotByProcQ    PrazosByProcessoQuery
+	agendaRes     PrazosResult
+	gotAgendaQ    PrazosQuery
+	byIntimRes    PrazosResult
+	gotByIntimTID string
+	gotByIntimID  string
+	detailView    PrazoDetailView
+	detailErr     error
+	gotDetailTID  string
+	gotDetailID   string
 
 	tasksByProcRes  TasksByProcessoResult
 	gotTasksByProcQ TasksByProcessoQuery
@@ -61,6 +64,11 @@ func (r *recordingReader) PrazosByProcesso(_ context.Context, q PrazosByProcesso
 func (r *recordingReader) Prazos(_ context.Context, q PrazosQuery) (PrazosResult, error) {
 	r.gotAgendaQ = q
 	return r.agendaRes, nil
+}
+
+func (r *recordingReader) PrazosByIntimacao(_ context.Context, tenantID, intimationID string) (PrazosResult, error) {
+	r.gotByIntimTID, r.gotByIntimID = tenantID, intimationID
+	return r.byIntimRes, nil
 }
 
 func (r *recordingReader) Prazo(_ context.Context, tenantID, id string) (PrazoDetailView, error) {
@@ -441,6 +449,82 @@ func TestHandler_ListPrazos_Empty(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %s\ngot: %s", want, body)
 		}
+	}
+}
+
+// --- GET /v1/prazos?intimation_id=... (F2 lookup) ---------------------------
+
+// With ?intimation_id set the handler takes the by-intimação path: it forwards the id
+// and the principal's tenant (never the query) and returns the prazo in the same envelope.
+func TestHandler_ListPrazos_ByIntimacao_ReturnsPrazo(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{byIntimRes: PrazosResult{
+		Items: []AgendaPrazoView{{
+			ID: "d-1", EndDate: time.Date(2024, 3, 11, 0, 0, 0, 0, time.UTC),
+			Status: "PENDING", IntimationID: "018f0000-0000-7000-8000-000000000abc",
+			CNJNumber: "0001", Court: "TJSP", CourtRecordID: "cr-1",
+		}},
+		TotalCount: 1,
+		Total:      1,
+	}}
+	app := newApp(rd, "tenant-9")
+
+	status, body := do(t, app, http.MethodGet,
+		"/v1/prazos?intimation_id=018f0000-0000-7000-8000-000000000abc", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	if rd.gotByIntimID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("forwarded intimation id = %q, want the query id", rd.gotByIntimID)
+	}
+	if rd.gotByIntimTID != "tenant-9" {
+		t.Errorf("TenantID = %q, want tenant-9 (from principal)", rd.gotByIntimTID)
+	}
+	// The agenda path must NOT run when ?intimation_id is present.
+	if rd.gotAgendaQ.TenantID != "" {
+		t.Errorf("agenda path ran (query %+v), want by-intimação only", rd.gotAgendaQ)
+	}
+	for _, want := range []string{
+		`"intimation_id":"018f0000-0000-7000-8000-000000000abc"`, `"total":1`, `"court":"TJSP"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// An intimação with no derived prazo serializes as an empty data array (never null) with
+// zero totals — 200, so the F2 screen renders "sem prazo".
+func TestHandler_ListPrazos_ByIntimacao_NoPrazo_EmptyData(t *testing.T) {
+	t.Parallel()
+
+	app := newApp(&recordingReader{}, "tenant-9")
+	status, body := do(t, app, http.MethodGet,
+		"/v1/prazos?intimation_id=018f0000-0000-7000-8000-000000000abc", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"data":[]`, `"next_cursor":null`, `"total":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// A malformed ?intimation_id (not a uuid) is a client error → 400, and the read port is
+// never called.
+func TestHandler_ListPrazos_ByIntimacao_BadID_400(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newApp(rd, "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/prazos?intimation_id=not-a-uuid", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if rd.gotByIntimID != "" {
+		t.Errorf("read port called with %q, want no call on a bad id", rd.gotByIntimID)
 	}
 }
 

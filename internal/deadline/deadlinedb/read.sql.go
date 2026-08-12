@@ -297,6 +297,84 @@ func (q *Queries) ListPrazos(ctx context.Context, arg ListPrazosParams) ([]ListP
 	return items, nil
 }
 
+const listPrazosByIntimacao = `-- name: ListPrazosByIntimacao :many
+SELECT d.id, d.kind, d.end_date,
+       (d.end_date - CURRENT_DATE)::int AS days_left,
+       d.counting, d.doubled, d.doubled_reason, d.status,
+       d.holidays_applied, d.notification_id,
+       (d.confirmed_by IS NOT NULL) AS confirmed,
+       d.court_record_id, cr.cnj_number, cr.court
+FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
+WHERE d.tenant_id = $1::uuid
+  AND d.notification_id = $2::uuid
+ORDER BY d.end_date ASC, d.id ASC
+`
+
+type ListPrazosByIntimacaoParams struct {
+	TenantID     uuid.UUID `json:"tenant_id"`
+	IntimationID uuid.UUID `json:"intimation_id"`
+}
+
+type ListPrazosByIntimacaoRow struct {
+	ID              uuid.UUID   `json:"id"`
+	Kind            *string     `json:"kind"`
+	EndDate         pgtype.Date `json:"end_date"`
+	DaysLeft        int32       `json:"days_left"`
+	Counting        string      `json:"counting"`
+	Doubled         bool        `json:"doubled"`
+	DoubledReason   *string     `json:"doubled_reason"`
+	Status          string      `json:"status"`
+	HolidaysApplied []byte      `json:"holidays_applied"`
+	NotificationID  uuid.UUID   `json:"notification_id"`
+	Confirmed       interface{} `json:"confirmed"`
+	CourtRecordID   uuid.UUID   `json:"court_record_id"`
+	CnjNumber       string      `json:"cnj_number"`
+	Court           string      `json:"court"`
+}
+
+// The prazo of ONE intimação (GET /v1/prazos?intimation_id=...): the F2 screen opens
+// from an intimação and needs its derived prazo. The deadline is 1:1 with the intimação
+// by notification_id (UNIQUE, migration 0006 column name), so this returns 0 or 1 rows.
+// SAME projection as ListPrazos (the agenda row shape, with the cnj/court context from
+// the join) so the handler can reuse the AgendaPrazoView envelope unchanged. Scoped to
+// tenant_id (barrier 1, from the principal — never the query): a foreign tenant sees no
+// prazo. No keyset/window filters here — the 1:1 lookup is already a single row.
+func (q *Queries) ListPrazosByIntimacao(ctx context.Context, arg ListPrazosByIntimacaoParams) ([]ListPrazosByIntimacaoRow, error) {
+	rows, err := q.db.Query(ctx, listPrazosByIntimacao, arg.TenantID, arg.IntimationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPrazosByIntimacaoRow
+	for rows.Next() {
+		var i ListPrazosByIntimacaoRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.EndDate,
+			&i.DaysLeft,
+			&i.Counting,
+			&i.Doubled,
+			&i.DoubledReason,
+			&i.Status,
+			&i.HolidaysApplied,
+			&i.NotificationID,
+			&i.Confirmed,
+			&i.CourtRecordID,
+			&i.CnjNumber,
+			&i.Court,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPrazosByProcesso = `-- name: ListPrazosByProcesso :many
 
 SELECT d.id, d.kind, d.end_date,
