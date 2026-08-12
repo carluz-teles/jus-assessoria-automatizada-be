@@ -602,17 +602,19 @@ func (uc *SyncUseCase) logSyncCompleted(ctx context.Context, ev SyncRequested, s
 // observed record, one docket_entry_observed per NEW entry, and one
 // sync_completed to close the run.
 func (uc *SyncUseCase) publishObserved(ctx context.Context, tx database.Tx, ev SyncRequested, syncRunID string, records []*CourtRecord, newDocket []DocketEntry, itemsNew, itemsDeduped int) error {
+	// One batch insert instead of one round-trip per observed event: a big window fans
+	// out hundreds of court_record_observed, and doing them one-by-one held the advisory
+	// lock for as many round-trips. sync_completed stays LAST (closes the run). Order is
+	// preserved by the batch.
+	evs := make([]events.Event, 0, len(records)+len(newDocket)+1)
 	for _, cr := range records {
-		if err := uc.outbox.Publish(ctx, tx, newCourtRecordObserved(ev, syncRunID, cr)); err != nil {
-			return err
-		}
+		evs = append(evs, newCourtRecordObserved(ev, syncRunID, cr))
 	}
 	for _, de := range newDocket {
-		if err := uc.outbox.Publish(ctx, tx, newDocketEntryObserved(ev, syncRunID, de)); err != nil {
-			return err
-		}
+		evs = append(evs, newDocketEntryObserved(ev, syncRunID, de))
 	}
-	return uc.outbox.Publish(ctx, tx, newSyncCompleted(ev, syncRunID, itemsNew, itemsDeduped))
+	evs = append(evs, newSyncCompleted(ev, syncRunID, itemsNew, itemsDeduped))
+	return uc.outbox.PublishBatch(ctx, tx, evs)
 }
 
 // docketParamsFor resolves each parsed docket entry to its court_record id via

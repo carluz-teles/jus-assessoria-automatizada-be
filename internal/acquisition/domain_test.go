@@ -212,6 +212,17 @@ func (f *fakeOutbox) Publish(_ context.Context, _ database.Tx, ev events.Event) 
 	return nil
 }
 
+// PublishBatch behaves as N Publishes for the fake, so call counting, the failAt abort
+// and the recorded-events assertions stay identical whether the code batches or not.
+func (f *fakeOutbox) PublishBatch(ctx context.Context, tx database.Tx, evs []events.Event) error {
+	for _, ev := range evs {
+		if err := f.Publish(ctx, tx, ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 const testTenant = "tenant-1"
 
 // --- tests -------------------------------------------------------------------

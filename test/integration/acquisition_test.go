@@ -116,6 +116,9 @@ func TestAcquisition_Activate_PublishFailRollsBackAll(t *testing.T) {
 type failingOutbox struct{ err error }
 
 func (f failingOutbox) Publish(context.Context, database.Tx, events.Event) error { return f.err }
+func (f failingOutbox) PublishBatch(context.Context, database.Tx, []events.Event) error {
+	return f.err
+}
 
 // AC5: re-activating with a changed scope emits a new event; re-activating with
 // the identical scope emits none (and does not duplicate the row).

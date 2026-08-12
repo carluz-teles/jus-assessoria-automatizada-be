@@ -15,6 +15,10 @@ import (
 // the transactional outbox. *events.Outbox satisfies it structurally.
 type publisher interface {
 	Publish(ctx context.Context, tx database.Tx, ev events.Event) error
+	// PublishBatch emits many events in one round-trip — used where a write fans out
+	// hundreds of observed events under the advisory lock (a sync window's
+	// court_record_observed set), so the lock is held for one insert, not N.
+	PublishBatch(ctx context.Context, tx database.Tx, evs []events.Event) error
 }
 
 // UseCase carries the acquisition use cases. It depends on the Repository

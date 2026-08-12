@@ -197,12 +197,13 @@ func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecord
 		if err != nil {
 			return err
 		}
+		// One batch insert: a DATAJUD process with a long movimento history fans out many
+		// docket_entry_observed; the per-event loop held the advisory lock for each.
+		evs := make([]events.Event, 0, len(newDocket))
 		for _, de := range newDocket {
-			if err := uc.outbox.Publish(ctx, tx, newDocketEntryObservedFromEnrich(ev, de)); err != nil {
-				return err
-			}
+			evs = append(evs, newDocketEntryObservedFromEnrich(ev, de))
 		}
-		return nil
+		return uc.outbox.PublishBatch(ctx, tx, evs)
 	})
 }
 
