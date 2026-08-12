@@ -67,6 +67,8 @@ type Repository interface {
 	// use case depends on the narrow readRepo view of these.
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -977,6 +979,7 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 	rows, err := r.q.ListProcessos(ctx, acquisitiondb.ListProcessosParams{
 		TenantID: tid,
 		Limit:    int32(q.Limit),
+		Search:   q.Search,
 		LastCnj:  q.LastCNJ,
 		LastID:   lastID,
 	})
@@ -1023,6 +1026,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	rows, err := r.q.ListIntimacoes(ctx, acquisitiondb.ListIntimacoesParams{
 		TenantID:          tid,
 		Limit:             int32(q.Limit),
+		Search:            q.Search,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
 	})
@@ -1047,6 +1051,57 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		})
 	}
 	return out, nil
+}
+
+// CountProcessos returns the processes screen's "X de Y" totals: totalCount is the
+// current context (filtered by search when present), total the tenant's global ACTIVE
+// count. With no search the two are equal, so a single COUNT (the reused global) fills
+// both; with a search the filtered COUNT is the second read. Tenant-scoped (barrier 1).
+func (r *pgRepository) CountProcessos(ctx context.Context, tenantID, search string) (int64, int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+	total, err := r.q.CountActiveCourtRecordsByTenant(ctx, tid)
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+	if search == "" {
+		return total, total, nil
+	}
+	filtered, err := r.q.CountProcessosMatchingSearch(ctx, acquisitiondb.CountProcessosMatchingSearchParams{
+		TenantID: tid,
+		Search:   search,
+	})
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+	return filtered, total, nil
+}
+
+// CountIntimacoes returns the intimations inbox's "X de Y" totals — the same policy as
+// CountProcessos, over the intimation table (filtered by the joined court record's
+// cnj_number). Tenant-scoped.
+func (r *pgRepository) CountIntimacoes(ctx context.Context, tenantID, search string) (int64, int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+	total, err := r.q.CountIntimationsByTenant(ctx, tid)
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+	if search == "" {
+		return total, total, nil
+	}
+	filtered, err := r.q.CountIntimacoesMatchingSearch(ctx, acquisitiondb.CountIntimacoesMatchingSearchParams{
+		TenantID: tid,
+		Search:   search,
+	})
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+	return filtered, total, nil
 }
 
 // newCourtRecordEntity assembles the CourtRecord the use case works with from the

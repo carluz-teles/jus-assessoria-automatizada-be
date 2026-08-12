@@ -27,8 +27,8 @@ type handlerUC interface {
 // reader is the narrow port the Handler uses from the read use case — the
 // keyset-paginated screen reads (each returns the page plus whether more remain).
 type reader interface {
-	Processos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, bool, error)
-	Intimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, bool, error)
+	Processos(ctx context.Context, q ProcessosQuery) (ProcessosResult, error)
+	Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error)
 	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error)
 	ReconciliationDetail(ctx context.Context, tenantID, jobID string) (ReconciliationDetailView, error)
@@ -172,7 +172,8 @@ func (h *Handler) syncRunItems(c *fiber.Ctx) error {
 }
 
 // listProcessos handles GET /v1/processos: the tenant's live processes, keyset
-// paginated (?limit, ?cursor). tenant_id comes from the principal.
+// paginated (?limit, ?cursor) and optionally filtered by ?search (cnj_number ILIKE).
+// tenant_id comes from the principal.
 func (h *Handler) listProcessos(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
@@ -186,17 +187,19 @@ func (h *Handler) listProcessos(c *fiber.Ctx) error {
 		lastCNJ, lastID = cur.LastSortValue, cur.LastID
 	}
 
-	items, hasMore, err := h.reader.Processos(c.UserContext(), ProcessosQuery{
+	res, err := h.reader.Processos(c.UserContext(), ProcessosQuery{
 		TenantID: tenantID, LastCNJ: lastCNJ, LastID: lastID, Limit: limit,
+		Search: c.Query("search"),
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	return c.Status(fiber.StatusOK).JSON(newProcessosPage(items, hasMore, limit))
+	return c.Status(fiber.StatusOK).JSON(newProcessosPage(res, limit))
 }
 
 // listIntimacoes handles GET /v1/intimacoes: the tenant's intimation inbox, newest
-// availability first, keyset paginated (?limit, ?cursor).
+// availability first, keyset paginated (?limit, ?cursor) and optionally filtered by
+// ?search (the court record's cnj_number ILIKE).
 func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
@@ -210,23 +213,25 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 		lastMade, lastID = cur.LastSortValue, cur.LastID
 	}
 
-	items, hasMore, err := h.reader.Intimacoes(c.UserContext(), IntimacoesQuery{
+	res, err := h.reader.Intimacoes(c.UserContext(), IntimacoesQuery{
 		TenantID: tenantID, LastMadeAvailable: lastMade, LastID: lastID, Limit: limit,
+		Search: c.Query("search"),
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	return c.Status(fiber.StatusOK).JSON(newIntimacoesPage(items, hasMore, limit))
+	return c.Status(fiber.StatusOK).JSON(newIntimacoesPage(res, limit))
 }
 
 // newProcessosPage wraps the processos read model in the cursor envelope; the next
-// cursor keys off the last row's (cnj_number, id).
-func newProcessosPage(items []ProcessoView, hasMore bool, limit int) httpx.Page[ProcessoView] {
+// cursor keys off the last row's (cnj_number, id) and the totals carry "X de Y".
+func newProcessosPage(res ProcessosResult, limit int) httpx.Page[ProcessoView] {
+	items := res.Items
 	if items == nil {
 		items = []ProcessoView{}
 	}
-	meta := httpx.PageMeta{Limit: limit}
-	if hasMore && len(items) > 0 {
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.TotalCount, Total: res.Total}
+	if res.HasMore && len(items) > 0 {
 		last := items[len(items)-1]
 		tok := httpx.EncodeCursor(httpx.Cursor{LastID: last.ID, LastSortValue: last.CNJNumber})
 		meta.NextCursor = &tok
@@ -235,13 +240,14 @@ func newProcessosPage(items []ProcessoView, hasMore bool, limit int) httpx.Page[
 }
 
 // newIntimacoesPage wraps the intimações read model in the cursor envelope; the
-// next cursor keys off the last row's (made_available_at, id).
-func newIntimacoesPage(items []IntimacaoView, hasMore bool, limit int) httpx.Page[IntimacaoView] {
+// next cursor keys off the last row's (made_available_at, id) and the totals "X de Y".
+func newIntimacoesPage(res IntimacoesResult, limit int) httpx.Page[IntimacaoView] {
+	items := res.Items
 	if items == nil {
 		items = []IntimacaoView{}
 	}
-	meta := httpx.PageMeta{Limit: limit}
-	if hasMore && len(items) > 0 {
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.TotalCount, Total: res.Total}
+	if res.HasMore && len(items) > 0 {
 		last := items[len(items)-1]
 		tok := httpx.EncodeCursor(httpx.Cursor{
 			LastID:        last.ID,

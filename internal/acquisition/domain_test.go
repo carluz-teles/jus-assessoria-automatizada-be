@@ -194,6 +194,14 @@ func (m *mockRepo) ListIntimacoes(_ context.Context, _ IntimacoesQuery) ([]Intim
 	return nil, nil
 }
 
+func (m *mockRepo) CountProcessos(_ context.Context, _, _ string) (int64, int64, error) {
+	return 0, 0, nil
+}
+
+func (m *mockRepo) CountIntimacoes(_ context.Context, _, _ string) (int64, int64, error) {
+	return 0, 0, nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {

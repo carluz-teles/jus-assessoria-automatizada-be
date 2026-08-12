@@ -181,12 +181,13 @@ func TestE2E_DJEN_DATAJUD(t *testing.T) {
 	// ── Phase 3: the screen reads (what the FE renders) ────────────────────────
 	readUC := acquisition.NewReadUseCase(repo)
 
-	procs, _, err := readUC.Processos(ctx, acquisition.ProcessosQuery{
+	procsRes, err := readUC.Processos(ctx, acquisition.ProcessosQuery{
 		TenantID: tenantID, LastCNJ: "", LastID: "00000000-0000-0000-0000-000000000000", Limit: 5,
 	})
 	if err != nil {
 		t.Fatalf("read Processos: %v", err)
 	}
+	procs := procsRes.Items
 	if len(procs) == 0 {
 		t.Error("Processos read returned nothing, but records were discovered")
 	}
@@ -199,12 +200,13 @@ func TestE2E_DJEN_DATAJUD(t *testing.T) {
 		t.Logf("   • %s [%s] %s — classe=%q · último andamento: %s", p.CNJNumber, p.Degree, p.Court, p.Class, last)
 	}
 
-	intims, _, err := readUC.Intimacoes(ctx, acquisition.IntimacoesQuery{
+	intimsRes, err := readUC.Intimacoes(ctx, acquisition.IntimacoesQuery{
 		TenantID: tenantID, LastMadeAvailable: "9999-12-31", LastID: "ffffffff-ffff-ffff-ffff-ffffffffffff", Limit: 5,
 	})
 	if err != nil {
 		t.Fatalf("read Intimacoes: %v", err)
 	}
+	intims := intimsRes.Items
 	if len(intims) == 0 {
 		t.Error("Intimacoes read returned nothing, but intimations were discovered")
 	}

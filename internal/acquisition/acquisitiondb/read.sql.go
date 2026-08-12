@@ -12,6 +12,28 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countIntimacoesMatchingSearch = `-- name: CountIntimacoesMatchingSearch :one
+SELECT count(*) FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.tenant_id = $1
+  AND cr.cnj_number ILIKE '%' || $2::text || '%'
+`
+
+type CountIntimacoesMatchingSearchParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Search   string    `json:"search"`
+}
+
+// The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
+// whose court record's cnj_number matches the search term. Called only when ?search
+// is present; the unfiltered "Y" reuses CountIntimationsByTenant.
+func (q *Queries) CountIntimacoesMatchingSearch(ctx context.Context, arg CountIntimacoesMatchingSearchParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countIntimacoesMatchingSearch, arg.TenantID, arg.Search)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countIntimationsByTenant = `-- name: CountIntimationsByTenant :one
 SELECT count(*) FROM intimation WHERE tenant_id = $1
 `
@@ -20,6 +42,28 @@ SELECT count(*) FROM intimation WHERE tenant_id = $1
 // CountActiveCourtRecordsByTenant for the processes side).
 func (q *Queries) CountIntimationsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countIntimationsByTenant, tenantID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countProcessosMatchingSearch = `-- name: CountProcessosMatchingSearch :one
+SELECT count(*) FROM court_record cr
+WHERE cr.tenant_id = $1
+  AND cr.lifecycle = 'ACTIVE'
+  AND cr.cnj_number ILIKE '%' || $2::text || '%'
+`
+
+type CountProcessosMatchingSearchParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Search   string    `json:"search"`
+}
+
+// The filtered "X" of the processes screen's "X de Y" counter: how many ACTIVE court
+// records match the search term (cnj_number ILIKE, trigram-indexed). Called only when
+// ?search is present; the unfiltered "Y" reuses CountActiveCourtRecordsByTenant.
+func (q *Queries) CountProcessosMatchingSearch(ctx context.Context, arg CountProcessosMatchingSearchParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countProcessosMatchingSearch, arg.TenantID, arg.Search)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -87,7 +131,8 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
-  AND (i.made_available_at, i.id) < ($3::date, $4::uuid)
+  AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%')
+  AND (i.made_available_at, i.id) < ($4::date, $5::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2
 `
@@ -95,6 +140,7 @@ LIMIT $2
 type ListIntimacoesParams struct {
 	TenantID          uuid.UUID   `json:"tenant_id"`
 	Limit             int32       `json:"limit"`
+	Search            string      `json:"search"`
 	LastMadeAvailable pgtype.Date `json:"last_made_available"`
 	LastID            uuid.UUID   `json:"last_id"`
 }
@@ -122,6 +168,7 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 	rows, err := q.db.Query(ctx, listIntimacoes,
 		arg.TenantID,
 		arg.Limit,
+		arg.Search,
 		arg.LastMadeAvailable,
 		arg.LastID,
 	)
@@ -225,7 +272,8 @@ LEFT JOIN LATERAL (
 ) m ON true
 WHERE cr.tenant_id = $1
   AND cr.lifecycle = 'ACTIVE'
-  AND (cr.cnj_number, cr.id) > ($3::text, $4::uuid)
+  AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%')
+  AND (cr.cnj_number, cr.id) > ($4::text, $5::uuid)
 ORDER BY cr.cnj_number, cr.id
 LIMIT $2
 `
@@ -233,6 +281,7 @@ LIMIT $2
 type ListProcessosParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	Limit    int32     `json:"limit"`
+	Search   string    `json:"search"`
 	LastCnj  string    `json:"last_cnj"`
 	LastID   uuid.UUID `json:"last_id"`
 }
@@ -267,6 +316,7 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 	rows, err := q.db.Query(ctx, listProcessos,
 		arg.TenantID,
 		arg.Limit,
+		arg.Search,
 		arg.LastCnj,
 		arg.LastID,
 	)

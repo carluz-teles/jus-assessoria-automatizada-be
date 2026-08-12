@@ -70,9 +70,17 @@ type Querier interface {
 	// INSERT so the count is consistent with what is about to be created. lifecycle is
 	// the schema's process-liveness flag; only ACTIVE records count against the ceiling.
 	CountActiveCourtRecordsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
+	// whose court record's cnj_number matches the search term. Called only when ?search
+	// is present; the unfiltered "Y" reuses CountIntimationsByTenant.
+	CountIntimacoesMatchingSearch(ctx context.Context, arg CountIntimacoesMatchingSearchParams) (int64, error)
 	// The reconciliations totals: how many intimations the tenant holds (paired with
 	// CountActiveCourtRecordsByTenant for the processes side).
 	CountIntimationsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// The filtered "X" of the processes screen's "X de Y" counter: how many ACTIVE court
+	// records match the search term (cnj_number ILIKE, trigram-indexed). Called only when
+	// ?search is present; the unfiltered "Y" reuses CountActiveCourtRecordsByTenant.
+	CountProcessosMatchingSearch(ctx context.Context, arg CountProcessosMatchingSearchParams) (int64, error)
 	// Drop a court_case orphaned when a concurrent sync won the court_record create
 	// race (our InsertCourtRecord hit ON CONFLICT DO NOTHING) — keeps cases 1:1 with
 	// records (v0 has no consolidation).

@@ -56,6 +56,7 @@ type ProcessosQuery struct {
 	LastCNJ  string
 	LastID   string
 	Limit    int
+	Search   string // ?search: ILIKE on cnj_number; "" means no filter
 }
 
 type IntimacoesQuery struct {
@@ -63,6 +64,24 @@ type IntimacoesQuery struct {
 	LastMadeAvailable string
 	LastID            string
 	Limit             int
+	Search            string // ?search: ILIKE on the court record's cnj_number; "" means no filter
+}
+
+// ProcessosResult / IntimacoesResult are the paginated read plus the two totals for
+// the "X de Y" counter: TotalCount is the current context (filtered by Search when
+// set), Total the tenant-wide count. HasMore drives the next cursor.
+type ProcessosResult struct {
+	Items      []ProcessoView
+	HasMore    bool
+	TotalCount int64
+	Total      int64
+}
+
+type IntimacoesResult struct {
+	Items      []IntimacaoView
+	HasMore    bool
+	TotalCount int64
+	Total      int64
 }
 
 // ImportStatusView is the onboarding backfill state for the FE banner ("importando
@@ -173,6 +192,8 @@ const reconciliationRunsLimit = 60
 type readRepo interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -194,18 +215,27 @@ func NewReadUseCase(repo readRepo) *ReadUseCase {
 	return &ReadUseCase{repo: repo}
 }
 
-// Processos returns up to q.Limit processes and whether a further page exists.
-func (uc *ReadUseCase) Processos(ctx context.Context, q ProcessosQuery) (items []ProcessoView, hasMore bool, err error) {
+// Processos returns up to q.Limit processes, whether a further page exists, and the
+// "X de Y" totals (filtered by q.Search, plus the tenant-wide total). The keyset read
+// over-fetches one row for hasMore; the totals are separate COUNTs (one when no
+// search, two when filtered) — a small skew vs the page under concurrent inserts is
+// tolerable (read model, not aggregate).
+func (uc *ReadUseCase) Processos(ctx context.Context, q ProcessosQuery) (ProcessosResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
 	rows, err := uc.repo.ListProcessos(ctx, q)
 	if err != nil {
-		return nil, false, err
+		return ProcessosResult{}, err
 	}
+	hasMore := false
 	if len(rows) > limit {
-		return rows[:limit], true, nil
+		rows, hasMore = rows[:limit], true
 	}
-	return rows, false, nil
+	totalCount, total, err := uc.repo.CountProcessos(ctx, q.TenantID, q.Search)
+	if err != nil {
+		return ProcessosResult{}, err
+	}
+	return ProcessosResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
 }
 
 // ImportStatus returns the tenant's latest backfill state — the FE banner reads it
@@ -262,17 +292,23 @@ func (uc *ReadUseCase) SyncRunItems(ctx context.Context, tenantID, syncRunID str
 	return SyncRunItemsView{Processos: processos, Intimacoes: intimacoes}, nil
 }
 
-// Intimacoes returns up to q.Limit intimations (newest availability first) and
-// whether a further page exists.
-func (uc *ReadUseCase) Intimacoes(ctx context.Context, q IntimacoesQuery) (items []IntimacaoView, hasMore bool, err error) {
+// Intimacoes returns up to q.Limit intimations (newest availability first), whether a
+// further page exists, and the "X de Y" totals (filtered by q.Search plus the
+// tenant-wide total). Same shape as Processos.
+func (uc *ReadUseCase) Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
 	rows, err := uc.repo.ListIntimacoes(ctx, q)
 	if err != nil {
-		return nil, false, err
+		return IntimacoesResult{}, err
 	}
+	hasMore := false
 	if len(rows) > limit {
-		return rows[:limit], true, nil
+		rows, hasMore = rows[:limit], true
 	}
-	return rows, false, nil
+	totalCount, total, err := uc.repo.CountIntimacoes(ctx, q.TenantID, q.Search)
+	if err != nil {
+		return IntimacoesResult{}, err
+	}
+	return IntimacoesResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
 }
