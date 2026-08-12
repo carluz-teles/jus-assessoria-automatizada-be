@@ -84,6 +84,33 @@ JOIN court_record cr ON cr.id = de.court_record_id
 WHERE de.court_record_id = @court_record_id::uuid
   AND cr.tenant_id = @tenant_id::uuid;
 
+-- name: ListIntimacoesByProcesso :many
+-- The "Intimações" tab of one process: the intimations filed on this court record,
+-- newest availability first, with the record's number/court/degree joined in (same
+-- projection as ListIntimacoes). Scoped by both court_record_id (the :id) and
+-- tenant_id (barrier 1) — intimation has its own tenant_id, so a foreign :id (another
+-- tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
+-- served by intimation(court_record_id, made_available_at DESC) — the first page
+-- passes the max sentinel ('9999-12-31', max-uuid).
+SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
+       i.content, i.type, i.status, i.source, i.source_url,
+       cr.cnj_number, cr.court, cr.degree
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.court_record_id = @court_record_id::uuid
+  AND i.tenant_id = @tenant_id::uuid
+  AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)
+ORDER BY i.made_available_at DESC, i.id DESC
+LIMIT @page_limit;
+
+-- name: CountIntimacoesByProcesso :one
+-- The "X de Y" total for the Intimações tab: how many intimations the process holds.
+-- Scoped by the same court_record_id + tenant_id as the list; no court_record join is
+-- needed (intimation carries tenant_id), unlike the andamentos count.
+SELECT count(*) FROM intimation i
+WHERE i.court_record_id = @court_record_id::uuid
+  AND i.tenant_id = @tenant_id::uuid;
+
 -- name: ListReconciliations :many
 -- The reconciliations screen: one "reconciliação" per import (backfill_job), with
 -- the processes/intimations its windows discovered summed up, the job's overall

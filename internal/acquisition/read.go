@@ -91,6 +91,19 @@ type AndamentosQuery struct {
 	Limit         int
 }
 
+// IntimacoesByProcessoQuery carries the descending keyset cursor (the last row's
+// made_available_at and id) plus the process (court_record) whose intimations to read
+// and the tenant. Mirrors AndamentosQuery — this tab has no ?search — but the sort key
+// is the intimation's made_available_at (a date). The handler fills the max sentinel
+// for a first page.
+type IntimacoesByProcessoQuery struct {
+	TenantID          string
+	CourtRecordID     string
+	LastMadeAvailable string
+	LastID            string
+	Limit             int
+}
+
 // ProcessosResult / IntimacoesResult are the paginated read plus the two totals for
 // the "X de Y" counter: TotalCount is the current context (filtered by Search when
 // set), Total the tenant-wide count. HasMore drives the next cursor.
@@ -113,6 +126,15 @@ type IntimacoesResult struct {
 // use case carries one Total. HasMore drives the next cursor.
 type AndamentosResult struct {
 	Items   []AndamentoView
+	HasMore bool
+	Total   int64
+}
+
+// IntimacoesByProcessoResult is a page of a process's intimations plus its total for
+// the "X de Y" counter. Like AndamentosResult (no search on this tab), it carries a
+// single Total; HasMore drives the next cursor.
+type IntimacoesByProcessoResult struct {
+	Items   []IntimacaoView
 	HasMore bool
 	Total   int64
 }
@@ -226,9 +248,11 @@ type readRepo interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
+	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
+	CountIntimacoesByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -293,6 +317,29 @@ func (uc *ReadUseCase) Andamentos(ctx context.Context, q AndamentosQuery) (Andam
 		return AndamentosResult{}, err
 	}
 	return AndamentosResult{Items: rows, HasMore: hasMore, Total: total}, nil
+}
+
+// IntimacoesByProcesso returns up to q.Limit of a process's intimations (newest
+// availability first), whether a further page exists, and the tab's total. Same
+// over-fetch policy as Andamentos: the keyset read over-fetches one row for hasMore,
+// the total is a separate COUNT — a small skew under concurrent inserts is fine (read
+// model).
+func (uc *ReadUseCase) IntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
+	limit := q.Limit
+	q.Limit = limit + 1
+	rows, err := uc.repo.ListIntimacoesByProcesso(ctx, q)
+	if err != nil {
+		return IntimacoesByProcessoResult{}, err
+	}
+	hasMore := false
+	if len(rows) > limit {
+		rows, hasMore = rows[:limit], true
+	}
+	total, err := uc.repo.CountIntimacoesByProcesso(ctx, q.TenantID, q.CourtRecordID)
+	if err != nil {
+		return IntimacoesByProcessoResult{}, err
+	}
+	return IntimacoesByProcessoResult{Items: rows, HasMore: hasMore, Total: total}, nil
 }
 
 // ImportStatus returns the tenant's latest backfill state — the FE banner reads it

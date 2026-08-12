@@ -33,6 +33,27 @@ func (q *Queries) CountAndamentosByProcesso(ctx context.Context, arg CountAndame
 	return count, err
 }
 
+const countIntimacoesByProcesso = `-- name: CountIntimacoesByProcesso :one
+SELECT count(*) FROM intimation i
+WHERE i.court_record_id = $1::uuid
+  AND i.tenant_id = $2::uuid
+`
+
+type CountIntimacoesByProcessoParams struct {
+	CourtRecordID uuid.UUID `json:"court_record_id"`
+	TenantID      uuid.UUID `json:"tenant_id"`
+}
+
+// The "X de Y" total for the Intimações tab: how many intimations the process holds.
+// Scoped by the same court_record_id + tenant_id as the list; no court_record join is
+// needed (intimation carries tenant_id), unlike the andamentos count.
+func (q *Queries) CountIntimacoesByProcesso(ctx context.Context, arg CountIntimacoesByProcessoParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countIntimacoesByProcesso, arg.CourtRecordID, arg.TenantID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countIntimacoesMatchingSearch = `-- name: CountIntimacoesMatchingSearch :one
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
@@ -268,6 +289,88 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 	var items []ListIntimacoesRow
 	for rows.Next() {
 		var i ListIntimacoesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.MadeAvailableAt,
+			&i.PublishedAt,
+			&i.DeadlineStartAt,
+			&i.Content,
+			&i.Type,
+			&i.Status,
+			&i.Source,
+			&i.SourceUrl,
+			&i.CnjNumber,
+			&i.Court,
+			&i.Degree,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listIntimacoesByProcesso = `-- name: ListIntimacoesByProcesso :many
+SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
+       i.content, i.type, i.status, i.source, i.source_url,
+       cr.cnj_number, cr.court, cr.degree
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.court_record_id = $1::uuid
+  AND i.tenant_id = $2::uuid
+  AND (i.made_available_at, i.id) < ($3::date, $4::uuid)
+ORDER BY i.made_available_at DESC, i.id DESC
+LIMIT $5
+`
+
+type ListIntimacoesByProcessoParams struct {
+	CourtRecordID     uuid.UUID   `json:"court_record_id"`
+	TenantID          uuid.UUID   `json:"tenant_id"`
+	LastMadeAvailable pgtype.Date `json:"last_made_available"`
+	LastID            uuid.UUID   `json:"last_id"`
+	PageLimit         int32       `json:"page_limit"`
+}
+
+type ListIntimacoesByProcessoRow struct {
+	ID              uuid.UUID   `json:"id"`
+	MadeAvailableAt pgtype.Date `json:"made_available_at"`
+	PublishedAt     pgtype.Date `json:"published_at"`
+	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
+	Content         string      `json:"content"`
+	Type            *string     `json:"type"`
+	Status          string      `json:"status"`
+	Source          string      `json:"source"`
+	SourceUrl       *string     `json:"source_url"`
+	CnjNumber       string      `json:"cnj_number"`
+	Court           string      `json:"court"`
+	Degree          string      `json:"degree"`
+}
+
+// The "Intimações" tab of one process: the intimations filed on this court record,
+// newest availability first, with the record's number/court/degree joined in (same
+// projection as ListIntimacoes). Scoped by both court_record_id (the :id) and
+// tenant_id (barrier 1) — intimation has its own tenant_id, so a foreign :id (another
+// tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
+// served by intimation(court_record_id, made_available_at DESC) — the first page
+// passes the max sentinel ('9999-12-31', max-uuid).
+func (q *Queries) ListIntimacoesByProcesso(ctx context.Context, arg ListIntimacoesByProcessoParams) ([]ListIntimacoesByProcessoRow, error) {
+	rows, err := q.db.Query(ctx, listIntimacoesByProcesso,
+		arg.CourtRecordID,
+		arg.TenantID,
+		arg.LastMadeAvailable,
+		arg.LastID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListIntimacoesByProcessoRow
+	for rows.Next() {
+		var i ListIntimacoesByProcessoRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.MadeAvailableAt,

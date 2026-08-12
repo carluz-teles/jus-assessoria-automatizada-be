@@ -85,6 +85,10 @@ type Querier interface {
 	// The "X de Y" total for the Andamentos tab: how many docket entries the process
 	// holds. Tenant-scoped through the same court_record join as the list.
 	CountAndamentosByProcesso(ctx context.Context, arg CountAndamentosByProcessoParams) (int64, error)
+	// The "X de Y" total for the Intimações tab: how many intimations the process holds.
+	// Scoped by the same court_record_id + tenant_id as the list; no court_record join is
+	// needed (intimation carries tenant_id), unlike the andamentos count.
+	CountIntimacoesByProcesso(ctx context.Context, arg CountIntimacoesByProcessoParams) (int64, error)
 	// The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
 	// whose court record's cnj_number matches the search term. Called only when ?search
 	// is present; the unfiltered "Y" reuses CountIntimationsByTenant.
@@ -226,6 +230,14 @@ type Querier interface {
 	// (made_available_at, id); the first page passes the max sentinel
 	// ('9999-12-31', max-uuid).
 	ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error)
+	// The "Intimações" tab of one process: the intimations filed on this court record,
+	// newest availability first, with the record's number/court/degree joined in (same
+	// projection as ListIntimacoes). Scoped by both court_record_id (the :id) and
+	// tenant_id (barrier 1) — intimation has its own tenant_id, so a foreign :id (another
+	// tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
+	// served by intimation(court_record_id, made_available_at DESC) — the first page
+	// passes the max sentinel ('9999-12-31', max-uuid).
+	ListIntimacoesByProcesso(ctx context.Context, arg ListIntimacoesByProcessoParams) ([]ListIntimacoesByProcessoRow, error)
 	// The intimations a window first discovered (collapse), newest availability first.
 	ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoesBySyncRunParams) ([]ListIntimacoesBySyncRunRow, error)
 	// read-model queries (acquisition slice) — the screen reads, kept OFF the write
