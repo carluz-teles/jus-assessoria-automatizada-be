@@ -483,10 +483,12 @@ func (c *DJENConnector) requestPage(ctx context.Context, query url.Values, label
 
 	res, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		recordDJENRequest(ctx, "error")
 		return djenResponse{}, apperr.NewInfra(fmt.Sprintf("djen: GET comunicacao (%s)", label), err)
 	}
 	defer res.Body.Close()
 	span.SetAttributes(attribute.Int("http.response.status_code", res.StatusCode))
+	recordDJENRequest(ctx, httpStatusClass(res.StatusCode))
 
 	// A 429 (or 503) is a rate block, not a fault: trip the shared cooldown so every
 	// slice backs off together, and surface a typed, retryable Unavailable carrying

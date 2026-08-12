@@ -26,6 +26,7 @@ import (
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/config"
 
+	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -36,7 +37,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"google.golang.org/grpc/credentials"
 )
 
@@ -121,6 +122,11 @@ func Setup(ctx context.Context, cfg config.Config, serviceName string) (shutdown
 
 	otel.SetTracerProvider(tp)
 	otel.SetMeterProvider(mp)
+	// Go runtime metrics (GC pauses, goroutine count, heap) for every binary — cheap,
+	// always-on infra signal. Bound to mp explicitly so it does not depend on the global.
+	if err := runtime.Start(runtime.WithMeterProvider(mp)); err != nil {
+		return nil, apperr.NewInfra("telemetry: start runtime metrics", err)
+	}
 	// Install the LoggerProvider on the log GLOBAL: the slog OTel bridge, built at
 	// the earlier boot logger step, delegates to this global and was a no-op until
 	// now — so it starts emitting without a boot reorder (see slog.go NewLogger).

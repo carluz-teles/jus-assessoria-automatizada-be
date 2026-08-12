@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jusassessoria/platform/lib/apperr"
@@ -58,6 +59,14 @@ const (
 // it is a no-op tracer, so calling it at any boot stage is safe.
 func Tracer() trace.Tracer {
 	return otel.Tracer(telemetry.InstrumentationScope)
+}
+
+// Meter returns the process meter under the shared instrumentation scope, so every
+// custom metric reports one scope name in the backend — the metric mirror of Tracer().
+// It reads the global MeterProvider that telemetry.Setup installs; before Setup it is a
+// no-op meter, so instruments built from it simply do not record until Setup runs.
+func Meter() metric.Meter {
+	return otel.Meter(telemetry.InstrumentationScope)
 }
 
 // Start opens a span from ctx under the shared tracer and returns the derived
