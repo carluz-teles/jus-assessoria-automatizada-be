@@ -92,6 +92,46 @@ func pgTimestamptz(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: true}
 }
 
+// pgOptionalTimestamptz lifts an OPTIONAL wall-clock time to a pgtype.Timestamptz: nil is
+// SQL NULL, otherwise the timestamp. task.completed_at is the case — set on DONE (a real
+// time), left NULL on DISMISSED (dispensar is not a completion).
+func pgOptionalTimestamptz(t *time.Time) pgtype.Timestamptz {
+	if t == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: *t, Valid: true}
+}
+
+// uuidText collapses a nullable uuid column (pgtype.UUID) to a plain string, "" standing in
+// for SQL NULL (an avulsa task's absent court_record_id/deadline_id, an unassigned task). The
+// task read/write mappers use it for the nullable FKs the entity carries as strings.
+func uuidText(u pgtype.UUID) string {
+	if !u.Valid {
+		return ""
+	}
+	return uuid.UUID(u.Bytes).String()
+}
+
+// datePtr collapses a nullable date column (pgtype.Date) to an optional time, nil standing in
+// for SQL NULL. task.due_date is the case — a task may carry no own date.
+func datePtr(d pgtype.Date) *time.Time {
+	if !d.Valid {
+		return nil
+	}
+	t := d.Time
+	return &t
+}
+
+// timestampPtr collapses a nullable timestamp column (pgtype.Timestamptz) to an optional time,
+// nil standing in for SQL NULL. task.completed_at is the case — NULL while OPEN/DISMISSED.
+func timestampPtr(ts pgtype.Timestamptz) *time.Time {
+	if !ts.Valid {
+		return nil
+	}
+	t := ts.Time
+	return &t
+}
+
 // marshalHolidays encodes the skipped-days audit as a jsonb array of "2006-01-02"
 // strings — human-legible in the row (the whole point of holidays_applied: "por que
 // dia 14?"). An empty slice becomes "[]" so the column never holds JSON null.

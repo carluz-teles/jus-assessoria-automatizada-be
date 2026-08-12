@@ -46,6 +46,11 @@ type recordingReader struct {
 	detailErr    error
 	gotDetailTID string
 	gotDetailID  string
+
+	tasksByProcRes  TasksByProcessoResult
+	gotTasksByProcQ TasksByProcessoQuery
+	tasksRes        TasksResult
+	gotTasksQ       TasksQuery
 }
 
 func (r *recordingReader) PrazosByProcesso(_ context.Context, q PrazosByProcessoQuery) (PrazosByProcessoResult, error) {
@@ -61,6 +66,16 @@ func (r *recordingReader) Prazos(_ context.Context, q PrazosQuery) (PrazosResult
 func (r *recordingReader) Prazo(_ context.Context, tenantID, id string) (PrazoDetailView, error) {
 	r.gotDetailTID, r.gotDetailID = tenantID, id
 	return r.detailView, r.detailErr
+}
+
+func (r *recordingReader) TasksByProcesso(_ context.Context, q TasksByProcessoQuery) (TasksByProcessoResult, error) {
+	r.gotTasksByProcQ = q
+	return r.tasksByProcRes, nil
+}
+
+func (r *recordingReader) Tasks(_ context.Context, q TasksQuery) (TasksResult, error) {
+	r.gotTasksQ = q
+	return r.tasksRes, nil
 }
 
 // recordingWriter implements the handler's writer port, capturing the commands the handler
@@ -86,6 +101,24 @@ type recordingWriter struct {
 	missedCalls                  int
 	missedRes                    MarkedDeadline
 	missedErr                    error
+
+	// task writes
+	gotCreateTaskCmd               CreateTaskCommand
+	createTaskCalls                int
+	createTaskRes                  *Task
+	createTaskErr                  error
+	gotUpdateTaskCmd               UpdateTaskCommand
+	updateTaskCalls                int
+	updateTaskRes                  *Task
+	updateTaskErr                  error
+	gotDoneTenant, gotDoneID       string
+	doneCalls                      int
+	doneRes                        TaskTransition
+	doneErr                        error
+	gotDismissTenant, gotDismissID string
+	dismissCalls                   int
+	dismissRes                     TaskTransition
+	dismissErr                     error
 }
 
 func (w *recordingWriter) Confirm(_ context.Context, cmd ConfirmCommand) (ConfirmResult, error) {
@@ -110,6 +143,30 @@ func (w *recordingWriter) MarkMissed(_ context.Context, tenantID, deadlineID str
 	w.missedCalls++
 	w.gotMissedTenant, w.gotMissedID = tenantID, deadlineID
 	return w.missedRes, w.missedErr
+}
+
+func (w *recordingWriter) CreateTask(_ context.Context, cmd CreateTaskCommand) (*Task, error) {
+	w.createTaskCalls++
+	w.gotCreateTaskCmd = cmd
+	return w.createTaskRes, w.createTaskErr
+}
+
+func (w *recordingWriter) UpdateTask(_ context.Context, cmd UpdateTaskCommand) (*Task, error) {
+	w.updateTaskCalls++
+	w.gotUpdateTaskCmd = cmd
+	return w.updateTaskRes, w.updateTaskErr
+}
+
+func (w *recordingWriter) MarkTaskDone(_ context.Context, tenantID, taskID string) (TaskTransition, error) {
+	w.doneCalls++
+	w.gotDoneTenant, w.gotDoneID = tenantID, taskID
+	return w.doneRes, w.doneErr
+}
+
+func (w *recordingWriter) DismissTask(_ context.Context, tenantID, taskID string) (TaskTransition, error) {
+	w.dismissCalls++
+	w.gotDismissTenant, w.gotDismissID = tenantID, taskID
+	return w.dismissRes, w.dismissErr
 }
 
 // newApp builds an app whose /v1 group mirrors production: Auth resolves a principal with
@@ -731,5 +788,356 @@ func TestHandler_MarkMet_NoToken_401(t *testing.T) {
 	}
 	if wr.metCalls != 0 {
 		t.Errorf("met calls = %d, want 0 (blocked at auth)", wr.metCalls)
+	}
+}
+
+// --- GET /v1/processos/:id/tasks --------------------------------------------
+
+// The handler forwards the path :id (court_record) and the decoded ?cursor to the read port,
+// clamps ?limit, takes the tenant from the principal, and serializes the row + envelope.
+func TestHandler_ListTasksByProcesso_ForwardsAndSerializes(t *testing.T) {
+	t.Parallel()
+
+	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	rd := &recordingReader{tasksByProcRes: TasksByProcessoResult{
+		Items: []TaskView{{
+			ID: "018f0000-0000-7000-8000-000000000abc", Title: "Contestar", Kind: "PECA",
+			DueDate: &due, Status: "OPEN", Source: "MANUAL", DeadlineID: "d-1", CourtRecordID: "cr-77",
+		}},
+		Total: 1,
+	}}
+	app := newApp(rd, "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-77/tasks?limit=25", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	if rd.gotTasksByProcQ.CourtRecordID != "cr-77" || rd.gotTasksByProcQ.TenantID != "tenant-9" {
+		t.Errorf("forwarded cr/tenant = %q/%q, want cr-77/tenant-9", rd.gotTasksByProcQ.CourtRecordID, rd.gotTasksByProcQ.TenantID)
+	}
+	if rd.gotTasksByProcQ.Limit != 25 {
+		t.Errorf("Limit = %d, want 25", rd.gotTasksByProcQ.Limit)
+	}
+	if rd.gotTasksByProcQ.LastDue != minDate || rd.gotTasksByProcQ.LastID != zeroUUID {
+		t.Errorf("first-page sentinel = (%q, %q), want (%q, %q)", rd.gotTasksByProcQ.LastDue, rd.gotTasksByProcQ.LastID, minDate, zeroUUID)
+	}
+	for _, want := range []string{`"title":"Contestar"`, `"status":"OPEN"`, `"source":"MANUAL"`, `"deadline_id":"d-1"`, `"total":1`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// --- GET /v1/tasks (agenda) --------------------------------------------------
+
+// The handler forwards ?status and the ?from/?to window (validated) to the read port; the tenant
+// comes from the principal.
+func TestHandler_ListTasks_ForwardsFilters(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newApp(rd, "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/tasks?status=OPEN&from=2024-03-01&to=2024-03-31&limit=10", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotTasksQ.Status != "OPEN" || rd.gotTasksQ.From != "2024-03-01" || rd.gotTasksQ.To != "2024-03-31" {
+		t.Errorf("filters not forwarded: %+v", rd.gotTasksQ)
+	}
+	if rd.gotTasksQ.TenantID != "tenant-9" {
+		t.Errorf("TenantID = %q, want tenant-9 (from principal)", rd.gotTasksQ.TenantID)
+	}
+}
+
+// ?assignee=me resolves to the principal's own user id (the "meus prazos" shortcut) — the tenant
+// and the resolved assignee both come from the verified principal, never the query.
+func TestHandler_ListTasks_AssigneeMeResolvesToPrincipal(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newApp(rd, "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/tasks?assignee=me", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	// stubResolver hands the handler UserID "u-1".
+	if rd.gotTasksQ.Assignee != "u-1" {
+		t.Errorf("Assignee = %q, want u-1 (principal's id via \"me\")", rd.gotTasksQ.Assignee)
+	}
+}
+
+// An unknown ?status and a malformed ?assignee are client errors → 400 (the read port is never called).
+func TestHandler_ListTasks_BadFilters_400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, query string }{
+		{"bad status", "/v1/tasks?status=BOGUS"},
+		{"bad assignee", "/v1/tasks?assignee=not-a-uuid"},
+		{"bad date", "/v1/tasks?from=03-2024"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			app := newApp(&recordingReader{}, "tenant-9")
+			status, body := do(t, app, http.MethodGet, tt.query, "jwt")
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+			}
+		})
+	}
+}
+
+// An empty agenda serializes as an empty data array (never null) with zero totals — 200.
+func TestHandler_ListTasks_Empty(t *testing.T) {
+	t.Parallel()
+
+	app := newApp(&recordingReader{}, "tenant-9")
+	status, body := do(t, app, http.MethodGet, "/v1/tasks", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"data":[]`, `"next_cursor":null`, `"total":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// Cursor round-trip across two pages: an undated last row keys its next cursor off the
+// '9999-12-31' sentinel (sortDue), and echoing it back resumes the keyset exactly there.
+func TestHandler_ListTasks_CursorRoundTrip_UndatedSentinel(t *testing.T) {
+	t.Parallel()
+
+	last := TaskView{ID: "018f0000-0000-7000-8000-0000000000ff"} // undated → sortDue is the zero time...
+	last.sortDue = time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC) // ...set to the coalesced sentinel by the repo
+	rd := &recordingReader{tasksRes: TasksResult{
+		Items:   []TaskView{{ID: "first"}, last},
+		HasMore: true,
+		Total:   50,
+	}}
+	app := newApp(rd, "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/tasks?limit=2", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("page 1 status = %d, want 200", status)
+	}
+	var page1 httpx.Page[TaskView]
+	if err := json.Unmarshal([]byte(body), &page1); err != nil {
+		t.Fatalf("unmarshal page 1: %v (body: %s)", err, body)
+	}
+	if page1.Page.NextCursor == nil {
+		t.Fatal("page 1 next_cursor = nil, want a token (HasMore was true)")
+	}
+
+	status, _ = do(t, app, http.MethodGet, "/v1/tasks?limit=2&cursor="+*page1.Page.NextCursor, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("page 2 status = %d, want 200", status)
+	}
+	if rd.gotTasksQ.LastDue != "9999-12-31" || rd.gotTasksQ.LastID != last.ID {
+		t.Errorf("page 2 keyset = (%q, %q), want (9999-12-31, %q)", rd.gotTasksQ.LastDue, rd.gotTasksQ.LastID, last.ID)
+	}
+}
+
+// --- POST /v1/tasks ----------------------------------------------------------
+
+// The create handler takes tenant_id/created_by from the PRINCIPAL (never the body), forwards the
+// mapped command, and returns 201 with the created task in the shared TaskView shape.
+func TestHandler_CreateTask_ForwardsCommandFromPrincipal_201(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{createTaskRes: &Task{ID: "t-1", Title: "Peça", Status: TaskStatusOpen, Source: SourceManual}}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	body := `{"deadline_id":"018f0000-0000-7000-8000-000000000abc","title":"Peça","due_date":"2024-03-15",
+		"assignee_user_id":"018f0000-0000-7000-8000-000000000def"}`
+	status, resBody := doJSON(t, app, http.MethodPost, "/v1/tasks", "jwt", body)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", status, resBody)
+	}
+	if wr.createTaskCalls != 1 {
+		t.Fatalf("create calls = %d, want 1", wr.createTaskCalls)
+	}
+	cmd := wr.gotCreateTaskCmd
+	if cmd.TenantID != "tenant-9" || cmd.UserID != "u-1" {
+		t.Errorf("tenant/user = %q/%q, want tenant-9/u-1 (from principal)", cmd.TenantID, cmd.UserID)
+	}
+	if cmd.Title != "Peça" || cmd.DueDate == nil || cmd.DeadlineID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("command = %+v", cmd)
+	}
+	if !strings.Contains(resBody, `"id":"t-1"`) || !strings.Contains(resBody, `"status":"OPEN"`) || !strings.Contains(resBody, `"source":"MANUAL"`) {
+		t.Errorf("response missing created task\ngot: %s", resBody)
+	}
+}
+
+// A malformed body (empty title, bad due_date, bad optional uuid) is a 400, and the use case is
+// never called.
+func TestHandler_CreateTask_Validation_400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, body string }{
+		{"empty title", `{"title":""}`},
+		{"missing title", `{"description":"x"}`},
+		{"bad due_date", `{"title":"x","due_date":"01/02/2024"}`},
+		{"bad deadline id", `{"title":"x","deadline_id":"not-a-uuid"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPost, "/v1/tasks", "jwt", tt.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+			}
+			if wr.createTaskCalls != 0 {
+				t.Errorf("create calls = %d, want 0 (rejected at the edge)", wr.createTaskCalls)
+			}
+		})
+	}
+}
+
+// --- PATCH /v1/tasks/:id -----------------------------------------------------
+
+// The patch handler takes tenant from the PRINCIPAL and the task id from the PATH (never the body),
+// forwards ONLY the present fields (a partial patch), and returns 200 with the saved task.
+func TestHandler_UpdateTask_ForwardsPartialPatch(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{updateTaskRes: &Task{ID: "t-1", Title: "novo", Status: TaskStatusOpen, Source: SourceManual}}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	body := `{"title":"novo","due_date":""}` // title set, due_date cleared; kind/description/assignee absent
+	status, resBody := doJSON(t, app, http.MethodPatch, "/v1/tasks/t-1", "jwt", body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
+	}
+	if wr.updateTaskCalls != 1 {
+		t.Fatalf("update calls = %d, want 1", wr.updateTaskCalls)
+	}
+	cmd := wr.gotUpdateTaskCmd
+	if cmd.TenantID != "tenant-9" || cmd.TaskID != "t-1" {
+		t.Errorf("tenant/id = %q/%q, want tenant-9/t-1", cmd.TenantID, cmd.TaskID)
+	}
+	if cmd.Title == nil || *cmd.Title != "novo" || cmd.DueDate == nil || *cmd.DueDate != "" {
+		t.Errorf("present fields title/due = %v/%v, want novo/\"\" (cleared)", cmd.Title, cmd.DueDate)
+	}
+	if cmd.Kind != nil || cmd.Description != nil || cmd.AssigneeUserID != nil {
+		t.Errorf("absent fields carried non-nil: kind=%v desc=%v assignee=%v", cmd.Kind, cmd.Description, cmd.AssigneeUserID)
+	}
+	if !strings.Contains(resBody, `"id":"t-1"`) || !strings.Contains(resBody, `"title":"novo"`) {
+		t.Errorf("response missing saved task\ngot: %s", resBody)
+	}
+}
+
+// A present-but-blank title is a 400; the use case is never called.
+func TestHandler_UpdateTask_Validation_400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, body string }{
+		{"blank title", `{"title":""}`},
+		{"bad due_date", `{"due_date":"2024/03/15"}`},
+		{"bad assignee", `{"assignee_user_id":"nope"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPatch, "/v1/tasks/t-1", "jwt", tt.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+			}
+			if wr.updateTaskCalls != 0 {
+				t.Errorf("update calls = %d, want 0 (rejected at the edge)", wr.updateTaskCalls)
+			}
+		})
+	}
+}
+
+// A miss is the use case's typed ErrTaskNotFound → 404.
+func TestHandler_UpdateTask_NotFound_404(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{updateTaskErr: ErrTaskNotFound}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	status, body := doJSON(t, app, http.MethodPatch, "/v1/tasks/missing", "jwt", `{"title":"x"}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", status, body)
+	}
+	if !strings.Contains(body, string(apperr.KindNotFound)) {
+		t.Errorf("body missing kind %q\ngot: %s", apperr.KindNotFound, body)
+	}
+}
+
+// --- POST /v1/tasks/:id/done | .../dismiss ----------------------------------
+
+// The done/dismiss handlers take the task id from the PATH and tenant from the PRINCIPAL, and
+// return 200 with {task_id, status}. No body is required.
+func TestHandler_TaskDoneAndDismiss_ForwardsFromPrincipalAndPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, path, wantStatus string
+	}{
+		{"done", "/v1/tasks/t-1/done", "DONE"},
+		{"dismiss", "/v1/tasks/t-1/dismiss", "DISMISSED"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{
+				doneRes:    TaskTransition{ID: "t-1", Status: TaskStatusDone},
+				dismissRes: TaskTransition{ID: "t-1", Status: TaskStatusDismissed},
+			}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPost, tt.path, "jwt", "")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+			}
+			if !strings.Contains(body, `"task_id":"t-1"`) || !strings.Contains(body, `"status":"`+tt.wantStatus+`"`) {
+				t.Errorf("response = %s, want task_id t-1 + status %s", body, tt.wantStatus)
+			}
+			if tt.name == "done" {
+				if wr.doneCalls != 1 || wr.gotDoneTenant != "tenant-9" || wr.gotDoneID != "t-1" {
+					t.Errorf("done forwarded calls/tenant/id = %d/%q/%q, want 1/tenant-9/t-1", wr.doneCalls, wr.gotDoneTenant, wr.gotDoneID)
+				}
+			} else {
+				if wr.dismissCalls != 1 || wr.gotDismissTenant != "tenant-9" || wr.gotDismissID != "t-1" {
+					t.Errorf("dismiss forwarded calls/tenant/id = %d/%q/%q, want 1/tenant-9/t-1", wr.dismissCalls, wr.gotDismissTenant, wr.gotDismissID)
+				}
+			}
+		})
+	}
+}
+
+// A non-OPEN task is the use case's typed ErrTaskNotOpen → 409; a miss → 404.
+func TestHandler_TaskDone_StatusErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"not open → 409", ErrTaskNotOpen, http.StatusConflict},
+		{"missing → 404", ErrTaskNotFound, http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{doneErr: tt.err}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPost, "/v1/tasks/t-1/done", "jwt", "")
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", status, tt.wantStatus, body)
+			}
+		})
 	}
 }

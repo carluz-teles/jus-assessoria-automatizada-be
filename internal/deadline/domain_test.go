@@ -57,6 +57,16 @@ type mockRepo struct {
 	markStatusID       string
 	markStatusErr      error
 
+	// task write path (5b)
+	taskForUpdate     *TaskForUpdate
+	taskForUpdateErr  error
+	updatedTask       *Task
+	updateTaskErr     error
+	taskTransition    TaskStatus
+	taskTransitionErr error
+	markTaskStatusID  string
+	markTaskStatusErr error
+
 	// captured inputs
 	gotClassTenantID      string
 	gotClassRecordID      string
@@ -97,6 +107,20 @@ type mockRepo struct {
 	gotMarkStatusFrom     Status
 	gotMarkStatusTo       Status
 	markStatusCalls       int
+	gotTaskUpdateID       string
+	gotTaskUpdateTenantID string
+	taskForUpdateCalls    int
+	gotUpdateTaskParams   UpdateTaskParams
+	updateTaskCalls       int
+	gotTaskTransitionID   string
+	gotTaskTransitionTID  string
+	taskTransitionCalls   int
+	gotMarkTaskID         string
+	gotMarkTaskTenantID   string
+	gotMarkTaskFrom       TaskStatus
+	gotMarkTaskTo         TaskStatus
+	gotMarkTaskCompleted  *time.Time
+	markTaskStatusCalls   int
 }
 
 func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
@@ -222,6 +246,50 @@ func (m *mockRepo) InsertTask(_ context.Context, _ database.Tx, t *Task) (*Task,
 	saved.ID = uuid.NewString()
 	m.insertedTasks = append(m.insertedTasks, &saved)
 	return &saved, nil
+}
+
+// GetTaskForUpdate returns the configured editable state and records the (id, tenant) scoping so
+// a PATCH test can assert the 2-barrier key.
+func (m *mockRepo) GetTaskForUpdate(_ context.Context, _ database.Tx, taskID, tenantID string) (*TaskForUpdate, error) {
+	m.taskForUpdateCalls++
+	m.gotTaskUpdateID = taskID
+	m.gotTaskUpdateTenantID = tenantID
+	return m.taskForUpdate, m.taskForUpdateErr
+}
+
+// UpdateTask captures the merged params and echoes the configured saved task (or error), so a
+// test can assert the patch was applied over the stored values.
+func (m *mockRepo) UpdateTask(_ context.Context, _ database.Tx, p UpdateTaskParams) (*Task, error) {
+	m.updateTaskCalls++
+	m.gotUpdateTaskParams = p
+	if m.updateTaskErr != nil {
+		return nil, m.updateTaskErr
+	}
+	return m.updatedTask, nil
+}
+
+// GetTaskForTransition returns the configured status and records the (id, tenant) scoping so a
+// done/dismiss test can assert the 2-barrier key.
+func (m *mockRepo) GetTaskForTransition(_ context.Context, _ database.Tx, taskID, tenantID string) (TaskStatus, error) {
+	m.taskTransitionCalls++
+	m.gotTaskTransitionID = taskID
+	m.gotTaskTransitionTID = tenantID
+	return m.taskTransition, m.taskTransitionErr
+}
+
+// MarkTaskStatus records the (id, tenant, from, to, completed_at) of a manual task transition and
+// returns the configured flipped id (or error), so a done/dismiss test can assert the guarded flip.
+func (m *mockRepo) MarkTaskStatus(_ context.Context, _ database.Tx, taskID, tenantID string, from, to TaskStatus, completedAt *time.Time) (string, error) {
+	m.markTaskStatusCalls++
+	m.gotMarkTaskID = taskID
+	m.gotMarkTaskTenantID = tenantID
+	m.gotMarkTaskFrom = from
+	m.gotMarkTaskTo = to
+	m.gotMarkTaskCompleted = completedAt
+	if m.markTaskStatusErr != nil {
+		return "", m.markTaskStatusErr
+	}
+	return m.markTaskStatusID, nil
 }
 
 // fakeCalendar records which motor was called (business vs calendar) and the args, and

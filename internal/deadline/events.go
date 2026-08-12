@@ -404,19 +404,107 @@ var _ events.Event = TaskCreated{}
 func (TaskCreated) Type() string          { return TypeTaskCreated }
 func (TaskCreated) AggregateType() string { return aggregateTypeTask }
 
-// newTaskCreated builds the produced event from the persisted task. aggregate_id is the task
-// id (a uuid, satisfying the outbox's uuid NOT NULL); the event id is a fresh uuid v7 (the
-// consumer dedup key). DueDate is formatted only when set, so an undated task emits no date.
+// newTaskCreated builds the produced event from a confirmed (F2) task. It funnels through
+// the shared taskCreatedEvent builder so the F2 confirm and the manual CREATE (5b, POST
+// /v1/tasks) announce a new task with a SINGLE construction — the contract has one source.
 func newTaskCreated(t ConfirmedTask) TaskCreated {
+	return taskCreatedEvent(t.ID, t.DeadlineID, t.CourtRecordID, t.AssigneeUserID, t.DueDate)
+}
+
+// newTaskCreatedFromTask builds the same produced event from a persisted *Task — the manual
+// CREATE path (POST /v1/tasks), where the task is an entity, not a ConfirmedTask. Same
+// builder as the confirm path (no parallel construction to drift).
+func newTaskCreatedFromTask(t *Task) TaskCreated {
+	return taskCreatedEvent(t.ID, t.DeadlineID, t.CourtRecordID, t.AssigneeUserID, t.DueDate)
+}
+
+// taskCreatedEvent is the shared builder for task.created. aggregate_id is the task id (a
+// uuid, satisfying the outbox's uuid NOT NULL); the event id is a fresh uuid v7 (the consumer
+// dedup key). DueDate is formatted only when set, so an undated task emits no date.
+func taskCreatedEvent(taskID, deadlineID, courtRecordID, assignee string, due *time.Time) TaskCreated {
 	ev := TaskCreated{
-		Base:           events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: t.ID},
-		TaskID:         t.ID,
-		DeadlineID:     t.DeadlineID,
-		CourtRecordID:  t.CourtRecordID,
-		AssigneeUserID: t.AssigneeUserID,
+		Base:           events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: taskID},
+		TaskID:         taskID,
+		DeadlineID:     deadlineID,
+		CourtRecordID:  courtRecordID,
+		AssigneeUserID: assignee,
 	}
-	if t.DueDate != nil {
-		ev.DueDate = t.DueDate.Format(time.DateOnly)
+	if due != nil {
+		ev.DueDate = due.Format(time.DateOnly)
 	}
 	return ev
+}
+
+// TypeTaskUpdated is the dotted id this slice PRODUCES when a task's editable fields are
+// patched (docs/erd-prazos.md §9: PATCH /v1/tasks/:id → ajustar tarefa). Its "task" prefix
+// routes it to the default work at the relay; its consumer (task read models / "meus prazos")
+// is a later slice, so it is an orphan-for-now, which is safe.
+const TypeTaskUpdated = "task.updated"
+
+// TaskUpdated announces one task edited (title/description/kind/due_date/assignee). The ERD
+// §7 task events are minimal {task_id}; the aggregate id already IS the task, so a consumer
+// re-reads the row for the new field values. The aggregate is the task, so its stream orders
+// by the task id.
+type TaskUpdated struct {
+	events.Base
+	TaskID string `json:"task_id"`
+}
+
+var _ events.Event = TaskUpdated{}
+
+func (TaskUpdated) Type() string          { return TypeTaskUpdated }
+func (TaskUpdated) AggregateType() string { return aggregateTypeTask }
+
+// newTaskUpdated builds the produced event from the patched task's id. Fresh uuid v7 event id
+// (the consumer dedup key); aggregate_id is the task id, mirroring newTaskCreated.
+func newTaskUpdated(taskID string) TaskUpdated {
+	return TaskUpdated{Base: events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: taskID}, TaskID: taskID}
+}
+
+// TypeTaskCompleted is the dotted id this slice PRODUCES when a task is marked DONE
+// (docs/erd-prazos.md §7: task.completed {task_id}; §9: POST /v1/tasks/:id/done). Same "task"
+// prefix/routing as task.created; its consumer (read models / "meus prazos") marks the task
+// done. It is the positive counterpart of task.dismissed.
+const TypeTaskCompleted = "task.completed"
+
+// TaskCompleted announces one task concluded (OPEN→DONE). Minimal {task_id} per ERD §7; the
+// aggregate is the task, so its stream orders by the task id.
+type TaskCompleted struct {
+	events.Base
+	TaskID string `json:"task_id"`
+}
+
+var _ events.Event = TaskCompleted{}
+
+func (TaskCompleted) Type() string          { return TypeTaskCompleted }
+func (TaskCompleted) AggregateType() string { return aggregateTypeTask }
+
+// newTaskCompleted builds the produced event from the completed task's id. Fresh uuid v7
+// event id; aggregate_id is the task id.
+func newTaskCompleted(taskID string) TaskCompleted {
+	return TaskCompleted{Base: events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: taskID}, TaskID: taskID}
+}
+
+// TypeTaskDismissed is the dotted id this slice PRODUCES when a task is dispensada
+// (docs/erd-prazos.md §7: task.dismissed {task_id}; §9: POST /v1/tasks/:id/dismiss —
+// OPEN→DISMISSED). Same "task" prefix/routing as task.completed; its consumer drops the task
+// from the checklist. It is the negative counterpart of task.completed.
+const TypeTaskDismissed = "task.dismissed"
+
+// TaskDismissed announces one task dismissed (OPEN→DISMISSED). Minimal {task_id} per ERD §7;
+// the aggregate is the task, so its stream orders by the task id.
+type TaskDismissed struct {
+	events.Base
+	TaskID string `json:"task_id"`
+}
+
+var _ events.Event = TaskDismissed{}
+
+func (TaskDismissed) Type() string          { return TypeTaskDismissed }
+func (TaskDismissed) AggregateType() string { return aggregateTypeTask }
+
+// newTaskDismissed builds the produced event from the dismissed task's id. Fresh uuid v7
+// event id; aggregate_id is the task id.
+func newTaskDismissed(taskID string) TaskDismissed {
+	return TaskDismissed{Base: events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: taskID}, TaskID: taskID}
 }

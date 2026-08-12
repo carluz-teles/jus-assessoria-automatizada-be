@@ -75,6 +75,72 @@ func (q *Queries) CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (
 	return count, err
 }
 
+const countTasks = `-- name: CountTasks :one
+SELECT count(*) FROM task t
+WHERE t.tenant_id = $1::uuid
+  AND ($2::text = '' OR t.status = $2::text)
+  AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
+  AND ($4::date IS NULL OR t.due_date >= $4::date)
+  AND ($5::date IS NULL OR t.due_date <= $5::date)
+`
+
+type CountTasksParams struct {
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	Status     string      `json:"status"`
+	AssigneeID pgtype.UUID `json:"assignee_id"`
+	FromDate   pgtype.Date `json:"from_date"`
+	ToDate     pgtype.Date `json:"to_date"`
+}
+
+// The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
+// @status / @assignee_id / window. Called only when a filter is present; the unfiltered "Y"
+// reuses CountTasksByTenant.
+func (q *Queries) CountTasks(ctx context.Context, arg CountTasksParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTasks,
+		arg.TenantID,
+		arg.Status,
+		arg.AssigneeID,
+		arg.FromDate,
+		arg.ToDate,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countTasksByProcesso = `-- name: CountTasksByProcesso :one
+SELECT count(*) FROM task t
+WHERE t.court_record_id = $1::uuid
+  AND t.tenant_id = $2::uuid
+`
+
+type CountTasksByProcessoParams struct {
+	CourtRecordID uuid.UUID `json:"court_record_id"`
+	TenantID      uuid.UUID `json:"tenant_id"`
+}
+
+// The "X de Y" total for the Tasks tab: how many tasks the process holds. Same tenant +
+// court_record scoping as the list.
+func (q *Queries) CountTasksByProcesso(ctx context.Context, arg CountTasksByProcessoParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTasksByProcesso, arg.CourtRecordID, arg.TenantID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countTasksByTenant = `-- name: CountTasksByTenant :one
+SELECT count(*) FROM task WHERE tenant_id = $1::uuid
+`
+
+// The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
+// any filter.
+func (q *Queries) CountTasksByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countTasksByTenant, tenantID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getPrazo = `-- name: GetPrazo :one
 SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
        (d.end_date - CURRENT_DATE)::int AS days_left,
@@ -308,6 +374,189 @@ func (q *Queries) ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProc
 			&i.HolidaysApplied,
 			&i.NotificationID,
 			&i.Confirmed,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTasks = `-- name: ListTasks :many
+SELECT t.id, t.title, t.description, t.kind, t.due_date,
+       COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
+       t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
+       t.court_record_id, t.completed_at
+FROM task t
+WHERE t.tenant_id = $1::uuid
+  AND ($2::text = '' OR t.status = $2::text)
+  AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
+  AND ($4::date IS NULL OR t.due_date >= $4::date)
+  AND ($5::date IS NULL OR t.due_date <= $5::date)
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($6::date, $7::uuid)
+ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
+LIMIT $8
+`
+
+type ListTasksParams struct {
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	Status     string      `json:"status"`
+	AssigneeID pgtype.UUID `json:"assignee_id"`
+	FromDate   pgtype.Date `json:"from_date"`
+	ToDate     pgtype.Date `json:"to_date"`
+	LastDue    pgtype.Date `json:"last_due"`
+	LastID     uuid.UUID   `json:"last_id"`
+	PageLimit  int32       `json:"page_limit"`
+}
+
+type ListTasksRow struct {
+	ID             uuid.UUID          `json:"id"`
+	Title          string             `json:"title"`
+	Description    *string            `json:"description"`
+	Kind           *string            `json:"kind"`
+	DueDate        pgtype.Date        `json:"due_date"`
+	SortDue        pgtype.Date        `json:"sort_due"`
+	Status         string             `json:"status"`
+	Source         string             `json:"source"`
+	AssigneeUserID pgtype.UUID        `json:"assignee_user_id"`
+	DeadlineID     pgtype.UUID        `json:"deadline_id"`
+	IntimationID   pgtype.UUID        `json:"intimation_id"`
+	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+// The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
+// first (undated last). Optional filters: @status (” = all), @assignee_id (NULL = all
+// assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]
+// (NULL = open bound). The window filters on the REAL due_date, so it naturally EXCLUDES
+// undated tasks (NULL >= date is NULL) — a dated-window query wants dated items. Ascending
+// (sort_due, id) keyset; the first page passes the min sentinel ('0001-01-01', zero-uuid).
+func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error) {
+	rows, err := q.db.Query(ctx, listTasks,
+		arg.TenantID,
+		arg.Status,
+		arg.AssigneeID,
+		arg.FromDate,
+		arg.ToDate,
+		arg.LastDue,
+		arg.LastID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTasksRow
+	for rows.Next() {
+		var i ListTasksRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.Description,
+			&i.Kind,
+			&i.DueDate,
+			&i.SortDue,
+			&i.Status,
+			&i.Source,
+			&i.AssigneeUserID,
+			&i.DeadlineID,
+			&i.IntimationID,
+			&i.CourtRecordID,
+			&i.CompletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTasksByProcesso = `-- name: ListTasksByProcesso :many
+
+SELECT t.id, t.title, t.description, t.kind, t.due_date,
+       COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
+       t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
+       t.court_record_id, t.completed_at
+FROM task t
+WHERE t.court_record_id = $1::uuid
+  AND t.tenant_id = $2::uuid
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($3::date, $4::uuid)
+ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
+LIMIT $5
+`
+
+type ListTasksByProcessoParams struct {
+	CourtRecordID uuid.UUID   `json:"court_record_id"`
+	TenantID      uuid.UUID   `json:"tenant_id"`
+	LastDue       pgtype.Date `json:"last_due"`
+	LastID        uuid.UUID   `json:"last_id"`
+	PageLimit     int32       `json:"page_limit"`
+}
+
+type ListTasksByProcessoRow struct {
+	ID             uuid.UUID          `json:"id"`
+	Title          string             `json:"title"`
+	Description    *string            `json:"description"`
+	Kind           *string            `json:"kind"`
+	DueDate        pgtype.Date        `json:"due_date"`
+	SortDue        pgtype.Date        `json:"sort_due"`
+	Status         string             `json:"status"`
+	Source         string             `json:"source"`
+	AssigneeUserID pgtype.UUID        `json:"assignee_user_id"`
+	DeadlineID     pgtype.UUID        `json:"deadline_id"`
+	IntimationID   pgtype.UUID        `json:"intimation_id"`
+	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+// ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
+// The task agenda reads soonest-due first, but due_date is NULLABLE (an undated backlog
+// task). Decisão travada: undated tasks sort LAST (a task with no date has no urgency, so it
+// trails the dated ones). We model NULLS LAST as a computed sort key
+// COALESCE(due_date, '9999-12-31') so the SAME ascending (sort_due, id) keyset the prazos
+// reads use works unchanged (a min sentinel '0001-01-01' for the first page; the handler
+// carries sort_due, not the raw due_date, into the next cursor). The read models expose the
+// REAL due_date (NULL for undated) — sort_due is a query-internal keyset column.
+// The Tasks tab of one process (GET /v1/processos/:id/tasks): the tasks anchored on the
+// court_record, soonest due first (undated last). ALL statuses (the tab is not filtered — the
+// FE decides what to show). @court_record_id is the court_record id; an avulsa task (NULL
+// court_record_id) never matches, so it is absent from a process tab (correct — it hangs on no
+// process). Scoped to tenant_id (barrier 1).
+func (q *Queries) ListTasksByProcesso(ctx context.Context, arg ListTasksByProcessoParams) ([]ListTasksByProcessoRow, error) {
+	rows, err := q.db.Query(ctx, listTasksByProcesso,
+		arg.CourtRecordID,
+		arg.TenantID,
+		arg.LastDue,
+		arg.LastID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTasksByProcessoRow
+	for rows.Next() {
+		var i ListTasksByProcessoRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.Description,
+			&i.Kind,
+			&i.DueDate,
+			&i.SortDue,
+			&i.Status,
+			&i.Source,
+			&i.AssigneeUserID,
+			&i.DeadlineID,
+			&i.IntimationID,
+			&i.CourtRecordID,
+			&i.CompletedAt,
 		); err != nil {
 			return nil, err
 		}

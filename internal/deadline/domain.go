@@ -64,10 +64,31 @@ type Repository interface {
 	// submit's tasks instead of accumulating a new set each call. A no-match deletes nothing
 	// (an empty first confirm is a clean no-op), so it never errors on absence.
 	DeleteTasksByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) error
-	// InsertTask persists one F2 task inside the caller's tx and returns it with its
-	// DB-assigned id (echoing the entity, like InsertDeadline). Scoping is via the entity's
-	// TenantID + RLS.
+	// InsertTask persists one task inside the caller's tx and returns it with its DB-assigned
+	// id (echoing the entity, like InsertDeadline). Scoping is via the entity's TenantID + RLS.
+	// Reused by BOTH the F2 confirm (the N approved tasks) and the manual CREATE (POST /v1/tasks).
 	InsertTask(ctx context.Context, tx database.Tx, t *Task) (*Task, error)
+	// GetTaskForUpdate loads a task's editable state (title, description, kind, due_date,
+	// assignee, status) by its id, scoped to tenantID (barrier 1). It backs PATCH /v1/tasks/:id:
+	// the partial patch is applied over these current values. A missing id in the tenant is
+	// ErrTaskNotFound (→ 404), never (nil, nil).
+	GetTaskForUpdate(ctx context.Context, tx database.Tx, taskID, tenantID string) (*TaskForUpdate, error)
+	// UpdateTask writes the merged editable fields keyed by the task id and scoped to tenantID
+	// (barrier 1); status/source/created_by/completed_at and the context FKs are left as-is (the
+	// edit never changes the lifecycle nor re-parents). A no-match is ErrTaskNotFound. Returns
+	// the full saved task so the handler renders the response without a re-read.
+	UpdateTask(ctx context.Context, tx database.Tx, p UpdateTaskParams) (*Task, error)
+	// GetTaskForTransition re-reads a task's status by its id, scoped to tenantID (barrier 1).
+	// It backs POST /v1/tasks/:id/done | .../dismiss: the use case pre-checks the transition on
+	// this status (distinguishing a 404 miss from a 409 invalid transition). A missing id in the
+	// tenant is ErrTaskNotFound.
+	GetTaskForTransition(ctx context.Context, tx database.Tx, taskID, tenantID string) (TaskStatus, error)
+	// MarkTaskStatus flips a task from `from` to `to` keyed by its id and scoped to tenantID
+	// (barrier 1), stamping completed_at (a time for DONE, nil for DISMISSED), guarded by
+	// `status = from` so the write is safe under a racing flip. The use case pre-checks the
+	// transition; this guarded UPDATE is the concurrency floor. A no-match (already transitioned)
+	// is ErrTaskNotFound. Returns the flipped task's id.
+	MarkTaskStatus(ctx context.Context, tx database.Tx, taskID, tenantID string, from, to TaskStatus, completedAt *time.Time) (string, error)
 	// GetDeadlineForAdjust loads a prazo's FULL adjustable state (id, court_record_id,
 	// start_date, status, and the current kind/days/counting/doubled/doubled_reason) by its
 	// id, scoped to tenantID (barrier 1). It backs the ajuste manual (PATCH /v1/prazos/:id):

@@ -82,3 +82,73 @@ SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
        (d.confirmed_by IS NOT NULL) AS confirmed
 FROM deadline d
 WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid;
+
+-- ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
+-- The task agenda reads soonest-due first, but due_date is NULLABLE (an undated backlog
+-- task). Decisão travada: undated tasks sort LAST (a task with no date has no urgency, so it
+-- trails the dated ones). We model NULLS LAST as a computed sort key
+-- COALESCE(due_date, '9999-12-31') so the SAME ascending (sort_due, id) keyset the prazos
+-- reads use works unchanged (a min sentinel '0001-01-01' for the first page; the handler
+-- carries sort_due, not the raw due_date, into the next cursor). The read models expose the
+-- REAL due_date (NULL for undated) — sort_due is a query-internal keyset column.
+
+-- name: ListTasksByProcesso :many
+-- The Tasks tab of one process (GET /v1/processos/:id/tasks): the tasks anchored on the
+-- court_record, soonest due first (undated last). ALL statuses (the tab is not filtered — the
+-- FE decides what to show). @court_record_id is the court_record id; an avulsa task (NULL
+-- court_record_id) never matches, so it is absent from a process tab (correct — it hangs on no
+-- process). Scoped to tenant_id (barrier 1).
+SELECT t.id, t.title, t.description, t.kind, t.due_date,
+       COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
+       t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
+       t.court_record_id, t.completed_at
+FROM task t
+WHERE t.court_record_id = @court_record_id::uuid
+  AND t.tenant_id = @tenant_id::uuid
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > (@last_due::date, @last_id::uuid)
+ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
+LIMIT @page_limit;
+
+-- name: CountTasksByProcesso :one
+-- The "X de Y" total for the Tasks tab: how many tasks the process holds. Same tenant +
+-- court_record scoping as the list.
+SELECT count(*) FROM task t
+WHERE t.court_record_id = @court_record_id::uuid
+  AND t.tenant_id = @tenant_id::uuid;
+
+-- name: ListTasks :many
+-- The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
+-- first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
+-- assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]
+-- (NULL = open bound). The window filters on the REAL due_date, so it naturally EXCLUDES
+-- undated tasks (NULL >= date is NULL) — a dated-window query wants dated items. Ascending
+-- (sort_due, id) keyset; the first page passes the min sentinel ('0001-01-01', zero-uuid).
+SELECT t.id, t.title, t.description, t.kind, t.due_date,
+       COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
+       t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
+       t.court_record_id, t.completed_at
+FROM task t
+WHERE t.tenant_id = @tenant_id::uuid
+  AND (@status::text = '' OR t.status = @status::text)
+  AND (sqlc.narg('assignee_id')::uuid IS NULL OR t.assignee_user_id = sqlc.narg('assignee_id')::uuid)
+  AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
+  AND (@to_date::date IS NULL OR t.due_date <= @to_date::date)
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > (@last_due::date, @last_id::uuid)
+ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
+LIMIT @page_limit;
+
+-- name: CountTasks :one
+-- The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
+-- @status / @assignee_id / window. Called only when a filter is present; the unfiltered "Y"
+-- reuses CountTasksByTenant.
+SELECT count(*) FROM task t
+WHERE t.tenant_id = @tenant_id::uuid
+  AND (@status::text = '' OR t.status = @status::text)
+  AND (sqlc.narg('assignee_id')::uuid IS NULL OR t.assignee_user_id = sqlc.narg('assignee_id')::uuid)
+  AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
+  AND (@to_date::date IS NULL OR t.due_date <= @to_date::date);
+
+-- name: CountTasksByTenant :one
+-- The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
+-- any filter.
+SELECT count(*) FROM task WHERE tenant_id = @tenant_id::uuid;

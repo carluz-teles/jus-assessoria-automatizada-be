@@ -1,0 +1,331 @@
+package deadline
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/jusassessoria/platform/lib/apperr"
+)
+
+// --- CreateTask -------------------------------------------------------------
+
+// TestCreateTask_InsertsManualOpenAndEmits is the happy path for POST /v1/tasks: a manual task is
+// persisted OPEN/MANUAL/created_by=principal carrying the (optional) context ids, in a
+// tenant-scoped tx, and exactly one task.created is emitted with a parseable uuid aggregate.
+func TestCreateTask_InsertsManualOpenAndEmits(t *testing.T) {
+	tenantID := uuid.NewString()
+	userID := uuid.NewString()
+	deadlineID := uuid.NewString()
+	courtRecordID := uuid.NewString()
+	assignee := uuid.NewString()
+	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{}
+	outbox := &fakeOutbox{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, uow)
+
+	task, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: tenantID, UserID: userID,
+		CourtRecordID: courtRecordID, DeadlineID: deadlineID,
+		Title: "Peça", Kind: "PECA", Description: "minutar", DueDate: &due, AssigneeUserID: assignee,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+		t.Errorf("uow scopes = %v, want [%q]", uow.scopes, tenantID)
+	}
+	if repo.insertTaskCalls != 1 || len(repo.insertedTasks) != 1 {
+		t.Fatalf("InsertTask calls = %d, want 1", repo.insertTaskCalls)
+	}
+	saved := repo.insertedTasks[0]
+	if saved.Status != TaskStatusOpen || saved.Source != SourceManual || saved.CreatedBy != userID {
+		t.Errorf("task status/source/created_by = %q/%q/%q, want OPEN/MANUAL/%q", saved.Status, saved.Source, saved.CreatedBy, userID)
+	}
+	if saved.TenantID != tenantID || saved.DeadlineID != deadlineID || saved.CourtRecordID != courtRecordID {
+		t.Error("task context ids (tenant/deadline/court_record) not carried")
+	}
+	if saved.AssigneeUserID != assignee || saved.DueDate == nil || !saved.DueDate.Equal(due) {
+		t.Errorf("task assignee/due = %q/%v, want %q/%v", saved.AssigneeUserID, saved.DueDate, assignee, due)
+	}
+	if task.ID == "" {
+		t.Error("returned task has no id")
+	}
+
+	created := publishedOfType[TaskCreated](outbox)
+	if len(created) != 1 {
+		t.Fatalf("task.created events = %d, want 1", len(created))
+	}
+	tc := created[0]
+	if tc.Type() != TypeTaskCreated || tc.AggregateType() != aggregateTypeTask || tc.AggregateID() != task.ID {
+		t.Errorf("task.created type/aggregate = %q/%q/%q", tc.Type(), tc.AggregateType(), tc.AggregateID())
+	}
+	if _, err := uuid.Parse(tc.AggregateID()); err != nil {
+		t.Errorf("task.created aggregate is not a uuid: %v", err)
+	}
+	if tc.DeadlineID != deadlineID || tc.CourtRecordID != courtRecordID || tc.AssigneeUserID != assignee {
+		t.Errorf("task.created payload = %+v", tc)
+	}
+}
+
+// TestCreateTask_AvulsaTaskHasNoContext proves a task with no deadline/process (avulsa) inserts
+// with empty context ids and still emits task.created — the manual backlog case.
+func TestCreateTask_AvulsaTaskHasNoContext(t *testing.T) {
+	repo := &mockRepo{}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if _, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: uuid.NewString(), UserID: uuid.NewString(), Title: "Ligar para o cliente",
+	}); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	saved := repo.insertedTasks[0]
+	if saved.DeadlineID != "" || saved.CourtRecordID != "" || saved.IntimationID != "" || saved.DueDate != nil {
+		t.Errorf("avulsa task carried context = deadline %q / cr %q / intim %q / due %v, want all empty",
+			saved.DeadlineID, saved.CourtRecordID, saved.IntimationID, saved.DueDate)
+	}
+	if len(publishedOfType[TaskCreated](outbox)) != 1 {
+		t.Error("task.created not emitted for an avulsa task")
+	}
+}
+
+// --- UpdateTask -------------------------------------------------------------
+
+// TestUpdateTask_AppliesOnlyPresentFields is the core of the partial patch: a body with ONLY the
+// title leaves description/kind/due_date/assignee at their stored values, in a tenant-scoped tx,
+// and emits task.updated with a parseable uuid aggregate.
+func TestUpdateTask_AppliesOnlyPresentFields(t *testing.T) {
+	tenantID := uuid.NewString()
+	taskID := uuid.NewString()
+	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{
+		taskForUpdate: &TaskForUpdate{
+			ID: taskID, Status: TaskStatusOpen, Title: "antigo", Description: "desc", Kind: "PECA",
+			DueDate: &due, AssigneeUserID: "u-old",
+		},
+		updatedTask: &Task{ID: taskID, Title: "novo", Status: TaskStatusOpen, Source: SourceManual},
+	}
+	outbox := &fakeOutbox{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, uow)
+
+	newTitle := "novo"
+	saved, err := uc.UpdateTask(context.Background(), UpdateTaskCommand{
+		TenantID: tenantID, TaskID: taskID, Title: &newTitle, // ONLY title present
+	})
+	if err != nil {
+		t.Fatalf("UpdateTask() error = %v", err)
+	}
+	if saved.ID != taskID {
+		t.Errorf("saved.ID = %q, want %q", saved.ID, taskID)
+	}
+	if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+		t.Errorf("uow scopes = %v, want [%q]", uow.scopes, tenantID)
+	}
+	if repo.gotTaskUpdateID != taskID || repo.gotTaskUpdateTenantID != tenantID {
+		t.Errorf("GetTaskForUpdate id/tenant = %q/%q, want %q/%q", repo.gotTaskUpdateID, repo.gotTaskUpdateTenantID, taskID, tenantID)
+	}
+
+	up := repo.gotUpdateTaskParams
+	if repo.updateTaskCalls != 1 {
+		t.Fatalf("UpdateTask calls = %d, want 1", repo.updateTaskCalls)
+	}
+	if up.TaskID != taskID || up.TenantID != tenantID {
+		t.Errorf("update keyed by task/tenant = %q/%q, want %q/%q", up.TaskID, up.TenantID, taskID, tenantID)
+	}
+	if up.Title != "novo" || up.Description != "desc" || up.Kind != "PECA" || up.AssigneeUserID != "u-old" {
+		t.Errorf("merged fields = %+v, want title novo + the rest kept from storage", up)
+	}
+	if up.DueDate == nil || !up.DueDate.Equal(due) {
+		t.Errorf("merged due_date = %v, want %v (kept)", up.DueDate, due)
+	}
+
+	updated := publishedOfType[TaskUpdated](outbox)
+	if len(updated) != 1 {
+		t.Fatalf("task.updated events = %d, want 1", len(updated))
+	}
+	u := updated[0]
+	if u.Type() != TypeTaskUpdated || u.AggregateType() != aggregateTypeTask || u.AggregateID() != taskID || u.TaskID != taskID {
+		t.Errorf("task.updated type/aggregate/task = %q/%q/%q/%q", u.Type(), u.AggregateType(), u.AggregateID(), u.TaskID)
+	}
+	if _, err := uuid.Parse(u.AggregateID()); err != nil {
+		t.Errorf("task.updated aggregate is not a uuid: %v", err)
+	}
+}
+
+// TestUpdateTask_ClearsDueDateAndAssignee proves a present "" clears the optional date/assignee
+// (distinguished from an absent field, which keeps the stored value).
+func TestUpdateTask_ClearsDueDateAndAssignee(t *testing.T) {
+	taskID := uuid.NewString()
+	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	repo := &mockRepo{
+		taskForUpdate: &TaskForUpdate{ID: taskID, Status: TaskStatusOpen, Title: "t", DueDate: &due, AssigneeUserID: "u-old"},
+		updatedTask:   &Task{ID: taskID, Title: "t", Status: TaskStatusOpen},
+	}
+	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	empty := ""
+	if _, err := uc.UpdateTask(context.Background(), UpdateTaskCommand{
+		TenantID: uuid.NewString(), TaskID: taskID, DueDate: &empty, AssigneeUserID: &empty,
+	}); err != nil {
+		t.Fatalf("UpdateTask() error = %v", err)
+	}
+	up := repo.gotUpdateTaskParams
+	if up.DueDate != nil {
+		t.Errorf("due_date = %v, want nil (cleared by present \"\")", up.DueDate)
+	}
+	if up.AssigneeUserID != "" {
+		t.Errorf("assignee = %q, want \"\" (unassigned by present \"\")", up.AssigneeUserID)
+	}
+}
+
+// TestUpdateTask_NotFound proves patching an unknown/foreign task is the repo's typed
+// ErrTaskNotFound (→ 404): nothing is updated or emitted.
+func TestUpdateTask_NotFound(t *testing.T) {
+	repo := &mockRepo{taskForUpdateErr: ErrTaskNotFound}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	title := "x"
+	_, err := uc.UpdateTask(context.Background(), UpdateTaskCommand{
+		TenantID: uuid.NewString(), TaskID: uuid.NewString(), Title: &title,
+	})
+	ae, ok := apperr.From(err)
+	if !ok || ae.Kind != apperr.KindNotFound {
+		t.Errorf("error = %v, want KindNotFound", err)
+	}
+	if repo.updateTaskCalls != 0 || len(outbox.published) != 0 {
+		t.Errorf("update/published = %d/%d, want 0/0 on not-found", repo.updateTaskCalls, len(outbox.published))
+	}
+}
+
+// --- MarkTaskDone / DismissTask ---------------------------------------------
+
+// TestMarkTaskDone_OpenToDone is the happy path for concluir: a still-OPEN task flips to DONE
+// (guarded OPEN→DONE) stamping completed_at=now, and exactly one task.completed is emitted with
+// the task id as a parseable uuid aggregate.
+func TestMarkTaskDone_OpenToDone(t *testing.T) {
+	tenantID := uuid.NewString()
+	taskID := uuid.NewString()
+	now := time.Date(2024, 3, 20, 9, 30, 0, 0, time.UTC)
+	repo := &mockRepo{taskTransition: TaskStatusOpen, markTaskStatusID: taskID}
+	outbox := &fakeOutbox{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, uow, WithClock(func() time.Time { return now }))
+
+	res, err := uc.MarkTaskDone(context.Background(), tenantID, taskID)
+	if err != nil {
+		t.Fatalf("MarkTaskDone() error = %v", err)
+	}
+	if res.ID != taskID || res.Status != TaskStatusDone {
+		t.Errorf("result = %+v, want %q/DONE", res, taskID)
+	}
+	if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+		t.Errorf("uow scopes = %v, want [%q]", uow.scopes, tenantID)
+	}
+	// The flip was guarded OPEN→DONE, tenant-scoped, stamping completed_at=now.
+	if repo.markTaskStatusCalls != 1 || repo.gotMarkTaskFrom != TaskStatusOpen || repo.gotMarkTaskTo != TaskStatusDone {
+		t.Errorf("MarkTaskStatus calls/from/to = %d/%q/%q, want 1/OPEN/DONE", repo.markTaskStatusCalls, repo.gotMarkTaskFrom, repo.gotMarkTaskTo)
+	}
+	if repo.gotMarkTaskID != taskID || repo.gotMarkTaskTenantID != tenantID {
+		t.Errorf("flip id/tenant = %q/%q, want %q/%q", repo.gotMarkTaskID, repo.gotMarkTaskTenantID, taskID, tenantID)
+	}
+	if repo.gotMarkTaskCompleted == nil || !repo.gotMarkTaskCompleted.Equal(now) {
+		t.Errorf("completed_at = %v, want %v (now)", repo.gotMarkTaskCompleted, now)
+	}
+
+	completed := publishedOfType[TaskCompleted](outbox)
+	if len(completed) != 1 {
+		t.Fatalf("task.completed events = %d, want 1", len(completed))
+	}
+	c := completed[0]
+	if c.Type() != TypeTaskCompleted || c.AggregateType() != aggregateTypeTask || c.AggregateID() != taskID || c.TaskID != taskID {
+		t.Errorf("task.completed type/aggregate/task = %q/%q/%q/%q", c.Type(), c.AggregateType(), c.AggregateID(), c.TaskID)
+	}
+}
+
+// TestDismissTask_OpenToDismissed is the manual dispensar: a still-OPEN task flips to DISMISSED
+// WITHOUT stamping completed_at (dispensar is not a completion), emitting one task.dismissed.
+func TestDismissTask_OpenToDismissed(t *testing.T) {
+	tenantID := uuid.NewString()
+	taskID := uuid.NewString()
+	repo := &mockRepo{taskTransition: TaskStatusOpen, markTaskStatusID: taskID}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	res, err := uc.DismissTask(context.Background(), tenantID, taskID)
+	if err != nil {
+		t.Fatalf("DismissTask() error = %v", err)
+	}
+	if res.Status != TaskStatusDismissed {
+		t.Errorf("result status = %q, want DISMISSED", res.Status)
+	}
+	if repo.gotMarkTaskFrom != TaskStatusOpen || repo.gotMarkTaskTo != TaskStatusDismissed {
+		t.Errorf("flip from/to = %q/%q, want OPEN/DISMISSED", repo.gotMarkTaskFrom, repo.gotMarkTaskTo)
+	}
+	if repo.gotMarkTaskCompleted != nil {
+		t.Errorf("completed_at = %v, want nil (dispensar is not a completion)", repo.gotMarkTaskCompleted)
+	}
+	dismissed := publishedOfType[TaskDismissed](outbox)
+	if len(dismissed) != 1 || dismissed[0].TaskID != taskID {
+		t.Errorf("task.dismissed events = %d (task %v), want 1 for %q", len(dismissed), dismissed, taskID)
+	}
+}
+
+// TestTask_TransitionRequiresOpen proves both manual transitions are OPEN-only: from any non-OPEN
+// status they return ErrTaskNotOpen (→ 409) without flipping or emitting.
+func TestTask_TransitionRequiresOpen(t *testing.T) {
+	transitions := []struct {
+		name string
+		call func(uc *UseCase, tenantID, taskID string) (TaskTransition, error)
+	}{
+		{"done", func(uc *UseCase, tenantID, taskID string) (TaskTransition, error) {
+			return uc.MarkTaskDone(context.Background(), tenantID, taskID)
+		}},
+		{"dismiss", func(uc *UseCase, tenantID, taskID string) (TaskTransition, error) {
+			return uc.DismissTask(context.Background(), tenantID, taskID)
+		}},
+	}
+	for _, tr := range transitions {
+		for _, status := range []TaskStatus{TaskStatusDone, TaskStatusDismissed} {
+			t.Run(tr.name+"/"+string(status), func(t *testing.T) {
+				repo := &mockRepo{taskTransition: status}
+				outbox := &fakeOutbox{}
+				uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+				_, err := tr.call(uc, uuid.NewString(), uuid.NewString())
+				ae, ok := apperr.From(err)
+				if !ok || ae.Kind != apperr.KindConflict {
+					t.Errorf("error = %v, want KindConflict (not open)", err)
+				}
+				if repo.markTaskStatusCalls != 0 || len(outbox.published) != 0 {
+					t.Errorf("flip/published ran on a non-OPEN task: %d/%d", repo.markTaskStatusCalls, len(outbox.published))
+				}
+			})
+		}
+	}
+}
+
+// TestTask_TransitionNotFound proves transitioning an unknown/foreign task is the typed
+// ErrTaskNotFound (→ 404): the status re-read misses, so nothing is flipped or emitted.
+func TestTask_TransitionNotFound(t *testing.T) {
+	repo := &mockRepo{taskTransitionErr: ErrTaskNotFound}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	_, err := uc.MarkTaskDone(context.Background(), uuid.NewString(), uuid.NewString())
+	ae, ok := apperr.From(err)
+	if !ok || ae.Kind != apperr.KindNotFound {
+		t.Errorf("error = %v, want KindNotFound", err)
+	}
+	if repo.markTaskStatusCalls != 0 || len(outbox.published) != 0 {
+		t.Errorf("flip/published = %d/%d, want 0/0 on not-found", repo.markTaskStatusCalls, len(outbox.published))
+	}
+}
