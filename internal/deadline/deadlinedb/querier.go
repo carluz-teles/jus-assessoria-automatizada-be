@@ -59,6 +59,15 @@ type Querier interface {
 	// missing record → pgx.ErrNoRows → typed not-found at the mapper. court is NOT NULL.
 	// $1 = id, $2 = tenant_id, both from the trusted principal's request context.
 	GetCourtRecordCourt(ctx context.Context, arg GetCourtRecordCourtParams) (string, error)
+	// Load a prazo's FULL adjustable state — the F2 ajuste manual (§9: PATCH /v1/prazos/:id)
+	// reads it BEFORE the recompute: start_date is the fixed anchor the calendar re-counts
+	// from, court_record_id feeds the court lookup (recompute UF), and the CURRENT
+	// {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
+	// over (a field absent from the body keeps its stored value). status gates the ajuste (only
+	// a PENDING/OPEN prazo is adjustable). Keyed by id and scoped to tenant_id (barrier 1, on top
+	// of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at
+	// the mapper (→ 404), never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
+	GetDeadlineForAdjust(ctx context.Context, arg GetDeadlineForAdjustParams) (GetDeadlineForAdjustRow, error)
 	// Re-read a prazo at a scheduled mark's fire time (deadline.reminder_check): the CURRENT
 	// status the fire handler branches on, plus the end_date and the context (kind, counting,
 	// court_record_id) a lembrete or MISSED fact may carry. Keyed by id and scoped to tenant_id
@@ -115,6 +124,14 @@ type Querier interface {
 	// historic column name, migration 0006) — the read model exposes it as intimation_id.
 	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
 	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
+	// Manual lifecycle transition of a prazo (§9: POST /v1/prazos/:id/met | .../missed → marca
+	// cumprido/perdido). Flips status from current_status to new_status, keyed by id and scoped
+	// to tenant_id (barrier 1). The `status = current_status` guard makes the flip SAFE and
+	// IDEMPOTENT under concurrency: the caller pre-checks the transition (loading the prazo for a
+	// distinct not-found vs invalid-transition error), and this guard defends the write against a
+	// racing flip — a no-match (already transitioned) → pgx.ErrNoRows → typed not-found at the
+	// mapper. On a hit it returns the id so deadline.met/deadline.missed commits in the SAME tx.
+	MarkDeadlineStatus(ctx context.Context, arg MarkDeadlineStatusParams) (uuid.UUID, error)
 	// Auto-mark a prazo MISSED at the D+1 carência (deadline.missed_check fire path). Scoped to
 	// tenant_id (barrier 1). The `status = 'OPEN' AND end_date < CURRENT_DATE` guard makes the
 	// flip SAFE and IDEMPOTENT (decisão travada: MISSED auto D+1 SÓ em OPEN — nunca perder um
@@ -144,6 +161,15 @@ type Querier interface {
 	// record it hung on) so deadline.revoked commits in the SAME tx. $1 = intimation_id (the
 	// notification_id column), $2 = tenant_id, both from the trusted event payload.
 	RevokeDeadlineByIntimation(ctx context.Context, arg RevokeDeadlineByIntimationParams) (RevokeDeadlineByIntimationRow, error)
+	// Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
+	// patched {kind, days, counting, doubled, doubled_reason} and the RECOMPUTED {end_date,
+	// holidays_applied} (from the fixed start_date), keyed by id and scoped to tenant_id (barrier
+	// 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays PENDING, an
+	// OPEN stays OPEN — the use case already refused a terminal prazo); source/start_date/
+	// rules_version/confirmed_* are untouched (the anchor and provenance persist). A no-match (the
+	// row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
+	// and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
+	UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAdjustParams) (UpdateDeadlineAdjustRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

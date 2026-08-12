@@ -317,6 +317,114 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 	return &saved, nil
 }
 
+// GetDeadlineForAdjust loads a prazo's full adjustable state by its id inside the caller's
+// tx, filtered by tenantID (barrier 1) — the ajuste counterpart of GetDeadlineForConfirm. A
+// missing id — or one in another tenant — maps to the typed ErrDeadlineNotFound (never nil,
+// nil). The mapper absorbs the driver types (uuid.UUID, pgtype.Date) and lifts the nullable
+// kind/doubled_reason to "" so the use case sees a pure *DeadlineForAdjust.
+func (r *pgRepository) GetDeadlineForAdjust(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (*DeadlineForAdjust, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).GetDeadlineForAdjust(ctx, deadlinedb.GetDeadlineForAdjustParams{
+		ID:       id,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDeadlineNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &DeadlineForAdjust{
+		ID:            row.ID.String(),
+		CourtRecordID: row.CourtRecordID.String(),
+		StartDate:     row.StartDate.Time,
+		Status:        Status(row.Status),
+		Kind:          derefString(row.Kind),
+		Days:          int(row.Days),
+		Counting:      Counting(row.Counting),
+		Doubled:       row.Doubled,
+		DoubledReason: derefString(row.DoubledReason),
+	}, nil
+}
+
+// UpdateDeadlineAdjust writes the patched fields + recomputed dates inside the caller's tx,
+// keyed by the prazo id and filtered by tenantID (barrier 1). It is the ajuste counterpart of
+// ConfirmDeadline; like it, the mapper writes the recomputed date and the jsonb holidays
+// audit. A no-match (the row vanished mid-tx) yields pgx.ErrNoRows, mapped to the typed
+// ErrDeadlineNotFound. On a hit it returns the prazo id and the record it hangs on.
+func (r *pgRepository) UpdateDeadlineAdjust(ctx context.Context, tx database.Tx, p UpdateDeadlineAdjustParams) (string, string, error) {
+	id, err := parseUUID(p.DeadlineID)
+	if err != nil {
+		return "", "", err
+	}
+	tenant, err := parseUUID(p.TenantID)
+	if err != nil {
+		return "", "", err
+	}
+	holidays, err := marshalHolidays(p.HolidaysApplied)
+	if err != nil {
+		return "", "", err
+	}
+
+	row, err := deadlinedb.New(tx).UpdateDeadlineAdjust(ctx, deadlinedb.UpdateDeadlineAdjustParams{
+		ID:              id,
+		TenantID:        tenant,
+		Kind:            textToNull(p.Kind),
+		Days:            int32(p.Days),
+		Counting:        string(p.Counting),
+		Doubled:         p.Doubled,
+		DoubledReason:   textToNull(p.DoubledReason),
+		EndDate:         pgDate(p.EndDate),
+		HolidaysApplied: holidays,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrDeadlineNotFound
+	}
+	if err != nil {
+		return "", "", database.WrapInfra(err)
+	}
+	return row.ID.String(), row.CourtRecordID.String(), nil
+}
+
+// MarkDeadlineStatus flips the prazo from `from` to `to` inside the caller's tx, keyed by its
+// id and filtered by tenantID (barrier 1). The query's `status = from` guard defends the
+// write against a racing flip: a no-match (already transitioned) yields pgx.ErrNoRows, mapped
+// to the typed ErrDeadlineNotFound. On a hit it returns the flipped prazo's id so
+// deadline.met/deadline.missed commits in the same tx.
+func (r *pgRepository) MarkDeadlineStatus(ctx context.Context, tx database.Tx, deadlineID, tenantID string, from, to Status) (string, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	flipped, err := deadlinedb.New(tx).MarkDeadlineStatus(ctx, deadlinedb.MarkDeadlineStatusParams{
+		NewStatus:     string(to),
+		ID:            id,
+		TenantID:      tenant,
+		CurrentStatus: string(from),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrDeadlineNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return flipped.String(), nil
+}
+
 // GetDeadlineForCheck re-reads the prazo by id inside the caller's tx, filtered by tenantID
 // (barrier 1). A missing id — or one in another tenant — maps to the typed
 // ErrDeadlineNotFound (never nil, nil); a NULL kind returns "". The mapper absorbs the

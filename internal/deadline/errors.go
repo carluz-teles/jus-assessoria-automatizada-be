@@ -26,4 +26,16 @@ var (
 	// (GET /v1/prazos/:id). Typed not-found (→ 404 at the edge), never (nil, nil): a
 	// foreign or unknown id is a client-facing miss, not a swallowed empty result.
 	ErrDeadlineNotFound = apperr.NewNotFound("deadline not found")
+
+	// ErrDeadlineNotAdjustable — a PATCH /v1/prazos/:id ajuste on a prazo that is not in an
+	// active state. Only a PENDING (suggestion) or OPEN (confirmed) prazo may be recalculated;
+	// a MET/MISSED/CANCELLED prazo is closed and its dates are frozen. It is a CONFLICT (→ 409),
+	// a distinct signal from the 404 miss — the prazo exists, but its state forbids the ajuste.
+	ErrDeadlineNotAdjustable = apperr.NewConflict("deadline is not adjustable: only a PENDING or OPEN prazo can be adjusted")
+
+	// ErrDeadlineNotOpen — a POST /v1/prazos/:id/met | .../missed transition requested on a
+	// prazo that is not OPEN. Marking cumprido/perdido leaves OPEN only: a PENDING suggestion
+	// must be confirmed first, and a terminal prazo cannot transition again. CONFLICT (→ 409),
+	// distinct from the 404 miss — the prazo exists, but its current status forbids the flip.
+	ErrDeadlineNotOpen = apperr.NewConflict("deadline transition requires an OPEN prazo")
 )
