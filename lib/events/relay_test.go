@@ -188,9 +188,15 @@ func TestQueueFor(t *testing.T) {
 		want string
 	}{
 		{"ingestao.movimento.observed", "ingestao"},
-		{"acquisition.integration_activated", "ingestao"},
-		{"acquisition.court_record_observed", "ingestao"},
-		{"acquisition.diario_requested", "diario"}, // dedicated serialized queue, not "ingestao"
+		{"acquisition.integration_activated", "ingestao"}, // regression: stays on "ingestao"
+		{"acquisition.court_record_observed", "ingestao"}, // regression: enrichment stays on "ingestao"
+		{"acquisition.sync_requested", "ingestao"},        // regression: the work event stays on "ingestao"
+		{"acquisition.diario_requested", "diario"},        // dedicated serialized queue, not "ingestao"
+		// The backfill completion counter gets its OWN light queue, drained by a separate
+		// server, so sync_completed/failed finalize the job without waiting behind the
+		// enrichment flood on "ingestao".
+		{"acquisition.sync_completed", "sync_status"},
+		{"acquisition.sync_failed", "sync_status"},
 		{"documents.file.extracted", "documents"},
 		{"ai.revisao.requested", "ai"},
 		{"notification.requested", "notifications"},
