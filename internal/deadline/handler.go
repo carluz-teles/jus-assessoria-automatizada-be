@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
@@ -23,6 +24,8 @@ type reader interface {
 	PrazosByProcesso(ctx context.Context, q PrazosByProcessoQuery) (PrazosByProcessoResult, error)
 	Prazos(ctx context.Context, q PrazosQuery) (PrazosResult, error)
 	Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
+	TasksByProcesso(ctx context.Context, q TasksByProcessoQuery) (TasksByProcessoResult, error)
+	Tasks(ctx context.Context, q TasksQuery) (TasksResult, error)
 }
 
 // writer is the narrow port the Handler uses from the write use case — the F2 confirmation
@@ -34,6 +37,10 @@ type writer interface {
 	Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadline, error)
 	MarkMet(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
 	MarkMissed(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
+	CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task, error)
+	UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task, error)
+	MarkTaskDone(ctx context.Context, tenantID, taskID string) (TaskTransition, error)
+	DismissTask(ctx context.Context, tenantID, taskID string) (TaskTransition, error)
 }
 
 // Handler is the deadline HTTP surface. It owns its routing; the api only composes by
@@ -63,6 +70,12 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Patch("/prazos/:id", h.adjustPrazo)
 	r.Post("/prazos/:id/met", h.markPrazoMet)
 	r.Post("/prazos/:id/missed", h.markPrazoMissed)
+	r.Get("/processos/:id/tasks", h.listTasksByProcesso)
+	r.Get("/tasks", h.listTasks)
+	r.Post("/tasks", h.createTask)
+	r.Patch("/tasks/:id", h.updateTask)
+	r.Post("/tasks/:id/done", h.markTaskDone)
+	r.Post("/tasks/:id/dismiss", h.dismissTask)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending scan (soonest vencimento
@@ -236,6 +249,152 @@ func (h *Handler) markPrazoMissed(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(newMarkResponse(res))
 }
 
+// listTasksByProcesso handles GET /v1/processos/:id/tasks: one process's Tasks tab — its tasks
+// ordered by due_date (soonest first, undated last), keyset paginated (?limit, ?cursor). The :id
+// is the court_record id; tenant_id comes from the principal, so a foreign :id yields an empty
+// page. The cursor's sort value is the coalesced due_date, so the first page starts at the min
+// sentinel.
+func (h *Handler) listTasksByProcesso(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	lastDue, lastID := minDate, zeroUUID
+	if tok := c.Query("cursor"); tok != "" {
+		cur, err := httpx.DecodeCursor(tok)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		lastDue, lastID = cur.LastSortValue, cur.LastID
+	}
+
+	res, err := h.reader.TasksByProcesso(c.UserContext(), TasksByProcessoQuery{
+		TenantID: tenantID, CourtRecordID: c.Params("id"),
+		LastDue: lastDue, LastID: lastID, Limit: limit,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newTasksByProcessoPage(res, limit))
+}
+
+// listTasks handles GET /v1/tasks: the tenant's task agenda ("meus prazos") — every task ordered
+// by due_date (soonest first, undated last), keyset paginated, optionally filtered by ?status (a
+// closed set), ?assignee (a user id, or the sentinel "me" → the principal's own id) and a
+// due_date window ?from/?to. A bad status/date/assignee is a client error → 400.
+func (h *Handler) listTasks(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	status := c.Query("status")
+	if status != "" && !isKnownTaskStatus(status) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid status filter"))
+	}
+	assignee, err := resolveAssignee(c.Query("assignee"), p.UserID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	from, err := validateOptionalDate(c.Query("from"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	to, err := validateOptionalDate(c.Query("to"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	lastDue, lastID := minDate, zeroUUID
+	if tok := c.Query("cursor"); tok != "" {
+		cur, err := httpx.DecodeCursor(tok)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		lastDue, lastID = cur.LastSortValue, cur.LastID
+	}
+
+	res, err := h.reader.Tasks(c.UserContext(), TasksQuery{
+		TenantID: tenantID, Status: status, Assignee: assignee, From: from, To: to,
+		LastDue: lastDue, LastID: lastID, Limit: limit,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newTasksPage(res, limit))
+}
+
+// createTask handles POST /v1/tasks: create a manual task (§9). It validates the body, then
+// persists the task (OPEN, MANUAL, created_by=principal) and emits task.created in one tx,
+// returning 201 with the created task. tenant_id and created_by come from the verified principal,
+// never the body. A bad body is a 400 with the {kind,message,details} envelope.
+func (h *Handler) createTask(c *fiber.Ctx) error {
+	var req CreateTaskRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	task, err := h.writer.CreateTask(c.UserContext(), req.toCommand(p.TenantID, p.UserID))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(newTaskViewFromEntity(task))
+}
+
+// updateTask handles PATCH /v1/tasks/:id: edit a task's fields (§9). It validates the partial
+// body, then merges + updates the task in one tx, returning 200 with the saved task. tenant_id
+// comes from the principal and the task id from the path (never the body). A miss is the use
+// case's typed ErrTaskNotFound → 404; a bad body is a 400.
+func (h *Handler) updateTask(c *fiber.Ctx) error {
+	var req UpdateTaskRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	task, err := h.writer.UpdateTask(c.UserContext(), req.toUpdateCommand(tenantID, c.Params("id")))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newTaskViewFromEntity(task))
+}
+
+// markTaskDone handles POST /v1/tasks/:id/done: concluir a tarefa (§9), OPEN→DONE stamping
+// completed_at. No body — the task id comes from the path and tenant_id from the principal. A
+// miss is ErrTaskNotFound → 404; a non-OPEN task is ErrTaskNotOpen → 409.
+func (h *Handler) markTaskDone(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	res, err := h.writer.MarkTaskDone(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newTaskTransitionResponse(res))
+}
+
+// dismissTask handles POST /v1/tasks/:id/dismiss: dispensar a tarefa (§9), OPEN→DISMISSED. Same
+// path/tenant/guards as markTaskDone; completed_at is left NULL (dispensar is not a completion).
+func (h *Handler) dismissTask(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	res, err := h.writer.DismissTask(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newTaskTransitionResponse(res))
+}
+
 // isKnownStatus reports whether s is a member of the closed prazo status set (the DB
 // CHECK enforces the same set). An unknown ?status is rejected at the edge rather than
 // silently returning an empty page.
@@ -245,6 +404,36 @@ func isKnownStatus(s string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// isKnownTaskStatus reports whether s is a member of the closed task status set (the DB CHECK
+// enforces the same set). An unknown ?status is rejected at the edge rather than silently
+// returning an empty page.
+func isKnownTaskStatus(s string) bool {
+	switch TaskStatus(s) {
+	case TaskStatusOpen, TaskStatusDone, TaskStatusDismissed:
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveAssignee turns the ?assignee filter into the value the read model filters on: "" is no
+// filter, the sentinel "me" resolves to the principal's own id (the "meus prazos" shortcut), and
+// any other value must be a well-formed uuid (a client error → 400 otherwise). It returns the
+// value verbatim (or the resolved principal id) so the repo re-parses it once.
+func resolveAssignee(assignee, principalUserID string) (string, error) {
+	switch assignee {
+	case "":
+		return "", nil
+	case "me":
+		return principalUserID, nil
+	default:
+		if _, err := uuid.Parse(assignee); err != nil {
+			return "", apperr.NewInvalid("invalid assignee filter (want a user id or \"me\")")
+		}
+		return assignee, nil
 	}
 }
 
@@ -394,6 +583,59 @@ type markResponse struct {
 // newMarkResponse maps the use case's MarkedDeadline to the client-facing payload.
 func newMarkResponse(d MarkedDeadline) markResponse {
 	return markResponse{DeadlineID: d.ID, Status: string(d.Status)}
+}
+
+// taskTransitionResponse is the POST /v1/tasks/:id/done | .../dismiss payload: the transitioned
+// task id and its new status (DONE / DISMISSED) — the minimal fact the FE needs to reflect the
+// flip. It mirrors markResponse (the prazo transitions).
+type taskTransitionResponse struct {
+	TaskID string `json:"task_id"`
+	Status string `json:"status"`
+}
+
+// newTaskTransitionResponse maps the use case's TaskTransition to the client-facing payload.
+func newTaskTransitionResponse(t TaskTransition) taskTransitionResponse {
+	return taskTransitionResponse{TaskID: t.ID, Status: string(t.Status)}
+}
+
+// newTasksByProcessoPage wraps the Tasks-tab read model in the cursor envelope; the next cursor
+// keys off the last row's (sort_due, id) — sort_due is the coalesced due_date, so an undated
+// task's cursor keys off the '9999-12-31' sentinel and the scan resumes correctly. No filter on
+// the tab, so the "X de Y" totals coincide.
+func newTasksByProcessoPage(res TasksByProcessoResult, limit int) httpx.Page[TaskView] {
+	items := res.Items
+	if items == nil {
+		items = []TaskView{}
+	}
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.Total, Total: res.Total}
+	if res.HasMore && len(items) > 0 {
+		last := items[len(items)-1]
+		tok := httpx.EncodeCursor(httpx.Cursor{
+			LastID:        last.ID,
+			LastSortValue: last.sortDue.Format(time.DateOnly),
+		})
+		meta.NextCursor = &tok
+	}
+	return httpx.Page[TaskView]{Data: items, Page: meta}
+}
+
+// newTasksPage wraps the task agenda read model in the cursor envelope; the next cursor keys off
+// the last row's (sort_due, id) and the totals carry "X de Y" (filtered vs tenant-wide).
+func newTasksPage(res TasksResult, limit int) httpx.Page[TaskView] {
+	items := res.Items
+	if items == nil {
+		items = []TaskView{}
+	}
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.TotalCount, Total: res.Total}
+	if res.HasMore && len(items) > 0 {
+		last := items[len(items)-1]
+		tok := httpx.EncodeCursor(httpx.Cursor{
+			LastID:        last.ID,
+			LastSortValue: last.sortDue.Format(time.DateOnly),
+		})
+		meta.NextCursor = &tok
+	}
+	return httpx.Page[TaskView]{Data: items, Page: meta}
 }
 
 // formatDates renders the holidays audit as wire dates (2006-01-02), always a non-nil

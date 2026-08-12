@@ -122,6 +122,60 @@ INSERT INTO task (
 )
 RETURNING id;
 
+-- name: GetTaskForUpdate :one
+-- Load a task's editable state — the manual ajuste (§9: PATCH /v1/tasks/:id) reads it BEFORE
+-- the merge so an absent body field keeps its stored value (a partial patch, not a full
+-- replace). Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A
+-- missing id in the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper (→ 404),
+-- never (nil, nil). $1 = id, $2 = tenant_id (from the principal). status is carried for the
+-- caller even though PATCH never changes it (edit is orthogonal to the lifecycle).
+SELECT id, status, title, description, kind, due_date, assignee_user_id
+FROM task
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: UpdateTask :one
+-- Manual ajuste of a task (§9: PATCH /v1/tasks/:id → editar tarefa). Writes the merged
+-- {title, description, kind, due_date, assignee_user_id} (already merged over the stored
+-- values by the use case), keyed by id and scoped to tenant_id (barrier 1). status/source/
+-- created_by/completed_at and the context FKs are LEFT AS-IS: the edit never changes the
+-- lifecycle nor re-parents the task. A no-match (the row vanished mid-tx) → pgx.ErrNoRows →
+-- ErrTaskNotFound at the mapper. Returns the full task row so the response renders without a
+-- re-read. $1 = id, $2 = tenant_id, then the patched fields.
+UPDATE task
+SET title            = $3,
+    description      = $4,
+    kind             = $5,
+    due_date         = $6,
+    assignee_user_id = $7
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, court_record_id, deadline_id, intimation_id,
+          title, description, kind, due_date, status, source, assignee_user_id,
+          created_by, completed_at;
+
+-- name: GetTaskForTransition :one
+-- Re-read a task's CURRENT status before a manual transition (§9: POST /v1/tasks/:id/done |
+-- .../dismiss). Keyed by id and scoped to tenant_id (barrier 1). The use case pre-checks the
+-- transition on this status so it can distinguish a 404 miss (ErrTaskNotFound) from a 409
+-- invalid transition (ErrTaskNotOpen), mirroring the deadline met/missed path. A missing id in
+-- the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper. $1 = id, $2 = tenant_id.
+SELECT id, status
+FROM task
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: MarkTaskStatus :one
+-- Manual lifecycle transition of a task (§9: POST /v1/tasks/:id/done → OPEN→DONE stamping
+-- completed_at; .../dismiss → OPEN→DISMISSED, completed_at NULL). Flips status from
+-- current_status to new_status and sets completed_at (the caller passes now() for done, NULL
+-- for dismiss), keyed by id and scoped to tenant_id (barrier 1). The `status = current_status`
+-- guard makes the flip SAFE and IDEMPOTENT under concurrency — the caller pre-checks the
+-- transition, and this guard defends the write against a racing flip; a no-match (already
+-- transitioned) → pgx.ErrNoRows → typed not-found at the mapper. On a hit it returns the id so
+-- task.completed/task.dismissed commits in the SAME tx.
+UPDATE task
+SET status = sqlc.arg(new_status), completed_at = sqlc.arg(completed_at)
+WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id) AND status = sqlc.arg(current_status)
+RETURNING id;
+
 -- name: DeleteTasksByDeadline :exec
 -- Drop every task of a confirmed prazo, the REPLACE step of the F2 confirm (§9: the
 -- confirm is an "upsert idempotente por intimation_id"). Confirm runs this in the SAME tx

@@ -245,6 +245,196 @@ func (r *pgReadRepository) GetPrazo(ctx context.Context, tenantID, id string) (P
 	}, nil
 }
 
+// ListTasksByProcesso reads one process's tasks (ascending keyset by the coalesced due_date,
+// soonest first / undated last) on the pool, filtered by tenant_id and court_record_id. The
+// caller passes the min sentinel cursor for the first page.
+func (r *pgReadRepository) ListTasksByProcesso(ctx context.Context, q TasksByProcessoQuery) ([]TaskView, error) {
+	tid, err := parseUUID(q.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	crid, err := parseUUID(q.CourtRecordID)
+	if err != nil {
+		return nil, err
+	}
+	lastID, err := parseUUID(q.LastID)
+	if err != nil {
+		return nil, err
+	}
+	lastDue, err := keysetDate(q.LastDue)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.q.ListTasksByProcesso(ctx, deadlinedb.ListTasksByProcessoParams{
+		CourtRecordID: crid,
+		TenantID:      tid,
+		LastDue:       lastDue,
+		LastID:        lastID,
+		PageLimit:     int32(q.Limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]TaskView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, TaskView{
+			ID:             row.ID.String(),
+			Title:          row.Title,
+			Description:    derefString(row.Description),
+			Kind:           derefString(row.Kind),
+			DueDate:        datePtr(row.DueDate),
+			Status:         row.Status,
+			Source:         row.Source,
+			AssigneeUserID: uuidText(row.AssigneeUserID),
+			DeadlineID:     uuidText(row.DeadlineID),
+			IntimationID:   uuidText(row.IntimationID),
+			CourtRecordID:  uuidText(row.CourtRecordID),
+			CompletedAt:    timestampPtr(row.CompletedAt),
+			sortDue:        row.SortDue.Time,
+		})
+	}
+	return out, nil
+}
+
+// CountTasksByProcesso returns the "X de Y" total for the Tasks tab, scoped by the same tenant +
+// court_record as the list.
+func (r *pgReadRepository) CountTasksByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return 0, err
+	}
+	crid, err := parseUUID(courtRecordID)
+	if err != nil {
+		return 0, err
+	}
+	total, err := r.q.CountTasksByProcesso(ctx, deadlinedb.CountTasksByProcessoParams{
+		CourtRecordID: crid,
+		TenantID:      tid,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return total, nil
+}
+
+// ListTasks reads the tenant's task agenda (ascending keyset by the coalesced due_date) on the
+// pool, with the optional status/assignee/window filters applied.
+func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskView, error) {
+	tid, err := parseUUID(q.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	lastID, err := parseUUID(q.LastID)
+	if err != nil {
+		return nil, err
+	}
+	lastDue, err := keysetDate(q.LastDue)
+	if err != nil {
+		return nil, err
+	}
+	from, err := optionalFilterDate(q.From)
+	if err != nil {
+		return nil, err
+	}
+	to, err := optionalFilterDate(q.To)
+	if err != nil {
+		return nil, err
+	}
+	assignee, err := optionalFilterUUID(q.Assignee)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.q.ListTasks(ctx, deadlinedb.ListTasksParams{
+		TenantID:   tid,
+		Status:     q.Status,
+		AssigneeID: assignee,
+		FromDate:   from,
+		ToDate:     to,
+		LastDue:    lastDue,
+		LastID:     lastID,
+		PageLimit:  int32(q.Limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]TaskView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, TaskView{
+			ID:             row.ID.String(),
+			Title:          row.Title,
+			Description:    derefString(row.Description),
+			Kind:           derefString(row.Kind),
+			DueDate:        datePtr(row.DueDate),
+			Status:         row.Status,
+			Source:         row.Source,
+			AssigneeUserID: uuidText(row.AssigneeUserID),
+			DeadlineID:     uuidText(row.DeadlineID),
+			IntimationID:   uuidText(row.IntimationID),
+			CourtRecordID:  uuidText(row.CourtRecordID),
+			CompletedAt:    timestampPtr(row.CompletedAt),
+			sortDue:        row.SortDue.Time,
+		})
+	}
+	return out, nil
+}
+
+// CountTasks returns the task agenda's "X de Y": the filtered count (Status/Assignee/window) and
+// the tenant-wide count. When no filter is active the two coincide, so a single tenant COUNT
+// fills both (mirrors CountPrazos) — one query instead of two.
+func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64, int64, error) {
+	tid, err := parseUUID(q.TenantID)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	total, err := r.q.CountTasksByTenant(ctx, tid)
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+
+	if q.Status == "" && q.Assignee == "" && q.From == "" && q.To == "" {
+		return total, total, nil
+	}
+
+	from, err := optionalFilterDate(q.From)
+	if err != nil {
+		return 0, 0, err
+	}
+	to, err := optionalFilterDate(q.To)
+	if err != nil {
+		return 0, 0, err
+	}
+	assignee, err := optionalFilterUUID(q.Assignee)
+	if err != nil {
+		return 0, 0, err
+	}
+	totalCount, err := r.q.CountTasks(ctx, deadlinedb.CountTasksParams{
+		TenantID:   tid,
+		Status:     q.Status,
+		AssigneeID: assignee,
+		FromDate:   from,
+		ToDate:     to,
+	})
+	if err != nil {
+		return 0, 0, database.WrapInfra(err)
+	}
+	return totalCount, total, nil
+}
+
+// optionalFilterUUID parses an optional assignee filter: "" is no filter (a NULL pgtype.UUID the
+// query reads as "any assignee"). A non-empty value is validated at the handler, so reaching
+// here with a malformed one is an infra fault.
+func optionalFilterUUID(s string) (pgtype.UUID, error) {
+	if s == "" {
+		return pgtype.UUID{}, nil
+	}
+	return pgUUID(s)
+}
+
 // holidaysFromJSON decodes the holidays_applied jsonb (an array of "2006-01-02" strings)
 // into the read model's []string. The column is NOT NULL DEFAULT '[]', so it is always
 // valid JSON; the slice is initialized so an empty audit serializes as [], never null.

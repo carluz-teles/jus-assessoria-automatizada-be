@@ -3,6 +3,7 @@ package deadline
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -263,25 +264,26 @@ func (r *pgRepository) DeleteTasksByDeadline(ctx context.Context, tx database.Tx
 	return nil
 }
 
-// InsertTask persists one F2 task inside the caller's tx and returns it with its
-// DB-assigned id (echoing the entity, like InsertDeadline). tenant_id is NOT NULL; the
-// context FKs (court_record_id/deadline_id/intimation_id/created_by) are always filled by
-// confirm but map to nullable columns, so the mapper lifts them to pgtype.UUID;
-// assignee_user_id/due_date/description/kind are optional (NULL when absent).
+// InsertTask persists one task inside the caller's tx and returns it with its DB-assigned id
+// (echoing the entity, like InsertDeadline). tenant_id is NOT NULL; the context FKs
+// (court_record_id/deadline_id/intimation_id) map to NULLABLE columns and are OPTIONAL — the F2
+// confirm always fills them (the prazo's context), but a manual avulsa task (POST /v1/tasks) may
+// leave them empty, so the mapper lifts each via pgOptionalUUID ("" → NULL). created_by is
+// always the principal on both paths; assignee_user_id/due_date/description/kind are optional too.
 func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) (*Task, error) {
 	tenant, err := parseUUID(t.TenantID)
 	if err != nil {
 		return nil, err
 	}
-	courtRecordID, err := pgUUID(t.CourtRecordID)
+	courtRecordID, err := pgOptionalUUID(t.CourtRecordID)
 	if err != nil {
 		return nil, err
 	}
-	deadlineID, err := pgUUID(t.DeadlineID)
+	deadlineID, err := pgOptionalUUID(t.DeadlineID)
 	if err != nil {
 		return nil, err
 	}
-	intimationID, err := pgUUID(t.IntimationID)
+	intimationID, err := pgOptionalUUID(t.IntimationID)
 	if err != nil {
 		return nil, err
 	}
@@ -315,6 +317,148 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 	saved := *t
 	saved.ID = id.String()
 	return &saved, nil
+}
+
+// GetTaskForUpdate loads a task's editable state by its id inside the caller's tx, filtered
+// by tenantID (barrier 1) — the PATCH /v1/tasks/:id counterpart of GetDeadlineForAdjust. A
+// missing id — or one in another tenant — maps to the typed ErrTaskNotFound (never nil, nil).
+// The mapper absorbs the driver types (pgtype.Date, pgtype.UUID) and lifts the nullable
+// description/kind/assignee to ""/nil so the use case merges over a pure *TaskForUpdate.
+func (r *pgRepository) GetTaskForUpdate(ctx context.Context, tx database.Tx, taskID, tenantID string) (*TaskForUpdate, error) {
+	id, err := parseUUID(taskID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).GetTaskForUpdate(ctx, deadlinedb.GetTaskForUpdateParams{ID: id, TenantID: tenant})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &TaskForUpdate{
+		ID:             row.ID.String(),
+		Status:         TaskStatus(row.Status),
+		Title:          row.Title,
+		Description:    derefString(row.Description),
+		Kind:           derefString(row.Kind),
+		DueDate:        datePtr(row.DueDate),
+		AssigneeUserID: uuidText(row.AssigneeUserID),
+	}, nil
+}
+
+// UpdateTask writes the merged {title, description, kind, due_date, assignee_user_id} inside
+// the caller's tx, keyed by the task id and filtered by tenantID (barrier 1). It is the ajuste
+// counterpart of ConfirmDeadline. A no-match (the row vanished mid-tx) yields pgx.ErrNoRows,
+// mapped to the typed ErrTaskNotFound. On a hit it returns the full saved task (from RETURNING)
+// so the handler renders the response without a re-read; the mapper absorbs the driver types.
+func (r *pgRepository) UpdateTask(ctx context.Context, tx database.Tx, p UpdateTaskParams) (*Task, error) {
+	id, err := parseUUID(p.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	assignee, err := pgOptionalUUID(p.AssigneeUserID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).UpdateTask(ctx, deadlinedb.UpdateTaskParams{
+		ID:             id,
+		TenantID:       tenant,
+		Title:          p.Title,
+		Description:    textToNull(p.Description),
+		Kind:           textToNull(p.Kind),
+		DueDate:        pgOptionalDate(p.DueDate),
+		AssigneeUserID: assignee,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &Task{
+		ID:             row.ID.String(),
+		TenantID:       row.TenantID.String(),
+		CourtRecordID:  uuidText(row.CourtRecordID),
+		DeadlineID:     uuidText(row.DeadlineID),
+		IntimationID:   uuidText(row.IntimationID),
+		Title:          row.Title,
+		Description:    derefString(row.Description),
+		Kind:           derefString(row.Kind),
+		DueDate:        datePtr(row.DueDate),
+		Status:         TaskStatus(row.Status),
+		Source:         Source(row.Source),
+		AssigneeUserID: uuidText(row.AssigneeUserID),
+		CreatedBy:      uuidText(row.CreatedBy),
+		CompletedAt:    timestampPtr(row.CompletedAt),
+	}, nil
+}
+
+// GetTaskForTransition re-reads a task's current status by its id inside the caller's tx,
+// filtered by tenantID (barrier 1) — the done/dismiss counterpart of GetDeadlineForCheck. A
+// missing id — or one in another tenant — maps to the typed ErrTaskNotFound. The status lets
+// the use case distinguish a 404 miss from a 409 invalid transition before the guarded flip.
+func (r *pgRepository) GetTaskForTransition(ctx context.Context, tx database.Tx, taskID, tenantID string) (TaskStatus, error) {
+	id, err := parseUUID(taskID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	row, err := deadlinedb.New(tx).GetTaskForTransition(ctx, deadlinedb.GetTaskForTransitionParams{ID: id, TenantID: tenant})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrTaskNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return TaskStatus(row.Status), nil
+}
+
+// MarkTaskStatus flips the task from `from` to `to` inside the caller's tx, keyed by its id and
+// filtered by tenantID (barrier 1), stamping completed_at (a real time for DONE, NULL for
+// DISMISSED). The query's `status = from` guard defends the write against a racing flip: a
+// no-match (already transitioned) yields pgx.ErrNoRows, mapped to the typed ErrTaskNotFound. On
+// a hit it returns the flipped task's id so task.completed/task.dismissed commits in the same tx.
+func (r *pgRepository) MarkTaskStatus(ctx context.Context, tx database.Tx, taskID, tenantID string, from, to TaskStatus, completedAt *time.Time) (string, error) {
+	id, err := parseUUID(taskID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	flipped, err := deadlinedb.New(tx).MarkTaskStatus(ctx, deadlinedb.MarkTaskStatusParams{
+		NewStatus:     string(to),
+		CompletedAt:   pgOptionalTimestamptz(completedAt),
+		ID:            id,
+		TenantID:      tenant,
+		CurrentStatus: string(from),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrTaskNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return flipped.String(), nil
 }
 
 // GetDeadlineForAdjust loads a prazo's full adjustable state by its id inside the caller's

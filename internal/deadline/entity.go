@@ -74,11 +74,13 @@ const (
 	SourceManual Source = "MANUAL"
 )
 
-// Task is one actionable work item of the F2 confirmation — the checklist of steps
-// toward the legal prazo (docs/erd-prazos.md §4/§10). 1 legal prazo (Deadline) → N
-// tasks; the assignee lives on the task, not the prazo (the prazo is the fact, the task
-// is who does it). At this slice tasks are only ever BORN at confirmation: status OPEN,
-// source MANUAL. entity.go holds only the aggregate + value types (no repo/lib import).
+// Task is one actionable work item (docs/erd-prazos.md §4/§10) — the checklist of steps
+// toward the legal prazo. 1 legal prazo (Deadline) → N tasks; a task can also be avulsa
+// (POST /v1/tasks, no deadline). The assignee lives on the task, not the prazo (the prazo
+// is the fact, the task is who does it). Tasks are BORN OPEN (at F2 confirmation or via the
+// manual CREATE) and move OPEN→DONE / OPEN→DISMISSED via the task write path (5b); the
+// creation source is MANUAL here (RULE/AI are later slices). entity.go holds only the
+// aggregate + value types (no repo/lib import).
 type Task struct {
 	ID             string
 	TenantID       string
@@ -93,10 +95,12 @@ type Task struct {
 	Source         Source
 	AssigneeUserID string // optional responsável ("meus prazos")
 	CreatedBy      string
+	CompletedAt    *time.Time // stamped when the task is marked DONE; NULL while OPEN/DISMISSED
 }
 
 // TaskStatus is the task lifecycle, a closed set the DB CHECK (0024) also enforces. A
-// task is born OPEN; DONE/DISMISSED transitions are a later slice (task CRUD, 5b).
+// task is born OPEN; the OPEN→DONE / OPEN→DISMISSED transitions are the task write path
+// (5b, POST /v1/tasks/:id/done | .../dismiss).
 type TaskStatus string
 
 const (

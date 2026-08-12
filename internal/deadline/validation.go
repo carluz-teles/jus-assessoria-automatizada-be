@@ -150,6 +150,147 @@ func (r AdjustRequest) toAdjustCommand(tenantID, userID, deadlineID string) Adju
 	return cmd
 }
 
+// CreateTaskRequest is the POST /v1/tasks body (docs/erd-prazos.md §9): a manual task. Title is
+// required; the context FKs (court_record_id, deadline_id, intimation_id) and the assignee are
+// optional (a task can be avulsa / unassigned) but must be well-formed uuids when present.
+// tenant_id / created_by come from the verified principal; status/source are server-set
+// (OPEN/MANUAL), so they are not accepted from the body.
+type CreateTaskRequest struct {
+	CourtRecordID  string `json:"court_record_id"`
+	DeadlineID     string `json:"deadline_id"`
+	IntimationID   string `json:"intimation_id"`
+	Title          string `json:"title"`
+	Description    string `json:"description"`
+	Kind           string `json:"kind"`
+	DueDate        string `json:"due_date"`
+	AssigneeUserID string `json:"assignee_user_id"`
+}
+
+// Validate enforces the edge rules: a non-empty title, a well-formed optional due_date (empty is
+// allowed — a task may be undated), and well-formed optional uuids for the context FKs + assignee
+// (empty = absent). A failure is a 400 at the edge (KindInvalid) via httpx.WriteValidationError.
+func (r CreateTaskRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Title, validation.Required),
+		validation.Field(&r.DueDate, validation.Date(time.DateOnly)),
+		validation.Field(&r.CourtRecordID, validation.By(uuidIfPresent)),
+		validation.Field(&r.DeadlineID, validation.By(uuidIfPresent)),
+		validation.Field(&r.IntimationID, validation.By(uuidIfPresent)),
+		validation.Field(&r.AssigneeUserID, validation.By(uuidIfPresent)),
+	)
+}
+
+// toCommand maps the validated request + the principal's ids into the use-case command.
+// TenantID and UserID come from the principal (never the body); the wire due_date is parsed here
+// (Validate guaranteed the format) into an optional time.
+func (r CreateTaskRequest) toCommand(tenantID, userID string) CreateTaskCommand {
+	return CreateTaskCommand{
+		TenantID:       tenantID,
+		UserID:         userID,
+		CourtRecordID:  r.CourtRecordID,
+		DeadlineID:     r.DeadlineID,
+		IntimationID:   r.IntimationID,
+		Title:          r.Title,
+		Description:    r.Description,
+		Kind:           r.Kind,
+		DueDate:        parseOptionalWireDate(r.DueDate),
+		AssigneeUserID: r.AssigneeUserID,
+	}
+}
+
+// UpdateTaskRequest is the PATCH /v1/tasks/:id body (docs/erd-prazos.md §9): the partial ajuste
+// of a task. Every field is a POINTER so an ABSENT field (kept at its stored value) is
+// distinguishable from a present value — a partial patch, not a full replace. A present due_date
+// of "" clears the date; a present assignee of "" unassigns. tenant_id / the task id come from
+// the principal + path, never the body; status is changed only via done/dismiss.
+type UpdateTaskRequest struct {
+	Title          *string `json:"title"`
+	Description    *string `json:"description"`
+	Kind           *string `json:"kind"`
+	DueDate        *string `json:"due_date"`
+	AssigneeUserID *string `json:"assignee_user_id"`
+}
+
+// Validate enforces the edge rules for the fields that ARE present (a nil field is a no-op): a
+// present title must be non-empty, a present due_date must be a wire date or "" (clear), and a
+// present assignee must be a uuid or "" (unassign). The rules are custom (validation.By) rather
+// than ozzo's built-ins because those skip a nil pointer AND a present zero — here a PRESENT
+// title must not be blank.
+func (r UpdateTaskRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Title, validation.By(nonEmptyIfPresent)),
+		validation.Field(&r.DueDate, validation.By(wireDateOrClearIfPresent)),
+		validation.Field(&r.AssigneeUserID, validation.By(uuidOrClearIfPresent)),
+	)
+}
+
+// toUpdateCommand maps the validated request + the principal's tenant + the path id into the
+// use-case command. TenantID comes from the principal and TaskID from the path (never the body);
+// the pointer fields carry through so the use case merges only what was present.
+func (r UpdateTaskRequest) toUpdateCommand(tenantID, taskID string) UpdateTaskCommand {
+	return UpdateTaskCommand{
+		TenantID:       tenantID,
+		TaskID:         taskID,
+		Title:          r.Title,
+		Description:    r.Description,
+		Kind:           r.Kind,
+		DueDate:        r.DueDate,
+		AssigneeUserID: r.AssigneeUserID,
+	}
+}
+
+// uuidIfPresent rejects a PRESENT, non-empty, malformed uuid; an empty value is a no-op (an
+// absent optional id). It backs the CREATE body's optional context FKs + assignee.
+func uuidIfPresent(value any) error {
+	s, _ := value.(string)
+	if s == "" {
+		return nil
+	}
+	if _, err := uuid.Parse(s); err != nil {
+		return errors.New("must be a valid uuid")
+	}
+	return nil
+}
+
+// nonEmptyIfPresent rejects a PRESENT but blank title; an absent (nil) title is a no-op (the
+// stored value is kept). It is the pointer counterpart of validation.Required.
+func nonEmptyIfPresent(value any) error {
+	s, ok := value.(*string)
+	if !ok || s == nil {
+		return nil
+	}
+	if *s == "" {
+		return errors.New("cannot be blank")
+	}
+	return nil
+}
+
+// wireDateOrClearIfPresent accepts an absent (nil) due_date, a present "" (clear the date), or a
+// present wire date (2006-01-02); anything else is a client error.
+func wireDateOrClearIfPresent(value any) error {
+	s, ok := value.(*string)
+	if !ok || s == nil || *s == "" {
+		return nil
+	}
+	if _, err := time.Parse(time.DateOnly, *s); err != nil {
+		return errors.New("must be a valid date (YYYY-MM-DD)")
+	}
+	return nil
+}
+
+// uuidOrClearIfPresent accepts an absent (nil) assignee, a present "" (unassign), or a present
+// valid uuid; anything else is a client error.
+func uuidOrClearIfPresent(value any) error {
+	s, ok := value.(*string)
+	if !ok || s == nil || *s == "" {
+		return nil
+	}
+	if _, err := uuid.Parse(*s); err != nil {
+		return errors.New("must be a valid uuid")
+	}
+	return nil
+}
+
 // isUUID is an ozzo rule that accepts only a parseable uuid — reusing google/uuid (the
 // same parser the repo uses) rather than a separate regex/dependency. An empty value is
 // handled by the accompanying validation.Required, so this only sees non-empty strings.

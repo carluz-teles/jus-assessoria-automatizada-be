@@ -33,6 +33,16 @@ type Querier interface {
 	// The tenant-wide "Y" of the agenda counter: every prazo the tenant holds, regardless
 	// of any filter.
 	CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
+	// @status / @assignee_id / window. Called only when a filter is present; the unfiltered "Y"
+	// reuses CountTasksByTenant.
+	CountTasks(ctx context.Context, arg CountTasksParams) (int64, error)
+	// The "X de Y" total for the Tasks tab: how many tasks the process holds. Same tenant +
+	// court_record scoping as the list.
+	CountTasksByProcesso(ctx context.Context, arg CountTasksByProcessoParams) (int64, error)
+	// The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
+	// any filter.
+	CountTasksByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// Drop every task of a confirmed prazo, the REPLACE step of the F2 confirm (§9: the
 	// confirm is an "upsert idempotente por intimation_id"). Confirm runs this in the SAME tx
 	// right after ConfirmDeadline and BEFORE re-inserting the submitted tasks, so re-confirming
@@ -90,6 +100,19 @@ type Querier interface {
 	// 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
 	// at the repo, never (nil, nil).
 	GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow, error)
+	// Re-read a task's CURRENT status before a manual transition (§9: POST /v1/tasks/:id/done |
+	// .../dismiss). Keyed by id and scoped to tenant_id (barrier 1). The use case pre-checks the
+	// transition on this status so it can distinguish a 404 miss (ErrTaskNotFound) from a 409
+	// invalid transition (ErrTaskNotOpen), mirroring the deadline met/missed path. A missing id in
+	// the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper. $1 = id, $2 = tenant_id.
+	GetTaskForTransition(ctx context.Context, arg GetTaskForTransitionParams) (GetTaskForTransitionRow, error)
+	// Load a task's editable state — the manual ajuste (§9: PATCH /v1/tasks/:id) reads it BEFORE
+	// the merge so an absent body field keeps its stored value (a partial patch, not a full
+	// replace). Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A
+	// missing id in the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper (→ 404),
+	// never (nil, nil). $1 = id, $2 = tenant_id (from the principal). status is carried for the
+	// caller even though PATCH never changes it (edit is orthogonal to the lifecycle).
+	GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdateParams) (GetTaskForUpdateRow, error)
 	// Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
 	// notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO row on a re-derivation, so
 	// the mapper reads pgx.ErrNoRows as "already exists" (ErrDeadlineExists) instead of
@@ -124,6 +147,27 @@ type Querier interface {
 	// historic column name, migration 0006) — the read model exposes it as intimation_id.
 	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
 	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
+	// The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
+	// first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
+	// assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]
+	// (NULL = open bound). The window filters on the REAL due_date, so it naturally EXCLUDES
+	// undated tasks (NULL >= date is NULL) — a dated-window query wants dated items. Ascending
+	// (sort_due, id) keyset; the first page passes the min sentinel ('0001-01-01', zero-uuid).
+	ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error)
+	// ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
+	// The task agenda reads soonest-due first, but due_date is NULLABLE (an undated backlog
+	// task). Decisão travada: undated tasks sort LAST (a task with no date has no urgency, so it
+	// trails the dated ones). We model NULLS LAST as a computed sort key
+	// COALESCE(due_date, '9999-12-31') so the SAME ascending (sort_due, id) keyset the prazos
+	// reads use works unchanged (a min sentinel '0001-01-01' for the first page; the handler
+	// carries sort_due, not the raw due_date, into the next cursor). The read models expose the
+	// REAL due_date (NULL for undated) — sort_due is a query-internal keyset column.
+	// The Tasks tab of one process (GET /v1/processos/:id/tasks): the tasks anchored on the
+	// court_record, soonest due first (undated last). ALL statuses (the tab is not filtered — the
+	// FE decides what to show). @court_record_id is the court_record id; an avulsa task (NULL
+	// court_record_id) never matches, so it is absent from a process tab (correct — it hangs on no
+	// process). Scoped to tenant_id (barrier 1).
+	ListTasksByProcesso(ctx context.Context, arg ListTasksByProcessoParams) ([]ListTasksByProcessoRow, error)
 	// Manual lifecycle transition of a prazo (§9: POST /v1/prazos/:id/met | .../missed → marca
 	// cumprido/perdido). Flips status from current_status to new_status, keyed by id and scoped
 	// to tenant_id (barrier 1). The `status = current_status` guard makes the flip SAFE and
@@ -140,6 +184,15 @@ type Querier interface {
 	// (never a phantom deadline.missed). On a hit it returns the id so deadline.missed commits
 	// in the SAME tx. $1 = id, $2 = tenant_id, both from the trusted scheduled-event payload.
 	MarkMissed(ctx context.Context, arg MarkMissedParams) (uuid.UUID, error)
+	// Manual lifecycle transition of a task (§9: POST /v1/tasks/:id/done → OPEN→DONE stamping
+	// completed_at; .../dismiss → OPEN→DISMISSED, completed_at NULL). Flips status from
+	// current_status to new_status and sets completed_at (the caller passes now() for done, NULL
+	// for dismiss), keyed by id and scoped to tenant_id (barrier 1). The `status = current_status`
+	// guard makes the flip SAFE and IDEMPOTENT under concurrency — the caller pre-checks the
+	// transition, and this guard defends the write against a racing flip; a no-match (already
+	// transitioned) → pgx.ErrNoRows → typed not-found at the mapper. On a hit it returns the id so
+	// task.completed/task.dismissed commits in the SAME tx.
+	MarkTaskStatus(ctx context.Context, arg MarkTaskStatusParams) (uuid.UUID, error)
 	// Resolve the conservative rule for (intimation_type, court) in a rules version. The
 	// resolution lives HERE, in SQL (decisão travada, erd-prazos.md §8/§11): the most
 	// SPECIFIC active match wins, falling back to the '*' catch-all — so an unknown type
@@ -170,6 +223,14 @@ type Querier interface {
 	// row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
 	// and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
 	UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAdjustParams) (UpdateDeadlineAdjustRow, error)
+	// Manual ajuste of a task (§9: PATCH /v1/tasks/:id → editar tarefa). Writes the merged
+	// {title, description, kind, due_date, assignee_user_id} (already merged over the stored
+	// values by the use case), keyed by id and scoped to tenant_id (barrier 1). status/source/
+	// created_by/completed_at and the context FKs are LEFT AS-IS: the edit never changes the
+	// lifecycle nor re-parents the task. A no-match (the row vanished mid-tx) → pgx.ErrNoRows →
+	// ErrTaskNotFound at the mapper. Returns the full task row so the response renders without a
+	// re-read. $1 = id, $2 = tenant_id, then the patched fields.
+	UpdateTask(ctx context.Context, arg UpdateTaskParams) (UpdateTaskRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

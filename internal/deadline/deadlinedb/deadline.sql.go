@@ -272,6 +272,76 @@ func (q *Queries) GetDeadlineForConfirm(ctx context.Context, arg GetDeadlineForC
 	return i, err
 }
 
+const getTaskForTransition = `-- name: GetTaskForTransition :one
+SELECT id, status
+FROM task
+WHERE id = $1 AND tenant_id = $2
+`
+
+type GetTaskForTransitionParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetTaskForTransitionRow struct {
+	ID     uuid.UUID `json:"id"`
+	Status string    `json:"status"`
+}
+
+// Re-read a task's CURRENT status before a manual transition (§9: POST /v1/tasks/:id/done |
+// .../dismiss). Keyed by id and scoped to tenant_id (barrier 1). The use case pre-checks the
+// transition on this status so it can distinguish a 404 miss (ErrTaskNotFound) from a 409
+// invalid transition (ErrTaskNotOpen), mirroring the deadline met/missed path. A missing id in
+// the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper. $1 = id, $2 = tenant_id.
+func (q *Queries) GetTaskForTransition(ctx context.Context, arg GetTaskForTransitionParams) (GetTaskForTransitionRow, error) {
+	row := q.db.QueryRow(ctx, getTaskForTransition, arg.ID, arg.TenantID)
+	var i GetTaskForTransitionRow
+	err := row.Scan(&i.ID, &i.Status)
+	return i, err
+}
+
+const getTaskForUpdate = `-- name: GetTaskForUpdate :one
+SELECT id, status, title, description, kind, due_date, assignee_user_id
+FROM task
+WHERE id = $1 AND tenant_id = $2
+`
+
+type GetTaskForUpdateParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetTaskForUpdateRow struct {
+	ID             uuid.UUID   `json:"id"`
+	Status         string      `json:"status"`
+	Title          string      `json:"title"`
+	Description    *string     `json:"description"`
+	Kind           *string     `json:"kind"`
+	DueDate        pgtype.Date `json:"due_date"`
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+}
+
+// Load a task's editable state — the manual ajuste (§9: PATCH /v1/tasks/:id) reads it BEFORE
+// the merge so an absent body field keeps its stored value (a partial patch, not a full
+// replace). Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A
+// missing id in the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper (→ 404),
+// never (nil, nil). $1 = id, $2 = tenant_id (from the principal). status is carried for the
+// caller even though PATCH never changes it (edit is orthogonal to the lifecycle).
+func (q *Queries) GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdateParams) (GetTaskForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getTaskForUpdate, arg.ID, arg.TenantID)
+	var i GetTaskForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.Title,
+		&i.Description,
+		&i.Kind,
+		&i.DueDate,
+		&i.AssigneeUserID,
+	)
+	return i, err
+}
+
 const insertDeadline = `-- name: InsertDeadline :one
 INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
@@ -442,6 +512,42 @@ func (q *Queries) MarkMissed(ctx context.Context, arg MarkMissedParams) (uuid.UU
 	return id, err
 }
 
+const markTaskStatus = `-- name: MarkTaskStatus :one
+UPDATE task
+SET status = $1, completed_at = $2
+WHERE id = $3 AND tenant_id = $4 AND status = $5
+RETURNING id
+`
+
+type MarkTaskStatusParams struct {
+	NewStatus     string             `json:"new_status"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	CurrentStatus string             `json:"current_status"`
+}
+
+// Manual lifecycle transition of a task (§9: POST /v1/tasks/:id/done → OPEN→DONE stamping
+// completed_at; .../dismiss → OPEN→DISMISSED, completed_at NULL). Flips status from
+// current_status to new_status and sets completed_at (the caller passes now() for done, NULL
+// for dismiss), keyed by id and scoped to tenant_id (barrier 1). The `status = current_status`
+// guard makes the flip SAFE and IDEMPOTENT under concurrency — the caller pre-checks the
+// transition, and this guard defends the write against a racing flip; a no-match (already
+// transitioned) → pgx.ErrNoRows → typed not-found at the mapper. On a hit it returns the id so
+// task.completed/task.dismissed commits in the SAME tx.
+func (q *Queries) MarkTaskStatus(ctx context.Context, arg MarkTaskStatusParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, markTaskStatus,
+		arg.NewStatus,
+		arg.CompletedAt,
+		arg.ID,
+		arg.TenantID,
+		arg.CurrentStatus,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const resolveDeadlineRule = `-- name: ResolveDeadlineRule :one
 SELECT rules_version, kind, days, counting, doubled
 FROM deadline_rule
@@ -579,5 +685,82 @@ func (q *Queries) UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAd
 	)
 	var i UpdateDeadlineAdjustRow
 	err := row.Scan(&i.ID, &i.CourtRecordID)
+	return i, err
+}
+
+const updateTask = `-- name: UpdateTask :one
+UPDATE task
+SET title            = $3,
+    description      = $4,
+    kind             = $5,
+    due_date         = $6,
+    assignee_user_id = $7
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, court_record_id, deadline_id, intimation_id,
+          title, description, kind, due_date, status, source, assignee_user_id,
+          created_by, completed_at
+`
+
+type UpdateTaskParams struct {
+	ID             uuid.UUID   `json:"id"`
+	TenantID       uuid.UUID   `json:"tenant_id"`
+	Title          string      `json:"title"`
+	Description    *string     `json:"description"`
+	Kind           *string     `json:"kind"`
+	DueDate        pgtype.Date `json:"due_date"`
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+}
+
+type UpdateTaskRow struct {
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
+	DeadlineID     pgtype.UUID        `json:"deadline_id"`
+	IntimationID   pgtype.UUID        `json:"intimation_id"`
+	Title          string             `json:"title"`
+	Description    *string            `json:"description"`
+	Kind           *string            `json:"kind"`
+	DueDate        pgtype.Date        `json:"due_date"`
+	Status         string             `json:"status"`
+	Source         string             `json:"source"`
+	AssigneeUserID pgtype.UUID        `json:"assignee_user_id"`
+	CreatedBy      pgtype.UUID        `json:"created_by"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+// Manual ajuste of a task (§9: PATCH /v1/tasks/:id → editar tarefa). Writes the merged
+// {title, description, kind, due_date, assignee_user_id} (already merged over the stored
+// values by the use case), keyed by id and scoped to tenant_id (barrier 1). status/source/
+// created_by/completed_at and the context FKs are LEFT AS-IS: the edit never changes the
+// lifecycle nor re-parents the task. A no-match (the row vanished mid-tx) → pgx.ErrNoRows →
+// ErrTaskNotFound at the mapper. Returns the full task row so the response renders without a
+// re-read. $1 = id, $2 = tenant_id, then the patched fields.
+func (q *Queries) UpdateTask(ctx context.Context, arg UpdateTaskParams) (UpdateTaskRow, error) {
+	row := q.db.QueryRow(ctx, updateTask,
+		arg.ID,
+		arg.TenantID,
+		arg.Title,
+		arg.Description,
+		arg.Kind,
+		arg.DueDate,
+		arg.AssigneeUserID,
+	)
+	var i UpdateTaskRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CourtRecordID,
+		&i.DeadlineID,
+		&i.IntimationID,
+		&i.Title,
+		&i.Description,
+		&i.Kind,
+		&i.DueDate,
+		&i.Status,
+		&i.Source,
+		&i.AssigneeUserID,
+		&i.CreatedBy,
+		&i.CompletedAt,
+	)
 	return i, err
 }

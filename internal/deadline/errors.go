@@ -38,4 +38,15 @@ var (
 	// must be confirmed first, and a terminal prazo cannot transition again. CONFLICT (→ 409),
 	// distinct from the 404 miss — the prazo exists, but its current status forbids the flip.
 	ErrDeadlineNotOpen = apperr.NewConflict("deadline transition requires an OPEN prazo")
+
+	// ErrTaskNotFound — the requested task id resolves to no row in the tenant (PATCH
+	// /v1/tasks/:id, POST /v1/tasks/:id/done | .../dismiss). Typed not-found (→ 404), never
+	// (nil, nil): a foreign or unknown id is a client-facing miss, not a swallowed empty result.
+	ErrTaskNotFound = apperr.NewNotFound("task not found")
+
+	// ErrTaskNotOpen — a POST /v1/tasks/:id/done | .../dismiss transition requested on a task
+	// that is not OPEN. Concluir/dispensar leaves OPEN only: a terminal (DONE/DISMISSED) task
+	// cannot transition again. CONFLICT (→ 409), distinct from the 404 miss — the task exists,
+	// but its current status forbids the flip. It mirrors ErrDeadlineNotOpen (same guard shape).
+	ErrTaskNotOpen = apperr.NewConflict("task transition requires an OPEN task")
 )
