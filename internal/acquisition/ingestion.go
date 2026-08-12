@@ -162,5 +162,6 @@ func (uc *IngestionUseCase) OnDiarioRequested(ctx context.Context, ev DiarioRequ
 
 	slog.InfoContext(ctx, "ingestion: tribunal ingested",
 		"tribunal", ev.Tribunal, "day", ev.Day, "items", len(items), "new", newCount)
+	recordDiarioLanded(ctx, newCount)
 	return nil
 }

@@ -596,6 +596,7 @@ func (uc *SyncUseCase) logSyncCompleted(ctx context.Context, ev SyncRequested, s
 			"deduped", t.Deduped,
 			"blocked", t.Blocked,
 		)...)
+	recordSyncTally(ctx, t)
 }
 
 // publishObserved emits, within the caller's tx, one court_record_observed per

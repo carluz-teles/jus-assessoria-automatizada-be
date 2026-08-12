@@ -65,6 +65,7 @@ func (uc *MatchUseCase) MatchDay(ctx context.Context, day time.Time) (err error)
 		return err
 	}
 	matched = len(matches)
+	recordMatch(ctx, matched)
 
 	for tenantID, b := range groupMatches(matches) {
 		if err = uc.writeForTenant(ctx, tenantID, b.keys, b.items); err != nil {
