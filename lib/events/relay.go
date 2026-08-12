@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/hibiken/asynq"
 	"go.opentelemetry.io/otel/attribute"
@@ -16,7 +17,7 @@ import (
 // selectUnpublished drains one batch of undelivered outbox rows in publication
 // order. FOR UPDATE SKIP LOCKED lets several relay replicas share the table
 // without publishing a row twice; the LIMIT bounds the work per Tick.
-const selectUnpublished = `SELECT id, type, payload, idempotency_key, trace_context, aggregate_id
+const selectUnpublished = `SELECT id, type, payload, idempotency_key, trace_context, aggregate_id, process_at
 	FROM outbox
 	WHERE published_at IS NULL
 	ORDER BY id
@@ -46,7 +47,9 @@ func NewRelay(uow database.UnitOfWork, enq Enqueuer) *Relay {
 	return &Relay{uow: uow, enq: enq}
 }
 
-// pendingEvent is one outbox row read for publication.
+// pendingEvent is one outbox row read for publication. processAt is nil for the
+// immediate rows (the default) and carries the ETA for a row that opted into future
+// delivery; publish turns it into an asynq.ProcessAt option.
 type pendingEvent struct {
 	id             int64
 	typ            string
@@ -54,6 +57,7 @@ type pendingEvent struct {
 	idempotencyKey string
 	traceContext   string
 	aggregateID    string
+	processAt      *time.Time
 }
 
 // PublishedEvent is the identity of one event the relay drained this tick — the
@@ -132,7 +136,7 @@ func readPending(ctx context.Context, tx database.Tx) ([]pendingEvent, error) {
 		var ev pendingEvent
 		if err := rows.Scan(
 			&ev.id, &ev.typ, &ev.payload,
-			&ev.idempotencyKey, &ev.traceContext, &ev.aggregateID,
+			&ev.idempotencyKey, &ev.traceContext, &ev.aggregateID, &ev.processAt,
 		); err != nil {
 			return nil, database.WrapInfra(err)
 		}
@@ -170,6 +174,12 @@ func (r *Relay) publish(ctx context.Context, tx database.Tx, ev pendingEvent) er
 	}
 	if ev.idempotencyKey != "" {
 		opts = append(opts, asynq.TaskID(ev.idempotencyKey))
+	}
+	// An opted-in ETA becomes an asynq.ProcessAt option, so the task lands SCHEDULED
+	// and the consumer only sees it once the time arrives. A nil processAt (the common
+	// case) leaves opts untouched — the task is pending immediately, exactly as before.
+	if ev.processAt != nil {
+		opts = append(opts, asynq.ProcessAt(*ev.processAt))
 	}
 
 	if _, err := r.enq.EnqueueContext(ctx, task, opts...); err != nil {

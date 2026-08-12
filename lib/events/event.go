@@ -11,6 +11,8 @@
 // WrapInfra, lib/apperr for typed errors — and it never imports Fiber or net/http.
 package events
 
+import "time"
+
 // Event is a domain fact a slice publishes. AggregateType and AggregateID place
 // the fact on its aggregate (aggregate_id orders the stream); Type is the dotted
 // id the relay routes and the consumer matches on (e.g. "ingestao.movimento.observed");
@@ -24,6 +26,23 @@ type Event interface {
 	AggregateID() string
 	Type() string
 	IdempotencyKey() string
+}
+
+// ScheduledEvent is the OPTIONAL half of Event: an event that OPTS INTO future
+// delivery implements it, returning the wall-clock time it should be delivered.
+// The relay reads process_at off the outbox row and enqueues the asynq task with
+// asynq.ProcessAt(t), so the task starts SCHEDULED and the consumer only sees it
+// once t arrives — the ETA lives in asynq, never in a polling loop (docs
+// erd-backend §4c; repo directive: ETA work is a scheduled task, not polling).
+//
+// The bool is the opt-out escape hatch: ProcessAt() returning (_, false) — or a
+// zero time — means "deliver now", identical to an event that does not implement
+// this interface at all. The MAJORITY of events do NOT implement ScheduledEvent
+// and stay immediate; the outbox type-asserts for it, so adding it to one event
+// changes nothing for the rest (retrocompatible).
+type ScheduledEvent interface {
+	Event
+	ProcessAt() (time.Time, bool)
 }
 
 // Base is an embeddable helper carrying the two per-instance fields every event
