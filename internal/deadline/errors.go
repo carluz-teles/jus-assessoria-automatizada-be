@@ -21,4 +21,9 @@ var (
 	// no row; the use case treats this as a no-op (the prazo is already there), so a
 	// second observed for the same intimação never opens a phantom prazo.
 	ErrDeadlineExists = apperr.NewConflict("deadline already exists for intimation")
+
+	// ErrDeadlineNotFound — the requested prazo id resolves to no row in the tenant
+	// (GET /v1/prazos/:id). Typed not-found (→ 404 at the edge), never (nil, nil): a
+	// foreign or unknown id is a client-facing miss, not a swallowed empty result.
+	ErrDeadlineNotFound = apperr.NewNotFound("deadline not found")
 )

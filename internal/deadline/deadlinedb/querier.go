@@ -11,6 +11,16 @@ import (
 )
 
 type Querier interface {
+	// The filtered "X" of the agenda's "X de Y" counter: how many prazos match the active
+	// @status / end_date window. Called only when a filter is present; the unfiltered "Y"
+	// reuses CountPrazosByTenant.
+	CountPrazos(ctx context.Context, arg CountPrazosParams) (int64, error)
+	// The "X de Y" total for the Prazos tab: how many prazos the process holds. Same
+	// tenant + court_record scoping as the list.
+	CountPrazosByProcesso(ctx context.Context, arg CountPrazosByProcessoParams) (int64, error)
+	// The tenant-wide "Y" of the agenda counter: every prazo the tenant holds, regardless
+	// of any filter.
+	CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// deadline slice queries (the prazos CREATION path). Every write and read runs inside
 	// the use case's transaction so RLS scopes it to the event's tenant (barrier 2) on top
 	// of the explicit tenant filter (barrier 1). Absence is a typed error at the mapper,
@@ -23,6 +33,12 @@ type Querier interface {
 	// scopes the tx: a NULL app.tenant_id or an RLS regression would otherwise let a read
 	// cross tenants. $2 = tenant_id, from the trusted event payload (never the body).
 	GetCourtRecordClass(ctx context.Context, arg GetCourtRecordClassParams) (*string, error)
+	// The audit/detail view of one prazo (GET /v1/prazos/:id): every field the "por quê"
+	// popover needs — the full holidays_applied, the rules_version that derived the days,
+	// the origin intimation_id, and start/end/days/counting/doubled. Tenant-scoped (barrier
+	// 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
+	// at the repo, never (nil, nil).
+	GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow, error)
 	// Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
 	// notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO row on a re-derivation, so
 	// the mapper reads pgx.ErrNoRows as "already exists" (ErrDeadlineExists) instead of
@@ -30,6 +46,26 @@ type Querier interface {
 	// yet — that is the F2 slice). Returns the DB-assigned id; the repo maps the rest from
 	// the input entity.
 	InsertDeadline(ctx context.Context, arg InsertDeadlineParams) (uuid.UUID, error)
+	// The global agenda (GET /v1/prazos): the tenant's prazos, soonest vencimento first,
+	// with the process context (cnj_number/court) joined in. Optional filters: @status ('' =
+	// all) and an end_date window [@from_date, @to_date] (NULL = open bound). Ascending
+	// keyset on (end_date, id); the first page passes the min sentinel ('0001-01-01',
+	// zero-uuid).
+	ListPrazos(ctx context.Context, arg ListPrazosParams) ([]ListPrazosRow, error)
+	// read-model queries (deadline slice) — the prazos SCREEN reads, kept OFF the write
+	// path (docs: "leitura de tela usa read model, DTO por query dedicada"). Each is
+	// tenant-scoped (barrier 1: an explicit tenant_id filter from the trusted principal,
+	// never the body) and, where paginated, keyset-paginated on a stable (end_date, id)
+	// pair — ascending, since a prazo agenda reads soonest-first. The caller passes a
+	// sentinel cursor for the first page, so there is no conditional WHERE. days_left is
+	// computed here as calendar days to end_date ((end_date - CURRENT_DATE)::int); the
+	// urgency styling (gold < 3 dias) is the FE's call, not the read model's.
+	// The Prazos tab of one process (GET /v1/processos/:id/prazos): the deadlines anchored
+	// on the court_record, soonest vencimento first. @court_record_id is the court_record
+	// id (the same id /processos returns). notification_id is the FK to intimation (the
+	// historic column name, migration 0006) — the read model exposes it as intimation_id.
+	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
+	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
 	// Resolve the conservative rule for (intimation_type, court) in a rules version. The
 	// resolution lives HERE, in SQL (decisão travada, erd-prazos.md §8/§11): the most
 	// SPECIFIC active match wins, falling back to the '*' catch-all — so an unknown type

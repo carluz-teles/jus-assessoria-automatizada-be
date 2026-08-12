@@ -18,6 +18,7 @@ import (
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
+	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -136,6 +137,11 @@ func run(logger *slog.Logger) error {
 		acquisition.NewReadUseCase(acquisitionRepo),
 	)
 
+	// Deadline wiring: the slice's HTTP surface is read-only at this fatia (the prazos
+	// screens). The creation path is event-driven and lives in the worker, so the api
+	// mounts only the pool-backed read handler — no write use case, no outbox here.
+	deadlineHandler := deadline.NewReadHandler(deadline.NewReadUseCase(deadline.NewReadRepository(pool)))
+
 	// Billing wiring: the slice owns the domain; the binary only assembles it
 	// (repo + Stripe gateway + shared outbox + dedup + unit of work + checkout
 	// config → use case → webhook + endpoint handler). One use case backs both the
@@ -203,6 +209,7 @@ func run(logger *slog.Logger) error {
 		billing:              billingHandler,
 		identity:             identityHandler,
 		acquisition:          acquisitionHandler,
+		deadline:             deadlineHandler,
 		lookup:               lookupHandler,
 	})
 
