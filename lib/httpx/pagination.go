@@ -15,10 +15,15 @@ const (
 )
 
 // PageMeta is the pagination block of the list envelope. NextCursor is nil on
-// the last page.
+// the last page. The two totals drive the "X de Y" counter on cursor-paginated
+// screens: TotalCount is the current context (filtered by ?search when present),
+// Total is the tenant-wide count regardless of any filter. With no search active
+// they are equal, so a single COUNT(*) fills both.
 type PageMeta struct {
 	NextCursor *string `json:"next_cursor"`
 	Limit      int     `json:"limit"`
+	TotalCount int64   `json:"total_count"`
+	Total      int64   `json:"total"`
 }
 
 // Page is the cursor-paginated list envelope (§4e.2): {data, page:{...}}. It is

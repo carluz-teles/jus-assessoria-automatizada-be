@@ -1,11 +1,45 @@
 package httpx_test
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
 )
+
+func TestPageMeta_MarshalsTotals(t *testing.T) {
+	t.Parallel()
+
+	cursor := "eyJsYXN0X2lkIjoiMSJ9"
+	page := httpx.Page[int]{
+		Data: []int{1, 2},
+		Page: httpx.PageMeta{
+			NextCursor: &cursor,
+			Limit:      25,
+			TotalCount: 32,   // current context (filtered when a search is active)
+			Total:      1247, // tenant-wide, always
+		},
+	}
+
+	raw, err := json.Marshal(page)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	got := string(raw)
+	for _, want := range []string{
+		`"next_cursor":"eyJsYXN0X2lkIjoiMSJ9"`,
+		`"limit":25`,
+		`"total_count":32`,
+		`"total":1247`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("marshaled page is missing %s\ngot: %s", want, got)
+		}
+	}
+}
 
 func TestCursor_RoundTrips(t *testing.T) {
 	t.Parallel()

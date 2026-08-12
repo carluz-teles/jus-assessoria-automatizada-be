@@ -968,7 +968,7 @@ Toda lista usa o mesmo contrato. **Cursor**, não offset — a carteira cresce e
 
 **Request:**
 ```
-GET /v1/processos?limit=20&cursor=<opaco>
+GET /v1/processos?limit=20&cursor=<opaco>&search=<termo>
 ```
 
 **Response — envelope padrão de toda lista:**
@@ -977,7 +977,9 @@ GET /v1/processos?limit=20&cursor=<opaco>
   "data": [ /* itens */ ],
   "page": {
     "next_cursor": "eyJpZCI6...",   // null quando acabou
-    "limit": 20
+    "limit": 20,
+    "total_count": 32,              // total do contexto atual (filtrado por ?search)
+    "total": 1247                   // total do tenant, sempre — independe de filtro
   }
 }
 ```
@@ -990,6 +992,8 @@ type Page[T any] struct {
 type PageMeta struct {
     NextCursor *string `json:"next_cursor"`
     Limit      int     `json:"limit"`
+    TotalCount int64   `json:"total_count"`
+    Total      int64   `json:"total"`
 }
 ```
 
@@ -997,7 +1001,8 @@ Mecânica:
 - o **cursor é opaco** — base64 de `{ last_id, last_sort_value }`. O cliente não interpreta, só devolve.
 - query usa keyset: `WHERE (ordenado_por, id) < (:cursor_val, :cursor_id) ORDER BY ... LIMIT :limit+1`. O `+1` detecta se há próxima página sem contar o total.
 - `limit` tem **teto** (ex: 100) — cliente não pede 10.000 e derruba o banco.
-- sem `total_count` por padrão — contar exige varrer tudo, e a UI de cursor não precisa. Endpoint separado se algum dia precisar do número.
+- **totais "X de Y"**: `total_count` é o total do contexto atual — quando há `?search`, conta só o que casa o filtro; sem `search`, é o total global. `total` é sempre o total do tenant, sem filtro. **Sem `search` os dois são iguais**, então um único `COUNT(*)` preenche ambos; com `search` são dois COUNTs (filtrado + global). O count é do total, não da página — a UI de cursor mostra "X de Y" e habilita o seletor de itens-por-página + avançar/voltar. São reads separados do keyset (sem tx compartilhada): um skew de ±1 sob inserts concorrentes é tolerável (é read model, não agregado).
+- **busca `?search`**: filtra por `cnj_number` (ILIKE, match parcial), acelerada por índice GIN trigram (`pg_trgm`); compõe com o cursor (o predicado de busca entra no `WHERE`, o keyset e o `LIMIT` seguem valendo).
 
 ## 4e.3 Filtro e ordenação — contrato declarativo
 
