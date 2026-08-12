@@ -204,6 +204,17 @@ func queueFor(typ string) string {
 	if typ == "acquisition.diario_requested" {
 		return "diario"
 	}
+	// sync_completed/sync_failed (the backfill completion counter) get their OWN light
+	// queue, drained by a dedicated concurrency-2 server: the increment/finalize is
+	// trivial, but on "ingestao" it queues behind thousands of slow court_record_observed
+	// enrichment tasks (~110s each, no preemption), so the backfill_job only flips to
+	// COMPLETED once the enrichment drains. asynq has no per-task priority within a queue
+	// (weight is per-queue), so a separate queue is the only way to let the sync finish
+	// independently of the eventual DATAJUD enrichment. Must match worker-ingestao's
+	// syncStatusQueue and the dedicated server's Queues below.
+	if typ == "acquisition.sync_completed" || typ == "acquisition.sync_failed" {
+		return "sync_status"
+	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":
 		// The acquisition slice's events (integration_activated, sync_requested,

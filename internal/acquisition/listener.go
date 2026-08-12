@@ -67,9 +67,14 @@ func NewListener(backfill backfillListenerUC, sync syncListenerUC, enrichment en
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntegrationActivated, l.handleIntegrationActivated)
 	mux.HandleFunc(TypeSyncRequested, l.handleSyncRequested)
-	mux.HandleFunc(TypeSyncCompleted, l.handleSyncCompleted)
-	mux.HandleFunc(TypeSyncFailed, l.handleSyncFailed)
 	mux.HandleFunc(TypeCourtRecordObserved, l.handleCourtRecordObserved)
+
+	// sync_completed/sync_failed are NOT registered here: they live on their OWN
+	// "sync_status" queue and are mounted on a dedicated concurrency-2 server via
+	// RegisterSyncStatus, so the light backfill completion counter finalizes the job
+	// without waiting behind this queue's slow enrichment flood. A pattern may be
+	// registered only ONCE — on the mux of the server that serves its queue — so keeping
+	// them here would either shadow the dedicated server or panic on a duplicate pattern.
 
 	// diario_requested is NOT registered here: it lives on its OWN queue and is mounted
 	// on a dedicated concurrency-1 server via RegisterIngestion, so the national bulk
@@ -142,6 +147,16 @@ func (l *Listener) handleCourtRecordObserved(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	return l.enrichment.OnCourtRecordObserved(ctx, ev)
+}
+
+// RegisterSyncStatus mounts the sync_completed/sync_failed handlers on a mux — meant
+// for the worker's DEDICATED concurrency-2 server (its own "sync_status" queue), so the
+// light backfill completion counter finalizes the job independently of the slow DATAJUD
+// enrichment on the "ingestao" queue. A pattern may be registered only once, so these two
+// handlers live here and NOT in Register (see Register's comment for the rationale).
+func (l *Listener) RegisterSyncStatus(mux *asynq.ServeMux) {
+	mux.HandleFunc(TypeSyncCompleted, l.handleSyncCompleted)
+	mux.HandleFunc(TypeSyncFailed, l.handleSyncFailed)
 }
 
 // RegisterIngestion mounts the diario_requested handler on a mux — meant for the
