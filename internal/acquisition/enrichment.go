@@ -144,7 +144,8 @@ func (uc *EnrichmentUseCase) OnCourtRecordObserved(ctx context.Context, ev Court
 // retire the placeholder, upsert the DATAJUD movimentos as docket entries, and
 // emit docket_entry_observed for the new ones — all atomically.
 func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecordObserved, graded ParsedCourtRecord, movimentos []ParsedDocketEntry) error {
-	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+	applied := false
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		// Take the per-tenant write lock FIRST (before the dedup row write) so this
 		// graded-record merge never deadlocks against a concurrent sync slice writing
 		// the same tenant's court_records. The DATAJUD fetch already ran outside this tx.
@@ -203,8 +204,19 @@ func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecord
 		for _, de := range newDocket {
 			evs = append(evs, newDocketEntryObservedFromEnrich(ev, de))
 		}
-		return uc.outbox.PublishBatch(ctx, tx, evs)
+		if err := uc.outbox.PublishBatch(ctx, tx, evs); err != nil {
+			return err
+		}
+		applied = true
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if applied {
+		recordEnrichmentApplied(ctx)
+	}
+	return nil
 }
 
 // enrichDocketParams binds every DATAJUD movimento to the graded record. Unlike

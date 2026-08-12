@@ -39,10 +39,14 @@ const (
 // line of per-handler code.
 //
 // For each task it:
-//  1. continues the producer's trace from the task header (this replaces the
+//  1. reads the producer's span context from the task header (this replaces the
 //     per-handler events.ExtractTrace calls — extraction now happens here, once);
-//  2. opens a CONSUMER span "<event.type> process" as a child of the producer's
-//     span, so the event's lifecycle is ONE trace end to end;
+//  2. opens a CONSUMER span "<event.type> process" as a NEW ROOT LINKED to the
+//     producer, so each consumed event is its own bounded, navigable trace instead of
+//     one giant tree — a big backfill fans into thousands of small linked traces, not a
+//     single 40k-span monster. The link preserves causality; the sampler judges each
+//     unit independently (lib/telemetry importTraceSampler). Correlate a whole run by
+//     the business ids on the spans (tenant_id, integration_id, …), not by trace walls;
 //  3. sets the span status from the handler outcome (Ok, or Error+exception);
 //  4. logs ONLY on failure — the happy path is told by the span (spans for flow,
 //     logs for failures, to keep New Relic ingest lean).
@@ -57,8 +61,9 @@ func Observe(logger *slog.Logger) asynq.MiddlewareFunc {
 		return asynq.HandlerFunc(func(ctx context.Context, t *asynq.Task) error {
 			start := time.Now()
 
-			// Continue the producer trace, then open the consumer span as its child.
-			ctx = ExtractTrace(ctx, t)
+			// Read the producer's span context for the LINK, then open the consumer span
+			// as a new root linking back to it — each event is its own trace (see doc).
+			producer := trace.SpanContextFromContext(ExtractTrace(ctx, t))
 			queue, _ := asynq.GetQueueName(ctx)
 			retry, _ := asynq.GetRetryCount(ctx)
 			maxRetry, _ := asynq.GetMaxRetry(ctx)
@@ -66,8 +71,9 @@ func Observe(logger *slog.Logger) asynq.MiddlewareFunc {
 			eventID := t.Headers()[eventIDHeader]
 			aggregateID := t.Headers()[aggregateIDHeader]
 
-			ctx, span := obs.Start(ctx, t.Type()+" process",
+			startOpts := []trace.SpanStartOption{
 				trace.WithSpanKind(trace.SpanKindConsumer),
+				trace.WithNewRoot(),
 				trace.WithAttributes(
 					attribute.String(attrMessagingSystem, "asynq"),
 					attribute.String(attrMessagingDest, queue),
@@ -77,7 +83,12 @@ func Observe(logger *slog.Logger) asynq.MiddlewareFunc {
 					attribute.String(obs.KeyAggregateID, aggregateID),
 					attribute.Int(obs.KeyRetry, retry),
 				),
-			)
+			}
+			if producer.IsValid() {
+				startOpts = append(startOpts, trace.WithLinks(trace.Link{SpanContext: producer}))
+			}
+
+			ctx, span := obs.Start(ctx, t.Type()+" process", startOpts...)
 			defer span.End()
 
 			err := next.ProcessTask(ctx, t)

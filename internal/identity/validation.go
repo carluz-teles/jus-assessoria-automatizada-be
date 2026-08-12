@@ -56,7 +56,7 @@ func (r UpdateOrgProfileRequest) Validate() error {
 		validation.Field(&r.TradeName, validation.Required),
 		validation.Field(&r.Address, validation.Skip.When(r.Address == (Address{}))),
 		validation.Field(&r.Phone, validation.Match(phoneDigits).Error("must be 10 or 11 digits")),
-		validation.Field(&r.Email, is.Email),
+		validation.Field(&r.Email, is.EmailFormat),
 	)
 }
 

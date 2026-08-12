@@ -45,6 +45,16 @@ const (
 	// diarioConcurrency is fixed at 1: the whole point is to serialize the national fetch
 	// against the DJEN global cap. Not env-tunable — a higher value reintroduces the storm.
 	diarioConcurrency = 1
+	// syncStatusQueue carries the backfill completion counter (sync_completed/sync_failed).
+	// It is drained by a SEPARATE asynq server so the light increment/finalize that flips
+	// backfill_job to COMPLETED never queues behind the enrichment flood (thousands of slow
+	// court_record_observed tasks) on "ingestao" — asynq has no per-task priority within a
+	// queue. Must match lib/events.queueFor's routing of these two events.
+	syncStatusQueue = "sync_status"
+	// syncStatusConcurrency is fixed at 2: advancing the counter and finalizing the job is
+	// trivial work, so 2 slots are plenty and, on their own queue, never compete with (or
+	// wait behind) the ~110s enrichment fetches on "ingestao".
+	syncStatusConcurrency = 2
 	// defaultConcurrency backs INGESTAO_CONCURRENCY when unset/invalid. Parallelism
 	// is the backfill's main lever: DJEN/DATAJUD fetches are LONG (~110s each, stuck
 	// on the residential proxy), so running many at once overlaps that wait and cuts
@@ -252,6 +262,26 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("start asynq server: %w", err)
 	}
 
+	// The DEDICATED backfill completion server: one small pool, its own "sync_status" queue,
+	// so the light sync_completed/sync_failed counter that flips backfill_job to COMPLETED is
+	// never stuck behind the enrichment flood on "ingestao". Built ALWAYS (unlike diarioSrv):
+	// every backfill must be able to finalize, pivot on or off. sync_status is deliberately
+	// NOT in the main srv's Queues, or it would compete on that pool again.
+	syncStatusSrv := asynq.NewServer(redisOpt, asynq.Config{
+		Concurrency: syncStatusConcurrency,
+		Queues:      map[string]int{syncStatusQueue: syncStatusConcurrency},
+		Logger:      events.NewAsynqLogger(logger),
+		LogLevel:    asynq.ErrorLevel,
+	})
+	syncStatusMux := asynq.NewServeMux()
+	syncStatusMux.Use(events.Observe(logger))
+	listener.RegisterSyncStatus(syncStatusMux)
+	if err := syncStatusSrv.Start(syncStatusMux); err != nil {
+		return fmt.Errorf("start sync_status asynq server: %w", err)
+	}
+	logger.Info("backfill completion server started (dedicated)",
+		"service", serviceName, "queue", syncStatusQueue, "concurrency", syncStatusConcurrency)
+
 	// The DEDICATED national-ingestion server: one worker, its own "diario" queue, so the
 	// slow globally-rate-limited DJEN diário fetch runs serialized (never 3-way hammering
 	// the cumulative cap) and stays off the enrichment/sync queue. Built only when the
@@ -285,6 +315,7 @@ func run(logger *slog.Logger) error {
 		},
 		func(shutdownCtx context.Context) error {
 			srv.Shutdown() // drains in-flight tasks before returning
+			syncStatusSrv.Shutdown()
 			if diarioSrv != nil {
 				diarioSrv.Shutdown()
 			}

@@ -67,6 +67,13 @@ func run(logger *slog.Logger) error {
 	}
 	asynqClient := asynq.NewClient(redisOpt)
 
+	// The relay is a singleton, so it is the one place to observe asynq queue depth
+	// without duplicating the series across scaled workers (all see the same Redis).
+	inspector := asynq.NewInspector(redisOpt)
+	if err := events.RegisterQueueDepth(inspector); err != nil {
+		return fmt.Errorf("register queue depth metrics: %w", err)
+	}
+
 	uow := database.NewUnitOfWork(pool)
 	relay := events.NewRelay(uow, asynqClient)
 
@@ -90,6 +97,9 @@ func run(logger *slog.Logger) error {
 			pool.Close()
 			if err := asynqClient.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("close asynq client: %w", err))
+			}
+			if err := inspector.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close asynq inspector: %w", err))
 			}
 			if err := telemetryShutdown(shutdownCtx); err != nil {
 				errs = append(errs, fmt.Errorf("shutdown telemetry: %w", err))

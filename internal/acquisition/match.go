@@ -7,8 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // matchRepo is the narrow port the match use case drives: the national join (read
@@ -40,18 +44,31 @@ func NewMatchUseCase(repo matchRepo, uow database.UnitOfWork, parser Parser) *Ma
 }
 
 // MatchDay fans a day's firehose out to the watching tenants.
-func (uc *MatchUseCase) MatchDay(ctx context.Context, day time.Time) error {
+func (uc *MatchUseCase) MatchDay(ctx context.Context, day time.Time) (err error) {
+	// A daily import root: the match tick has no upstream request, so it is its own
+	// trace — the span parents the system read + per-tenant writes (otelpgx would emit
+	// orphan query spans otherwise) and records how much of the firehose it folded in.
+	ctx, span := obs.Start(ctx, "scheduler match_day", trace.WithSpanKind(trace.SpanKindInternal))
+	matched := 0
+	defer func() {
+		span.SetAttributes(attribute.String("day", day.Format(dateLayout)), attribute.Int("matched", matched))
+		obs.Record(span, err)
+		span.End()
+	}()
+
 	var matches []PublicationMatch
-	if err := uc.uow.DoSystem(ctx, func(tx database.Tx) error {
+	if err = uc.uow.DoSystem(ctx, func(tx database.Tx) error {
 		var e error
 		matches, e = uc.repo.MatchPublicationsByDay(ctx, tx, day)
 		return e
 	}); err != nil {
 		return err
 	}
+	matched = len(matches)
+	recordMatch(ctx, matched)
 
 	for tenantID, b := range groupMatches(matches) {
-		if err := uc.writeForTenant(ctx, tenantID, b.keys, b.items); err != nil {
+		if err = uc.writeForTenant(ctx, tenantID, b.keys, b.items); err != nil {
 			return err
 		}
 	}

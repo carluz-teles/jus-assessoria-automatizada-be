@@ -16,9 +16,12 @@ import (
 	"context"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/telemetry"
 )
 
@@ -36,6 +39,10 @@ const (
 	KeyMaxRetry    = "max_retry"
 	KeyOutcome     = "outcome"
 	KeyDurationMS  = "duration_ms"
+	// KeyErrorKind facets a failed span by the typed apperr.Kind (INFRA_ERROR,
+	// SERVICE_UNAVAILABLE, …), so the backend groups failures by cause — a DJEN 429
+	// (Unavailable) reads apart from a bug (Infra) without parsing the message.
+	KeyErrorKind = "error.kind"
 )
 
 // Outcome values for KeyOutcome — low-cardinality and stable so the log message
@@ -54,6 +61,14 @@ func Tracer() trace.Tracer {
 	return otel.Tracer(telemetry.InstrumentationScope)
 }
 
+// Meter returns the process meter under the shared instrumentation scope, so every
+// custom metric reports one scope name in the backend — the metric mirror of Tracer().
+// It reads the global MeterProvider that telemetry.Setup installs; before Setup it is a
+// no-op meter, so instruments built from it simply do not record until Setup runs.
+func Meter() metric.Meter {
+	return otel.Meter(telemetry.InstrumentationScope)
+}
+
 // Start opens a span from ctx under the shared tracer and returns the derived
 // context (carrying the span) and the span. The caller MUST `defer span.End()`.
 // It is a thin wrapper so callers never reach for otel.Tracer with an ad-hoc
@@ -70,6 +85,11 @@ func Record(span trace.Span, err error) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
+		// Stamp the typed kind so every failure span is filterable by cause; a plain
+		// (non-AppError) err just carries no kind facet.
+		if ae, ok := apperr.From(err); ok {
+			span.SetAttributes(attribute.String(KeyErrorKind, string(ae.Kind)))
+		}
 		return
 	}
 	span.SetStatus(codes.Ok, "")

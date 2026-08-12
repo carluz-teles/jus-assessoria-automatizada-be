@@ -9,9 +9,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // diarioNamespace namespaces the deterministic v5 aggregate id of a diario_requested.
@@ -71,6 +74,17 @@ func NewIngestionScheduler(outbox publisher, uow database.UnitOfWork) *Ingestion
 // self-heal for a tribunal that failed a prior run.
 func (uc *IngestionScheduler) RequestDay(ctx context.Context, day time.Time) (requested int, err error) {
 	d := day.Format(dateLayout)
+
+	// A daily import root: no upstream request, so it is its own trace. The span parents
+	// the fan-out's outbox writes (otherwise otelpgx emits orphan query spans) and lets
+	// each diario_requested consumer link back to this tick (see consumer middleware).
+	ctx, span := obs.Start(ctx, "scheduler request_day", trace.WithSpanKind(trace.SpanKindInternal))
+	defer func() {
+		span.SetAttributes(attribute.String("day", d), attribute.Int("requested", requested))
+		obs.Record(span, err)
+		span.End()
+	}()
+
 	err = uc.uow.DoSystem(ctx, func(tx database.Tx) error {
 		requested = 0
 		for _, trib := range tribunais {
@@ -148,5 +162,6 @@ func (uc *IngestionUseCase) OnDiarioRequested(ctx context.Context, ev DiarioRequ
 
 	slog.InfoContext(ctx, "ingestion: tribunal ingested",
 		"tribunal", ev.Tribunal, "day", ev.Day, "items", len(items), "new", newCount)
+	recordDiarioLanded(ctx, newCount)
 	return nil
 }

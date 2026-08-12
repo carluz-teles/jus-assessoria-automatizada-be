@@ -184,10 +184,10 @@ func (r *Relay) publish(ctx context.Context, tx database.Tx, ev pendingEvent) er
 	return nil
 }
 
-// ExtractTrace returns a ctx continuing the producer's trace, read from the
-// traceparent header the relay stamped on the task. Consumers call it first so
-// their spans join the originating trace (docs erd-backend §4c.3). With no header
-// it returns ctx unchanged.
+// ExtractTrace returns a ctx carrying the producer's span context, read from the
+// traceparent header the relay stamped on the task. The consumer middleware uses it to
+// LINK its span back to the producer (each event is its own trace; docs erd-backend
+// §4c.3). With no header it returns ctx unchanged.
 func ExtractTrace(ctx context.Context, t *asynq.Task) context.Context {
 	return CtxWithTraceContext(ctx, t.Headers()[traceparentKey])
 }
@@ -203,6 +203,17 @@ func queueFor(typ string) string {
 	// stops it from starving — or being starved by — the enrichment/sync work.
 	if typ == "acquisition.diario_requested" {
 		return "diario"
+	}
+	// sync_completed/sync_failed (the backfill completion counter) get their OWN light
+	// queue, drained by a dedicated concurrency-2 server: the increment/finalize is
+	// trivial, but on "ingestao" it queues behind thousands of slow court_record_observed
+	// enrichment tasks (~110s each, no preemption), so the backfill_job only flips to
+	// COMPLETED once the enrichment drains. asynq has no per-task priority within a queue
+	// (weight is per-queue), so a separate queue is the only way to let the sync finish
+	// independently of the eventual DATAJUD enrichment. Must match worker-ingestao's
+	// syncStatusQueue and the dedicated server's Queues below.
+	if typ == "acquisition.sync_completed" || typ == "acquisition.sync_failed" {
+		return "sync_status"
 	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":

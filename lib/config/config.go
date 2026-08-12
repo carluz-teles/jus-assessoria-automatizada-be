@@ -38,6 +38,14 @@ type Config struct {
 	OTELHeaders  string `env:"OTEL_EXPORTER_OTLP_HEADERS"`
 	OTELInsecure bool   `env:"OTEL_EXPORTER_OTLP_INSECURE" envDefault:"false"`
 
+	// OTELTracesMode controla o sampling de traces (deny-by-default). "import-only"
+	// (default) mantém no backend SÓ o fluxo de import — corta o flood de preflight,
+	// polling e reads que afogava o painel (e o custo de ingest no New Relic); "all"
+	// volta a amostrar tudo, a alavanca de incidente pra investigar um fluxo ainda não
+	// instrumentado sem redeploy. Valor desconhecido cai em import-only (o padrão
+	// seguro). Ver TracesImportOnly() e lib/telemetry.buildSampler.
+	OTELTracesMode string `env:"OTEL_TRACES_MODE" envDefault:"import-only"`
+
 	// LogLevel — nível mínimo de log do processo (todos os binários). Default "info";
 	// "debug" liga os logs por-evento do relay e o diagnóstico geral sem redeploy de
 	// código. Valores: debug|info|warn|error (case-insensitive); um valor desconhecido
@@ -182,6 +190,13 @@ func (c Config) SlogLevel() slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// TracesImportOnly informa se o processo amostra SÓ o fluxo de import (deny-by-default).
+// Só "all" (case-insensitive) desliga o filtro; qualquer outro valor — inclusive um
+// típo — mantém o padrão seguro import-only. Ver lib/telemetry.buildSampler.
+func (c Config) TracesImportOnly() bool {
+	return strings.ToLower(strings.TrimSpace(c.OTELTracesMode)) != "all"
 }
 
 // S3Enabled informa se o storage de objetos está totalmente configurado. O api
