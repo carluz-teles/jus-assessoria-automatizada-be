@@ -48,6 +48,19 @@ type IntimacaoView struct {
 	ContentPreview  string    `json:"content_preview"`
 }
 
+// AndamentoView is one row of a process's "Andamentos" tab: a docket entry
+// (andamento) — when the court acted, when we observed it, the TPU code, and the
+// text. TPUCode is a pointer so an absent code serializes as JSON null, not 0.
+type AndamentoView struct {
+	ID         string    `json:"id"`
+	OccurredAt time.Time `json:"occurred_at"`
+	ObservedAt time.Time `json:"observed_at"`
+	TPUCode    *int      `json:"tpu_code"`
+	Text       string    `json:"text"`
+	Source     string    `json:"source"`
+	Fidelity   int       `json:"fidelity"`
+}
+
 // ProcessosQuery / IntimacoesQuery carry the keyset cursor (the last row's sort key
 // and id) and the page size. The handler fills the sentinel for a first page; the
 // repo turns them into the query's keyset predicate.
@@ -67,6 +80,17 @@ type IntimacoesQuery struct {
 	Search            string // ?search: ILIKE on the court record's cnj_number; "" means no filter
 }
 
+// AndamentosQuery carries the descending keyset cursor (the last row's occurred_at
+// and id) plus the process (court_record) whose andamentos to read and the tenant.
+// The handler fills the max sentinel for a first page.
+type AndamentosQuery struct {
+	TenantID      string
+	CourtRecordID string
+	LastOccurred  string
+	LastID        string
+	Limit         int
+}
+
 // ProcessosResult / IntimacoesResult are the paginated read plus the two totals for
 // the "X de Y" counter: TotalCount is the current context (filtered by Search when
 // set), Total the tenant-wide count. HasMore drives the next cursor.
@@ -82,6 +106,15 @@ type IntimacoesResult struct {
 	HasMore    bool
 	TotalCount int64
 	Total      int64
+}
+
+// AndamentosResult is a page of a process's andamentos plus its total for the "X de
+// Y" counter. There is no search on this tab, so the two totals coincide; the read
+// use case carries one Total. HasMore drives the next cursor.
+type AndamentosResult struct {
+	Items   []AndamentoView
+	HasMore bool
+	Total   int64
 }
 
 // ImportStatusView is the onboarding backfill state for the FE banner ("importando
@@ -192,8 +225,10 @@ const reconciliationRunsLimit = 60
 type readRepo interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -236,6 +271,28 @@ func (uc *ReadUseCase) Processos(ctx context.Context, q ProcessosQuery) (Process
 		return ProcessosResult{}, err
 	}
 	return ProcessosResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+}
+
+// Andamentos returns up to q.Limit of a process's docket entries (newest first),
+// whether a further page exists, and the tab's total. Same over-fetch policy as
+// Processos: the keyset read over-fetches one row for hasMore, the total is a
+// separate COUNT — a small skew under concurrent inserts is fine (read model).
+func (uc *ReadUseCase) Andamentos(ctx context.Context, q AndamentosQuery) (AndamentosResult, error) {
+	limit := q.Limit
+	q.Limit = limit + 1
+	rows, err := uc.repo.ListAndamentosByProcesso(ctx, q)
+	if err != nil {
+		return AndamentosResult{}, err
+	}
+	hasMore := false
+	if len(rows) > limit {
+		rows, hasMore = rows[:limit], true
+	}
+	total, err := uc.repo.CountAndamentosByProcesso(ctx, q.TenantID, q.CourtRecordID)
+	if err != nil {
+		return AndamentosResult{}, err
+	}
+	return AndamentosResult{Items: rows, HasMore: hasMore, Total: total}, nil
 }
 
 // ImportStatus returns the tenant's latest backfill state — the FE banner reads it

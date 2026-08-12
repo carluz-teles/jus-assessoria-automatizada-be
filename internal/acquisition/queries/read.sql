@@ -61,6 +61,29 @@ JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
   AND cr.cnj_number ILIKE '%' || @search::text || '%' ESCAPE '\';
 
+-- name: ListAndamentosByProcesso :many
+-- The "Andamentos" tab of one process: the court record's docket entries, newest
+-- first. Scoped by tenant via the court_record join (docket_entry has no tenant_id
+-- of its own) so a foreign court_record.id passed as :id yields nothing. Descending
+-- keyset on (occurred_at, id) — served by docket_entry(court_record_id, occurred_at)
+-- — the first page passes the max sentinel ('9999-12-31T23:59:59Z', max-uuid).
+SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.source, de.fidelity
+FROM docket_entry de
+JOIN court_record cr ON cr.id = de.court_record_id
+WHERE de.court_record_id = @court_record_id::uuid
+  AND cr.tenant_id = @tenant_id::uuid
+  AND (de.occurred_at, de.id) < (@last_occurred::timestamptz, @last_id::uuid)
+ORDER BY de.occurred_at DESC, de.id DESC
+LIMIT @page_limit;
+
+-- name: CountAndamentosByProcesso :one
+-- The "X de Y" total for the Andamentos tab: how many docket entries the process
+-- holds. Tenant-scoped through the same court_record join as the list.
+SELECT count(*) FROM docket_entry de
+JOIN court_record cr ON cr.id = de.court_record_id
+WHERE de.court_record_id = @court_record_id::uuid
+  AND cr.tenant_id = @tenant_id::uuid;
+
 -- name: ListReconciliations :many
 -- The reconciliations screen: one "reconciliação" per import (backfill_job), with
 -- the processes/intimations its windows discovered summed up, the job's overall

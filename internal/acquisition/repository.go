@@ -68,8 +68,10 @@ type Repository interface {
 	// use case depends on the narrow readRepo view of these.
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -1054,6 +1056,75 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	return out, nil
 }
 
+// ListAndamentosByProcesso reads one process's docket entries (keyset-paginated,
+// newest first) on the pool. docket_entry has no tenant_id, so tenant isolation
+// (barrier 1) runs through the court_record join: a court_record.id belonging to
+// another tenant matches nothing. The caller passes the max sentinel cursor for the
+// first page.
+func (r *pgRepository) ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	crid, err := uuid.Parse(q.CourtRecordID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastID, err := uuid.Parse(q.LastID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastOccurred, err := time.Parse(time.RFC3339Nano, q.LastOccurred)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListAndamentosByProcesso(ctx, acquisitiondb.ListAndamentosByProcessoParams{
+		CourtRecordID: crid,
+		TenantID:      tid,
+		LastOccurred:  pgtype.Timestamptz{Time: lastOccurred, Valid: true},
+		LastID:        lastID,
+		PageLimit:     int32(q.Limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]AndamentoView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, AndamentoView{
+			ID:         row.ID.String(),
+			OccurredAt: row.OccurredAt.Time,
+			ObservedAt: row.ObservedAt.Time,
+			TPUCode:    intPtr(row.TpuCode),
+			Text:       row.Text,
+			Source:     row.Source,
+			Fidelity:   int(row.Fidelity),
+		})
+	}
+	return out, nil
+}
+
+// CountAndamentosByProcesso returns the "X de Y" total for the Andamentos tab: how
+// many docket entries the process holds. Tenant-scoped through the same
+// court_record join as the list.
+func (r *pgRepository) CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	crid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	total, err := r.q.CountAndamentosByProcesso(ctx, acquisitiondb.CountAndamentosByProcessoParams{
+		CourtRecordID: crid,
+		TenantID:      tid,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return total, nil
+}
+
 // likeEscaper escapes the ILIKE metacharacters so a user-typed % or _ matches
 // literally, not as a wildcard. Backslash first (it is the escape char, paired with
 // ESCAPE '\' in the queries) so the replacements do not compound.
@@ -1159,6 +1230,16 @@ func derefString(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// intPtr lifts a nullable int column (*int32) to a *int for a read model — nil on
+// NULL, so an absent tpu_code serializes as JSON null rather than 0.
+func intPtr(n *int32) *int {
+	if n == nil {
+		return nil
+	}
+	v := int(*n)
+	return &v
 }
 
 // dateOrEmpty formats a date column to the wire layout (2006-01-02), empty on NULL.

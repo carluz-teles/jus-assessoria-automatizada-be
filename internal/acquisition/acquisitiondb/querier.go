@@ -82,6 +82,9 @@ type Querier interface {
 	// INSERT so the count is consistent with what is about to be created. lifecycle is
 	// the schema's process-liveness flag; only ACTIVE records count against the ceiling.
 	CountActiveCourtRecordsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// The "X de Y" total for the Andamentos tab: how many docket entries the process
+	// holds. Tenant-scoped through the same court_record join as the list.
+	CountAndamentosByProcesso(ctx context.Context, arg CountAndamentosByProcessoParams) (int64, error)
 	// The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
 	// whose court record's cnj_number matches the search term. Called only when ?search
 	// is present; the unfiltered "Y" reuses CountIntimationsByTenant.
@@ -209,6 +212,12 @@ type Querier interface {
 	// Add one watched OAB for an integration, idempotent on (integration_id, oab_key):
 	// a re-activation with the same scope is a no-op. oab_key is the normalized "NUMBER|UF".
 	InsertWatchedOAB(ctx context.Context, arg InsertWatchedOABParams) error
+	// The "Andamentos" tab of one process: the court record's docket entries, newest
+	// first. Scoped by tenant via the court_record join (docket_entry has no tenant_id
+	// of its own) so a foreign court_record.id passed as :id yields nothing. Descending
+	// keyset on (occurred_at, id) — served by docket_entry(court_record_id, occurred_at)
+	// — the first page passes the max sentinel ('9999-12-31T23:59:59Z', max-uuid).
+	ListAndamentosByProcesso(ctx context.Context, arg ListAndamentosByProcessoParams) ([]ListAndamentosByProcessoRow, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)

@@ -16,6 +16,9 @@ type recordingReadRepo struct {
 	procTotal      int64
 	lastProcQuery  ProcessosQuery
 	procSearchSeen string
+	andRows        []AndamentoView
+	andTotal       int64
+	lastAndQuery   AndamentosQuery
 }
 
 func (r *recordingReadRepo) ListProcessos(_ context.Context, q ProcessosQuery) ([]ProcessoView, error) {
@@ -33,6 +36,13 @@ func (r *recordingReadRepo) ListIntimacoes(context.Context, IntimacoesQuery) ([]
 }
 func (r *recordingReadRepo) CountIntimacoes(context.Context, string, string) (int64, int64, error) {
 	return 0, 0, nil
+}
+func (r *recordingReadRepo) ListAndamentosByProcesso(_ context.Context, q AndamentosQuery) ([]AndamentoView, error) {
+	r.lastAndQuery = q
+	return r.andRows, nil
+}
+func (r *recordingReadRepo) CountAndamentosByProcesso(context.Context, string, string) (int64, error) {
+	return r.andTotal, nil
 }
 func (r *recordingReadRepo) GetImportStatus(context.Context, string) (ImportStatusView, error) {
 	return ImportStatusView{}, nil
@@ -100,5 +110,59 @@ func TestReadUseCase_Processos_WiresTotals(t *testing.T) {
 	}
 	if res.TotalCount != 32 || res.Total != 1247 {
 		t.Errorf("totals = (%d, %d), want (32, 1247)", res.TotalCount, res.Total)
+	}
+}
+
+// Andamentos forwards the process (court_record) and keyset cursor to the repo, over-
+// fetches limit+1 to detect the next page, trims the extra row, and wires the total.
+func TestReadUseCase_Andamentos_OverfetchesAndWiresTotal(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{
+		andRows:  []AndamentoView{{ID: "a"}, {ID: "b"}, {ID: "c"}}, // 3 rows for limit 2 → hasMore
+		andTotal: 87,
+	}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Andamentos(context.Background(), AndamentosQuery{
+		TenantID: "t-1", CourtRecordID: "cr-9", Limit: 2,
+	})
+	if err != nil {
+		t.Fatalf("Andamentos: %v", err)
+	}
+	if repo.lastAndQuery.Limit != 3 {
+		t.Errorf("repo limit = %d, want 3 (over-fetch of limit+1)", repo.lastAndQuery.Limit)
+	}
+	if repo.lastAndQuery.CourtRecordID != "cr-9" {
+		t.Errorf("CourtRecordID = %q, want cr-9 (forwarded)", repo.lastAndQuery.CourtRecordID)
+	}
+	if !res.HasMore {
+		t.Error("HasMore = false, want true")
+	}
+	if len(res.Items) != 2 {
+		t.Errorf("len(Items) = %d, want 2 (extra row trimmed)", len(res.Items))
+	}
+	if res.Total != 87 {
+		t.Errorf("Total = %d, want 87", res.Total)
+	}
+}
+
+// With no over-fetch (fewer rows than the limit) there is no next page and every row
+// is returned — the process-with-few (or no) andamentos case.
+func TestReadUseCase_Andamentos_NoNextPage(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{andRows: []AndamentoView{{ID: "a"}}}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Andamentos(context.Background(), AndamentosQuery{TenantID: "t-1", CourtRecordID: "cr-1", Limit: 20})
+	if err != nil {
+		t.Fatalf("Andamentos: %v", err)
+	}
+	if res.HasMore {
+		t.Error("HasMore = true, want false")
+	}
+	if len(res.Items) != 1 {
+		t.Errorf("len(Items) = %d, want 1", len(res.Items))
 	}
 }
