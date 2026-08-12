@@ -184,10 +184,10 @@ func (r *Relay) publish(ctx context.Context, tx database.Tx, ev pendingEvent) er
 	return nil
 }
 
-// ExtractTrace returns a ctx continuing the producer's trace, read from the
-// traceparent header the relay stamped on the task. Consumers call it first so
-// their spans join the originating trace (docs erd-backend §4c.3). With no header
-// it returns ctx unchanged.
+// ExtractTrace returns a ctx carrying the producer's span context, read from the
+// traceparent header the relay stamped on the task. The consumer middleware uses it to
+// LINK its span back to the producer (each event is its own trace; docs erd-backend
+// §4c.3). With no header it returns ctx unchanged.
 func ExtractTrace(ctx context.Context, t *asynq.Task) context.Context {
 	return CtxWithTraceContext(ctx, t.Headers()[traceparentKey])
 }

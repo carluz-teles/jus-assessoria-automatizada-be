@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -57,6 +58,14 @@ func run(logger *slog.Logger) error {
 
 	if err := health.WaitAll(ctx, cfg); err != nil {
 		return fmt.Errorf("dependency health check: %w", err)
+	}
+
+	// Without this the scheduler exported NOTHING — no traces, metrics or logs — so the
+	// daily import (RequestDay/MatchDay) was invisible in the backend. Setup installs the
+	// global providers the loops' spans and the slog OTel bridge delegate to.
+	telemetryShutdown, err := telemetry.Setup(ctx, cfg, serviceName)
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
 	}
 
 	pool, err := database.NewPool(ctx, cfg)
@@ -124,11 +133,15 @@ func run(logger *slog.Logger) error {
 			wg.Wait()
 			return nil
 		},
-		func(context.Context) error {
+		func(shutdownCtx context.Context) error {
 			cancelLoop()
 			<-loopDone
+			var errs []error
 			pool.Close()
-			return nil
+			if err := telemetryShutdown(shutdownCtx); err != nil {
+				errs = append(errs, fmt.Errorf("shutdown telemetry: %w", err))
+			}
+			return errors.Join(errs...)
 		},
 	)
 

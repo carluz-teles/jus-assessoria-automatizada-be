@@ -98,6 +98,70 @@ func TestObserve(t *testing.T) {
 	}
 }
 
+// A consumed event is its OWN trace linked to the producer: the recorded consumer span
+// is a NEW ROOT (a different trace id from the producer) carrying a link back to the
+// producer's span context, so a big async fan-out becomes many small linked traces
+// instead of one giant tree. The W3C propagator is installed by TestMain.
+func TestObserve_LinksToProducer(t *testing.T) {
+	sr := newRecorder(t)
+	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
+	producer := spanContext(t) // deterministic sampled producer, serialized as wantTraceparent
+
+	task := asynq.NewTaskWithHeaders(
+		"acquisition.sync_requested",
+		[]byte("{}"),
+		map[string]string{traceparentKey: wantTraceparent, eventIDHeader: "evt-1"},
+	)
+	handler := Observe(logger)(asynq.HandlerFunc(
+		func(context.Context, *asynq.Task) error { return nil },
+	))
+	if err := handler.ProcessTask(context.Background(), task); err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+
+	ended := sr.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(ended))
+	}
+	span := ended[0]
+
+	if span.SpanContext().TraceID() == producer.TraceID() {
+		t.Errorf("consumer span shares the producer trace id %v — want a new root", producer.TraceID())
+	}
+
+	links := span.Links()
+	if len(links) != 1 {
+		t.Fatalf("recorded %d links, want 1 (the producer)", len(links))
+	}
+	if got := links[0].SpanContext; got.TraceID() != producer.TraceID() || got.SpanID() != producer.SpanID() {
+		t.Errorf("link = %v/%v, want producer %v/%v",
+			got.TraceID(), got.SpanID(), producer.TraceID(), producer.SpanID())
+	}
+}
+
+// With no producer traceparent on the task, the consumer span is a fresh root with no
+// link — the async hop simply begins a new trace.
+func TestObserve_NoProducerNoLink(t *testing.T) {
+	sr := newRecorder(t)
+	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
+
+	task := asynq.NewTaskWithHeaders("acquisition.sync_requested", []byte("{}"), map[string]string{})
+	handler := Observe(logger)(asynq.HandlerFunc(
+		func(context.Context, *asynq.Task) error { return nil },
+	))
+	if err := handler.ProcessTask(context.Background(), task); err != nil {
+		t.Fatalf("ProcessTask: %v", err)
+	}
+
+	ended := sr.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(ended))
+	}
+	if links := ended[0].Links(); len(links) != 0 {
+		t.Errorf("recorded %d links, want 0", len(links))
+	}
+}
+
 func TestOutcomeFor(t *testing.T) {
 	tests := []struct {
 		name     string
