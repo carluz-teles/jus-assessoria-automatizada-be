@@ -58,35 +58,34 @@ locals {
       APP_BILLING_CANCEL_URL  = var.billing_cancel_url
       APP_BILLING_RETURN_URL  = var.billing_return_url
     })
-    # worker-ingestao: roda o listener de notifications (e-mail via Resend), o
-    # backfill/sync do DJEN E — com o redesign event-driven — o CONSUMER da ingestão
-    # nacional (diario_requested → FetchDiario → grava no store). Todo egress DJEN sai
-    # pelo proxy residencial (DJEN_PROXY_URL) p/ contornar o WAF que 403 o IP de datacenter.
+    # worker-ingestao: roda o listener de notifications (e-mail via Resend) e o
+    # backfill/sync DJEN por-OAB (on-demand no onboarding). Todo egress DJEN sai pelo
+    # proxy residencial (DJEN_PROXY_URL, contorna o 403 de IP datacenter) + fingerprint
+    # TLS do Chrome (uTLS no connector).
     "worker-ingestao" = merge(local.base_vars, {
       RESEND_API_KEY    = var.resend_api_key
       RESEND_FROM_EMAIL = var.resend_from_email
       DJEN_PROXY_URL    = var.djen_proxy_url
-      # DJEN pace/concorrência do sweet-spot (o teto do DJEN é ~2 req/s GLOBAL; acima
-      # disso = 429). Com INGESTION_ENABLED: o cutover troca o backfill per-OAB por
-      # history-match contra o store, E o worker passa a fetchar o diário nacional
-      # (a fila "ingestao" dá retry 25×+DLQ por tribunal). Page size = default 1000.
-      DJEN_RATE_PER_MINUTE = "120"
-      INGESTAO_CONCURRENCY = "3"
-      INGESTION_ENABLED    = "true"
+      # Com o uTLS o throttle por-JA3 do DJEN morreu (era ele o "teto", não um limite
+      # global) — então o limiter deixa de ser muleta anti-429 e vira o gargalo se ficar
+      # baixo. Backfill per-OAB rápido: 12 janelas mensais (BACKFILL_WINDOW_DAYS=30) em
+      # paralelo (INGESTAO_CONCURRENCY=12), com rate 600/min (10/s) pra saturar a
+      # concorrência. Sweet-spot inicial — medir 429/504 e empurrar se vier limpo.
+      DJEN_RATE_PER_MINUTE = "600"
+      INGESTAO_CONCURRENCY = "12"
+      BACKFILL_WINDOW_DAYS = "30"
+      INGESTION_ENABLED    = "false"
     })
     # Skeletons por ora — só a base (config.Load exige os 5 required).
     "worker-ai"           = local.base_vars
     "worker-documents"    = local.base_vars
     "worker-outbox-relay" = local.base_vars
-    # scheduler: re-poll + o PRODUTOR da ingestão nacional. Com o redesign event-driven,
-    # o scheduler NÃO fetcha mais o DJEN — só emite um diario_requested por tribunal
-    # (worker-ingestao fetcha e grava, com retry+DLQ por tribunal) e roda o match tick.
-    # Logo NÃO recebe egress DJEN (proxy/rate/page): esses vivem no worker. BOOTSTRAP_DAYS=0
-    # pula o cold-start histórico; o loop diário requisita ontem + lookback.
+    # scheduler: re-poll dos court_records due (enrichment DATAJUD). A ingestão nacional
+    # bulk está DESLIGADA (INGESTION_ENABLED=false) — voltamos pro per-OAB on-demand, que
+    # o uTLS destravou (o "teto global" era o throttle por-JA3). Sem egress DJEN aqui (o
+    # re-poll só emite eventos; o worker faz os fetches). O código bulk fica dormente.
     "scheduler" = merge(local.base_vars, {
-      INGESTION_ENABLED       = "true"
-      INGESTION_LOOKBACK_DAYS = "1"
-      BOOTSTRAP_DAYS          = "0"
+      INGESTION_ENABLED = "false"
     })
   }
 

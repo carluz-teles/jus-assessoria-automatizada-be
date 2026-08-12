@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
@@ -197,12 +198,12 @@ func run(logger *slog.Logger) error {
 		logger.Info("backfill window override", "service", serviceName, "window_days", cfg.BackfillWindowDays)
 	}
 
-	// TEMP (E2E do bulk): gate de entitlement DESLIGADO — o SyncUseCase cai no default
-	// sem ceiling (unlimitedEntitlement), pra o onboarding de teste rodar sem
-	// subscription. RESTAURAR depois do E2E:
-	//   entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
-	//   sync := acquisition.NewSyncUseCase(..., acquisition.WithEntitlementChecker(entitlement))
-	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser)
+	// The sync use case is entitlement-gated: a window that would take the tenant over its
+	// ACTIVE-process ceiling (from billing) is refused, so the per-OAB backfill honors the
+	// plan limit instead of importing unlimited processes.
+	entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
+	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser,
+		acquisition.WithEntitlementChecker(entitlement))
 
 	// DATAJUD enrichment reacts to court_record_observed (a DJEN placeholder,
 	// degree=UNKNOWN): it fetches the process by number to reveal the grau and does

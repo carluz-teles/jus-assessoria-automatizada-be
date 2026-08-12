@@ -125,16 +125,14 @@ func run(logger *slog.Logger) error {
 
 	// Acquisition wiring: the slice owns the domain; the binary only assembles it
 	// (repo + shared outbox + unit of work → write use case; the same repo backs the
-	// read use case for the processos/intimações screen reads).
-	//
-	// TEMP (E2E do bulk): gate de entitlement na BORDA DESLIGADO — sem
-	// WithActivationEntitlementChecker a ativação cai em unlimitedEntitlement, pra o
-	// onboarding de teste rodar sem subscription. RESTAURAR depois do E2E:
-	//   acquisitionEntitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
-	//   ... acquisition.NewUseCase(..., acquisition.WithActivationEntitlementChecker(acquisitionEntitlement))
+	// read use case for the processos/intimações screen reads). Activation is
+	// entitlement-gated (the tenant's ACTIVE-process ceiling, read from billing), so an
+	// over-limit onboarding is refused at the edge.
 	acquisitionRepo := acquisition.NewRepository(pool)
+	acquisitionEntitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
 	acquisitionHandler := acquisition.NewHandler(
-		acquisition.NewUseCase(acquisitionRepo, events.NewOutbox(), uow),
+		acquisition.NewUseCase(acquisitionRepo, events.NewOutbox(), uow,
+			acquisition.WithActivationEntitlementChecker(acquisitionEntitlement)),
 		acquisition.NewReadUseCase(acquisitionRepo),
 	)
 
