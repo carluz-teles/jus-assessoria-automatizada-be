@@ -1,6 +1,6 @@
 {
   "name": "Import — Observabilidade",
-  "description": "Funil de import (aquisição): descoberta DJEN, enriquecimento DATAJUD, ingestão nacional, filas asynq, erros por kind e runtime Go. Construído sobre lib/telemetry + internal/acquisition/metrics.go. Ao importar, o New Relic define a conta automaticamente (os accountIds:0 são substituídos).",
+  "description": "Funil de import (aquisição): descoberta DJEN, enriquecimento DATAJUD, ingestão nacional, filas asynq, erros por kind e runtime Go. Construído sobre lib/telemetry + internal/acquisition/metrics.go. accountIds já setados para a conta 8336829 — troque se importar em outra conta.",
   "permissions": "PUBLIC_READ_WRITE",
   "pages": [
     {
@@ -12,7 +12,7 @@
           "layout": { "column": 1, "row": 1, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.court_records) FACET state TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.court_records) FACET state TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -21,7 +21,7 @@
           "layout": { "column": 5, "row": 1, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.docket_entries_new) TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.docket_entries_new) TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -30,7 +30,7 @@
           "layout": { "column": 9, "row": 1, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.intimations) FACET state TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.intimations) FACET state TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -39,7 +39,7 @@
           "layout": { "column": 1, "row": 4, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.enrichments_applied) TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.enrichments_applied) TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -48,7 +48,7 @@
           "layout": { "column": 5, "row": 4, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.diario_publications) TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.diario_publications) TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -57,7 +57,7 @@
           "layout": { "column": 9, "row": 4, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.match_publications) TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.match_publications) TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -66,7 +66,7 @@
           "layout": { "column": 1, "row": 7, "width": 12, "height": 3 },
           "visualization": { "id": "viz.billboard" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.court_records) AS 'processos', sum(import.docket_entries_new) AS 'andamentos', sum(import.intimations) AS 'intimações', sum(import.diario_publications) AS 'diário' SINCE 1 day ago" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.court_records) AS 'processos', sum(import.docket_entries_new) AS 'andamentos', sum(import.intimations) AS 'intimações', sum(import.diario_publications) AS 'diário' SINCE 1 day ago" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         }
@@ -81,7 +81,7 @@
           "layout": { "column": 1, "row": 1, "width": 6, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.djen_requests) FACET status_class TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.djen_requests) FACET status_class TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -90,7 +90,7 @@
           "layout": { "column": 7, "row": 1, "width": 6, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT sum(import.djen_requests) WHERE status_class = '429' TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT sum(import.djen_requests) WHERE status_class = '429' TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -99,7 +99,7 @@
           "layout": { "column": 1, "row": 4, "width": 6, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Span SELECT percentile(duration.ms, 50, 95, 99) WHERE name = 'djen.request_page' TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Span SELECT percentile(duration.ms, 50, 95, 99) WHERE name = 'djen.request_page' TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -108,7 +108,7 @@
           "layout": { "column": 7, "row": 4, "width": 6, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Span SELECT percentile(duration.ms, 95) WHERE name = 'datajud.fetch_by_number' TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Span SELECT percentile(duration.ms, 95) WHERE name = 'datajud.fetch_by_number' TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -117,7 +117,7 @@
           "layout": { "column": 1, "row": 7, "width": 6, "height": 3 },
           "visualization": { "id": "viz.area" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT latest(asynq.queue.depth) FACET queue, state TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT latest(asynq.queue.depth) FACET queue, state TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -126,7 +126,7 @@
           "layout": { "column": 7, "row": 7, "width": 6, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT latest(asynq.queue.depth) WHERE state = 'pending' FACET queue TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT latest(asynq.queue.depth) WHERE state = 'pending' FACET queue TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         }
@@ -141,7 +141,7 @@
           "layout": { "column": 1, "row": 1, "width": 6, "height": 3 },
           "visualization": { "id": "viz.table" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Span SELECT count(*) WHERE error.kind IS NOT NULL AND (name LIKE 'acquisition.%' OR name LIKE 'djen.%' OR name LIKE 'datajud.%' OR name LIKE 'scheduler %') FACET error.kind, name SINCE 1 day ago" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Span SELECT count(*) WHERE error.kind IS NOT NULL AND (name LIKE 'acquisition.%' OR name LIKE 'djen.%' OR name LIKE 'datajud.%' OR name LIKE 'scheduler %') FACET error.kind, name SINCE 1 day ago" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -150,7 +150,7 @@
           "layout": { "column": 7, "row": 1, "width": 6, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Span SELECT percentage(count(*), WHERE otel.status_code = 'ERROR') WHERE name LIKE 'acquisition.%process' TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Span SELECT percentage(count(*), WHERE otel.status_code = 'ERROR') WHERE name LIKE 'acquisition.%process' TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -159,7 +159,7 @@
           "layout": { "column": 1, "row": 4, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT latest(go.goroutine.count) FACET service.name TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT latest(go.goroutine.count) FACET service.name TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -168,7 +168,7 @@
           "layout": { "column": 5, "row": 4, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT latest(go.memory.used) FACET service.name TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT latest(go.memory.used) FACET service.name TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         },
@@ -177,7 +177,7 @@
           "layout": { "column": 9, "row": 4, "width": 4, "height": 3 },
           "visualization": { "id": "viz.line" },
           "rawConfiguration": {
-            "nrqlQueries": [{ "accountIds": [0], "query": "FROM Metric SELECT percentile(go.schedule.duration, 95) FACET service.name TIMESERIES" }],
+            "nrqlQueries": [{ "accountIds": [8336829], "query": "FROM Metric SELECT percentile(go.schedule.duration, 95) FACET service.name TIMESERIES" }],
             "platformOptions": { "ignoreTimeRange": false }
           }
         }
