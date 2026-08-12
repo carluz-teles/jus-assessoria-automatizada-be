@@ -18,6 +18,7 @@ import (
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
+	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
@@ -257,6 +258,13 @@ func run(logger *slog.Logger) error {
 	notifyUC := notifications.NewNotifyUseCase(notifRepo, emailChannel, notifDedup, uow)
 	inAppUC := notifications.NewInAppUseCase(notifRepo, notifDedup, uow, pubsub.NewRedisPubSub(pubsubClient))
 	notifications.NewListener(notifyUC, inAppUC).Register(mux)
+
+	// deadline (slice 2c): consume acquisition.intimation.observed and derive the prazo
+	// deterministically (rules layer → the shared judicial calendar `cal`), persisting it
+	// PENDING and emitting deadline.opened in one idempotent tx. intimation.observed routes
+	// to the "ingestao" queue, so its handler mounts on the main mux alongside the others.
+	deadlineUC := deadline.NewUseCase(deadline.NewRepository(), cal, outbox, deadline.NewDedup(), uow)
+	deadline.NewListener(deadlineUC).Register(mux)
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)
