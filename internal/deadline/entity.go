@@ -116,6 +116,25 @@ type DeadlineForConfirm struct {
 	StartDate     time.Time
 }
 
+// DeadlineForAdjust is the FULL adjustable state the F2 ajuste manual loads BEFORE the
+// recompute (GetDeadlineForAdjust, PATCH /v1/prazos/:id), keyed by id: the prazo id, the
+// record it hangs on (feeds the court lookup), the fixed StartDate the calendar re-counts
+// from, the Status the ajuste is gated on (only PENDING/OPEN is adjustable), and the CURRENT
+// {Kind, Days, Counting, Doubled, DoubledReason} the partial patch is applied over — a field
+// absent from the body keeps its stored value. A missing prazo is ErrDeadlineNotFound (→ 404),
+// never a zero value.
+type DeadlineForAdjust struct {
+	ID            string
+	CourtRecordID string
+	StartDate     time.Time
+	Status        Status
+	Kind          string
+	Days          int
+	Counting      Counting
+	Doubled       bool
+	DoubledReason string
+}
+
 // Kind constants — the legible prazo kinds the v0 rules layer emits (docs/erd-prazos.md
 // §4/§8). GENERICO is the safe catch-all the UI later flags "confirme".
 const (

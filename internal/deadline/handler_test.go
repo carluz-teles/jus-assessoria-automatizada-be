@@ -63,19 +63,53 @@ func (r *recordingReader) Prazo(_ context.Context, tenantID, id string) (PrazoDe
 	return r.detailView, r.detailErr
 }
 
-// recordingWriter implements the handler's writer port, capturing the confirm command the
-// handler forwards and returning a canned result/error.
+// recordingWriter implements the handler's writer port, capturing the commands the handler
+// forwards and returning canned results/errors for each write entry point.
 type recordingWriter struct {
 	gotCmd ConfirmCommand
 	calls  int
 	res    ConfirmResult
 	err    error
+
+	// adjust
+	gotAdjustCmd AdjustCommand
+	adjustCalls  int
+	adjustRes    AdjustedDeadline
+	adjustErr    error
+
+	// met / missed
+	gotMetTenant, gotMetID       string
+	metCalls                     int
+	metRes                       MarkedDeadline
+	metErr                       error
+	gotMissedTenant, gotMissedID string
+	missedCalls                  int
+	missedRes                    MarkedDeadline
+	missedErr                    error
 }
 
 func (w *recordingWriter) Confirm(_ context.Context, cmd ConfirmCommand) (ConfirmResult, error) {
 	w.calls++
 	w.gotCmd = cmd
 	return w.res, w.err
+}
+
+func (w *recordingWriter) Adjust(_ context.Context, cmd AdjustCommand) (AdjustedDeadline, error) {
+	w.adjustCalls++
+	w.gotAdjustCmd = cmd
+	return w.adjustRes, w.adjustErr
+}
+
+func (w *recordingWriter) MarkMet(_ context.Context, tenantID, deadlineID string) (MarkedDeadline, error) {
+	w.metCalls++
+	w.gotMetTenant, w.gotMetID = tenantID, deadlineID
+	return w.metRes, w.metErr
+}
+
+func (w *recordingWriter) MarkMissed(_ context.Context, tenantID, deadlineID string) (MarkedDeadline, error) {
+	w.missedCalls++
+	w.gotMissedTenant, w.gotMissedID = tenantID, deadlineID
+	return w.missedRes, w.missedErr
 }
 
 // newApp builds an app whose /v1 group mirrors production: Auth resolves a principal with
@@ -516,5 +550,186 @@ func TestHandler_Confirm_NoToken_401(t *testing.T) {
 	}
 	if wr.calls != 0 {
 		t.Errorf("writer calls = %d, want 0 (blocked at auth)", wr.calls)
+	}
+}
+
+// --- PATCH /v1/prazos/:id (ajuste) ------------------------------------------
+
+// The ajuste handler takes tenant_id/confirmed_by from the PRINCIPAL and the prazo id from the
+// PATH (never the body), forwards ONLY the present fields (a partial patch), and returns 200
+// with the recomputed prazo.
+func TestHandler_Adjust_ForwardsPartialPatchFromPrincipalAndPath(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{adjustRes: AdjustedDeadline{ID: "d-1", Days: 10, Status: StatusOpen, Counting: CountingBusiness}}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	// Only days + counting present; kind/doubled/doubled_reason are absent (nil).
+	body := `{"days":10,"counting":"BUSINESS"}`
+	status, resBody := doJSON(t, app, http.MethodPatch, "/v1/prazos/d-1", "jwt", body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
+	}
+	if wr.adjustCalls != 1 {
+		t.Fatalf("adjust calls = %d, want 1", wr.adjustCalls)
+	}
+	cmd := wr.gotAdjustCmd
+	if cmd.TenantID != "tenant-9" || cmd.UserID != "u-1" || cmd.DeadlineID != "d-1" {
+		t.Errorf("tenant/user/id = %q/%q/%q, want tenant-9/u-1/d-1", cmd.TenantID, cmd.UserID, cmd.DeadlineID)
+	}
+	if cmd.Days == nil || *cmd.Days != 10 || cmd.Counting == nil || *cmd.Counting != CountingBusiness {
+		t.Errorf("present fields days/counting = %v/%v, want 10/BUSINESS", cmd.Days, cmd.Counting)
+	}
+	if cmd.Kind != nil || cmd.Doubled != nil || cmd.DoubledReason != nil {
+		t.Errorf("absent fields carried non-nil: kind=%v doubled=%v reason=%v", cmd.Kind, cmd.Doubled, cmd.DoubledReason)
+	}
+	if !strings.Contains(resBody, `"id":"d-1"`) || !strings.Contains(resBody, `"days":10`) || !strings.Contains(resBody, `"status":"OPEN"`) {
+		t.Errorf("response missing recomputed deadline\ngot: %s", resBody)
+	}
+}
+
+// A present-but-invalid field (days ≤ 0 or a bad counting) is a 400; the use case is never
+// called. An absent field is fine (nothing to validate).
+func TestHandler_Adjust_Validation_400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"days zero", `{"days":0}`},
+		{"days negative", `{"days":-3}`},
+		{"bad counting", `{"counting":"WEEKLY"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPatch, "/v1/prazos/d-1", "jwt", tt.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+			}
+			if wr.adjustCalls != 0 {
+				t.Errorf("adjust calls = %d, want 0 (rejected at the edge)", wr.adjustCalls)
+			}
+		})
+	}
+}
+
+// A terminal prazo is the use case's typed ErrDeadlineNotAdjustable → 409; a miss → 404.
+func TestHandler_Adjust_StatusErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantKind   string
+	}{
+		{"terminal → 409", ErrDeadlineNotAdjustable, http.StatusConflict, string(apperr.KindConflict)},
+		{"missing → 404", ErrDeadlineNotFound, http.StatusNotFound, string(apperr.KindNotFound)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{adjustErr: tt.err}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPatch, "/v1/prazos/d-1", "jwt", `{"days":10}`)
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", status, tt.wantStatus, body)
+			}
+			if !strings.Contains(body, tt.wantKind) {
+				t.Errorf("body missing kind %q\ngot: %s", tt.wantKind, body)
+			}
+		})
+	}
+}
+
+// --- POST /v1/prazos/:id/met | .../missed -----------------------------------
+
+// The met/missed handlers take the prazo id from the PATH and tenant from the PRINCIPAL, and
+// return 200 with {deadline_id, status}. No body is required.
+func TestHandler_MarkMetAndMissed_ForwardsFromPrincipalAndPath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		path       string
+		wantStatus string
+	}{
+		{"met", "/v1/prazos/d-1/met", "MET"},
+		{"missed", "/v1/prazos/d-1/missed", "MISSED"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{
+				metRes:    MarkedDeadline{ID: "d-1", Status: StatusMet},
+				missedRes: MarkedDeadline{ID: "d-1", Status: StatusMissed},
+			}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPost, tt.path, "jwt", "")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+			}
+			if !strings.Contains(body, `"deadline_id":"d-1"`) || !strings.Contains(body, `"status":"`+tt.wantStatus+`"`) {
+				t.Errorf("response = %s, want deadline_id d-1 + status %s", body, tt.wantStatus)
+			}
+			if tt.name == "met" {
+				if wr.metCalls != 1 || wr.gotMetTenant != "tenant-9" || wr.gotMetID != "d-1" {
+					t.Errorf("met forwarded calls/tenant/id = %d/%q/%q, want 1/tenant-9/d-1", wr.metCalls, wr.gotMetTenant, wr.gotMetID)
+				}
+			} else {
+				if wr.missedCalls != 1 || wr.gotMissedTenant != "tenant-9" || wr.gotMissedID != "d-1" {
+					t.Errorf("missed forwarded calls/tenant/id = %d/%q/%q, want 1/tenant-9/d-1", wr.missedCalls, wr.gotMissedTenant, wr.gotMissedID)
+				}
+			}
+		})
+	}
+}
+
+// A non-OPEN prazo is the use case's typed ErrDeadlineNotOpen → 409; a miss → 404.
+func TestHandler_MarkMet_StatusErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"not open → 409", ErrDeadlineNotOpen, http.StatusConflict},
+		{"missing → 404", ErrDeadlineNotFound, http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{metErr: tt.err}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPost, "/v1/prazos/d-1/met", "jwt", "")
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", status, tt.wantStatus, body)
+			}
+		})
+	}
+}
+
+// No bearer token → 401 at the auth boundary; the met handler never runs.
+func TestHandler_MarkMet_NoToken_401(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	status, _ := doJSON(t, app, http.MethodPost, "/v1/prazos/d-1/met", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if wr.metCalls != 0 {
+		t.Errorf("met calls = %d, want 0 (blocked at auth)", wr.metCalls)
 	}
 }

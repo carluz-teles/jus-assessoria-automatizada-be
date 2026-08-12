@@ -133,6 +133,52 @@ RETURNING id;
 DELETE FROM task
 WHERE deadline_id = $1 AND tenant_id = $2;
 
+-- name: GetDeadlineForAdjust :one
+-- Load a prazo's FULL adjustable state — the F2 ajuste manual (§9: PATCH /v1/prazos/:id)
+-- reads it BEFORE the recompute: start_date is the fixed anchor the calendar re-counts
+-- from, court_record_id feeds the court lookup (recompute UF), and the CURRENT
+-- {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
+-- over (a field absent from the body keeps its stored value). status gates the ajuste (only
+-- a PENDING/OPEN prazo is adjustable). Keyed by id and scoped to tenant_id (barrier 1, on top
+-- of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at
+-- the mapper (→ 404), never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
+SELECT id, court_record_id, start_date, status, kind, days, counting, doubled, doubled_reason
+FROM deadline
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: UpdateDeadlineAdjust :one
+-- Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
+-- patched {kind, days, counting, doubled, doubled_reason} and the RECOMPUTED {end_date,
+-- holidays_applied} (from the fixed start_date), keyed by id and scoped to tenant_id (barrier
+-- 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays PENDING, an
+-- OPEN stays OPEN — the use case already refused a terminal prazo); source/start_date/
+-- rules_version/confirmed_* are untouched (the anchor and provenance persist). A no-match (the
+-- row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
+-- and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
+UPDATE deadline
+SET kind             = $3,
+    days             = $4,
+    counting         = $5,
+    doubled          = $6,
+    doubled_reason   = $7,
+    end_date         = $8,
+    holidays_applied = $9
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, court_record_id;
+
+-- name: MarkDeadlineStatus :one
+-- Manual lifecycle transition of a prazo (§9: POST /v1/prazos/:id/met | .../missed → marca
+-- cumprido/perdido). Flips status from current_status to new_status, keyed by id and scoped
+-- to tenant_id (barrier 1). The `status = current_status` guard makes the flip SAFE and
+-- IDEMPOTENT under concurrency: the caller pre-checks the transition (loading the prazo for a
+-- distinct not-found vs invalid-transition error), and this guard defends the write against a
+-- racing flip — a no-match (already transitioned) → pgx.ErrNoRows → typed not-found at the
+-- mapper. On a hit it returns the id so deadline.met/deadline.missed commits in the SAME tx.
+UPDATE deadline
+SET status = sqlc.arg(new_status)
+WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id) AND status = sqlc.arg(current_status)
+RETURNING id;
+
 -- name: GetDeadlineForCheck :one
 -- Re-read a prazo at a scheduled mark's fire time (deadline.reminder_check): the CURRENT
 -- status the fire handler branches on, plus the end_date and the context (kind, counting,

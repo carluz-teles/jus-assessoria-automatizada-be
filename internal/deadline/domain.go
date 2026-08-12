@@ -68,6 +68,24 @@ type Repository interface {
 	// DB-assigned id (echoing the entity, like InsertDeadline). Scoping is via the entity's
 	// TenantID + RLS.
 	InsertTask(ctx context.Context, tx database.Tx, t *Task) (*Task, error)
+	// GetDeadlineForAdjust loads a prazo's FULL adjustable state (id, court_record_id,
+	// start_date, status, and the current kind/days/counting/doubled/doubled_reason) by its
+	// id, scoped to tenantID (barrier 1). It backs the ajuste manual (PATCH /v1/prazos/:id):
+	// the partial patch is applied over these current values, and the recompute re-counts from
+	// the fixed start_date. A missing id in the tenant is ErrDeadlineNotFound (→ 404), never
+	// (nil, nil).
+	GetDeadlineForAdjust(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (*DeadlineForAdjust, error)
+	// UpdateDeadlineAdjust writes the patched fields + the recomputed {end_date,
+	// holidays_applied} keyed by the prazo id and scoped to tenantID (barrier 1); status/
+	// source/start_date are left as-is (the ajuste never changes the lifecycle or the anchor).
+	// A no-match is ErrDeadlineNotFound. Returns the prazo id + the record it hangs on.
+	UpdateDeadlineAdjust(ctx context.Context, tx database.Tx, p UpdateDeadlineAdjustParams) (deadlineID, courtRecordID string, err error)
+	// MarkDeadlineStatus flips a prazo from `from` to `to` keyed by its id and scoped to
+	// tenantID (barrier 1), guarded by `status = from` so the write is safe under a racing
+	// flip. The use case pre-checks the transition (distinguishing a 404 miss from a 409
+	// invalid transition); this guarded UPDATE is the concurrency floor. A no-match (already
+	// transitioned) is ErrDeadlineNotFound. Returns the flipped prazo's id.
+	MarkDeadlineStatus(ctx context.Context, tx database.Tx, deadlineID, tenantID string, from, to Status) (string, error)
 	// GetDeadlineForCheck re-reads a prazo at a scheduled mark's fire time, keyed by its id
 	// and scoped to tenantID (barrier 1). It backs OnReminderCheck's re-check: the CURRENT
 	// status decides whether a lembrete is still due. A missing id in the tenant (a prazo

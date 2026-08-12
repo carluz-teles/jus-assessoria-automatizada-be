@@ -152,6 +152,54 @@ func (q *Queries) GetCourtRecordCourt(ctx context.Context, arg GetCourtRecordCou
 	return court, err
 }
 
+const getDeadlineForAdjust = `-- name: GetDeadlineForAdjust :one
+SELECT id, court_record_id, start_date, status, kind, days, counting, doubled, doubled_reason
+FROM deadline
+WHERE id = $1 AND tenant_id = $2
+`
+
+type GetDeadlineForAdjustParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetDeadlineForAdjustRow struct {
+	ID            uuid.UUID   `json:"id"`
+	CourtRecordID uuid.UUID   `json:"court_record_id"`
+	StartDate     pgtype.Date `json:"start_date"`
+	Status        string      `json:"status"`
+	Kind          *string     `json:"kind"`
+	Days          int32       `json:"days"`
+	Counting      string      `json:"counting"`
+	Doubled       bool        `json:"doubled"`
+	DoubledReason *string     `json:"doubled_reason"`
+}
+
+// Load a prazo's FULL adjustable state — the F2 ajuste manual (§9: PATCH /v1/prazos/:id)
+// reads it BEFORE the recompute: start_date is the fixed anchor the calendar re-counts
+// from, court_record_id feeds the court lookup (recompute UF), and the CURRENT
+// {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
+// over (a field absent from the body keeps its stored value). status gates the ajuste (only
+// a PENDING/OPEN prazo is adjustable). Keyed by id and scoped to tenant_id (barrier 1, on top
+// of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at
+// the mapper (→ 404), never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
+func (q *Queries) GetDeadlineForAdjust(ctx context.Context, arg GetDeadlineForAdjustParams) (GetDeadlineForAdjustRow, error) {
+	row := q.db.QueryRow(ctx, getDeadlineForAdjust, arg.ID, arg.TenantID)
+	var i GetDeadlineForAdjustRow
+	err := row.Scan(
+		&i.ID,
+		&i.CourtRecordID,
+		&i.StartDate,
+		&i.Status,
+		&i.Kind,
+		&i.Days,
+		&i.Counting,
+		&i.Doubled,
+		&i.DoubledReason,
+	)
+	return i, err
+}
+
 const getDeadlineForCheck = `-- name: GetDeadlineForCheck :one
 SELECT id, status, end_date, court_record_id, kind, counting
 FROM deadline
@@ -335,6 +383,39 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UU
 	return id, err
 }
 
+const markDeadlineStatus = `-- name: MarkDeadlineStatus :one
+UPDATE deadline
+SET status = $1
+WHERE id = $2 AND tenant_id = $3 AND status = $4
+RETURNING id
+`
+
+type MarkDeadlineStatusParams struct {
+	NewStatus     string    `json:"new_status"`
+	ID            uuid.UUID `json:"id"`
+	TenantID      uuid.UUID `json:"tenant_id"`
+	CurrentStatus string    `json:"current_status"`
+}
+
+// Manual lifecycle transition of a prazo (§9: POST /v1/prazos/:id/met | .../missed → marca
+// cumprido/perdido). Flips status from current_status to new_status, keyed by id and scoped
+// to tenant_id (barrier 1). The `status = current_status` guard makes the flip SAFE and
+// IDEMPOTENT under concurrency: the caller pre-checks the transition (loading the prazo for a
+// distinct not-found vs invalid-transition error), and this guard defends the write against a
+// racing flip — a no-match (already transitioned) → pgx.ErrNoRows → typed not-found at the
+// mapper. On a hit it returns the id so deadline.met/deadline.missed commits in the SAME tx.
+func (q *Queries) MarkDeadlineStatus(ctx context.Context, arg MarkDeadlineStatusParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, markDeadlineStatus,
+		arg.NewStatus,
+		arg.ID,
+		arg.TenantID,
+		arg.CurrentStatus,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const markMissed = `-- name: MarkMissed :one
 UPDATE deadline
 SET status = 'MISSED'
@@ -442,6 +523,61 @@ type RevokeDeadlineByIntimationRow struct {
 func (q *Queries) RevokeDeadlineByIntimation(ctx context.Context, arg RevokeDeadlineByIntimationParams) (RevokeDeadlineByIntimationRow, error) {
 	row := q.db.QueryRow(ctx, revokeDeadlineByIntimation, arg.NotificationID, arg.TenantID)
 	var i RevokeDeadlineByIntimationRow
+	err := row.Scan(&i.ID, &i.CourtRecordID)
+	return i, err
+}
+
+const updateDeadlineAdjust = `-- name: UpdateDeadlineAdjust :one
+UPDATE deadline
+SET kind             = $3,
+    days             = $4,
+    counting         = $5,
+    doubled          = $6,
+    doubled_reason   = $7,
+    end_date         = $8,
+    holidays_applied = $9
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, court_record_id
+`
+
+type UpdateDeadlineAdjustParams struct {
+	ID              uuid.UUID   `json:"id"`
+	TenantID        uuid.UUID   `json:"tenant_id"`
+	Kind            *string     `json:"kind"`
+	Days            int32       `json:"days"`
+	Counting        string      `json:"counting"`
+	Doubled         bool        `json:"doubled"`
+	DoubledReason   *string     `json:"doubled_reason"`
+	EndDate         pgtype.Date `json:"end_date"`
+	HolidaysApplied []byte      `json:"holidays_applied"`
+}
+
+type UpdateDeadlineAdjustRow struct {
+	ID            uuid.UUID `json:"id"`
+	CourtRecordID uuid.UUID `json:"court_record_id"`
+}
+
+// Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
+// patched {kind, days, counting, doubled, doubled_reason} and the RECOMPUTED {end_date,
+// holidays_applied} (from the fixed start_date), keyed by id and scoped to tenant_id (barrier
+// 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays PENDING, an
+// OPEN stays OPEN — the use case already refused a terminal prazo); source/start_date/
+// rules_version/confirmed_* are untouched (the anchor and provenance persist). A no-match (the
+// row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
+// and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
+func (q *Queries) UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAdjustParams) (UpdateDeadlineAdjustRow, error) {
+	row := q.db.QueryRow(ctx, updateDeadlineAdjust,
+		arg.ID,
+		arg.TenantID,
+		arg.Kind,
+		arg.Days,
+		arg.Counting,
+		arg.Doubled,
+		arg.DoubledReason,
+		arg.EndDate,
+		arg.HolidaysApplied,
+	)
+	var i UpdateDeadlineAdjustRow
 	err := row.Scan(&i.ID, &i.CourtRecordID)
 	return i, err
 }

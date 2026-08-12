@@ -48,6 +48,15 @@ type mockRepo struct {
 	confirmErr       error
 	insertTaskErr    error
 
+	// adjust + manual transition path (5c)
+	adjustResult       *DeadlineForAdjust
+	adjustErr          error
+	updateAdjustID     string
+	updateAdjustRecord string
+	updateAdjustErr    error
+	markStatusID       string
+	markStatusErr      error
+
 	// captured inputs
 	gotClassTenantID      string
 	gotClassRecordID      string
@@ -78,6 +87,16 @@ type mockRepo struct {
 	gotDeleteDeadlineID   string
 	gotDeleteTenantID     string
 	deleteTasksCalls      int
+	gotAdjustID           string
+	gotAdjustTenantID     string
+	adjustReadCalls       int
+	gotUpdateAdjustParams UpdateDeadlineAdjustParams
+	updateAdjustCalls     int
+	gotMarkStatusID       string
+	gotMarkStatusTenantID string
+	gotMarkStatusFrom     Status
+	gotMarkStatusTo       Status
+	markStatusCalls       int
 }
 
 func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
@@ -156,6 +175,40 @@ func (m *mockRepo) DeleteTasksByDeadline(_ context.Context, _ database.Tx, deadl
 	m.gotDeleteTenantID = tenantID
 	m.insertedTasks = nil
 	return nil
+}
+
+// GetDeadlineForAdjust returns the configured adjustable state and records the (id, tenant)
+// scoping so an ajuste test can assert the 2-barrier key.
+func (m *mockRepo) GetDeadlineForAdjust(_ context.Context, _ database.Tx, deadlineID, tenantID string) (*DeadlineForAdjust, error) {
+	m.adjustReadCalls++
+	m.gotAdjustID = deadlineID
+	m.gotAdjustTenantID = tenantID
+	return m.adjustResult, m.adjustErr
+}
+
+// UpdateDeadlineAdjust captures the merged/recomputed params and echoes the configured ids,
+// so a test can assert the patch was applied over the stored values and the recompute landed.
+func (m *mockRepo) UpdateDeadlineAdjust(_ context.Context, _ database.Tx, p UpdateDeadlineAdjustParams) (string, string, error) {
+	m.updateAdjustCalls++
+	m.gotUpdateAdjustParams = p
+	if m.updateAdjustErr != nil {
+		return "", "", m.updateAdjustErr
+	}
+	return m.updateAdjustID, m.updateAdjustRecord, nil
+}
+
+// MarkDeadlineStatus records the (id, tenant, from, to) of a manual transition and returns the
+// configured flipped id (or error), so a met/missed test can assert the guarded flip's args.
+func (m *mockRepo) MarkDeadlineStatus(_ context.Context, _ database.Tx, deadlineID, tenantID string, from, to Status) (string, error) {
+	m.markStatusCalls++
+	m.gotMarkStatusID = deadlineID
+	m.gotMarkStatusTenantID = tenantID
+	m.gotMarkStatusFrom = from
+	m.gotMarkStatusTo = to
+	if m.markStatusErr != nil {
+		return "", m.markStatusErr
+	}
+	return m.markStatusID, nil
 }
 
 // InsertTask echoes the task back with a real uuid id (as the DB would), so a test can

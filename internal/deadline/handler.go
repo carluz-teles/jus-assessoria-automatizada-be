@@ -25,11 +25,15 @@ type reader interface {
 	Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
 }
 
-// writer is the narrow port the Handler uses from the write use case — the single F2
-// confirmation entry point. It is deliberately separate from reader (and from the read
-// use case): the confirm runs on the transactional write path, the reads on the pool.
+// writer is the narrow port the Handler uses from the write use case — the F2 confirmation
+// PLUS the ajuste manual (PATCH) and the manual transitions (met/missed). It is deliberately
+// separate from reader (and from the read use case): the writes run on the transactional
+// write path, the reads on the pool.
 type writer interface {
 	Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResult, error)
+	Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadline, error)
+	MarkMet(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
+	MarkMissed(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
 }
 
 // Handler is the deadline HTTP surface. It owns its routing; the api only composes by
@@ -47,14 +51,18 @@ func NewHandler(reader reader, writer writer) *Handler {
 }
 
 // RegisterV1 mounts the prazos routes on the /v1 group: three reads open to any
-// authenticated principal of the tenant (scoped to its own prazos), plus the F2 write
-// POST /prazos/confirm. The api calls this once — adding the slice's HTTP surface is one
-// line of composition.
+// authenticated principal of the tenant (scoped to its own prazos), the F2 write
+// POST /prazos/confirm, and the ajuste + manual transitions of an already-derived prazo
+// (PATCH /prazos/:id, POST /prazos/:id/met, POST /prazos/:id/missed). The api calls this
+// once — adding the slice's HTTP surface is one line of composition.
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/processos/:id/prazos", h.listPrazosByProcesso)
 	r.Get("/prazos", h.listPrazos)
 	r.Get("/prazos/:id", h.getPrazo)
 	r.Post("/prazos/confirm", h.confirmPrazo)
+	r.Patch("/prazos/:id", h.adjustPrazo)
+	r.Post("/prazos/:id/met", h.markPrazoMet)
+	r.Post("/prazos/:id/missed", h.markPrazoMissed)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending scan (soonest vencimento
@@ -172,6 +180,62 @@ func (h *Handler) confirmPrazo(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(newConfirmResponse(res))
 }
 
+// adjustPrazo handles PATCH /v1/prazos/:id: the F2 ajuste manual (§9). It validates the
+// partial body, then recomputes + updates the prazo in one tx, returning 200 with the
+// recomputed prazo. tenant_id comes from the principal and the prazo id from the path (never
+// the body). A miss is the use case's typed ErrDeadlineNotFound → 404; a terminal prazo is
+// ErrDeadlineNotAdjustable → 409; a bad body is a 400 with the {kind,message,details} envelope.
+func (h *Handler) adjustPrazo(c *fiber.Ctx) error {
+	var req AdjustRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	res, err := h.writer.Adjust(c.UserContext(), req.toAdjustCommand(p.TenantID, p.UserID, c.Params("id")))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newAdjustResponse(res))
+}
+
+// markPrazoMet handles POST /v1/prazos/:id/met: mark cumprido (§9), OPEN→MET. No body — the
+// prazo id comes from the path and tenant_id from the principal. A miss is ErrDeadlineNotFound
+// → 404; a non-OPEN prazo is ErrDeadlineNotOpen → 409.
+func (h *Handler) markPrazoMet(c *fiber.Ctx) error {
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	res, err := h.writer.MarkMet(c.UserContext(), p.TenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newMarkResponse(res))
+}
+
+// markPrazoMissed handles POST /v1/prazos/:id/missed: mark perdido (§9), OPEN→MISSED. The
+// manual counterpart of the D+1 carência auto-miss (4b-ii) — same guard (OPEN only), same
+// deadline.missed fact. A miss → 404; a non-OPEN prazo → 409.
+func (h *Handler) markPrazoMissed(c *fiber.Ctx) error {
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	res, err := h.writer.MarkMissed(c.UserContext(), p.TenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newMarkResponse(res))
+}
+
 // isKnownStatus reports whether s is a member of the closed prazo status set (the DB
 // CHECK enforces the same set). An unknown ?status is rejected at the edge rather than
 // silently returning an empty page.
@@ -282,6 +346,54 @@ func newConfirmResponse(res ConfirmResult) confirmResponse {
 		},
 		Tasks: tasks,
 	}
+}
+
+// adjustedDeadlineView is the PATCH /v1/prazos/:id payload: the recomputed prazo (the ajuste
+// touches only the deadline, so there are no tasks). It carries the same auditable
+// holidays_applied + wire dates as the confirm view; Status is echoed unchanged (the ajuste
+// never flips the lifecycle).
+type adjustedDeadlineView struct {
+	ID              string    `json:"id"`
+	CourtRecordID   string    `json:"court_record_id"`
+	Kind            string    `json:"kind"`
+	Days            int       `json:"days"`
+	Counting        string    `json:"counting"`
+	Doubled         bool      `json:"doubled"`
+	DoubledReason   string    `json:"doubled_reason"`
+	Status          string    `json:"status"`
+	StartDate       time.Time `json:"start_date"`
+	EndDate         time.Time `json:"end_date"`
+	HolidaysApplied []string  `json:"holidays_applied"`
+}
+
+// newAdjustResponse maps the use case's AdjustedDeadline to the client-facing payload; the
+// holidays audit is formatted here (always a non-nil slice, so an empty audit is []).
+func newAdjustResponse(d AdjustedDeadline) adjustedDeadlineView {
+	return adjustedDeadlineView{
+		ID:              d.ID,
+		CourtRecordID:   d.CourtRecordID,
+		Kind:            d.Kind,
+		Days:            d.Days,
+		Counting:        string(d.Counting),
+		Doubled:         d.Doubled,
+		DoubledReason:   d.DoubledReason,
+		Status:          string(d.Status),
+		StartDate:       d.StartDate,
+		EndDate:         d.EndDate,
+		HolidaysApplied: formatDates(d.HolidaysApplied),
+	}
+}
+
+// markResponse is the POST /v1/prazos/:id/met | .../missed payload: the transitioned prazo id
+// and its new status (MET / MISSED) — the minimal fact the F2 screen needs to reflect the flip.
+type markResponse struct {
+	DeadlineID string `json:"deadline_id"`
+	Status     string `json:"status"`
+}
+
+// newMarkResponse maps the use case's MarkedDeadline to the client-facing payload.
+func newMarkResponse(d MarkedDeadline) markResponse {
+	return markResponse{DeadlineID: d.ID, Status: string(d.Status)}
 }
 
 // formatDates renders the holidays audit as wire dates (2006-01-02), always a non-nil

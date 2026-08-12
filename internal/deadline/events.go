@@ -294,6 +294,37 @@ func newDeadlineMissed(tenantID, deadlineID string) DeadlineMissed {
 	}
 }
 
+// TypeDeadlineMet is the dotted id this slice PRODUCES when a human marks a prazo cumprido
+// (docs/erd-prazos.md §9: POST /v1/prazos/:id/met — transição de status OPEN→MET). Same
+// "deadline" prefix/routing as deadline.missed; its consumer (read models, notifications)
+// updates the prazo as done. It is the positive counterpart of deadline.missed.
+const TypeDeadlineMet = "deadline.met"
+
+// DeadlineMet announces a prazo manually marked MET (OPEN→MET). It mirrors DeadlineMissed:
+// TenantID scopes the future consumer's read/send, DeadlineID is the prazo. Immediate (no
+// process_at). The aggregate is the deadline, so its stream orders by the deadline id.
+type DeadlineMet struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
+
+var _ events.Event = DeadlineMet{}
+
+func (DeadlineMet) Type() string          { return TypeDeadlineMet }
+func (DeadlineMet) AggregateType() string { return aggregateTypeDeadline }
+
+// newDeadlineMet builds the immediate MET fact. Fresh uuid v7 event id (the consumer dedup
+// key); aggregate_id is the deadline id (a uuid, satisfying the outbox's uuid NOT NULL),
+// mirroring newDeadlineMissed.
+func newDeadlineMet(tenantID, deadlineID string) DeadlineMet {
+	return DeadlineMet{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+	}
+}
+
 // TypeDeadlineUpdated is the dotted id this slice PRODUCES when the F2 human confirmation
 // flips a prazo PENDING→OPEN with the recomputed dates (docs/erd-prazos.md §7: deadline.updated
 // {deadline_id, ...} — ajuste humano no F2). Same "deadline" prefix/routing as deadline.opened;
@@ -318,17 +349,30 @@ var _ events.Event = DeadlineUpdated{}
 func (DeadlineUpdated) Type() string          { return TypeDeadlineUpdated }
 func (DeadlineUpdated) AggregateType() string { return aggregateTypeDeadline }
 
-// newDeadlineUpdated builds the produced event from the confirmed prazo. aggregate_id is the
+// newDeadlineUpdated builds the produced event from the confirmed prazo (F2 confirm, 5a).
+func newDeadlineUpdated(d ConfirmedDeadline) DeadlineUpdated {
+	return deadlineUpdatedEvent(d.ID, d.Kind, d.EndDate, d.Counting, d.Status)
+}
+
+// newDeadlineUpdatedFromAdjust builds the same produced event from an ajuste manual (5c,
+// PATCH /v1/prazos/:id). Both the confirm and the ajuste recompute the prazo and announce it
+// with deadline.updated, so both funnel through the one builder — the event contract has a
+// single source (no parallel construction to drift).
+func newDeadlineUpdatedFromAdjust(d AdjustedDeadline) DeadlineUpdated {
+	return deadlineUpdatedEvent(d.ID, d.Kind, d.EndDate, d.Counting, d.Status)
+}
+
+// deadlineUpdatedEvent is the shared builder for deadline.updated. aggregate_id is the
 // deadline id (a uuid, satisfying the outbox's uuid NOT NULL); the event id is a fresh uuid v7
 // (the consumer dedup key), mirroring newDeadlineOpened.
-func newDeadlineUpdated(d ConfirmedDeadline) DeadlineUpdated {
+func deadlineUpdatedEvent(id, kind string, endDate time.Time, counting Counting, status Status) DeadlineUpdated {
 	return DeadlineUpdated{
-		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: d.ID},
-		DeadlineID: d.ID,
-		Kind:       d.Kind,
-		EndDate:    d.EndDate.Format(time.DateOnly),
-		Counting:   string(d.Counting),
-		Status:     string(d.Status),
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: id},
+		DeadlineID: id,
+		Kind:       kind,
+		EndDate:    endDate.Format(time.DateOnly),
+		Counting:   string(counting),
+		Status:     string(status),
 	}
 }
 

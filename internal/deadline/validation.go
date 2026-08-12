@@ -77,6 +77,79 @@ func (t ConfirmTaskRequest) Validate() error {
 	)
 }
 
+// AdjustRequest is the PATCH /v1/prazos/:id body (docs/erd-prazos.md §9): the partial ajuste
+// of an already-derived prazo. Every field is a POINTER so an ABSENT field (kept at its stored
+// value) is distinguishable from a present zero value — a partial patch, not a full replace.
+// tenant_id / the prazo id / user come from the principal + path, never the body; the
+// recomputed end_date is server-derived, so it is not accepted either.
+type AdjustRequest struct {
+	Kind          *string `json:"kind"`
+	Days          *int    `json:"days"`
+	Counting      *string `json:"counting"`
+	Doubled       *bool   `json:"doubled"`
+	DoubledReason *string `json:"doubled_reason"`
+}
+
+// Validate enforces the edge rules for the fields that ARE present (a nil field is a no-op,
+// kept at its stored value): days > 0 and a counting in the closed set. The rules are custom
+// (validation.By) rather than ozzo's Min/In because those skip a nil pointer AND a present
+// zero, which would silently accept days:0 — here a PRESENT day count must be positive.
+func (r AdjustRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Days, validation.By(positiveDaysIfPresent)),
+		validation.Field(&r.Counting, validation.By(validCountingIfPresent)),
+	)
+}
+
+// positiveDaysIfPresent rejects a PRESENT, non-positive day count; an absent (nil) days is a
+// no-op (the stored value is kept).
+func positiveDaysIfPresent(value any) error {
+	days, ok := value.(*int)
+	if !ok || days == nil {
+		return nil
+	}
+	if *days < 1 {
+		return errors.New("must be greater than 0")
+	}
+	return nil
+}
+
+// validCountingIfPresent rejects a PRESENT counting outside the closed set (the same set the
+// DB CHECK enforces); an absent (nil) counting is a no-op.
+func validCountingIfPresent(value any) error {
+	c, ok := value.(*string)
+	if !ok || c == nil {
+		return nil
+	}
+	switch Counting(*c) {
+	case CountingBusiness, CountingCalendar:
+		return nil
+	default:
+		return errors.New("must be BUSINESS or CALENDAR")
+	}
+}
+
+// toAdjustCommand maps the validated request + the principal's ids + the path id into the
+// use-case command. TenantID/UserID come from the principal and DeadlineID from the path
+// (never the body); the pointer fields carry through so the use case merges only what was
+// present. Counting is converted *string → *Counting.
+func (r AdjustRequest) toAdjustCommand(tenantID, userID, deadlineID string) AdjustCommand {
+	cmd := AdjustCommand{
+		TenantID:      tenantID,
+		UserID:        userID,
+		DeadlineID:    deadlineID,
+		Kind:          r.Kind,
+		Days:          r.Days,
+		Doubled:       r.Doubled,
+		DoubledReason: r.DoubledReason,
+	}
+	if r.Counting != nil {
+		c := Counting(*r.Counting)
+		cmd.Counting = &c
+	}
+	return cmd
+}
+
 // isUUID is an ozzo rule that accepts only a parseable uuid — reusing google/uuid (the
 // same parser the repo uses) rather than a separate regex/dependency. An empty value is
 // handled by the accompanying validation.Required, so this only sees non-empty strings.
