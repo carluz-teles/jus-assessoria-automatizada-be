@@ -22,7 +22,7 @@ import (
 )
 
 // newDeadlineReader wires the pool-backed read use case — exactly the api's composition
-// (deadline.NewReadHandler over this).
+// (deadline.NewHandler over this reader).
 func newDeadlineReader(pool *pgxpool.Pool) *deadline.ReadUseCase {
 	return deadline.NewReadUseCase(deadline.NewReadRepository(pool))
 }

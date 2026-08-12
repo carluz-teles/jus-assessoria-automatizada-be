@@ -75,6 +75,9 @@ type mockRepo struct {
 	confirmCalls          int
 	insertedTasks         []*Task
 	insertTaskCalls       int
+	gotDeleteDeadlineID   string
+	gotDeleteTenantID     string
+	deleteTasksCalls      int
 }
 
 func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
@@ -141,6 +144,18 @@ func (m *mockRepo) ConfirmDeadline(_ context.Context, _ database.Tx, p ConfirmDe
 		return "", "", m.confirmErr
 	}
 	return m.confirmID, m.confirmRecordID, nil
+}
+
+// DeleteTasksByDeadline models the REPLACE step: it drops the confirmed prazo's live tasks
+// (clearing insertedTasks) before the confirm re-inserts the submitted set, so insertedTasks
+// reflects only the last submit — the way a real DELETE + re-INSERT would. Records the count
+// and the (deadlineID, tenantID) scoping so a test can assert the 2-barrier key.
+func (m *mockRepo) DeleteTasksByDeadline(_ context.Context, _ database.Tx, deadlineID, tenantID string) error {
+	m.deleteTasksCalls++
+	m.gotDeleteDeadlineID = deadlineID
+	m.gotDeleteTenantID = tenantID
+	m.insertedTasks = nil
+	return nil
 }
 
 // InsertTask echoes the task back with a real uuid id (as the DB would), so a test can

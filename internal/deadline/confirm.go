@@ -109,9 +109,15 @@ type ConfirmResult struct {
 
 // Confirm is the F2 "Aprovar tudo" (docs/erd-prazos.md §9): in ONE tenant-scoped tx it
 // recomputes the prazo from the human-approved {days, counting, doubled}, flips it
-// PENDING→OPEN (stamping confirmed_by/at), inserts the N tasks, and emits deadline.updated
-// + one task.created per task — entity writes and outbox rows committing together
-// (transactional outbox).
+// PENDING→OPEN (stamping confirmed_by/at), REPLACES the prazo's tasks with the submitted N,
+// and emits deadline.updated + one task.created per task — entity writes and outbox rows
+// committing together (transactional outbox).
+//
+// The confirm is IDEMPOTENT on the whole prazo (ERD §9's "upsert por intimation_id"), on
+// BOTH the deadline and its tasks: the deadline UPDATE is keyed by the 1:1 intimação (never a
+// second prazo), and the tasks follow REPLACE semantics — every confirm deletes the prazo's
+// tasks before re-inserting the submitted set, so re-confirming leaves EXACTLY the last
+// submit (an empty task set clears them) instead of accumulating +N rows each call.
 //
 // Steps (§9):
 //  1. load the prazo's anchor by the 1:1 intimação (a miss → ErrDeadlineNotFound → 404);
@@ -121,8 +127,10 @@ type ConfirmResult struct {
 //     via the chosen lib/calendar motor (BUSINESS→dias úteis, CALENDAR→dias corridos);
 //  4. ConfirmDeadline UPDATE → OPEN + the confirmed/recomputed fields (idempotent on the
 //     1:1 intimação: re-confirm re-UPDATEs the one row, never a second prazo);
-//  5. InsertTask per item (OPEN, MANUAL, created_by = principal) + emit task.created;
-//  6. emit deadline.updated. All in the SAME tx.
+//  5. DeleteTasksByDeadline (REPLACE): drop the prazo's existing tasks so the confirm is
+//     idempotent on tasks too — re-confirm does not accumulate;
+//  6. InsertTask per submitted item (OPEN, MANUAL, created_by = principal) + emit task.created;
+//  7. emit deadline.updated. All in the SAME tx.
 //
 // TenantID scopes the tx's RLS and every read/write (barrier 1 + 2); it comes from the
 // verified principal, never the body.
@@ -172,6 +180,14 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 			ConfirmedAt:     confirmedAt,
 		})
 		if err != nil {
+			return err
+		}
+
+		// REPLACE, not append: drop this prazo's existing tasks before re-inserting the
+		// submitted set, so re-confirming the same intimação leaves EXACTLY the last submit
+		// (ERD §9's "upsert idempotente por intimation_id") instead of accumulating +N rows
+		// each call. Same tx as the confirm — the delete + re-insert commit atomically.
+		if err := uc.repo.DeleteTasksByDeadline(ctx, tx, deadlineID, cmd.TenantID); err != nil {
 			return err
 		}
 

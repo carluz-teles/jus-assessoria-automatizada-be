@@ -276,6 +276,52 @@ func TestConfirm_ReConfirmIsUpdateNotInsert(t *testing.T) {
 	}
 }
 
+// TestConfirm_ReConfirmReplacesTasks proves the REPLACE semantics on tasks (ERD §9 "upsert
+// idempotente por intimation_id"): every confirm deletes the prazo's tasks BEFORE re-inserting
+// the submitted set, so re-confirming the same intimação leaves EXACTLY the last submit's tasks
+// — never the accumulated 2N. An empty task set clears them (delete, no insert).
+func TestConfirm_ReConfirmReplacesTasks(t *testing.T) {
+	p := newConfirmParents()
+	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
+	repo := confirmRepo(p, start, "TJSP")
+	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	cmd := confirmCmd(p)
+	cmd.Tasks = []ConfirmTaskInput{{Title: "Peça"}, {Title: "Ciência"}}
+
+	// Confirm the same intimação twice, each submitting 2 tasks.
+	for i := 0; i < 2; i++ {
+		if _, err := uc.Confirm(context.Background(), cmd); err != nil {
+			t.Fatalf("Confirm() #%d error = %v", i, err)
+		}
+	}
+	// One delete per confirm, and the live set is the last submit's 2 tasks — not 4.
+	if repo.deleteTasksCalls != 2 {
+		t.Errorf("DeleteTasksByDeadline calls = %d, want 2 (one per confirm)", repo.deleteTasksCalls)
+	}
+	if len(repo.insertedTasks) != 2 {
+		t.Errorf("live tasks after re-confirm = %d, want 2 (replaced, not accumulated)", len(repo.insertedTasks))
+	}
+	// The delete is keyed by the confirmed deadline id and scoped to the tenant (barrier 1).
+	if repo.gotDeleteDeadlineID != p.deadlineID || repo.gotDeleteTenantID != p.tenantID {
+		t.Errorf("delete keyed by deadline/tenant = %q/%q, want %q/%q",
+			repo.gotDeleteDeadlineID, repo.gotDeleteTenantID, p.deadlineID, p.tenantID)
+	}
+
+	// Re-confirming with NO tasks clears the deadline's tasks (delete runs, nothing re-inserted).
+	empty := confirmCmd(p)
+	empty.Tasks = nil
+	if _, err := uc.Confirm(context.Background(), empty); err != nil {
+		t.Fatalf("Confirm() empty error = %v", err)
+	}
+	if repo.deleteTasksCalls != 3 {
+		t.Errorf("DeleteTasksByDeadline calls = %d, want 3 (empty confirm still replaces)", repo.deleteTasksCalls)
+	}
+	if len(repo.insertedTasks) != 0 {
+		t.Errorf("live tasks after empty confirm = %d, want 0 (cleared)", len(repo.insertedTasks))
+	}
+}
+
 // TestConfirm_DeadlineNotFound proves confirming an intimação with no derived prazo is the
 // repo's typed ErrDeadlineNotFound (→ 404): nothing is recomputed, confirmed, or emitted.
 func TestConfirm_DeadlineNotFound(t *testing.T) {

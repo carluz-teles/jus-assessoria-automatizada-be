@@ -77,6 +77,28 @@ func (q *Queries) ConfirmDeadline(ctx context.Context, arg ConfirmDeadlineParams
 	return i, err
 }
 
+const deleteTasksByDeadline = `-- name: DeleteTasksByDeadline :exec
+DELETE FROM task
+WHERE deadline_id = $1 AND tenant_id = $2
+`
+
+type DeleteTasksByDeadlineParams struct {
+	DeadlineID pgtype.UUID `json:"deadline_id"`
+	TenantID   uuid.UUID   `json:"tenant_id"`
+}
+
+// Drop every task of a confirmed prazo, the REPLACE step of the F2 confirm (§9: the
+// confirm is an "upsert idempotente por intimation_id"). Confirm runs this in the SAME tx
+// right after ConfirmDeadline and BEFORE re-inserting the submitted tasks, so re-confirming
+// the same intimação leaves EXACTLY the last submit's set instead of accumulating +N rows
+// each call. Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A first confirm (no
+// prior tasks) deletes nothing — a clean no-op, never an error. $1 = deadline_id, $2 =
+// tenant_id, both from the confirm tx (the id ConfirmDeadline returned + the principal).
+func (q *Queries) DeleteTasksByDeadline(ctx context.Context, arg DeleteTasksByDeadlineParams) error {
+	_, err := q.db.Exec(ctx, deleteTasksByDeadline, arg.DeadlineID, arg.TenantID)
+	return err
+}
+
 const getCourtRecordClass = `-- name: GetCourtRecordClass :one
 
 SELECT class

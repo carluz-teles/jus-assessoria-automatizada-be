@@ -237,6 +237,32 @@ func (r *pgRepository) ConfirmDeadline(ctx context.Context, tx database.Tx, p Co
 	return row.ID.String(), row.CourtRecordID.String(), nil
 }
 
+// DeleteTasksByDeadline drops the confirmed prazo's tasks inside the caller's tx, scoped to
+// (deadlineID, tenantID) (barrier 1 + RLS barrier 2). It is the REPLACE step of the F2
+// confirm: the use case runs it right after ConfirmDeadline and before the InsertTask loop,
+// so re-confirming the same intimação leaves only the last submit's tasks (ERD §9's upsert
+// semantics) instead of accumulating +N rows. deadline_id is a nullable column (mapper lifts
+// it to pgtype.UUID); tenant_id is NOT NULL. Deleting no row (a first confirm) is a clean
+// success, not an error.
+func (r *pgRepository) DeleteTasksByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) error {
+	id, err := pgUUID(deadlineID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+
+	if err := deadlinedb.New(tx).DeleteTasksByDeadline(ctx, deadlinedb.DeleteTasksByDeadlineParams{
+		DeadlineID: id,
+		TenantID:   tenant,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
 // InsertTask persists one F2 task inside the caller's tx and returns it with its
 // DB-assigned id (echoing the entity, like InsertDeadline). tenant_id is NOT NULL; the
 // context FKs (court_record_id/deadline_id/intimation_id/created_by) are always filled by

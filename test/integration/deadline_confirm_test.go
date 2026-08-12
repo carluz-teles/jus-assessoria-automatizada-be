@@ -180,6 +180,75 @@ func TestDeadline_Confirm_FlipsOpenRecomputesAndWritesTasks(t *testing.T) {
 	}
 }
 
+// DLC3: re-confirming the same intimação REPLACES its tasks (ERD §9's "upsert idempotente
+// por intimation_id") instead of accumulating them. Seed a PENDING prazo, confirm it twice
+// with N=2 tasks each, and assert the live task rows for the prazo stay N (=2), never 2N (=4)
+// — proving DeleteTasksByDeadline runs in the confirm tx before the re-insert.
+func TestDeadline_Confirm_ReConfirmReplacesTasks(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	uc := newDeadlineUC(pool)
+
+	// Seed the PENDING prazo (the F2 suggestion) via the creation path.
+	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
+	if err := uc.OnIntimationObserved(ctx, obs); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	var deadlineID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM deadline WHERE notification_id = $1`, p.intimationID).Scan(&deadlineID); err != nil {
+		t.Fatalf("read pending deadline: %v", err)
+	}
+
+	cmd := deadline.ConfirmCommand{
+		TenantID:     p.tenantID.String(),
+		UserID:       uuid.NewString(),
+		IntimationID: p.intimationID.String(),
+		Kind:         deadline.KindContestacao,
+		Days:         10,
+		Counting:     deadline.CountingBusiness,
+		Tasks: []deadline.ConfirmTaskInput{
+			{Title: "Protocolar contestação", Kind: "PECA"},
+			{Title: "Dar ciência ao cliente"},
+		},
+	}
+
+	// Confirm the same intimação TWICE with 2 tasks each.
+	for i := 0; i < 2; i++ {
+		if _, err := uc.Confirm(ctx, cmd); err != nil {
+			t.Fatalf("Confirm() #%d error = %v", i, err)
+		}
+	}
+
+	// The prazo has EXACTLY 2 live tasks — the last submit — not the accumulated 4.
+	var taskCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM task WHERE deadline_id = $1 AND tenant_id = $2`,
+		deadlineID, p.tenantID).Scan(&taskCount); err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	if taskCount != 2 {
+		t.Errorf("task rows after re-confirm = %d, want 2 (replaced, not accumulated 2N)", taskCount)
+	}
+
+	// A final confirm with NO tasks clears them (REPLACE with an empty set).
+	empty := cmd
+	empty.Tasks = nil
+	if _, err := uc.Confirm(ctx, empty); err != nil {
+		t.Fatalf("Confirm() empty error = %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM task WHERE deadline_id = $1 AND tenant_id = $2`,
+		deadlineID, p.tenantID).Scan(&taskCount); err != nil {
+		t.Fatalf("count tasks after empty confirm: %v", err)
+	}
+	if taskCount != 0 {
+		t.Errorf("task rows after empty confirm = %d, want 0 (cleared)", taskCount)
+	}
+}
+
 // DLC2: confirming an intimação with NO derived prazo is the typed ErrDeadlineNotFound (→
 // 404 at the edge) — nothing is written, no phantom prazo/tasks/events.
 func TestDeadline_Confirm_NoPrazo_NotFound(t *testing.T) {

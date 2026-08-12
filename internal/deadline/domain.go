@@ -57,6 +57,13 @@ type Repository interface {
 	// notification_id), never a second prazo. A no-match is ErrDeadlineNotFound. Returns the
 	// confirmed prazo id and the record it hangs on (RETURNING id, court_record_id).
 	ConfirmDeadline(ctx context.Context, tx database.Tx, p ConfirmDeadlineParams) (deadlineID, courtRecordID string, err error)
+	// DeleteTasksByDeadline drops every task of the confirmed prazo inside the caller's tx,
+	// scoped to (deadlineID, tenantID) (barrier 1 + RLS). Confirm calls it right after
+	// ConfirmDeadline and BEFORE the InsertTask loop, giving the confirm REPLACE semantics
+	// (ERD §9 "upsert idempotente por intimation_id"): re-confirming leaves exactly the last
+	// submit's tasks instead of accumulating a new set each call. A no-match deletes nothing
+	// (an empty first confirm is a clean no-op), so it never errors on absence.
+	DeleteTasksByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) error
 	// InsertTask persists one F2 task inside the caller's tx and returns it with its
 	// DB-assigned id (echoing the entity, like InsertDeadline). Scoping is via the entity's
 	// TenantID + RLS.
