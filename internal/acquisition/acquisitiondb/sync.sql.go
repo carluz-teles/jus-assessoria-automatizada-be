@@ -177,25 +177,33 @@ func (q *Queries) BatchMarkCourtRecordsSynced(ctx context.Context, updates []byt
 }
 
 const batchUpsertIntimations = `-- name: BatchUpsertIntimations :many
-INSERT INTO intimation
-    (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
-     deadline_start_at, content, source, type, status, source_url, cancelled_at,
-     cancel_reason, recipients, sync_run_id)
-SELECT $1::uuid, r.case_id, r.court_record_id, r.hash, r.made_available_at,
-       r.published_at, r.deadline_start_at, r.content, r.source, r.type, r.status,
-       r.source_url, r.cancelled_at, r.cancel_reason, r.recipients, r.sync_run_id
-FROM jsonb_to_recordset($2::jsonb) AS r(
-    case_id uuid, court_record_id uuid, hash text, made_available_at date, published_at date,
-    deadline_start_at date, content text, source text, type text, status text, source_url text,
-    cancelled_at date, cancel_reason text, recipients jsonb, sync_run_id uuid
+WITH upserted AS (
+    INSERT INTO intimation
+        (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
+         deadline_start_at, content, source, type, status, source_url, cancelled_at,
+         cancel_reason, recipients, sync_run_id)
+    SELECT $1::uuid, r.case_id, r.court_record_id, r.hash, r.made_available_at,
+           r.published_at, r.deadline_start_at, r.content, r.source, r.type, r.status,
+           r.source_url, r.cancelled_at, r.cancel_reason, r.recipients, r.sync_run_id
+    FROM jsonb_to_recordset($2::jsonb) AS r(
+        case_id uuid, court_record_id uuid, hash text, made_available_at date, published_at date,
+        deadline_start_at date, content text, source text, type text, status text, source_url text,
+        cancelled_at date, cancel_reason text, recipients jsonb, sync_run_id uuid
+    )
+    ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
+        status        = EXCLUDED.status,
+        cancelled_at  = EXCLUDED.cancelled_at,
+        cancel_reason = EXCLUDED.cancel_reason,
+        type          = EXCLUDED.type,
+        source_url    = EXCLUDED.source_url
+    RETURNING id, court_record_id, type, status, deadline_start_at,
+              cancel_reason, (xmax = 0) AS inserted
 )
-ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
-    status        = EXCLUDED.status,
-    cancelled_at  = EXCLUDED.cancelled_at,
-    cancel_reason = EXCLUDED.cancel_reason,
-    type          = EXCLUDED.type,
-    source_url    = EXCLUDED.source_url
-RETURNING id, (xmax = 0) AS inserted
+SELECT u.id, u.court_record_id, u.type, u.status, u.deadline_start_at,
+       u.cancel_reason, u.inserted, cr.court, cr.case_id,
+       COALESCE((SELECT old.status FROM intimation old WHERE old.id = u.id), '')::text AS old_status
+FROM upserted u
+JOIN court_record cr ON cr.id = u.court_record_id
 `
 
 type BatchUpsertIntimationsParams struct {
@@ -204,15 +212,35 @@ type BatchUpsertIntimationsParams struct {
 }
 
 type BatchUpsertIntimationsRow struct {
-	ID       uuid.UUID `json:"id"`
-	Inserted bool      `json:"inserted"`
+	ID              uuid.UUID   `json:"id"`
+	CourtRecordID   uuid.UUID   `json:"court_record_id"`
+	Type            *string     `json:"type"`
+	Status          string      `json:"status"`
+	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
+	CancelReason    *string     `json:"cancel_reason"`
+	Inserted        bool        `json:"inserted"`
+	Court           string      `json:"court"`
+	CaseID          uuid.UUID   `json:"case_id"`
+	OldStatus       string      `json:"old_status"`
 }
 
 // Bulk counterpart of InsertIntimation: upsert MANY intimações in one round-trip from
 // a jsonb array of rows. Same ON CONFLICT (tenant, case, hash) DO UPDATE as the single
 // version (a retracted publication re-arrives with the same hash carrying CANCELLED).
 // JSON handles it all: null → NULL (nullable dates/type/source_url), and recipients
-// (text[]) maps from a JSON array. (xmax = 0) tallies inserted vs updated per row.
+// (text[]) maps from a JSON array.
+//
+// The RETURNING is enriched so the producer can emit the right domain event per row,
+// in the SAME tx, without the deadline slice reading anything back:
+//   - inserted  ((xmax = 0)) — a FIRST insert → intimation.observed;
+//   - old_status — the status BEFORE this upsert, read by a correlated subquery on
+//     `intimation`. A data-modifying CTE and the main query share one snapshot, so
+//     the subquery cannot see `upserted`'s effect and returns the PRE-upsert row (a
+//     fresh insert has no prior row → NULL → ”). old_status <> 'CANCELLED' + new
+//     status = 'CANCELLED' on an UPDATE is the ACTIVE → CANCELLED transition →
+//     intimation.cancelled.
+//   - court — denormalized from the row's court_record (a join), so the producer
+//     derives uf via ufFromTribunal at emission.
 func (q *Queries) BatchUpsertIntimations(ctx context.Context, arg BatchUpsertIntimationsParams) ([]BatchUpsertIntimationsRow, error) {
 	rows, err := q.db.Query(ctx, batchUpsertIntimations, arg.TenantID, arg.Intimations)
 	if err != nil {
@@ -222,7 +250,18 @@ func (q *Queries) BatchUpsertIntimations(ctx context.Context, arg BatchUpsertInt
 	var items []BatchUpsertIntimationsRow
 	for rows.Next() {
 		var i BatchUpsertIntimationsRow
-		if err := rows.Scan(&i.ID, &i.Inserted); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.CourtRecordID,
+			&i.Type,
+			&i.Status,
+			&i.DeadlineStartAt,
+			&i.CancelReason,
+			&i.Inserted,
+			&i.Court,
+			&i.CaseID,
+			&i.OldStatus,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

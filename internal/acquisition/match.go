@@ -22,7 +22,7 @@ type matchRepo interface {
 	MatchPublicationsForTenantSince(ctx context.Context, tx database.Tx, tenantID string, since time.Time) ([]PublicationMatch, error)
 	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
 	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
-	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error)
+	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error)
 }
 
 // MatchUseCase turns a day's national publications into per-tenant intimações: it
@@ -170,7 +170,10 @@ func (uc *MatchUseCase) writeForTenant(ctx context.Context, tenantID string, key
 		if err != nil {
 			return err
 		}
-		if _, err := uc.repo.UpsertIntimations(ctx, tx, intimParams); err != nil {
+		// National bulk match is a separate producer; it does not emit the
+		// intimation.observed/cancelled events the sync slice does (a future slice may),
+		// so the change slices are intentionally discarded here.
+		if _, _, err := uc.repo.UpsertIntimations(ctx, tx, intimParams); err != nil {
 			return err
 		}
 		return nil

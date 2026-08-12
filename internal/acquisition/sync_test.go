@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/lib/database"
@@ -101,6 +102,11 @@ type stubSyncRepo struct {
 	intimCalls  int
 	intimParams []IntimationParams
 	intimNew    int
+	// intimCourt is the court denormalized onto every new/cancelled intimation the
+	// stub returns (default TJSP → uf SP), so a test can assert the observed event's
+	// UF. intimCancelled are the ACTIVE → CANCELLED transitions the upsert reports.
+	intimCourt     string
+	intimCancelled []IntimationChange
 
 	updates []SyncRunOutcome
 	// closedRuns models the sync_run's status=RUNNING compare-and-swap: the first
@@ -206,10 +212,31 @@ func (s *stubSyncRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, par
 	return out, nil
 }
 
-func (s *stubSyncRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) (int, error) {
+func (s *stubSyncRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) ([]IntimationChange, []IntimationChange, error) {
 	s.intimCalls++
 	s.intimParams = params
-	return s.intimNew, nil
+
+	court := s.intimCourt
+	if court == "" {
+		court = "TJSP"
+	}
+	n := s.intimNew
+	if n > len(params) {
+		n = len(params)
+	}
+	newRows := make([]IntimationChange, 0, n)
+	for i := range n {
+		p := params[i]
+		newRows = append(newRows, IntimationChange{
+			ID:              uuid.NewString(), // the DB assigns a uuid; mirror that so aggregate_id parses
+			CourtRecordID:   p.CourtRecordID,
+			CaseID:          p.CaseID,
+			Type:            p.Type,
+			Court:           court,
+			DeadlineStartAt: dateStr(p.DeadlineStartAt),
+		})
+	}
+	return newRows, s.intimCancelled, nil
 }
 
 // syncRequestedEvent builds a valid sync_requested event for the default tenant,
@@ -427,6 +454,146 @@ func TestSyncUseCase_TalliesNewProcessosAndIntimacoes(t *testing.T) {
 		if p.SyncRunID != "run-1" {
 			t.Errorf("intimation param SyncRunID = %q, want run-1", p.SyncRunID)
 		}
+	}
+}
+
+// firstOfType returns the first published event of the given dotted type (nil if
+// none), so a test can inspect a specific event's payload.
+func firstOfType(published []events.Event, typ string) events.Event {
+	for _, ev := range published {
+		if ev.Type() == typ {
+			return ev
+		}
+	}
+	return nil
+}
+
+// U-intim-1: a NEW intimação (the upsert reports it in newRows) emits exactly one
+// intimation.observed and NO cancelled, in the same PublishBatch as the other
+// observed events. The event denormalizes UF from the record's court (TJSP → SP),
+// carries the record/case ids and deadline, and its aggregate_id is the intimation
+// uuid (assert uuid.Parse).
+func TestSyncUseCase_NewIntimation_EmitsObserved(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 2, intimNew: 1, intimCourt: "TJSP"}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	counts := countByType(outbox.published)
+	if counts[TypeIntimationObserved] != 1 || counts[TypeIntimationCancelled] != 0 {
+		t.Fatalf("intimation events = {observed:%d cancelled:%d}, want {1 0}",
+			counts[TypeIntimationObserved], counts[TypeIntimationCancelled])
+	}
+
+	ev, ok := firstOfType(outbox.published, TypeIntimationObserved).(IntimationObserved)
+	if !ok {
+		t.Fatal("no intimation.observed event published")
+	}
+	if ev.AggregateType() != aggregateTypeIntimation {
+		t.Errorf("aggregate_type = %q, want %q", ev.AggregateType(), aggregateTypeIntimation)
+	}
+	if _, err := uuid.Parse(ev.AggregateID()); err != nil {
+		t.Errorf("aggregate_id %q is not a uuid: %v", ev.AggregateID(), err)
+	}
+	if ev.IntimationID != ev.AggregateID() {
+		t.Errorf("intimation_id %q != aggregate_id %q", ev.IntimationID, ev.AggregateID())
+	}
+	if ev.TenantID != testTenant {
+		t.Errorf("tenant_id = %q, want %q", ev.TenantID, testTenant)
+	}
+	if ev.Court != "TJSP" || ev.UF != "SP" {
+		t.Errorf("court/uf = {%q %q}, want {TJSP SP} (uf denormalized via ufFromTribunal)", ev.Court, ev.UF)
+	}
+	if ev.CourtRecordID == "" || ev.CaseID == "" {
+		t.Errorf("court_record_id/case_id = {%q %q}, want both set", ev.CourtRecordID, ev.CaseID)
+	}
+	// The fixture's intimation deadline_start_at is 2024-01-16, denormalized as a wire date.
+	if ev.DeadlineStartAt != "2024-01-16" {
+		t.Errorf("deadline_start_at = %q, want 2024-01-16", ev.DeadlineStartAt)
+	}
+	if ev.EventID == "" {
+		t.Error("event_id empty, want a fresh event id (events.Base)")
+	}
+}
+
+// U-intim-2: a DEDUPED intimação (the upsert reports neither new nor cancelled)
+// emits NO intimation event — silent, exactly like a deduped docket entry.
+func TestSyncUseCase_DedupedIntimation_EmitsNoEvent(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 0, intimNew: 0}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	counts := countByType(outbox.published)
+	if counts[TypeIntimationObserved] != 0 || counts[TypeIntimationCancelled] != 0 {
+		t.Fatalf("intimation events on a deduped window = {observed:%d cancelled:%d}, want {0 0}",
+			counts[TypeIntimationObserved], counts[TypeIntimationCancelled])
+	}
+}
+
+// U-intim-3: an intimação the upsert transitioned ACTIVE → CANCELLED emits exactly
+// one intimation.cancelled (carrying the reason) and NO observed for that
+// transition. The cancelled event's aggregate_id is the intimation uuid.
+func TestSyncUseCase_CancelledIntimation_EmitsCancelledNotObserved(t *testing.T) {
+	t.Parallel()
+
+	cancelledID := uuid.NewString()
+	repo := &stubSyncRepo{
+		syncRunID:      "run-1",
+		docketNewCount: 0,
+		intimNew:       0, // the retracted publication is not a new insert
+		intimCancelled: []IntimationChange{{ID: cancelledID, CancelReason: "retratação pelo tribunal"}},
+	}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	counts := countByType(outbox.published)
+	if counts[TypeIntimationCancelled] != 1 || counts[TypeIntimationObserved] != 0 {
+		t.Fatalf("intimation events on a cancellation = {cancelled:%d observed:%d}, want {1 0}",
+			counts[TypeIntimationCancelled], counts[TypeIntimationObserved])
+	}
+
+	ev, ok := firstOfType(outbox.published, TypeIntimationCancelled).(IntimationCancelled)
+	if !ok {
+		t.Fatal("no intimation.cancelled event published")
+	}
+	if ev.AggregateType() != aggregateTypeIntimation {
+		t.Errorf("aggregate_type = %q, want %q", ev.AggregateType(), aggregateTypeIntimation)
+	}
+	if _, err := uuid.Parse(ev.AggregateID()); err != nil {
+		t.Errorf("aggregate_id %q is not a uuid: %v", ev.AggregateID(), err)
+	}
+	if ev.IntimationID != cancelledID {
+		t.Errorf("intimation_id = %q, want %q", ev.IntimationID, cancelledID)
+	}
+	if ev.TenantID != testTenant {
+		t.Errorf("tenant_id = %q, want %q", ev.TenantID, testTenant)
+	}
+	if ev.Reason != "retratação pelo tribunal" {
+		t.Errorf("reason = %q, want %q", ev.Reason, "retratação pelo tribunal")
 	}
 }
 

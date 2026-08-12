@@ -51,7 +51,7 @@ type Repository interface {
 	// stays for the enrichment path (one record at a time).
 	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
-	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
+	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error)
 
 	// DATAJUD enrichment — the placeholder+merge grade reconciliation. The
 	// enrichment use case depends on the narrow enrichRepo view of these.
@@ -719,12 +719,12 @@ func (r *pgRepository) markCourtRecordSynced(ctx context.Context, q *acquisition
 // UpsertDocketEntries is the SET-BASED bulk insert — see repository_batch.go.
 
 // UpsertIntimations inserts-or-updates each intimação ON CONFLICT DO UPDATE inside
-// the caller's tx and returns how many were ACTUALLY new. The DO UPDATE always
-// returns a row (unlike the docket entries' DO NOTHING), so newness is read from
-// the query's `inserted` flag (xmax = 0) rather than a pgx.ErrNoRows miss: an
-// existing intimation retracted by the source is updated in place (so the deadline
-// slice can revoke its prazo), counting as deduped, not new. This slice emits no
-// intimation-observed event, so only the count is returned.
+// the caller's tx and returns the rows event-worthy for the producer (see the
+// SET-BASED impl in repository_batch.go): the FIRST inserts (xmax = 0 → observed)
+// and the ACTIVE → CANCELLED transitions (→ cancelled). The DO UPDATE always returns
+// a row (unlike the docket entries' DO NOTHING), so newness is read from the query's
+// `inserted` flag rather than a pgx.ErrNoRows miss; a retraction updates the row in
+// place (so the deadline slice can revoke its prazo).
 // AcquireTenantWriteLock takes the per-tenant advisory lock inside the caller's
 // tx so concurrent sync/enrichment write transactions serialize their court_record
 // writes (no 40P01 deadlock) while their fetches still overlap. Released at tx end.

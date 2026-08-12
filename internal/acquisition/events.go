@@ -36,6 +36,15 @@ const (
 	TypeDocketEntryObserved = "acquisition.docket_entry_observed"
 )
 
+// Type ids of the intimation events the sync cycle produces in the SAME tx as the
+// intimation upsert: observed for a newly landed intimação, cancelled when the DJEN
+// retracts one (ACTIVE → CANCELLED). The deadline slice consumes them to open/revoke
+// a prazo; it never reads back the acquisition tables (slices talk only by event).
+const (
+	TypeIntimationObserved  = "acquisition.intimation.observed"
+	TypeIntimationCancelled = "acquisition.intimation.cancelled"
+)
+
 const aggregateTypeIntegration = "integration"
 
 const aggregateTypeBackfillJob = "backfill_job"
@@ -47,6 +56,8 @@ const aggregateTypeCourtRecord = "court_record"
 const aggregateTypeDocketEntry = "docket_entry"
 
 const aggregateTypeDiario = "diario"
+
+const aggregateTypeIntimation = "intimation"
 
 // IntegrationActivated is emitted, in the same transaction as the upsert, when a
 // source is activated or its scope meaningfully changes. The payload carries
@@ -153,6 +164,48 @@ var _ events.Event = DocketEntryObserved{}
 
 func (DocketEntryObserved) Type() string          { return TypeDocketEntryObserved }
 func (DocketEntryObserved) AggregateType() string { return aggregateTypeDocketEntry }
+
+// IntimationObserved announces one NEWLY landed intimação (a re-sync of the same
+// window is silent — deduped rows do not emit it). UF is DENORMALIZED here by the
+// producer (derived from Court via ufFromTribunal) so the deadline slice — which
+// never imports acquisition — receives the state ready for its holiday-calendar
+// lookup. DeadlineStartAt is the wire date (2006-01-02) the deadline derivation
+// starts from. Aggregate id is the intimation id.
+type IntimationObserved struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	IntimationID  string `json:"intimation_id"`
+	CourtRecordID string `json:"court_record_id"`
+	CaseID        string `json:"case_id"`
+	// IntimationType is the DJEN type (INTIMACAO/CITACAO/COMUNICACAO). The Go field
+	// avoids the name Type — that is the events.Event method; the JSON stays "type".
+	IntimationType  string `json:"type"`
+	Court           string `json:"court"`
+	UF              string `json:"uf"`
+	DeadlineStartAt string `json:"deadline_start_at"`
+}
+
+var _ events.Event = IntimationObserved{}
+
+func (IntimationObserved) Type() string          { return TypeIntimationObserved }
+func (IntimationObserved) AggregateType() string { return aggregateTypeIntimation }
+
+// IntimationCancelled announces that a previously ACTIVE intimação transitioned to
+// CANCELLED on this upsert (the DJEN brought a data_cancelamento). The deadline slice
+// consumes it to revoke the derived prazo, so a phantom deadline never survives a
+// retraction. Reason is the DJEN motivo_cancelamento (empty when it did not disclose
+// one). Aggregate id is the intimation id.
+type IntimationCancelled struct {
+	events.Base
+	TenantID     string `json:"tenant_id"`
+	IntimationID string `json:"intimation_id"`
+	Reason       string `json:"reason"`
+}
+
+var _ events.Event = IntimationCancelled{}
+
+func (IntimationCancelled) Type() string          { return TypeIntimationCancelled }
+func (IntimationCancelled) AggregateType() string { return aggregateTypeIntimation }
 
 // SyncCompleted closes a successful run with its item tallies (new vs. deduped),
 // so the backfill slice can advance its slice counters (a later sub-slice).

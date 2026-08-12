@@ -57,7 +57,19 @@ type Querier interface {
 	// a jsonb array of rows. Same ON CONFLICT (tenant, case, hash) DO UPDATE as the single
 	// version (a retracted publication re-arrives with the same hash carrying CANCELLED).
 	// JSON handles it all: null → NULL (nullable dates/type/source_url), and recipients
-	// (text[]) maps from a JSON array. (xmax = 0) tallies inserted vs updated per row.
+	// (text[]) maps from a JSON array.
+	//
+	// The RETURNING is enriched so the producer can emit the right domain event per row,
+	// in the SAME tx, without the deadline slice reading anything back:
+	//   • inserted  ((xmax = 0)) — a FIRST insert → intimation.observed;
+	//   • old_status — the status BEFORE this upsert, read by a correlated subquery on
+	//     `intimation`. A data-modifying CTE and the main query share one snapshot, so
+	//     the subquery cannot see `upserted`'s effect and returns the PRE-upsert row (a
+	//     fresh insert has no prior row → NULL → ''). old_status <> 'CANCELLED' + new
+	//     status = 'CANCELLED' on an UPDATE is the ACTIVE → CANCELLED transition →
+	//     intimation.cancelled.
+	//   • court — denormalized from the row's court_record (a join), so the producer
+	//     derives uf via ufFromTribunal at emission.
 	BatchUpsertIntimations(ctx context.Context, arg BatchUpsertIntimationsParams) ([]BatchUpsertIntimationsRow, error)
 	// Push a record's next_sync_at forward as its re-poll is enqueued, so the next tick
 	// does not re-enqueue it; if the resync never lands, it falls due again after the

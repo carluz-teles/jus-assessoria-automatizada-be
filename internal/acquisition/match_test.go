@@ -60,9 +60,10 @@ func (r *stubMatchRepo) BatchUpsertCourtRecords(_ context.Context, _ database.Tx
 	}
 	return outcomes, len(params), nil
 }
-func (r *stubMatchRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) (int, error) {
+func (r *stubMatchRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) ([]IntimationChange, []IntimationChange, error) {
 	r.upsertCalls++
-	return len(params), nil
+	newRows := make([]IntimationChange, len(params))
+	return newRows, nil, nil
 }
 
 // --- tests -------------------------------------------------------------------

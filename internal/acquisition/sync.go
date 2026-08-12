@@ -147,6 +147,23 @@ type IntimationParams struct {
 	SyncRunID string
 }
 
+// IntimationChange is one intimação the upsert reported as event-worthy: either
+// FIRST inserted (→ intimation.observed) or transitioned ACTIVE → CANCELLED (→
+// intimation.cancelled). Court is DENORMALIZED from the intimation's court_record
+// (a join in the query) so the producer derives UF via ufFromTribunal at emission
+// and hands the deadline slice everything it needs — no cross-slice read-back.
+// DeadlineStartAt is the wire date (2006-01-02); CancelReason is set only on a
+// cancellation.
+type IntimationChange struct {
+	ID              string
+	CourtRecordID   string
+	CaseID          string
+	Type            string
+	Court           string
+	DeadlineStartAt string
+	CancelReason    string
+}
+
 // syncRepo is the narrow persistence port the sync use case drives.
 // *pgRepository satisfies it (and the wider Repository); the use case depends on
 // this minimal view so its unit test mocks only these five methods.
@@ -160,7 +177,10 @@ type syncRepo interface {
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
 	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
-	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
+	// UpsertIntimations returns the intimações this upsert first inserted (newRows,
+	// → observed) and those it transitioned ACTIVE → CANCELLED (cancelledRows, →
+	// cancelled), so the use case emits the right event per change in the same tx.
+	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error)
 }
 
 // EntitlementChecker resolves a tenant's ceiling on ACTIVE processes — the v0
@@ -483,10 +503,11 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		if err != nil {
 			return err
 		}
-		intimationsNew, err := uc.repo.UpsertIntimations(ctx, tx, intimParams)
+		newIntim, cancelledIntim, err := uc.repo.UpsertIntimations(ctx, tx, intimParams)
 		if err != nil {
 			return err
 		}
+		intimationsNew := len(newIntim)
 
 		itemsNew := len(newDocket)
 		itemsDeduped := len(docketParams) - itemsNew
@@ -521,7 +542,7 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			Blocked:         len(blocked),
 		}
 		committed = true
-		return uc.publishObserved(ctx, tx, ev, syncRunID, ordered, newDocket, itemsNew, itemsDeduped)
+		return uc.publishObserved(ctx, tx, ev, syncRunID, ordered, newDocket, newIntim, cancelledIntim, itemsNew, itemsDeduped)
 	})
 	if err != nil {
 		return err
@@ -600,19 +621,26 @@ func (uc *SyncUseCase) logSyncCompleted(ctx context.Context, ev SyncRequested, s
 }
 
 // publishObserved emits, within the caller's tx, one court_record_observed per
-// observed record, one docket_entry_observed per NEW entry, and one
-// sync_completed to close the run.
-func (uc *SyncUseCase) publishObserved(ctx context.Context, tx database.Tx, ev SyncRequested, syncRunID string, records []*CourtRecord, newDocket []DocketEntry, itemsNew, itemsDeduped int) error {
+// observed record, one docket_entry_observed per NEW entry, one intimation.observed
+// per NEW intimação and one intimation.cancelled per ACTIVE → CANCELLED transition,
+// and one sync_completed to close the run.
+func (uc *SyncUseCase) publishObserved(ctx context.Context, tx database.Tx, ev SyncRequested, syncRunID string, records []*CourtRecord, newDocket []DocketEntry, newIntim, cancelledIntim []IntimationChange, itemsNew, itemsDeduped int) error {
 	// One batch insert instead of one round-trip per observed event: a big window fans
 	// out hundreds of court_record_observed, and doing them one-by-one held the advisory
 	// lock for as many round-trips. sync_completed stays LAST (closes the run). Order is
 	// preserved by the batch.
-	evs := make([]events.Event, 0, len(records)+len(newDocket)+1)
+	evs := make([]events.Event, 0, len(records)+len(newDocket)+len(newIntim)+len(cancelledIntim)+1)
 	for _, cr := range records {
 		evs = append(evs, newCourtRecordObserved(ev, syncRunID, cr))
 	}
 	for _, de := range newDocket {
 		evs = append(evs, newDocketEntryObserved(ev, syncRunID, de))
+	}
+	for _, n := range newIntim {
+		evs = append(evs, newIntimationObserved(ev, n))
+	}
+	for _, c := range cancelledIntim {
+		evs = append(evs, newIntimationCancelled(ev, c))
 	}
 	evs = append(evs, newSyncCompleted(ev, syncRunID, itemsNew, itemsDeduped))
 	return uc.outbox.PublishBatch(ctx, tx, evs)
@@ -765,6 +793,34 @@ func newDocketEntryObserved(ev SyncRequested, syncRunID string, de DocketEntry) 
 		CourtRecordID: de.CourtRecordID,
 		DocketEntryID: de.ID,
 		Hash:          de.Hash,
+	}
+}
+
+// newIntimationObserved builds the observed event for a newly landed intimação,
+// denormalizing UF from the record's court (ufFromTribunal) at emission — the
+// producer hands the deadline slice the state ready for its holiday lookup.
+func newIntimationObserved(ev SyncRequested, n IntimationChange) IntimationObserved {
+	return IntimationObserved{
+		Base:            events.Base{EventID: newEventID(), Aggregate: n.ID},
+		TenantID:        ev.TenantID,
+		IntimationID:    n.ID,
+		CourtRecordID:   n.CourtRecordID,
+		CaseID:          n.CaseID,
+		IntimationType:  n.Type,
+		Court:           n.Court,
+		UF:              ufFromTribunal(n.Court),
+		DeadlineStartAt: n.DeadlineStartAt,
+	}
+}
+
+// newIntimationCancelled builds the cancelled event for an intimação the upsert
+// transitioned ACTIVE → CANCELLED, carrying the DJEN retraction reason.
+func newIntimationCancelled(ev SyncRequested, c IntimationChange) IntimationCancelled {
+	return IntimationCancelled{
+		Base:         events.Base{EventID: newEventID(), Aggregate: c.ID},
+		TenantID:     ev.TenantID,
+		IntimationID: c.ID,
+		Reason:       c.CancelReason,
 	}
 }
 

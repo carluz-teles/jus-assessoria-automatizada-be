@@ -256,15 +256,19 @@ type intimationRowJSON struct {
 
 // UpsertIntimations bulk-upserts a window's intimações in ONE round-trip via a jsonb
 // payload, replacing the per-intimation InsertIntimation loop. Same ON CONFLICT semantics
-// (a retracted publication re-arrives with the same hash carrying CANCELLED); newCount
-// tallies the rows that were inserted fresh (xmax = 0).
-func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error) {
+// (a retracted publication re-arrives with the same hash carrying CANCELLED). It returns
+// the rows event-worthy for the producer: newRows are the FIRST inserts (xmax = 0 →
+// intimation.observed) and cancelledRows are those that transitioned to CANCELLED on
+// this upsert (old_status <> CANCELLED, new status = CANCELLED → intimation.cancelled).
+// A plain re-observation (deduped, no relevant change) appears in neither. Court is
+// carried on every row (joined from court_record) so the producer denormalizes uf.
+func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error) {
 	if len(params) == 0 {
-		return 0, nil
+		return nil, nil, nil
 	}
 	tid, err := uuid.Parse(params[0].TenantID)
 	if err != nil {
-		return 0, database.WrapInfra(err)
+		return nil, nil, database.WrapInfra(err)
 	}
 	rows := make([]intimationRowJSON, len(params))
 	for i, p := range params {
@@ -288,21 +292,32 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 	}
 	payload, err := json.Marshal(rows)
 	if err != nil {
-		return 0, database.WrapInfra(err)
+		return nil, nil, database.WrapInfra(err)
 	}
-	inserted, err := acquisitiondb.New(tx).BatchUpsertIntimations(ctx, acquisitiondb.BatchUpsertIntimationsParams{
+	upserted, err := acquisitiondb.New(tx).BatchUpsertIntimations(ctx, acquisitiondb.BatchUpsertIntimationsParams{
 		TenantID: tid, Intimations: payload,
 	})
 	if err != nil {
-		return 0, database.WrapInfra(err)
+		return nil, nil, database.WrapInfra(err)
 	}
-	newCount := 0
-	for _, row := range inserted {
-		if row.Inserted {
-			newCount++
+	for _, row := range upserted {
+		change := IntimationChange{
+			ID:              row.ID.String(),
+			CourtRecordID:   row.CourtRecordID.String(),
+			CaseID:          row.CaseID.String(),
+			Type:            derefString(row.Type),
+			Court:           row.Court,
+			DeadlineStartAt: dateOrEmpty(row.DeadlineStartAt),
+			CancelReason:    derefString(row.CancelReason),
+		}
+		switch {
+		case row.Inserted:
+			newRows = append(newRows, change)
+		case row.OldStatus != IntimationStatusCancelled && row.Status == IntimationStatusCancelled:
+			cancelledRows = append(cancelledRows, change)
 		}
 	}
-	return newCount, nil
+	return newRows, cancelledRows, nil
 }
 
 // rawArrayOrEmpty embeds the parser's recipients JSON array as-is (jsonb_to_recordset

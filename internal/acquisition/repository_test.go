@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pashagolub/pgxmock/v4"
 )
 
@@ -42,14 +43,33 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 	const doUpdateSQL = `ON CONFLICT \(tenant_id, case_id, hash\) DO UPDATE SET`
 
 	tests := []struct {
-		name         string
-		param        IntimationParams
-		inserted     bool // what the query's (xmax = 0) flag returns
-		wantNewCount int
-		wantJSON     []string // substrings the marshaled row payload must contain
+		name          string
+		param         IntimationParams
+		inserted      bool   // what the query's (xmax = 0) flag returns
+		oldStatus     string // the status BEFORE this upsert (the correlated subquery)
+		newStatus     string // the status AFTER this upsert (RETURNING status)
+		wantNew       int    // rows classified as newRows (→ observed)
+		wantCancelled int    // rows classified as cancelledRows (→ cancelled)
+		wantJSON      []string
 	}{
 		{
-			name: "cancelled intimation updates the existing row (not new)",
+			name: "fresh active intimation inserts → new (observed)",
+			param: IntimationParams{
+				TenantID:      uuid.NewString(),
+				CaseID:        uuid.NewString(),
+				CourtRecordID: uuid.NewString(),
+				Hash:          "stub-notif-2",
+				Status:        IntimationStatusActive,
+			},
+			inserted:      true,
+			oldStatus:     "",
+			newStatus:     IntimationStatusActive,
+			wantNew:       1,
+			wantCancelled: 0,
+			wantJSON:      []string{`"status":"` + IntimationStatusActive + `"`, `"cancelled_at":null`},
+		},
+		{
+			name: "active → cancelled transition → cancelled (not new, not observed)",
 			param: IntimationParams{
 				TenantID:      uuid.NewString(),
 				CaseID:        uuid.NewString(),
@@ -59,22 +79,45 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 				CancelledAt:   time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC),
 				CancelReason:  "retratada pelo tribunal",
 			},
-			inserted:     false,
-			wantNewCount: 0,
-			wantJSON:     []string{`"status":"` + IntimationStatusCancelled + `"`, `"cancelled_at":"2024-02-01"`},
+			inserted:      false,
+			oldStatus:     IntimationStatusActive,
+			newStatus:     IntimationStatusCancelled,
+			wantNew:       0,
+			wantCancelled: 1,
+			wantJSON:      []string{`"status":"` + IntimationStatusCancelled + `"`, `"cancelled_at":"2024-02-01"`},
 		},
 		{
-			name: "fresh active intimation inserts and counts as new",
+			name: "reobserved active (deduped) → neither event",
 			param: IntimationParams{
 				TenantID:      uuid.NewString(),
 				CaseID:        uuid.NewString(),
 				CourtRecordID: uuid.NewString(),
-				Hash:          "stub-notif-2",
+				Hash:          "stub-notif-3",
 				Status:        IntimationStatusActive,
 			},
-			inserted:     true,
-			wantNewCount: 1,
-			wantJSON:     []string{`"status":"` + IntimationStatusActive + `"`, `"cancelled_at":null`},
+			inserted:      false,
+			oldStatus:     IntimationStatusActive,
+			newStatus:     IntimationStatusActive,
+			wantNew:       0,
+			wantCancelled: 0,
+			wantJSON:      []string{`"status":"` + IntimationStatusActive + `"`},
+		},
+		{
+			name: "already-cancelled re-arrives → neither event (no re-emit)",
+			param: IntimationParams{
+				TenantID:      uuid.NewString(),
+				CaseID:        uuid.NewString(),
+				CourtRecordID: uuid.NewString(),
+				Hash:          "stub-notif-4",
+				Status:        IntimationStatusCancelled,
+				CancelReason:  "retratada pelo tribunal",
+			},
+			inserted:      false,
+			oldStatus:     IntimationStatusCancelled,
+			newStatus:     IntimationStatusCancelled,
+			wantNew:       0,
+			wantCancelled: 0,
+			wantJSON:      []string{`"status":"` + IntimationStatusCancelled + `"`},
 		},
 	}
 
@@ -90,21 +133,32 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 
 			// The set-based upsert takes exactly two args: the tenant id and the jsonb rows
 			// payload. Matching the DO-UPDATE SQL guards against a regression to DO NOTHING;
-			// the jsonb matcher proves the retraction fields reach the query.
+			// the jsonb matcher proves the retraction fields reach the query. The returned
+			// rows carry the enriched columns (court joined, old_status subquery) the mapper
+			// classifies into new vs cancelled.
 			mock.ExpectQuery(doUpdateSQL).
 				WithArgs(pgxmock.AnyArg(), jsonbContains{tt.wantJSON}).
 				WillReturnRows(
-					pgxmock.NewRows([]string{"id", "inserted"}).
-						AddRow(uuid.New(), tt.inserted),
+					pgxmock.NewRows([]string{
+						"id", "court_record_id", "type", "status", "deadline_start_at",
+						"cancel_reason", "inserted", "court", "case_id", "old_status",
+					}).AddRow(
+						uuid.New(), uuid.New(), (*string)(nil), tt.newStatus,
+						pgtype.Date{Time: time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC), Valid: true},
+						(*string)(nil), tt.inserted, "TJSP", uuid.New(), tt.oldStatus,
+					),
 				)
 
 			r := &pgRepository{}
-			newCount, err := r.UpsertIntimations(context.Background(), mock, []IntimationParams{tt.param})
+			newRows, cancelledRows, err := r.UpsertIntimations(context.Background(), mock, []IntimationParams{tt.param})
 			if err != nil {
 				t.Fatalf("UpsertIntimations: %v", err)
 			}
-			if newCount != tt.wantNewCount {
-				t.Errorf("newCount = %d, want %d", newCount, tt.wantNewCount)
+			if len(newRows) != tt.wantNew {
+				t.Errorf("newRows = %d, want %d", len(newRows), tt.wantNew)
+			}
+			if len(cancelledRows) != tt.wantCancelled {
+				t.Errorf("cancelledRows = %d, want %d", len(cancelledRows), tt.wantCancelled)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("unmet expectations: %v", err)

@@ -146,8 +146,8 @@ func (m *mockRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, _ []Doc
 	return nil, nil
 }
 
-func (m *mockRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []IntimationParams) (int, error) {
-	return 0, nil
+func (m *mockRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []IntimationParams) ([]IntimationChange, []IntimationChange, error) {
+	return nil, nil, nil
 }
 
 func (m *mockRepo) InsertPublications(_ context.Context, _ database.Tx, _ []PublicationParams) (int, error) {
