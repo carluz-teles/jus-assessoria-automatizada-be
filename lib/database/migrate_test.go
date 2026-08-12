@@ -149,10 +149,11 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(24); err != nil || next != 25 {
 		t.Fatalf("Next(24) = (%d, %v), want (25, nil)", next, err)
 	}
-	// 0026 is reserved for a parallel slice (absent in this branch), so the source
-	// skips from 25 straight to this slice's 0027, the last migration here.
-	if next, err := src.Next(25); err != nil || next != 27 {
-		t.Fatalf("Next(25) = (%d, %v), want (27, nil)", next, err)
+	if next, err := src.Next(25); err != nil || next != 26 {
+		t.Fatalf("Next(25) = (%d, %v), want (26, nil)", next, err)
+	}
+	if next, err := src.Next(26); err != nil || next != 27 {
+		t.Fatalf("Next(26) = (%d, %v), want (27, nil)", next, err)
 	}
 	if _, err := src.Next(27); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Next(27) error = %v, want fs.ErrNotExist", err)

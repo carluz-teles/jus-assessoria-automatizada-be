@@ -8,6 +8,7 @@ import (
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
+	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -41,6 +42,7 @@ type routerDeps struct {
 	billing              *billing.Handler
 	identity             *identity.Handler
 	acquisition          *acquisition.Handler
+	deadline             *deadline.Handler
 	lookup               *lookup.Handler
 }
 
@@ -141,6 +143,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// domain use cases) still builds.
 	if deps.acquisition != nil {
 		deps.acquisition.RegisterV1(v1)
+	}
+
+	// deadline owns its /v1 prazos read routes (the Prazos tab + the /prazos agenda +
+	// the prazo detail) and mounts them via RegisterV1 — the api only composes. The
+	// slice's write surface (confirm/adjust) is a later fatia. Nil-guarded so the router
+	// test's fixture (which wires no domain use cases) still builds.
+	if deps.deadline != nil {
+		deps.deadline.RegisterV1(v1)
 	}
 
 	// notifications owns its authenticated /v1 in-app inbox routes (list/badge/
