@@ -14,9 +14,12 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // djen.go is the REAL DJEN connector: it discovers a tenant's communications on
@@ -318,7 +321,16 @@ type djenItemKey struct {
 // (the same process reaches both of its advogados), and returns them as one
 // djenPayload. A transport or non-success response is a retryable infra error —
 // the sync use case records a FAILED run and acks so the scheduler re-syncs.
-func (c *DJENConnector) Fetch(ctx context.Context, req FetchRequest) (RawPayload, error) {
+func (c *DJENConnector) Fetch(ctx context.Context, req FetchRequest) (_ RawPayload, err error) {
+	ctx, span := obs.Start(ctx, "djen.fetch", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("djen.capability", string(req.Capability)),
+			attribute.Int("djen.oab_count", len(req.OABs)),
+			attribute.String("djen.window_from", req.WindowFrom),
+			attribute.String("djen.window_to", req.WindowTo),
+		))
+	defer func() { obs.Record(span, err); span.End() }()
+
 	if req.Capability != CapabilityDiscoverByOAB {
 		return RawPayload{}, fmt.Errorf("djen: unsupported capability %q (only %s)", req.Capability, CapabilityDiscoverByOAB)
 	}
@@ -326,10 +338,11 @@ func (c *DJENConnector) Fetch(ctx context.Context, req FetchRequest) (RawPayload
 	seen := make(map[string]bool)
 	items := make([]json.RawMessage, 0)
 	for _, oab := range req.OABs {
-		if err := c.fetchOAB(ctx, oab, req.WindowFrom, req.WindowTo, seen, &items); err != nil {
-			return RawPayload{}, err
+		if ferr := c.fetchOAB(ctx, oab, req.WindowFrom, req.WindowTo, seen, &items); ferr != nil {
+			return RawPayload{}, ferr
 		}
 	}
+	span.SetAttributes(attribute.Int("djen.items", len(items)))
 
 	body, err := json.Marshal(djenPayload{OABs: req.OABs, Items: items})
 	if err != nil {
@@ -378,12 +391,24 @@ func (c *DJENConnector) fetchOAB(ctx context.Context, oab OABEntry, from, to str
 // and matches OABs locally. Unlike the per-OAB Fetch it needs no cross-query dedup (a
 // tribunal page's items are already unique), so a straight accumulate suffices. The
 // walk ends at the first short page or the defensive page cap.
-func (c *DJENConnector) FetchDiario(ctx context.Context, tribunal, from, to string) ([]json.RawMessage, error) {
+func (c *DJENConnector) FetchDiario(ctx context.Context, tribunal, from, to string) (_ []json.RawMessage, err error) {
+	ctx, span := obs.Start(ctx, "djen.fetch_diario", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("djen.tribunal", tribunal),
+			attribute.String("djen.window_from", from),
+			attribute.String("djen.window_to", to),
+		))
 	items := make([]json.RawMessage, 0)
+	defer func() {
+		span.SetAttributes(attribute.Int("djen.items", len(items)))
+		obs.Record(span, err)
+		span.End()
+	}()
+
 	for page := 1; page <= djenMaxPages; page++ {
-		resp, err := c.getDiarioPage(ctx, tribunal, from, to, page)
-		if err != nil {
-			return nil, err
+		resp, perr := c.getDiarioPage(ctx, tribunal, from, to, page)
+		if perr != nil {
+			return nil, perr
 		}
 		items = append(items, resp.Items...)
 		if len(resp.Items) < c.pageSize {
@@ -429,7 +454,11 @@ func (c *DJENConnector) getDiarioPage(ctx context.Context, tribunal, from, to st
 // reads. It fails on a transport error, a non-200 status, or a non-success envelope;
 // a 429/503 trips the shared cooldown and surfaces onBlock (with Status/RetryAfter
 // filled in) as a retryable Unavailable. label identifies the request in error text.
-func (c *DJENConnector) requestPage(ctx context.Context, query url.Values, label string, onBlock RateLimitedError) (djenResponse, error) {
+func (c *DJENConnector) requestPage(ctx context.Context, query url.Values, label string, onBlock RateLimitedError) (resp djenResponse, err error) {
+	ctx, span := obs.Start(ctx, "djen.request_page", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("djen.request", label)))
+	defer func() { obs.Record(span, err); span.End() }()
+
 	endpoint := c.baseURL + "/comunicacao?" + query.Encode()
 
 	// Back off together with every other slice while a rate block is cooling down,
@@ -457,6 +486,7 @@ func (c *DJENConnector) requestPage(ctx context.Context, query url.Values, label
 		return djenResponse{}, apperr.NewInfra(fmt.Sprintf("djen: GET comunicacao (%s)", label), err)
 	}
 	defer res.Body.Close()
+	span.SetAttributes(attribute.Int("http.response.status_code", res.StatusCode))
 
 	// A 429 (or 503) is a rate block, not a fault: trip the shared cooldown so every
 	// slice backs off together, and surface a typed, retryable Unavailable carrying
@@ -466,6 +496,10 @@ func (c *DJENConnector) requestPage(ctx context.Context, query url.Values, label
 		c.cooldown.trip(retryAfter)
 		onBlock.Status = res.StatusCode
 		onBlock.RetryAfter = retryAfter
+		span.SetAttributes(
+			attribute.Bool("djen.rate_limited", true),
+			attribute.Int64("djen.retry_after_ms", retryAfter.Milliseconds()),
+		)
 		return djenResponse{}, apperr.NewUnavailable(
 			fmt.Sprintf("djen: comunicacao rate limited (%s)", label),
 			&onBlock,
