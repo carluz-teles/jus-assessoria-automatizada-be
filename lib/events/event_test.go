@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/pashagolub/pgxmock/v4"
 
@@ -32,6 +33,20 @@ func (sampleEvent) Type() string          { return "minuta.revised" }
 
 // Compile-time proof sampleEvent (and thus the Base embedding) satisfies Event.
 var _ Event = sampleEvent{}
+
+// scheduledSampleEvent is a sampleEvent that OPTS INTO future delivery by
+// implementing ScheduledEvent. at/ok are the value ProcessAt reports, so tests can
+// exercise both the future-delivery path (ok=true) and the opt-out (ok=false).
+type scheduledSampleEvent struct {
+	sampleEvent
+	at time.Time
+	ok bool
+}
+
+func (e scheduledSampleEvent) ProcessAt() (time.Time, bool) { return e.at, e.ok }
+
+// Compile-time proof the opt-in interface is satisfied through the embedding.
+var _ ScheduledEvent = scheduledSampleEvent{}
 
 // newMockPool builds a pgxmock pool shared by the DB-less tests in this package.
 // It satisfies both database.Tx (Exec/Query/QueryRow) and the Dedup execer seam.

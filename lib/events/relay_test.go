@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/hibiken/asynq"
 	"github.com/pashagolub/pgxmock/v4"
@@ -13,13 +14,16 @@ import (
 )
 
 // recordedEnqueue captures one EnqueueContext call, decoding the opaque options so
-// tests can assert routing (Queue), retry budget (MaxRetry) and dedup id (TaskID).
+// tests can assert routing (Queue), retry budget (MaxRetry), dedup id (TaskID) and
+// the optional schedule time (ProcessAt).
 type recordedEnqueue struct {
-	task      *asynq.Task
-	queue     string
-	maxRetry  int
-	taskID    string
-	hasTaskID bool
+	task         *asynq.Task
+	queue        string
+	maxRetry     int
+	taskID       string
+	hasTaskID    bool
+	processAt    time.Time
+	hasProcessAt bool
 }
 
 // fakeEnqueuer is a Redis-free Enqueuer: it records every call and can be told to
@@ -41,6 +45,9 @@ func (f *fakeEnqueuer) EnqueueContext(_ context.Context, task *asynq.Task, opts 
 		case asynq.TaskIDOpt:
 			rec.taskID = o.Value().(string)
 			rec.hasTaskID = true
+		case asynq.ProcessAtOpt:
+			rec.processAt = o.Value().(time.Time)
+			rec.hasProcessAt = true
 		}
 	}
 
@@ -52,11 +59,15 @@ func (f *fakeEnqueuer) EnqueueContext(_ context.Context, task *asynq.Task, opts 
 	return &asynq.TaskInfo{ID: rec.taskID, Queue: rec.queue}, nil
 }
 
-// outboxRows builds a two-row result set in the column order Tick scans.
+// outboxColumns is the column order Tick scans, shared by the row builders.
+var outboxColumns = []string{"id", "type", "payload", "idempotency_key", "trace_context", "aggregate_id", "process_at"}
+
+// outboxRows builds a two-row result set in the column order Tick scans. Both rows
+// have a NULL process_at (immediate delivery), the default path.
 func outboxRows() *pgxmock.Rows {
-	return pgxmock.NewRows([]string{"id", "type", "payload", "idempotency_key", "trace_context", "aggregate_id"}).
-		AddRow(int64(1), "ingestao.movimento.observed", []byte(`{"a":1}`), "idem-1", wantTraceparent, "agg-1").
-		AddRow(int64(2), "ai.revisao.requested", []byte(`{"b":2}`), "idem-2", "", "agg-2")
+	return pgxmock.NewRows(outboxColumns).
+		AddRow(int64(1), "ingestao.movimento.observed", []byte(`{"a":1}`), "idem-1", wantTraceparent, "agg-1", nil).
+		AddRow(int64(2), "ai.revisao.requested", []byte(`{"b":2}`), "idem-2", "", "agg-2", nil)
 }
 
 // Happy path: two rows drain in order — each enqueued with the right queue/retry/id
@@ -106,6 +117,10 @@ func TestRelay_Tick_PublishesBatch(t *testing.T) {
 	if c0.task.Type() != "ingestao.movimento.observed" {
 		t.Errorf("call[0] type = %q", c0.task.Type())
 	}
+	// NULL process_at means no ProcessAt option — pending immediately, as before.
+	if c0.hasProcessAt {
+		t.Errorf("call[0] ProcessAt set = %v, want no ProcessAt for a NULL process_at row", c0.processAt)
+	}
 
 	// Row 2 → ai queue, small retry; empty trace_context means no trace header, but
 	// the event-identity headers are still present.
@@ -119,7 +134,46 @@ func TestRelay_Tick_PublishesBatch(t *testing.T) {
 	if got := c1.task.Headers()[aggregateIDHeader]; got != "agg-2" {
 		t.Errorf("call[1] %s header = %q, want agg-2", aggregateIDHeader, got)
 	}
+	if c1.hasProcessAt {
+		t.Errorf("call[1] ProcessAt set = %v, want no ProcessAt for a NULL process_at row", c1.processAt)
+	}
 
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A row whose process_at is set (opted into future delivery) is enqueued with the
+// asynq.ProcessAt option carrying exactly that time, so the task lands SCHEDULED.
+func TestRelay_Tick_ScheduledRow_EnqueuesWithProcessAt(t *testing.T) {
+	at := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	mock := newMockPool(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id, type, payload").WillReturnRows(
+		pgxmock.NewRows(outboxColumns).
+			AddRow(int64(1), "ingestao.movimento.observed", []byte(`{"a":1}`), "idem-1", "", "agg-1", &at),
+	)
+	mock.ExpectExec("UPDATE outbox SET published_at").WithArgs(int64(1)).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+
+	fake := &fakeEnqueuer{failAt: -1}
+	relay := NewRelay(database.NewUnitOfWork(mock), fake)
+
+	if _, err := relay.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("enqueue calls = %d, want 1", len(fake.calls))
+	}
+	c0 := fake.calls[0]
+	if !c0.hasProcessAt {
+		t.Fatal("call[0] ProcessAt not set, want the row's process_at as an asynq.ProcessAt option")
+	}
+	if !c0.processAt.Equal(at) {
+		t.Errorf("call[0] ProcessAt = %v, want %v", c0.processAt, at)
+	}
+	// The row is still drained this tick — the ETA lives in asynq, not the outbox.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}
@@ -161,8 +215,8 @@ func TestRelay_Tick_TaskIDConflict_MarksPublished(t *testing.T) {
 	mock := newMockPool(t)
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT id, type, payload").WillReturnRows(
-		pgxmock.NewRows([]string{"id", "type", "payload", "idempotency_key", "trace_context", "aggregate_id"}).
-			AddRow(int64(1), "ingestao.movimento.observed", []byte(`{"a":1}`), "idem-1", "", "agg-1"),
+		pgxmock.NewRows(outboxColumns).
+			AddRow(int64(1), "ingestao.movimento.observed", []byte(`{"a":1}`), "idem-1", "", "agg-1", nil),
 	)
 	mock.ExpectExec("UPDATE outbox SET published_at").WithArgs(int64(1)).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectCommit()

@@ -249,6 +249,7 @@ type Outbox struct {
 	TraceContext   *string            `json:"trace_context"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	PublishedAt    pgtype.Timestamptz `json:"published_at"`
+	ProcessAt      pgtype.Timestamptz `json:"process_at"`
 }
 
 type Petition struct {

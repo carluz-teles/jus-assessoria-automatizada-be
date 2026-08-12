@@ -3,16 +3,18 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
 )
 
 // insertOutbox appends one row to the transactional outbox. Column order matches
 // Publish's argument order; id and created_at default in the DB and published_at
-// stays NULL until the relay drains it.
+// stays NULL until the relay drains it. process_at is NULL unless the event opts
+// into future delivery (see scheduledAt).
 const insertOutbox = `INSERT INTO outbox
-	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context)
-	VALUES ($1, $2, $3, $4, $5, $6)`
+	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context, process_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 // Outbox is the producer half of the pipeline. It is stateless: Publish writes
 // through the caller's transaction, so the same tx that persists the domain entity
@@ -44,23 +46,45 @@ func (o *Outbox) Publish(ctx context.Context, tx database.Tx, ev Event) error {
 		payload,
 		ev.IdempotencyKey(),
 		TraceContextFromCtx(ctx),
+		scheduledAt(ev),
 	)
 	return database.WrapInfra(err)
+}
+
+// scheduledAt is the internal type-assert that reads an event's optional ETA. If ev
+// implements ScheduledEvent and asks for a future delivery, it returns a pointer to
+// that time (written to process_at); otherwise it returns nil, so process_at is SQL
+// NULL and the event is delivered immediately — the default for the vast majority
+// of events, which do not implement ScheduledEvent. Keeping the assertion here (not
+// in Publish's signature) is what makes the primitive retrocompatible.
+func scheduledAt(ev Event) *time.Time {
+	s, ok := ev.(ScheduledEvent)
+	if !ok {
+		return nil
+	}
+	t, ok := s.ProcessAt()
+	if !ok || t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // insertOutboxBatch appends MANY rows in one round-trip from a jsonb array — the set-
 // based counterpart of insertOutbox. bigserial ids are assigned in array order, so the
 // events keep their relative publication order.
 const insertOutboxBatch = `INSERT INTO outbox
-	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context)
-	SELECT r.aggregate_type, r.aggregate_id, r.type, r.payload, r.idempotency_key, r.trace_context
+	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context, process_at)
+	SELECT r.aggregate_type, r.aggregate_id, r.type, r.payload, r.idempotency_key, r.trace_context, r.process_at
 	FROM jsonb_to_recordset($1::jsonb) AS r(
 		aggregate_type text, aggregate_id uuid, type text, payload jsonb,
-		idempotency_key text, trace_context text
+		idempotency_key text, trace_context text, process_at timestamptz
 	)`
 
 // outboxRowJSON is one row of the PublishBatch payload. payload is the event's own JSON,
-// embedded as-is; trace_context is captured once for the whole batch.
+// embedded as-is; trace_context is captured once for the whole batch. ProcessAt is the
+// per-event optional ETA: a nil pointer marshals to JSON null, which jsonb_to_recordset
+// reads back as a SQL NULL process_at (immediate delivery); a set time marshals as
+// RFC3339, which timestamptz parses (future delivery).
 type outboxRowJSON struct {
 	AggregateType  string          `json:"aggregate_type"`
 	AggregateID    string          `json:"aggregate_id"`
@@ -68,6 +92,7 @@ type outboxRowJSON struct {
 	Payload        json.RawMessage `json:"payload"`
 	IdempotencyKey string          `json:"idempotency_key"`
 	TraceContext   string          `json:"trace_context"`
+	ProcessAt      *time.Time      `json:"process_at"`
 }
 
 // PublishBatch inserts MANY events into the outbox in ONE round-trip, within tx. It is
@@ -92,6 +117,7 @@ func (o *Outbox) PublishBatch(ctx context.Context, tx database.Tx, evs []Event) 
 			Payload:        payload,
 			IdempotencyKey: ev.IdempotencyKey(),
 			TraceContext:   trace,
+			ProcessAt:      scheduledAt(ev),
 		}
 	}
 	batch, err := json.Marshal(rows)
