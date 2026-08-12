@@ -251,6 +251,22 @@ func TestQueueFor(t *testing.T) {
 		// enrichment flood on "ingestao".
 		{"acquisition.sync_completed", "sync_status"},
 		{"acquisition.sync_failed", "sync_status"},
+		// The prazo flow gets its OWN dedicated queue so creating a prazo is never starved by
+		// the enrichment flood on "ingestao". The two intimation events carry the "acquisition"
+		// prefix, so they must be special-cased ahead of the prefix switch.
+		{"acquisition.intimation.observed", "deadline"},
+		{"acquisition.intimation.cancelled", "deadline"},
+		{"deadline.reminder_check", "deadline"},
+		{"deadline.missed_check", "deadline"},
+		// due_soon/missed are consumed by the NOTIFICATIONS listener (main server), not the
+		// deadline server — route them to the queue that listener serves.
+		{"deadline.due_soon", "notifications"},
+		{"deadline.missed", "notifications"},
+		// The rest of the deadline domain has no async consumer — stays on "ingestao"
+		// (archived as handler-not-found), not "default".
+		{"deadline.opened", "ingestao"},
+		{"deadline.revoked", "ingestao"},
+		{"deadline.task.created", "ingestao"},
 		{"documents.file.extracted", "documents"},
 		{"ai.revisao.requested", "ai"},
 		{"notification.requested", "notifications"},
