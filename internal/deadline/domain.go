@@ -41,6 +41,18 @@ type Repository interface {
 	// notification_id DO NOTHING) and returns it with its DB-assigned id. A conflict
 	// (a prazo already exists for the intimação) is ErrDeadlineExists.
 	InsertDeadline(ctx context.Context, tx database.Tx, d *Deadline) (*Deadline, error)
+	// GetDeadlineForCheck re-reads a prazo at a scheduled mark's fire time, keyed by its id
+	// and scoped to tenantID (barrier 1). It backs OnReminderCheck's re-check: the CURRENT
+	// status decides whether a lembrete is still due. A missing id in the tenant (a prazo
+	// hard-gone — it should not happen, prazos only change status) is ErrDeadlineNotFound,
+	// never (nil, nil).
+	GetDeadlineForCheck(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (*DeadlineForCheck, error)
+	// MarkMissed auto-flips a prazo to MISSED at the D+1 carência, scoped to tenantID
+	// (barrier 1). The UPDATE's status='OPEN' AND end_date < CURRENT_DATE guard makes it a
+	// safe, idempotent no-op in every other case — a PENDING (unconfirmed) prazo, an already
+	// terminal one, or one not yet overdue touches no row and returns ErrDeadlineNotFound.
+	// On a hit it returns the missed prazo's id so deadline.missed commits in the same tx.
+	MarkMissed(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
 	// RevokeDeadlineByIntimation cancels the prazo derived from the intimação (keyed by
 	// the 1:1 notification_id), scoped to tenantID (barrier 1). The UPDATE's status <>
 	// CANCELLED guard makes it idempotent: when it touches no row — no prazo for the
@@ -74,21 +86,46 @@ type businessCalendar interface {
 	AddCalendarDays(ctx context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error)
 }
 
-// UseCase derives a prazo from an observed intimação. It depends only on the ports
-// above and the UnitOfWork — never a concrete implementation (docs §2.5).
+// UseCase derives a prazo from an observed intimação and drives its scheduled marks. It
+// depends only on the ports above and the UnitOfWork — never a concrete implementation
+// (docs §2.5). now is the clock the birth-time future-guard compares mark ETAs against;
+// it defaults to time.Now and is overridable in tests via WithClock.
 type UseCase struct {
 	repo   Repository
 	cal    businessCalendar
 	outbox publisher
 	dedup  deduper
 	uow    database.UnitOfWork
+	now    func() time.Time
+}
+
+// Option configures a UseCase at construction. Kept as functional options so the clock
+// seam can be injected in tests without breaking the worker's positional call.
+type Option func(*UseCase)
+
+// WithClock overrides the reference clock the birth-time future-guard uses when deciding
+// which marks are still in the future. Production leaves the default (time.Now); tests pin
+// it to assert deterministically which D-N marks a given end_date schedules.
+func WithClock(now func() time.Time) Option {
+	return func(uc *UseCase) { uc.now = now }
 }
 
 // NewUseCase wires the use case to its repository, calendar, outbox publisher, dedup
-// guard and unit of work.
-func NewUseCase(repo Repository, cal businessCalendar, outbox publisher, dedup deduper, uow database.UnitOfWork) *UseCase {
-	return &UseCase{repo: repo, cal: cal, outbox: outbox, dedup: dedup, uow: uow}
+// guard and unit of work. opts is variadic so existing callers stay source-compatible;
+// the clock defaults to time.Now.
+func NewUseCase(repo Repository, cal businessCalendar, outbox publisher, dedup deduper, uow database.UnitOfWork, opts ...Option) *UseCase {
+	uc := &UseCase{repo: repo, cal: cal, outbox: outbox, dedup: dedup, uow: uow, now: time.Now}
+	for _, opt := range opts {
+		opt(uc)
+	}
+	return uc
 }
+
+// reminderDaysLeft are the D-N marks a freshly opened prazo schedules a reminder_check for:
+// D-3, D-1 and the vencimento (D-0). Each becomes a scheduled deadline.reminder_check whose
+// ETA is start-of-day(end_date) minus that many calendar days; marks already in the past at
+// birth are skipped (a prazo born <3 dias do fim gets no D-3).
+var reminderDaysLeft = []int{3, 1, 0}
 
 // OnIntimationObserved is the creation path: from one acquisition.intimation.observed
 // it derives a prazo and opens it, all in a single tenant-scoped transaction so the
@@ -168,7 +205,112 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 			return err
 		}
 
-		return uc.outbox.Publish(ctx, tx, newDeadlineOpened(saved))
+		if err := uc.outbox.Publish(ctx, tx, newDeadlineOpened(saved)); err != nil {
+			return err
+		}
+
+		// Schedule the D-N reminder marks and the D+1 carência mark in the SAME tx (docs
+		// erd-prazos.md §12; repo directive: ETA work is a scheduled task, not polling). Each
+		// is a ScheduledEvent whose process_at the relay turns into an asynq.ProcessAt, so the
+		// checks live in asynq, never in a polling loop.
+		return uc.scheduleChecks(ctx, tx, saved)
+	})
+}
+
+// scheduleChecks publishes the prazo's future self-messages: one deadline.reminder_check
+// per D-N mark plus one deadline.missed_check, each with its ETA. Only marks whose ETA is
+// STRICTLY in the future are scheduled (uc.now is the reference): a prazo born past a mark
+// never fires a stale reminder, and a prazo born already overdue schedules no carência (it
+// is PENDING, so a missed_check would no-op anyway). Publish inserts each row in the
+// caller's tx, so the marks commit atomically with the prazo and its deadline.opened.
+func (uc *UseCase) scheduleChecks(ctx context.Context, tx database.Tx, d *Deadline) error {
+	now := uc.now()
+	for _, daysLeft := range reminderDaysLeft {
+		mark := newDeadlineReminderCheck(d.TenantID, d.ID, daysLeft, d.EndDate)
+		if at, _ := mark.ProcessAt(); !at.After(now) {
+			continue
+		}
+		if err := uc.outbox.Publish(ctx, tx, mark); err != nil {
+			return err
+		}
+	}
+	missed := newDeadlineMissedCheck(d.TenantID, d.ID, d.EndDate)
+	if at, _ := missed.ProcessAt(); at.After(now) {
+		if err := uc.outbox.Publish(ctx, tx, missed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// OnReminderCheck is a mark's FIRE path: a scheduled deadline.reminder_check arrived at its
+// ETA, so re-read the prazo and decide whether the lembrete is still due. The re-check is
+// the whole point of the two-step design (schedule a check, not the lembrete): a prazo
+// cancelled, met or already missed between birth and the mark must NOT send an obsolete
+// reminder. Only a PENDING or OPEN prazo still deserves it (decisão travada: due_soon avisa
+// OPEN e PENDING, viés seguro). The dedup mark and the emitted deadline.due_soon commit in
+// ONE tenant-scoped tx.
+//
+// Steps:
+//  1. dedup — a redelivered task (same stable event id) marks nothing new and returns;
+//  2. re-read the prazo (tenant-scoped); a gone prazo is a terminal not-found;
+//  3. status ∈ {PENDING, OPEN} → emit deadline.due_soon; anything terminal → NO-OP.
+func (uc *UseCase) OnReminderCheck(ctx context.Context, ev DeadlineReminderCheck) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDeadline, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		d, err := uc.repo.GetDeadlineForCheck(ctx, tx, ev.DeadlineID, ev.TenantID)
+		if err != nil {
+			return err
+		}
+		if d.Status != StatusPending && d.Status != StatusOpen {
+			// CANCELLED / MET / MISSED — the mark is obsolete; never send a stale lembrete.
+			return nil
+		}
+
+		return uc.outbox.Publish(ctx, tx, newDeadlineDueSoon(ev.TenantID, d.ID, ev.DaysLeft))
+	})
+}
+
+// OnMissedCheck is the carência mark's FIRE path: a scheduled deadline.missed_check arrived
+// at end_date + 1 day, so auto-mark the prazo MISSED — but ONLY if it is still OPEN and
+// overdue (decisão travada: MISSED auto D+1, SÓ em OPEN — perder um PENDING não confirmado
+// não faz sentido). The guarded MarkMissed UPDATE collapses every other case (PENDING, a
+// terminal status, or not yet overdue) to a safe no-op that touches no row, mirroring the
+// revoke path. The dedup mark, the status flip and deadline.missed commit in ONE tx.
+//
+// Steps:
+//  1. dedup — a redelivered task returns before any write;
+//  2. MarkMissed (status='OPEN' AND end_date < CURRENT_DATE guard) → no row → NO-OP;
+//  3. otherwise emit deadline.missed in the SAME tx.
+func (uc *UseCase) OnMissedCheck(ctx context.Context, ev DeadlineMissedCheck) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDeadline, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		missedID, err := uc.repo.MarkMissed(ctx, tx, ev.DeadlineID, ev.TenantID)
+		if errors.Is(err, ErrDeadlineNotFound) {
+			// Not OPEN, not yet overdue, or already terminal — nothing to miss. The dedup
+			// mark still commits, so a redelivery stays a no-op and no phantom deadline.missed
+			// is emitted (the safe bias).
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		return uc.outbox.Publish(ctx, tx, newDeadlineMissed(ev.TenantID, missedID))
 	})
 }
 

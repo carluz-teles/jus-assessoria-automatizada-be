@@ -42,6 +42,46 @@ func (q *Queries) GetCourtRecordClass(ctx context.Context, arg GetCourtRecordCla
 	return class, err
 }
 
+const getDeadlineForCheck = `-- name: GetDeadlineForCheck :one
+SELECT id, status, end_date, court_record_id, kind, counting
+FROM deadline
+WHERE id = $1 AND tenant_id = $2
+`
+
+type GetDeadlineForCheckParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetDeadlineForCheckRow struct {
+	ID            uuid.UUID   `json:"id"`
+	Status        string      `json:"status"`
+	EndDate       pgtype.Date `json:"end_date"`
+	CourtRecordID uuid.UUID   `json:"court_record_id"`
+	Kind          *string     `json:"kind"`
+	Counting      string      `json:"counting"`
+}
+
+// Re-read a prazo at a scheduled mark's fire time (deadline.reminder_check): the CURRENT
+// status the fire handler branches on, plus the end_date and the context (kind, counting,
+// court_record_id) a lembrete or MISSED fact may carry. Keyed by id and scoped to tenant_id
+// (barrier 1, on top of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed
+// ErrDeadlineNotFound at the mapper, never (nil, nil). $1 = id, $2 = tenant_id, both from
+// the trusted scheduled-event payload.
+func (q *Queries) GetDeadlineForCheck(ctx context.Context, arg GetDeadlineForCheckParams) (GetDeadlineForCheckRow, error) {
+	row := q.db.QueryRow(ctx, getDeadlineForCheck, arg.ID, arg.TenantID)
+	var i GetDeadlineForCheckRow
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.EndDate,
+		&i.CourtRecordID,
+		&i.Kind,
+		&i.Counting,
+	)
+	return i, err
+}
+
 const insertDeadline = `-- name: InsertDeadline :one
 INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
@@ -96,6 +136,32 @@ func (q *Queries) InsertDeadline(ctx context.Context, arg InsertDeadlineParams) 
 		arg.Kind,
 		arg.RulesVersion,
 	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const markMissed = `-- name: MarkMissed :one
+UPDATE deadline
+SET status = 'MISSED'
+WHERE id = $1 AND tenant_id = $2 AND status = 'OPEN' AND end_date < CURRENT_DATE
+RETURNING id
+`
+
+type MarkMissedParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Auto-mark a prazo MISSED at the D+1 carência (deadline.missed_check fire path). Scoped to
+// tenant_id (barrier 1). The `status = 'OPEN' AND end_date < CURRENT_DATE` guard makes the
+// flip SAFE and IDEMPOTENT (decisão travada: MISSED auto D+1 SÓ em OPEN — nunca perder um
+// PENDING não confirmado): a redelivery, a PENDING/terminal prazo, or one not yet overdue
+// updates NO row → pgx.ErrNoRows → typed not-found at the mapper, the use case's no-op
+// (never a phantom deadline.missed). On a hit it returns the id so deadline.missed commits
+// in the SAME tx. $1 = id, $2 = tenant_id, both from the trusted scheduled-event payload.
+func (q *Queries) MarkMissed(ctx context.Context, arg MarkMissedParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, markMissed, arg.ID, arg.TenantID)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err

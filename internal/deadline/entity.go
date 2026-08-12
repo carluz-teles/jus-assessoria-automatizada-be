@@ -91,6 +91,20 @@ type RevokedDeadline struct {
 	CourtRecordID string
 }
 
+// DeadlineForCheck is the thin re-read of a prazo at a scheduled mark's fire time
+// (reminder_check / missed_check): the current Status the handler branches on, the EndDate
+// and the context (Kind, Counting, CourtRecordID) a lembrete or MISSED fact may carry. It
+// is a read value object — the fire handlers never mutate through it (MISSED goes through
+// the guarded MarkMissed UPDATE). A missing id in the tenant is ErrDeadlineNotFound.
+type DeadlineForCheck struct {
+	ID            string
+	Status        Status
+	EndDate       time.Time
+	CourtRecordID string
+	Kind          string
+	Counting      Counting
+}
+
 // DeadlineRule is the resolved conservative rule (a deadline_rule row, §8): how many
 // days, counted which way, under which kind, and whether the rule already implies the
 // dobro. It is a read value object — the resolver returns the most specific active

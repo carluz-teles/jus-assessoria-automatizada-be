@@ -1,6 +1,7 @@
 package deadline
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -130,5 +131,165 @@ func newDeadlineRevoked(deadlineID, intimationID, reason string) DeadlineRevoked
 		DeadlineID:   deadlineID,
 		IntimationID: intimationID,
 		Reason:       reason,
+	}
+}
+
+// TypeDeadlineReminderCheck is the dotted id of the INTERNAL, SCHEDULED task-cheque this
+// slice both PRODUCES (at prazo birth, one per D-N mark) and CONSUMES (at the ETA). It
+// carries no lembrete itself: when it fires the handler re-reads the prazo's CURRENT
+// status and only THEN emits the real deadline.due_soon — so a prazo cancelled or met
+// between birth and the mark never sends a stale reminder (re-check no disparo).
+const TypeDeadlineReminderCheck = "deadline.reminder_check"
+
+// DeadlineReminderCheck is the D-N mark's scheduled self-message. TenantID is the scope
+// channel every tenant-scoped consumer needs — the outbox carries no tenant, so the
+// payload is the only way the fire handler can open its RLS-scoped tx and filter the read
+// (barrier 1), mirroring how intimation.observed carries it. DaysLeft (3/1/0) rides
+// through onto the emitted due_soon. processAt is the computed ETA, kept UNEXPORTED so it
+// never serializes: it feeds ProcessAt() at publish time (the relay writes it to the
+// outbox row's process_at) and is irrelevant to the consumer, which re-loads by id.
+type DeadlineReminderCheck struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+	DaysLeft   int    `json:"days_left"`
+	processAt  time.Time
+}
+
+var (
+	_ events.Event          = DeadlineReminderCheck{}
+	_ events.ScheduledEvent = DeadlineReminderCheck{}
+)
+
+func (DeadlineReminderCheck) Type() string          { return TypeDeadlineReminderCheck }
+func (DeadlineReminderCheck) AggregateType() string { return aggregateTypeDeadline }
+
+// ProcessAt opts the check INTO future delivery (docs erd-backend §4c; repo directive: ETA
+// work is a scheduled task, not polling). The ETA is start-of-day(end_date) minus DaysLeft
+// calendar days, so the D-3/D-1/D-0 marks land at midnight of their day.
+func (e DeadlineReminderCheck) ProcessAt() (time.Time, bool) { return e.processAt, true }
+
+// newDeadlineReminderCheck builds one D-N mark for a freshly opened prazo. aggregate_id is
+// the deadline id (a uuid, satisfying the outbox's uuid NOT NULL). The event id is a
+// STABLE per-mark key ("deadline-reminder:{id}:{days_left}"): the relay uses it as the
+// asynq TaskID so re-deriving the same prazo never schedules the mark twice (enqueue
+// dedup), and the fire handler dedups the SAME key against processed_event (consumer
+// dedup) — the one string threads both idempotency floors.
+func newDeadlineReminderCheck(tenantID, deadlineID string, daysLeft int, endDate time.Time) DeadlineReminderCheck {
+	return DeadlineReminderCheck{
+		Base:       events.Base{EventID: fmt.Sprintf("deadline-reminder:%s:%d", deadlineID, daysLeft), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+		DaysLeft:   daysLeft,
+		processAt:  startOfDay(endDate).AddDate(0, 0, -daysLeft),
+	}
+}
+
+// TypeDeadlineMissedCheck is the dotted id of the INTERNAL, SCHEDULED carência task: at
+// end_date + 1 day the handler auto-marks the prazo MISSED — but only if it is still OPEN
+// (a PENDING, unconfirmed prazo is never "lost"), and the revogável D+1 grace is exactly
+// the ETA gap that lets a human confirm/meet it first.
+const TypeDeadlineMissedCheck = "deadline.missed_check"
+
+// DeadlineMissedCheck is the carência mark's scheduled self-message. TenantID scopes the
+// fire handler's tx/read (barrier 1) as in DeadlineReminderCheck; processAt (end_date + 1
+// day) is UNEXPORTED so it never serializes.
+type DeadlineMissedCheck struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+	processAt  time.Time
+}
+
+var (
+	_ events.Event          = DeadlineMissedCheck{}
+	_ events.ScheduledEvent = DeadlineMissedCheck{}
+)
+
+func (DeadlineMissedCheck) Type() string          { return TypeDeadlineMissedCheck }
+func (DeadlineMissedCheck) AggregateType() string { return aggregateTypeDeadline }
+
+// ProcessAt opts the carência check INTO future delivery at start-of-day(end_date) + 1
+// day — the revogável D+1 grace before a still-OPEN prazo is auto-missed.
+func (e DeadlineMissedCheck) ProcessAt() (time.Time, bool) { return e.processAt, true }
+
+// newDeadlineMissedCheck builds the single carência mark for a freshly opened prazo. Like
+// the reminder mark, the event id is a STABLE key ("deadline-missed:{id}") doubling as the
+// asynq TaskID (schedule-once) and the consumer dedup key (process-once).
+func newDeadlineMissedCheck(tenantID, deadlineID string, endDate time.Time) DeadlineMissedCheck {
+	return DeadlineMissedCheck{
+		Base:       events.Base{EventID: fmt.Sprintf("deadline-missed:%s", deadlineID), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+		processAt:  startOfDay(endDate).AddDate(0, 0, 1),
+	}
+}
+
+// startOfDay collapses a civil date to midnight in its own location — the anchor of the
+// mark math. end_date is already a date-only value (midnight UTC from lib/calendar), so
+// this normalizes any stray time-of-day before the day arithmetic.
+func startOfDay(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
+// TypeDeadlineDueSoon is the dotted id of the IMMEDIATE lembrete this slice PRODUCES when a
+// reminder_check fires on a still-active prazo. It is the REAL reminder — its consumer is
+// notifications (fatia 4c); until that lands it is an orphan, which is safe (nothing fires
+// it in prod without a real prazo).
+const TypeDeadlineDueSoon = "deadline.due_soon"
+
+// DeadlineDueSoon announces a prazo approaching its vencimento (DaysLeft ∈ {3,1,0}).
+// TenantID lets the future notifications consumer scope its send; DeadlineID + DaysLeft are
+// what the lembrete needs. Immediate (does NOT implement ScheduledEvent → process_at NULL).
+type DeadlineDueSoon struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+	DaysLeft   int    `json:"days_left"`
+}
+
+var _ events.Event = DeadlineDueSoon{}
+
+func (DeadlineDueSoon) Type() string          { return TypeDeadlineDueSoon }
+func (DeadlineDueSoon) AggregateType() string { return aggregateTypeDeadline }
+
+// newDeadlineDueSoon builds the immediate lembrete from the (re-checked) prazo id and the
+// firing mark's DaysLeft. Fresh uuid v7 event id (the consumer dedup key), mirroring
+// newDeadlineOpened; aggregate_id is the deadline id.
+func newDeadlineDueSoon(tenantID, deadlineID string, daysLeft int) DeadlineDueSoon {
+	return DeadlineDueSoon{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+		DaysLeft:   daysLeft,
+	}
+}
+
+// TypeDeadlineMissed is the dotted id of the IMMEDIATE fact this slice PRODUCES when a
+// missed_check auto-flips a still-OPEN, overdue prazo to MISSED. Consumer is notifications
+// (4c, future); orphan-for-now is safe.
+const TypeDeadlineMissed = "deadline.missed"
+
+// DeadlineMissed announces a prazo auto-marked MISSED at the D+1 carência. TenantID scopes
+// the future consumer; DeadlineID is the prazo. Immediate (no process_at).
+type DeadlineMissed struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
+
+var _ events.Event = DeadlineMissed{}
+
+func (DeadlineMissed) Type() string          { return TypeDeadlineMissed }
+func (DeadlineMissed) AggregateType() string { return aggregateTypeDeadline }
+
+// newDeadlineMissed builds the immediate MISSED fact. Fresh uuid v7 event id; aggregate_id
+// is the deadline id.
+func newDeadlineMissed(tenantID, deadlineID string) DeadlineMissed {
+	return DeadlineMissed{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
 	}
 }
