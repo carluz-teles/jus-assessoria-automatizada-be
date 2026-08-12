@@ -16,9 +16,11 @@ import (
 	"context"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/telemetry"
 )
 
@@ -36,6 +38,10 @@ const (
 	KeyMaxRetry    = "max_retry"
 	KeyOutcome     = "outcome"
 	KeyDurationMS  = "duration_ms"
+	// KeyErrorKind facets a failed span by the typed apperr.Kind (INFRA_ERROR,
+	// SERVICE_UNAVAILABLE, …), so the backend groups failures by cause — a DJEN 429
+	// (Unavailable) reads apart from a bug (Infra) without parsing the message.
+	KeyErrorKind = "error.kind"
 )
 
 // Outcome values for KeyOutcome — low-cardinality and stable so the log message
@@ -70,6 +76,11 @@ func Record(span trace.Span, err error) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
+		// Stamp the typed kind so every failure span is filterable by cause; a plain
+		// (non-AppError) err just carries no kind facet.
+		if ae, ok := apperr.From(err); ok {
+			span.SetAttributes(attribute.String(KeyErrorKind, string(ae.Kind)))
+		}
 		return
 	}
 	span.SetStatus(codes.Ok, "")

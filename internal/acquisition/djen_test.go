@@ -8,6 +8,15 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // djenItem builds a minimal comunicação JSON with a given hash — enough for the
@@ -201,4 +210,67 @@ func TestDJENConnectorFetchErrors(t *testing.T) {
 			t.Fatal("want error for HTTP 403, got nil")
 		}
 	})
+}
+
+// A 429 is captured on the djen.request_page span: the HTTP status, the rate_limited
+// flag and the typed error.kind (SERVICE_UNAVAILABLE, stamped by obs.Record) — so the
+// backend can facet a rate block apart from a bug without parsing the message. NOT
+// parallel: it installs a global recorder, which the package's parallel tests (parked
+// meanwhile) must not observe.
+func TestDJENConnector_RequestPageSpan(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prev); _ = tp.Shutdown(context.Background()) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := NewDJENConnector(WithDJENBaseURL(srv.URL), WithDJENRatePerMinute(6000000))
+	if _, err := c.Fetch(context.Background(), FetchRequest{
+		Capability: CapabilityDiscoverByOAB,
+		OABs:       []OABEntry{{Number: "347019", UF: "SP"}},
+	}); err == nil {
+		t.Fatal("want error for HTTP 429, got nil")
+	}
+
+	span := findSpan(t, sr.Ended(), "djen.request_page")
+	attrs := attrMap(span.Attributes())
+	if got := attrs["http.response.status_code"]; got != int64(http.StatusTooManyRequests) {
+		t.Errorf("status attr = %v, want 429", got)
+	}
+	if got := attrs["djen.rate_limited"]; got != true {
+		t.Errorf("rate_limited attr = %v, want true", got)
+	}
+	if got := attrs[obs.KeyErrorKind]; got != string(apperr.KindUnavailable) {
+		t.Errorf("error.kind attr = %v, want %s", got, apperr.KindUnavailable)
+	}
+	if span.Status().Code != codes.Error {
+		t.Errorf("span status = %v, want Error", span.Status().Code)
+	}
+}
+
+// findSpan returns the one ended span with the given name, failing if absent.
+func findSpan(t *testing.T, spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
+	t.Helper()
+	for _, s := range spans {
+		if s.Name() == name {
+			return s
+		}
+	}
+	t.Fatalf("span %q not recorded (got %d spans)", name, len(spans))
+	return nil
+}
+
+// attrMap flattens span attributes to a comparable map keyed by attribute name.
+func attrMap(attrs []attribute.KeyValue) map[string]any {
+	m := make(map[string]any, len(attrs))
+	for _, a := range attrs {
+		m[string(a.Key)] = a.Value.AsInterface()
+	}
+	return m
 }

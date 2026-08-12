@@ -10,9 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/obs"
 )
 
 // datajud.go is the REAL DATAJUD connector: it ENRICHES a known process on the
@@ -135,7 +138,14 @@ type datajudMatch struct {
 // error; a transport or non-200 response is a retryable infra error (the enrichment
 // use case lets asynq re-deliver — a DATAJUD rate-limit is transient). The raw ES
 // envelope becomes the RawPayload the parser reads.
-func (c *DATAJUDConnector) Fetch(ctx context.Context, req FetchRequest) (RawPayload, error) {
+func (c *DATAJUDConnector) Fetch(ctx context.Context, req FetchRequest) (_ RawPayload, err error) {
+	ctx, span := obs.Start(ctx, "datajud.fetch_by_number", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("datajud.court", req.Court),
+			attribute.String("datajud.cnj_number", req.CNJNumber),
+		))
+	defer func() { obs.Record(span, err); span.End() }()
+
 	if req.Capability != CapabilityFetchByNumber {
 		return RawPayload{}, fmt.Errorf("datajud: unsupported capability %q (only %s)", req.Capability, CapabilityFetchByNumber)
 	}
@@ -166,6 +176,7 @@ func (c *DATAJUDConnector) Fetch(ctx context.Context, req FetchRequest) (RawPayl
 		return RawPayload{}, apperr.NewInfra(fmt.Sprintf("datajud: POST %s (%s)", endpoint, req.CNJNumber), err)
 	}
 	defer res.Body.Close()
+	span.SetAttributes(attribute.Int("http.response.status_code", res.StatusCode))
 
 	if res.StatusCode != http.StatusOK {
 		return RawPayload{}, apperr.NewInfra(
