@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/lib/events"
 )
 
@@ -20,6 +21,39 @@ const (
 	TypeBackfillFinished    = acquisition.TypeBackfillFinished
 	TypeDocketEntryObserved = acquisition.TypeDocketEntryObserved
 )
+
+// The two deadline-produced events this slice ALSO consumes (fatia 4c). Unlike the
+// acquisition events above (aliased to the producer's struct), these follow the
+// deadline slice's own consumed-event mold: only the type CONST crosses the boundary
+// (TypeDeadlineDueSoon/TypeDeadlineMissed = deadline.…), while the payload SHAPE is
+// redefined LOCALLY below — so this slice never imports deadline's event struct, only
+// the dotted id. A contract round-trip test (events_test.go) marshals the producer's
+// struct and unmarshals it into the local shape, guarding against silent field drift.
+// The import is acyclic (deadline does not import notifications).
+const (
+	TypeDeadlineDueSoon = deadline.TypeDeadlineDueSoon
+	TypeDeadlineMissed  = deadline.TypeDeadlineMissed
+)
+
+// DeadlineDueSoon is the LOCAL decode shape of deadline.due_soon: a prazo approaching its
+// vencimento. TenantID scopes the aviso (barrier 1); DeadlineID + DaysLeft are what the
+// lembrete text and payload need. Only ever DECODED here (events.Decode needs no
+// interface), so it carries no events.Event method. Base yields the event id for dedup.
+type DeadlineDueSoon struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+	DaysLeft   int    `json:"days_left"`
+}
+
+// DeadlineMissed is the LOCAL decode shape of deadline.missed: a prazo auto-marked MISSED
+// at the D+1 carência. Same tenant scope and only-ever-decoded contract as DeadlineDueSoon;
+// it needs just the deadline id. Base yields the event id for dedup.
+type DeadlineMissed struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
 
 // TypeNotificationRequested is the dotted id this slice consumes. Its "notification"
 // prefix routes it to the "notifications" work queue at the relay (lib/events'

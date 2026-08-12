@@ -30,10 +30,16 @@ func (s *spyNotifyUC) OnNotificationRequested(_ context.Context, ev Notification
 type spyInAppUC struct {
 	backfill    BackfillFinished
 	docket      DocketEntryObserved
+	dueSoon     DeadlineDueSoon
+	missed      DeadlineMissed
 	backfillN   int
 	docketN     int
+	dueSoonN    int
+	missedN     int
 	backfillErr error
 	docketErr   error
+	dueSoonErr  error
+	missedErr   error
 }
 
 func (s *spyInAppUC) OnBackfillFinished(_ context.Context, ev BackfillFinished) error {
@@ -46,6 +52,18 @@ func (s *spyInAppUC) OnDocketEntryObserved(_ context.Context, ev DocketEntryObse
 	s.docketN++
 	s.docket = ev
 	return s.docketErr
+}
+
+func (s *spyInAppUC) OnDeadlineDueSoon(_ context.Context, ev DeadlineDueSoon) error {
+	s.dueSoonN++
+	s.dueSoon = ev
+	return s.dueSoonErr
+}
+
+func (s *spyInAppUC) OnDeadlineMissed(_ context.Context, ev DeadlineMissed) error {
+	s.missedN++
+	s.missed = ev
+	return s.missedErr
 }
 
 // A well-formed notification.requested task is decoded and dispatched to the use case
@@ -206,6 +224,98 @@ func TestListener_HandleDocketEntryObserved_UseCaseErrorPropagates(t *testing.T)
 		t.Fatalf("marshal: %v", err)
 	}
 	if err := l.handleDocketEntryObserved(context.Background(), asynq.NewTask(TypeDocketEntryObserved, payload)); !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the use-case error", err)
+	}
+}
+
+// A well-formed deadline.due_soon task is decoded and dispatched to the in-app use case with
+// its fields intact.
+func TestListener_HandleDeadlineDueSoon_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := DeadlineDueSoon{
+		Base:       events.Base{EventID: "evt-ds", Aggregate: "deadline-1"},
+		TenantID:   "tenant-3",
+		DeadlineID: "deadline-1",
+		DaysLeft:   3,
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+	if err := l.handleDeadlineDueSoon(context.Background(), asynq.NewTask(TypeDeadlineDueSoon, payload)); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if inApp.dueSoonN != 1 {
+		t.Fatalf("use case called %d times, want 1", inApp.dueSoonN)
+	}
+	if inApp.dueSoon.TenantID != "tenant-3" || inApp.dueSoon.DeadlineID != "deadline-1" || inApp.dueSoon.DaysLeft != 3 {
+		t.Fatalf("dispatched event = %+v", inApp.dueSoon)
+	}
+}
+
+// A malformed deadline.due_soon payload wraps asynq.SkipRetry (archived), and the use case is
+// never called.
+func TestListener_HandleDeadlineDueSoon_BadPayloadSkipsRetry(t *testing.T) {
+	t.Parallel()
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+
+	err := l.handleDeadlineDueSoon(context.Background(), asynq.NewTask(TypeDeadlineDueSoon, []byte("{bad")))
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("err = %v, want it to wrap asynq.SkipRetry", err)
+	}
+	if inApp.dueSoonN != 0 {
+		t.Fatalf("use case called %d times on a decode fault, want 0", inApp.dueSoonN)
+	}
+}
+
+// A well-formed deadline.missed task is decoded and dispatched to the in-app use case.
+func TestListener_HandleDeadlineMissed_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := DeadlineMissed{
+		Base:       events.Base{EventID: "evt-ms", Aggregate: "deadline-2"},
+		TenantID:   "tenant-4",
+		DeadlineID: "deadline-2",
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+	if err := l.handleDeadlineMissed(context.Background(), asynq.NewTask(TypeDeadlineMissed, payload)); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if inApp.missedN != 1 {
+		t.Fatalf("use case called %d times, want 1", inApp.missedN)
+	}
+	if inApp.missed.TenantID != "tenant-4" || inApp.missed.DeadlineID != "deadline-2" {
+		t.Fatalf("dispatched event = %+v", inApp.missed)
+	}
+}
+
+// A use-case error from the missed handler propagates unchanged (retryable infra stays retryable).
+func TestListener_HandleDeadlineMissed_UseCaseErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("boom")
+	inApp := &spyInAppUC{missedErr: sentinel}
+	l := NewListener(&spyNotifyUC{}, inApp)
+
+	payload, err := json.Marshal(DeadlineMissed{Base: events.Base{EventID: "e"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := l.handleDeadlineMissed(context.Background(), asynq.NewTask(TypeDeadlineMissed, payload)); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the use-case error", err)
 	}
 }

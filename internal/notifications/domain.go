@@ -219,6 +219,14 @@ const (
 
 	newAndamentoTitle = "Novo andamento processual"
 	newAndamentoBody  = "Um novo andamento foi identificado em um dos seus processos."
+
+	// Deadline avisos (fatia 4c). The due_soon title is fixed; its body varies by
+	// days_left (0 → "hoje", else "em N dia(s)"). The missed aviso is fully fixed.
+	deadlineDueSoonTitle     = "Prazo a vencer"
+	deadlineDueSoonTodayBody = "Prazo vence hoje."
+	deadlineDueSoonBody      = "Prazo vence em %d dia(s)."
+	deadlineMissedTitle      = "Prazo vencido"
+	deadlineMissedBody       = "Um prazo venceu sem confirmação."
 )
 
 // InAppUseCase turns two acquisition events into IN_APP avisos (slice 1a): a
@@ -340,6 +348,82 @@ func (uc *InAppUseCase) OnDocketEntryObserved(ctx context.Context, ev DocketEntr
 	// or replayed event leaves created == nil, so nothing is pushed.
 	uc.publish(ctx, ev.TenantID, TypeDocketEntryObserved, created)
 	return nil
+}
+
+// OnDeadlineDueSoon handles one deadline.due_soon (fatia 4c). In the event's tenant scope it
+// dedups FIRST (so the event is consumed exactly once), then records a deadline-due-soon aviso
+// whose body reports how many days remain — or "hoje" at zero. The dedup mark and the aviso
+// commit together, so a crash never leaves the event marked-but-unrecorded. Unlike the docket
+// aviso, it is NEVER suppressed during onboarding: a prazo nearing its vencimento always
+// warrants surfacing (and the deadline slice only emits it for a re-checked, still-active prazo).
+func (uc *InAppUseCase) OnDeadlineDueSoon(ctx context.Context, ev DeadlineDueSoon) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDeadlineDueSoon, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		title, body := renderDeadlineDueSoon(ev.DaysLeft)
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeDeadlineDueSoonAviso, title, body, map[string]any{
+			"deadline_id": ev.DeadlineID,
+			"days_left":   ev.DaysLeft,
+		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Push only a genuinely new aviso, after the commit (a replay leaves created == nil).
+	uc.publish(ctx, ev.TenantID, TypeDeadlineDueSoon, created)
+	return nil
+}
+
+// OnDeadlineMissed handles one deadline.missed (fatia 4c): a prazo auto-marked MISSED at the
+// D+1 carência. Same tenant-scoped dedup-then-record shape as OnDeadlineDueSoon, with a fixed
+// "Prazo vencido" aviso and the deadline id in the payload.
+func (uc *InAppUseCase) OnDeadlineMissed(ctx context.Context, ev DeadlineMissed) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDeadlineMissed, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeDeadlineMissedAviso, deadlineMissedTitle, deadlineMissedBody, map[string]any{
+			"deadline_id": ev.DeadlineID,
+		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	uc.publish(ctx, ev.TenantID, TypeDeadlineMissed, created)
+	return nil
+}
+
+// renderDeadlineDueSoon materializes the due_soon title/body from days_left. The title is
+// fixed; the body is the "hoje" text at zero, else the "em N dia(s)" text — so the aviso
+// tells the user exactly how much runway is left without opening the prazo.
+func renderDeadlineDueSoon(daysLeft int) (title, body string) {
+	if daysLeft == 0 {
+		return deadlineDueSoonTitle, deadlineDueSoonTodayBody
+	}
+	return deadlineDueSoonTitle, fmt.Sprintf(deadlineDueSoonBody, daysLeft)
 }
 
 // record writes the tenant-level aviso fact (CREATED) and its single IN_APP delivery
