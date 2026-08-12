@@ -72,6 +72,18 @@ func observedFor(p deadlineParents, eventID, typ, court, uf, start string) deadl
 	}
 }
 
+// cancelledFor builds an intimation.cancelled for the seeded chain — the revocation
+// counterpart of observedFor. It targets the same 1:1 intimação, so the revoke keys onto
+// whatever prazo that intimação derived.
+func cancelledFor(p deadlineParents, eventID, reason string) deadline.IntimationCancelled {
+	return deadline.IntimationCancelled{
+		Base:         events.Base{EventID: eventID, Aggregate: p.intimationID.String()},
+		TenantID:     p.tenantID.String(),
+		IntimationID: p.intimationID.String(),
+		Reason:       reason,
+	}
+}
+
 // DL1: a fresh observed intimação derives exactly one PENDING deadline (source RULE,
 // kind/days/counting from the seeded rule) AND one deadline.opened, in the same tx, with
 // the deadline id as the outbox aggregate.
@@ -262,6 +274,175 @@ func TestDeadline_Observed_HolidayShiftsAndAudits(t *testing.T) {
 	}
 	if !contains(applied, holiday) {
 		t.Errorf("holidays_applied = %v, want it to contain %q", applied, holiday)
+	}
+}
+
+// DL5 (revoke path, slice 4a): observe → cancel. The derived prazo flips to CANCELLED and
+// exactly one deadline.revoked commits with the deadline id as the outbox aggregate and
+// the triggering intimação + reason in the payload.
+func TestDeadline_Cancelled_RevokesDeadlineAndEmitsRevoked(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	uc := newDeadlineUC(pool)
+
+	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
+	if err := uc.OnIntimationObserved(ctx, obs); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	var deadlineID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM deadline WHERE notification_id = $1`, p.intimationID).Scan(&deadlineID); err != nil {
+		t.Fatalf("read deadline id: %v", err)
+	}
+
+	const reason = "retificada pelo tribunal"
+	canc := cancelledFor(p, uuid.NewString(), reason)
+	if err := uc.OnIntimationCancelled(ctx, canc); err != nil {
+		t.Fatalf("OnIntimationCancelled() error = %v", err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM deadline WHERE id = $1`, deadlineID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "CANCELLED" {
+		t.Errorf("status = %q, want CANCELLED", status)
+	}
+
+	var revokedCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM outbox
+		WHERE type = $1 AND aggregate_type = 'deadline' AND aggregate_id = $2`,
+		deadline.TypeDeadlineRevoked, deadlineID).Scan(&revokedCount); err != nil {
+		t.Fatalf("count deadline.revoked: %v", err)
+	}
+	if revokedCount != 1 {
+		t.Fatalf("deadline.revoked rows = %d, want 1", revokedCount)
+	}
+
+	var payloadDeadlineID, payloadIntimationID, payloadReason string
+	if err := pool.QueryRow(ctx, `
+		SELECT payload->>'deadline_id', payload->>'intimation_id', payload->>'reason'
+		FROM outbox WHERE type = $1 AND aggregate_id = $2`,
+		deadline.TypeDeadlineRevoked, deadlineID).
+		Scan(&payloadDeadlineID, &payloadIntimationID, &payloadReason); err != nil {
+		t.Fatalf("read deadline.revoked payload: %v", err)
+	}
+	if payloadDeadlineID != deadlineID || payloadIntimationID != p.intimationID.String() || payloadReason != reason {
+		t.Errorf("payload deadline/intimation/reason = %q/%q/%q, want %q/%q/%q",
+			payloadDeadlineID, payloadIntimationID, payloadReason, deadlineID, p.intimationID, reason)
+	}
+}
+
+// DL6: a cancel that arrives BEFORE any observe is a pure no-op — no prazo exists to
+// revoke, so no row is written and no deadline.revoked is emitted (the safe bias: never a
+// phantom revoked).
+func TestDeadline_Cancelled_BeforeObserve_NoOp(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	uc := newDeadlineUC(pool)
+
+	canc := cancelledFor(p, uuid.NewString(), "retificada")
+	if err := uc.OnIntimationCancelled(ctx, canc); err != nil {
+		t.Fatalf("OnIntimationCancelled() error = %v (want nil no-op)", err)
+	}
+
+	var deadlines int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM deadline WHERE notification_id = $1`, p.intimationID).Scan(&deadlines); err != nil {
+		t.Fatalf("count deadline: %v", err)
+	}
+	if deadlines != 0 {
+		t.Errorf("deadline rows = %d, want 0 (nothing to revoke)", deadlines)
+	}
+
+	var revoked int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM outbox
+		WHERE type = $1 AND payload->>'intimation_id' = $2`,
+		deadline.TypeDeadlineRevoked, p.intimationID.String()).Scan(&revoked); err != nil {
+		t.Fatalf("count deadline.revoked: %v", err)
+	}
+	if revoked != 0 {
+		t.Errorf("deadline.revoked rows = %d, want 0 (no phantom revoked)", revoked)
+	}
+}
+
+// DL7: a double delivery of the SAME cancel event_id revokes exactly once — the
+// processed_event dedup (marked in the write tx) bars the second from re-emitting.
+func TestDeadline_Cancelled_DedupOnReplay(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	uc := newDeadlineUC(pool)
+
+	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
+	if err := uc.OnIntimationObserved(ctx, obs); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	canc := cancelledFor(p, uuid.NewString(), "retificada") // one event id, delivered twice
+	for i := 0; i < 2; i++ {
+		if err := uc.OnIntimationCancelled(ctx, canc); err != nil {
+			t.Fatalf("cancel delivery %d error = %v", i, err)
+		}
+	}
+
+	var deadlineID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM deadline WHERE notification_id = $1`, p.intimationID).Scan(&deadlineID); err != nil {
+		t.Fatalf("read deadline id: %v", err)
+	}
+	var revoked int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM outbox WHERE type = $1 AND aggregate_id = $2`,
+		deadline.TypeDeadlineRevoked, deadlineID).Scan(&revoked); err != nil {
+		t.Fatalf("count deadline.revoked: %v", err)
+	}
+	if revoked != 1 {
+		t.Errorf("deadline.revoked rows after replay = %d, want 1 (dedup)", revoked)
+	}
+}
+
+// DL8: a DIFFERENT cancel event_id for an already-CANCELLED prazo (past the dedup) still
+// revokes only once — the query's status <> CANCELLED guard bars the second flip, so no
+// duplicate deadline.revoked is emitted (the DB-level idempotency floor, mirroring DL3).
+func TestDeadline_Cancelled_AlreadyCancelledBarsDuplicate(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	uc := newDeadlineUC(pool)
+
+	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
+	if err := uc.OnIntimationObserved(ctx, obs); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	first := cancelledFor(p, uuid.NewString(), "retificada")
+	second := cancelledFor(p, uuid.NewString(), "retificada de novo") // new event id, same intimação
+	if err := uc.OnIntimationCancelled(ctx, first); err != nil {
+		t.Fatalf("first cancel: %v", err)
+	}
+	if err := uc.OnIntimationCancelled(ctx, second); err != nil {
+		t.Fatalf("second cancel (should no-op, not error): %v", err)
+	}
+
+	var deadlineID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM deadline WHERE notification_id = $1`, p.intimationID).Scan(&deadlineID); err != nil {
+		t.Fatalf("read deadline id: %v", err)
+	}
+	var revoked int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM outbox WHERE type = $1 AND aggregate_id = $2`,
+		deadline.TypeDeadlineRevoked, deadlineID).Scan(&revoked); err != nil {
+		t.Fatalf("count deadline.revoked: %v", err)
+	}
+	if revoked != 1 {
+		t.Errorf("deadline.revoked rows = %d, want 1 (status guard bars the duplicate)", revoked)
 	}
 }
 

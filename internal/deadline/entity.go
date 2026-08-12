@@ -81,6 +81,16 @@ const (
 	KindGenerico     = "GENERICO"
 )
 
+// RevokedDeadline is the thin result of revoking a prazo by its intimação: the id of the
+// row that flipped to CANCELLED and the record it hung on. The revoke path needs only the
+// id (it anchors the deadline.revoked event); CourtRecordID is carried for symmetry with
+// the open path and any consumer that keys off the record. A no-op revoke — no prazo, or
+// one already CANCELLED — yields no RevokedDeadline (ErrDeadlineNotFound), never a zero value.
+type RevokedDeadline struct {
+	ID            string
+	CourtRecordID string
+}
+
 // DeadlineRule is the resolved conservative rule (a deadline_rule row, §8): how many
 // days, counted which way, under which kind, and whether the rule already implies the
 // dobro. It is a read value object — the resolver returns the most specific active

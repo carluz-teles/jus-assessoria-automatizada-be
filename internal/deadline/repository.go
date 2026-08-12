@@ -127,3 +127,37 @@ func (r *pgRepository) InsertDeadline(ctx context.Context, tx database.Tx, d *De
 	saved.ID = id.String()
 	return &saved, nil
 }
+
+// RevokeDeadlineByIntimation cancels the prazo derived from the intimação inside the
+// caller's tx, filtered by tenantID (barrier 1). The query's status <> 'CANCELLED' guard
+// means a redelivery — or a cancel that arrives before (or without) any prazo — updates no
+// row: sqlc returns pgx.ErrNoRows, mapped to the typed ErrDeadlineNotFound so the use case
+// no-ops instead of emitting a phantom revoked (never nil, nil). On a hit it returns the
+// revoked prazo's id and the record it hung on. IntimationID is matched against the
+// notification_id column (the historic-name FK to intimation — see mapper.go).
+func (r *pgRepository) RevokeDeadlineByIntimation(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*RevokedDeadline, error) {
+	intID, err := parseUUID(intimationID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).RevokeDeadlineByIntimation(ctx, deadlinedb.RevokeDeadlineByIntimationParams{
+		NotificationID: intID,
+		TenantID:       tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDeadlineNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &RevokedDeadline{
+		ID:            row.ID.String(),
+		CourtRecordID: row.CourtRecordID.String(),
+	}, nil
+}

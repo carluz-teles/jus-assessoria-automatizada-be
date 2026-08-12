@@ -41,6 +41,14 @@ type Repository interface {
 	// notification_id DO NOTHING) and returns it with its DB-assigned id. A conflict
 	// (a prazo already exists for the intimação) is ErrDeadlineExists.
 	InsertDeadline(ctx context.Context, tx database.Tx, d *Deadline) (*Deadline, error)
+	// RevokeDeadlineByIntimation cancels the prazo derived from the intimação (keyed by
+	// the 1:1 notification_id), scoped to tenantID (barrier 1). The UPDATE's status <>
+	// CANCELLED guard makes it idempotent: when it touches no row — no prazo for the
+	// intimação (the cancel raced ahead of the observe, or the intimação was dead on
+	// arrival), or one already CANCELLED — it returns ErrDeadlineNotFound, the use case's
+	// safe no-op. On a hit it returns the revoked prazo so deadline.revoked commits in the
+	// same tx.
+	RevokeDeadlineByIntimation(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*RevokedDeadline, error)
 }
 
 // deduper is the consumer-side idempotency guard port. It marks (consumer, eventID)
@@ -161,6 +169,48 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 		}
 
 		return uc.outbox.Publish(ctx, tx, newDeadlineOpened(saved))
+	})
+}
+
+// OnIntimationCancelled is the REVOCATION path — the counterpart of OnIntimationObserved
+// (docs/erd-prazos.md §7/§11). From one acquisition.intimation.cancelled it cancels the
+// prazo derived from that intimação and emits deadline.revoked, so a retificação never
+// leaves a prazo-fantasma standing. The dedup mark, the status flip and the outbox row
+// commit in ONE tenant-scoped tx (transactional outbox).
+//
+// Steps:
+//  1. dedup — a replay marks nothing new and returns before any write;
+//  2. revoke the prazo keyed by the 1:1 intimação (idempotent: status <> CANCELLED);
+//  3. no prazo revoked (none exists, the cancel raced ahead of the observe, or it was
+//     already CANCELLED) → NO-OP (return nil): cancelling the inexistent is safe, and never
+//     emitting a phantom revoked is the conservative bias (§3.5);
+//  4. otherwise emit deadline.revoked in the SAME tx.
+//
+// tenantID comes from the trusted event payload (no Clerk token on the worker) and scopes
+// the transaction's RLS.
+func (uc *UseCase) OnIntimationCancelled(ctx context.Context, ev IntimationCancelled) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDeadline, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		revoked, err := uc.repo.RevokeDeadlineByIntimation(ctx, tx, ev.IntimationID, ev.TenantID)
+		if errors.Is(err, ErrDeadlineNotFound) {
+			// No prazo flipped: none exists for this intimação, the cancel arrived before
+			// the observe, or the prazo is already CANCELLED. The dedup mark above still
+			// commits, so a redelivery stays a no-op and no phantom deadline.revoked is
+			// emitted — the safe bias the design demands (§3.5).
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		return uc.outbox.Publish(ctx, tx, newDeadlineRevoked(revoked.ID, ev.IntimationID, ev.Reason))
 	})
 }
 

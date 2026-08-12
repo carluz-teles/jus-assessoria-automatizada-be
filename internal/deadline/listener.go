@@ -16,28 +16,33 @@ import (
 // and delegate to the use case. Trace continuation and the consumer span are handled
 // once by the events.Observe middleware, not here.
 
-// openUC is the port for the creation consumer (intimation.observed → deadline.opened).
-type openUC interface {
+// useCase is the port the listener delegates to — the deadline slice's two async entry
+// points, both satisfied by *UseCase: creation (intimation.observed → deadline.opened) and
+// revocation (intimation.cancelled → deadline.revoked). Kept as ONE interface because a
+// single use case object owns both transitions; the listener holds no transport state.
+type useCase interface {
 	OnIntimationObserved(ctx context.Context, ev IntimationObserved) error
+	OnIntimationCancelled(ctx context.Context, ev IntimationCancelled) error
 }
 
 // Listener is the deadline slice's asynq consumer. It holds no transport state; the use
 // case owns persistence and the transaction boundary.
 type Listener struct {
-	open openUC
+	uc useCase
 }
 
-// NewListener wires the listener to the creation use case.
-func NewListener(open openUC) *Listener {
-	return &Listener{open: open}
+// NewListener wires the listener to the deadline use case.
+func NewListener(uc useCase) *Listener {
+	return &Listener{uc: uc}
 }
 
-// Register mounts the slice's task handler on the asynq mux — the async analog of a
-// Handler.Register. intimation.observed routes to the "ingestao" queue (acquisition
-// prefix), so this is registered on the worker's main mux. Adding a consumed event =
-// one HandleFunc here plus one Register call in the worker's composition root.
+// Register mounts the slice's task handlers on the asynq mux — the async analog of a
+// Handler.Register. Both intimation.observed and intimation.cancelled route to the
+// "ingestao" queue (acquisition prefix), so they mount on the worker's main mux. Adding a
+// consumed event = one HandleFunc here plus one Register call in the worker's composition.
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntimationObserved, l.handleIntimationObserved)
+	mux.HandleFunc(TypeIntimationCancelled, l.handleIntimationCancelled)
 }
 
 // handleIntimationObserved is the asynq.HandlerFunc for acquisition.intimation.observed.
@@ -53,7 +58,27 @@ func (l *Listener) handleIntimationObserved(ctx context.Context, t *asynq.Task) 
 	if err != nil {
 		return err
 	}
-	if err := l.open.OnIntimationObserved(ctx, ev); err != nil {
+	if err := l.uc.OnIntimationObserved(ctx, ev); err != nil {
+		if isTerminal(err) {
+			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
+		}
+		return err
+	}
+	return nil
+}
+
+// handleIntimationCancelled is the asynq.HandlerFunc for acquisition.intimation.cancelled,
+// the revocation counterpart of handleIntimationObserved: decode into the LOCAL shape and
+// delegate, mapping the outcome to asynq's retry decision the same way. The use case
+// treats "no prazo to revoke" (ErrDeadlineNotFound) as an idempotent no-op and returns
+// nil, so a terminal error never surfaces from that path; any error that does reach here
+// is classified by isTerminal (a malformed payload was already archived at decode).
+func (l *Listener) handleIntimationCancelled(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[IntimationCancelled](t)
+	if err != nil {
+		return err
+	}
+	if err := l.uc.OnIntimationCancelled(ctx, ev); err != nil {
 		if isTerminal(err) {
 			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 		}

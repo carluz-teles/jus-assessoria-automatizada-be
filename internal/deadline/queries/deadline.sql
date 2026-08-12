@@ -56,3 +56,18 @@ INSERT INTO deadline (
 )
 ON CONFLICT (notification_id) DO NOTHING
 RETURNING id;
+
+-- name: RevokeDeadlineByIntimation :one
+-- Revoke (CANCEL) the prazo derived from an intimação the DJEN retracted (erd-prazos.md
+-- §7/§11: uma intimação retificada vira prazo-fantasma → deadline.revoked). Keyed by the
+-- 1:1 notification_id (=intimation id) and scoped to tenant_id (barrier 1, on top of RLS
+-- barrier 2). The `status <> 'CANCELLED'` guard makes the revoke IDEMPOTENT: a redelivery
+-- past the dedup — or a cancel that lands before any prazo exists, or on an already
+-- CANCELLED one — updates NO row → pgx.ErrNoRows → typed not-found at the mapper, the use
+-- case's safe no-op (never a phantom revoked). On a hit it returns the revoked id (+ the
+-- record it hung on) so deadline.revoked commits in the SAME tx. $1 = intimation_id (the
+-- notification_id column), $2 = tenant_id, both from the trusted event payload.
+UPDATE deadline
+SET status = 'CANCELLED'
+WHERE notification_id = $1 AND tenant_id = $2 AND status <> 'CANCELLED'
+RETURNING id, court_record_id;
