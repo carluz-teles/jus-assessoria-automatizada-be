@@ -69,9 +69,11 @@ type Repository interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
+	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
+	CountIntimacoesByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -1116,6 +1118,80 @@ func (r *pgRepository) CountAndamentosByProcesso(ctx context.Context, tenantID, 
 		return 0, database.WrapInfra(err)
 	}
 	total, err := r.q.CountAndamentosByProcesso(ctx, acquisitiondb.CountAndamentosByProcessoParams{
+		CourtRecordID: crid,
+		TenantID:      tid,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return total, nil
+}
+
+// ListIntimacoesByProcesso reads one process's intimations (keyset-paginated, newest
+// availability first) on the pool. intimation carries its own tenant_id, so tenant
+// isolation (barrier 1) is the direct filter alongside court_record_id; the join only
+// supplies the record's number/court/degree. The caller passes the max sentinel cursor
+// for the first page.
+func (r *pgRepository) ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	crid, err := uuid.Parse(q.CourtRecordID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastID, err := uuid.Parse(q.LastID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastMade, err := time.Parse(time.DateOnly, q.LastMadeAvailable)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListIntimacoesByProcesso(ctx, acquisitiondb.ListIntimacoesByProcessoParams{
+		CourtRecordID:     crid,
+		TenantID:          tid,
+		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
+		LastID:            lastID,
+		PageLimit:         int32(q.Limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]IntimacaoView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, IntimacaoView{
+			ID:              row.ID.String(),
+			CNJNumber:       row.CnjNumber,
+			Court:           row.Court,
+			Degree:          row.Degree,
+			Type:            deref(row.Type),
+			Status:          row.Status,
+			Source:          row.Source,
+			SourceURL:       deref(row.SourceUrl),
+			MadeAvailableAt: row.MadeAvailableAt.Time,
+			PublishedAt:     row.PublishedAt.Time,
+			DeadlineStartAt: row.DeadlineStartAt.Time,
+			ContentPreview:  contentPreview(row.Content),
+		})
+	}
+	return out, nil
+}
+
+// CountIntimacoesByProcesso returns the "X de Y" total for the Intimações tab: how many
+// intimations the process holds. Scoped by court_record_id + tenant_id (barrier 1) — no
+// join, since intimation carries tenant_id.
+func (r *pgRepository) CountIntimacoesByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	crid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	total, err := r.q.CountIntimacoesByProcesso(ctx, acquisitiondb.CountIntimacoesByProcessoParams{
 		CourtRecordID: crid,
 		TenantID:      tid,
 	})

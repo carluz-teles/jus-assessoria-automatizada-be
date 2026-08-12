@@ -30,6 +30,7 @@ type reader interface {
 	Processos(ctx context.Context, q ProcessosQuery) (ProcessosResult, error)
 	Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error)
 	Andamentos(ctx context.Context, q AndamentosQuery) (AndamentosResult, error)
+	IntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error)
 	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error)
 	ReconciliationDetail(ctx context.Context, tenantID, jobID string) (ReconciliationDetailView, error)
@@ -60,6 +61,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/acquisition/sync-runs/:syncRunId/items", h.syncRunItems)
 	r.Get("/processos", h.listProcessos)
 	r.Get("/processos/:id/andamentos", h.listAndamentos)
+	r.Get("/processos/:id/intimacoes", h.listIntimacoesByProcesso)
 	r.Get("/intimacoes", h.listIntimacoes)
 }
 
@@ -255,6 +257,34 @@ func (h *Handler) listAndamentos(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(newAndamentosPage(res, limit))
 }
 
+// listIntimacoesByProcesso handles GET /v1/processos/:id/intimacoes: the "Intimações" tab
+// of one process — its intimations, newest availability first, keyset paginated (?limit,
+// ?cursor). The :id is the court_record id (the same id /processos returns); tenant_id
+// comes from the principal, and the read is tenant-scoped so a foreign :id yields an
+// empty page.
+func (h *Handler) listIntimacoesByProcesso(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	lastMade, lastID := maxDate, maxUUID
+	if tok := c.Query("cursor"); tok != "" {
+		cur, err := httpx.DecodeCursor(tok)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		lastMade, lastID = cur.LastSortValue, cur.LastID
+	}
+
+	res, err := h.reader.IntimacoesByProcesso(c.UserContext(), IntimacoesByProcessoQuery{
+		TenantID: tenantID, CourtRecordID: c.Params("id"),
+		LastMadeAvailable: lastMade, LastID: lastID, Limit: limit,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newIntimacoesByProcessoPage(res, limit))
+}
+
 // newProcessosPage wraps the processos read model in the cursor envelope; the next
 // cursor keys off the last row's (cnj_number, id) and the totals carry "X de Y".
 func newProcessosPage(res ProcessosResult, limit int) httpx.Page[ProcessoView] {
@@ -308,6 +338,26 @@ func newAndamentosPage(res AndamentosResult, limit int) httpx.Page[AndamentoView
 		meta.NextCursor = &tok
 	}
 	return httpx.Page[AndamentoView]{Data: items, Page: meta}
+}
+
+// newIntimacoesByProcessoPage wraps the per-process intimations read model in the cursor
+// envelope; the next cursor keys off the last row's (made_available_at, id). There is no
+// search on this tab, so the "X de Y" totals coincide (both the process's intimation count).
+func newIntimacoesByProcessoPage(res IntimacoesByProcessoResult, limit int) httpx.Page[IntimacaoView] {
+	items := res.Items
+	if items == nil {
+		items = []IntimacaoView{}
+	}
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.Total, Total: res.Total}
+	if res.HasMore && len(items) > 0 {
+		last := items[len(items)-1]
+		tok := httpx.EncodeCursor(httpx.Cursor{
+			LastID:        last.ID,
+			LastSortValue: last.MadeAvailableAt.Format(time.DateOnly),
+		})
+		meta.NextCursor = &tok
+	}
+	return httpx.Page[IntimacaoView]{Data: items, Page: meta}
 }
 
 // newListEnvelope maps entities to the client-facing envelope. The data slice is

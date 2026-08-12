@@ -19,6 +19,9 @@ type recordingReadRepo struct {
 	andRows        []AndamentoView
 	andTotal       int64
 	lastAndQuery   AndamentosQuery
+	intiRows       []IntimacaoView
+	intiTotal      int64
+	lastIntiQuery  IntimacoesByProcessoQuery
 }
 
 func (r *recordingReadRepo) ListProcessos(_ context.Context, q ProcessosQuery) ([]ProcessoView, error) {
@@ -43,6 +46,13 @@ func (r *recordingReadRepo) ListAndamentosByProcesso(_ context.Context, q Andame
 }
 func (r *recordingReadRepo) CountAndamentosByProcesso(context.Context, string, string) (int64, error) {
 	return r.andTotal, nil
+}
+func (r *recordingReadRepo) ListIntimacoesByProcesso(_ context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error) {
+	r.lastIntiQuery = q
+	return r.intiRows, nil
+}
+func (r *recordingReadRepo) CountIntimacoesByProcesso(context.Context, string, string) (int64, error) {
+	return r.intiTotal, nil
 }
 func (r *recordingReadRepo) GetImportStatus(context.Context, string) (ImportStatusView, error) {
 	return ImportStatusView{}, nil
@@ -158,6 +168,64 @@ func TestReadUseCase_Andamentos_NoNextPage(t *testing.T) {
 	res, err := uc.Andamentos(context.Background(), AndamentosQuery{TenantID: "t-1", CourtRecordID: "cr-1", Limit: 20})
 	if err != nil {
 		t.Fatalf("Andamentos: %v", err)
+	}
+	if res.HasMore {
+		t.Error("HasMore = true, want false")
+	}
+	if len(res.Items) != 1 {
+		t.Errorf("len(Items) = %d, want 1", len(res.Items))
+	}
+}
+
+// IntimacoesByProcesso forwards the process (court_record) and the descending keyset
+// cursor's "after" (made_available_at) to the repo, over-fetches limit+1 to detect the
+// next page, trims the extra row, and wires the total.
+func TestReadUseCase_IntimacoesByProcesso_OverfetchesAndWiresTotal(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{
+		intiRows:  []IntimacaoView{{ID: "a"}, {ID: "b"}, {ID: "c"}}, // 3 rows for limit 2 → hasMore
+		intiTotal: 41,
+	}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.IntimacoesByProcesso(context.Background(), IntimacoesByProcessoQuery{
+		TenantID: "t-1", CourtRecordID: "cr-9", LastMadeAvailable: "2024-03-01", Limit: 2,
+	})
+	if err != nil {
+		t.Fatalf("IntimacoesByProcesso: %v", err)
+	}
+	if repo.lastIntiQuery.Limit != 3 {
+		t.Errorf("repo limit = %d, want 3 (over-fetch of limit+1)", repo.lastIntiQuery.Limit)
+	}
+	if repo.lastIntiQuery.CourtRecordID != "cr-9" {
+		t.Errorf("CourtRecordID = %q, want cr-9 (forwarded)", repo.lastIntiQuery.CourtRecordID)
+	}
+	if repo.lastIntiQuery.LastMadeAvailable != "2024-03-01" {
+		t.Errorf("LastMadeAvailable = %q, want 2024-03-01 (cursor after forwarded)", repo.lastIntiQuery.LastMadeAvailable)
+	}
+	if !res.HasMore {
+		t.Error("HasMore = false, want true")
+	}
+	if len(res.Items) != 2 {
+		t.Errorf("len(Items) = %d, want 2 (extra row trimmed)", len(res.Items))
+	}
+	if res.Total != 41 {
+		t.Errorf("Total = %d, want 41", res.Total)
+	}
+}
+
+// With no over-fetch (fewer rows than the limit) there is no next page and every row is
+// returned — the process-with-few (or no) intimations case.
+func TestReadUseCase_IntimacoesByProcesso_NoNextPage(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{intiRows: []IntimacaoView{{ID: "a"}}}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.IntimacoesByProcesso(context.Background(), IntimacoesByProcessoQuery{TenantID: "t-1", CourtRecordID: "cr-1", Limit: 20})
+	if err != nil {
+		t.Fatalf("IntimacoesByProcesso: %v", err)
 	}
 	if res.HasMore {
 		t.Error("HasMore = true, want false")

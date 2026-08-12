@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS intimation_court_record_id_made_available_at_idx;

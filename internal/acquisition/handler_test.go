@@ -72,6 +72,10 @@ func (fakeReader) Andamentos(context.Context, AndamentosQuery) (AndamentosResult
 	return AndamentosResult{}, nil
 }
 
+func (fakeReader) IntimacoesByProcesso(context.Context, IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
+	return IntimacoesByProcessoResult{}, nil
+}
+
 func (fakeReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
 	return ImportStatusView{}, nil
 }
@@ -245,10 +249,12 @@ func TestHandler_List_ScopedToTenant(t *testing.T) {
 // and returning a canned result — lets the HTTP tests assert query-param wiring and
 // the envelope shape without a database.
 type recordingReader struct {
-	res         ProcessosResult
-	gotQuery    ProcessosQuery
-	andRes      AndamentosResult
-	gotAndQuery AndamentosQuery
+	res          ProcessosResult
+	gotQuery     ProcessosQuery
+	andRes       AndamentosResult
+	gotAndQuery  AndamentosQuery
+	intiRes      IntimacoesByProcessoResult
+	gotIntiQuery IntimacoesByProcessoQuery
 }
 
 func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (ProcessosResult, error) {
@@ -261,6 +267,10 @@ func (r *recordingReader) Intimacoes(context.Context, IntimacoesQuery) (Intimaco
 func (r *recordingReader) Andamentos(_ context.Context, q AndamentosQuery) (AndamentosResult, error) {
 	r.gotAndQuery = q
 	return r.andRes, nil
+}
+func (r *recordingReader) IntimacoesByProcesso(_ context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
+	r.gotIntiQuery = q
+	return r.intiRes, nil
 }
 func (r *recordingReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
 	return ImportStatusView{}, nil
@@ -504,5 +514,177 @@ func TestHandler_ListAndamentos_CursorRoundTrip(t *testing.T) {
 	}
 	if rd.gotAndQuery.LastID != last.ID {
 		t.Errorf("page 2 LastID = %q, want %q", rd.gotAndQuery.LastID, last.ID)
+	}
+}
+
+// --- read route: /v1/processos/:id/intimacoes -------------------------------
+
+// GET /v1/processos/:id/intimacoes forwards the path :id (the court_record id) and the
+// decoded ?cursor to the read port, clamps ?limit, and takes the tenant from the
+// principal (never the query/body).
+func TestHandler_ListIntimacoesByProcesso_ForwardsProcessoAndCursor(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	cursor := httpx.EncodeCursor(httpx.Cursor{
+		LastSortValue: "2024-03-01",
+		LastID:        "018f0000-0000-7000-8000-000000000abc",
+	})
+	status, _ := do(t, app, http.MethodGet,
+		"/v1/processos/cr-77/intimacoes?limit=25&cursor="+cursor, "", "jwt")
+
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotIntiQuery.CourtRecordID != "cr-77" {
+		t.Errorf("CourtRecordID = %q, want cr-77 (from path)", rd.gotIntiQuery.CourtRecordID)
+	}
+	if rd.gotIntiQuery.TenantID != "tenant-9" {
+		t.Errorf("TenantID = %q, want tenant-9 (from principal)", rd.gotIntiQuery.TenantID)
+	}
+	if rd.gotIntiQuery.LastMadeAvailable != "2024-03-01" {
+		t.Errorf("LastMadeAvailable = %q, want the decoded cursor sort value", rd.gotIntiQuery.LastMadeAvailable)
+	}
+	if rd.gotIntiQuery.LastID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("LastID = %q, want the decoded cursor id", rd.gotIntiQuery.LastID)
+	}
+	if rd.gotIntiQuery.Limit != 25 {
+		t.Errorf("Limit = %d, want 25", rd.gotIntiQuery.Limit)
+	}
+}
+
+// The first page passes the max sentinel cursor (no ?cursor), and ?limit defaults to
+// DefaultLimit when absent.
+func TestHandler_ListIntimacoesByProcesso_FirstPageSentinelAndDefaultLimit(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/processos/cr-1/intimacoes", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotIntiQuery.Limit != httpx.DefaultLimit {
+		t.Errorf("Limit = %d, want %d (default)", rd.gotIntiQuery.Limit, httpx.DefaultLimit)
+	}
+	if rd.gotIntiQuery.LastMadeAvailable != maxDate || rd.gotIntiQuery.LastID != maxUUID {
+		t.Errorf("first-page sentinel = (%q, %q), want (%q, %q)",
+			rd.gotIntiQuery.LastMadeAvailable, rd.gotIntiQuery.LastID, maxDate, maxUUID)
+	}
+}
+
+// ?limit above the ceiling is clamped to MaxLimit (100).
+func TestHandler_ListIntimacoesByProcesso_ClampsLimit(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/processos/cr-1/intimacoes?limit=500", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotIntiQuery.Limit != httpx.MaxLimit {
+		t.Errorf("Limit = %d, want %d (clamped)", rd.gotIntiQuery.Limit, httpx.MaxLimit)
+	}
+}
+
+// A process with no intimations serializes as an empty data array (never null) with the
+// zero totals — 200, not 404.
+func TestHandler_ListIntimacoesByProcesso_Empty(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{intiRes: IntimacoesByProcessoResult{}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-empty/intimacoes", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"data":[]`, `"next_cursor":null`, `"total":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("envelope missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// The response envelope carries the "X de Y" total from the read result (no search on
+// this tab, so total_count and total coincide).
+func TestHandler_ListIntimacoesByProcesso_EnvelopeHasTotal(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{intiRes: IntimacoesByProcessoResult{
+		Items: []IntimacaoView{{ID: "a", CNJNumber: "0001"}},
+		Total: 12,
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-1/intimacoes", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"total_count":12`, `"total":12`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("envelope missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// A malformed ?cursor is a client error → 400, not a 500.
+func TestHandler_ListIntimacoesByProcesso_BadCursor_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-1/intimacoes?cursor=not-a-cursor", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+}
+
+// Cursor round-trip across two pages: when the read reports a further page, the envelope
+// carries a next_cursor keyed off the last row's (made_available_at, id) descending
+// keyset; echoing it back resumes the scan exactly there.
+func TestHandler_ListIntimacoesByProcesso_CursorRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	last := IntimacaoView{
+		ID:              "018f0000-0000-7000-8000-0000000000ff",
+		MadeAvailableAt: time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC),
+	}
+	rd := &recordingReader{intiRes: IntimacoesByProcessoResult{
+		Items:   []IntimacaoView{{ID: "first"}, last},
+		HasMore: true,
+		Total:   50,
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	// Page 1: no cursor → sentinel, and the envelope hands back a next_cursor.
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-1/intimacoes?limit=2", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("page 1 status = %d, want 200", status)
+	}
+	var page1 httpx.Page[IntimacaoView]
+	if err := json.Unmarshal([]byte(body), &page1); err != nil {
+		t.Fatalf("unmarshal page 1: %v (body: %s)", err, body)
+	}
+	if page1.Page.NextCursor == nil {
+		t.Fatal("page 1 next_cursor = nil, want a token (HasMore was true)")
+	}
+
+	// Page 2: echo the token → the handler decodes it into the last row's keyset.
+	status, _ = do(t, app, http.MethodGet,
+		"/v1/processos/cr-1/intimacoes?limit=2&cursor="+*page1.Page.NextCursor, "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("page 2 status = %d, want 200", status)
+	}
+	if rd.gotIntiQuery.LastMadeAvailable != last.MadeAvailableAt.Format(time.DateOnly) {
+		t.Errorf("page 2 LastMadeAvailable = %q, want %q",
+			rd.gotIntiQuery.LastMadeAvailable, last.MadeAvailableAt.Format(time.DateOnly))
+	}
+	if rd.gotIntiQuery.LastID != last.ID {
+		t.Errorf("page 2 LastID = %q, want %q", rd.gotIntiQuery.LastID, last.ID)
 	}
 }
