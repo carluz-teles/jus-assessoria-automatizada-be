@@ -28,14 +28,20 @@ type mockRepo struct {
 	insertID  string
 	insertErr error
 
+	revokeResult *RevokedDeadline
+	revokeErr    error
+
 	// captured inputs
-	gotClassTenantID string
-	gotClassRecordID string
-	gotRuleType      string
-	gotRuleCourt     string
-	gotRuleVersion   string
-	inserted         *Deadline
-	insertCalls      int
+	gotClassTenantID      string
+	gotClassRecordID      string
+	gotRuleType           string
+	gotRuleCourt          string
+	gotRuleVersion        string
+	inserted              *Deadline
+	insertCalls           int
+	gotRevokeIntimationID string
+	gotRevokeTenantID     string
+	revokeCalls           int
 }
 
 func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
@@ -58,6 +64,13 @@ func (m *mockRepo) InsertDeadline(_ context.Context, _ database.Tx, d *Deadline)
 	saved := *d
 	saved.ID = m.insertID
 	return &saved, nil
+}
+
+func (m *mockRepo) RevokeDeadlineByIntimation(_ context.Context, _ database.Tx, intimationID, tenantID string) (*RevokedDeadline, error) {
+	m.revokeCalls++
+	m.gotRevokeIntimationID = intimationID
+	m.gotRevokeTenantID = tenantID
+	return m.revokeResult, m.revokeErr
 }
 
 // fakeCalendar records which motor was called (business vs calendar) and the args, and
@@ -165,6 +178,17 @@ func observedFixture() IntimationObserved {
 
 func citacaoRule() DeadlineRule {
 	return DeadlineRule{RulesVersion: "v0", Kind: KindContestacao, Days: 15, Counting: CountingBusiness}
+}
+
+// cancelledFixture builds a well-formed intimation.cancelled, the revocation trigger;
+// tests override the fields they exercise.
+func cancelledFixture() IntimationCancelled {
+	return IntimationCancelled{
+		Base:         events.Base{EventID: uuid.NewString(), Aggregate: uuid.NewString()},
+		TenantID:     uuid.NewString(),
+		IntimationID: uuid.NewString(),
+		Reason:       "retificada pelo tribunal",
+	}
 }
 
 // --- tests ------------------------------------------------------------------
@@ -426,6 +450,134 @@ func TestOnIntimationObserved_Errors(t *testing.T) {
 				t.Errorf("published events = %d, want 0 on error", len(outbox.published))
 			}
 		})
+	}
+}
+
+// TestOnIntimationCancelled_RevokesExistingDeadline is the revocation happy path: the
+// repo reports the prazo was flipped to CANCELLED, so the use case emits exactly one
+// deadline.revoked whose aggregate is the revoked deadline id (a parseable uuid) and whose
+// payload carries the triggering intimação + the DJEN reason. The revoke is scoped to the
+// event's tenant/intimação (barrier 1 args threaded through).
+func TestOnIntimationCancelled_RevokesExistingDeadline(t *testing.T) {
+	ev := cancelledFixture()
+	deadlineID := uuid.NewString()
+	courtRecordID := uuid.NewString()
+
+	repo := &mockRepo{revokeResult: &RevokedDeadline{ID: deadlineID, CourtRecordID: courtRecordID}}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnIntimationCancelled(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationCancelled() error = %v", err)
+	}
+
+	// The revoke read the event's intimação, scoped to the event's tenant (barrier 1).
+	if repo.revokeCalls != 1 {
+		t.Fatalf("RevokeDeadlineByIntimation calls = %d, want 1", repo.revokeCalls)
+	}
+	if repo.gotRevokeIntimationID != ev.IntimationID || repo.gotRevokeTenantID != ev.TenantID {
+		t.Errorf("revoke args intimation/tenant = %q/%q, want %q/%q",
+			repo.gotRevokeIntimationID, repo.gotRevokeTenantID, ev.IntimationID, ev.TenantID)
+	}
+
+	// Exactly one deadline.revoked, aggregate = the revoked deadline id (a uuid).
+	if len(outbox.published) != 1 {
+		t.Fatalf("published events = %d, want 1", len(outbox.published))
+	}
+	revoked, ok := outbox.published[0].(DeadlineRevoked)
+	if !ok {
+		t.Fatalf("published[0] type = %T, want DeadlineRevoked", outbox.published[0])
+	}
+	if revoked.Type() != TypeDeadlineRevoked || revoked.AggregateType() != aggregateTypeDeadline {
+		t.Errorf("event type/aggregate = %q/%q", revoked.Type(), revoked.AggregateType())
+	}
+	if revoked.AggregateID() != deadlineID {
+		t.Errorf("aggregate id = %q, want the deadline id %q", revoked.AggregateID(), deadlineID)
+	}
+	if _, err := uuid.Parse(revoked.AggregateID()); err != nil {
+		t.Errorf("aggregate id is not a uuid: %v", err)
+	}
+	if revoked.DeadlineID != deadlineID || revoked.IntimationID != ev.IntimationID || revoked.Reason != ev.Reason {
+		t.Errorf("revoked deadline/intimation/reason = %q/%q/%q, want %q/%q/%q",
+			revoked.DeadlineID, revoked.IntimationID, revoked.Reason, deadlineID, ev.IntimationID, ev.Reason)
+	}
+}
+
+// TestOnIntimationCancelled_NoDeadlineNoOp proves the safe bias: when there is no prazo to
+// revoke — none was ever derived (the cancel raced ahead of the observe, or the intimação
+// was dead on arrival) OR it is already CANCELLED — the repo returns ErrDeadlineNotFound
+// and the use case no-ops: no error, no phantom deadline.revoked. Both collapse to the
+// same path because the query's status <> CANCELLED guard touches no row in either case.
+func TestOnIntimationCancelled_NoDeadlineNoOp(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "no prazo exists for the intimação"},
+		{name: "prazo already CANCELLED"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := cancelledFixture()
+			repo := &mockRepo{revokeErr: ErrDeadlineNotFound}
+			outbox := &fakeOutbox{}
+			uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+			if err := uc.OnIntimationCancelled(context.Background(), ev); err != nil {
+				t.Fatalf("OnIntimationCancelled() error = %v, want nil (safe no-op)", err)
+			}
+			if repo.revokeCalls != 1 {
+				t.Errorf("RevokeDeadlineByIntimation calls = %d, want 1", repo.revokeCalls)
+			}
+			if len(outbox.published) != 0 {
+				t.Errorf("published events = %d, want 0 (no phantom deadline.revoked)", len(outbox.published))
+			}
+		})
+	}
+}
+
+// TestOnIntimationCancelled_Idempotent proves a replay (dedup reports seen) is a pure
+// no-op: no revoke, no event — the dedup floor guards the revocation exactly as it guards
+// the creation path.
+func TestOnIntimationCancelled_Idempotent(t *testing.T) {
+	ev := cancelledFixture()
+	repo := &mockRepo{revokeResult: &RevokedDeadline{ID: uuid.NewString(), CourtRecordID: uuid.NewString()}}
+	outbox := &fakeOutbox{}
+	dedup := &fakeDedup{seen: true}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, dedup, &fakeUOW{})
+
+	if err := uc.OnIntimationCancelled(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationCancelled() error = %v", err)
+	}
+	if repo.revokeCalls != 0 {
+		t.Errorf("RevokeDeadlineByIntimation calls = %d, want 0 on a replay", repo.revokeCalls)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on a replay", len(outbox.published))
+	}
+	// It still dedups under the slice-specific consumer name.
+	if len(dedup.consumers) != 1 || dedup.consumers[0] != consumerDeadline {
+		t.Errorf("dedup consumer = %v, want [%q]", dedup.consumers, consumerDeadline)
+	}
+}
+
+// TestOnIntimationCancelled_InfraErrorPropagates proves an infra fault from the revoke
+// aborts the tx (retryable) and emits nothing — only ErrDeadlineNotFound is a no-op.
+func TestOnIntimationCancelled_InfraErrorPropagates(t *testing.T) {
+	ev := cancelledFixture()
+	repo := &mockRepo{revokeErr: apperr.NewInfra("db down", errors.New("boom"))}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	err := uc.OnIntimationCancelled(context.Background(), ev)
+	if err == nil {
+		t.Fatal("expected an error to propagate")
+	}
+	ae, ok := apperr.From(err)
+	if !ok || ae.Kind != apperr.KindInfra {
+		t.Errorf("error kind = %v, want KindInfra", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on error", len(outbox.published))
 	}
 }
 

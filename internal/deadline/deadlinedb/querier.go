@@ -77,6 +77,16 @@ type Querier interface {
 	// $1 = rules_version, $2 = intimation_type, $3 = court. A court_prefix matches when the
 	// court sigla starts with it ($3 LIKE prefix || '%'); a NULL prefix matches any court.
 	ResolveDeadlineRule(ctx context.Context, arg ResolveDeadlineRuleParams) (ResolveDeadlineRuleRow, error)
+	// Revoke (CANCEL) the prazo derived from an intimação the DJEN retracted (erd-prazos.md
+	// §7/§11: uma intimação retificada vira prazo-fantasma → deadline.revoked). Keyed by the
+	// 1:1 notification_id (=intimation id) and scoped to tenant_id (barrier 1, on top of RLS
+	// barrier 2). The `status <> 'CANCELLED'` guard makes the revoke IDEMPOTENT: a redelivery
+	// past the dedup — or a cancel that lands before any prazo exists, or on an already
+	// CANCELLED one — updates NO row → pgx.ErrNoRows → typed not-found at the mapper, the use
+	// case's safe no-op (never a phantom revoked). On a hit it returns the revoked id (+ the
+	// record it hung on) so deadline.revoked commits in the SAME tx. $1 = intimation_id (the
+	// notification_id column), $2 = tenant_id, both from the trusted event payload.
+	RevokeDeadlineByIntimation(ctx context.Context, arg RevokeDeadlineByIntimationParams) (RevokeDeadlineByIntimationRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

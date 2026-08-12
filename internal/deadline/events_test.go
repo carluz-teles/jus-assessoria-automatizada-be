@@ -75,3 +75,45 @@ func TestIntimationObserved_ContractRoundTrip(t *testing.T) {
 		t.Errorf("DeadlineStartAt = %q, want %q", got.DeadlineStartAt, producer.DeadlineStartAt)
 	}
 }
+
+// TestIntimationCancelled_ContractRoundTrip is the revocation counterpart of the observed
+// round-trip guard (memória parallel-producer-consumer-roundtrip): it MARSHALS the
+// producer's acquisition.IntimationCancelled and UNMARSHALS it into this slice's LOCAL
+// decode struct, asserting every field the revocation reads survives the wire. This slice
+// imports only the type const, so without this test a field rename on either side would
+// drift silently and the revoke would key off zero values. It also pins the shared id.
+func TestIntimationCancelled_ContractRoundTrip(t *testing.T) {
+	if TypeIntimationCancelled != acquisition.TypeIntimationCancelled {
+		t.Fatalf("consumed type %q != producer type %q", TypeIntimationCancelled, acquisition.TypeIntimationCancelled)
+	}
+
+	producer := acquisition.IntimationCancelled{
+		Base:         events.Base{EventID: uuid.NewString(), Aggregate: uuid.NewString()},
+		TenantID:     uuid.NewString(),
+		IntimationID: uuid.NewString(),
+		Reason:       "retificada pelo tribunal",
+	}
+
+	raw, err := json.Marshal(producer)
+	if err != nil {
+		t.Fatalf("marshal producer: %v", err)
+	}
+
+	var got IntimationCancelled
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal into local shape: %v", err)
+	}
+
+	if got.EventID != producer.EventID {
+		t.Errorf("EventID = %q, want %q", got.EventID, producer.EventID)
+	}
+	if got.TenantID != producer.TenantID {
+		t.Errorf("TenantID = %q, want %q", got.TenantID, producer.TenantID)
+	}
+	if got.IntimationID != producer.IntimationID {
+		t.Errorf("IntimationID = %q, want %q", got.IntimationID, producer.IntimationID)
+	}
+	if got.Reason != producer.Reason {
+		t.Errorf("Reason = %q, want %q", got.Reason, producer.Reason)
+	}
+}
