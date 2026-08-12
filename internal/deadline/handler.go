@@ -23,6 +23,7 @@ import (
 type reader interface {
 	PrazosByProcesso(ctx context.Context, q PrazosByProcessoQuery) (PrazosByProcessoResult, error)
 	Prazos(ctx context.Context, q PrazosQuery) (PrazosResult, error)
+	PrazosByIntimacao(ctx context.Context, tenantID, intimationID string) (PrazosResult, error)
 	Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
 	TasksByProcesso(ctx context.Context, q TasksByProcessoQuery) (TasksByProcessoResult, error)
 	Tasks(ctx context.Context, q TasksQuery) (TasksResult, error)
@@ -115,10 +116,23 @@ func (h *Handler) listPrazosByProcesso(c *fiber.Ctx) error {
 // listPrazos handles GET /v1/prazos: the tenant's agenda — every prazo ordered by
 // end_date (soonest first), keyset paginated (?limit, ?cursor), optionally filtered by
 // ?status (a closed set) and an end_date window ?from/?to (wire date 2006-01-02). A bad
-// status or malformed date is a client error → 400.
+// status or malformed date is a client error → 400. As a special case, ?intimation_id
+// (a uuid) narrows to the single prazo of that intimação — the F2 lookup — returning the
+// same envelope with 0 or 1 item (a malformed id is a 400).
 func (h *Handler) listPrazos(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	if intimationID := c.Query("intimation_id"); intimationID != "" {
+		if _, err := uuid.Parse(intimationID); err != nil {
+			return httpx.WriteError(c, apperr.NewInvalid("invalid intimation_id (want a uuid)"))
+		}
+		res, err := h.reader.PrazosByIntimacao(c.UserContext(), tenantID, intimationID)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		return c.Status(fiber.StatusOK).JSON(newPrazosPage(res, limit))
+	}
 
 	status := c.Query("status")
 	if status != "" && !isKnownStatus(status) {

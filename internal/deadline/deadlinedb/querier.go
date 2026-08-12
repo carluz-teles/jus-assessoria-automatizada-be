@@ -133,6 +133,14 @@ type Querier interface {
 	// keyset on (end_date, id); the first page passes the min sentinel ('0001-01-01',
 	// zero-uuid).
 	ListPrazos(ctx context.Context, arg ListPrazosParams) ([]ListPrazosRow, error)
+	// The prazo of ONE intimação (GET /v1/prazos?intimation_id=...): the F2 screen opens
+	// from an intimação and needs its derived prazo. The deadline is 1:1 with the intimação
+	// by notification_id (UNIQUE, migration 0006 column name), so this returns 0 or 1 rows.
+	// SAME projection as ListPrazos (the agenda row shape, with the cnj/court context from
+	// the join) so the handler can reuse the AgendaPrazoView envelope unchanged. Scoped to
+	// tenant_id (barrier 1, from the principal — never the query): a foreign tenant sees no
+	// prazo. No keyset/window filters here — the 1:1 lookup is already a single row.
+	ListPrazosByIntimacao(ctx context.Context, arg ListPrazosByIntimacaoParams) ([]ListPrazosByIntimacaoRow, error)
 	// read-model queries (deadline slice) — the prazos SCREEN reads, kept OFF the write
 	// path (docs: "leitura de tela usa read model, DTO por query dedicada"). Each is
 	// tenant-scoped (barrier 1: an explicit tenant_id filter from the trusted principal,

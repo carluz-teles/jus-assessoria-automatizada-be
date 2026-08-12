@@ -22,6 +22,10 @@ type recordingReadRepo struct {
 	lastAgendaQuery  PrazosQuery
 	lastAgendaCountQ PrazosQuery
 
+	byIntimacaoRows []AgendaPrazoView
+	lastByIntimTID  string
+	lastByIntimID   string
+
 	detailView PrazoDetailView
 	detailErr  error
 	lastGetTID string
@@ -49,6 +53,11 @@ func (r *recordingReadRepo) CountPrazosByProcesso(context.Context, string, strin
 func (r *recordingReadRepo) ListPrazos(_ context.Context, q PrazosQuery) ([]AgendaPrazoView, error) {
 	r.lastAgendaQuery = q
 	return r.agendaRows, nil
+}
+
+func (r *recordingReadRepo) ListPrazosByIntimacao(_ context.Context, tenantID, intimationID string) ([]AgendaPrazoView, error) {
+	r.lastByIntimTID, r.lastByIntimID = tenantID, intimationID
+	return r.byIntimacaoRows, nil
 }
 
 func (r *recordingReadRepo) CountPrazos(_ context.Context, q PrazosQuery) (int64, int64, error) {
@@ -169,6 +178,48 @@ func TestReadUseCase_Prazos_ForwardsFiltersAndWiresTotals(t *testing.T) {
 	}
 	if res.TotalCount != 7 || res.Total != 41 {
 		t.Errorf("totals = (%d, %d), want (7, 41)", res.TotalCount, res.Total)
+	}
+}
+
+// PrazosByIntimacao forwards the tenant + intimação id to the repo and wraps the single
+// derived prazo in the agenda result shape: HasMore false and both totals = the item
+// count (the 1:1 lookup is one row, no pagination).
+func TestReadUseCase_PrazosByIntimacao_WrapsSingleRow(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{byIntimacaoRows: []AgendaPrazoView{{ID: "d-1", IntimationID: "i-9"}}}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.PrazosByIntimacao(context.Background(), "t-1", "i-9")
+	if err != nil {
+		t.Fatalf("PrazosByIntimacao: %v", err)
+	}
+	if repo.lastByIntimTID != "t-1" || repo.lastByIntimID != "i-9" {
+		t.Errorf("forwarded (tenant, intimation) = (%q, %q), want (t-1, i-9)", repo.lastByIntimTID, repo.lastByIntimID)
+	}
+	if res.HasMore {
+		t.Error("HasMore = true, want false (1:1 lookup, never paginated)")
+	}
+	if len(res.Items) != 1 || res.TotalCount != 1 || res.Total != 1 {
+		t.Errorf("result = items %d / totals %d,%d, want 1/1,1", len(res.Items), res.TotalCount, res.Total)
+	}
+}
+
+// An intimação with no derived prazo yields an empty page with zero totals — not an error
+// (the F2 screen renders "sem prazo" from an empty data array).
+func TestReadUseCase_PrazosByIntimacao_NoPrazo_EmptyResult(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{byIntimacaoRows: nil}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.PrazosByIntimacao(context.Background(), "t-1", "i-empty")
+	if err != nil {
+		t.Fatalf("PrazosByIntimacao: %v", err)
+	}
+	if len(res.Items) != 0 || res.TotalCount != 0 || res.Total != 0 || res.HasMore {
+		t.Errorf("result = items %d / totals %d,%d / hasMore %v, want 0/0,0/false",
+			len(res.Items), res.TotalCount, res.Total, res.HasMore)
 	}
 }
 

@@ -197,6 +197,62 @@ func TestPrazosRead_Agenda_KeysetPaginatesAscending(t *testing.T) {
 	}
 }
 
+// PR3: the F2 lookup (GET /v1/prazos?intimation_id=...) returns exactly the prazo derived
+// from that intimação — one item carrying the right intimation_id and the process context
+// — while a foreign tenant or an intimação with no prazo sees an empty result (never an
+// error). Proves the 1:1 notification_id filter against a real derivation.
+func TestPrazosRead_ByIntimacao_ReturnsSingleDerivedDeadline(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	p := seedDeadlineParentsCommitted(ctx, t, pool)
+
+	ev := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
+	if err := newDeadlineUC(pool).OnIntimationObserved(ctx, ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+	deadlineID := deadlineIDFor(ctx, t, pool, p.intimationID)
+
+	tenant := p.tenantID.String()
+	reader := newDeadlineReader(pool)
+
+	res, err := reader.PrazosByIntimacao(ctx, tenant, p.intimationID.String())
+	if err != nil {
+		t.Fatalf("PrazosByIntimacao: %v", err)
+	}
+	if len(res.Items) != 1 || res.TotalCount != 1 || res.Total != 1 || res.HasMore {
+		t.Fatalf("result = items %d / totals %d,%d / hasMore %v, want 1/1,1/false",
+			len(res.Items), res.TotalCount, res.Total, res.HasMore)
+	}
+	row := res.Items[0]
+	if row.ID != deadlineID {
+		t.Errorf("row.ID = %q, want %q", row.ID, deadlineID)
+	}
+	if row.IntimationID != p.intimationID.String() {
+		t.Errorf("IntimationID = %q, want %q", row.IntimationID, p.intimationID)
+	}
+	if row.Court != "TJSP" || row.CourtRecordID != p.courtRecordID.String() {
+		t.Errorf("context = court %q / cr %q, want TJSP / %q", row.Court, row.CourtRecordID, p.courtRecordID)
+	}
+
+	// A foreign tenant sees no prazo for the same intimação — empty, never an error.
+	foreign, err := reader.PrazosByIntimacao(ctx, uuid.NewString(), p.intimationID.String())
+	if err != nil {
+		t.Fatalf("cross-tenant PrazosByIntimacao: %v", err)
+	}
+	if len(foreign.Items) != 0 || foreign.Total != 0 {
+		t.Errorf("cross-tenant result = items %d / total %d, want 0/0", len(foreign.Items), foreign.Total)
+	}
+
+	// An intimação with no derived prazo is an empty result, not a 404.
+	none, err := reader.PrazosByIntimacao(ctx, tenant, uuid.NewString())
+	if err != nil {
+		t.Fatalf("no-prazo PrazosByIntimacao: %v", err)
+	}
+	if len(none.Items) != 0 || none.Total != 0 {
+		t.Errorf("no-prazo result = items %d / total %d, want 0/0", len(none.Items), none.Total)
+	}
+}
+
 // seedSecondIntimation inserts a second intimation on the same tenant/case/record as the
 // seeded parents (a distinct notification_id so a second deadline can hang off it), and
 // returns its id. Committed so the derivation use case's own tx can reference it.

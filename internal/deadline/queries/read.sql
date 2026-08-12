@@ -54,6 +54,26 @@ WHERE d.tenant_id = @tenant_id::uuid
 ORDER BY d.end_date ASC, d.id ASC
 LIMIT @page_limit;
 
+-- name: ListPrazosByIntimacao :many
+-- The prazo of ONE intimação (GET /v1/prazos?intimation_id=...): the F2 screen opens
+-- from an intimação and needs its derived prazo. The deadline is 1:1 with the intimação
+-- by notification_id (UNIQUE, migration 0006 column name), so this returns 0 or 1 rows.
+-- SAME projection as ListPrazos (the agenda row shape, with the cnj/court context from
+-- the join) so the handler can reuse the AgendaPrazoView envelope unchanged. Scoped to
+-- tenant_id (barrier 1, from the principal — never the query): a foreign tenant sees no
+-- prazo. No keyset/window filters here — the 1:1 lookup is already a single row.
+SELECT d.id, d.kind, d.end_date,
+       (d.end_date - CURRENT_DATE)::int AS days_left,
+       d.counting, d.doubled, d.doubled_reason, d.status,
+       d.holidays_applied, d.notification_id,
+       (d.confirmed_by IS NOT NULL) AS confirmed,
+       d.court_record_id, cr.cnj_number, cr.court
+FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
+WHERE d.tenant_id = @tenant_id::uuid
+  AND d.notification_id = @intimation_id::uuid
+ORDER BY d.end_date ASC, d.id ASC;
+
 -- name: CountPrazos :one
 -- The filtered "X" of the agenda's "X de Y" counter: how many prazos match the active
 -- @status / end_date window. Called only when a filter is present; the unfiltered "Y"
