@@ -181,30 +181,6 @@ func TestDJENType(t *testing.T) {
 	}
 }
 
-func TestUFFromTribunal(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{"TJRS", "RS"},
-		{"TJSP", "SP"},
-		{"tjmg", "MG"},
-		{"TJDFT", "DF"},  // DF via registry
-		{"TJMSP", "SP"},  // militar estadual → UF do estado (registry-backed)
-		{"TRE-SP", "SP"}, // eleitoral → UF do estado
-		{"TRF4", ""},
-		{"STJ", ""},
-		{"TJXX", ""}, // sigla desconhecida → "" (não deriva mais "XX")
-		{"", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.in, func(t *testing.T) {
-			t.Parallel()
-			if got := ufFromTribunal(tt.in); got != tt.want {
-				t.Errorf("ufFromTribunal(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
-	}
-}
+// TestUFFromTribunal moved to pkg/tribunal (TestUF) with the registry relocation —
+// UF derivation is reference data shared by acquisition and deadline, so it lives in
+// /pkg now (Regra nº1: one source of truth, two consumers).

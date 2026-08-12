@@ -41,6 +41,33 @@ type Repository interface {
 	// notification_id DO NOTHING) and returns it with its DB-assigned id. A conflict
 	// (a prazo already exists for the intimação) is ErrDeadlineExists.
 	InsertDeadline(ctx context.Context, tx database.Tx, d *Deadline) (*Deadline, error)
+	// GetDeadlineForConfirm loads the F2 confirmation anchor (id, court_record_id,
+	// start_date) by the 1:1 intimação, scoped to tenantID (barrier 1). start_date is
+	// the fixed anchor the recompute re-counts from. A missing prazo for the intimação
+	// is ErrDeadlineNotFound (→ 404 at the edge), never (nil, nil).
+	GetDeadlineForConfirm(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*DeadlineForConfirm, error)
+	// GetCourtRecordCourt reads the court sigla for the record, scoped to tenantID
+	// (barrier 1). The confirm recompute derives the UF from it (pkg/tribunal.UF); it is
+	// the confirm counterpart of GetCourtRecordClass (same read-the-table, never import
+	// acquisition, decisão P1). A missing record is ErrCourtRecordNotFound; court is NOT NULL.
+	GetCourtRecordCourt(ctx context.Context, tx database.Tx, tenantID, courtRecordID string) (string, error)
+	// ConfirmDeadline flips the prazo PENDING→OPEN with the human-approved fields + the
+	// recomputed dates, keyed by the 1:1 intimação and scoped to tenantID (barrier 1). It
+	// is idempotent on the deadline: re-confirming re-UPDATEs the one row (the 1:1
+	// notification_id), never a second prazo. A no-match is ErrDeadlineNotFound. Returns the
+	// confirmed prazo id and the record it hangs on (RETURNING id, court_record_id).
+	ConfirmDeadline(ctx context.Context, tx database.Tx, p ConfirmDeadlineParams) (deadlineID, courtRecordID string, err error)
+	// DeleteTasksByDeadline drops every task of the confirmed prazo inside the caller's tx,
+	// scoped to (deadlineID, tenantID) (barrier 1 + RLS). Confirm calls it right after
+	// ConfirmDeadline and BEFORE the InsertTask loop, giving the confirm REPLACE semantics
+	// (ERD §9 "upsert idempotente por intimation_id"): re-confirming leaves exactly the last
+	// submit's tasks instead of accumulating a new set each call. A no-match deletes nothing
+	// (an empty first confirm is a clean no-op), so it never errors on absence.
+	DeleteTasksByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) error
+	// InsertTask persists one F2 task inside the caller's tx and returns it with its
+	// DB-assigned id (echoing the entity, like InsertDeadline). Scoping is via the entity's
+	// TenantID + RLS.
+	InsertTask(ctx context.Context, tx database.Tx, t *Task) (*Task, error)
 	// GetDeadlineForCheck re-reads a prazo at a scheduled mark's fire time, keyed by its id
 	// and scoped to tenantID (barrier 1). It backs OnReminderCheck's re-check: the CURRENT
 	// status decides whether a lembrete is still due. A missing id in the tenant (a prazo

@@ -63,8 +63,9 @@ const (
 	StatusCancelled Status = "CANCELLED"
 )
 
-// Source records where the {days, counting} came from. This slice derives from the
-// conservative rules layer only, so it always writes RULE; AI/MANUAL are later slices.
+// Source records where the {days, counting} came from. The creation path derives from
+// the conservative rules layer (RULE); the F2 confirmation creates its tasks MANUAL.
+// AI is a later slice.
 type Source string
 
 const (
@@ -72,6 +73,48 @@ const (
 	SourceAI     Source = "AI"
 	SourceManual Source = "MANUAL"
 )
+
+// Task is one actionable work item of the F2 confirmation — the checklist of steps
+// toward the legal prazo (docs/erd-prazos.md §4/§10). 1 legal prazo (Deadline) → N
+// tasks; the assignee lives on the task, not the prazo (the prazo is the fact, the task
+// is who does it). At this slice tasks are only ever BORN at confirmation: status OPEN,
+// source MANUAL. entity.go holds only the aggregate + value types (no repo/lib import).
+type Task struct {
+	ID             string
+	TenantID       string
+	CourtRecordID  string
+	DeadlineID     string
+	IntimationID   string
+	Title          string
+	Description    string
+	Kind           string
+	DueDate        *time.Time // optional own date (≤ Deadline.EndDate when present)
+	Status         TaskStatus
+	Source         Source
+	AssigneeUserID string // optional responsável ("meus prazos")
+	CreatedBy      string
+}
+
+// TaskStatus is the task lifecycle, a closed set the DB CHECK (0024) also enforces. A
+// task is born OPEN; DONE/DISMISSED transitions are a later slice (task CRUD, 5b).
+type TaskStatus string
+
+const (
+	TaskStatusOpen      TaskStatus = "OPEN"
+	TaskStatusDone      TaskStatus = "DONE"
+	TaskStatusDismissed TaskStatus = "DISMISSED"
+)
+
+// DeadlineForConfirm is the thin anchor read the F2 confirmation loads BEFORE the
+// recompute (GetDeadlineForConfirm), keyed by the 1:1 intimação: the prazo id, the
+// record it hangs on (feeds the court lookup + the tasks), and the fixed StartDate the
+// calendar math re-counts from. A missing prazo for the intimação is ErrDeadlineNotFound
+// (→ 404), never a zero value.
+type DeadlineForConfirm struct {
+	ID            string
+	CourtRecordID string
+	StartDate     time.Time
+}
 
 // Kind constants — the legible prazo kinds the v0 rules layer emits (docs/erd-prazos.md
 // §4/§8). GENERICO is the safe catch-all the UI later flags "confirme".

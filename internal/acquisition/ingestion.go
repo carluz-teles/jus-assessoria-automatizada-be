@@ -15,6 +15,7 @@ import (
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/obs"
+	"github.com/jusassessoria/platform/pkg/tribunal"
 )
 
 // diarioNamespace namespaces the deterministic v5 aggregate id of a diario_requested.
@@ -87,8 +88,8 @@ func (uc *IngestionScheduler) RequestDay(ctx context.Context, day time.Time) (re
 
 	err = uc.uow.DoSystem(ctx, func(tx database.Tx) error {
 		requested = 0
-		for _, trib := range tribunais {
-			if perr := uc.outbox.Publish(ctx, tx, newDiarioRequested(trib.sigla, d)); perr != nil {
+		for _, trib := range tribunal.Tribunais {
+			if perr := uc.outbox.Publish(ctx, tx, newDiarioRequested(trib.Sigla, d)); perr != nil {
 				return perr
 			}
 			requested++

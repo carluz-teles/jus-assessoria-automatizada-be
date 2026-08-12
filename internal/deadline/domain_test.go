@@ -38,6 +38,16 @@ type mockRepo struct {
 	markMissedID  string
 	markMissedErr error
 
+	// confirm path
+	confirmAnchor    *DeadlineForConfirm
+	confirmAnchorErr error
+	courtRecordCourt string
+	courtRecordErr   error
+	confirmID        string
+	confirmRecordID  string
+	confirmErr       error
+	insertTaskErr    error
+
 	// captured inputs
 	gotClassTenantID      string
 	gotClassRecordID      string
@@ -55,6 +65,19 @@ type mockRepo struct {
 	gotMissedID           string
 	gotMissedTenantID     string
 	markMissedCalls       int
+	gotConfirmIntimation  string
+	gotConfirmTenantID    string
+	confirmAnchorCalls    int
+	gotCourtRecordID      string
+	gotCourtTenantID      string
+	courtCalls            int
+	gotConfirmParams      ConfirmDeadlineParams
+	confirmCalls          int
+	insertedTasks         []*Task
+	insertTaskCalls       int
+	gotDeleteDeadlineID   string
+	gotDeleteTenantID     string
+	deleteTasksCalls      int
 }
 
 func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
@@ -98,6 +121,54 @@ func (m *mockRepo) MarkMissed(_ context.Context, _ database.Tx, deadlineID, tena
 	m.gotMissedID = deadlineID
 	m.gotMissedTenantID = tenantID
 	return m.markMissedID, m.markMissedErr
+}
+
+func (m *mockRepo) GetDeadlineForConfirm(_ context.Context, _ database.Tx, intimationID, tenantID string) (*DeadlineForConfirm, error) {
+	m.confirmAnchorCalls++
+	m.gotConfirmIntimation = intimationID
+	m.gotConfirmTenantID = tenantID
+	return m.confirmAnchor, m.confirmAnchorErr
+}
+
+func (m *mockRepo) GetCourtRecordCourt(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
+	m.courtCalls++
+	m.gotCourtTenantID = tenantID
+	m.gotCourtRecordID = courtRecordID
+	return m.courtRecordCourt, m.courtRecordErr
+}
+
+func (m *mockRepo) ConfirmDeadline(_ context.Context, _ database.Tx, p ConfirmDeadlineParams) (string, string, error) {
+	m.confirmCalls++
+	m.gotConfirmParams = p
+	if m.confirmErr != nil {
+		return "", "", m.confirmErr
+	}
+	return m.confirmID, m.confirmRecordID, nil
+}
+
+// DeleteTasksByDeadline models the REPLACE step: it drops the confirmed prazo's live tasks
+// (clearing insertedTasks) before the confirm re-inserts the submitted set, so insertedTasks
+// reflects only the last submit — the way a real DELETE + re-INSERT would. Records the count
+// and the (deadlineID, tenantID) scoping so a test can assert the 2-barrier key.
+func (m *mockRepo) DeleteTasksByDeadline(_ context.Context, _ database.Tx, deadlineID, tenantID string) error {
+	m.deleteTasksCalls++
+	m.gotDeleteDeadlineID = deadlineID
+	m.gotDeleteTenantID = tenantID
+	m.insertedTasks = nil
+	return nil
+}
+
+// InsertTask echoes the task back with a real uuid id (as the DB would), so a test can
+// assert task.created's aggregate is a parseable uuid, and captures every inserted task.
+func (m *mockRepo) InsertTask(_ context.Context, _ database.Tx, t *Task) (*Task, error) {
+	m.insertTaskCalls++
+	if m.insertTaskErr != nil {
+		return nil, m.insertTaskErr
+	}
+	saved := *t
+	saved.ID = uuid.NewString()
+	m.insertedTasks = append(m.insertedTasks, &saved)
+	return &saved, nil
 }
 
 // fakeCalendar records which motor was called (business vs calendar) and the args, and

@@ -1,4 +1,4 @@
-package acquisition
+package tribunal
 
 import (
 	"strings"
@@ -13,22 +13,22 @@ func TestTribunais(t *testing.T) {
 
 	// 27 estaduais + 3 militares + 27 eleitorais + 6 TRFs + 24 TRTs + 4 superiores.
 	const want = 27 + 3 + 27 + 6 + 24 + 4
-	if len(tribunais) != want {
-		t.Fatalf("len(tribunais) = %d, want %d", len(tribunais), want)
+	if len(Tribunais) != want {
+		t.Fatalf("len(Tribunais) = %d, want %d", len(Tribunais), want)
 	}
 
-	bySigla := make(map[string]tribunal, len(tribunais))
-	for _, tr := range tribunais {
-		if tr.sigla == "" {
+	bySigla := make(map[string]Tribunal, len(Tribunais))
+	for _, tr := range Tribunais {
+		if tr.Sigla == "" {
 			t.Errorf("tribunal com sigla vazia: %+v", tr)
 		}
-		if tr.sigla != strings.ToUpper(tr.sigla) {
-			t.Errorf("sigla não-uppercase: %q", tr.sigla)
+		if tr.Sigla != strings.ToUpper(tr.Sigla) {
+			t.Errorf("sigla não-uppercase: %q", tr.Sigla)
 		}
-		if _, dup := bySigla[tr.sigla]; dup {
-			t.Errorf("sigla duplicada: %q", tr.sigla)
+		if _, dup := bySigla[tr.Sigla]; dup {
+			t.Errorf("sigla duplicada: %q", tr.Sigla)
 		}
-		bySigla[tr.sigla] = tr
+		bySigla[tr.Sigla] = tr
 	}
 
 	// Grafias validadas contra a API viva (2026-08) + exclusões.
@@ -58,8 +58,8 @@ func TestTribunais(t *testing.T) {
 			if ok != c.present {
 				t.Fatalf("%q present = %v, want %v", c.sigla, ok, c.present)
 			}
-			if ok && tr.uf != c.uf {
-				t.Errorf("%q uf = %q, want %q", c.sigla, tr.uf, c.uf)
+			if ok && tr.UF != c.uf {
+				t.Errorf("%q uf = %q, want %q", c.sigla, tr.UF, c.uf)
 			}
 		})
 	}
@@ -76,5 +76,36 @@ func TestTribunais(t *testing.T) {
 		if _, ok := bySigla["TRE-"+uf]; !ok {
 			t.Errorf("faltou o TRE de %s (TRE-%s)", uf, uf)
 		}
+	}
+}
+
+// TestUF pins the sigla→UF resolution (moved from acquisition's TestUFFromTribunal):
+// state/electoral/state-military courts carry their UF; region- and nationally-scoped
+// courts and any unknown sigla resolve to "". Input is trimmed and upper-cased.
+func TestUF(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"TJRS", "RS"},
+		{"TJSP", "SP"},
+		{"tjmg", "MG"},
+		{"TJDFT", "DF"},  // DF via registry
+		{"TJMSP", "SP"},  // militar estadual → UF do estado (registry-backed)
+		{"TRE-SP", "SP"}, // eleitoral → UF do estado
+		{"TRF4", ""},
+		{"STJ", ""},
+		{"TJXX", ""}, // sigla desconhecida → "" (não deriva mais "XX")
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			t.Parallel()
+			if got := UF(tt.in); got != tt.want {
+				t.Errorf("UF(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }

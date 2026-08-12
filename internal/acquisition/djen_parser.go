@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/pkg/tribunal"
 )
 
 // djen_parser.go turns a DJEN RawPayload (the djenPayload the connector emits)
@@ -160,7 +161,7 @@ func (p *DJENParser) parseIntimation(ctx context.Context, item djenComunicacao, 
 		return ParsedIntimation{}, false
 	}
 
-	uf, court := ufFromTribunal(item.SiglaTribunal), item.SiglaTribunal
+	uf, court := tribunal.UF(item.SiglaTribunal), item.SiglaTribunal
 
 	// published_at = first business day after availability; deadline_start_at =
 	// first business day after publication (CPC 224). A calendar fault is not fatal
@@ -303,15 +304,6 @@ func djenType(tipo string) string {
 	default:
 		return IntimationTypeComunicacao
 	}
-}
-
-// ufFromTribunal resolves the state UF of a tribunal sigla for the state-holiday
-// lookup, from the tribunal registry (single source): state, electoral and state
-// military courts (TJSP → SP, TRE-SP → SP, TJMSP → SP) carry their UF, while region-
-// and nationally-scoped courts (TRF/TRT/STJ/…) and any unknown sigla resolve to ""
-// so the calendar applies only national + court-scoped holidays.
-func ufFromTribunal(sigla string) string {
-	return tribunalUF[strings.ToUpper(strings.TrimSpace(sigla))]
 }
 
 // parseDJENDate parses an optional ISO date, returning the zero time when it is
