@@ -713,44 +713,7 @@ func (r *pgRepository) markCourtRecordSynced(ctx context.Context, q *acquisition
 // is folded into "deduped"; the returned slice is the entries that were ACTUALLY
 // new (each with its assigned id), so the use case emits an observed event only
 // for those and tallies new vs. deduped.
-func (r *pgRepository) UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) ([]DocketEntry, error) {
-	q := acquisitiondb.New(tx)
-	newEntries := make([]DocketEntry, 0, len(params))
-	for _, p := range params {
-		crid, err := uuid.Parse(p.CourtRecordID)
-		if err != nil {
-			return nil, database.WrapInfra(err)
-		}
-		id, err := q.InsertDocketEntry(ctx, acquisitiondb.InsertDocketEntryParams{
-			CourtRecordID: crid,
-			Hash:          p.Hash,
-			OccurredAt:    pgtype.Timestamptz{Time: p.OccurredAt, Valid: true},
-			ObservedAt:    pgtype.Timestamptz{Time: p.ObservedAt, Valid: true},
-			Source:        p.Source,
-			Fidelity:      int32(p.Fidelity),
-			TpuCode:       nullInt32(p.TPUCode),
-			Complements:   complementsOrNil(p.Complements),
-			Text:          p.Text,
-		})
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return nil, database.WrapInfra(err)
-		}
-		newEntries = append(newEntries, DocketEntry{
-			ID:            id.String(),
-			CourtRecordID: p.CourtRecordID,
-			Hash:          p.Hash,
-			OccurredAt:    p.OccurredAt,
-			ObservedAt:    p.ObservedAt,
-			Source:        p.Source,
-			Fidelity:      p.Fidelity,
-			Text:          p.Text,
-		})
-	}
-	return newEntries, nil
-}
+// UpsertDocketEntries is the SET-BASED bulk insert — see repository_batch.go.
 
 // UpsertIntimations inserts-or-updates each intimação ON CONFLICT DO UPDATE inside
 // the caller's tx and returns how many were ACTUALLY new. The DO UPDATE always

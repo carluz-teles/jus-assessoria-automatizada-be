@@ -315,6 +315,94 @@ func rawArrayOrEmpty(rm json.RawMessage) json.RawMessage {
 	return rm
 }
 
+// docketEntryRowJSON is one row of the BatchInsertDocketEntries jsonb payload. tpu_code
+// (0 → null) and complements (empty → null) mirror the per-row nullInt32/complementsOrNil.
+type docketEntryRowJSON struct {
+	CourtRecordID string          `json:"court_record_id"`
+	Hash          string          `json:"hash"`
+	OccurredAt    time.Time       `json:"occurred_at"`
+	ObservedAt    time.Time       `json:"observed_at"`
+	Source        string          `json:"source"`
+	Fidelity      int             `json:"fidelity"`
+	TPUCode       *int            `json:"tpu_code"`
+	Complements   json.RawMessage `json:"complements"`
+	Text          string          `json:"text"`
+}
+
+// UpsertDocketEntries bulk-inserts a window's andamentos in ONE round-trip via a jsonb
+// payload (replacing the per-entry InsertDocketEntry loop), ON CONFLICT DO NOTHING. Only
+// the ACTUALLY new entries are returned (in input order, deduped keys dropped), so the
+// enrichment/sync use case emits an observed event only for those.
+func (r *pgRepository) UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) ([]DocketEntry, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	rows := make([]docketEntryRowJSON, len(params))
+	for i, p := range params {
+		rows[i] = docketEntryRowJSON{
+			CourtRecordID: p.CourtRecordID,
+			Hash:          p.Hash,
+			OccurredAt:    p.OccurredAt,
+			ObservedAt:    p.ObservedAt,
+			Source:        p.Source,
+			Fidelity:      p.Fidelity,
+			TPUCode:       intPtrOrNil(p.TPUCode),
+			Complements:   rawOrNull(p.Complements),
+			Text:          p.Text,
+		}
+	}
+	payload, err := json.Marshal(rows)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	inserted, err := acquisitiondb.New(tx).BatchInsertDocketEntries(ctx, payload)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	// Map the returned NEW rows (DO NOTHING omits conflicts) back to their params, in
+	// input order; a duplicate key within the batch is consumed once (deduped after).
+	insertedIDByKey := make(map[string]uuid.UUID, len(inserted))
+	for _, row := range inserted {
+		insertedIDByKey[row.CourtRecordID.String()+"|"+row.Hash] = row.ID
+	}
+	newEntries := make([]DocketEntry, 0, len(inserted))
+	for _, p := range params {
+		k := p.CourtRecordID + "|" + p.Hash
+		id, ok := insertedIDByKey[k]
+		if !ok {
+			continue // conflicted → deduped
+		}
+		delete(insertedIDByKey, k)
+		newEntries = append(newEntries, DocketEntry{
+			ID:            id.String(),
+			CourtRecordID: p.CourtRecordID,
+			Hash:          p.Hash,
+			OccurredAt:    p.OccurredAt,
+			ObservedAt:    p.ObservedAt,
+			Source:        p.Source,
+			Fidelity:      p.Fidelity,
+			Text:          p.Text,
+		})
+	}
+	return newEntries, nil
+}
+
+// intPtrOrNil maps 0 to nil (JSON null → SQL NULL), mirroring nullInt32.
+func intPtrOrNil(n int) *int {
+	if n == 0 {
+		return nil
+	}
+	return &n
+}
+
+// rawOrNull maps an empty raw message to nil (JSON null → SQL NULL), mirroring complementsOrNil.
+func rawOrNull(rm json.RawMessage) json.RawMessage {
+	if len(rm) == 0 {
+		return nil
+	}
+	return rm
+}
+
 // dateStr formats a date for the jsonb payload (date column parses YYYY-MM-DD).
 func dateStr(t time.Time) string { return t.Format("2006-01-02") }
 

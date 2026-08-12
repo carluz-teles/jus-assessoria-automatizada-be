@@ -43,6 +43,12 @@ type Querier interface {
 	// advisory lock there is no concurrent same-tenant writer, so the conflict path only
 	// fires on a genuine re-run, never a create race.
 	BatchInsertCourtRecords(ctx context.Context, arg BatchInsertCourtRecordsParams) ([]BatchInsertCourtRecordsRow, error)
+	// Bulk counterpart of InsertDocketEntry: insert MANY andamentos in ONE round-trip from
+	// a jsonb array of rows, ON CONFLICT (court_record_id, hash) DO NOTHING (idempotent).
+	// Only the rows that were ACTUALLY new are returned (DO NOTHING omits conflicts), so the
+	// caller maps them back to build the observed events. This is what keeps the enrichment's
+	// per-tenant write lock hold short even for a process with a long movimento history.
+	BatchInsertDocketEntries(ctx context.Context, entries []byte) ([]BatchInsertDocketEntriesRow, error)
 	// Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
 	// completeness/next_sync_at and COALESCE judging_body (a sync that omits it keeps the
 	// prior value) for MANY records in one round-trip, from a jsonb array of rows.

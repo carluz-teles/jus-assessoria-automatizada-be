@@ -114,6 +114,49 @@ func (q *Queries) BatchInsertCourtRecords(ctx context.Context, arg BatchInsertCo
 	return items, nil
 }
 
+const batchInsertDocketEntries = `-- name: BatchInsertDocketEntries :many
+INSERT INTO docket_entry
+    (court_record_id, hash, occurred_at, observed_at, source, fidelity, tpu_code, complements, text)
+SELECT r.court_record_id, r.hash, r.occurred_at, r.observed_at, r.source, r.fidelity, r.tpu_code, r.complements, r.text
+FROM jsonb_to_recordset($1::jsonb) AS r(
+    court_record_id uuid, hash text, occurred_at timestamptz, observed_at timestamptz,
+    source text, fidelity int, tpu_code int, complements jsonb, text text
+)
+ON CONFLICT (court_record_id, hash) DO NOTHING
+RETURNING id, court_record_id, hash
+`
+
+type BatchInsertDocketEntriesRow struct {
+	ID            uuid.UUID `json:"id"`
+	CourtRecordID uuid.UUID `json:"court_record_id"`
+	Hash          string    `json:"hash"`
+}
+
+// Bulk counterpart of InsertDocketEntry: insert MANY andamentos in ONE round-trip from
+// a jsonb array of rows, ON CONFLICT (court_record_id, hash) DO NOTHING (idempotent).
+// Only the rows that were ACTUALLY new are returned (DO NOTHING omits conflicts), so the
+// caller maps them back to build the observed events. This is what keeps the enrichment's
+// per-tenant write lock hold short even for a process with a long movimento history.
+func (q *Queries) BatchInsertDocketEntries(ctx context.Context, entries []byte) ([]BatchInsertDocketEntriesRow, error) {
+	rows, err := q.db.Query(ctx, batchInsertDocketEntries, entries)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BatchInsertDocketEntriesRow
+	for rows.Next() {
+		var i BatchInsertDocketEntriesRow
+		if err := rows.Scan(&i.ID, &i.CourtRecordID, &i.Hash); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const batchMarkCourtRecordsSynced = `-- name: BatchMarkCourtRecordsSynced :exec
 UPDATE court_record cr
 SET completeness = u.completeness,
