@@ -19,11 +19,13 @@ type notifyUC interface {
 	OnNotificationRequested(ctx context.Context, ev NotificationRequested) error
 }
 
-// inAppUC is the port for the in-app consumers (slice 1a): the two acquisition events
-// this slice turns into IN_APP avisos.
+// inAppUC is the port for the in-app consumers: the two acquisition events (slice 1a) and
+// the two deadline events (fatia 4c) this slice turns into IN_APP avisos.
 type inAppUC interface {
 	OnBackfillFinished(ctx context.Context, ev BackfillFinished) error
 	OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error
+	OnDeadlineDueSoon(ctx context.Context, ev DeadlineDueSoon) error
+	OnDeadlineMissed(ctx context.Context, ev DeadlineMissed) error
 }
 
 // Listener is notifications' asynq consumer. It holds no transport state; the use
@@ -48,6 +50,8 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeNotificationRequested, l.handleNotificationRequested)
 	mux.HandleFunc(TypeBackfillFinished, l.handleBackfillFinished)
 	mux.HandleFunc(TypeDocketEntryObserved, l.handleDocketEntryObserved)
+	mux.HandleFunc(TypeDeadlineDueSoon, l.handleDeadlineDueSoon)
+	mux.HandleFunc(TypeDeadlineMissed, l.handleDeadlineMissed)
 }
 
 // handleNotificationRequested is the asynq.HandlerFunc for notification.requested. It
@@ -84,4 +88,27 @@ func (l *Listener) handleDocketEntryObserved(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	return l.inApp.OnDocketEntryObserved(ctx, ev)
+}
+
+// handleDeadlineDueSoon is the asynq.HandlerFunc for deadline.due_soon (fatia 4c). It decodes
+// the payload and hands off to the in-app use case (→ a deadline-due-soon aviso). A decode
+// error wraps asynq.SkipRetry (archived, not retried); an infra error from the use case stays
+// retryable.
+func (l *Listener) handleDeadlineDueSoon(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DeadlineDueSoon](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnDeadlineDueSoon(ctx, ev)
+}
+
+// handleDeadlineMissed is the asynq.HandlerFunc for deadline.missed (fatia 4c). It decodes the
+// payload and hands off to the in-app use case (→ a "Prazo vencido" aviso). Same error contract
+// as the other handlers.
+func (l *Listener) handleDeadlineMissed(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DeadlineMissed](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnDeadlineMissed(ctx, ev)
 }

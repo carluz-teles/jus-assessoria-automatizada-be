@@ -237,6 +237,25 @@ func docketEntryObserved(eventID string) DocketEntryObserved {
 	}
 }
 
+// deadlineDueSoon builds a deadline.due_soon for the fixture tenant with a given days_left.
+func deadlineDueSoon(eventID string, daysLeft int) DeadlineDueSoon {
+	return DeadlineDueSoon{
+		Base:       baseWithID(eventID),
+		TenantID:   tenantID,
+		DeadlineID: "deadline-uuid",
+		DaysLeft:   daysLeft,
+	}
+}
+
+// deadlineMissed builds a deadline.missed for the fixture tenant.
+func deadlineMissed(eventID string) DeadlineMissed {
+	return DeadlineMissed{
+		Base:       baseWithID(eventID),
+		TenantID:   tenantID,
+		DeadlineID: "deadline-uuid",
+	}
+}
+
 // --- tests ------------------------------------------------------------------
 
 // AC2: notification.requested → notification + delivery(QUEUED) created in the
@@ -609,6 +628,144 @@ func TestInAppUseCase_OnBackfillFinished_PublishFailureIsSwallowed(t *testing.T)
 	// The push was attempted exactly once — a failure is not retried in the handler.
 	if len(pub.channels) != 1 {
 		t.Fatalf("publish attempts = %d, want 1 (no retry)", len(pub.channels))
+	}
+}
+
+// fatia 4c: a deadline.due_soon creates one deadline-due-soon aviso + one IN_APP delivery
+// QUEUED, tenant-level, in the tenant-scoped tx, and pushes it once. The body varies by
+// days_left: "hoje" at 0, "em N dia(s)" otherwise.
+func TestInAppUseCase_OnDeadlineDueSoon_CreatesAviso(t *testing.T) {
+	tests := []struct {
+		name     string
+		daysLeft int
+		wantBody string
+	}{
+		{name: "vence hoje", daysLeft: 0, wantBody: deadlineDueSoonTodayBody},
+		{name: "vence em 1 dia", daysLeft: 1, wantBody: "Prazo vence em 1 dia(s)."},
+		{name: "vence em 3 dias", daysLeft: 3, wantBody: "Prazo vence em 3 dia(s)."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := repoInApp()
+			dedup := &fakeDedup{}
+			uow := &fakeUOW{}
+			pub := &fakePublisher{}
+			uc := NewInAppUseCase(repo, dedup, uow, pub)
+
+			if err := uc.OnDeadlineDueSoon(context.Background(), deadlineDueSoon("evt-ds-1", tt.daysLeft)); err != nil {
+				t.Fatalf("OnDeadlineDueSoon: %v", err)
+			}
+
+			if len(repo.insertedNotif) != 1 {
+				t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+			}
+			notif := repo.insertedNotif[0]
+			if notif.Type != TypeDeadlineDueSoonAviso || notif.Status != StatusCreated || notif.RecipientUserID != "" {
+				t.Fatalf("notification = %+v, want deadline_due_soon/CREATED/tenant-level", notif)
+			}
+			if notif.Title != deadlineDueSoonTitle || notif.Body != tt.wantBody {
+				t.Fatalf("title/body = %q / %q, want %q / %q", notif.Title, notif.Body, deadlineDueSoonTitle, tt.wantBody)
+			}
+			// The payload carries the source ids for the in-app UI to link back.
+			if notif.Payload["deadline_id"] != "deadline-uuid" || notif.Payload["days_left"] != tt.daysLeft {
+				t.Fatalf("payload = %v, want deadline_id + days_left", notif.Payload)
+			}
+			if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Channel != ChannelInApp || repo.insertedDelivery[0].Status != DeliveryQueued {
+				t.Fatalf("inserted delivery = %+v, want one IN_APP/QUEUED", repo.insertedDelivery)
+			}
+			if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+				t.Fatalf("uow scopes = %v, want one %q", uow.scopes, tenantID)
+			}
+			if len(dedup.marked) != 1 || dedup.marked[0] != "evt-ds-1" || dedup.consumers[0] != consumerDeadlineDueSoon {
+				t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-ds-1] under %q", dedup.marked, dedup.consumers, consumerDeadlineDueSoon)
+			}
+			// A fresh aviso is pushed once, carrying the materialized text.
+			push := assertPushedOnce(t, pub)
+			if push["id"] != notifID || push["type"] != TypeDeadlineDueSoonAviso || push["title"] != deadlineDueSoonTitle || push["body"] != tt.wantBody {
+				t.Fatalf("push = %v, want the deadline_due_soon aviso", push)
+			}
+		})
+	}
+}
+
+// fatia 4c: a replay of a deadline.due_soon (dedup already seen) is a pure no-op — no aviso,
+// no delivery, no push.
+func TestInAppUseCase_OnDeadlineDueSoon_ReplayIsNoOp(t *testing.T) {
+	repo := repoInApp()
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran on a replay")
+		return nil, nil
+	}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{}, pub)
+
+	if err := uc.OnDeadlineDueSoon(context.Background(), deadlineDueSoon("evt-ds-dup", 3)); err != nil {
+		t.Fatalf("OnDeadlineDueSoon: %v", err)
+	}
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	if len(pub.channels) != 0 {
+		t.Fatalf("replay pushed %d times, want 0", len(pub.channels))
+	}
+}
+
+// fatia 4c: a deadline.missed creates one "Prazo vencido" aviso + one IN_APP delivery QUEUED,
+// tenant-level, and pushes it once.
+func TestInAppUseCase_OnDeadlineMissed_CreatesAviso(t *testing.T) {
+	repo := repoInApp()
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, dedup, uow, pub)
+
+	if err := uc.OnDeadlineMissed(context.Background(), deadlineMissed("evt-ms-1")); err != nil {
+		t.Fatalf("OnDeadlineMissed: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 1 {
+		t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+	}
+	notif := repo.insertedNotif[0]
+	if notif.Type != TypeDeadlineMissedAviso || notif.Status != StatusCreated || notif.RecipientUserID != "" {
+		t.Fatalf("notification = %+v, want deadline_missed/CREATED/tenant-level", notif)
+	}
+	if notif.Title != deadlineMissedTitle || notif.Body != deadlineMissedBody {
+		t.Fatalf("title/body = %q / %q, want the missed strings", notif.Title, notif.Body)
+	}
+	if notif.Payload["deadline_id"] != "deadline-uuid" {
+		t.Fatalf("payload = %v, want deadline_id", notif.Payload)
+	}
+	if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Channel != ChannelInApp || repo.insertedDelivery[0].Status != DeliveryQueued {
+		t.Fatalf("inserted delivery = %+v, want one IN_APP/QUEUED", repo.insertedDelivery)
+	}
+	if len(dedup.marked) != 1 || dedup.marked[0] != "evt-ms-1" || dedup.consumers[0] != consumerDeadlineMissed {
+		t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-ms-1] under %q", dedup.marked, dedup.consumers, consumerDeadlineMissed)
+	}
+	push := assertPushedOnce(t, pub)
+	if push["id"] != notifID || push["type"] != TypeDeadlineMissedAviso {
+		t.Fatalf("push = %v, want the deadline_missed aviso", push)
+	}
+}
+
+// fatia 4c: a replay of a deadline.missed is a pure no-op — no aviso, no delivery, no push.
+func TestInAppUseCase_OnDeadlineMissed_ReplayIsNoOp(t *testing.T) {
+	repo := repoInApp()
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran on a replay")
+		return nil, nil
+	}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{}, pub)
+
+	if err := uc.OnDeadlineMissed(context.Background(), deadlineMissed("evt-ms-dup")); err != nil {
+		t.Fatalf("OnDeadlineMissed: %v", err)
+	}
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	if len(pub.channels) != 0 {
+		t.Fatalf("replay pushed %d times, want 0", len(pub.channels))
 	}
 }
 

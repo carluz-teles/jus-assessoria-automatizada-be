@@ -69,6 +69,14 @@ const (
 	// TypeNewAndamento — a new andamento was observed outside the backfill window
 	// (acquisition.docket_entry_observed).
 	TypeNewAndamento = "new_andamento"
+	// TypeDeadlineDueSoonAviso — a prazo is approaching its vencimento (deadline.due_soon).
+	// This is the aviso's `type` column, distinct from the dotted EVENT id
+	// TypeDeadlineDueSoon in events.go, mirroring how TypeNewAndamento pairs with
+	// TypeDocketEntryObserved.
+	TypeDeadlineDueSoonAviso = "deadline_due_soon"
+	// TypeDeadlineMissedAviso — a prazo was auto-marked MISSED at the D+1 carência
+	// (deadline.missed).
+	TypeDeadlineMissedAviso = "deadline_missed"
 )
 
 // Notification is the local aviso: someone (RecipientUserID, empty for a

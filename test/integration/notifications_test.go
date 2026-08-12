@@ -521,6 +521,109 @@ func TestNotifications_InApp_HasRunningBackfillForTenant(t *testing.T) {
 	}
 }
 
+// deadlineDueSoon builds a deadline.due_soon for a tenant with a given days_left.
+func deadlineDueSoon(eventID, tenantID string, daysLeft int) notifications.DeadlineDueSoon {
+	return notifications.DeadlineDueSoon{
+		Base:       events.Base{EventID: eventID, Aggregate: uuid.NewString()},
+		TenantID:   tenantID,
+		DeadlineID: uuid.NewString(),
+		DaysLeft:   daysLeft,
+	}
+}
+
+// deadlineMissed builds a deadline.missed for a tenant.
+func deadlineMissed(eventID, tenantID string) notifications.DeadlineMissed {
+	return notifications.DeadlineMissed{
+		Base:       events.Base{EventID: eventID, Aggregate: uuid.NewString()},
+		TenantID:   tenantID,
+		DeadlineID: uuid.NewString(),
+	}
+}
+
+// fatia 4c: a deadline.due_soon persists one deadline_due_soon aviso (materialized title/body)
+// plus one IN_APP/QUEUED delivery, tenant-scoped — read back through a real round-trip. A
+// replay (same event id) creates nothing more (processed_event dedup).
+func TestNotifications_InApp_DeadlineDueSoon_PersistsAviso(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-inapp-duesoon", 0)
+
+	uc := newInAppUC(pool)
+	if err := uc.OnDeadlineDueSoon(ctx, deadlineDueSoon("evt_inapp_ds_1", tenantID, 3)); err != nil {
+		t.Fatalf("OnDeadlineDueSoon: %v", err)
+	}
+
+	if n := countNotifications(t, pool, tenantID); n != 1 {
+		t.Fatalf("notification rows = %d, want 1", n)
+	}
+	row, ok := readNotification(t, pool, tenantID)
+	if !ok {
+		t.Fatal("notification row was not created")
+	}
+	if row.typ != notifications.TypeDeadlineDueSoonAviso {
+		t.Fatalf("type = %q, want deadline_due_soon", row.typ)
+	}
+	if row.title == nil || *row.title == "" || row.body == nil || *row.body == "" {
+		t.Fatalf("title/body = %v / %v, want both materialized", row.title, row.body)
+	}
+	delivery, ok := readDelivery(t, pool, tenantID)
+	if !ok {
+		t.Fatal("delivery row was not created")
+	}
+	if delivery.channel != notifications.ChannelInApp || delivery.status != string(notifications.DeliveryQueued) {
+		t.Fatalf("delivery = %+v, want IN_APP/QUEUED", delivery)
+	}
+	if got := countBillingProcessedEvent(t, pool, "notifications.deadline_due_soon", "evt_inapp_ds_1"); got != 1 {
+		t.Fatalf("processed_event rows = %d, want 1", got)
+	}
+
+	// Replay: the same event id creates nothing more.
+	if err := uc.OnDeadlineDueSoon(ctx, deadlineDueSoon("evt_inapp_ds_1", tenantID, 3)); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if n := countNotifications(t, pool, tenantID); n != 1 {
+		t.Fatalf("notification rows after replay = %d, want 1", n)
+	}
+}
+
+// fatia 4c: a deadline.missed persists one deadline_missed aviso plus one IN_APP/QUEUED
+// delivery, tenant-scoped. A replay is idempotent (one aviso).
+func TestNotifications_InApp_DeadlineMissed_PersistsAviso(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-inapp-missed", 0)
+
+	uc := newInAppUC(pool)
+	if err := uc.OnDeadlineMissed(ctx, deadlineMissed("evt_inapp_ms_1", tenantID)); err != nil {
+		t.Fatalf("OnDeadlineMissed: %v", err)
+	}
+
+	row, ok := readNotification(t, pool, tenantID)
+	if !ok {
+		t.Fatal("notification row was not created")
+	}
+	if row.typ != notifications.TypeDeadlineMissedAviso {
+		t.Fatalf("type = %q, want deadline_missed", row.typ)
+	}
+	delivery, ok := readDelivery(t, pool, tenantID)
+	if !ok {
+		t.Fatal("delivery row was not created")
+	}
+	if delivery.channel != notifications.ChannelInApp || delivery.status != string(notifications.DeliveryQueued) {
+		t.Fatalf("delivery = %+v, want IN_APP/QUEUED", delivery)
+	}
+
+	// Replay: the same event id creates nothing more.
+	if err := uc.OnDeadlineMissed(ctx, deadlineMissed("evt_inapp_ms_1", tenantID)); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if n := countNotifications(t, pool, tenantID); n != 1 {
+		t.Fatalf("notification rows after replay = %d, want 1", n)
+	}
+}
+
 // countNotificationsAsRLSRole counts notification rows visible to the non-owner
 // app_rls role with app.tenant_id set (or unset when empty), on a DEDICATED
 // connection — mirrors countSubscriptionsAsRLSRole (see rls_test.go for the
