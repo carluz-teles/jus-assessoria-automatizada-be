@@ -233,6 +233,13 @@ func queueFor(typ string) string {
 		// they land in "default", which no worker consumes — the whole async
 		// discovery/enrichment chain silently stalls.
 		return "ingestao"
+	case "deadline":
+		// The deadline slice's events (opened, revoked, and the scheduled reminder_check /
+		// missed_check self-messages) are consumed by the deadline listener, which is mounted
+		// on worker-ingestao — so route the "deadline" domain to "ingestao" too. Without this
+		// they land in "default", which no worker consumes: the reminder/miss ETAs would never
+		// fire and deadline.opened/revoked would never be delivered.
+		return "ingestao"
 	case "documents":
 		return "documents"
 	case "ai":

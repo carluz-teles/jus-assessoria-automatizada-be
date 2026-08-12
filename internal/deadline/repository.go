@@ -128,6 +128,69 @@ func (r *pgRepository) InsertDeadline(ctx context.Context, tx database.Tx, d *De
 	return &saved, nil
 }
 
+// GetDeadlineForCheck re-reads the prazo by id inside the caller's tx, filtered by tenantID
+// (barrier 1). A missing id — or one in another tenant — maps to the typed
+// ErrDeadlineNotFound (never nil, nil); a NULL kind returns "". The mapper absorbs the
+// driver types (uuid.UUID, pgtype.Date) so the use case sees a pure *DeadlineForCheck.
+func (r *pgRepository) GetDeadlineForCheck(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (*DeadlineForCheck, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).GetDeadlineForCheck(ctx, deadlinedb.GetDeadlineForCheckParams{
+		ID:       id,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDeadlineNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &DeadlineForCheck{
+		ID:            row.ID.String(),
+		Status:        Status(row.Status),
+		EndDate:       row.EndDate.Time,
+		CourtRecordID: row.CourtRecordID.String(),
+		Kind:          derefString(row.Kind),
+		Counting:      Counting(row.Counting),
+	}, nil
+}
+
+// MarkMissed auto-flips the prazo to MISSED inside the caller's tx, filtered by tenantID
+// (barrier 1). The query's status='OPEN' AND end_date < CURRENT_DATE guard means a
+// redelivery — or a PENDING/terminal/not-yet-overdue prazo — updates no row: sqlc returns
+// pgx.ErrNoRows, mapped to the typed ErrDeadlineNotFound so the use case no-ops instead of
+// emitting a phantom missed. On a hit it returns the missed prazo's id.
+func (r *pgRepository) MarkMissed(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	missed, err := deadlinedb.New(tx).MarkMissed(ctx, deadlinedb.MarkMissedParams{
+		ID:       id,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrDeadlineNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return missed.String(), nil
+}
+
 // RevokeDeadlineByIntimation cancels the prazo derived from the intimação inside the
 // caller's tx, filtered by tenantID (barrier 1). The query's status <> 'CANCELLED' guard
 // means a redelivery — or a cancel that arrives before (or without) any prazo — updates no

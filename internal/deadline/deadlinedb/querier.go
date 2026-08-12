@@ -33,6 +33,13 @@ type Querier interface {
 	// scopes the tx: a NULL app.tenant_id or an RLS regression would otherwise let a read
 	// cross tenants. $2 = tenant_id, from the trusted event payload (never the body).
 	GetCourtRecordClass(ctx context.Context, arg GetCourtRecordClassParams) (*string, error)
+	// Re-read a prazo at a scheduled mark's fire time (deadline.reminder_check): the CURRENT
+	// status the fire handler branches on, plus the end_date and the context (kind, counting,
+	// court_record_id) a lembrete or MISSED fact may carry. Keyed by id and scoped to tenant_id
+	// (barrier 1, on top of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed
+	// ErrDeadlineNotFound at the mapper, never (nil, nil). $1 = id, $2 = tenant_id, both from
+	// the trusted scheduled-event payload.
+	GetDeadlineForCheck(ctx context.Context, arg GetDeadlineForCheckParams) (GetDeadlineForCheckRow, error)
 	// The audit/detail view of one prazo (GET /v1/prazos/:id): every field the "por quê"
 	// popover needs — the full holidays_applied, the rules_version that derived the days,
 	// the origin intimation_id, and start/end/days/counting/doubled. Tenant-scoped (barrier
@@ -66,6 +73,14 @@ type Querier interface {
 	// historic column name, migration 0006) — the read model exposes it as intimation_id.
 	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
 	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
+	// Auto-mark a prazo MISSED at the D+1 carência (deadline.missed_check fire path). Scoped to
+	// tenant_id (barrier 1). The `status = 'OPEN' AND end_date < CURRENT_DATE` guard makes the
+	// flip SAFE and IDEMPOTENT (decisão travada: MISSED auto D+1 SÓ em OPEN — nunca perder um
+	// PENDING não confirmado): a redelivery, a PENDING/terminal prazo, or one not yet overdue
+	// updates NO row → pgx.ErrNoRows → typed not-found at the mapper, the use case's no-op
+	// (never a phantom deadline.missed). On a hit it returns the id so deadline.missed commits
+	// in the SAME tx. $1 = id, $2 = tenant_id, both from the trusted scheduled-event payload.
+	MarkMissed(ctx context.Context, arg MarkMissedParams) (uuid.UUID, error)
 	// Resolve the conservative rule for (intimation_type, court) in a rules version. The
 	// resolution lives HERE, in SQL (decisão travada, erd-prazos.md §8/§11): the most
 	// SPECIFIC active match wins, falling back to the '*' catch-all — so an unknown type

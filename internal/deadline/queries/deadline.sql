@@ -57,6 +57,30 @@ INSERT INTO deadline (
 ON CONFLICT (notification_id) DO NOTHING
 RETURNING id;
 
+-- name: GetDeadlineForCheck :one
+-- Re-read a prazo at a scheduled mark's fire time (deadline.reminder_check): the CURRENT
+-- status the fire handler branches on, plus the end_date and the context (kind, counting,
+-- court_record_id) a lembrete or MISSED fact may carry. Keyed by id and scoped to tenant_id
+-- (barrier 1, on top of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed
+-- ErrDeadlineNotFound at the mapper, never (nil, nil). $1 = id, $2 = tenant_id, both from
+-- the trusted scheduled-event payload.
+SELECT id, status, end_date, court_record_id, kind, counting
+FROM deadline
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: MarkMissed :one
+-- Auto-mark a prazo MISSED at the D+1 carência (deadline.missed_check fire path). Scoped to
+-- tenant_id (barrier 1). The `status = 'OPEN' AND end_date < CURRENT_DATE` guard makes the
+-- flip SAFE and IDEMPOTENT (decisão travada: MISSED auto D+1 SÓ em OPEN — nunca perder um
+-- PENDING não confirmado): a redelivery, a PENDING/terminal prazo, or one not yet overdue
+-- updates NO row → pgx.ErrNoRows → typed not-found at the mapper, the use case's no-op
+-- (never a phantom deadline.missed). On a hit it returns the id so deadline.missed commits
+-- in the SAME tx. $1 = id, $2 = tenant_id, both from the trusted scheduled-event payload.
+UPDATE deadline
+SET status = 'MISSED'
+WHERE id = $1 AND tenant_id = $2 AND status = 'OPEN' AND end_date < CURRENT_DATE
+RETURNING id;
+
 -- name: RevokeDeadlineByIntimation :one
 -- Revoke (CANCEL) the prazo derived from an intimação the DJEN retracted (erd-prazos.md
 -- §7/§11: uma intimação retificada vira prazo-fantasma → deadline.revoked). Keyed by the

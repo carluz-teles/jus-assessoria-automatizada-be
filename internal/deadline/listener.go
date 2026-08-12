@@ -23,6 +23,8 @@ import (
 type useCase interface {
 	OnIntimationObserved(ctx context.Context, ev IntimationObserved) error
 	OnIntimationCancelled(ctx context.Context, ev IntimationCancelled) error
+	OnReminderCheck(ctx context.Context, ev DeadlineReminderCheck) error
+	OnMissedCheck(ctx context.Context, ev DeadlineMissedCheck) error
 }
 
 // Listener is the deadline slice's asynq consumer. It holds no transport state; the use
@@ -43,6 +45,8 @@ func NewListener(uc useCase) *Listener {
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntimationObserved, l.handleIntimationObserved)
 	mux.HandleFunc(TypeIntimationCancelled, l.handleIntimationCancelled)
+	mux.HandleFunc(TypeDeadlineReminderCheck, l.handleReminderCheck)
+	mux.HandleFunc(TypeDeadlineMissedCheck, l.handleMissedCheck)
 }
 
 // handleIntimationObserved is the asynq.HandlerFunc for acquisition.intimation.observed.
@@ -79,6 +83,44 @@ func (l *Listener) handleIntimationCancelled(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	if err := l.uc.OnIntimationCancelled(ctx, ev); err != nil {
+		if isTerminal(err) {
+			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
+		}
+		return err
+	}
+	return nil
+}
+
+// handleReminderCheck is the asynq.HandlerFunc for the slice's own deadline.reminder_check:
+// the D-N mark fired at its ETA. It decodes the LOCAL scheduled shape and delegates to the
+// re-check use case, mapping the outcome to asynq's retry decision exactly as the
+// intimation handlers do. A gone prazo (ErrDeadlineNotFound) is terminal (SkipRetry); an
+// obsolete-status prazo is an in-use-case no-op that returns nil.
+func (l *Listener) handleReminderCheck(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DeadlineReminderCheck](t)
+	if err != nil {
+		return err
+	}
+	if err := l.uc.OnReminderCheck(ctx, ev); err != nil {
+		if isTerminal(err) {
+			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
+		}
+		return err
+	}
+	return nil
+}
+
+// handleMissedCheck is the asynq.HandlerFunc for the slice's own deadline.missed_check: the
+// D+1 carência fired. It decodes the LOCAL scheduled shape and delegates to the auto-miss
+// use case, mapping the outcome to asynq's retry decision the same way. Every non-OPEN /
+// not-overdue case is an in-use-case no-op (returns nil), so only genuine infra faults stay
+// retryable.
+func (l *Listener) handleMissedCheck(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DeadlineMissedCheck](t)
+	if err != nil {
+		return err
+	}
+	if err := l.uc.OnMissedCheck(ctx, ev); err != nil {
 		if isTerminal(err) {
 			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 		}

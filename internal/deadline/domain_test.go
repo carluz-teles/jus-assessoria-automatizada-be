@@ -3,6 +3,7 @@ package deadline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -31,6 +32,12 @@ type mockRepo struct {
 	revokeResult *RevokedDeadline
 	revokeErr    error
 
+	checkResult *DeadlineForCheck
+	checkErr    error
+
+	markMissedID  string
+	markMissedErr error
+
 	// captured inputs
 	gotClassTenantID      string
 	gotClassRecordID      string
@@ -42,6 +49,12 @@ type mockRepo struct {
 	gotRevokeIntimationID string
 	gotRevokeTenantID     string
 	revokeCalls           int
+	gotCheckID            string
+	gotCheckTenantID      string
+	checkCalls            int
+	gotMissedID           string
+	gotMissedTenantID     string
+	markMissedCalls       int
 }
 
 func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
@@ -71,6 +84,20 @@ func (m *mockRepo) RevokeDeadlineByIntimation(_ context.Context, _ database.Tx, 
 	m.gotRevokeIntimationID = intimationID
 	m.gotRevokeTenantID = tenantID
 	return m.revokeResult, m.revokeErr
+}
+
+func (m *mockRepo) GetDeadlineForCheck(_ context.Context, _ database.Tx, deadlineID, tenantID string) (*DeadlineForCheck, error) {
+	m.checkCalls++
+	m.gotCheckID = deadlineID
+	m.gotCheckTenantID = tenantID
+	return m.checkResult, m.checkErr
+}
+
+func (m *mockRepo) MarkMissed(_ context.Context, _ database.Tx, deadlineID, tenantID string) (string, error) {
+	m.markMissedCalls++
+	m.gotMissedID = deadlineID
+	m.gotMissedTenantID = tenantID
+	return m.markMissedID, m.markMissedErr
 }
 
 // fakeCalendar records which motor was called (business vs calendar) and the args, and
@@ -453,6 +480,160 @@ func TestOnIntimationObserved_Errors(t *testing.T) {
 	}
 }
 
+// publishedOfType returns every published event of the concrete type T — the reminder/miss
+// marks and lembretes are asserted per-type without index bookkeeping.
+func publishedOfType[T events.Event](out *fakeOutbox) []T {
+	var res []T
+	for _, ev := range out.published {
+		if v, ok := ev.(T); ok {
+			res = append(res, v)
+		}
+	}
+	return res
+}
+
+// TestOnIntimationObserved_SchedulesReminderAndMissedChecks proves the 4b-ii creation
+// extension: after the deadline.opened, a fresh prazo whose end_date is comfortably in the
+// future schedules all three D-N reminder_check marks (days_left 3/1/0, each with the right
+// ETA and stable idempotency key) plus one missed_check at D+1 — every mark carrying the
+// tenant and the deadline id as aggregate.
+func TestOnIntimationObserved_SchedulesReminderAndMissedChecks(t *testing.T) {
+	ev := observedFixture()
+	deadlineID := uuid.NewString()
+	end := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{class: "Cível", rule: citacaoRule(), insertID: deadlineID}
+	cal := &fakeCalendar{endDate: end}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	// deadline.opened is still emitted exactly once (the marks are additive).
+	if got := len(publishedOfType[DeadlineOpened](outbox)); got != 1 {
+		t.Fatalf("deadline.opened events = %d, want 1", got)
+	}
+
+	// Three reminder_check marks: days_left 3/1/0, ETA = start-of-day(end) − days_left.
+	reminders := publishedOfType[DeadlineReminderCheck](outbox)
+	if len(reminders) != 3 {
+		t.Fatalf("reminder_check marks = %d, want 3", len(reminders))
+	}
+	wantAt := map[int]time.Time{
+		3: time.Date(2024, 1, 29, 0, 0, 0, 0, time.UTC),
+		1: time.Date(2024, 1, 31, 0, 0, 0, 0, time.UTC),
+		0: end,
+	}
+	seen := map[int]bool{}
+	for _, r := range reminders {
+		seen[r.DaysLeft] = true
+		at, ok := r.ProcessAt()
+		if !ok || !at.Equal(wantAt[r.DaysLeft]) {
+			t.Errorf("reminder days_left=%d ProcessAt = %v (ok=%v), want %v", r.DaysLeft, at, ok, wantAt[r.DaysLeft])
+		}
+		if r.TenantID != ev.TenantID {
+			t.Errorf("reminder days_left=%d tenant = %q, want %q", r.DaysLeft, r.TenantID, ev.TenantID)
+		}
+		if r.AggregateType() != aggregateTypeDeadline || r.AggregateID() != deadlineID {
+			t.Errorf("reminder aggregate = %q/%q, want deadline/%q", r.AggregateType(), r.AggregateID(), deadlineID)
+		}
+		if want := fmt.Sprintf("deadline-reminder:%s:%d", deadlineID, r.DaysLeft); r.IdempotencyKey() != want {
+			t.Errorf("reminder idempotency key = %q, want %q", r.IdempotencyKey(), want)
+		}
+	}
+	for _, dl := range reminderDaysLeft {
+		if !seen[dl] {
+			t.Errorf("missing reminder_check for days_left=%d", dl)
+		}
+	}
+
+	// One missed_check at D+1, stable key, tenant + aggregate carried.
+	missed := publishedOfType[DeadlineMissedCheck](outbox)
+	if len(missed) != 1 {
+		t.Fatalf("missed_check marks = %d, want 1", len(missed))
+	}
+	at, ok := missed[0].ProcessAt()
+	if !ok || !at.Equal(time.Date(2024, 2, 2, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("missed_check ProcessAt = %v (ok=%v), want 2024-02-02", at, ok)
+	}
+	if missed[0].TenantID != ev.TenantID || missed[0].AggregateID() != deadlineID {
+		t.Errorf("missed_check tenant/aggregate = %q/%q", missed[0].TenantID, missed[0].AggregateID())
+	}
+	if want := "deadline-missed:" + deadlineID; missed[0].IdempotencyKey() != want {
+		t.Errorf("missed_check idempotency key = %q, want %q", missed[0].IdempotencyKey(), want)
+	}
+
+	// opened + 3 reminders + 1 missed = 5 total, nothing else.
+	if len(outbox.published) != 5 {
+		t.Errorf("total published = %d, want 5", len(outbox.published))
+	}
+}
+
+// TestOnIntimationObserved_SkipsPastMarks proves the birth-time future-guard: a mark whose
+// ETA already passed at birth is never scheduled. A prazo born <3 dias do fim skips D-3; a
+// prazo born after its vencimento schedules nothing at all.
+func TestOnIntimationObserved_SkipsPastMarks(t *testing.T) {
+	end := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name         string
+		now          time.Time
+		wantDaysLeft []int
+		wantMissed   bool
+		wantTotalPub int
+	}{
+		{
+			name:         "born <3 days before end skips D-3",
+			now:          time.Date(2024, 1, 30, 12, 0, 0, 0, time.UTC), // D-3 (01-29) already past
+			wantDaysLeft: []int{1, 0},
+			wantMissed:   true,
+			wantTotalPub: 4, // opened + 2 reminders + missed
+		},
+		{
+			name:         "born after vencimento schedules nothing",
+			now:          time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC), // even D+1 is past
+			wantDaysLeft: nil,
+			wantMissed:   false,
+			wantTotalPub: 1, // opened only
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := observedFixture()
+			repo := &mockRepo{class: "Cível", rule: citacaoRule(), insertID: uuid.NewString()}
+			outbox := &fakeOutbox{}
+			uc := NewUseCase(repo, &fakeCalendar{endDate: end}, outbox, &fakeDedup{}, &fakeUOW{},
+				WithClock(func() time.Time { return tt.now }))
+
+			if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+				t.Fatalf("OnIntimationObserved() error = %v", err)
+			}
+
+			reminders := publishedOfType[DeadlineReminderCheck](outbox)
+			if len(reminders) != len(tt.wantDaysLeft) {
+				t.Fatalf("reminder marks = %d, want %d", len(reminders), len(tt.wantDaysLeft))
+			}
+			got := map[int]bool{}
+			for _, r := range reminders {
+				got[r.DaysLeft] = true
+			}
+			for _, dl := range tt.wantDaysLeft {
+				if !got[dl] {
+					t.Errorf("missing reminder for days_left=%d", dl)
+				}
+			}
+			if gotMissed := len(publishedOfType[DeadlineMissedCheck](outbox)) == 1; gotMissed != tt.wantMissed {
+				t.Errorf("missed_check scheduled = %v, want %v", gotMissed, tt.wantMissed)
+			}
+			if len(outbox.published) != tt.wantTotalPub {
+				t.Errorf("total published = %d, want %d", len(outbox.published), tt.wantTotalPub)
+			}
+		})
+	}
+}
+
 // TestOnIntimationCancelled_RevokesExistingDeadline is the revocation happy path: the
 // repo reports the prazo was flipped to CANCELLED, so the use case emits exactly one
 // deadline.revoked whose aggregate is the revoked deadline id (a parseable uuid) and whose
@@ -624,5 +805,233 @@ func TestParseWireDate(t *testing.T) {
 	ae, ok := apperr.From(err)
 	if !ok || ae.Kind != apperr.KindInvalid {
 		t.Errorf("parseWireDate invalid = %v, want KindInvalid", err)
+	}
+}
+
+// reminderCheckFixture builds a fired reminder_check for a given prazo id/tenant/days_left.
+// processAt is irrelevant on the fire path (the handler re-loads by id), so it stays zero.
+func reminderCheckFixture(tenantID, deadlineID string, daysLeft int) DeadlineReminderCheck {
+	return DeadlineReminderCheck{
+		Base:       events.Base{EventID: uuid.NewString(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+		DaysLeft:   daysLeft,
+	}
+}
+
+// TestOnReminderCheck_ReChecksStatus proves the re-check no disparo (decisão travada:
+// due_soon avisa OPEN e PENDING, viés seguro): a fired reminder emits exactly one
+// deadline.due_soon only when the prazo is still PENDING or OPEN, and is a pure no-op for
+// any terminal status (a prazo cancelled/met/missed between birth and the mark never sends
+// a stale lembrete).
+func TestOnReminderCheck_ReChecksStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   Status
+		wantEmit bool
+	}{
+		{"PENDING → due_soon", StatusPending, true},
+		{"OPEN → due_soon", StatusOpen, true},
+		{"CANCELLED → no-op", StatusCancelled, false},
+		{"MET → no-op", StatusMet, false},
+		{"MISSED → no-op", StatusMissed, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deadlineID := uuid.NewString()
+			ev := reminderCheckFixture(uuid.NewString(), deadlineID, 3)
+			repo := &mockRepo{checkResult: &DeadlineForCheck{ID: deadlineID, Status: tt.status}}
+			outbox := &fakeOutbox{}
+			uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+			if err := uc.OnReminderCheck(context.Background(), ev); err != nil {
+				t.Fatalf("OnReminderCheck() error = %v", err)
+			}
+
+			// The re-read was tenant-scoped to the event (barrier 1 args threaded).
+			if repo.checkCalls != 1 || repo.gotCheckID != deadlineID || repo.gotCheckTenantID != ev.TenantID {
+				t.Errorf("GetDeadlineForCheck calls/id/tenant = %d/%q/%q, want 1/%q/%q",
+					repo.checkCalls, repo.gotCheckID, repo.gotCheckTenantID, deadlineID, ev.TenantID)
+			}
+
+			dueSoon := publishedOfType[DeadlineDueSoon](outbox)
+			if !tt.wantEmit {
+				if len(dueSoon) != 0 {
+					t.Fatalf("due_soon events = %d, want 0 (obsolete mark)", len(dueSoon))
+				}
+				return
+			}
+			if len(dueSoon) != 1 {
+				t.Fatalf("due_soon events = %d, want 1", len(dueSoon))
+			}
+			d := dueSoon[0]
+			if d.Type() != TypeDeadlineDueSoon || d.AggregateType() != aggregateTypeDeadline {
+				t.Errorf("due_soon type/aggregate = %q/%q", d.Type(), d.AggregateType())
+			}
+			if d.AggregateID() != deadlineID {
+				t.Errorf("due_soon aggregate id = %q, want %q", d.AggregateID(), deadlineID)
+			}
+			if _, err := uuid.Parse(d.AggregateID()); err != nil {
+				t.Errorf("due_soon aggregate id is not a uuid: %v", err)
+			}
+			if d.DeadlineID != deadlineID || d.DaysLeft != ev.DaysLeft || d.TenantID != ev.TenantID {
+				t.Errorf("due_soon deadline/days/tenant = %q/%d/%q, want %q/%d/%q",
+					d.DeadlineID, d.DaysLeft, d.TenantID, deadlineID, ev.DaysLeft, ev.TenantID)
+			}
+		})
+	}
+}
+
+// TestOnReminderCheck_Idempotent proves a replay (dedup reports seen) is a pure no-op: no
+// re-read, no lembrete — the dedup floor guards the fire path as it guards creation.
+func TestOnReminderCheck_Idempotent(t *testing.T) {
+	ev := reminderCheckFixture(uuid.NewString(), uuid.NewString(), 1)
+	repo := &mockRepo{checkResult: &DeadlineForCheck{ID: ev.DeadlineID, Status: StatusOpen}}
+	outbox := &fakeOutbox{}
+	dedup := &fakeDedup{seen: true}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, dedup, &fakeUOW{})
+
+	if err := uc.OnReminderCheck(context.Background(), ev); err != nil {
+		t.Fatalf("OnReminderCheck() error = %v", err)
+	}
+	if repo.checkCalls != 0 {
+		t.Errorf("GetDeadlineForCheck calls = %d, want 0 on a replay", repo.checkCalls)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on a replay", len(outbox.published))
+	}
+	if len(dedup.consumers) != 1 || dedup.consumers[0] != consumerDeadline {
+		t.Errorf("dedup consumer = %v, want [%q]", dedup.consumers, consumerDeadline)
+	}
+}
+
+// TestOnReminderCheck_DeadlineGoneIsTerminal proves a re-read that finds no prazo surfaces
+// the typed not-found (KindNotFound → the listener SkipRetries it), emitting nothing.
+func TestOnReminderCheck_DeadlineGoneIsTerminal(t *testing.T) {
+	ev := reminderCheckFixture(uuid.NewString(), uuid.NewString(), 0)
+	repo := &mockRepo{checkErr: ErrDeadlineNotFound}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	err := uc.OnReminderCheck(context.Background(), ev)
+	aerr, ok := apperr.From(err)
+	if !ok || aerr.Kind != apperr.KindNotFound {
+		t.Errorf("error = %v, want KindNotFound", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on error", len(outbox.published))
+	}
+}
+
+// TestOnMissedCheck_MarksMissed proves the auto-miss (decisão travada: MISSED auto D+1, SÓ
+// em OPEN): when the guarded UPDATE flips a still-OPEN, overdue prazo it emits exactly one
+// deadline.missed; when the guard touches no row (PENDING, terminal, or not yet overdue —
+// all collapsed to ErrDeadlineNotFound) it is a pure no-op.
+func TestOnMissedCheck_MarksMissed(t *testing.T) {
+	tests := []struct {
+		name     string
+		markID   string
+		markErr  error
+		wantEmit bool
+	}{
+		{"OPEN & overdue → MISSED + event", "", nil, true},
+		{"not OPEN / not overdue → no-op", "", ErrDeadlineNotFound, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deadlineID := uuid.NewString()
+			ev := DeadlineMissedCheck{
+				Base:       events.Base{EventID: uuid.NewString(), Aggregate: deadlineID},
+				TenantID:   uuid.NewString(),
+				DeadlineID: deadlineID,
+			}
+			repo := &mockRepo{markMissedErr: tt.markErr}
+			if tt.markErr == nil {
+				repo.markMissedID = deadlineID
+			}
+			outbox := &fakeOutbox{}
+			uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+			if err := uc.OnMissedCheck(context.Background(), ev); err != nil {
+				t.Fatalf("OnMissedCheck() error = %v", err)
+			}
+
+			// The flip was tenant-scoped to the event (barrier 1 args threaded).
+			if repo.markMissedCalls != 1 || repo.gotMissedID != deadlineID || repo.gotMissedTenantID != ev.TenantID {
+				t.Errorf("MarkMissed calls/id/tenant = %d/%q/%q, want 1/%q/%q",
+					repo.markMissedCalls, repo.gotMissedID, repo.gotMissedTenantID, deadlineID, ev.TenantID)
+			}
+
+			missed := publishedOfType[DeadlineMissed](outbox)
+			if !tt.wantEmit {
+				if len(missed) != 0 {
+					t.Fatalf("deadline.missed events = %d, want 0 (safe no-op)", len(missed))
+				}
+				return
+			}
+			if len(missed) != 1 {
+				t.Fatalf("deadline.missed events = %d, want 1", len(missed))
+			}
+			m := missed[0]
+			if m.Type() != TypeDeadlineMissed || m.AggregateType() != aggregateTypeDeadline {
+				t.Errorf("missed type/aggregate = %q/%q", m.Type(), m.AggregateType())
+			}
+			if m.AggregateID() != deadlineID {
+				t.Errorf("missed aggregate id = %q, want %q", m.AggregateID(), deadlineID)
+			}
+			if _, err := uuid.Parse(m.AggregateID()); err != nil {
+				t.Errorf("missed aggregate id is not a uuid: %v", err)
+			}
+			if m.DeadlineID != deadlineID || m.TenantID != ev.TenantID {
+				t.Errorf("missed deadline/tenant = %q/%q, want %q/%q", m.DeadlineID, m.TenantID, deadlineID, ev.TenantID)
+			}
+		})
+	}
+}
+
+// TestOnMissedCheck_Idempotent proves a replay is a pure no-op: no flip, no event.
+func TestOnMissedCheck_Idempotent(t *testing.T) {
+	deadlineID := uuid.NewString()
+	ev := DeadlineMissedCheck{
+		Base:       events.Base{EventID: uuid.NewString(), Aggregate: deadlineID},
+		TenantID:   uuid.NewString(),
+		DeadlineID: deadlineID,
+	}
+	repo := &mockRepo{markMissedID: deadlineID}
+	outbox := &fakeOutbox{}
+	dedup := &fakeDedup{seen: true}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, dedup, &fakeUOW{})
+
+	if err := uc.OnMissedCheck(context.Background(), ev); err != nil {
+		t.Fatalf("OnMissedCheck() error = %v", err)
+	}
+	if repo.markMissedCalls != 0 {
+		t.Errorf("MarkMissed calls = %d, want 0 on a replay", repo.markMissedCalls)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on a replay", len(outbox.published))
+	}
+}
+
+// TestOnMissedCheck_InfraErrorPropagates proves an infra fault from the flip aborts the tx
+// (retryable) and emits nothing — only ErrDeadlineNotFound is a no-op.
+func TestOnMissedCheck_InfraErrorPropagates(t *testing.T) {
+	deadlineID := uuid.NewString()
+	ev := DeadlineMissedCheck{
+		Base:       events.Base{EventID: uuid.NewString(), Aggregate: deadlineID},
+		TenantID:   uuid.NewString(),
+		DeadlineID: deadlineID,
+	}
+	repo := &mockRepo{markMissedErr: apperr.NewInfra("db down", errors.New("boom"))}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	err := uc.OnMissedCheck(context.Background(), ev)
+	aerr, ok := apperr.From(err)
+	if !ok || aerr.Kind != apperr.KindInfra {
+		t.Errorf("error = %v, want KindInfra", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on error", len(outbox.published))
 	}
 }
