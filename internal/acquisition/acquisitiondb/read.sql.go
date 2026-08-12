@@ -16,7 +16,7 @@ const countIntimacoesMatchingSearch = `-- name: CountIntimacoesMatchingSearch :o
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
-  AND cr.cnj_number ILIKE '%' || $2::text || '%'
+  AND cr.cnj_number ILIKE '%' || $2::text || '%' ESCAPE '\'
 `
 
 type CountIntimacoesMatchingSearchParams struct {
@@ -51,7 +51,7 @@ const countProcessosMatchingSearch = `-- name: CountProcessosMatchingSearch :one
 SELECT count(*) FROM court_record cr
 WHERE cr.tenant_id = $1
   AND cr.lifecycle = 'ACTIVE'
-  AND cr.cnj_number ILIKE '%' || $2::text || '%'
+  AND cr.cnj_number ILIKE '%' || $2::text || '%' ESCAPE '\'
 `
 
 type CountProcessosMatchingSearchParams struct {
@@ -131,7 +131,7 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
-  AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%')
+  AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%' ESCAPE '\')
   AND (i.made_available_at, i.id) < ($4::date, $5::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2
@@ -272,7 +272,7 @@ LEFT JOIN LATERAL (
 ) m ON true
 WHERE cr.tenant_id = $1
   AND cr.lifecycle = 'ACTIVE'
-  AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%')
+  AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%' ESCAPE '\')
   AND (cr.cnj_number, cr.id) > ($4::text, $5::uuid)
 ORDER BY cr.cnj_number, cr.id
 LIMIT $2

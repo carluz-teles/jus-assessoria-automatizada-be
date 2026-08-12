@@ -172,6 +172,33 @@ func TestListIntimacoes_SearchByCourtRecordCNJ(t *testing.T) {
 	}
 }
 
+// TestListProcessos_SearchEscapesWildcards covers the ILIKE-wildcard escape: a typed
+// "%" is matched literally (matches nothing here), not as "match everything".
+func TestListProcessos_SearchEscapesWildcards(t *testing.T) {
+	pool := newPool(t)
+	repo := acquisition.NewRepository(pool)
+	uc := acquisition.NewReadUseCase(repo)
+	ctx := context.Background()
+
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-wildcard", 0)
+	seedCourtRecordCNJ(t, pool, tenantID, "0001111-11.2023.8.26.0001")
+	seedCourtRecordCNJ(t, pool, tenantID, "0002222-22.2023.8.26.0002")
+
+	got, err := uc.Processos(ctx, acquisition.ProcessosQuery{
+		TenantID: tenantID, Limit: 20, LastCNJ: firstCNJ, LastID: zeroUUIDlit, Search: "%",
+	})
+	if err != nil {
+		t.Fatalf("Processos (wildcard): %v", err)
+	}
+	if len(got.Items) != 0 || got.TotalCount != 0 {
+		t.Errorf("search '%%': items=%d total_count=%d, want 0/0 (literal, not match-all)", len(got.Items), got.TotalCount)
+	}
+	if got.Total != 2 {
+		t.Errorf("total = %d, want 2 (global unaffected)", got.Total)
+	}
+}
+
 // seedIntimationFor inserts one intimation for the record (no discovering window —
 // sync_run_id stays NULL), enough for the inbox read and its counts.
 func seedIntimationFor(t *testing.T, pool *pgxpool.Pool, tenantID, caseID, recordID string) {

@@ -232,3 +232,115 @@ func TestHandler_List_ScopedToTenant(t *testing.T) {
 		t.Fatalf("response leaked credential_ref: %s", body)
 	}
 }
+
+// --- read routes: /v1/processos search + pagination --------------------------
+
+// recordingReader implements the handler's reader port, capturing the ProcessosQuery
+// and returning a canned result — lets the HTTP tests assert query-param wiring and
+// the envelope shape without a database.
+type recordingReader struct {
+	res      ProcessosResult
+	gotQuery ProcessosQuery
+}
+
+func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (ProcessosResult, error) {
+	r.gotQuery = q
+	return r.res, nil
+}
+func (r *recordingReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
+	return IntimacoesResult{}, nil
+}
+func (r *recordingReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
+	return ImportStatusView{}, nil
+}
+func (r *recordingReader) Reconciliations(context.Context, string) (ReconciliationsView, error) {
+	return ReconciliationsView{}, nil
+}
+func (r *recordingReader) ReconciliationDetail(context.Context, string, string) (ReconciliationDetailView, error) {
+	return ReconciliationDetailView{}, nil
+}
+func (r *recordingReader) SyncRunItems(context.Context, string, string) (SyncRunItemsView, error) {
+	return SyncRunItemsView{}, nil
+}
+
+// GET /v1/processos forwards ?search and the decoded ?cursor to the read port, and the
+// tenant comes from the principal (never the query).
+func TestHandler_ListProcessos_ForwardsSearchAndCursor(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	cursor := httpx.EncodeCursor(httpx.Cursor{
+		LastSortValue: "0000123-45.2023.8.26.0001",
+		LastID:        "018f0000-0000-7000-8000-000000000abc",
+	})
+	status, _ := do(t, app, http.MethodGet,
+		"/v1/processos?search=petrobras&limit=25&cursor="+cursor, "", "jwt")
+
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotQuery.Search != "petrobras" {
+		t.Errorf("Search = %q, want petrobras", rd.gotQuery.Search)
+	}
+	if rd.gotQuery.TenantID != "tenant-9" {
+		t.Errorf("TenantID = %q, want tenant-9 (from principal)", rd.gotQuery.TenantID)
+	}
+	if rd.gotQuery.LastCNJ != "0000123-45.2023.8.26.0001" {
+		t.Errorf("LastCNJ = %q, want the decoded cursor sort value", rd.gotQuery.LastCNJ)
+	}
+	if rd.gotQuery.Limit != 25 {
+		t.Errorf("Limit = %d, want 25", rd.gotQuery.Limit)
+	}
+}
+
+// ?limit above the ceiling is clamped to MaxLimit (100) — the handler never asks the
+// repo for an unbounded page.
+func TestHandler_ListProcessos_ClampsLimit(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/processos?limit=500", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotQuery.Limit != 100 {
+		t.Errorf("Limit = %d, want 100 (clamped)", rd.gotQuery.Limit)
+	}
+}
+
+// A malformed ?cursor is a client error → 400, not a 500.
+func TestHandler_ListProcessos_BadCursor_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, body := do(t, app, http.MethodGet, "/v1/processos?cursor=not-a-cursor", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+}
+
+// The response envelope carries the "X de Y" totals from the read result.
+func TestHandler_ListProcessos_EnvelopeHasTotals(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{res: ProcessosResult{
+		Items:      []ProcessoView{{ID: "a", CNJNumber: "0001"}},
+		TotalCount: 32,
+		Total:      1247,
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos?search=petro", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"total_count":32`, `"total":1247`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("envelope missing %s\ngot: %s", want, body)
+		}
+	}
+}

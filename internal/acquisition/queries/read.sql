@@ -22,7 +22,7 @@ LEFT JOIN LATERAL (
 ) m ON true
 WHERE cr.tenant_id = $1
   AND cr.lifecycle = 'ACTIVE'
-  AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%')
+  AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%' ESCAPE '\')
   AND (cr.cnj_number, cr.id) > (@last_cnj::text, @last_id::uuid)
 ORDER BY cr.cnj_number, cr.id
 LIMIT $2;
@@ -38,7 +38,7 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
-  AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%')
+  AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%' ESCAPE '\')
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
@@ -50,7 +50,7 @@ LIMIT $2;
 SELECT count(*) FROM court_record cr
 WHERE cr.tenant_id = $1
   AND cr.lifecycle = 'ACTIVE'
-  AND cr.cnj_number ILIKE '%' || @search::text || '%';
+  AND cr.cnj_number ILIKE '%' || @search::text || '%' ESCAPE '\';
 
 -- name: CountIntimacoesMatchingSearch :one
 -- The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
@@ -59,7 +59,7 @@ WHERE cr.tenant_id = $1
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
-  AND cr.cnj_number ILIKE '%' || @search::text || '%';
+  AND cr.cnj_number ILIKE '%' || @search::text || '%' ESCAPE '\';
 
 -- name: ListReconciliations :many
 -- The reconciliations screen: one "reconciliação" per import (backfill_job), with

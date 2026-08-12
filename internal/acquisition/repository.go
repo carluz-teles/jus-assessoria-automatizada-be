@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -979,7 +980,7 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 	rows, err := r.q.ListProcessos(ctx, acquisitiondb.ListProcessosParams{
 		TenantID: tid,
 		Limit:    int32(q.Limit),
-		Search:   q.Search,
+		Search:   escapeLike(q.Search),
 		LastCnj:  q.LastCNJ,
 		LastID:   lastID,
 	})
@@ -1026,7 +1027,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	rows, err := r.q.ListIntimacoes(ctx, acquisitiondb.ListIntimacoesParams{
 		TenantID:          tid,
 		Limit:             int32(q.Limit),
-		Search:            q.Search,
+		Search:            escapeLike(q.Search),
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
 	})
@@ -1053,6 +1054,17 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	return out, nil
 }
 
+// likeEscaper escapes the ILIKE metacharacters so a user-typed % or _ matches
+// literally, not as a wildcard. Backslash first (it is the escape char, paired with
+// ESCAPE '\' in the queries) so the replacements do not compound.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// escapeLike neutralizes ILIKE wildcards in a search term. An empty term stays empty,
+// so the queries' `@search = ''` short-circuit (no filter) is preserved.
+func escapeLike(s string) string {
+	return likeEscaper.Replace(s)
+}
+
 // CountProcessos returns the processes screen's "X de Y" totals: totalCount is the
 // current context (filtered by search when present), total the tenant's global ACTIVE
 // count. With no search the two are equal, so a single COUNT (the reused global) fills
@@ -1071,7 +1083,7 @@ func (r *pgRepository) CountProcessos(ctx context.Context, tenantID, search stri
 	}
 	filtered, err := r.q.CountProcessosMatchingSearch(ctx, acquisitiondb.CountProcessosMatchingSearchParams{
 		TenantID: tid,
-		Search:   search,
+		Search:   escapeLike(search),
 	})
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
@@ -1096,7 +1108,7 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, tenantID, search str
 	}
 	filtered, err := r.q.CountIntimacoesMatchingSearch(ctx, acquisitiondb.CountIntimacoesMatchingSearchParams{
 		TenantID: tid,
-		Search:   search,
+		Search:   escapeLike(search),
 	})
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
