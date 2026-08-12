@@ -6,8 +6,9 @@ que vive no código. **Fonte de verdade dos nomes:** `lib/telemetry/sampler.go` 
 (profundidade de fila), e os spans em `djen.go`/`datajud.go`/`sync.go`/`enrichment.go`.
 
 Estas queries são NRQL prontas pra colar em widgets/alertas. Um `import-dashboard.json`
-importável acompanha — no import da UI do New Relic a conta é escolhida e preenchida
-automaticamente (os `accountIds: 0` do arquivo são sobrescritos).
+importável acompanha, já com os `accountIds` setados para a conta **8336829** — o New
+Relic **não** reescreve o account id no import, então pra outra conta troque o número
+antes de importar.
 
 ## Contexto: por que só o import aparece
 
@@ -108,8 +109,8 @@ De `runtime.Start` no `telemetry.Setup` (todos os binários; facet por `service.
 ## Como aplicar
 
 1. **Importar o dashboard:** New Relic → Dashboards → Import dashboard → cole
-   `import-dashboard.json`. A UI pede a conta e reescreve os `accountIds` — não precisa
-   editar o arquivo.
+   `import-dashboard.json`. Já vem com `accountIds: 8336829`; o editor de import valida os
+   account ids (um id inválido como `0` é rejeitado ali) — pra outra conta, troque antes.
 2. **Ou montar à mão:** crie um dashboard e cole as NRQL das tabelas acima nos widgets.
 3. **Alertas:** Alerts → NRQL condition → cole a query + threshold da tabela.
 4. Se um widget vier vazio, rode a query de descoberta (§5) — o naming OTLP→NR do seu
