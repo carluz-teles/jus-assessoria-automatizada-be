@@ -8,8 +8,9 @@ import (
 )
 
 // traceparentKey is the W3C header the propagator reads and writes. It is the one
-// field we carry across the async hop: the relay copies it onto the asynq task so
-// the worker's span becomes a child of the producer's (docs erd-backend §4c, §6).
+// field we carry across the async hop: the relay copies it onto the asynq task so the
+// worker's consumer span LINKS back to the producer's (each event is its own trace —
+// see lib/events consumer middleware; docs erd-backend §4c, §6).
 const traceparentKey = "traceparent"
 
 // TraceContextFromCtx serializes the active span to a W3C traceparent using the

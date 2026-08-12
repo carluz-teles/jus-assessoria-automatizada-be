@@ -105,6 +105,10 @@ func Setup(ctx context.Context, cfg config.Config, serviceName string) (shutdown
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(traceExp),
 		sdktrace.WithResource(res),
+		// Deny-by-default: keep only the import flow unless OTEL_TRACES_MODE=all (see
+		// sampler.go). The default (nil) sampler would be ParentBased(AlwaysSample) —
+		// every request a trace, which is what drowned the backend panel.
+		sdktrace.WithSampler(buildSampler(cfg)),
 	)
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExp)),
