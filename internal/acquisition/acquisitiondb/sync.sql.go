@@ -29,6 +29,167 @@ func (q *Queries) AcquireTenantWriteLock(ctx context.Context, tenantID string) e
 	return err
 }
 
+const batchInsertCourtCases = `-- name: BatchInsertCourtCases :many
+INSERT INTO court_case (tenant_id)
+SELECT $1::uuid FROM generate_series(1, $2::int)
+RETURNING id
+`
+
+type BatchInsertCourtCasesParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	N        int32     `json:"n"`
+}
+
+// Create N fresh lides in one round-trip (v0: one case per new record). Returns the
+// N new ids; the caller pairs each with a new court_record.
+func (q *Queries) BatchInsertCourtCases(ctx context.Context, arg BatchInsertCourtCasesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, batchInsertCourtCases, arg.TenantID, arg.N)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const batchInsertCourtRecords = `-- name: BatchInsertCourtRecords :many
+INSERT INTO court_record
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body, sync_run_id, next_sync_at)
+SELECT $1::uuid, r.case_id, r.cnj_number, r.degree, r.court,
+       r.class, r.subject, r.completeness, r.judging_body, r.sync_run_id, r.next_sync_at
+FROM jsonb_to_recordset($2::jsonb) AS r(
+    case_id uuid, cnj_number text, degree text, court text, class text, subject text,
+    completeness real, judging_body text, sync_run_id uuid, next_sync_at timestamptz
+)
+ON CONFLICT (tenant_id, cnj_number, degree) DO NOTHING
+RETURNING id, cnj_number, degree
+`
+
+type BatchInsertCourtRecordsParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Records  []byte    `json:"records"`
+}
+
+type BatchInsertCourtRecordsRow struct {
+	ID        uuid.UUID `json:"id"`
+	CnjNumber string    `json:"cnj_number"`
+	Degree    string    `json:"degree"`
+}
+
+// Bulk create of first-seen records from a jsonb array of rows: folds the post-sync
+// fields (completeness/judging_body/next_sync_at) straight into the INSERT, so a NEW
+// record needs no separate MarkCourtRecordSynced. JSON null → SQL NULL naturally
+// (nullable class/subject/judging_body/sync_run_id). ON CONFLICT DO NOTHING keeps it
+// idempotent (a re-run of the window no-ops on rows it already created); RETURNING the
+// natural key lets the caller map ids back to input order. Under the per-tenant
+// advisory lock there is no concurrent same-tenant writer, so the conflict path only
+// fires on a genuine re-run, never a create race.
+func (q *Queries) BatchInsertCourtRecords(ctx context.Context, arg BatchInsertCourtRecordsParams) ([]BatchInsertCourtRecordsRow, error) {
+	rows, err := q.db.Query(ctx, batchInsertCourtRecords, arg.TenantID, arg.Records)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BatchInsertCourtRecordsRow
+	for rows.Next() {
+		var i BatchInsertCourtRecordsRow
+		if err := rows.Scan(&i.ID, &i.CnjNumber, &i.Degree); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const batchMarkCourtRecordsSynced = `-- name: BatchMarkCourtRecordsSynced :exec
+UPDATE court_record cr
+SET completeness = u.completeness,
+    next_sync_at = u.next_sync_at,
+    judging_body = COALESCE(u.judging_body, cr.judging_body)
+FROM jsonb_to_recordset($1::jsonb) AS u(
+    id uuid, completeness real, next_sync_at timestamptz, judging_body text
+)
+WHERE cr.id = u.id
+`
+
+// Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
+// completeness/next_sync_at and COALESCE judging_body (a sync that omits it keeps the
+// prior value) for MANY records in one round-trip, from a jsonb array of rows.
+func (q *Queries) BatchMarkCourtRecordsSynced(ctx context.Context, updates []byte) error {
+	_, err := q.db.Exec(ctx, batchMarkCourtRecordsSynced, updates)
+	return err
+}
+
+const batchUpsertIntimations = `-- name: BatchUpsertIntimations :many
+INSERT INTO intimation
+    (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
+     deadline_start_at, content, source, type, status, source_url, cancelled_at,
+     cancel_reason, recipients, sync_run_id)
+SELECT $1::uuid, r.case_id, r.court_record_id, r.hash, r.made_available_at,
+       r.published_at, r.deadline_start_at, r.content, r.source, r.type, r.status,
+       r.source_url, r.cancelled_at, r.cancel_reason, r.recipients, r.sync_run_id
+FROM jsonb_to_recordset($2::jsonb) AS r(
+    case_id uuid, court_record_id uuid, hash text, made_available_at date, published_at date,
+    deadline_start_at date, content text, source text, type text, status text, source_url text,
+    cancelled_at date, cancel_reason text, recipients jsonb, sync_run_id uuid
+)
+ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
+    status        = EXCLUDED.status,
+    cancelled_at  = EXCLUDED.cancelled_at,
+    cancel_reason = EXCLUDED.cancel_reason,
+    type          = EXCLUDED.type,
+    source_url    = EXCLUDED.source_url
+RETURNING id, (xmax = 0) AS inserted
+`
+
+type BatchUpsertIntimationsParams struct {
+	TenantID    uuid.UUID `json:"tenant_id"`
+	Intimations []byte    `json:"intimations"`
+}
+
+type BatchUpsertIntimationsRow struct {
+	ID       uuid.UUID `json:"id"`
+	Inserted bool      `json:"inserted"`
+}
+
+// Bulk counterpart of InsertIntimation: upsert MANY intimações in one round-trip from
+// a jsonb array of rows. Same ON CONFLICT (tenant, case, hash) DO UPDATE as the single
+// version (a retracted publication re-arrives with the same hash carrying CANCELLED).
+// JSON handles it all: null → NULL (nullable dates/type/source_url), and recipients
+// (text[]) maps from a JSON array. (xmax = 0) tallies inserted vs updated per row.
+func (q *Queries) BatchUpsertIntimations(ctx context.Context, arg BatchUpsertIntimationsParams) ([]BatchUpsertIntimationsRow, error) {
+	rows, err := q.db.Query(ctx, batchUpsertIntimations, arg.TenantID, arg.Intimations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BatchUpsertIntimationsRow
+	for rows.Next() {
+		var i BatchUpsertIntimationsRow
+		if err := rows.Scan(&i.ID, &i.Inserted); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countActiveCourtRecordsByTenant = `-- name: CountActiveCourtRecordsByTenant :one
 SELECT count(*) FROM court_record
 WHERE tenant_id = $1 AND lifecycle = 'ACTIVE'
@@ -128,6 +289,58 @@ func (q *Queries) GetCourtRecordByKey(ctx context.Context, arg GetCourtRecordByK
 	var i GetCourtRecordByKeyRow
 	err := row.Scan(&i.ID, &i.CaseID)
 	return i, err
+}
+
+const getCourtRecordsByKeys = `-- name: GetCourtRecordsByKeys :many
+SELECT id, case_id, cnj_number, degree
+FROM court_record
+WHERE tenant_id = $1
+  AND (cnj_number, degree) IN (
+    SELECT k.cnj_number, k.degree
+    FROM jsonb_to_recordset($2::jsonb) AS k(cnj_number text, degree text)
+  )
+`
+
+type GetCourtRecordsByKeysParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Keys     []byte    `json:"keys"`
+}
+
+type GetCourtRecordsByKeysRow struct {
+	ID        uuid.UUID `json:"id"`
+	CaseID    uuid.UUID `json:"case_id"`
+	CnjNumber string    `json:"cnj_number"`
+	Degree    string    `json:"degree"`
+}
+
+// Batch counterpart of GetCourtRecordByKey: resolve MANY records by their natural
+// keys in one round-trip, so a sync window partitions its whole result into existing
+// (reobservation → update) vs new (create) with ONE query instead of one GET per
+// record. Keys arrive as a jsonb array of {cnj_number, degree} — one scalar param,
+// so sqlc stays happy (it does not model multi-arg unnest).
+func (q *Queries) GetCourtRecordsByKeys(ctx context.Context, arg GetCourtRecordsByKeysParams) ([]GetCourtRecordsByKeysRow, error) {
+	rows, err := q.db.Query(ctx, getCourtRecordsByKeys, arg.TenantID, arg.Keys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetCourtRecordsByKeysRow
+	for rows.Next() {
+		var i GetCourtRecordsByKeysRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CaseID,
+			&i.CnjNumber,
+			&i.Degree,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const insertCourtCase = `-- name: InsertCourtCase :one

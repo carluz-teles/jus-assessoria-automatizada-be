@@ -44,6 +44,11 @@ type Repository interface {
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
 	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (record *CourtRecord, created bool, err error)
+	// BatchUpsertCourtRecords is the SET-BASED write path (repository_batch.go): it
+	// resolves-or-creates a whole window's records in a handful of statements so the
+	// per-tenant write lock is held for milliseconds, not seconds. FindOrCreateCourtRecord
+	// stays for the enrichment path (one record at a time).
+	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
 
@@ -870,49 +875,7 @@ func (r *pgRepository) ReplaceWatchedOABs(ctx context.Context, tx database.Tx, t
 	return nil
 }
 
-func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error) {
-	q := acquisitiondb.New(tx)
-	newCount := 0
-	for _, p := range params {
-		tid, err := uuid.Parse(p.TenantID)
-		if err != nil {
-			return 0, database.WrapInfra(err)
-		}
-		caseID, err := uuid.Parse(p.CaseID)
-		if err != nil {
-			return 0, database.WrapInfra(err)
-		}
-		crid, err := uuid.Parse(p.CourtRecordID)
-		if err != nil {
-			return 0, database.WrapInfra(err)
-		}
-		row, err := q.InsertIntimation(ctx, acquisitiondb.InsertIntimationParams{
-			TenantID:        tid,
-			CaseID:          caseID,
-			CourtRecordID:   crid,
-			Hash:            p.Hash,
-			MadeAvailableAt: pgtype.Date{Time: p.MadeAvailableAt, Valid: true},
-			PublishedAt:     pgtype.Date{Time: p.PublishedAt, Valid: true},
-			DeadlineStartAt: pgtype.Date{Time: p.DeadlineStartAt, Valid: true},
-			Content:         p.Content,
-			Source:          p.Source,
-			Type:            nullString(p.Type),
-			Status:          p.Status,
-			SourceUrl:       nullString(p.SourceURL),
-			CancelledAt:     nullDate(p.CancelledAt),
-			CancelReason:    nullString(p.CancelReason),
-			Recipients:      recipientsOrEmpty(p.Recipients),
-			SyncRunID:       nullUUID(p.SyncRunID),
-		})
-		if err != nil {
-			return 0, database.WrapInfra(err)
-		}
-		if row.Inserted {
-			newCount++
-		}
-	}
-	return newCount, nil
-}
+// UpsertIntimations is the SET-BASED bulk upsert — see repository_batch.go.
 
 // UpsertGradedCourtRecord find-or-creates the graded court record inside the
 // caller's tx (natural key tenant+cnj+degree, in the given case) and refreshes the

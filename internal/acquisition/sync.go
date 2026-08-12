@@ -158,7 +158,7 @@ type syncRepo interface {
 	InsertSyncRun(ctx context.Context, tx database.Tx, params SyncRunParams) (id string, err error)
 	FindSyncRunByEventID(ctx context.Context, tx database.Tx, eventID string) (*SyncRun, error)
 	UpdateSyncRun(ctx context.Context, tx database.Tx, outcome SyncRunOutcome) (closed bool, err error)
-	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (record *CourtRecord, created bool, err error)
+	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newCount int, err error)
 }
@@ -428,48 +428,46 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 			return err
 		}
 
-		records := make(map[string]*CourtRecord, len(parsed.CourtRecords))
-		ordered := make([]*CourtRecord, 0, len(parsed.CourtRecords))
-		blocked := make(map[string]bool)
-		courtRecordsNew := 0
 		nextSync := uc.now().Add(defaultSyncInterval)
-
-		for _, pr := range parsed.CourtRecords {
-			cr, created, err := uc.repo.FindOrCreateCourtRecord(ctx, tx, FindOrCreateCourtRecordParams{
-				TenantID:           ev.TenantID,
-				CNJNumber:          pr.CNJNumber,
-				Degree:             pr.Degree,
-				Court:              pr.Court,
-				Class:              pr.Class,
-				Subject:            pr.Subject,
-				Completeness:       pr.Completeness,
-				JudgingBody:        pr.JudgingBody,
-				NextSyncAt:         nextSync,
-				ActiveProcessLimit: limit,
-				SyncRunID:          syncRunID,
-			})
-			if errors.Is(err, ErrProcessLimitReached) {
+		crParams := make([]FindOrCreateCourtRecordParams, len(parsed.CourtRecords))
+		for i, pr := range parsed.CourtRecords {
+			crParams[i] = FindOrCreateCourtRecordParams{
+				TenantID:     ev.TenantID,
+				CNJNumber:    pr.CNJNumber,
+				Degree:       pr.Degree,
+				Court:        pr.Court,
+				Class:        pr.Class,
+				Subject:      pr.Subject,
+				Completeness: pr.Completeness,
+				JudgingBody:  pr.JudgingBody,
+				NextSyncAt:   nextSync,
+				SyncRunID:    syncRunID,
+			}
+		}
+		// One set-based resolve-or-create for the whole window (the ceiling is applied
+		// once inside, so a brand-new record over the limit comes back Blocked, not an
+		// error). This is what keeps the advisory lock held for milliseconds.
+		outcomes, courtRecordsNew, err := uc.repo.BatchUpsertCourtRecords(ctx, tx, ev.TenantID, limit, crParams)
+		if err != nil {
+			return err
+		}
+		records := make(map[string]*CourtRecord, len(outcomes))
+		ordered := make([]*CourtRecord, 0, len(outcomes))
+		blocked := make(map[string]bool)
+		for i, o := range outcomes {
+			pr := parsed.CourtRecords[i]
+			key := recordKey(pr.CNJNumber, pr.Degree)
+			if o.Blocked {
 				// Expected, not a failure: the tenant is at its plan ceiling and this is a
-				// brand-new process. Skip it (and its docket/intimation children below),
-				// keep folding the rest of the batch, and let the run close OK. Disparo de
-				// notification.requested avisando o tenant fica para uma fatia futura.
+				// brand-new process. Skip it (and its docket/intimation children below); the
+				// run still closes OK. Notifying the tenant is a future slice.
 				slog.WarnContext(ctx, "acquisition: active process limit reached; skipping new court record",
-					"tenant_id", ev.TenantID,
-					"cnj_number", pr.CNJNumber,
-					"court", pr.Court,
-					"degree", pr.Degree,
-				)
-				blocked[recordKey(pr.CNJNumber, pr.Degree)] = true
+					"tenant_id", ev.TenantID, "cnj_number", pr.CNJNumber, "court", pr.Court, "degree", pr.Degree)
+				blocked[key] = true
 				continue
 			}
-			if err != nil {
-				return err
-			}
-			records[recordKey(pr.CNJNumber, pr.Degree)] = cr
-			ordered = append(ordered, cr)
-			if created {
-				courtRecordsNew++
-			}
+			records[key] = o.Record
+			ordered = append(ordered, o.Record)
 		}
 
 		docketParams, err := docketParamsFor(parsed.DocketEntries, records, blocked)

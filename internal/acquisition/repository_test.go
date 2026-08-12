@@ -2,44 +2,51 @@ package acquisition
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pashagolub/pgxmock/v4"
 )
 
-// validDate is a pgxmock argument matcher asserting a bound date column is a real
-// (non-NULL) date — the evidence that cancelled_at is written, not left NULL, when
-// a retracted intimation flows through the upsert.
-type validDate struct{}
+// jsonbContains is a pgxmock argument matcher asserting the BatchUpsertIntimations jsonb
+// payload (a []byte) contains all the given substrings — enough to prove the Go side maps
+// status/cancelled_at into the row objects the set-based upsert unpacks.
+type jsonbContains struct{ subs []string }
 
-func (validDate) Match(v any) bool {
-	d, ok := v.(pgtype.Date)
-	return ok && d.Valid
+func (j jsonbContains) Match(v any) bool {
+	b, ok := v.([]byte)
+	if !ok {
+		return false
+	}
+	s := string(b)
+	for _, sub := range j.subs {
+		if !strings.Contains(s, sub) {
+			return false
+		}
+	}
+	return true
 }
 
-// TestPgRepositoryUpsertIntimations proves the DJEN cancellation contract at the
-// query boundary: the generated InsertIntimation is ON CONFLICT ... DO UPDATE (not
-// DO NOTHING), so a retracted intimation (status=CANCELLED + cancelled_at) UPDATES
-// the existing row instead of being silently dropped. It runs against pgxmock (no
-// real Postgres), so it stays in the plain green gate. The mock matches the actual
-// SQL sqlc generated, so a regression to DO NOTHING fails the expectation.
+// TestPgRepositoryUpsertIntimations proves the DJEN cancellation contract at the query
+// boundary: UpsertIntimations now issues ONE set-based BatchUpsertIntimations whose SQL is
+// ON CONFLICT ... DO UPDATE (not DO NOTHING), and the Go side marshals status +
+// cancelled_at into the jsonb payload — so a retracted intimation (CANCELLED +
+// cancelled_at) UPDATES the existing row instead of being silently dropped, and a fresh
+// one counts as new. Runs against pgxmock (no real Postgres); the full jsonb_to_recordset
+// round-trip is covered by the integration test.
 func TestPgRepositoryUpsertIntimations(t *testing.T) {
 	t.Parallel()
 
 	const doUpdateSQL = `ON CONFLICT \(tenant_id, case_id, hash\) DO UPDATE SET`
-
-	cancelledAt := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
 
 	tests := []struct {
 		name         string
 		param        IntimationParams
 		inserted     bool // what the query's (xmax = 0) flag returns
 		wantNewCount int
-		wantStatus   string
-		wantCancel   pgxmock.Argument
+		wantJSON     []string // substrings the marshaled row payload must contain
 	}{
 		{
 			name: "cancelled intimation updates the existing row (not new)",
@@ -49,13 +56,12 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 				CourtRecordID: uuid.NewString(),
 				Hash:          "stub-notif-1",
 				Status:        IntimationStatusCancelled,
-				CancelledAt:   cancelledAt,
+				CancelledAt:   time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC),
 				CancelReason:  "retratada pelo tribunal",
 			},
 			inserted:     false,
 			wantNewCount: 0,
-			wantStatus:   IntimationStatusCancelled,
-			wantCancel:   validDate{},
+			wantJSON:     []string{`"status":"` + IntimationStatusCancelled + `"`, `"cancelled_at":"2024-02-01"`},
 		},
 		{
 			name: "fresh active intimation inserts and counts as new",
@@ -68,8 +74,7 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 			},
 			inserted:     true,
 			wantNewCount: 1,
-			wantStatus:   IntimationStatusActive,
-			wantCancel:   pgxmock.AnyArg(), // no cancellation date on a fresh publication
+			wantJSON:     []string{`"status":"` + IntimationStatusActive + `"`, `"cancelled_at":null`},
 		},
 	}
 
@@ -83,28 +88,11 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 			}
 			defer mock.Close()
 
-			// Args 1-9 are the identity/date/content columns (not under test here); the
-			// DJEN columns follow. Asserting Status and cancelled_at proves the retraction
-			// data reaches the query.
+			// The set-based upsert takes exactly two args: the tenant id and the jsonb rows
+			// payload. Matching the DO-UPDATE SQL guards against a regression to DO NOTHING;
+			// the jsonb matcher proves the retraction fields reach the query.
 			mock.ExpectQuery(doUpdateSQL).
-				WithArgs(
-					pgxmock.AnyArg(), // tenant_id
-					pgxmock.AnyArg(), // case_id
-					pgxmock.AnyArg(), // court_record_id
-					pgxmock.AnyArg(), // hash
-					pgxmock.AnyArg(), // made_available_at
-					pgxmock.AnyArg(), // published_at
-					pgxmock.AnyArg(), // deadline_start_at
-					pgxmock.AnyArg(), // content
-					pgxmock.AnyArg(), // source
-					pgxmock.AnyArg(), // type
-					tt.wantStatus,    // status
-					pgxmock.AnyArg(), // source_url
-					tt.wantCancel,    // cancelled_at
-					pgxmock.AnyArg(), // cancel_reason
-					pgxmock.AnyArg(), // recipients
-					pgxmock.AnyArg(), // sync_run_id
-				).
+				WithArgs(pgxmock.AnyArg(), jsonbContains{tt.wantJSON}).
 				WillReturnRows(
 					pgxmock.NewRows([]string{"id", "inserted"}).
 						AddRow(uuid.New(), tt.inserted),

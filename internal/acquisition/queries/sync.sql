@@ -148,3 +148,83 @@ RETURNING id, (xmax = 0) AS inserted;
 -- different tenants never block each other; hashtext is int4, widened to the int8
 -- pg_advisory_xact_lock expects.
 SELECT pg_advisory_xact_lock(hashtext(@tenant_id::text)::bigint);
+
+-- name: GetCourtRecordsByKeys :many
+-- Batch counterpart of GetCourtRecordByKey: resolve MANY records by their natural
+-- keys in one round-trip, so a sync window partitions its whole result into existing
+-- (reobservation → update) vs new (create) with ONE query instead of one GET per
+-- record. Keys arrive as a jsonb array of {cnj_number, degree} — one scalar param,
+-- so sqlc stays happy (it does not model multi-arg unnest).
+SELECT id, case_id, cnj_number, degree
+FROM court_record
+WHERE tenant_id = @tenant_id
+  AND (cnj_number, degree) IN (
+    SELECT k.cnj_number, k.degree
+    FROM jsonb_to_recordset(@keys::jsonb) AS k(cnj_number text, degree text)
+  );
+
+-- name: BatchInsertCourtCases :many
+-- Create N fresh lides in one round-trip (v0: one case per new record). Returns the
+-- N new ids; the caller pairs each with a new court_record.
+INSERT INTO court_case (tenant_id)
+SELECT @tenant_id::uuid FROM generate_series(1, @n::int)
+RETURNING id;
+
+-- name: BatchInsertCourtRecords :many
+-- Bulk create of first-seen records from a jsonb array of rows: folds the post-sync
+-- fields (completeness/judging_body/next_sync_at) straight into the INSERT, so a NEW
+-- record needs no separate MarkCourtRecordSynced. JSON null → SQL NULL naturally
+-- (nullable class/subject/judging_body/sync_run_id). ON CONFLICT DO NOTHING keeps it
+-- idempotent (a re-run of the window no-ops on rows it already created); RETURNING the
+-- natural key lets the caller map ids back to input order. Under the per-tenant
+-- advisory lock there is no concurrent same-tenant writer, so the conflict path only
+-- fires on a genuine re-run, never a create race.
+INSERT INTO court_record
+    (tenant_id, case_id, cnj_number, degree, court, class, subject, completeness, judging_body, sync_run_id, next_sync_at)
+SELECT @tenant_id::uuid, r.case_id, r.cnj_number, r.degree, r.court,
+       r.class, r.subject, r.completeness, r.judging_body, r.sync_run_id, r.next_sync_at
+FROM jsonb_to_recordset(@records::jsonb) AS r(
+    case_id uuid, cnj_number text, degree text, court text, class text, subject text,
+    completeness real, judging_body text, sync_run_id uuid, next_sync_at timestamptz
+)
+ON CONFLICT (tenant_id, cnj_number, degree) DO NOTHING
+RETURNING id, cnj_number, degree;
+
+-- name: BatchMarkCourtRecordsSynced :exec
+-- Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
+-- completeness/next_sync_at and COALESCE judging_body (a sync that omits it keeps the
+-- prior value) for MANY records in one round-trip, from a jsonb array of rows.
+UPDATE court_record cr
+SET completeness = u.completeness,
+    next_sync_at = u.next_sync_at,
+    judging_body = COALESCE(u.judging_body, cr.judging_body)
+FROM jsonb_to_recordset(@updates::jsonb) AS u(
+    id uuid, completeness real, next_sync_at timestamptz, judging_body text
+)
+WHERE cr.id = u.id;
+
+-- name: BatchUpsertIntimations :many
+-- Bulk counterpart of InsertIntimation: upsert MANY intimações in one round-trip from
+-- a jsonb array of rows. Same ON CONFLICT (tenant, case, hash) DO UPDATE as the single
+-- version (a retracted publication re-arrives with the same hash carrying CANCELLED).
+-- JSON handles it all: null → NULL (nullable dates/type/source_url), and recipients
+-- (text[]) maps from a JSON array. (xmax = 0) tallies inserted vs updated per row.
+INSERT INTO intimation
+    (tenant_id, case_id, court_record_id, hash, made_available_at, published_at,
+     deadline_start_at, content, source, type, status, source_url, cancelled_at,
+     cancel_reason, recipients, sync_run_id)
+SELECT @tenant_id::uuid, r.case_id, r.court_record_id, r.hash, r.made_available_at,
+       r.published_at, r.deadline_start_at, r.content, r.source, r.type, r.status,
+       r.source_url, r.cancelled_at, r.cancel_reason, r.recipients, r.sync_run_id
+FROM jsonb_to_recordset(@intimations::jsonb) AS r(
+    case_id uuid, court_record_id uuid, hash text, made_available_at date, published_at date,
+    deadline_start_at date, content text, source text, type text, status text, source_url text,
+    cancelled_at date, cancel_reason text, recipients jsonb, sync_run_id uuid
+)
+ON CONFLICT (tenant_id, case_id, hash) DO UPDATE SET
+    status        = EXCLUDED.status,
+    cancelled_at  = EXCLUDED.cancelled_at,
+    cancel_reason = EXCLUDED.cancel_reason,
+    type          = EXCLUDED.type,
+    source_url    = EXCLUDED.source_url
+RETURNING id, (xmax = 0) AS inserted;

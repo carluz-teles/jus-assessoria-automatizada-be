@@ -138,6 +138,10 @@ func (m *mockRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, _ F
 	return nil, false, nil
 }
 
+func (m *mockRepo) BatchUpsertCourtRecords(_ context.Context, _ database.Tx, _ string, _ int, params []FindOrCreateCourtRecordParams) ([]CourtRecordOutcome, int, error) {
+	return make([]CourtRecordOutcome, len(params)), 0, nil
+}
+
 func (m *mockRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, _ []DocketEntryParams) ([]DocketEntry, error) {
 	return nil, nil
 }

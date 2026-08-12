@@ -31,6 +31,28 @@ type Querier interface {
 	// listener uses it as the first-activation guard: a re-activation must not
 	// re-dispatch a backfill.
 	BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error)
+	// Create N fresh lides in one round-trip (v0: one case per new record). Returns the
+	// N new ids; the caller pairs each with a new court_record.
+	BatchInsertCourtCases(ctx context.Context, arg BatchInsertCourtCasesParams) ([]uuid.UUID, error)
+	// Bulk create of first-seen records from a jsonb array of rows: folds the post-sync
+	// fields (completeness/judging_body/next_sync_at) straight into the INSERT, so a NEW
+	// record needs no separate MarkCourtRecordSynced. JSON null → SQL NULL naturally
+	// (nullable class/subject/judging_body/sync_run_id). ON CONFLICT DO NOTHING keeps it
+	// idempotent (a re-run of the window no-ops on rows it already created); RETURNING the
+	// natural key lets the caller map ids back to input order. Under the per-tenant
+	// advisory lock there is no concurrent same-tenant writer, so the conflict path only
+	// fires on a genuine re-run, never a create race.
+	BatchInsertCourtRecords(ctx context.Context, arg BatchInsertCourtRecordsParams) ([]BatchInsertCourtRecordsRow, error)
+	// Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
+	// completeness/next_sync_at and COALESCE judging_body (a sync that omits it keeps the
+	// prior value) for MANY records in one round-trip, from a jsonb array of rows.
+	BatchMarkCourtRecordsSynced(ctx context.Context, updates []byte) error
+	// Bulk counterpart of InsertIntimation: upsert MANY intimações in one round-trip from
+	// a jsonb array of rows. Same ON CONFLICT (tenant, case, hash) DO UPDATE as the single
+	// version (a retracted publication re-arrives with the same hash carrying CANCELLED).
+	// JSON handles it all: null → NULL (nullable dates/type/source_url), and recipients
+	// (text[]) maps from a JSON array. (xmax = 0) tallies inserted vs updated per row.
+	BatchUpsertIntimations(ctx context.Context, arg BatchUpsertIntimationsParams) ([]BatchUpsertIntimationsRow, error)
 	// Push a record's next_sync_at forward as its re-poll is enqueued, so the next tick
 	// does not re-enqueue it; if the resync never lands, it falls due again after the
 	// interval (at-least-once).
@@ -80,6 +102,12 @@ type Querier interface {
 	// Resolve a court record by its natural key inside the caller's tx. A miss
 	// (pgx.ErrNoRows) is how FindOrCreateCourtRecord learns it must create one.
 	GetCourtRecordByKey(ctx context.Context, arg GetCourtRecordByKeyParams) (GetCourtRecordByKeyRow, error)
+	// Batch counterpart of GetCourtRecordByKey: resolve MANY records by their natural
+	// keys in one round-trip, so a sync window partitions its whole result into existing
+	// (reobservation → update) vs new (create) with ONE query instead of one GET per
+	// record. Keys arrive as a jsonb array of {cnj_number, degree} — one scalar param,
+	// so sqlc stays happy (it does not model multi-arg unnest).
+	GetCourtRecordsByKeys(ctx context.Context, arg GetCourtRecordsByKeysParams) ([]GetCourtRecordsByKeysRow, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
 	// The tenant's most recent backfill job — status + tallies — for the import-status
 	// read (the FE banner "importando seus processos…"). Newest job wins (a re-activation

@@ -52,9 +52,13 @@ func (r *stubMatchRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx,
 	r.lockTenants = append(r.lockTenants, tenantID)
 	return nil
 }
-func (r *stubMatchRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, p FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
-	r.findCalls++
-	return &CourtRecord{ID: "rec-" + p.CNJNumber, CaseID: "case-" + p.CNJNumber, CNJNumber: p.CNJNumber, Degree: p.Degree}, true, nil
+func (r *stubMatchRepo) BatchUpsertCourtRecords(_ context.Context, _ database.Tx, _ string, _ int, params []FindOrCreateCourtRecordParams) ([]CourtRecordOutcome, int, error) {
+	r.findCalls++ // one batch call per tenant window (the test's records are 1-per-tenant)
+	outcomes := make([]CourtRecordOutcome, len(params))
+	for i, p := range params {
+		outcomes[i] = CourtRecordOutcome{Record: &CourtRecord{ID: "rec-" + p.CNJNumber, CaseID: "case-" + p.CNJNumber, CNJNumber: p.CNJNumber, Degree: p.Degree}}
+	}
+	return outcomes, len(params), nil
 }
 func (r *stubMatchRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) (int, error) {
 	r.upsertCalls++

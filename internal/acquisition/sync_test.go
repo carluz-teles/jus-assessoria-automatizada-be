@@ -143,18 +143,29 @@ func (s *stubSyncRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, 
 	return nil
 }
 
-func (s *stubSyncRepo) FindOrCreateCourtRecord(_ context.Context, _ database.Tx, p FindOrCreateCourtRecordParams) (*CourtRecord, bool, error) {
-	s.findCalls++
-	s.findParams = append(s.findParams, p)
-
-	if s.existingKeys[recordKey(p.CNJNumber, p.Degree)] {
-		return stubCourtRecord(p), false, nil // HIT — reobservation, never gated.
+// BatchUpsertCourtRecords replicates the old per-record find-or-create-or-gate over a
+// batch: findCalls/findParams still tick PER RECORD (the tests assert one per record),
+// the entitlement ceiling now arrives as the activeLimit arg (applied once by the use
+// case), and a MISS at/over the ceiling comes back Blocked instead of erroring.
+func (s *stubSyncRepo) BatchUpsertCourtRecords(_ context.Context, _ database.Tx, _ string, activeLimit int, params []FindOrCreateCourtRecordParams) ([]CourtRecordOutcome, int, error) {
+	outcomes := make([]CourtRecordOutcome, len(params))
+	newCount := 0
+	for i, p := range params {
+		s.findCalls++
+		s.findParams = append(s.findParams, p)
+		if s.existingKeys[recordKey(p.CNJNumber, p.Degree)] {
+			outcomes[i] = CourtRecordOutcome{Record: stubCourtRecord(p)} // HIT — reobservation
+			continue
+		}
+		if s.activeCount >= activeLimit {
+			outcomes[i] = CourtRecordOutcome{Blocked: true} // MISS at/over the ceiling — gated
+			continue
+		}
+		s.activeCount++
+		newCount++
+		outcomes[i] = CourtRecordOutcome{Record: stubCourtRecord(p)} // MISS — created
 	}
-	if s.activeCount >= p.ActiveProcessLimit {
-		return nil, false, ErrProcessLimitReached // MISS at/over the ceiling — gated.
-	}
-	s.activeCount++
-	return stubCourtRecord(p), true, nil // MISS — a brand-new record was created.
+	return outcomes, newCount, nil
 }
 
 // stubCourtRecord builds the CourtRecord the stub returns for a resolved record,

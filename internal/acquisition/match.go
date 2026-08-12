@@ -17,7 +17,7 @@ type matchRepo interface {
 	MatchPublicationsByDay(ctx context.Context, tx database.Tx, day time.Time) ([]PublicationMatch, error)
 	MatchPublicationsForTenantSince(ctx context.Context, tx database.Tx, tenantID string, since time.Time) ([]PublicationMatch, error)
 	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
-	FindOrCreateCourtRecord(ctx context.Context, tx database.Tx, params FindOrCreateCourtRecordParams) (*CourtRecord, bool, error)
+	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (int, error)
 }
 
@@ -122,26 +122,32 @@ func (uc *MatchUseCase) writeForTenant(ctx context.Context, tenantID string, key
 		if err := uc.repo.AcquireTenantWriteLock(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		records := make(map[string]*CourtRecord, len(parsed.CourtRecords))
 		nextSync := uc.now().Add(defaultSyncInterval)
-		for _, pr := range parsed.CourtRecords {
-			cr, _, err := uc.repo.FindOrCreateCourtRecord(ctx, tx, FindOrCreateCourtRecordParams{
-				TenantID:           tenantID,
-				CNJNumber:          pr.CNJNumber,
-				Degree:             pr.Degree,
-				Court:              pr.Court,
-				Class:              pr.Class,
-				Subject:            pr.Subject,
-				Completeness:       pr.Completeness,
-				JudgingBody:        pr.JudgingBody,
-				NextSyncAt:         nextSync,
-				ActiveProcessLimit: math.MaxInt, // bulk match is ungated, like the backfill
-				SyncRunID:          "",          // not from a sync run — national ingestion
-			})
-			if err != nil {
-				return err
+		crParams := make([]FindOrCreateCourtRecordParams, len(parsed.CourtRecords))
+		for i, pr := range parsed.CourtRecords {
+			crParams[i] = FindOrCreateCourtRecordParams{
+				TenantID:     tenantID,
+				CNJNumber:    pr.CNJNumber,
+				Degree:       pr.Degree,
+				Court:        pr.Court,
+				Class:        pr.Class,
+				Subject:      pr.Subject,
+				Completeness: pr.Completeness,
+				JudgingBody:  pr.JudgingBody,
+				NextSyncAt:   nextSync,
+				SyncRunID:    "", // not from a sync run — national ingestion
 			}
-			records[recordKey(pr.CNJNumber, pr.Degree)] = cr
+		}
+		// One set-based resolve-or-create; bulk match is ungated (math.MaxInt), like the
+		// backfill, so nothing comes back Blocked.
+		outcomes, _, err := uc.repo.BatchUpsertCourtRecords(ctx, tx, tenantID, math.MaxInt, crParams)
+		if err != nil {
+			return err
+		}
+		records := make(map[string]*CourtRecord, len(outcomes))
+		for i, o := range outcomes {
+			pr := parsed.CourtRecords[i]
+			records[recordKey(pr.CNJNumber, pr.Degree)] = o.Record
 		}
 		intimParams, err := intimationParamsFor(tenantID, "", parsed.Intimations, records, nil)
 		if err != nil {
