@@ -399,25 +399,82 @@ CREATE INDEX ON petition (court_record_id) WHERE observed_result IS NULL;  -- ca
 
 # 7. Deadlines
 
-## deadline [v0 (reduzido)]
-Prazo — conta-regressiva derivada de intimation. Ancora na **court_record**.
+## deadline [v0]
+Prazo legal — conta-regressiva derivada de intimation (1:1 via `notification_id UNIQUE`). Ancora na **court_record**. Os deltas de auditoria/produto (`tenant_id`, `kind`, `source`, `confirmed_by/at`, `doubled_reason`, `rules_version`) e o status fechado entram na **0024** (mapa: `docs/erd-prazos.md` §4/§8).
 
 ```sql
 CREATE TABLE deadline (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id        uuid NOT NULL REFERENCES tenant(id),               -- 0024: 1ª classe (agenda /prazos + RLS)
   court_record_id  uuid NOT NULL REFERENCES court_record(id),
-  notification_id  uuid NOT NULL UNIQUE REFERENCES intimation(id),  -- coluna mantém o nome; FK aponta p/ intimation
+  notification_id  uuid NOT NULL UNIQUE REFERENCES intimation(id),    -- coluna mantém o nome; FK aponta p/ intimation
   start_date       date NOT NULL,
   end_date         date NOT NULL,
   days             int NOT NULL,
-  counting         text NOT NULL,         -- BUSINESS | CALENDAR
+  counting         text NOT NULL,                    -- BUSINESS | CALENDAR
   doubled          boolean NOT NULL DEFAULT false,
-  holidays_applied jsonb NOT NULL DEFAULT '[]',   -- auditável
-  status           text NOT NULL DEFAULT 'OPEN'   -- OPEN|MET|MISSED
+  doubled_reason   text,                             -- 0024: LITISCONSORCIO_229|FAZENDA_183|MP_180|DEFENSORIA_186
+  holidays_applied jsonb NOT NULL DEFAULT '[]',      -- auditável
+  kind             text,                             -- 0024: CONTESTACAO|RECURSO|MANIFESTACAO|GENERICO|...
+  source           text NOT NULL DEFAULT 'RULE',     -- 0024: RULE|AI|MANUAL (de onde vieram os days)
+  confirmed_by     uuid,                             -- 0024: quem aprovou no F2 (nullable: nasce sem aval)
+  confirmed_at     timestamptz,                      -- 0024
+  rules_version    text NOT NULL DEFAULT 'v0',       -- 0024: qual deadline_rule derivou este prazo
+  status           text NOT NULL DEFAULT 'PENDING'   -- 0024: PENDING|OPEN|MET|MISSED|CANCELLED (+ CHECK)
+    CHECK (status IN ('PENDING','OPEN','MET','MISSED','CANCELLED'))
 );
 CREATE INDEX ON deadline (end_date) WHERE status = 'OPEN';   -- varredura de vencimento
+-- 0024: deadline é per-tenant → RLS tenant_isolation (mesma política de toda tabela de usuário).
 ```
-`holidays_applied` guardado porque quando o advogado discordar da data, a resposta tem que estar aqui.
+**Status (0024):** o prazo derivado pela regra **nasce `PENDING`** (uma sugestão); só vira `OPEN` na **confirmação humana do F2** (fatia 2c). `CANCELLED` é a revogação quando a intimação é retificada (`intimation.cancelled`). O `CHECK` é cinto-e-suspensório sobre a validação na app, porque prazo é dado crítico. `holidays_applied` guardado porque quando o advogado discordar da data, a resposta tem que estar aqui.
+
+## deadline_rule [v0 (referência)]
+Camada de regras versionada (`docs/erd-prazos.md` §8): mapeia sinais baratos (`intimation.type` + `court_prefix` opcional) para um `{kind, days, counting}` **seguro**. Dado de **referência global** (sem `tenant_id`, como `holiday`; override por-tenant é fatia futura). A **resolução** (match mais específico / maior `priority` ganha) é da fatia **2c** — aqui só o schema + o seed v0. Entra na **0024**.
+
+```sql
+CREATE TABLE deadline_rule (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  rules_version   text NOT NULL,
+  intimation_type text NOT NULL,                     -- CITACAO|INTIMACAO|COMUNICACAO|* ('*' = catch-all)
+  court_prefix    text,                              -- ex.: 'TRT' p/ rito específico; NULL = qualquer tribunal
+  kind            text NOT NULL,
+  days            int  NOT NULL CHECK (days > 0),
+  counting        text NOT NULL CHECK (counting IN ('BUSINESS','CALENDAR')),
+  doubled         boolean NOT NULL DEFAULT false,
+  priority        int  NOT NULL DEFAULT 0,           -- mais específico / maior ganha (2c resolve)
+  active          boolean NOT NULL DEFAULT true,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  UNIQUE NULLS NOT DISTINCT (rules_version, intimation_type, court_prefix)  -- 1 regra por (versão,tipo,prefixo)
+);
+```
+**`UNIQUE NULLS NOT DISTINCT`** (PG15+): as linhas catch-all (`court_prefix IS NULL`) não podem duplicar silenciosamente — o `UNIQUE` simples trataria cada NULL como distinto e deixaria entrar duas regras "qualquer tribunal" p/ o mesmo tipo. **Seed v0** (viés seguro, `counting=BUSINESS`, CPC art. 219; 2c pode sobrepor p/ CALENDAR conforme rito): `CITACAO→(CONTESTACAO,15)`, `INTIMACAO→(MANIFESTACAO,5)`, `COMUNICACAO→(GENERICO,5)`, e o catch-all `*→(GENERICO,5)`. Sem regra específica: GENERICO curto + a UI sinaliza "confirme" (nunca inventa data precisa).
+
+## task [v0]
+A **ação acionável** (o "criar tarefa" do F2): 1 prazo legal → N tarefas. O **responsável** vive aqui (não no `deadline`): o prazo é o fato, a task é quem o cumpre. Todas as FKs exceto `tenant_id` são nullable (task avulsa/manual). Per-tenant → RLS. Entra na **0024** (nenhuma linha escrita; a gravação é a confirmação do F2, fatia futura).
+
+```sql
+CREATE TABLE task (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id        uuid NOT NULL REFERENCES tenant(id),
+  court_record_id  uuid REFERENCES court_record(id),   -- contexto (nullable: avulsa)
+  deadline_id      uuid REFERENCES deadline(id),        -- prazo legal que a originou (nullable)
+  intimation_id    uuid REFERENCES intimation(id),      -- origem (nullable: task manual)
+  title            text NOT NULL,
+  description      text,
+  kind             text,                                -- ação sugerida (peça, juntada, ciência…)
+  due_date         date,                                -- data própria (≤ deadline.end_date, ou manual)
+  status           text NOT NULL DEFAULT 'OPEN'
+                     CHECK (status IN ('OPEN','DONE','DISMISSED')),
+  source           text NOT NULL,                       -- AI|RULE|MANUAL
+  assignee_user_id uuid,                                -- responsável ("meus prazos")
+  created_by       uuid,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  completed_at     timestamptz
+);
+CREATE INDEX ON task (tenant_id, status);
+CREATE INDEX ON task (due_date) WHERE status = 'OPEN';   -- varredura / agenda
+-- 0024: task é per-tenant → RLS tenant_isolation.
+```
 
 ## holiday [v0 (referência)]
 Calendário de dias não úteis — insumo de `lib/calendar` para derivar `published_at`/`deadline_start_at` (intimation) e `end_date` (deadline). É dado de **referência** (não é por-tenant).
@@ -543,7 +600,9 @@ O `UPDATE ... RETURNING` atômico sobre `slices_ok` é o que evita corrida na co
 | `draft` | Advisory | ✅ | sim | saga_state |
 | `review` | Advisory | ✅ | sim | coverage declarada |
 | `petition` | Advisory | ✅ | sim | fecha o loop |
-| `deadline` | Deadlines | ✅ | sim | ancora na court_record |
+| `deadline` | Deadlines | ✅ | sim | ancora na court_record; deltas + status fechado na 0024 |
+| `deadline_rule` | Deadlines | ✅ | não | referência global versionada (regra type→dias); seed v0 na 0024 |
+| `task` | Deadlines | ✅ | sim | ação acionável (N por prazo); responsável mora aqui; 0024 |
 | `holiday` | Deadlines | ✅ | não | referência (não por-tenant); insumo de lib/calendar |
 | `risk_assessment` | Risk | ⛔ v1+ | sim | append-only |
 | `outbox` | Infra | ✅ | **muito** | purgar publicados |

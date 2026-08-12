@@ -86,16 +86,37 @@ type CourtRecord struct {
 }
 
 type Deadline struct {
-	ID              uuid.UUID   `json:"id"`
-	CourtRecordID   uuid.UUID   `json:"court_record_id"`
-	NotificationID  uuid.UUID   `json:"notification_id"`
-	StartDate       pgtype.Date `json:"start_date"`
-	EndDate         pgtype.Date `json:"end_date"`
-	Days            int32       `json:"days"`
-	Counting        string      `json:"counting"`
-	Doubled         bool        `json:"doubled"`
-	HolidaysApplied []byte      `json:"holidays_applied"`
-	Status          string      `json:"status"`
+	ID              uuid.UUID          `json:"id"`
+	CourtRecordID   uuid.UUID          `json:"court_record_id"`
+	NotificationID  uuid.UUID          `json:"notification_id"`
+	StartDate       pgtype.Date        `json:"start_date"`
+	EndDate         pgtype.Date        `json:"end_date"`
+	Days            int32              `json:"days"`
+	Counting        string             `json:"counting"`
+	Doubled         bool               `json:"doubled"`
+	HolidaysApplied []byte             `json:"holidays_applied"`
+	Status          string             `json:"status"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	Kind            *string            `json:"kind"`
+	Source          string             `json:"source"`
+	ConfirmedBy     pgtype.UUID        `json:"confirmed_by"`
+	ConfirmedAt     pgtype.Timestamptz `json:"confirmed_at"`
+	DoubledReason   *string            `json:"doubled_reason"`
+	RulesVersion    string             `json:"rules_version"`
+}
+
+type DeadlineRule struct {
+	ID             uuid.UUID          `json:"id"`
+	RulesVersion   string             `json:"rules_version"`
+	IntimationType string             `json:"intimation_type"`
+	CourtPrefix    *string            `json:"court_prefix"`
+	Kind           string             `json:"kind"`
+	Days           int32              `json:"days"`
+	Counting       string             `json:"counting"`
+	Doubled        bool               `json:"doubled"`
+	Priority       int32              `json:"priority"`
+	Active         bool               `json:"active"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 type DocketEntry struct {
@@ -299,6 +320,24 @@ type SyncRun struct {
 	BackfillJobID    pgtype.UUID        `json:"backfill_job_id"`
 	CourtRecordsNew  int32              `json:"court_records_new"`
 	IntimationsNew   int32              `json:"intimations_new"`
+}
+
+type Task struct {
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
+	DeadlineID     pgtype.UUID        `json:"deadline_id"`
+	IntimationID   pgtype.UUID        `json:"intimation_id"`
+	Title          string             `json:"title"`
+	Description    *string            `json:"description"`
+	Kind           *string            `json:"kind"`
+	DueDate        pgtype.Date        `json:"due_date"`
+	Status         string             `json:"status"`
+	Source         string             `json:"source"`
+	AssigneeUserID pgtype.UUID        `json:"assignee_user_id"`
+	CreatedBy      pgtype.UUID        `json:"created_by"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 }
 
 type Tenant struct {
