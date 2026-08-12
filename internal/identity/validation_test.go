@@ -105,8 +105,24 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name:    ".com.br email is accepted",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Email = "advogado@escritorio.com.br" },
+			wantErr: false,
+		},
+		{
+			name:    ".adv.br email is accepted",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Email = "dr@banca.adv.br" },
+			wantErr: false,
+		},
+		{
 			name:    "malformed email is rejected",
 			mutate:  func(r *UpdateOrgProfileRequest) { r.Email = "not-an-email" },
+			wantErr: true,
+			field:   "email",
+		},
+		{
+			name:    "email missing @ is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Email = "foo.com.br" },
 			wantErr: true,
 			field:   "email",
 		},
