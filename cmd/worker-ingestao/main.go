@@ -56,6 +56,18 @@ const (
 	// trivial work, so 2 slots are plenty and, on their own queue, never compete with (or
 	// wait behind) the ~110s enrichment fetches on "ingestao".
 	syncStatusConcurrency = 2
+	// deadlineQueue carries the prazo flow (acquisition.intimation.observed/cancelled and the
+	// scheduled deadline.reminder_check/missed_check). It is drained by a SEPARATE asynq server
+	// so creating a prazo — fast DB+outbox work — is never stuck behind the DATAJUD enrichment
+	// flood on "ingestao" (thousands of ~110s court_record_observed tasks, no per-task priority
+	// within a queue), which in prod starved prazos to ~16/min. Same starvation fix as
+	// syncStatusQueue. Must match lib/events.queueFor's routing of these events.
+	deadlineQueue = "deadline"
+	// deadlineConcurrency is fixed at 8: deriving a prazo is a short DB+outbox transaction
+	// (no slow external fetch, unlike the enrichment), so a handful of slots clears the
+	// intimation backlog quickly; on its own queue those 8 workers never compete with the
+	// enrichment/sync work on "ingestao". Not env-tunable — the work is cheap and bounded.
+	deadlineConcurrency = 8
 	// defaultConcurrency backs INGESTAO_CONCURRENCY when unset/invalid. Parallelism
 	// is the backfill's main lever: DJEN/DATAJUD fetches are LONG (~110s each, stuck
 	// on the residential proxy), so running many at once overlaps that wait and cuts
@@ -261,10 +273,10 @@ func run(logger *slog.Logger) error {
 
 	// deadline (slice 2c): consume acquisition.intimation.observed and derive the prazo
 	// deterministically (rules layer → the shared judicial calendar `cal`), persisting it
-	// PENDING and emitting deadline.opened in one idempotent tx. intimation.observed routes
-	// to the "ingestao" queue, so its handler mounts on the main mux alongside the others.
+	// PENDING and emitting deadline.opened in one idempotent tx. The use case is built here,
+	// but its listener mounts on the DEDICATED deadline server below (not this main mux): the
+	// prazo flow moved off "ingestao" so it stops being starved by the enrichment flood.
 	deadlineUC := deadline.NewUseCase(deadline.NewRepository(), cal, outbox, deadline.NewDedup(), uow)
-	deadline.NewListener(deadlineUC).Register(mux)
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)
@@ -289,6 +301,28 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("backfill completion server started (dedicated)",
 		"service", serviceName, "queue", syncStatusQueue, "concurrency", syncStatusConcurrency)
+
+	// The DEDICATED deadline server: its own "deadline" queue, so the fast prazo flow
+	// (intimation.observed/cancelled + the scheduled reminder_check/missed_check) is never
+	// stuck behind the enrichment flood on "ingestao" — the same starvation fix as the
+	// sync_status server above. Built ALWAYS: every intimation must be able to open its prazo.
+	// deadline is deliberately NOT in the main srv's Queues, or it would compete on that pool
+	// again. deadline.due_soon/missed stay on the MAIN server (queue "notifications", the
+	// notifications listener) — they are not consumed here.
+	deadlineSrv := asynq.NewServer(redisOpt, asynq.Config{
+		Concurrency: deadlineConcurrency,
+		Queues:      map[string]int{deadlineQueue: deadlineConcurrency},
+		Logger:      events.NewAsynqLogger(logger),
+		LogLevel:    asynq.ErrorLevel,
+	})
+	deadlineMux := asynq.NewServeMux()
+	deadlineMux.Use(events.Observe(logger))
+	deadline.NewListener(deadlineUC).Register(deadlineMux)
+	if err := deadlineSrv.Start(deadlineMux); err != nil {
+		return fmt.Errorf("start deadline asynq server: %w", err)
+	}
+	logger.Info("deadline server started (dedicated)",
+		"service", serviceName, "queue", deadlineQueue, "concurrency", deadlineConcurrency)
 
 	// The DEDICATED national-ingestion server: one worker, its own "diario" queue, so the
 	// slow globally-rate-limited DJEN diário fetch runs serialized (never 3-way hammering
@@ -324,6 +358,7 @@ func run(logger *slog.Logger) error {
 		func(shutdownCtx context.Context) error {
 			srv.Shutdown() // drains in-flight tasks before returning
 			syncStatusSrv.Shutdown()
+			deadlineSrv.Shutdown()
 			if diarioSrv != nil {
 				diarioSrv.Shutdown()
 			}

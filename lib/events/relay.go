@@ -225,6 +225,27 @@ func queueFor(typ string) string {
 	if typ == "acquisition.sync_completed" || typ == "acquisition.sync_failed" {
 		return "sync_status"
 	}
+	// The deadline slice's async listener (intimation.observed/cancelled + the scheduled
+	// reminder_check/missed_check self-messages) gets its OWN queue, drained by a dedicated
+	// server on worker-ingestao: creating a prazo is fast (DB + outbox), but on "ingestao" it
+	// queues behind the DATAJUD enrichment flood (thousands of ~110s court_record_observed
+	// tasks, no per-task priority within a queue), so prazos come out starved (~16/min in
+	// prod). A separate queue lets the prazo flow run independently — the same fix as
+	// sync_status. intimation.observed/cancelled carry the "acquisition" prefix, so they must
+	// be routed HERE (before the prefix switch sends "acquisition" to "ingestao"). String
+	// literals, not the slice's consts: queueFor cannot import internal/deadline (import
+	// cycle). Must match worker-ingestao's deadlineQueue and the dedicated server's Queues.
+	if typ == "acquisition.intimation.observed" || typ == "acquisition.intimation.cancelled" ||
+		typ == "deadline.reminder_check" || typ == "deadline.missed_check" {
+		return "deadline"
+	}
+	// deadline.due_soon/missed are NOT consumed by the deadline server — they are consumed by
+	// the NOTIFICATIONS listener, which runs on the main server (it serves "notifications").
+	// Route them to that queue so the reminder/miss avisos are delivered, not to "deadline"
+	// (whose server has no notifications handler) nor to "ingestao".
+	if typ == "deadline.due_soon" || typ == "deadline.missed" {
+		return "notifications"
+	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":
 		// The acquisition slice's events (integration_activated, sync_requested,
@@ -234,11 +255,12 @@ func queueFor(typ string) string {
 		// discovery/enrichment chain silently stalls.
 		return "ingestao"
 	case "deadline":
-		// The deadline slice's events (opened, revoked, and the scheduled reminder_check /
-		// missed_check self-messages) are consumed by the deadline listener, which is mounted
-		// on worker-ingestao — so route the "deadline" domain to "ingestao" too. Without this
-		// they land in "default", which no worker consumes: the reminder/miss ETAs would never
-		// fire and deadline.opened/revoked would never be delivered.
+		// The deadline slice's CONSUMED events (reminder_check/missed_check → "deadline",
+		// due_soon/missed → "notifications") are special-cased above. What reaches here is the
+		// REST of the domain — deadline.opened/revoked/updated/met and task.* — which has NO
+		// async consumer today. Keep it on "ingestao" (the current behavior: archived as
+		// handler-not-found), NOT "default", so the rows don't pile up in a Redis queue no
+		// worker drains.
 		return "ingestao"
 	case "documents":
 		return "documents"
