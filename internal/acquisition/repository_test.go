@@ -103,6 +103,28 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 			wantJSON:      []string{`"status":"` + IntimationStatusActive + `"`},
 		},
 		{
+			// Dead-on-arrival: a hash never seen before whose payload already carries
+			// CANCELLED (the DJEN retracted it inside the same window we first ingest).
+			// The row returns Inserted=true with Status=CANCELLED and old_status='' (no
+			// prior row). It must emit NEITHER: no deadline to open, none to revoke.
+			name: "fresh insert already cancelled → neither event (dead-on-arrival)",
+			param: IntimationParams{
+				TenantID:      uuid.NewString(),
+				CaseID:        uuid.NewString(),
+				CourtRecordID: uuid.NewString(),
+				Hash:          "stub-notif-5",
+				Status:        IntimationStatusCancelled,
+				CancelledAt:   time.Date(2024, 2, 2, 0, 0, 0, 0, time.UTC),
+				CancelReason:  "retratada pelo tribunal",
+			},
+			inserted:      true,
+			oldStatus:     "",
+			newStatus:     IntimationStatusCancelled,
+			wantNew:       0,
+			wantCancelled: 0,
+			wantJSON:      []string{`"status":"` + IntimationStatusCancelled + `"`, `"cancelled_at":"2024-02-02"`},
+		},
+		{
 			name: "already-cancelled re-arrives → neither event (no re-emit)",
 			param: IntimationParams{
 				TenantID:      uuid.NewString(),

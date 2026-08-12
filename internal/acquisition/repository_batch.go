@@ -312,7 +312,15 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 		}
 		switch {
 		case row.Inserted:
-			newRows = append(newRows, change)
+			// First insert: observed only if still active. A row that arrives
+			// dead-on-arrival (fresh INSERT already carrying CANCELLED — e.g. the DJEN
+			// retracts a publication inside the same window we first ingest it) emits
+			// NOTHING. There is no deadline to open (skip observed) and none to revoke
+			// (no prior ACTIVE state → not a transition; gating on row.Inserted here
+			// also keeps it out of the cancelled case below, whose old_status is '').
+			if row.Status != IntimationStatusCancelled {
+				newRows = append(newRows, change)
+			}
 		case row.OldStatus != IntimationStatusCancelled && row.Status == IntimationStatusCancelled:
 			cancelledRows = append(cancelledRows, change)
 		}

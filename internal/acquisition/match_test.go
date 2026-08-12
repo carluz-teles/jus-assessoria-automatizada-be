@@ -60,10 +60,12 @@ func (r *stubMatchRepo) BatchUpsertCourtRecords(_ context.Context, _ database.Tx
 	}
 	return outcomes, len(params), nil
 }
-func (r *stubMatchRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) ([]IntimationChange, []IntimationChange, error) {
+func (r *stubMatchRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []IntimationParams) ([]IntimationChange, []IntimationChange, error) {
 	r.upsertCalls++
-	newRows := make([]IntimationChange, len(params))
-	return newRows, nil, nil
+	// The national match path discards the change slices (see MatchUseCase.writeForTenant),
+	// so nil expresses the discard semantics — returning N zero-value structs would falsely
+	// suggest N rows were classified as "new".
+	return nil, nil, nil
 }
 
 // --- tests -------------------------------------------------------------------
