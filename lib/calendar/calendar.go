@@ -114,6 +114,61 @@ func (c *Calendar) AddBusinessDays(ctx context.Context, start time.Time, n int, 
 	return d, skipped, nil
 }
 
+// AddCalendarDays advances start by n CALENDAR (corridos) days and returns the
+// resulting date plus the days that PUSHED that date forward (the prorrogação
+// audit, for holidays_applied). It is the counterpart of AddBusinessDays for the
+// rites that count corrido (e.g. some CLT deadlines), and follows CPC art. 224:
+// the start day is EXCLUDED (day 1 is the day after start) and the returned date
+// is the n-th day. n must be >= 0; n == 0 returns start unchanged with no audit.
+//
+// The essential difference from AddBusinessDays is the COUNT: weekends and
+// holidays COUNT as calendar days, so the n-th day is simply start + n days.
+//
+// Prorrogação (CPC art. 224 §1): if that n-th day is not a business day (weekend,
+// holiday, OR inside the art. 220 recess), the deadline rolls forward to the
+// first business day, exactly like NextBusinessDay. The recess is handled
+// conservatively here: a recess day never counts as the vencimento — it is a
+// non-business day, so a due date landing inside the recess always rolls to the
+// first business day after 20 January (never falls within it).
+//
+// holidays_applied audits only what pushed the FINAL date: the non-weekend
+// non-working days skipped during that roll-forward (prorrogação holidays and
+// recess weekdays). It mirrors AddBusinessDays' philosophy — weekends are the
+// norm and never audited, and internal calendar days are NOT audited (they count
+// silently); only the final prorrogação is. The roll-forward reuses the shared
+// maxScan bound, so a broken HolidaySource surfaces as an error, not a hang.
+func (c *Calendar) AddCalendarDays(ctx context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error) {
+	if n < 0 {
+		return time.Time{}, nil, fmt.Errorf("AddCalendarDays: n must be >= 0, got %d", n)
+	}
+	d := dateOnly(start)
+	if n == 0 {
+		return d, nil, nil
+	}
+	// The n-th calendar day: every intervening day counts, start excluded.
+	d = d.AddDate(0, 0, n)
+
+	// Prorrogação: walk to the first business day on or after the vencimento,
+	// auditing the non-weekend days (holidays/recess) that pushed it.
+	var applied []time.Time
+	for scan := 0; scan < maxScan; scan++ {
+		ok, err := c.IsBusinessDay(ctx, d, uf, court)
+		if err != nil {
+			return time.Time{}, nil, err
+		}
+		if ok {
+			return d, applied, nil
+		}
+		if !isWeekend(d) {
+			// A holiday or recess day pushing the deadline forward — audited.
+			// Weekends are the norm, not audited.
+			applied = append(applied, d)
+		}
+		d = d.AddDate(0, 0, 1)
+	}
+	return time.Time{}, nil, fmt.Errorf("AddCalendarDays: exceeded %d-day scan from %s", maxScan, dateOnly(start).Format(time.DateOnly))
+}
+
 // dateOnly pins a value to midnight UTC, taking the year/month/day from the
 // value's OWN components. The Calendar works on CIVIL dates, not instants: the
 // contract is that callers pass a date whose Y/M/D already are the intended
