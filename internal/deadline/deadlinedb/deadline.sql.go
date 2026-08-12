@@ -16,8 +16,13 @@ const getCourtRecordClass = `-- name: GetCourtRecordClass :one
 
 SELECT class
 FROM court_record
-WHERE id = $1
+WHERE id = $1 AND tenant_id = $2
 `
+
+type GetCourtRecordClassParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
 
 // deadline slice queries (the prazos CREATION path). Every write and read runs inside
 // the use case's transaction so RLS scopes it to the event's tenant (barrier 2) on top
@@ -27,8 +32,11 @@ WHERE id = $1
 // cross-table read the derivation needs (decisão P1: read the table, never import the
 // acquisition package). A missing record → pgx.ErrNoRows → typed not-found at the
 // mapper. class itself may be NULL (mapped to "").
-func (q *Queries) GetCourtRecordClass(ctx context.Context, id uuid.UUID) (*string, error) {
-	row := q.db.QueryRow(ctx, getCourtRecordClass, id)
+// tenant_id is filtered explicitly (barrier 1) even though RLS (barrier 2) already
+// scopes the tx: a NULL app.tenant_id or an RLS regression would otherwise let a read
+// cross tenants. $2 = tenant_id, from the trusted event payload (never the body).
+func (q *Queries) GetCourtRecordClass(ctx context.Context, arg GetCourtRecordClassParams) (*string, error) {
+	row := q.db.QueryRow(ctx, getCourtRecordClass, arg.ID, arg.TenantID)
 	var class *string
 	err := row.Scan(&class)
 	return class, err

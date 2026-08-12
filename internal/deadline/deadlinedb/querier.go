@@ -19,7 +19,10 @@ type Querier interface {
 	// cross-table read the derivation needs (decisão P1: read the table, never import the
 	// acquisition package). A missing record → pgx.ErrNoRows → typed not-found at the
 	// mapper. class itself may be NULL (mapped to "").
-	GetCourtRecordClass(ctx context.Context, id uuid.UUID) (*string, error)
+	// tenant_id is filtered explicitly (barrier 1) even though RLS (barrier 2) already
+	// scopes the tx: a NULL app.tenant_id or an RLS regression would otherwise let a read
+	// cross tenants. $2 = tenant_id, from the trusted event payload (never the body).
+	GetCourtRecordClass(ctx context.Context, arg GetCourtRecordClassParams) (*string, error)
 	// Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
 	// notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO row on a re-derivation, so
 	// the mapper reads pgx.ErrNoRows as "already exists" (ErrDeadlineExists) instead of

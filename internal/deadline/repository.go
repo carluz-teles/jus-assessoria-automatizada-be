@@ -21,16 +21,24 @@ var _ Repository = (*pgRepository)(nil)
 // the tx it is given, so there is nothing to inject at construction.
 func NewRepository() Repository { return &pgRepository{} }
 
-// GetCourtRecordClass reads the rito signal for the record inside the caller's tx. A
-// missing record maps to the typed ErrCourtRecordNotFound (never nil, nil); a present
-// record with a NULL class returns "".
-func (r *pgRepository) GetCourtRecordClass(ctx context.Context, tx database.Tx, courtRecordID string) (string, error) {
+// GetCourtRecordClass reads the rito signal for the record inside the caller's tx,
+// filtered by tenantID (barrier 1). A missing record — or one belonging to another
+// tenant — maps to the typed ErrCourtRecordNotFound (never nil, nil); a present record
+// with a NULL class returns "".
+func (r *pgRepository) GetCourtRecordClass(ctx context.Context, tx database.Tx, tenantID, courtRecordID string) (string, error) {
 	id, err := parseUUID(courtRecordID)
 	if err != nil {
 		return "", err
 	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
 
-	class, err := deadlinedb.New(tx).GetCourtRecordClass(ctx, id)
+	class, err := deadlinedb.New(tx).GetCourtRecordClass(ctx, deadlinedb.GetCourtRecordClassParams{
+		ID:       id,
+		TenantID: tenant,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrCourtRecordNotFound
 	}

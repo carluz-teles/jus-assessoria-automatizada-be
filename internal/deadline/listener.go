@@ -2,9 +2,11 @@ package deadline
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/hibiken/asynq"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/events"
 )
 
@@ -39,14 +41,43 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 }
 
 // handleIntimationObserved is the asynq.HandlerFunc for acquisition.intimation.observed.
-// It decodes the payload into the LOCAL shape and hands off to the use case. A decode
-// error is returned as-is (it wraps asynq.SkipRetry, so a malformed task is archived,
-// not retried); an infra error from the use case stays retryable. The ctx already
-// carries the producer's trace and the consumer span (events.Observe middleware).
+// It decodes the payload into the LOCAL shape and hands off to the use case, then maps
+// the outcome to asynq's retry decision. A decode error is returned as-is (it already
+// wraps asynq.SkipRetry, so a malformed task is archived, not retried); a terminal
+// domain error is wrapped with SkipRetry here (the transport owns the retry decision —
+// domain.go stays asynq-agnostic); every other error (infra/unavailable) stays
+// retryable. The ctx already carries the producer's trace and the consumer span
+// (events.Observe middleware).
 func (l *Listener) handleIntimationObserved(ctx context.Context, t *asynq.Task) error {
 	ev, err := events.Decode[IntimationObserved](t)
 	if err != nil {
 		return err
 	}
-	return l.open.OnIntimationObserved(ctx, ev)
+	if err := l.open.OnIntimationObserved(ctx, ev); err != nil {
+		if isTerminal(err) {
+			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
+		}
+		return err
+	}
+	return nil
+}
+
+// isTerminal reports whether a use-case error can never succeed on redelivery, so the
+// listener archives the task (asynq.SkipRetry) instead of burning the retry budget:
+//   - KindInvalid — a malformed anchor (deadline_start_at) decoded from the event; the
+//     payload is fixed, so a retry re-parses the same garbage.
+//   - KindNotFound — a missing court_record or deadline_rule. The court_record is
+//     committed upstream before intimation.observed is published (transactional outbox),
+//     so its absence is a data/config fault, not a race the tenant's tx will heal; the
+//     missing rule is a broken seed. Neither becomes present on retry.
+//
+// Everything else (KindInfra, KindUnavailable) stays retryable — asynq backs off and
+// only archives to the DLQ once the attempt budget is spent. KindConflict never reaches
+// here: the use case treats ErrDeadlineExists as an idempotent no-op (returns nil).
+func isTerminal(err error) bool {
+	ae, ok := apperr.From(err)
+	if !ok {
+		return false
+	}
+	return ae.Kind == apperr.KindInvalid || ae.Kind == apperr.KindNotFound
 }

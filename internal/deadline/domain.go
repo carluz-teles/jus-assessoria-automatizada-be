@@ -26,11 +26,13 @@ const rulesVersion = "v0"
 // docs §2.5). Every method takes the caller's tx so it participates in the use case's
 // unit of work and RLS scopes the reads/writes to the event's tenant.
 type Repository interface {
-	// GetCourtRecordClass reads the rito signal (court_record.class) for the record.
-	// This is the ONLY cross-table read the slice needs; it reads the table directly
-	// (no import of the acquisition package — slices talk by event, decisão P1). A
-	// missing record is ErrCourtRecordNotFound, never (nil, nil). class may be "".
-	GetCourtRecordClass(ctx context.Context, tx database.Tx, courtRecordID string) (string, error)
+	// GetCourtRecordClass reads the rito signal (court_record.class) for the record,
+	// scoped to tenantID (barrier 1, the explicit filter — RLS is barrier 2). This is
+	// the ONLY cross-table read the slice needs; it reads the table directly (no import
+	// of the acquisition package — slices talk by event, decisão P1). A missing record
+	// (or one owned by another tenant) is ErrCourtRecordNotFound, never (nil, nil).
+	// class may be "".
+	GetCourtRecordClass(ctx context.Context, tx database.Tx, tenantID, courtRecordID string) (string, error)
 	// ResolveRule returns the most specific active rule for (intimationType, court) in
 	// rulesVersion, falling back to the '*' catch-all (the resolution is in SQL —
 	// specificity + priority DESC + LIMIT 1). No match at all is ErrRuleNotFound.
@@ -111,7 +113,7 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 			return err
 		}
 
-		class, err := uc.repo.GetCourtRecordClass(ctx, tx, ev.CourtRecordID)
+		class, err := uc.repo.GetCourtRecordClass(ctx, tx, ev.TenantID, ev.CourtRecordID)
 		if err != nil {
 			return err
 		}

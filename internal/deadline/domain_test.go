@@ -29,6 +29,7 @@ type mockRepo struct {
 	insertErr error
 
 	// captured inputs
+	gotClassTenantID string
 	gotClassRecordID string
 	gotRuleType      string
 	gotRuleCourt     string
@@ -37,7 +38,8 @@ type mockRepo struct {
 	insertCalls      int
 }
 
-func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, courtRecordID string) (string, error) {
+func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
+	m.gotClassTenantID = tenantID
 	m.gotClassRecordID = courtRecordID
 	return m.class, m.classErr
 }
@@ -221,9 +223,13 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 		t.Errorf("calendar args uf/court/n = %q/%q/%d, want SP/TJSP/15", cal.gotUF, cal.gotCourt, cal.gotN)
 	}
 
-	// The read used the event's record id (decisão P1).
+	// The read used the event's record id (decisão P1), scoped to the event's tenant
+	// (barrier 1 — the explicit tenant filter).
 	if repo.gotClassRecordID != ev.CourtRecordID {
 		t.Errorf("GetCourtRecordClass got %q, want %q", repo.gotClassRecordID, ev.CourtRecordID)
+	}
+	if repo.gotClassTenantID != ev.TenantID {
+		t.Errorf("GetCourtRecordClass tenant = %q, want %q", repo.gotClassTenantID, ev.TenantID)
 	}
 	// The resolver got the event's type + court.
 	if repo.gotRuleType != "CITACAO" || repo.gotRuleCourt != "TJSP" || repo.gotRuleVersion != rulesVersion {
