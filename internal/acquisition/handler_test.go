@@ -2,11 +2,13 @@ package acquisition
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -64,6 +66,10 @@ func (fakeReader) Processos(context.Context, ProcessosQuery) (ProcessosResult, e
 
 func (fakeReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
 	return IntimacoesResult{}, nil
+}
+
+func (fakeReader) Andamentos(context.Context, AndamentosQuery) (AndamentosResult, error) {
+	return AndamentosResult{}, nil
 }
 
 func (fakeReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
@@ -239,8 +245,10 @@ func TestHandler_List_ScopedToTenant(t *testing.T) {
 // and returning a canned result — lets the HTTP tests assert query-param wiring and
 // the envelope shape without a database.
 type recordingReader struct {
-	res      ProcessosResult
-	gotQuery ProcessosQuery
+	res         ProcessosResult
+	gotQuery    ProcessosQuery
+	andRes      AndamentosResult
+	gotAndQuery AndamentosQuery
 }
 
 func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (ProcessosResult, error) {
@@ -249,6 +257,10 @@ func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (Proces
 }
 func (r *recordingReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
 	return IntimacoesResult{}, nil
+}
+func (r *recordingReader) Andamentos(_ context.Context, q AndamentosQuery) (AndamentosResult, error) {
+	r.gotAndQuery = q
+	return r.andRes, nil
 }
 func (r *recordingReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
 	return ImportStatusView{}, nil
@@ -342,5 +354,155 @@ func TestHandler_ListProcessos_EnvelopeHasTotals(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("envelope missing %s\ngot: %s", want, body)
 		}
+	}
+}
+
+// --- read route: /v1/processos/:id/andamentos -------------------------------
+
+// GET /v1/processos/:id/andamentos forwards the path :id (the court_record id) and the
+// decoded ?cursor to the read port, clamps ?limit, and takes the tenant from the
+// principal (never the query).
+func TestHandler_ListAndamentos_ForwardsProcessoAndCursor(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	cursor := httpx.EncodeCursor(httpx.Cursor{
+		LastSortValue: "2024-03-01T12:30:00Z",
+		LastID:        "018f0000-0000-7000-8000-000000000abc",
+	})
+	status, _ := do(t, app, http.MethodGet,
+		"/v1/processos/cr-77/andamentos?limit=25&cursor="+cursor, "", "jwt")
+
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotAndQuery.CourtRecordID != "cr-77" {
+		t.Errorf("CourtRecordID = %q, want cr-77 (from path)", rd.gotAndQuery.CourtRecordID)
+	}
+	if rd.gotAndQuery.TenantID != "tenant-9" {
+		t.Errorf("TenantID = %q, want tenant-9 (from principal)", rd.gotAndQuery.TenantID)
+	}
+	if rd.gotAndQuery.LastOccurred != "2024-03-01T12:30:00Z" {
+		t.Errorf("LastOccurred = %q, want the decoded cursor sort value", rd.gotAndQuery.LastOccurred)
+	}
+	if rd.gotAndQuery.LastID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("LastID = %q, want the decoded cursor id", rd.gotAndQuery.LastID)
+	}
+	if rd.gotAndQuery.Limit != 25 {
+		t.Errorf("Limit = %d, want 25", rd.gotAndQuery.Limit)
+	}
+}
+
+// The first page passes the max sentinel cursor (no ?cursor), and ?limit defaults to
+// DefaultLimit when absent — the handler never asks the repo for an unbounded page.
+func TestHandler_ListAndamentos_FirstPageSentinelAndDefaultLimit(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/processos/cr-1/andamentos", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotAndQuery.Limit != httpx.DefaultLimit {
+		t.Errorf("Limit = %d, want %d (default)", rd.gotAndQuery.Limit, httpx.DefaultLimit)
+	}
+	if rd.gotAndQuery.LastOccurred != maxTimestamp || rd.gotAndQuery.LastID != maxUUID {
+		t.Errorf("first-page sentinel = (%q, %q), want (%q, %q)",
+			rd.gotAndQuery.LastOccurred, rd.gotAndQuery.LastID, maxTimestamp, maxUUID)
+	}
+}
+
+// ?limit above the ceiling is clamped to MaxLimit (100).
+func TestHandler_ListAndamentos_ClampsLimit(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/processos/cr-1/andamentos?limit=500", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotAndQuery.Limit != httpx.MaxLimit {
+		t.Errorf("Limit = %d, want %d (clamped)", rd.gotAndQuery.Limit, httpx.MaxLimit)
+	}
+}
+
+// A process with no andamentos serializes as an empty data array (never null) with the
+// zero totals — 200, not 404.
+func TestHandler_ListAndamentos_Empty(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{andRes: AndamentosResult{}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-empty/andamentos", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"data":[]`, `"next_cursor":null`, `"total":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("envelope missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// A malformed ?cursor is a client error → 400, not a 500.
+func TestHandler_ListAndamentos_BadCursor_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-1/andamentos?cursor=not-a-cursor", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+}
+
+// Cursor round-trip across two pages: when the read reports a further page, the
+// envelope carries a next_cursor keyed off the last row's (occurred_at, id); echoing
+// it back resumes the keyset exactly there.
+func TestHandler_ListAndamentos_CursorRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	last := AndamentoView{
+		ID:         "018f0000-0000-7000-8000-0000000000ff",
+		OccurredAt: time.Date(2024, 3, 1, 12, 30, 0, 0, time.UTC),
+	}
+	rd := &recordingReader{andRes: AndamentosResult{
+		Items:   []AndamentoView{{ID: "first"}, last},
+		HasMore: true,
+		Total:   50,
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	// Page 1: no cursor → sentinel, and the envelope hands back a next_cursor.
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-1/andamentos?limit=2", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("page 1 status = %d, want 200", status)
+	}
+	var page1 httpx.Page[AndamentoView]
+	if err := json.Unmarshal([]byte(body), &page1); err != nil {
+		t.Fatalf("unmarshal page 1: %v (body: %s)", err, body)
+	}
+	if page1.Page.NextCursor == nil {
+		t.Fatal("page 1 next_cursor = nil, want a token (HasMore was true)")
+	}
+
+	// Page 2: echo the token → the handler decodes it into the last row's keyset.
+	status, _ = do(t, app, http.MethodGet,
+		"/v1/processos/cr-1/andamentos?limit=2&cursor="+*page1.Page.NextCursor, "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("page 2 status = %d, want 200", status)
+	}
+	if rd.gotAndQuery.LastOccurred != last.OccurredAt.Format(time.RFC3339Nano) {
+		t.Errorf("page 2 LastOccurred = %q, want %q",
+			rd.gotAndQuery.LastOccurred, last.OccurredAt.Format(time.RFC3339Nano))
+	}
+	if rd.gotAndQuery.LastID != last.ID {
+		t.Errorf("page 2 LastID = %q, want %q", rd.gotAndQuery.LastID, last.ID)
 	}
 }

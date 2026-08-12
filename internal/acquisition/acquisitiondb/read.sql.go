@@ -12,6 +12,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countAndamentosByProcesso = `-- name: CountAndamentosByProcesso :one
+SELECT count(*) FROM docket_entry de
+JOIN court_record cr ON cr.id = de.court_record_id
+WHERE de.court_record_id = $1::uuid
+  AND cr.tenant_id = $2::uuid
+`
+
+type CountAndamentosByProcessoParams struct {
+	CourtRecordID uuid.UUID `json:"court_record_id"`
+	TenantID      uuid.UUID `json:"tenant_id"`
+}
+
+// The "X de Y" total for the Andamentos tab: how many docket entries the process
+// holds. Tenant-scoped through the same court_record join as the list.
+func (q *Queries) CountAndamentosByProcesso(ctx context.Context, arg CountAndamentosByProcessoParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countAndamentosByProcesso, arg.CourtRecordID, arg.TenantID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countIntimacoesMatchingSearch = `-- name: CountIntimacoesMatchingSearch :one
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
@@ -122,6 +143,74 @@ func (q *Queries) GetReconciliation(ctx context.Context, arg GetReconciliationPa
 		&i.FinishedAt,
 	)
 	return i, err
+}
+
+const listAndamentosByProcesso = `-- name: ListAndamentosByProcesso :many
+SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.source, de.fidelity
+FROM docket_entry de
+JOIN court_record cr ON cr.id = de.court_record_id
+WHERE de.court_record_id = $1::uuid
+  AND cr.tenant_id = $2::uuid
+  AND (de.occurred_at, de.id) < ($3::timestamptz, $4::uuid)
+ORDER BY de.occurred_at DESC, de.id DESC
+LIMIT $5
+`
+
+type ListAndamentosByProcessoParams struct {
+	CourtRecordID uuid.UUID          `json:"court_record_id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	LastOccurred  pgtype.Timestamptz `json:"last_occurred"`
+	LastID        uuid.UUID          `json:"last_id"`
+	PageLimit     int32              `json:"page_limit"`
+}
+
+type ListAndamentosByProcessoRow struct {
+	ID         uuid.UUID          `json:"id"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+	TpuCode    *int32             `json:"tpu_code"`
+	Text       string             `json:"text"`
+	Source     string             `json:"source"`
+	Fidelity   int32              `json:"fidelity"`
+}
+
+// The "Andamentos" tab of one process: the court record's docket entries, newest
+// first. Scoped by tenant via the court_record join (docket_entry has no tenant_id
+// of its own) so a foreign court_record.id passed as :id yields nothing. Descending
+// keyset on (occurred_at, id) — served by docket_entry(court_record_id, occurred_at)
+// — the first page passes the max sentinel ('9999-12-31T23:59:59Z', max-uuid).
+func (q *Queries) ListAndamentosByProcesso(ctx context.Context, arg ListAndamentosByProcessoParams) ([]ListAndamentosByProcessoRow, error) {
+	rows, err := q.db.Query(ctx, listAndamentosByProcesso,
+		arg.CourtRecordID,
+		arg.TenantID,
+		arg.LastOccurred,
+		arg.LastID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAndamentosByProcessoRow
+	for rows.Next() {
+		var i ListAndamentosByProcessoRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.OccurredAt,
+			&i.ObservedAt,
+			&i.TpuCode,
+			&i.Text,
+			&i.Source,
+			&i.Fidelity,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listIntimacoes = `-- name: ListIntimacoes :many

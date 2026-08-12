@@ -29,6 +29,7 @@ type handlerUC interface {
 type reader interface {
 	Processos(ctx context.Context, q ProcessosQuery) (ProcessosResult, error)
 	Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error)
+	Andamentos(ctx context.Context, q AndamentosQuery) (AndamentosResult, error)
 	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error)
 	ReconciliationDetail(ctx context.Context, tenantID, jobID string) (ReconciliationDetailView, error)
@@ -58,6 +59,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/acquisition/reconciliations/:jobId", h.reconciliationDetail)
 	r.Get("/acquisition/sync-runs/:syncRunId/items", h.syncRunItems)
 	r.Get("/processos", h.listProcessos)
+	r.Get("/processos/:id/andamentos", h.listAndamentos)
 	r.Get("/intimacoes", h.listIntimacoes)
 }
 
@@ -69,6 +71,9 @@ const (
 	zeroUUID    = "00000000-0000-0000-0000-000000000000"
 	maxDate     = "9999-12-31"
 	maxUUID     = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+	// maxTimestamp is the descending keyset's first-page sentinel for occurred_at (a
+	// timestamptz, unlike intimações' date column) — above every real andamento.
+	maxTimestamp = "9999-12-31T23:59:59Z"
 )
 
 // integrationView is the read model returned to the client — a per-endpoint DTO.
@@ -223,6 +228,33 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(newIntimacoesPage(res, limit))
 }
 
+// listAndamentos handles GET /v1/processos/:id/andamentos: the "Andamentos" tab of one
+// process — its docket entries, newest first, keyset paginated (?limit, ?cursor). The
+// :id is the court_record id (the same id /processos returns); tenant_id comes from the
+// principal, and the read is tenant-scoped so a foreign :id yields an empty page.
+func (h *Handler) listAndamentos(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	lastOccurred, lastID := maxTimestamp, maxUUID
+	if tok := c.Query("cursor"); tok != "" {
+		cur, err := httpx.DecodeCursor(tok)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		lastOccurred, lastID = cur.LastSortValue, cur.LastID
+	}
+
+	res, err := h.reader.Andamentos(c.UserContext(), AndamentosQuery{
+		TenantID: tenantID, CourtRecordID: c.Params("id"),
+		LastOccurred: lastOccurred, LastID: lastID, Limit: limit,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newAndamentosPage(res, limit))
+}
+
 // newProcessosPage wraps the processos read model in the cursor envelope; the next
 // cursor keys off the last row's (cnj_number, id) and the totals carry "X de Y".
 func newProcessosPage(res ProcessosResult, limit int) httpx.Page[ProcessoView] {
@@ -256,6 +288,26 @@ func newIntimacoesPage(res IntimacoesResult, limit int) httpx.Page[IntimacaoView
 		meta.NextCursor = &tok
 	}
 	return httpx.Page[IntimacaoView]{Data: items, Page: meta}
+}
+
+// newAndamentosPage wraps the andamentos read model in the cursor envelope; the next
+// cursor keys off the last row's (occurred_at, id). There is no search on this tab, so
+// the "X de Y" totals coincide (both the process's andamento count).
+func newAndamentosPage(res AndamentosResult, limit int) httpx.Page[AndamentoView] {
+	items := res.Items
+	if items == nil {
+		items = []AndamentoView{}
+	}
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.Total, Total: res.Total}
+	if res.HasMore && len(items) > 0 {
+		last := items[len(items)-1]
+		tok := httpx.EncodeCursor(httpx.Cursor{
+			LastID:        last.ID,
+			LastSortValue: last.OccurredAt.Format(time.RFC3339Nano),
+		})
+		meta.NextCursor = &tok
+	}
+	return httpx.Page[AndamentoView]{Data: items, Page: meta}
 }
 
 // newListEnvelope maps entities to the client-facing envelope. The data slice is
