@@ -137,10 +137,22 @@ func run(logger *slog.Logger) error {
 		acquisition.NewReadUseCase(acquisitionRepo),
 	)
 
-	// Deadline wiring: the slice's HTTP surface is read-only at this fatia (the prazos
-	// screens). The creation path is event-driven and lives in the worker, so the api
-	// mounts only the pool-backed read handler — no write use case, no outbox here.
-	deadlineHandler := deadline.NewReadHandler(deadline.NewReadUseCase(deadline.NewReadRepository(pool)))
+	// Deadline wiring: the slice's HTTP surface is the prazos screen reads (pool-backed)
+	// PLUS the F2 confirmation write (POST /prazos/confirm, §9). The confirm runs on the
+	// transactional path, so it needs the write use case's deps (sqlc repo + judicial
+	// calendar + shared outbox + dedup + unit of work) — the same composition the worker's
+	// creation listener uses. The event-driven creation path still lives in the worker.
+	deadlineWriteUC := deadline.NewUseCase(
+		deadline.NewRepository(),
+		calendar.New(calendar.NewStore(pool)),
+		events.NewOutbox(),
+		deadline.NewDedup(),
+		uow,
+	)
+	deadlineHandler := deadline.NewHandler(
+		deadline.NewReadUseCase(deadline.NewReadRepository(pool)),
+		deadlineWriteUC,
+	)
 
 	// Billing wiring: the slice owns the domain; the binary only assembles it
 	// (repo + Stripe gateway + shared outbox + dedup + unit of work + checkout

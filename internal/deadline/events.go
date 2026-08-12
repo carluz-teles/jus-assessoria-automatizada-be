@@ -293,3 +293,86 @@ func newDeadlineMissed(tenantID, deadlineID string) DeadlineMissed {
 		DeadlineID: deadlineID,
 	}
 }
+
+// TypeDeadlineUpdated is the dotted id this slice PRODUCES when the F2 human confirmation
+// flips a prazo PENDING→OPEN with the recomputed dates (docs/erd-prazos.md §7: deadline.updated
+// {deadline_id, ...} — ajuste humano no F2). Same "deadline" prefix/routing as deadline.opened;
+// downstream read models refresh the prazo (now OPEN, confirmed) on it.
+const TypeDeadlineUpdated = "deadline.updated"
+
+// DeadlineUpdated announces a confirmed prazo: the recomputed Kind/EndDate/Counting and the
+// new Status (OPEN). It carries what a consumer needs without reading the row back. The
+// aggregate is the deadline, so its stream orders by the deadline id; Base carries the event
+// id (consumer dedup) and that aggregate id.
+type DeadlineUpdated struct {
+	events.Base
+	DeadlineID string `json:"deadline_id"`
+	Kind       string `json:"kind"`
+	EndDate    string `json:"end_date"`
+	Counting   string `json:"counting"`
+	Status     string `json:"status"`
+}
+
+var _ events.Event = DeadlineUpdated{}
+
+func (DeadlineUpdated) Type() string          { return TypeDeadlineUpdated }
+func (DeadlineUpdated) AggregateType() string { return aggregateTypeDeadline }
+
+// newDeadlineUpdated builds the produced event from the confirmed prazo. aggregate_id is the
+// deadline id (a uuid, satisfying the outbox's uuid NOT NULL); the event id is a fresh uuid v7
+// (the consumer dedup key), mirroring newDeadlineOpened.
+func newDeadlineUpdated(d ConfirmedDeadline) DeadlineUpdated {
+	return DeadlineUpdated{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: d.ID},
+		DeadlineID: d.ID,
+		Kind:       d.Kind,
+		EndDate:    d.EndDate.Format(time.DateOnly),
+		Counting:   string(d.Counting),
+		Status:     string(d.Status),
+	}
+}
+
+// TypeTaskCreated is the dotted id this slice PRODUCES per task at the F2 confirmation
+// (docs/erd-prazos.md §7: task.created {task_id, deadline_id?, court_record_id, due_date,
+// assignee_user_id?} — a aprovação grava deadline (1) e task (N) na MESMA tx). Its "task"
+// prefix routes it to the default work at the relay; its consumer (task read models /
+// "meus prazos") is a later slice, so it is an orphan-for-now, which is safe.
+const TypeTaskCreated = "task.created"
+
+// aggregateTypeTask places task.created on the TASK aggregate (its own stream), unlike the
+// deadline.* facts which order by the deadline id.
+const aggregateTypeTask = "task"
+
+// TaskCreated announces one freshly created action item. DueDate is the wire date
+// (2006-01-02), omitted when the task has none; AssigneeUserID is omitted when unassigned.
+// The aggregate is the task, so its stream orders by the task id.
+type TaskCreated struct {
+	events.Base
+	TaskID         string `json:"task_id"`
+	DeadlineID     string `json:"deadline_id"`
+	CourtRecordID  string `json:"court_record_id"`
+	DueDate        string `json:"due_date,omitempty"`
+	AssigneeUserID string `json:"assignee_user_id,omitempty"`
+}
+
+var _ events.Event = TaskCreated{}
+
+func (TaskCreated) Type() string          { return TypeTaskCreated }
+func (TaskCreated) AggregateType() string { return aggregateTypeTask }
+
+// newTaskCreated builds the produced event from the persisted task. aggregate_id is the task
+// id (a uuid, satisfying the outbox's uuid NOT NULL); the event id is a fresh uuid v7 (the
+// consumer dedup key). DueDate is formatted only when set, so an undated task emits no date.
+func newTaskCreated(t ConfirmedTask) TaskCreated {
+	ev := TaskCreated{
+		Base:           events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: t.ID},
+		TaskID:         t.ID,
+		DeadlineID:     t.DeadlineID,
+		CourtRecordID:  t.CourtRecordID,
+		AssigneeUserID: t.AssigneeUserID,
+	}
+	if t.DueDate != nil {
+		ev.DueDate = t.DueDate.Format(time.DateOnly)
+	}
+	return ev
+}

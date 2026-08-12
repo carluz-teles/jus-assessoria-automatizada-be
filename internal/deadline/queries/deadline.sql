@@ -57,6 +57,71 @@ INSERT INTO deadline (
 ON CONFLICT (notification_id) DO NOTHING
 RETURNING id;
 
+-- name: GetDeadlineForConfirm :one
+-- Load a PENDING prazo's confirmation anchor — the F2 "Aprovar tudo" (§9) reads it
+-- BEFORE the recompute: start_date is the fixed anchor of the calendar math (=
+-- intimation.deadline_start_at, already persisted at derivation), court_record_id feeds
+-- both the court lookup (for the recompute UF) and the inserted tasks. Keyed by the 1:1
+-- notification_id (=intimation id) and scoped to tenant_id (barrier 1, on top of RLS
+-- barrier 2). A missing prazo → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper,
+-- never (nil, nil): confirming an intimação with no derived prazo is a 404 at the edge.
+-- $1 = intimation_id (the notification_id column), $2 = tenant_id (from the principal).
+SELECT id, court_record_id, start_date
+FROM deadline
+WHERE notification_id = $1 AND tenant_id = $2;
+
+-- name: GetCourtRecordCourt :one
+-- Read the court sigla for the record the prazo hangs on — the confirmation recompute
+-- derives the UF from it (pkg/tribunal.UF) for the state-holiday calendar lookup, the
+-- confirm-path counterpart of GetCourtRecordClass. Scoped to tenant_id (barrier 1). A
+-- missing record → pgx.ErrNoRows → typed not-found at the mapper. court is NOT NULL.
+-- $1 = id, $2 = tenant_id, both from the trusted principal's request context.
+SELECT court
+FROM court_record
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: ConfirmDeadline :one
+-- The F2 confirmation (§9: "Aprovar tudo" grava o deadline PENDING→OPEN recalculado).
+-- Flips the prazo to OPEN with the human-approved {kind, days, counting, doubled,
+-- doubled_reason} and the RECOMPUTED {end_date, holidays_applied}, stamping who/when
+-- (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
+-- 1). IDEMPOTENT on the deadline: re-confirming the same intimação re-UPDATEs the one row
+-- (the 1:1 notification_id) — it never opens a second prazo. source/start_date/
+-- rules_version are LEFT AS-IS: source keeps its provenance (RULE/AI), start_date is the
+-- fixed anchor, and rules_version still records which rule set first derived the prazo
+-- even when the human overrode the days. A no-match (no prazo for the intimação) yields
+-- NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id, $2 =
+-- tenant_id, then the confirmed fields.
+UPDATE deadline
+SET status           = 'OPEN',
+    kind             = $3,
+    days             = $4,
+    counting         = $5,
+    doubled          = $6,
+    doubled_reason   = $7,
+    end_date         = $8,
+    holidays_applied = $9,
+    confirmed_by     = $10,
+    confirmed_at     = $11
+WHERE notification_id = $1 AND tenant_id = $2
+RETURNING id, court_record_id;
+
+-- name: InsertTask :one
+-- Persist one F2 action item (§4: 1 legal prazo → N tasks, gravadas na MESMA tx do
+-- confirm). Born status='OPEN', source='MANUAL' (a human created it at confirmation —
+-- AI-suggested tasks are a later slice). All FKs but tenant_id are nullable per the 0024
+-- schema, but confirm always fills court_record_id/deadline_id/intimation_id/created_by
+-- (the prazo's context); assignee_user_id/due_date/description/kind are optional. Returns
+-- the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
+INSERT INTO task (
+    tenant_id, court_record_id, deadline_id, intimation_id,
+    title, description, kind, due_date, status, source, assignee_user_id, created_by
+) VALUES (
+    $1, $2, $3, $4,
+    $5, $6, $7, $8, $9, $10, $11, $12
+)
+RETURNING id;
+
 -- name: GetDeadlineForCheck :one
 -- Re-read a prazo at a scheduled mark's fire time (deadline.reminder_check): the CURRENT
 -- status the fire handler branches on, plus the end_date and the context (kind, counting,

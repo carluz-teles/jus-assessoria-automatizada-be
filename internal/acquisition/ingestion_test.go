@@ -11,6 +11,7 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/pkg/tribunal"
 )
 
 type stubDiarioFetcher struct {
@@ -53,15 +54,15 @@ func TestIngestionScheduler_RequestDay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RequestDay: %v", err)
 	}
-	if n != len(tribunais) {
-		t.Fatalf("requested = %d, want %d (one per tribunal)", n, len(tribunais))
+	if n != len(tribunal.Tribunais) {
+		t.Fatalf("requested = %d, want %d (one per tribunal)", n, len(tribunal.Tribunais))
 	}
-	if len(outbox.published) != len(tribunais) {
-		t.Fatalf("published = %d events, want %d", len(outbox.published), len(tribunais))
+	if len(outbox.published) != len(tribunal.Tribunais) {
+		t.Fatalf("published = %d events, want %d", len(outbox.published), len(tribunal.Tribunais))
 	}
 
-	seenTribunal := make(map[string]bool, len(tribunais))
-	seenEventID := make(map[string]bool, len(tribunais))
+	seenTribunal := make(map[string]bool, len(tribunal.Tribunais))
+	seenEventID := make(map[string]bool, len(tribunal.Tribunais))
 	for _, ev := range outbox.published {
 		dr, ok := ev.(DiarioRequested)
 		if !ok {
@@ -85,8 +86,8 @@ func TestIngestionScheduler_RequestDay(t *testing.T) {
 		seenEventID[dr.EventID] = true
 		seenTribunal[dr.Tribunal] = true
 	}
-	if len(seenTribunal) != len(tribunais) {
-		t.Errorf("distinct tribunais = %d, want %d", len(seenTribunal), len(tribunais))
+	if len(seenTribunal) != len(tribunal.Tribunais) {
+		t.Errorf("distinct tribunais = %d, want %d", len(seenTribunal), len(tribunal.Tribunais))
 	}
 }
 

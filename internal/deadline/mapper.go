@@ -55,6 +55,43 @@ func parseUUID(s string) (uuid.UUID, error) {
 	return id, nil
 }
 
+// pgUUID lifts a REQUIRED id string to a valid pgtype.UUID — for a nullable uuid column
+// (e.g. task.deadline_id/court_record_id/created_by) that confirm always fills. A
+// malformed value is the same infra fault parseUUID reports.
+func pgUUID(s string) (pgtype.UUID, error) {
+	id, err := parseUUID(s)
+	if err != nil {
+		return pgtype.UUID{}, err
+	}
+	return pgtype.UUID{Bytes: [16]byte(id), Valid: true}, nil
+}
+
+// pgOptionalUUID lifts an OPTIONAL id to a pgtype.UUID: an empty string is SQL NULL
+// (the invalid zero value), anything else is parsed. task.assignee_user_id is the case —
+// a task may be unassigned.
+func pgOptionalUUID(s string) (pgtype.UUID, error) {
+	if s == "" {
+		return pgtype.UUID{}, nil
+	}
+	return pgUUID(s)
+}
+
+// pgOptionalDate lifts an OPTIONAL civil date to a pgtype.Date: nil is SQL NULL,
+// otherwise the date (time-of-day irrelevant). task.due_date is the case — a task may
+// carry no own date.
+func pgOptionalDate(t *time.Time) pgtype.Date {
+	if t == nil {
+		return pgtype.Date{}
+	}
+	return pgtype.Date{Time: *t, Valid: true}
+}
+
+// pgTimestamptz lifts a wall-clock time to a valid pgtype.Timestamptz — for confirmed_at,
+// stamped at confirmation (never NULL on this path).
+func pgTimestamptz(t time.Time) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: t, Valid: true}
+}
+
 // marshalHolidays encodes the skipped-days audit as a jsonb array of "2006-01-02"
 // strings — human-legible in the row (the whole point of holidays_applied: "por que
 // dia 14?"). An empty slice becomes "[]" so the column never holds JSON null.

@@ -17,6 +17,7 @@ import (
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/obs"
+	"github.com/jusassessoria/platform/pkg/tribunal"
 )
 
 // sync.go is the consumer of acquisition.sync_requested: one window of an
@@ -808,7 +809,7 @@ func newIntimationObserved(ev SyncRequested, n IntimationChange) IntimationObser
 		CaseID:          n.CaseID,
 		IntimationType:  n.Type,
 		Court:           n.Court,
-		UF:              ufFromTribunal(n.Court),
+		UF:              tribunal.UF(n.Court),
 		DeadlineStartAt: n.DeadlineStartAt,
 	}
 }

@@ -63,14 +63,35 @@ func (r *recordingReader) Prazo(_ context.Context, tenantID, id string) (PrazoDe
 	return r.detailView, r.detailErr
 }
 
-// newApp builds an app whose /v1 group mirrors production: Auth resolves a principal
-// with the given tenant, then the deadline read routes mount under it.
+// recordingWriter implements the handler's writer port, capturing the confirm command the
+// handler forwards and returning a canned result/error.
+type recordingWriter struct {
+	gotCmd ConfirmCommand
+	calls  int
+	res    ConfirmResult
+	err    error
+}
+
+func (w *recordingWriter) Confirm(_ context.Context, cmd ConfirmCommand) (ConfirmResult, error) {
+	w.calls++
+	w.gotCmd = cmd
+	return w.res, w.err
+}
+
+// newApp builds an app whose /v1 group mirrors production: Auth resolves a principal with
+// the given tenant, then the deadline routes mount under it. It uses a throwaway writer —
+// the read tests never hit the confirm route; newAppWithWriter injects a specific one.
 func newApp(rd reader, tenant string) *fiber.App {
+	return newAppWithWriter(rd, &recordingWriter{}, tenant)
+}
+
+// newAppWithWriter is newApp with an explicit writer, for the confirm-route tests.
+func newAppWithWriter(rd reader, wr writer, tenant string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{tenant: tenant}))
-	NewReadHandler(rd).RegisterV1(v1)
+	NewHandler(rd, wr).RegisterV1(v1)
 	return app
 }
 
@@ -372,5 +393,128 @@ func TestHandler_GetPrazo_NotFound_404(t *testing.T) {
 	}
 	if !strings.Contains(body, string(apperr.KindNotFound)) {
 		t.Errorf("body missing kind %q\ngot: %s", apperr.KindNotFound, body)
+	}
+}
+
+// --- POST /v1/prazos/confirm -------------------------------------------------
+
+// doJSON drives one request with a JSON body through app, returning status and raw body.
+func doJSON(t *testing.T, app *fiber.App, method, path, bearer, body string) (int, string) {
+	t.Helper()
+
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	if bearer != "" {
+		req.Header.Set(fiber.HeaderAuthorization, "Bearer "+bearer)
+	}
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, string(raw)
+}
+
+// The confirm handler takes tenant_id/confirmed_by from the PRINCIPAL (never the body),
+// forwards the mapped command, and returns 200 with the confirmed prazo.
+func TestHandler_Confirm_ForwardsCommandFromPrincipal(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{res: ConfirmResult{Deadline: ConfirmedDeadline{ID: "d-1", Status: StatusOpen}}}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	body := `{"intimation_id":"018f0000-0000-7000-8000-000000000abc",
+		"deadline":{"kind":"CONTESTACAO","days":15,"counting":"BUSINESS","doubled":false},
+		"tasks":[{"title":"Contestar","due_date":"2024-02-01"}]}`
+	status, resBody := doJSON(t, app, http.MethodPost, "/v1/prazos/confirm", "jwt", body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
+	}
+	if wr.calls != 1 {
+		t.Fatalf("writer calls = %d, want 1", wr.calls)
+	}
+	cmd := wr.gotCmd
+	if cmd.TenantID != "tenant-9" || cmd.UserID != "u-1" {
+		t.Errorf("tenant/user = %q/%q, want tenant-9/u-1 (from principal)", cmd.TenantID, cmd.UserID)
+	}
+	if cmd.IntimationID != "018f0000-0000-7000-8000-000000000abc" || cmd.Days != 15 || cmd.Counting != CountingBusiness {
+		t.Errorf("command = %+v", cmd)
+	}
+	if len(cmd.Tasks) != 1 || cmd.Tasks[0].Title != "Contestar" || cmd.Tasks[0].DueDate == nil {
+		t.Errorf("tasks = %+v, want one dated 'Contestar'", cmd.Tasks)
+	}
+	if !strings.Contains(resBody, `"id":"d-1"`) || !strings.Contains(resBody, `"status":"OPEN"`) {
+		t.Errorf("response missing confirmed deadline\ngot: %s", resBody)
+	}
+}
+
+// A malformed body (bad counting, non-positive days, empty task title, bad uuid) is a 400
+// with the {kind,...} envelope, and the use case is never called.
+func TestHandler_Confirm_Validation_400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"bad counting", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":15,"counting":"WEEKLY"},"tasks":[]}`},
+		{"days zero", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":0,"counting":"BUSINESS"},"tasks":[]}`},
+		{"empty task title", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[{"title":""}]}`},
+		{"bad intimation id", `{"intimation_id":"not-a-uuid","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[]}`},
+		{"bad due_date", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[{"title":"x","due_date":"01/02/2024"}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			wr := &recordingWriter{}
+			app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+			status, body := doJSON(t, app, http.MethodPost, "/v1/prazos/confirm", "jwt", tt.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+			}
+			if wr.calls != 0 {
+				t.Errorf("writer calls = %d, want 0 (rejected at the edge)", wr.calls)
+			}
+		})
+	}
+}
+
+// The use case's typed ErrDeadlineNotFound (no prazo for the intimação) surfaces as 404.
+func TestHandler_Confirm_NotFound_404(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{err: ErrDeadlineNotFound}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	body := `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[]}`
+	status, resBody := doJSON(t, app, http.MethodPost, "/v1/prazos/confirm", "jwt", body)
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", status, resBody)
+	}
+	if !strings.Contains(resBody, string(apperr.KindNotFound)) {
+		t.Errorf("body missing kind %q\ngot: %s", apperr.KindNotFound, resBody)
+	}
+}
+
+// No bearer token → 401 at the auth boundary; the confirm handler never runs.
+func TestHandler_Confirm_NoToken_401(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	status, _ := doJSON(t, app, http.MethodPost, "/v1/prazos/confirm", "",
+		`{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[]}`)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if wr.calls != 0 {
+		t.Errorf("writer calls = %d, want 0 (blocked at auth)", wr.calls)
 	}
 }

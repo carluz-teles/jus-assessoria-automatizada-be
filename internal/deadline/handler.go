@@ -10,11 +10,12 @@ import (
 	"github.com/jusassessoria/platform/lib/httpx"
 )
 
-// handler.go is the deadline slice's HTTP read surface — the prazos screen reads that
-// destravam the Prazos tab and the /prazos agenda. It is READ-ONLY at this slice: the
-// creation path is event-driven (listener.go) and every mutation (confirm/met/missed/
-// revoke) is a later fatia. The slice owns its routing; cmd/api only composes by calling
-// RegisterV1. tenant_id always comes from the verified principal, never the path/query.
+// handler.go is the deadline slice's HTTP surface — the prazos screen reads (the Prazos
+// tab and the /prazos agenda) PLUS the F2 confirmation write (POST /prazos/confirm, the
+// coração do produto, §9). The creation path stays event-driven (listener.go); PATCH/
+// met/missed and task CRUD are later fatias. The slice owns its routing; cmd/api only
+// composes by calling RegisterV1. tenant_id always comes from the verified principal,
+// never the path/query/body.
 
 // reader is the narrow port the Handler uses from the read use case — the keyset-
 // paginated prazos reads plus the single-prazo detail.
@@ -24,26 +25,36 @@ type reader interface {
 	Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
 }
 
-// Handler is the deadline HTTP read surface. It owns its routing; the api only composes
-// by calling RegisterV1.
+// writer is the narrow port the Handler uses from the write use case — the single F2
+// confirmation entry point. It is deliberately separate from reader (and from the read
+// use case): the confirm runs on the transactional write path, the reads on the pool.
+type writer interface {
+	Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResult, error)
+}
+
+// Handler is the deadline HTTP surface. It owns its routing; the api only composes by
+// calling RegisterV1.
 type Handler struct {
 	reader reader
+	writer writer
 }
 
-// NewReadHandler wires the read handler to the prazos read use case. It is named for the
-// read side deliberately: the slice's write surface (confirm/adjust, a later fatia) will
-// mount its own routes without colliding with this.
-func NewReadHandler(reader reader) *Handler {
-	return &Handler{reader: reader}
+// NewHandler wires the handler to the prazos read use case and the F2 confirmation write
+// use case. Both are injected as narrow ports so the binary composes them (the api mounts
+// this handler once) and tests substitute fakes.
+func NewHandler(reader reader, writer writer) *Handler {
+	return &Handler{reader: reader, writer: writer}
 }
 
-// RegisterV1 mounts the prazos read routes on the /v1 group. All three are open to any
-// authenticated principal of the tenant (scoped to its own prazos). The api calls this
-// once — adding the slice's HTTP surface is one line of composition.
+// RegisterV1 mounts the prazos routes on the /v1 group: three reads open to any
+// authenticated principal of the tenant (scoped to its own prazos), plus the F2 write
+// POST /prazos/confirm. The api calls this once — adding the slice's HTTP surface is one
+// line of composition.
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/processos/:id/prazos", h.listPrazosByProcesso)
 	r.Get("/prazos", h.listPrazos)
 	r.Get("/prazos/:id", h.getPrazo)
+	r.Post("/prazos/confirm", h.confirmPrazo)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending scan (soonest vencimento
@@ -132,6 +143,35 @@ func (h *Handler) getPrazo(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(view)
 }
 
+// confirmPrazo handles POST /v1/prazos/confirm: the F2 "Aprovar tudo" (§9). It validates
+// the body, then confirms the prazo (PENDING→OPEN, recomputed) and creates the N tasks in
+// one tx, returning 200 with the confirmed prazo + created tasks. tenant_id and
+// confirmed_by come from the verified principal, never the body — so the write cannot be
+// spoofed onto another tenant. A missing prazo for the intimação is the use case's typed
+// ErrDeadlineNotFound → 404; a bad body is a 400 with the {kind,message,details} envelope.
+func (h *Handler) confirmPrazo(c *fiber.Ctx) error {
+	var req ConfirmRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		// The route mounts under Auth, so this is defensive: no principal → treat as
+		// unauthenticated rather than confirming with an empty tenant.
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	res, err := h.writer.Confirm(c.UserContext(), req.toCommand(p.TenantID, p.UserID))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newConfirmResponse(res))
+}
+
 // isKnownStatus reports whether s is a member of the closed prazo status set (the DB
 // CHECK enforces the same set). An unknown ?status is rejected at the edge rather than
 // silently returning an empty page.
@@ -155,6 +195,103 @@ func validateOptionalDate(s string) (string, error) {
 		return "", apperr.NewInvalid("invalid date filter (want YYYY-MM-DD)")
 	}
 	return s, nil
+}
+
+// confirmResponse is the POST /prazos/confirm payload: the confirmed prazo + the created
+// tasks. It is a purpose-built write DTO (not the read-model detail view — that is 5b's
+// concern), so the F2 screen can render the result without a follow-up read.
+type confirmResponse struct {
+	Deadline confirmedDeadlineView `json:"deadline"`
+	Tasks    []confirmedTaskView   `json:"tasks"`
+}
+
+// confirmedDeadlineView is the confirmed prazo in the response — the recomputed,
+// human-approved fact with its auditable holidays_applied.
+type confirmedDeadlineView struct {
+	ID              string    `json:"id"`
+	CourtRecordID   string    `json:"court_record_id"`
+	IntimationID    string    `json:"intimation_id"`
+	Kind            string    `json:"kind"`
+	Days            int       `json:"days"`
+	Counting        string    `json:"counting"`
+	Doubled         bool      `json:"doubled"`
+	DoubledReason   string    `json:"doubled_reason"`
+	Status          string    `json:"status"`
+	StartDate       time.Time `json:"start_date"`
+	EndDate         time.Time `json:"end_date"`
+	HolidaysApplied []string  `json:"holidays_applied"`
+	ConfirmedBy     string    `json:"confirmed_by"`
+}
+
+// confirmedTaskView is one created task in the response, with its DB-assigned id. due_date
+// is the wire date (omitted when the task has none); assignee_user_id is omitted when
+// unassigned.
+type confirmedTaskView struct {
+	ID             string `json:"id"`
+	DeadlineID     string `json:"deadline_id"`
+	CourtRecordID  string `json:"court_record_id"`
+	IntimationID   string `json:"intimation_id"`
+	Title          string `json:"title"`
+	Description    string `json:"description,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+	DueDate        string `json:"due_date,omitempty"`
+	Status         string `json:"status"`
+	Source         string `json:"source"`
+	AssigneeUserID string `json:"assignee_user_id,omitempty"`
+}
+
+// newConfirmResponse maps the use case's ConfirmResult to the client-facing payload. The
+// holidays audit and the wire dates are formatted here; the Tasks slice is always
+// initialized so an empty result serializes as [] rather than null.
+func newConfirmResponse(res ConfirmResult) confirmResponse {
+	d := res.Deadline
+	tasks := make([]confirmedTaskView, 0, len(res.Tasks))
+	for _, t := range res.Tasks {
+		tv := confirmedTaskView{
+			ID:             t.ID,
+			DeadlineID:     t.DeadlineID,
+			CourtRecordID:  t.CourtRecordID,
+			IntimationID:   t.IntimationID,
+			Title:          t.Title,
+			Description:    t.Description,
+			Kind:           t.Kind,
+			Status:         string(t.Status),
+			Source:         string(t.Source),
+			AssigneeUserID: t.AssigneeUserID,
+		}
+		if t.DueDate != nil {
+			tv.DueDate = t.DueDate.Format(time.DateOnly)
+		}
+		tasks = append(tasks, tv)
+	}
+	return confirmResponse{
+		Deadline: confirmedDeadlineView{
+			ID:              d.ID,
+			CourtRecordID:   d.CourtRecordID,
+			IntimationID:    d.IntimationID,
+			Kind:            d.Kind,
+			Days:            d.Days,
+			Counting:        string(d.Counting),
+			Doubled:         d.Doubled,
+			DoubledReason:   d.DoubledReason,
+			Status:          string(d.Status),
+			StartDate:       d.StartDate,
+			EndDate:         d.EndDate,
+			HolidaysApplied: formatDates(d.HolidaysApplied),
+			ConfirmedBy:     d.ConfirmedBy,
+		},
+		Tasks: tasks,
+	}
+}
+
+// formatDates renders the holidays audit as wire dates (2006-01-02), always a non-nil
+// slice so it serializes as [] not null.
+func formatDates(days []time.Time) []string {
+	out := make([]string, 0, len(days))
+	for _, d := range days {
+		out = append(out, d.Format(time.DateOnly))
+	}
+	return out
 }
 
 // newPrazosByProcessoPage wraps the Prazos-tab read model in the cursor envelope; the
