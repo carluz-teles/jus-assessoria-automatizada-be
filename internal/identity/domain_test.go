@@ -25,6 +25,7 @@ type mockRepo struct {
 	findActiveUser   func(ctx context.Context, clerkUserID string) (*AppUser, error)
 	getMe            func(ctx context.Context, clerkUserID string) (*Me, error)
 	updateOrgProfile func(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error)
+	listOrgMembers   func(ctx context.Context, tenantID string) ([]OrgMember, error)
 }
 
 func (m *mockRepo) UpsertTenant(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error) {
@@ -69,6 +70,10 @@ func (m *mockRepo) GetMeByClerkUser(ctx context.Context, clerkUserID string) (*M
 
 func (m *mockRepo) UpdateOrgProfile(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error) {
 	return m.updateOrgProfile(ctx, tx, tenantID, profile)
+}
+
+func (m *mockRepo) ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error) {
+	return m.listOrgMembers(ctx, tenantID)
 }
 
 // fakeUOW is a no-op unit of work: it records the RLS scope the use case asked
@@ -859,6 +864,56 @@ func TestUseCase_GetOrgProfile(t *testing.T) {
 		}
 
 		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).GetOrgProfile(ctx, tenantID)
+		if !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
+		}
+	})
+}
+
+func TestUseCase_ListOrgMembers(t *testing.T) {
+	ctx := context.Background()
+	const tenantID = "tenant-uuid"
+
+	// A plain read model passthrough: the use case forwards the principal's tenant and
+	// returns the repo's members verbatim, opening no tx. The ACTIVE-only / tenant filter
+	// is enforced in the query (covered by the integration test); here we prove the
+	// delegation and scoping.
+	t.Run("returns the tenant's members, forwarding the scope and opening no tx", func(t *testing.T) {
+		want := []OrgMember{
+			{ID: "u-1", Name: "Dra. Ana", Email: "ana@e.com", Role: RoleAdmin},
+			{ID: "u-2", Name: "Dr. Bruno", Email: "bruno@e.com", Role: RoleLawyer},
+		}
+		var gotTenantID string
+		repo := &mockRepo{
+			listOrgMembers: func(_ context.Context, tid string) ([]OrgMember, error) {
+				gotTenantID = tid
+				return want, nil
+			},
+		}
+		uow := &fakeUOW{}
+
+		got, err := NewUseCase(repo, noopOutbox{}, uow).ListOrgMembers(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("ListOrgMembers() error = %v", err)
+		}
+		if len(got) != 2 || got[0].ID != "u-1" || got[1].Role != RoleLawyer {
+			t.Fatalf("members = %+v, want the repo's two rows verbatim", got)
+		}
+		if gotTenantID != tenantID {
+			t.Fatalf("repo scoped to tenant %q, want %q (from the principal)", gotTenantID, tenantID)
+		}
+		if uow.called {
+			t.Fatal("unit of work opened for a pool read")
+		}
+	})
+
+	t.Run("an infra error from the repo propagates", func(t *testing.T) {
+		boom := errors.New("db down")
+		repo := &mockRepo{
+			listOrgMembers: func(context.Context, string) ([]OrgMember, error) { return nil, boom },
+		}
+
+		_, err := NewUseCase(repo, noopOutbox{}, &fakeUOW{}).ListOrgMembers(ctx, tenantID)
 		if !errors.Is(err, boom) {
 			t.Fatalf("error = %v, want %v", err, boom)
 		}

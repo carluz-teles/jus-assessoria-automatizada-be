@@ -67,6 +67,18 @@ type mockRepo struct {
 	markTaskStatusID  string
 	markTaskStatusErr error
 
+	// task_item write path (checklist / subtarefas, 0031)
+	ensureTaskErr    error
+	nextItemPosition int
+	nextItemPosErr   error
+	insertedItem     *TaskItem
+	insertItemErr    error
+	itemForUpdate    *TaskItemForUpdate
+	itemForUpdateErr error
+	updatedItem      *TaskItem
+	updateItemErr    error
+	deleteItemErr    error
+
 	// captured inputs
 	gotClassTenantID      string
 	gotClassRecordID      string
@@ -121,6 +133,22 @@ type mockRepo struct {
 	gotMarkTaskTo         TaskStatus
 	gotMarkTaskCompleted  *time.Time
 	markTaskStatusCalls   int
+	gotEnsureTaskID       string
+	gotEnsureTenantID     string
+	ensureTaskCalls       int
+	gotNextPosTaskID      string
+	nextPosCalls          int
+	insertedItems         []*TaskItem
+	insertItemCalls       int
+	gotItemForUpdateID    string
+	gotItemForUpdateTask  string
+	itemForUpdateCalls    int
+	gotUpdateItemParams   UpdateTaskItemParams
+	updateItemCalls       int
+	gotDeleteItemID       string
+	gotDeleteItemTask     string
+	gotDeleteItemTenant   string
+	deleteItemCalls       int
 }
 
 func (m *mockRepo) GetCourtRecordClass(_ context.Context, _ database.Tx, tenantID, courtRecordID string) (string, error) {
@@ -290,6 +318,74 @@ func (m *mockRepo) MarkTaskStatus(_ context.Context, _ database.Tx, taskID, tena
 		return "", m.markTaskStatusErr
 	}
 	return m.markTaskStatusID, nil
+}
+
+// EnsureTaskInTenant records the (task, tenant) guard scoping and returns the configured error
+// (nil = the parent task exists), so a checklist-create test can assert the parent guard runs first.
+func (m *mockRepo) EnsureTaskInTenant(_ context.Context, _ database.Tx, taskID, tenantID string) error {
+	m.ensureTaskCalls++
+	m.gotEnsureTaskID = taskID
+	m.gotEnsureTenantID = tenantID
+	return m.ensureTaskErr
+}
+
+// NextTaskItemPosition returns the configured append slot, recording the task it was asked for.
+func (m *mockRepo) NextTaskItemPosition(_ context.Context, _ database.Tx, taskID, _ string) (int, error) {
+	m.nextPosCalls++
+	m.gotNextPosTaskID = taskID
+	if m.nextItemPosErr != nil {
+		return 0, m.nextItemPosErr
+	}
+	return m.nextItemPosition, nil
+}
+
+// InsertTaskItem records the inserted item and echoes back the configured saved item (with its id),
+// mirroring how the DB would return the row.
+func (m *mockRepo) InsertTaskItem(_ context.Context, _ database.Tx, item *TaskItem) (*TaskItem, error) {
+	m.insertItemCalls++
+	m.insertedItems = append(m.insertedItems, item)
+	if m.insertItemErr != nil {
+		return nil, m.insertItemErr
+	}
+	if m.insertedItem != nil {
+		return m.insertedItem, nil
+	}
+	saved := *item
+	saved.ID = uuid.NewString()
+	return &saved, nil
+}
+
+// GetTaskItemForUpdate returns the configured editable state, recording the (item, task) scoping so
+// a patch test can assert the cross-task guard key.
+func (m *mockRepo) GetTaskItemForUpdate(_ context.Context, _ database.Tx, itemID, taskID, _ string) (*TaskItemForUpdate, error) {
+	m.itemForUpdateCalls++
+	m.gotItemForUpdateID = itemID
+	m.gotItemForUpdateTask = taskID
+	if m.itemForUpdateErr != nil {
+		return nil, m.itemForUpdateErr
+	}
+	return m.itemForUpdate, nil
+}
+
+// UpdateTaskItem records the merged params (the caller-derived done_at included) and returns the
+// configured saved item, so a patch test can assert the merge + done_at logic.
+func (m *mockRepo) UpdateTaskItem(_ context.Context, _ database.Tx, p UpdateTaskItemParams) (*TaskItem, error) {
+	m.updateItemCalls++
+	m.gotUpdateItemParams = p
+	if m.updateItemErr != nil {
+		return nil, m.updateItemErr
+	}
+	return m.updatedItem, nil
+}
+
+// DeleteTaskItem records the (item, task, tenant) scoping and returns the configured error, so a
+// delete test can assert the 404-on-miss and the barrier key.
+func (m *mockRepo) DeleteTaskItem(_ context.Context, _ database.Tx, itemID, taskID, tenantID string) error {
+	m.deleteItemCalls++
+	m.gotDeleteItemID = itemID
+	m.gotDeleteItemTask = taskID
+	m.gotDeleteItemTenant = tenantID
+	return m.deleteItemErr
 }
 
 // fakeCalendar records which motor was called (business vs calendar) and the args, and

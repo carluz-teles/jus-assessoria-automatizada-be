@@ -119,6 +119,28 @@ type Repository interface {
 	// terminal one, or one not yet overdue touches no row and returns ErrDeadlineNotFound.
 	// On a hit it returns the missed prazo's id so deadline.missed commits in the same tx.
 	MarkMissed(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
+	// EnsureTaskInTenant guards the checklist writes: it confirms the parent task exists in the
+	// tenant (POST /v1/tasks/:id/items) before any item write, scoped to tenantID (barrier 1). A
+	// missing/foreign task id is ErrTaskItemNotFound (→ 404), so an item can never be grafted onto
+	// another tenant's — or a non-existent — task.
+	EnsureTaskInTenant(ctx context.Context, tx database.Tx, taskID, tenantID string) error
+	// NextTaskItemPosition returns the append slot for a new checklist item (one past the current
+	// max, 0 when empty), scoped to (taskID, tenantID). It keeps appended items ordered last.
+	NextTaskItemPosition(ctx context.Context, tx database.Tx, taskID, tenantID string) (int, error)
+	// InsertTaskItem persists one checklist item (born done=false) inside the caller's tx and
+	// returns it with its DB-assigned id. Scoping is via the entity's TenantID + RLS.
+	InsertTaskItem(ctx context.Context, tx database.Tx, item *TaskItem) (*TaskItem, error)
+	// GetTaskItemForUpdate loads a checklist item's editable {title, done} by (itemID, taskID),
+	// scoped to tenantID (barrier 1). Binding taskID means an item under a different task is a
+	// miss. A missing item is ErrTaskItemNotFound (→ 404), never (nil, nil).
+	GetTaskItemForUpdate(ctx context.Context, tx database.Tx, itemID, taskID, tenantID string) (*TaskItemForUpdate, error)
+	// UpdateTaskItem writes the merged {title, done, done_at} keyed by (item, task, tenant)
+	// (barrier 1); position/created_at are left as-is. A no-match is ErrTaskItemNotFound. Returns
+	// the full saved item so the handler renders it without a re-read.
+	UpdateTaskItem(ctx context.Context, tx database.Tx, p UpdateTaskItemParams) (*TaskItem, error)
+	// DeleteTaskItem removes one checklist item keyed by (item, task, tenant) (barrier 1). A
+	// no-match (foreign/unknown item) is ErrTaskItemNotFound (→ 404), never a silent no-op.
+	DeleteTaskItem(ctx context.Context, tx database.Tx, itemID, taskID, tenantID string) error
 	// RevokeDeadlineByIntimation cancels the prazo derived from the intimação (keyed by
 	// the 1:1 notification_id), scoped to tenantID (barrier 1). The UPDATE's status <>
 	// CANCELLED guard makes it idempotent: when it touches no row — no prazo for the

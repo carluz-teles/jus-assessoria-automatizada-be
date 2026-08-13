@@ -209,3 +209,62 @@ func TestSync_IntimationCancelled_OnTransition(t *testing.T) {
 		t.Fatalf("intimation.observed outbox rows = %d, want 1 (the transition emits no new observed)", observed)
 	}
 }
+
+// II3 — CORRECTNESS CRITICAL: a re-observação of an intimação the user already RESOLVED
+// must NOT reset its user_status back to PENDING. The sync upsert flips the DJEN `status`
+// (ACTIVE/CANCELLED) but must leave the triagem `user_status` untouched. Sequence:
+// (1) first sync lands the intimação PENDING; (2) the user resolves it (RESOLVED);
+// (3) a second sync re-arrives with the SAME hash (still ACTIVE) — the upsert runs its
+// UPDATE branch; (4) user_status is STILL RESOLVED, and DJEN status STILL ACTIVE.
+func TestSync_ReobservationPreservesUserStatus(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-inti-triage", 0)
+	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+
+	parser := &scriptedParser{result: intimationFixture(acquisition.IntimationStatusActive, "")}
+	syncUC := newSyncUCWithParser(pool, parser)
+
+	// (1) First sync — the intimação lands. Its user_status defaults to PENDING.
+	if err := syncUC.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	var intiID, userStatus string
+	if err := pool.QueryRow(ctx,
+		`SELECT id::text, user_status FROM intimation WHERE tenant_id=$1 AND hash=$2`,
+		tenantID, "intim-evt-1").Scan(&intiID, &userStatus); err != nil {
+		t.Fatalf("read seeded intimation: %v", err)
+	}
+	if userStatus != acquisition.IntimationUserStatusPending {
+		t.Fatalf("fresh intimation user_status = %q, want PENDING (column default)", userStatus)
+	}
+
+	// (2) The user resolves it, through the real write use case (tx + RLS).
+	writeUC := acquisition.NewUseCase(
+		acquisition.NewRepository(pool), events.NewOutbox(), database.NewUnitOfWork(pool))
+	if err := writeUC.ResolveIntimacao(ctx, tenantID, intiID); err != nil {
+		t.Fatalf("ResolveIntimacao: %v", err)
+	}
+
+	// (3) A second sync brings the SAME hash again (still ACTIVE) → the upsert UPDATE runs.
+	parser.result = intimationFixture(acquisition.IntimationStatusActive, "")
+	if err := syncUC.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
+		t.Fatalf("re-sync: %v", err)
+	}
+
+	// (4) The re-observação did NOT clobber the user's decision: user_status stays RESOLVED,
+	// while the DJEN status is still ACTIVE (the upsert touched it, unchanged).
+	var afterUserStatus, afterStatus string
+	if err := pool.QueryRow(ctx,
+		`SELECT user_status, status FROM intimation WHERE tenant_id=$1 AND hash=$2`,
+		tenantID, "intim-evt-1").Scan(&afterUserStatus, &afterStatus); err != nil {
+		t.Fatalf("read intimation after re-sync: %v", err)
+	}
+	if afterUserStatus != acquisition.IntimationUserStatusResolved {
+		t.Fatalf("user_status after re-sync = %q, want RESOLVED preserved (re-observação must NOT reset triagem)", afterUserStatus)
+	}
+	if afterStatus != acquisition.IntimationStatusActive {
+		t.Fatalf("DJEN status after re-sync = %q, want ACTIVE", afterStatus)
+	}
+}

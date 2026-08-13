@@ -49,4 +49,10 @@ var (
 	// cannot transition again. CONFLICT (→ 409), distinct from the 404 miss — the task exists,
 	// but its current status forbids the flip. It mirrors ErrDeadlineNotOpen (same guard shape).
 	ErrTaskNotOpen = apperr.NewConflict("task transition requires an OPEN task")
+
+	// ErrTaskItemNotFound — the requested checklist item resolves to no row under the parent
+	// task in the tenant (PATCH/DELETE /v1/tasks/:id/items/:itemId), OR the parent task itself
+	// is unknown/foreign on a create (POST /v1/tasks/:id/items). Typed not-found (→ 404), never
+	// (nil, nil): a foreign or cross-task itemId is a client-facing miss, not a swallowed empty.
+	ErrTaskItemNotFound = apperr.NewNotFound("task item not found")
 )

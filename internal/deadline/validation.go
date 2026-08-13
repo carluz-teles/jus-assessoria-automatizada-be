@@ -239,6 +239,57 @@ func (r UpdateTaskRequest) toUpdateCommand(tenantID, taskID string) UpdateTaskCo
 	}
 }
 
+// CreateTaskItemRequest is the POST /v1/tasks/:id/items body (§4/§10): one checklist item. Title
+// is the only user input and is required; tenant_id + the task id come from the principal + path,
+// and position/done are server-set (appended last, done=false).
+type CreateTaskItemRequest struct {
+	Title string `json:"title"`
+}
+
+// Validate enforces the one edge rule: a non-empty title. A failure is a 400 at the edge.
+func (r CreateTaskItemRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Title, validation.Required),
+	)
+}
+
+// toCommand maps the validated request + the principal's tenant + the path task id into the
+// use-case command. TenantID/TaskID come from the principal + path (never the body).
+func (r CreateTaskItemRequest) toCommand(tenantID, taskID string) CreateTaskItemCommand {
+	return CreateTaskItemCommand{TenantID: tenantID, TaskID: taskID, Title: r.Title}
+}
+
+// UpdateTaskItemRequest is the PATCH /v1/tasks/:id/items/:itemId body (§4/§10): the partial edit
+// of a checklist item. Both fields are POINTERS so an ABSENT field keeps its stored value: a nil
+// Done keeps the tick, a nil Title keeps the label. done_at is derived from Done server-side, so
+// it is not accepted.
+type UpdateTaskItemRequest struct {
+	Title *string `json:"title"`
+	Done  *bool   `json:"done"`
+}
+
+// Validate enforces the edge rule for the fields that ARE present: a present title must be
+// non-empty (a nil title is a no-op — the stored value is kept). done is a bool toggle with no
+// constraint.
+func (r UpdateTaskItemRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Title, validation.By(nonEmptyIfPresent)),
+	)
+}
+
+// toCommand maps the validated request + the principal's tenant + the path ids into the use-case
+// command. TenantID/TaskID/ItemID come from the principal + path (never the body); the pointer
+// fields carry through so the use case merges only what was present.
+func (r UpdateTaskItemRequest) toCommand(tenantID, taskID, itemID string) UpdateTaskItemCommand {
+	return UpdateTaskItemCommand{
+		TenantID: tenantID,
+		TaskID:   taskID,
+		ItemID:   itemID,
+		Title:    r.Title,
+		Done:     r.Done,
+	}
+}
+
 // uuidIfPresent rejects a PRESENT, non-empty, malformed uuid; an empty value is a no-op (an
 // absent optional id). It backs the CREATE body's optional context FKs + assignee.
 func uuidIfPresent(value any) error {

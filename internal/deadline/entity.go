@@ -109,6 +109,72 @@ const (
 	TaskStatusDismissed TaskStatus = "DISMISSED"
 )
 
+// TaskItem is one checklist step of a task (docs/erd-prazos.md §4/§10, the Tarefas screen):
+// a small, orderable, tickable subtarefa ("Ler intimação", "Redigir", …). 1 task → N items
+// (task_item, migration 0031, ON DELETE CASCADE). Position orders the checklist; Done is the
+// tick, DoneAt stamped when it flips true and cleared when it flips false. entity.go holds only
+// the aggregate + value types (no repo/lib import).
+type TaskItem struct {
+	ID        string
+	TenantID  string
+	TaskID    string
+	Title     string
+	Position  int
+	Done      bool
+	DoneAt    *time.Time
+	CreatedAt time.Time
+}
+
+// TaskProgress is a task's checklist tally — Done ticked of Total items. It feeds both the
+// detail view's progress bar and the derived DisplayStatus (any item done ⇒ "Em execução").
+// An empty checklist is {0, 0}.
+type TaskProgress struct {
+	Done  int `json:"done"`
+	Total int `json:"total"`
+}
+
+// DisplayStatus is the presentation status the Tarefas screen buckets a task by — DERIVED
+// (not stored) from the task's lifecycle status, its checklist progress, and its due_date.
+// It is a closed set of Portuguese labels the FE renders directly. A DISMISSED task has NO
+// display bucket (it is dispensada, out of the cockpit), so DisplayStatus returns "" for it.
+type DisplayStatus string
+
+const (
+	DisplayAberta     DisplayStatus = "Aberta"
+	DisplayEmExecucao DisplayStatus = "Em execução"
+	DisplayConcluida  DisplayStatus = "Concluída"
+	DisplayAtrasada   DisplayStatus = "Atrasada"
+)
+
+// deriveDisplayStatus is the SINGLE source of truth for a task's presentation status, reused
+// by the detail view, the list rows and the tasks/summary buckets — so a task shows the same
+// status everywhere. The rules (docs: the Tarefas screen), evaluated in order:
+//   - DONE                          → Concluída (a completion trumps everything);
+//   - OPEN & due_date < today       → Atrasada (overdue beats in-progress);
+//   - OPEN & some checklist item done → Em execução;
+//   - OPEN & no item done            → Aberta;
+//   - DISMISSED                       → "" (no bucket — dispensada is out of the cockpit).
+//
+// `now` is the reference day (the caller passes the same clock the read model uses); only the
+// calendar day matters, so a due_date is "past" strictly before today.
+func deriveDisplayStatus(status TaskStatus, progress TaskProgress, dueDate *time.Time, now time.Time) DisplayStatus {
+	switch status {
+	case TaskStatusDone:
+		return DisplayConcluida
+	case TaskStatusOpen:
+		if dueDate != nil && startOfDay(*dueDate).Before(startOfDay(now)) {
+			return DisplayAtrasada
+		}
+		if progress.Done > 0 {
+			return DisplayEmExecucao
+		}
+		return DisplayAberta
+	default:
+		// DISMISSED — no display bucket.
+		return ""
+	}
+}
+
 // DeadlineForConfirm is the thin anchor read the F2 confirmation loads BEFORE the
 // recompute (GetDeadlineForConfirm), keyed by the 1:1 intimação: the prazo id, the
 // record it hangs on (feeds the court lookup + the tasks), and the fixed StartDate the

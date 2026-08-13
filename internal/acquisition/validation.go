@@ -4,6 +4,7 @@ import (
 	"regexp"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
+	"github.com/go-ozzo/ozzo-validation/v4/is"
 )
 
 // oabRegex matches an OAB registration: a two-letter uppercase UF followed by 1–6
@@ -33,6 +34,25 @@ func (r ActivateIntegrationRequest) Validate() error {
 			validation.Each(validation.In(SourceDJEN)),
 		),
 		validation.Field(&r.Scope),
+	)
+}
+
+// AssignResponsibleRequest is the PUT /v1/processos/:id/responsavel body: the user to
+// make responsável for the process, or null to desatribuir. UserID is a *string so the
+// caller can send an explicit null (unset the responsável) distinctly from omitting it.
+// tenant_id is NOT here — it comes from the verified principal. Membership (the user
+// belongs to the escritório) is a domain check under the tx, not a boundary rule.
+type AssignResponsibleRequest struct {
+	UserID *string `json:"user_id"`
+}
+
+// Validate enforces the boundary rule via ozzo: WHEN a user_id is present it must be a
+// well-formed uuid (a bad shape is a 400 at the edge, before any DB hop). A nil user_id is
+// valid — it is desatribuir. Whether that uuid names a real member is a domain concern the
+// use case checks under the tx (ErrResponsibleNotMember), not a shape rule here.
+func (r AssignResponsibleRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.UserID, is.UUID),
 	)
 }
 

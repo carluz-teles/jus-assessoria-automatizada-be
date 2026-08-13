@@ -154,6 +154,52 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (AppUser, error
 	return i, err
 }
 
+const listOrgMembers = `-- name: ListOrgMembers :many
+SELECT u.id, u.name, u.email, m.role
+FROM membership m
+JOIN app_user u ON u.id = m.app_user_id AND u.tenant_id = m.tenant_id
+WHERE m.tenant_id = $1 AND m.status = 'ACTIVE'
+ORDER BY u.name, u.id
+`
+
+type ListOrgMembersRow struct {
+	ID    uuid.UUID `json:"id"`
+	Name  *string   `json:"name"`
+	Email string    `json:"email"`
+	Role  string    `json:"role"`
+}
+
+// The escritório's team for the responsável selector (and the /organization members
+// list): every ACTIVE membership of the tenant, joined to its app_user for name/email.
+// Tenant-scoped by m.tenant_id (barrier 1; RLS is barrier 2 on both tables). Only ACTIVE
+// rows — a soft-removed member drops out. The role is the membership's own copy (kept in
+// lockstep with app_user.role by organizationMembership.updated). Ordered by name so the
+// selector is stable; the team is small, so no cursor.
+func (q *Queries) ListOrgMembers(ctx context.Context, tenantID uuid.UUID) ([]ListOrgMembersRow, error) {
+	rows, err := q.db.Query(ctx, listOrgMembers, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOrgMembersRow
+	for rows.Next() {
+		var i ListOrgMembersRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Email,
+			&i.Role,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const softRemoveMembership = `-- name: SoftRemoveMembership :one
 UPDATE membership
    SET status = 'REMOVED',

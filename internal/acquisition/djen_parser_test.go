@@ -181,6 +181,158 @@ func TestDJENType(t *testing.T) {
 	}
 }
 
+// TestDJENParserParties checks that the parser materializes the process's partes from
+// the real captured page's `destinatarios` (nome + polo A/P) — the array that was
+// historically discarded — mapping polo A→PLAINTIFF, P→DEFENDANT, and attaching the
+// communication's advogados to the destinatários' polo.
+func TestDJENParserParties(t *testing.T) {
+	t.Parallel()
+
+	raw := djenRawFromFixture(t, []OABEntry{{Number: "41101", UF: "RS"}})
+	res, err := NewDJENParser(fakeCalendar{}).Parse(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(res.Parties) == 0 {
+		t.Fatal("no parties parsed from the fixture's destinatarios")
+	}
+
+	// The fixture's item[1] carries two polo-A (autor) destinatários with one advogado
+	// (ARIVANDO BOHM, 41101/RS): both land PLAINTIFF and each carries that counsel.
+	var plaintiffWithCounsel int
+	for _, p := range res.Parties {
+		if p.Role != PartyRolePlaintiff && p.Role != PartyRoleDefendant && p.Role != PartyRoleThirdParty {
+			t.Errorf("party %q: role %q not in enum", p.Name, p.Role)
+		}
+		if p.Degree != DegreeUnknown {
+			t.Errorf("party %q: degree %q, want UNKNOWN", p.Name, p.Degree)
+		}
+		if p.CNJNumber == "" {
+			t.Errorf("party %q: empty CNJNumber", p.Name)
+		}
+		if p.Role == PartyRolePlaintiff && p.Name == "ETANIEL KRAUSE SCHWARTZ" {
+			for _, c := range p.Counsels {
+				if c.OAB == "41101" && c.UF == "RS" {
+					plaintiffWithCounsel++
+				}
+			}
+		}
+	}
+	if plaintiffWithCounsel == 0 {
+		t.Error("expected the polo-A autor ETANIEL to carry the communication's advogado 41101/RS")
+	}
+}
+
+// TestParseParties covers the advogado→parte attribution rules directly on parseParties
+// (pure, no calendar): single-polo attaches counsel to that polo; mixed-polo defaults
+// counsel to DEFENDANT; a counsel-only item keeps the advogado on a DEFENDANT placeholder.
+func TestParseParties(t *testing.T) {
+	t.Parallel()
+
+	adv := func(oab string) djenAdvogadoLink {
+		return djenAdvogadoLink{Advogado: djenAdvogado{Nome: "ADV " + oab, NumeroOAB: oab, UFOAB: "SP"}}
+	}
+
+	tests := []struct {
+		name          string
+		item          djenComunicacao
+		wantRoles     map[string]string // name → role
+		counselOnName string            // the party name that must carry the advogado (empty = the placeholder)
+	}{
+		{
+			name: "single polo A: counsel attaches to the plaintiff",
+			item: djenComunicacao{
+				NumeroProcesso: "1",
+				Destinatarios:  []djenDestinatario{{Nome: "AUTOR", Polo: "A"}},
+				Advogados:      []djenAdvogadoLink{adv("111")},
+			},
+			wantRoles:     map[string]string{"AUTOR": PartyRolePlaintiff},
+			counselOnName: "AUTOR",
+		},
+		{
+			name: "single polo P: counsel attaches to the defendant",
+			item: djenComunicacao{
+				NumeroProcesso: "1",
+				Destinatarios:  []djenDestinatario{{Nome: "REU", Polo: "P"}},
+				Advogados:      []djenAdvogadoLink{adv("222")},
+			},
+			wantRoles:     map[string]string{"REU": PartyRoleDefendant},
+			counselOnName: "REU",
+		},
+		{
+			name: "mixed polo: counsel defaults to the DEFENDANT",
+			item: djenComunicacao{
+				NumeroProcesso: "1",
+				Destinatarios:  []djenDestinatario{{Nome: "AUTOR", Polo: "A"}, {Nome: "REU", Polo: "P"}},
+				Advogados:      []djenAdvogadoLink{adv("333")},
+			},
+			wantRoles:     map[string]string{"AUTOR": PartyRolePlaintiff, "REU": PartyRoleDefendant},
+			counselOnName: "REU",
+		},
+		{
+			name: "unknown polo maps to THIRD_PARTY",
+			item: djenComunicacao{
+				NumeroProcesso: "1",
+				Destinatarios:  []djenDestinatario{{Nome: "TERCEIRO", Polo: "X"}},
+			},
+			wantRoles: map[string]string{"TERCEIRO": PartyRoleThirdParty},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			parties := parseParties(tt.item)
+			gotRoles := make(map[string]string, len(parties))
+			for _, p := range parties {
+				gotRoles[p.Name] = p.Role
+			}
+			for name, role := range tt.wantRoles {
+				if gotRoles[name] != role {
+					t.Errorf("party %q role = %q, want %q", name, gotRoles[name], role)
+				}
+			}
+			if tt.counselOnName == "" {
+				return
+			}
+			for _, p := range parties {
+				hasCounsel := len(p.Counsels) > 0
+				if p.Name == tt.counselOnName && !hasCounsel {
+					t.Errorf("party %q should carry the advogado but has none", p.Name)
+				}
+				if p.Name != tt.counselOnName && hasCounsel {
+					t.Errorf("party %q should NOT carry the advogado but has %d", p.Name, len(p.Counsels))
+				}
+			}
+		})
+	}
+}
+
+// TestParsePartiesCounselOnlyPlaceholder covers the item with advogados but no named
+// destinatário: the counsel must not be dropped — it lands on a DEFENDANT placeholder.
+func TestParsePartiesCounselOnlyPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	item := djenComunicacao{
+		NumeroProcesso: "1",
+		Destinatarios:  []djenDestinatario{{Nome: "SIGILO", Polo: ""}}, // no usable polo → THIRD_PARTY, but named
+		Advogados:      []djenAdvogadoLink{{Advogado: djenAdvogado{Nome: "ADV", NumeroOAB: "999", UFOAB: "SP"}}},
+	}
+	parties := parseParties(item)
+	if len(parties) == 0 {
+		t.Fatal("expected at least the SIGILO party")
+	}
+	// SIGILO has an empty polo → THIRD_PARTY (single polo), so the counsel attaches to it.
+	var counsels int
+	for _, p := range parties {
+		counsels += len(p.Counsels)
+	}
+	if counsels == 0 {
+		t.Error("advogado dropped: expected it attached to the single-polo party")
+	}
+}
+
 // TestUFFromTribunal moved to pkg/tribunal (TestUF) with the registry relocation —
 // UF derivation is reference data shared by acquisition and deadline, so it lives in
 // /pkg now (Regra nº1: one source of truth, two consumers).

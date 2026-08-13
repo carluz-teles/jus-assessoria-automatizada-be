@@ -118,6 +118,76 @@ func (uc *UseCase) ListIntegrations(ctx context.Context, tenantID string) ([]*In
 	return uc.repo.List(ctx, tenantID)
 }
 
+// AssignResponsible sets (or clears, when assignedUserID is nil) the responsável on the
+// court_case behind a court_record, in ONE transaction (UoW → SET LOCAL app.tenant_id, so
+// RLS is a second barrier under the explicit tenant filters). The FE addresses the process
+// by its court_record :id, so the write first hops record → case (a foreign/unknown id →
+// ErrProcessoNotFound, → 404), then — for a non-null assignee — guards that the target user
+// is an app_user of this same escritório (else ErrResponsibleNotMember, so a process cannot
+// be pinned on someone outside the tenant), and finally writes the assignment. A nil
+// assignee is desatribuir and skips the membership guard.
+//
+// No outbox event here: there is no consumer yet — auditoria/evento (who reassigned, when)
+// is a future slice. When that lands, the event publishes in THIS same tx (transactional
+// outbox), so the assignment and its audit fact commit together.
+//
+// tenantID comes from the verified principal, never the body. The caller re-reads the
+// ProcessoView afterwards (the read path) so the FE reidrates the header.
+func (uc *UseCase) AssignResponsible(ctx context.Context, tenantID, courtRecordID string, assignedUserID *string) error {
+	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		caseID, err := uc.repo.ResolveCaseIDByCourtRecord(ctx, tx, tenantID, courtRecordID)
+		if err != nil {
+			return err
+		}
+
+		if assignedUserID != nil {
+			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *assignedUserID)
+			if err != nil {
+				return err
+			}
+			if !member {
+				return ErrResponsibleNotMember
+			}
+		}
+
+		return uc.repo.AssignCaseResponsible(ctx, tx, tenantID, caseID, assignedUserID)
+	})
+}
+
+// ResolveIntimacao / IgnoreIntimacao / ReopenIntimacao are the triagem actions the user
+// drives from the inbox: they move ONE intimation's user_status to RESOLVED / IGNORED /
+// PENDING, in a single tx (UoW → SET LOCAL app.tenant_id, RLS as a second barrier under
+// the explicit tenant filter). They write ONLY user_status — the DJEN cancellation
+// `status` is untouched — so the acquisition sync cycle's re-observação upsert (which
+// SETs `status`, never `user_status`) can never clobber the user's decision. A miss or a
+// foreign tenant's id is the repo's typed ErrIntimationNotFound (→ 404); the handler
+// re-reads the detail view afterwards so the FE reidrates the row from the fresh state.
+//
+// No outbox event here: there is no consumer of a triagem fact yet — an audit/derivation
+// event (who resolved, when; a possible prazo effect) is a future slice. When it lands,
+// the event publishes in THIS same tx (transactional outbox). tenantID comes from the
+// verified principal, never the body.
+func (uc *UseCase) ResolveIntimacao(ctx context.Context, tenantID, intimationID string) error {
+	return uc.setIntimacaoUserStatus(ctx, tenantID, intimationID, IntimationUserStatusResolved)
+}
+
+func (uc *UseCase) IgnoreIntimacao(ctx context.Context, tenantID, intimationID string) error {
+	return uc.setIntimacaoUserStatus(ctx, tenantID, intimationID, IntimationUserStatusIgnored)
+}
+
+func (uc *UseCase) ReopenIntimacao(ctx context.Context, tenantID, intimationID string) error {
+	return uc.setIntimacaoUserStatus(ctx, tenantID, intimationID, IntimationUserStatusPending)
+}
+
+// setIntimacaoUserStatus is the shared body of the three triagem actions: one tx that
+// writes the target user_status. Kept private — the caller picks the state via the three
+// verbs above, so an arbitrary status string never reaches the write.
+func (uc *UseCase) setIntimacaoUserStatus(ctx context.Context, tenantID, intimationID, userStatus string) error {
+	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.repo.SetIntimationUserStatus(ctx, tx, tenantID, intimationID, userStatus)
+	})
+}
+
 // checkEntitlement refuses activation when the tenant's ACTIVE court record count
 // already meets or exceeds its billing entitlement's active_process_limit. It
 // reuses GetReconciliationTotals — the same pool read the reconciliations screen

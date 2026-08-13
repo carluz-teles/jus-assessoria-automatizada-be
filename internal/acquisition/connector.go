@@ -87,6 +87,36 @@ type ParsedResult struct {
 	CourtRecords  []ParsedCourtRecord
 	DocketEntries []ParsedDocketEntry
 	Intimations   []ParsedIntimation
+	// Parties are the process's partes (autor/réu/terceiro) with their advogados, as
+	// the source discloses them (DJEN `destinatarios` + `destinatarioadvogados`). Like
+	// the other lists they are keyed to a record by (CNJNumber, Degree); the use case
+	// resolves that to a case_id and upserts them idempotently. DATAJUD never carries
+	// parties (LGPD), so only the DJEN parser fills this.
+	Parties []ParsedParty
+}
+
+// ParsedParty is one party of a process as the source discloses it, with the
+// advogados the same communication addressed. Role is the polo→role mapping
+// (A→PLAINTIFF, P→DEFENDANT, else THIRD_PARTY); Name is the destinatário's nome.
+// It belongs to the record named by (CNJNumber, Degree) and, downstream, to that
+// record's case. The DJEN does not link an advogado to a specific party, so Counsels
+// are the communication's advogados attributed to this party by the ingestion's
+// polo-inference rule (see the note in sync.go) — never invented, and CPF/CNPJ is
+// never fabricated (the party's document stays absent until manual entry).
+type ParsedParty struct {
+	CNJNumber string
+	Degree    string
+	Role      string
+	Name      string
+	Counsels  []ParsedCounsel
+}
+
+// ParsedCounsel is one advogado representing a ParsedParty: nome + OAB (número, UF)
+// as the DJEN `destinatarioadvogados.advogado` discloses them.
+type ParsedCounsel struct {
+	Name string
+	OAB  string
+	UF   string
 }
 
 // ParsedCourtRecord is one court record as the source reports it. CNJNumber and

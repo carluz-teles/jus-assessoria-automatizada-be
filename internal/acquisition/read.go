@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -14,18 +15,24 @@ import (
 // plus its most recent andamento. Nullable columns are pointers so an absent value
 // serializes as JSON null, not a zero.
 type ProcessoView struct {
-	ID               string     `json:"id"`
-	CaseID           string     `json:"case_id"`
-	CNJNumber        string     `json:"cnj_number"`
-	Court            string     `json:"court"`
-	Degree           string     `json:"degree"`
-	Class            string     `json:"class"`
-	Subject          string     `json:"subject"`
-	JudgingBody      string     `json:"judging_body"`
-	FiledAt          *time.Time `json:"filed_at"`
-	Secrecy          string     `json:"secrecy"`
-	Lifecycle        string     `json:"lifecycle"`
-	Completeness     float32    `json:"completeness"`
+	ID           string     `json:"id"`
+	CaseID       string     `json:"case_id"`
+	CNJNumber    string     `json:"cnj_number"`
+	Court        string     `json:"court"`
+	Degree       string     `json:"degree"`
+	Class        string     `json:"class"`
+	Subject      string     `json:"subject"`
+	JudgingBody  string     `json:"judging_body"`
+	FiledAt      *time.Time `json:"filed_at"`
+	Secrecy      string     `json:"secrecy"`
+	Lifecycle    string     `json:"lifecycle"`
+	Completeness float32    `json:"completeness"`
+	ClaimValue   *string    `json:"claim_value"` // valor da causa (numeric); nil (JSON null) when unset
+	// responsável do processo — assigned at case level (court_case), so it is shared
+	// across the process's graus. Both nil (JSON null) when no one is assigned; name
+	// is the app_user.name joined in, so the FE renders the header without a second read.
+	AssignedUserID   *string    `json:"assigned_user_id"`
+	AssignedUserName *string    `json:"assigned_user_name"`
 	LastMovementText string     `json:"last_movement_text"`
 	LastMovementAt   *time.Time `json:"last_movement_at"`
 }
@@ -39,13 +46,52 @@ type IntimacaoView struct {
 	Court           string    `json:"court"`
 	Degree          string    `json:"degree"`
 	Type            string    `json:"type"`
-	Status          string    `json:"status"`
+	Status          string    `json:"status"`      // DJEN cancellation lifecycle (ACTIVE|CANCELLED)
+	UserStatus      string    `json:"user_status"` // triagem state (PENDING|RESOLVED|IGNORED)
 	Source          string    `json:"source"`
 	SourceURL       string    `json:"source_url"`
 	MadeAvailableAt time.Time `json:"made_available_at"`
 	PublishedAt     time.Time `json:"published_at"`
 	DeadlineStartAt time.Time `json:"deadline_start_at"`
 	ContentPreview  string    `json:"content_preview"`
+}
+
+// IntimacaoDetailView is the deep-link detail of one intimation (GET
+// /v1/intimacoes/:id). It embeds the full IntimacaoView (so every list field the FE
+// already renders is present — additive, nothing removed) and adds the detail-only
+// extras the inbox row omits: the FULL teor (not the truncated preview), the court
+// record's órgão julgador, and the addressee list. Recipients is the jsonb column
+// forwarded verbatim (a list of {name, oab, matched}); it defaults to an empty array,
+// never JSON null.
+type IntimacaoDetailView struct {
+	IntimacaoView
+	Content     string          `json:"content"`      // FULL teor (untruncated), for the detail screen
+	JudgingBody string          `json:"judging_body"` // court_record.judging_body (órgão julgador)
+	Recipients  json.RawMessage `json:"recipients"`   // destinatários (jsonb array), verbatim
+}
+
+// ProcessosSummaryView is the KPI header of the processes list (GET
+// /v1/processos/summary): the tenant's process counts bucketed by court_record
+// lifecycle. Baixados has no lifecycle source in v0 (always 0); see SummarizeProcessos.
+type ProcessosSummaryView struct {
+	Total       int64 `json:"total"`
+	EmAndamento int64 `json:"em_andamento"`
+	Suspensos   int64 `json:"suspensos"`
+	Arquivados  int64 `json:"arquivados"`
+	Baixados    int64 `json:"baixados"`
+}
+
+// IntimacoesSummaryView is the KPI header of the intimações inbox (GET
+// /v1/intimacoes/summary): the tenant's intimation counts bucketed by triagem state.
+// EmAnalise and Criticas have no source yet (Fase 3 / prazo derivation) — always 0;
+// see SummarizeIntimacoes.
+type IntimacoesSummaryView struct {
+	Total      int64 `json:"total"`
+	Pendentes  int64 `json:"pendentes"`
+	EmAnalise  int64 `json:"em_analise"`
+	Resolvidas int64 `json:"resolvidas"`
+	Ignoradas  int64 `json:"ignoradas"`
+	Criticas   int64 `json:"criticas"`
 }
 
 // AndamentoView is one row of a process's "Andamentos" tab: a docket entry
@@ -59,6 +105,41 @@ type AndamentoView struct {
 	Text       string    `json:"text"`
 	Source     string    `json:"source"`
 	Fidelity   int       `json:"fidelity"`
+}
+
+// PartyCounselView is one advogado of a party on the cockpit's AUTOR/RÉU cards.
+type PartyCounselView struct {
+	Name string `json:"name"`
+	OAB  string `json:"oab"`
+	UF   string `json:"uf"`
+}
+
+// PartyView is one party (autor/réu/terceiro) with its advogados, for the cockpit's
+// partes cards. Document (CPF/CNPJ) is a pointer so an absent value (always, in v0 —
+// the DJEN never discloses it) serializes as JSON null, not "". Counsels is always an
+// initialized array (never null) so the FE can map over it unconditionally.
+type PartyView struct {
+	Name     string             `json:"name"`
+	Document *string            `json:"document"`
+	Counsels []PartyCounselView `json:"counsels"`
+}
+
+// PartesView is the /processos/:id/partes read: the process's parties bucketed by role
+// for the cockpit's AUTOR/RÉU cards. Terceiros carries THIRD_PARTY and anything the DJEN
+// polo did not map to autor/réu. Each list is always initialized (never null) so a
+// process with no discovered parties serializes as three empty arrays.
+type PartesView struct {
+	Autor     []PartyView `json:"autor"`
+	Reu       []PartyView `json:"reu"`
+	Terceiros []PartyView `json:"terceiros"`
+}
+
+// PartyRow is one party as the read repo returns it — a PartyView plus its role, so the
+// read use case buckets it into the PartesView lists. Kept off PartyView (the wire shape)
+// because the FE reads role implicitly from which bucket the party lands in.
+type PartyRow struct {
+	Role string
+	PartyView
 }
 
 // ProcessosQuery / IntimacoesQuery carry the keyset cursor (the last row's sort key
@@ -246,12 +327,16 @@ const reconciliationRunsLimit = 60
 // and the import-status/reconciliations reads, off the write path.
 type readRepo interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
+	GetProcesso(ctx context.Context, tenantID, id string) (ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
-	GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error)
+	GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoDetailView, error)
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
+	ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	SummarizeProcessos(ctx context.Context, tenantID string) (ProcessosSummaryView, error)
+	SummarizeIntimacoes(ctx context.Context, tenantID string) (IntimacoesSummaryView, error)
 	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	CountIntimacoesByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
@@ -422,6 +507,55 @@ func (uc *ReadUseCase) Intimacoes(ctx context.Context, q IntimacoesQuery) (Intim
 // intimation not on the loaded inbox page). A plain pool read scoped to the tenant — no
 // pagination policy — so it delegates straight to the repo, which maps a miss/foreign
 // row to the typed 404 and a non-uuid id to the typed 400.
-func (uc *ReadUseCase) Intimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error) {
+func (uc *ReadUseCase) Intimacao(ctx context.Context, tenantID, id string) (IntimacaoDetailView, error) {
 	return uc.repo.GetIntimacao(ctx, tenantID, id)
+}
+
+// ProcessosSummary returns the processes list KPI counts (bucketed by lifecycle) for
+// the tenant. A single aggregate read on the pool — a read model, not an aggregate.
+func (uc *ReadUseCase) ProcessosSummary(ctx context.Context, tenantID string) (ProcessosSummaryView, error) {
+	return uc.repo.SummarizeProcessos(ctx, tenantID)
+}
+
+// IntimacoesSummary returns the intimações inbox KPI counts (bucketed by triagem state)
+// for the tenant. A single aggregate read on the pool — a read model, not an aggregate.
+func (uc *ReadUseCase) IntimacoesSummary(ctx context.Context, tenantID string) (IntimacoesSummaryView, error) {
+	return uc.repo.SummarizeIntimacoes(ctx, tenantID)
+}
+
+// Processo returns one process by id for the FE deep-link (open the detail of a process
+// not on the loaded list page). A plain pool read scoped to the tenant — no pagination
+// policy — so it delegates straight to the repo, which maps a miss/foreign row to the
+// typed 404 and a non-uuid id to the typed 400.
+func (uc *ReadUseCase) Processo(ctx context.Context, tenantID, id string) (ProcessoView, error) {
+	return uc.repo.GetProcesso(ctx, tenantID, id)
+}
+
+// Partes returns the process's parties (behind the court_record :id), bucketed by role
+// for the cockpit's AUTOR/RÉU cards. A read model, not an aggregate: one tenant-scoped
+// pool read, then the flat rows are folded into the three role lists. A foreign or
+// unknown :id yields three empty lists (the repo's read resolves no case), never an
+// error — this deep-read has no 404 (the parties tab of an absent process is simply
+// empty). Each bucket is initialized so the payload is three arrays, never null.
+func (uc *ReadUseCase) Partes(ctx context.Context, tenantID, courtRecordID string) (PartesView, error) {
+	rows, err := uc.repo.ListPartesByProcesso(ctx, tenantID, courtRecordID)
+	if err != nil {
+		return PartesView{}, err
+	}
+	view := PartesView{
+		Autor:     []PartyView{},
+		Reu:       []PartyView{},
+		Terceiros: []PartyView{},
+	}
+	for _, row := range rows {
+		switch row.Role {
+		case PartyRolePlaintiff:
+			view.Autor = append(view.Autor, row.PartyView)
+		case PartyRoleDefendant:
+			view.Reu = append(view.Reu, row.PartyView)
+		default:
+			view.Terceiros = append(view.Terceiros, row.PartyView)
+		}
+	}
+	return view, nil
 }

@@ -158,8 +158,20 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(27); err != nil || next != 28 {
 		t.Fatalf("Next(27) = (%d, %v), want (28, nil)", next, err)
 	}
-	if _, err := src.Next(28); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(28) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(28); err != nil || next != 29 {
+		t.Fatalf("Next(28) = (%d, %v), want (29, nil)", next, err)
+	}
+	if next, err := src.Next(29); err != nil || next != 30 {
+		t.Fatalf("Next(29) = (%d, %v), want (30, nil)", next, err)
+	}
+	if next, err := src.Next(30); err != nil || next != 31 {
+		t.Fatalf("Next(30) = (%d, %v), want (31, nil)", next, err)
+	}
+	if next, err := src.Next(31); err != nil || next != 32 {
+		t.Fatalf("Next(31) = (%d, %v), want (32, nil)", next, err)
+	}
+	if _, err := src.Next(32); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(32) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

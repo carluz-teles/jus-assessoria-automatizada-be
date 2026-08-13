@@ -77,6 +77,29 @@ func (q *Queries) ConfirmDeadline(ctx context.Context, arg ConfirmDeadlineParams
 	return i, err
 }
 
+const deleteTaskItem = `-- name: DeleteTaskItem :one
+DELETE FROM task_item
+WHERE id = $1 AND task_id = $2 AND tenant_id = $3
+RETURNING id
+`
+
+type DeleteTaskItemParams struct {
+	ID       uuid.UUID `json:"id"`
+	TaskID   uuid.UUID `json:"task_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Remove one checklist item (DELETE …/items/:itemId), keyed by (id, task_id, tenant_id)
+// (barrier 1). Returns the deleted id so a no-match (foreign/unknown item) → pgx.ErrNoRows →
+// typed ErrTaskItemNotFound at the mapper (→ 404), never a silent 204 on nothing. $1 = id,
+// $2 = task_id, $3 = tenant_id.
+func (q *Queries) DeleteTaskItem(ctx context.Context, arg DeleteTaskItemParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, deleteTaskItem, arg.ID, arg.TaskID, arg.TenantID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const deleteTasksByDeadline = `-- name: DeleteTasksByDeadline :exec
 DELETE FROM task
 WHERE deadline_id = $1 AND tenant_id = $2
@@ -342,6 +365,42 @@ func (q *Queries) GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdatePara
 	return i, err
 }
 
+const getTaskItemForUpdate = `-- name: GetTaskItemForUpdate :one
+SELECT id, task_id, title, done
+FROM task_item
+WHERE id = $1 AND task_id = $2 AND tenant_id = $3
+`
+
+type GetTaskItemForUpdateParams struct {
+	ID       uuid.UUID `json:"id"`
+	TaskID   uuid.UUID `json:"task_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetTaskItemForUpdateRow struct {
+	ID     uuid.UUID `json:"id"`
+	TaskID uuid.UUID `json:"task_id"`
+	Title  string    `json:"title"`
+	Done   bool      `json:"done"`
+}
+
+// Load a checklist item's current {title, done} before the partial PATCH (PATCH
+// /v1/tasks/:id/items/:itemId), keyed by (item id, parent task id) and scoped to tenant_id
+// (barrier 1). Binding task_id too means an itemId under a DIFFERENT task is a miss (→ 404),
+// not a cross-task edit. A missing row → pgx.ErrNoRows → typed ErrTaskItemNotFound at the
+// mapper. $1 = id, $2 = task_id, $3 = tenant_id.
+func (q *Queries) GetTaskItemForUpdate(ctx context.Context, arg GetTaskItemForUpdateParams) (GetTaskItemForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getTaskItemForUpdate, arg.ID, arg.TaskID, arg.TenantID)
+	var i GetTaskItemForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Title,
+		&i.Done,
+	)
+	return i, err
+}
+
 const insertDeadline = `-- name: InsertDeadline :one
 INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
@@ -453,6 +512,53 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UU
 	return id, err
 }
 
+const insertTaskItem = `-- name: InsertTaskItem :one
+INSERT INTO task_item (tenant_id, task_id, title, position)
+VALUES ($1, $2, $3, $4)
+RETURNING id, task_id, title, position, done, done_at, created_at
+`
+
+type InsertTaskItemParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	TaskID   uuid.UUID `json:"task_id"`
+	Title    string    `json:"title"`
+	Position int32     `json:"position"`
+}
+
+type InsertTaskItemRow struct {
+	ID        uuid.UUID          `json:"id"`
+	TaskID    uuid.UUID          `json:"task_id"`
+	Title     string             `json:"title"`
+	Position  int32              `json:"position"`
+	Done      bool               `json:"done"`
+	DoneAt    pgtype.Timestamptz `json:"done_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Append one checklist item to a task (POST /v1/tasks/:id/items). Born done=false (the
+// default), done_at NULL. tenant_id/task_id come from the request context + the guarded
+// parent; position is the computed append slot. Returns the whole row so the handler renders
+// it without a re-read. $1 = tenant_id, $2 = task_id, $3 = title, $4 = position.
+func (q *Queries) InsertTaskItem(ctx context.Context, arg InsertTaskItemParams) (InsertTaskItemRow, error) {
+	row := q.db.QueryRow(ctx, insertTaskItem,
+		arg.TenantID,
+		arg.TaskID,
+		arg.Title,
+		arg.Position,
+	)
+	var i InsertTaskItemRow
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Title,
+		&i.Position,
+		&i.Done,
+		&i.DoneAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const markDeadlineStatus = `-- name: MarkDeadlineStatus :one
 UPDATE deadline
 SET status = $1
@@ -548,6 +654,28 @@ func (q *Queries) MarkTaskStatus(ctx context.Context, arg MarkTaskStatusParams) 
 	return id, err
 }
 
+const nextTaskItemPosition = `-- name: NextTaskItemPosition :one
+SELECT COALESCE(MAX(position) + 1, 0)::int AS next_position
+FROM task_item
+WHERE task_id = $1 AND tenant_id = $2
+`
+
+type NextTaskItemPositionParams struct {
+	TaskID   uuid.UUID `json:"task_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// The position a newly appended checklist item takes: one past the current max within the
+// task (0 when the checklist is empty). Scoped to tenant_id (barrier 1). Keeps positions
+// gap-free-ish on append (the FE may later rewrite them to reorder). $1 = task_id, $2 =
+// tenant_id.
+func (q *Queries) NextTaskItemPosition(ctx context.Context, arg NextTaskItemPositionParams) (int32, error) {
+	row := q.db.QueryRow(ctx, nextTaskItemPosition, arg.TaskID, arg.TenantID)
+	var next_position int32
+	err := row.Scan(&next_position)
+	return next_position, err
+}
+
 const resolveDeadlineRule = `-- name: ResolveDeadlineRule :one
 SELECT rules_version, kind, days, counting, doubled
 FROM deadline_rule
@@ -631,6 +759,34 @@ func (q *Queries) RevokeDeadlineByIntimation(ctx context.Context, arg RevokeDead
 	var i RevokeDeadlineByIntimationRow
 	err := row.Scan(&i.ID, &i.CourtRecordID)
 	return i, err
+}
+
+const taskExistsInTenant = `-- name: TaskExistsInTenant :one
+
+SELECT id
+FROM task
+WHERE id = $1 AND tenant_id = $2
+`
+
+type TaskExistsInTenantParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// ── task_item write path (checklist / subtarefas, §4/§10) ────────────────────
+// The Tarefas screen's checklist: a task grows N ordered items the user ticks off. Every
+// write is keyed by the parent task and scoped to tenant_id (barrier 1, on top of RLS
+// barrier 2). The parent-task guard (TaskExistsInTenant) turns a foreign/unknown task_id
+// into a typed 404 BEFORE any item write, so an item can never be grafted onto another
+// tenant's task.
+// Guard the item writes: does this task exist in the tenant? POST /v1/tasks/:id/items
+// checks it BEFORE inserting so a foreign/unknown :id is a typed ErrTaskNotFound (→ 404) at
+// the mapper, not a phantom item on nothing (or a raw FK error). $1 = id, $2 = tenant_id.
+func (q *Queries) TaskExistsInTenant(ctx context.Context, arg TaskExistsInTenantParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, taskExistsInTenant, arg.ID, arg.TenantID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const updateDeadlineAdjust = `-- name: UpdateDeadlineAdjust :one
@@ -761,6 +917,61 @@ func (q *Queries) UpdateTask(ctx context.Context, arg UpdateTaskParams) (UpdateT
 		&i.AssigneeUserID,
 		&i.CreatedBy,
 		&i.CompletedAt,
+	)
+	return i, err
+}
+
+const updateTaskItem = `-- name: UpdateTaskItem :one
+UPDATE task_item
+SET title   = $4,
+    done    = $5,
+    done_at = $6
+WHERE id = $1 AND task_id = $2 AND tenant_id = $3
+RETURNING id, task_id, title, position, done, done_at, created_at
+`
+
+type UpdateTaskItemParams struct {
+	ID       uuid.UUID          `json:"id"`
+	TaskID   uuid.UUID          `json:"task_id"`
+	TenantID uuid.UUID          `json:"tenant_id"`
+	Title    string             `json:"title"`
+	Done     bool               `json:"done"`
+	DoneAt   pgtype.Timestamptz `json:"done_at"`
+}
+
+type UpdateTaskItemRow struct {
+	ID        uuid.UUID          `json:"id"`
+	TaskID    uuid.UUID          `json:"task_id"`
+	Title     string             `json:"title"`
+	Position  int32              `json:"position"`
+	Done      bool               `json:"done"`
+	DoneAt    pgtype.Timestamptz `json:"done_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Write the merged {title, done, done_at} of a checklist item (PATCH …/items/:itemId),
+// keyed by (id, task_id, tenant_id) (barrier 1). done_at is set/cleared by the use case to
+// match done (a real time when done flips true, NULL when it flips false). A no-match → 404
+// at the mapper. Returns the whole row so the handler renders it without a re-read. $1 = id,
+// $2 = task_id, $3 = tenant_id, $4 = title, $5 = done, $6 = done_at.
+func (q *Queries) UpdateTaskItem(ctx context.Context, arg UpdateTaskItemParams) (UpdateTaskItemRow, error) {
+	row := q.db.QueryRow(ctx, updateTaskItem,
+		arg.ID,
+		arg.TaskID,
+		arg.TenantID,
+		arg.Title,
+		arg.Done,
+		arg.DoneAt,
+	)
+	var i UpdateTaskItemRow
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Title,
+		&i.Position,
+		&i.Done,
+		&i.DoneAt,
+		&i.CreatedAt,
 	)
 	return i, err
 }

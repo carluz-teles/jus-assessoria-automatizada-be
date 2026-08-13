@@ -79,12 +79,16 @@ type PrazoDetailView struct {
 // keyset sort value (COALESCE(due_date, sentinel)) — unexported so it never serializes; the
 // handler reads it to build the next cursor (an undated task's cursor keys off the sentinel).
 type TaskView struct {
-	ID             string     `json:"id"`
-	Title          string     `json:"title"`
-	Description    string     `json:"description,omitempty"`
-	Kind           string     `json:"kind,omitempty"`
-	DueDate        *time.Time `json:"due_date"`
-	Status         string     `json:"status"`
+	ID          string     `json:"id"`
+	Title       string     `json:"title"`
+	Description string     `json:"description,omitempty"`
+	Kind        string     `json:"kind,omitempty"`
+	DueDate     *time.Time `json:"due_date"`
+	Status      string     `json:"status"`
+	// DisplayStatus is the DERIVED presentation status (Aberta|Em execução|Concluída|Atrasada;
+	// "" for a DISMISSED task) the cockpit/agenda bucket the row by — additive to the existing
+	// wire shape, so cockpit and agenda keep consuming Status while the new tabs read this.
+	DisplayStatus  string     `json:"display_status,omitempty"`
 	Source         string     `json:"source"`
 	AssigneeUserID string     `json:"assignee_user_id,omitempty"`
 	DeadlineID     string     `json:"deadline_id,omitempty"`
@@ -92,6 +96,10 @@ type TaskView struct {
 	CourtRecordID  string     `json:"court_record_id,omitempty"`
 	CompletedAt    *time.Time `json:"completed_at"`
 	sortDue        time.Time
+	// doneItems is the count of ticked checklist items for the row, the raw ingredient the
+	// read use case turns into DisplayStatus (any done ⇒ Em execução). Unexported so it never
+	// serializes — the FE reads DisplayStatus, not this count.
+	doneItems int
 }
 
 // newTaskViewFromEntity renders a persisted *Task (the CREATE/PATCH write result) as the shared
@@ -199,6 +207,66 @@ type PrazosResult struct {
 	Total      int64
 }
 
+// TaskItemView is one checklist item on the task detail screen (GET /v1/tasks/:id): the
+// tickable subtarefa in its ordered slot. DoneAt is omitted while the item is undone.
+type TaskItemView struct {
+	ID        string     `json:"id"`
+	Title     string     `json:"title"`
+	Position  int        `json:"position"`
+	Done      bool       `json:"done"`
+	DoneAt    *time.Time `json:"done_at"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+// TaskDetailView is the task detail read model (GET /v1/tasks/:id): the task's own fields, its
+// ordered checklist, the {done, total} progress, and the DERIVED display_status. Items is always
+// a non-nil slice so an itemless task serializes as [] not null.
+type TaskDetailView struct {
+	ID             string         `json:"id"`
+	Title          string         `json:"title"`
+	Description    string         `json:"description,omitempty"`
+	Kind           string         `json:"kind,omitempty"`
+	DueDate        *time.Time     `json:"due_date"`
+	Status         string         `json:"status"`
+	DisplayStatus  string         `json:"display_status,omitempty"`
+	Source         string         `json:"source"`
+	AssigneeUserID string         `json:"assignee_user_id,omitempty"`
+	DeadlineID     string         `json:"deadline_id,omitempty"`
+	IntimationID   string         `json:"intimation_id,omitempty"`
+	CourtRecordID  string         `json:"court_record_id,omitempty"`
+	CompletedAt    *time.Time     `json:"completed_at"`
+	Items          []TaskItemView `json:"items"`
+	Progress       TaskProgress   `json:"progress"`
+}
+
+// PrazosSummary is the prazos KPI read model (GET /v1/prazos/summary), aggregated per tenant
+// from deadline.status + days_left. Thresholds (decisão travada, coherent with PrazoView's
+// urgency semantics — the gold-<3-dias styling): OPEN/PENDING is "aberto"; among those,
+// days_left ≤ 1 is "crítico" and days_left ∈ 0..3 is "vencendo" (both subsets of aberto, not
+// disjoint); a future start (start_date > hoje) is "futuro"; days_left < 0 (or MISSED) is
+// "vencido"; MET is "cumprido". CANCELLED counts only in total. The buckets deliberately
+// OVERLAP (a crítico is also aberto and vencendo) — the FE picks the most urgent label per card.
+type PrazosSummary struct {
+	Total     int `json:"total"`
+	Criticos  int `json:"criticos"`
+	Vencendo  int `json:"vencendo"`
+	Abertos   int `json:"abertos"`
+	Futuros   int `json:"futuros"`
+	Vencidos  int `json:"vencidos"`
+	Cumpridos int `json:"cumpridos"`
+}
+
+// TasksSummary is the tasks KPI read model (GET /v1/tasks/summary), aggregated per tenant using
+// the SAME derivation as display_status: abertas = OPEN, not overdue, no item done; em_execucao =
+// OPEN, not overdue, some item done; concluidas = DONE; atrasadas = OPEN & overdue. DISMISSED is
+// excluded (out of the cockpit), so these four are DISJOINT and sum to the non-dismissed tasks.
+type TasksSummary struct {
+	Abertas    int `json:"abertas"`
+	EmExecucao int `json:"em_execucao"`
+	Concluidas int `json:"concluidas"`
+	Atrasadas  int `json:"atrasadas"`
+}
+
 // readRepo is the narrow read port the ReadUseCase drives — the keyset list reads, the
 // counters and the single-prazo detail. It is deliberately separate from the write
 // Repository (2c): reads run on the pool, off the transactional write path.
@@ -213,18 +281,47 @@ type readRepo interface {
 	CountTasksByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	ListTasks(ctx context.Context, q TasksQuery) ([]TaskView, error)
 	CountTasks(ctx context.Context, q TasksQuery) (totalCount, total int64, err error)
+	// GetTaskDetail reads a task's own fields for the detail view, scoped to tenantID (barrier
+	// 1). A miss is ErrTaskNotFound (→ 404). The checklist + progress are separate reads.
+	GetTaskDetail(ctx context.Context, tenantID, id string) (TaskDetailView, error)
+	// ListTaskItems reads a task's ordered checklist, scoped to (taskID, tenantID). An itemless
+	// task yields an empty slice, never an error.
+	ListTaskItems(ctx context.Context, tenantID, taskID string) ([]TaskItemView, error)
+	// TaskItemProgress reads a task's {done, total} checklist tally, scoped to (taskID, tenantID).
+	TaskItemProgress(ctx context.Context, tenantID, taskID string) (TaskProgress, error)
+	// PrazosSummary reads the tenant's prazos KPI counts (single object). No pagination.
+	PrazosSummary(ctx context.Context, tenantID string) (PrazosSummary, error)
+	// TasksSummary reads the tenant's tasks KPI counts (single object). No pagination.
+	TasksSummary(ctx context.Context, tenantID string) (TasksSummary, error)
 }
 
 // ReadUseCase serves the prazos screen reads. It is a pagination policy over readRepo:
 // it over-fetches one row per page so the handler learns whether more remain without a
-// separate COUNT.
+// separate COUNT. `now` is the reference day the derived display_status compares due_dates
+// against; it defaults to time.Now and is overridable in tests via WithReadClock.
 type ReadUseCase struct {
 	repo readRepo
+	now  func() time.Time
+}
+
+// ReadOption configures a ReadUseCase at construction (functional options, like the write
+// UseCase) so the clock seam can be injected in tests without breaking the positional call.
+type ReadOption func(*ReadUseCase)
+
+// WithReadClock overrides the reference clock the derived display_status uses to decide whether
+// a task's due_date is past. Production leaves the default (time.Now); tests pin it so a given
+// due_date deterministically buckets as Atrasada or not.
+func WithReadClock(now func() time.Time) ReadOption {
+	return func(uc *ReadUseCase) { uc.now = now }
 }
 
 // NewReadUseCase wires the read use case over a read port (the pool-backed read repo).
-func NewReadUseCase(repo readRepo) *ReadUseCase {
-	return &ReadUseCase{repo: repo}
+func NewReadUseCase(repo readRepo, opts ...ReadOption) *ReadUseCase {
+	uc := &ReadUseCase{repo: repo, now: time.Now}
+	for _, opt := range opts {
+		opt(uc)
+	}
+	return uc
 }
 
 // PrazosByProcesso returns up to q.Limit of a process's prazos (soonest first), whether
@@ -308,6 +405,7 @@ func (uc *ReadUseCase) TasksByProcesso(ctx context.Context, q TasksByProcessoQue
 	if err != nil {
 		return TasksByProcessoResult{}, err
 	}
+	uc.decorateDisplayStatus(rows)
 	return TasksByProcessoResult{Items: rows, HasMore: hasMore, Total: total}, nil
 }
 
@@ -329,5 +427,59 @@ func (uc *ReadUseCase) Tasks(ctx context.Context, q TasksQuery) (TasksResult, er
 	if err != nil {
 		return TasksResult{}, err
 	}
+	uc.decorateDisplayStatus(rows)
 	return TasksResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+}
+
+// decorateDisplayStatus fills each row's DERIVED display_status from its (status, done-item
+// count, due_date) against the read use case's clock — the SINGLE derivation the detail view and
+// the summaries also use, so a task's presentation status is identical however it is read. It
+// mutates in place (the rows are the use case's own slice, not shared).
+func (uc *ReadUseCase) decorateDisplayStatus(rows []TaskView) {
+	now := uc.now()
+	for i := range rows {
+		progress := TaskProgress{Done: rows[i].doneItems}
+		rows[i].DisplayStatus = string(deriveDisplayStatus(TaskStatus(rows[i].Status), progress, rows[i].DueDate, now))
+	}
+}
+
+// TaskDetail returns the task detail read model (GET /v1/tasks/:id): the task's own fields, its
+// ordered checklist, the {done, total} progress and the DERIVED display_status. A miss is the
+// repo's typed ErrTaskNotFound (→ 404). The checklist and progress are separate tenant-scoped
+// reads, so an itemless task still resolves (empty checklist, {0,0} progress).
+func (uc *ReadUseCase) TaskDetail(ctx context.Context, tenantID, id string) (TaskDetailView, error) {
+	view, err := uc.repo.GetTaskDetail(ctx, tenantID, id)
+	if err != nil {
+		return TaskDetailView{}, err
+	}
+	items, err := uc.repo.ListTaskItems(ctx, tenantID, id)
+	if err != nil {
+		return TaskDetailView{}, err
+	}
+	progress, err := uc.repo.TaskItemProgress(ctx, tenantID, id)
+	if err != nil {
+		return TaskDetailView{}, err
+	}
+	if items == nil {
+		items = []TaskItemView{}
+	}
+	view.Items = items
+	view.Progress = progress
+	view.DisplayStatus = string(deriveDisplayStatus(TaskStatus(view.Status), progress, view.DueDate, uc.now()))
+	return view, nil
+}
+
+// PrazosSummary returns the tenant's prazos KPI counts (GET /v1/prazos/summary) — a single
+// aggregated object, no pagination. It is a thin pass-through: the buckets are derived in SQL
+// (the counts are cheap and the thresholds documented at PrazosSummary).
+func (uc *ReadUseCase) PrazosSummary(ctx context.Context, tenantID string) (PrazosSummary, error) {
+	return uc.repo.PrazosSummary(ctx, tenantID)
+}
+
+// TasksSummary returns the tenant's tasks KPI counts (GET /v1/tasks/summary) — a single
+// aggregated object, no pagination. The buckets use the same display_status derivation as the
+// detail/list views (computed in SQL against CURRENT_DATE, so the tenant-wide aggregate stays
+// one query rather than scanning every task in Go).
+func (uc *ReadUseCase) TasksSummary(ctx context.Context, tenantID string) (TasksSummary, error) {
+	return uc.repo.TasksSummary(ctx, tenantID)
 }

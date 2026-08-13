@@ -43,6 +43,11 @@ type Querier interface {
 	// The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
 	// any filter.
 	CountTasksByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// Remove one checklist item (DELETE …/items/:itemId), keyed by (id, task_id, tenant_id)
+	// (barrier 1). Returns the deleted id so a no-match (foreign/unknown item) → pgx.ErrNoRows →
+	// typed ErrTaskItemNotFound at the mapper (→ 404), never a silent 204 on nothing. $1 = id,
+	// $2 = task_id, $3 = tenant_id.
+	DeleteTaskItem(ctx context.Context, arg DeleteTaskItemParams) (uuid.UUID, error)
 	// Drop every task of a confirmed prazo, the REPLACE step of the F2 confirm (§9: the
 	// confirm is an "upsert idempotente por intimation_id"). Confirm runs this in the SAME tx
 	// right after ConfirmDeadline and BEFORE re-inserting the submitted tasks, so re-confirming
@@ -100,6 +105,27 @@ type Querier interface {
 	// 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
 	// at the repo, never (nil, nil).
 	GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow, error)
+	// ── KPI summaries (GET /v1/prazos/summary, GET /v1/tasks/summary) ────────────
+	// Single-object read models for the Tarefas/Prazos cockpit KPIs, aggregated per tenant. Both
+	// follow the intimacoes/summary precedent (0030): one query, count(*) FILTER per bucket, no
+	// pagination. The buckets' semantics are documented at the read.go DTOs.
+	// The prazos KPI counts, derived from deadline.status + days_left ((end_date - CURRENT_DATE)),
+	// scoped to tenant_id (barrier 1). The buckets (thresholds documented at PrazosSummary in
+	// read.go): criticos = OPEN/PENDING with days_left <= 1; vencendo = OPEN/PENDING with days_left
+	// in 0..3; abertos = every OPEN/PENDING; futuros = OPEN/PENDING starting in the future
+	// (start_date > today); vencidos = MISSED or an OPEN/PENDING already past (days_left < 0);
+	// cumpridos = MET. CANCELLED is counted only in total. $1 = tenant_id.
+	GetPrazosSummary(ctx context.Context, tenantID uuid.UUID) (GetPrazosSummaryRow, error)
+	// ── task detail + checklist (GET /v1/tasks/:id) ─────────────────────────────
+	// The task detail screen (docs/erd-prazos.md, a Tarefa aberta): the task's own fields + its
+	// ordered checklist + the {done, total} progress the derived display_status reads. All
+	// tenant-scoped (barrier 1). display_status is DERIVED in Go (read.go), not here — the SQL
+	// returns the raw ingredients (status, due_date, and the progress counts).
+	// The task's own fields for the detail view, keyed by id and scoped to tenant_id (barrier 1).
+	// A miss (foreign/unknown id) → pgx.ErrNoRows → typed ErrTaskNotFound (→ 404) at the mapper,
+	// never (nil, nil). The checklist + progress are separate queries (a task with no items still
+	// resolves). $1 = id, $2 = tenant_id.
+	GetTaskDetail(ctx context.Context, arg GetTaskDetailParams) (GetTaskDetailRow, error)
 	// Re-read a task's CURRENT status before a manual transition (§9: POST /v1/tasks/:id/done |
 	// .../dismiss). Keyed by id and scoped to tenant_id (barrier 1). The use case pre-checks the
 	// transition on this status so it can distinguish a 404 miss (ErrTaskNotFound) from a 409
@@ -113,6 +139,22 @@ type Querier interface {
 	// never (nil, nil). $1 = id, $2 = tenant_id (from the principal). status is carried for the
 	// caller even though PATCH never changes it (edit is orthogonal to the lifecycle).
 	GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdateParams) (GetTaskForUpdateRow, error)
+	// Load a checklist item's current {title, done} before the partial PATCH (PATCH
+	// /v1/tasks/:id/items/:itemId), keyed by (item id, parent task id) and scoped to tenant_id
+	// (barrier 1). Binding task_id too means an itemId under a DIFFERENT task is a miss (→ 404),
+	// not a cross-task edit. A missing row → pgx.ErrNoRows → typed ErrTaskItemNotFound at the
+	// mapper. $1 = id, $2 = task_id, $3 = tenant_id.
+	GetTaskItemForUpdate(ctx context.Context, arg GetTaskItemForUpdateParams) (GetTaskItemForUpdateRow, error)
+	// The {done, total} progress of one task's checklist (the detail view's progress bar + the
+	// Em execução signal for display_status). Scoped to (task_id, tenant_id) (barrier 1). An empty
+	// checklist yields {0, 0}. $1 = task_id, $2 = tenant_id.
+	GetTaskItemProgress(ctx context.Context, arg GetTaskItemProgressParams) (GetTaskItemProgressRow, error)
+	// The tasks KPI counts, derived from the SAME display_status logic the detail/list views use,
+	// scoped to tenant_id (barrier 1). em_execucao needs the checklist progress, so a LEFT JOIN
+	// LATERAL folds each task's done-item count in. Buckets (DISMISSED excluded, mirrors the derived
+	// display_status): concluidas = DONE; atrasadas = OPEN with due_date < today; em_execucao = OPEN,
+	// not yet due, with at least one done item; abertas = OPEN, not yet due, no done item. $1 = tenant_id.
+	GetTasksSummary(ctx context.Context, tenantID uuid.UUID) (GetTasksSummaryRow, error)
 	// Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
 	// notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO row on a re-derivation, so
 	// the mapper reads pgx.ErrNoRows as "already exists" (ErrDeadlineExists) instead of
@@ -127,6 +169,11 @@ type Querier interface {
 	// (the prazo's context); assignee_user_id/due_date/description/kind are optional. Returns
 	// the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
 	InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UUID, error)
+	// Append one checklist item to a task (POST /v1/tasks/:id/items). Born done=false (the
+	// default), done_at NULL. tenant_id/task_id come from the request context + the guarded
+	// parent; position is the computed append slot. Returns the whole row so the handler renders
+	// it without a re-read. $1 = tenant_id, $2 = task_id, $3 = title, $4 = position.
+	InsertTaskItem(ctx context.Context, arg InsertTaskItemParams) (InsertTaskItemRow, error)
 	// The global agenda (GET /v1/prazos): the tenant's prazos, soonest vencimento first,
 	// with the process context (cnj_number/court) joined in. Optional filters: @status ('' =
 	// all) and an end_date window [@from_date, @to_date] (NULL = open bound). Ascending
@@ -155,6 +202,9 @@ type Querier interface {
 	// historic column name, migration 0006) — the read model exposes it as intimation_id.
 	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
 	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
+	// One task's checklist, ordered by position (the detail view). Scoped to (task_id, tenant_id)
+	// (barrier 1). An empty checklist is 0 rows (not an error). $1 = task_id, $2 = tenant_id.
+	ListTaskItems(ctx context.Context, arg ListTaskItemsParams) ([]ListTaskItemsRow, error)
 	// The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 	// first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
 	// assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]
@@ -201,6 +251,11 @@ type Querier interface {
 	// transitioned) → pgx.ErrNoRows → typed not-found at the mapper. On a hit it returns the id so
 	// task.completed/task.dismissed commits in the SAME tx.
 	MarkTaskStatus(ctx context.Context, arg MarkTaskStatusParams) (uuid.UUID, error)
+	// The position a newly appended checklist item takes: one past the current max within the
+	// task (0 when the checklist is empty). Scoped to tenant_id (barrier 1). Keeps positions
+	// gap-free-ish on append (the FE may later rewrite them to reorder). $1 = task_id, $2 =
+	// tenant_id.
+	NextTaskItemPosition(ctx context.Context, arg NextTaskItemPositionParams) (int32, error)
 	// Resolve the conservative rule for (intimation_type, court) in a rules version. The
 	// resolution lives HERE, in SQL (decisão travada, erd-prazos.md §8/§11): the most
 	// SPECIFIC active match wins, falling back to the '*' catch-all — so an unknown type
@@ -222,6 +277,16 @@ type Querier interface {
 	// record it hung on) so deadline.revoked commits in the SAME tx. $1 = intimation_id (the
 	// notification_id column), $2 = tenant_id, both from the trusted event payload.
 	RevokeDeadlineByIntimation(ctx context.Context, arg RevokeDeadlineByIntimationParams) (RevokeDeadlineByIntimationRow, error)
+	// ── task_item write path (checklist / subtarefas, §4/§10) ────────────────────
+	// The Tarefas screen's checklist: a task grows N ordered items the user ticks off. Every
+	// write is keyed by the parent task and scoped to tenant_id (barrier 1, on top of RLS
+	// barrier 2). The parent-task guard (TaskExistsInTenant) turns a foreign/unknown task_id
+	// into a typed 404 BEFORE any item write, so an item can never be grafted onto another
+	// tenant's task.
+	// Guard the item writes: does this task exist in the tenant? POST /v1/tasks/:id/items
+	// checks it BEFORE inserting so a foreign/unknown :id is a typed ErrTaskNotFound (→ 404) at
+	// the mapper, not a phantom item on nothing (or a raw FK error). $1 = id, $2 = tenant_id.
+	TaskExistsInTenant(ctx context.Context, arg TaskExistsInTenantParams) (uuid.UUID, error)
 	// Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
 	// patched {kind, days, counting, doubled, doubled_reason} and the RECOMPUTED {end_date,
 	// holidays_applied} (from the fixed start_date), keyed by id and scoped to tenant_id (barrier
@@ -239,6 +304,12 @@ type Querier interface {
 	// ErrTaskNotFound at the mapper. Returns the full task row so the response renders without a
 	// re-read. $1 = id, $2 = tenant_id, then the patched fields.
 	UpdateTask(ctx context.Context, arg UpdateTaskParams) (UpdateTaskRow, error)
+	// Write the merged {title, done, done_at} of a checklist item (PATCH …/items/:itemId),
+	// keyed by (id, task_id, tenant_id) (barrier 1). done_at is set/cleared by the use case to
+	// match done (a real time when done flips true, NULL when it flips false). A no-match → 404
+	// at the mapper. Returns the whole row so the handler renders it without a re-read. $1 = id,
+	// $2 = task_id, $3 = tenant_id, $4 = title, $5 = done, $6 = done_at.
+	UpdateTaskItem(ctx context.Context, arg UpdateTaskItemParams) (UpdateTaskItemRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

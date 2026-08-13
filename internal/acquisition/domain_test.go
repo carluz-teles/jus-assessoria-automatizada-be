@@ -40,6 +40,22 @@ type mockRepo struct {
 	// totals backs GetReconciliationTotals — the entitlement gate's active-count
 	// read. Defaults to the zero value (0 active records).
 	totals ReconciliationTotals
+
+	// Responsável write path (AssignResponsible). resolveCaseID is the case the
+	// record→case hop returns; resolveErr forces the not-found branch. memberOK backs
+	// the membership guard (false → not-a-member). The rest capture what was written.
+	resolveCaseID   string
+	resolveErr      error
+	memberOK        bool
+	assignedCaseID  string
+	assignedUser    *string
+	memberCheckedID string
+
+	// Triagem write path (SetIntimationUserStatus): capture what was written and an
+	// optional canned error to drive the not-found branch.
+	setUserStatusErr    error
+	gotUserStatusIntiID string
+	gotUserStatusValue  string
 }
 
 func (m *mockRepo) GetBySource(_ context.Context, _ database.Tx, _, source string) (*Integration, error) {
@@ -150,6 +166,14 @@ func (m *mockRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []Intim
 	return nil, nil, nil
 }
 
+func (m *mockRepo) UpsertParties(_ context.Context, _ database.Tx, _ []PartyParams) error {
+	return nil
+}
+
+func (m *mockRepo) ListPartesByProcesso(_ context.Context, _, _ string) ([]PartyRow, error) {
+	return nil, nil
+}
+
 func (m *mockRepo) InsertPublications(_ context.Context, _ database.Tx, _ []PublicationParams) (int, error) {
 	return 0, nil
 }
@@ -194,12 +218,40 @@ func (m *mockRepo) ListProcessos(_ context.Context, _ ProcessosQuery) ([]Process
 	return nil, nil
 }
 
+func (m *mockRepo) GetProcesso(_ context.Context, _, _ string) (ProcessoView, error) {
+	return ProcessoView{}, nil
+}
+
+func (m *mockRepo) ResolveCaseIDByCourtRecord(_ context.Context, _ database.Tx, _, _ string) (string, error) {
+	if m.resolveErr != nil {
+		return "", m.resolveErr
+	}
+	return m.resolveCaseID, nil
+}
+
+func (m *mockRepo) AppUserInTenant(_ context.Context, _ database.Tx, _, appUserID string) (bool, error) {
+	m.memberCheckedID = appUserID
+	return m.memberOK, nil
+}
+
+func (m *mockRepo) AssignCaseResponsible(_ context.Context, _ database.Tx, _, caseID string, assignedUserID *string) error {
+	m.assignedCaseID = caseID
+	m.assignedUser = assignedUserID
+	return nil
+}
+
 func (m *mockRepo) ListIntimacoes(_ context.Context, _ IntimacoesQuery) ([]IntimacaoView, error) {
 	return nil, nil
 }
 
-func (m *mockRepo) GetIntimacao(_ context.Context, _, _ string) (IntimacaoView, error) {
-	return IntimacaoView{}, nil
+func (m *mockRepo) GetIntimacao(_ context.Context, _, _ string) (IntimacaoDetailView, error) {
+	return IntimacaoDetailView{}, nil
+}
+
+func (m *mockRepo) SetIntimationUserStatus(_ context.Context, _ database.Tx, _, intimationID, userStatus string) error {
+	m.gotUserStatusIntiID = intimationID
+	m.gotUserStatusValue = userStatus
+	return m.setUserStatusErr
 }
 
 func (m *mockRepo) CountProcessos(_ context.Context, _, _ string) (int64, int64, error) {
@@ -208,6 +260,14 @@ func (m *mockRepo) CountProcessos(_ context.Context, _, _ string) (int64, int64,
 
 func (m *mockRepo) CountIntimacoes(_ context.Context, _, _ string) (int64, int64, error) {
 	return 0, 0, nil
+}
+
+func (m *mockRepo) SummarizeProcessos(_ context.Context, _ string) (ProcessosSummaryView, error) {
+	return ProcessosSummaryView{}, nil
+}
+
+func (m *mockRepo) SummarizeIntimacoes(_ context.Context, _ string) (IntimacoesSummaryView, error) {
+	return IntimacoesSummaryView{}, nil
 }
 
 func (m *mockRepo) ListAndamentosByProcesso(_ context.Context, _ AndamentosQuery) ([]AndamentoView, error) {
@@ -505,5 +565,159 @@ func TestUseCase_ListIntegrations(t *testing.T) {
 	}
 	if uow.calls != 0 {
 		t.Fatalf("unit of work runs = %d, want 0 (a read needs no tx)", uow.calls)
+	}
+}
+
+// --- AssignResponsible (responsável do processo) -----------------------------
+
+// Assigning a responsável: the use case hops court_record → court_case (one tx),
+// guards the target user is a member, and writes the assignment with that case id.
+func TestUseCase_AssignResponsible_Assigns(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-42", memberOK: true}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	user := "user-7"
+	if err := uc.AssignResponsible(context.Background(), testTenant, "cr-1", &user); err != nil {
+		t.Fatalf("AssignResponsible() error = %v", err)
+	}
+
+	if uow.calls != 1 || uow.tenantID != testTenant {
+		t.Fatalf("uow calls=%d tenant=%q, want 1 run scoped to %q", uow.calls, uow.tenantID, testTenant)
+	}
+	if repo.memberCheckedID != user {
+		t.Fatalf("membership guard checked %q, want %q", repo.memberCheckedID, user)
+	}
+	if repo.assignedCaseID != "case-42" {
+		t.Fatalf("assigned on case %q, want the resolved case-42", repo.assignedCaseID)
+	}
+	if repo.assignedUser == nil || *repo.assignedUser != user {
+		t.Fatalf("assigned user = %v, want %q", repo.assignedUser, user)
+	}
+}
+
+// Desatribuir: a nil user_id clears the responsável and SKIPS the membership guard
+// (there is no user to validate).
+func TestUseCase_AssignResponsible_Unassigns(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-42", memberOK: false}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	if err := uc.AssignResponsible(context.Background(), testTenant, "cr-1", nil); err != nil {
+		t.Fatalf("AssignResponsible(nil) error = %v", err)
+	}
+
+	if repo.memberCheckedID != "" {
+		t.Fatalf("membership guard ran for a desatribuir (checked %q), want skipped", repo.memberCheckedID)
+	}
+	if repo.assignedCaseID != "case-42" || repo.assignedUser != nil {
+		t.Fatalf("expected NULL assignment on case-42, got case=%q user=%v", repo.assignedCaseID, repo.assignedUser)
+	}
+}
+
+// A user_id from outside the escritório fails the membership guard → the typed
+// ErrResponsibleNotMember, and nothing is written.
+func TestUseCase_AssignResponsible_ForeignUser_Errors(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-42", memberOK: false}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	user := "user-outsider"
+	err := uc.AssignResponsible(context.Background(), testTenant, "cr-1", &user)
+	if !errors.Is(err, ErrResponsibleNotMember) {
+		t.Fatalf("error = %v, want ErrResponsibleNotMember", err)
+	}
+	if repo.assignedCaseID != "" {
+		t.Fatalf("assignment written despite a foreign user (case %q)", repo.assignedCaseID)
+	}
+}
+
+// An unknown/foreign court_record :id (the record→case hop finds nothing) → the typed
+// ErrProcessoNotFound, and nothing is written.
+func TestUseCase_AssignResponsible_UnknownRecord_NotFound(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveErr: ErrProcessoNotFound, memberOK: true}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	user := "user-7"
+	err := uc.AssignResponsible(context.Background(), testTenant, "cr-missing", &user)
+	if !errors.Is(err, ErrProcessoNotFound) {
+		t.Fatalf("error = %v, want ErrProcessoNotFound", err)
+	}
+	if repo.memberCheckedID != "" || repo.assignedCaseID != "" {
+		t.Fatalf("guard/assign ran despite an unresolved record (checked=%q case=%q)", repo.memberCheckedID, repo.assignedCaseID)
+	}
+}
+
+// --- triagem: resolve / ignore / reopen --------------------------------------
+
+// The three triagem verbs map to the three target user_status values, and each runs in
+// exactly one tx scoped to the principal's tenant. Table-driven: one row per verb.
+func TestUseCase_TriageIntimacao_SetsUserStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		act        func(uc *UseCase, ctx context.Context) error
+		wantStatus string
+	}{
+		{
+			name:       "resolve → RESOLVED",
+			act:        func(uc *UseCase, ctx context.Context) error { return uc.ResolveIntimacao(ctx, testTenant, "inti-1") },
+			wantStatus: IntimationUserStatusResolved,
+		},
+		{
+			name:       "ignore → IGNORED",
+			act:        func(uc *UseCase, ctx context.Context) error { return uc.IgnoreIntimacao(ctx, testTenant, "inti-1") },
+			wantStatus: IntimationUserStatusIgnored,
+		},
+		{
+			name:       "reopen → PENDING",
+			act:        func(uc *UseCase, ctx context.Context) error { return uc.ReopenIntimacao(ctx, testTenant, "inti-1") },
+			wantStatus: IntimationUserStatusPending,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := &mockRepo{}
+			uow := &fakeUoW{}
+			uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+			if err := tt.act(uc, context.Background()); err != nil {
+				t.Fatalf("triage action error = %v", err)
+			}
+			if uow.calls != 1 || uow.tenantID != testTenant {
+				t.Fatalf("uow calls=%d tenant=%q, want 1 run scoped to %q", uow.calls, uow.tenantID, testTenant)
+			}
+			if repo.gotUserStatusIntiID != "inti-1" {
+				t.Fatalf("wrote to intimation %q, want inti-1", repo.gotUserStatusIntiID)
+			}
+			if repo.gotUserStatusValue != tt.wantStatus {
+				t.Fatalf("user_status = %q, want %q", repo.gotUserStatusValue, tt.wantStatus)
+			}
+		})
+	}
+}
+
+// A miss/foreign id surfaces as the repo's typed ErrIntimationNotFound, propagated
+// verbatim out of the tx (the use case adds no handling of its own).
+func TestUseCase_TriageIntimacao_NotFound(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{setUserStatusErr: ErrIntimationNotFound}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	err := uc.ResolveIntimacao(context.Background(), testTenant, "inti-missing")
+	if !errors.Is(err, ErrIntimationNotFound) {
+		t.Fatalf("error = %v, want ErrIntimationNotFound", err)
 	}
 }

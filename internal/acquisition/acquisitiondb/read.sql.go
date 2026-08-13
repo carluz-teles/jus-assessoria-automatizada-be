@@ -113,8 +113,8 @@ func (q *Queries) CountProcessosMatchingSearch(ctx context.Context, arg CountPro
 
 const getIntimacao = `-- name: GetIntimacao :one
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
-       i.content, i.type, i.status, i.source, i.source_url,
-       cr.cnj_number, cr.court, cr.degree
+       i.content, i.type, i.status, i.user_status, i.source, i.source_url,
+       i.recipients, cr.cnj_number, cr.court, cr.degree, cr.judging_body
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.id = $1 AND i.tenant_id = $2
@@ -133,18 +133,28 @@ type GetIntimacaoRow struct {
 	Content         string      `json:"content"`
 	Type            *string     `json:"type"`
 	Status          string      `json:"status"`
+	UserStatus      string      `json:"user_status"`
 	Source          string      `json:"source"`
 	SourceUrl       *string     `json:"source_url"`
+	Recipients      []byte      `json:"recipients"`
 	CnjNumber       string      `json:"cnj_number"`
 	Court           string      `json:"court"`
 	Degree          string      `json:"degree"`
+	JudgingBody     *string     `json:"judging_body"`
 }
 
-// One intimation by id, for the FE deep-link into the inbox detail (an intimation not
-// on the loaded list page). SAME projection as ListIntimacoes — the record's
-// number/court/degree joined in — so it maps to the same IntimacaoView. Scoped by
-// tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404 upstream,
-// never nil,nil). Read-only, off the write path.
+// One intimation by id, for the FE deep-link into the inbox DETAIL screen (an intimation
+// not on the loaded list page). It is a SUPERSET of the list projection: it carries the
+// list fields (so it still maps a full IntimacaoView) PLUS the detail-only extras the
+// inbox row omits —
+//   - content       — the FULL teor (not the 500-rune preview the list truncates);
+//   - judging_body  — the court record's órgão julgador (court_record.judging_body, 0014);
+//   - recipients    — the addressee jsonb list (every destinatário + matched-OAB flag);
+//   - user_status   — the triagem state (PENDING|RESOLVED|IGNORED), so the detail can
+//     render the resolve/ignore/reopen affordance.
+//
+// Scoped by tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404
+// upstream, never nil,nil). Read-only, off the write path.
 func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error) {
 	row := q.db.QueryRow(ctx, getIntimacao, arg.ID, arg.TenantID)
 	var i GetIntimacaoRow
@@ -156,11 +166,91 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 		&i.Content,
 		&i.Type,
 		&i.Status,
+		&i.UserStatus,
 		&i.Source,
 		&i.SourceUrl,
+		&i.Recipients,
 		&i.CnjNumber,
 		&i.Court,
 		&i.Degree,
+		&i.JudgingBody,
+	)
+	return i, err
+}
+
+const getProcesso = `-- name: GetProcesso :one
+SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
+       cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       cr.claim_value,
+       -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
+       -- an unassigned case still returns the record with NULL assigned_user_id/name.
+       cc.assigned_user_id, au.name AS assigned_user_name,
+       COALESCE(m.text, '') AS last_movement_text, m.occurred_at AS last_movement_at
+FROM court_record cr
+LEFT JOIN court_case cc ON cc.id = cr.case_id
+LEFT JOIN app_user au ON au.id = cc.assigned_user_id
+LEFT JOIN LATERAL (
+    SELECT de.text, de.occurred_at
+    FROM docket_entry de
+    WHERE de.court_record_id = cr.id
+    ORDER BY de.occurred_at DESC
+    LIMIT 1
+) m ON true
+WHERE cr.id = $1 AND cr.tenant_id = $2
+`
+
+type GetProcessoParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetProcessoRow struct {
+	ID               uuid.UUID          `json:"id"`
+	CaseID           uuid.UUID          `json:"case_id"`
+	CnjNumber        string             `json:"cnj_number"`
+	Court            string             `json:"court"`
+	Degree           string             `json:"degree"`
+	Class            *string            `json:"class"`
+	Subject          *string            `json:"subject"`
+	JudgingBody      *string            `json:"judging_body"`
+	FiledAt          pgtype.Date        `json:"filed_at"`
+	Secrecy          string             `json:"secrecy"`
+	Lifecycle        string             `json:"lifecycle"`
+	Completeness     float32            `json:"completeness"`
+	ClaimValue       pgtype.Numeric     `json:"claim_value"`
+	AssignedUserID   pgtype.UUID        `json:"assigned_user_id"`
+	AssignedUserName *string            `json:"assigned_user_name"`
+	LastMovementText string             `json:"last_movement_text"`
+	LastMovementAt   pgtype.Timestamptz `json:"last_movement_at"`
+}
+
+// One process by id, for the FE deep-link into the processes detail (a process not on
+// the loaded list page). SAME projection as ListProcessos — the record's fields, its
+// last andamento via the LATERAL, and claim_value — so it maps to the same ProcessoView.
+// Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
+// placeholder is still reachable by direct link. A foreign or unknown id yields no row
+// (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
+func (q *Queries) GetProcesso(ctx context.Context, arg GetProcessoParams) (GetProcessoRow, error) {
+	row := q.db.QueryRow(ctx, getProcesso, arg.ID, arg.TenantID)
+	var i GetProcessoRow
+	err := row.Scan(
+		&i.ID,
+		&i.CaseID,
+		&i.CnjNumber,
+		&i.Court,
+		&i.Degree,
+		&i.Class,
+		&i.Subject,
+		&i.JudgingBody,
+		&i.FiledAt,
+		&i.Secrecy,
+		&i.Lifecycle,
+		&i.Completeness,
+		&i.ClaimValue,
+		&i.AssignedUserID,
+		&i.AssignedUserName,
+		&i.LastMovementText,
+		&i.LastMovementAt,
 	)
 	return i, err
 }
@@ -290,7 +380,7 @@ func (q *Queries) ListAndamentosByProcesso(ctx context.Context, arg ListAndament
 
 const listIntimacoes = `-- name: ListIntimacoes :many
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
-       i.content, i.type, i.status, i.source, i.source_url,
+       i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
@@ -317,6 +407,7 @@ type ListIntimacoesRow struct {
 	Content         string      `json:"content"`
 	Type            *string     `json:"type"`
 	Status          string      `json:"status"`
+	UserStatus      string      `json:"user_status"`
 	Source          string      `json:"source"`
 	SourceUrl       *string     `json:"source_url"`
 	CnjNumber       string      `json:"cnj_number"`
@@ -351,6 +442,7 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 			&i.Content,
 			&i.Type,
 			&i.Status,
+			&i.UserStatus,
 			&i.Source,
 			&i.SourceUrl,
 			&i.CnjNumber,
@@ -369,7 +461,7 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 
 const listIntimacoesByProcesso = `-- name: ListIntimacoesByProcesso :many
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
-       i.content, i.type, i.status, i.source, i.source_url,
+       i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
@@ -396,6 +488,7 @@ type ListIntimacoesByProcessoRow struct {
 	Content         string      `json:"content"`
 	Type            *string     `json:"type"`
 	Status          string      `json:"status"`
+	UserStatus      string      `json:"user_status"`
 	Source          string      `json:"source"`
 	SourceUrl       *string     `json:"source_url"`
 	CnjNumber       string      `json:"cnj_number"`
@@ -433,6 +526,7 @@ func (q *Queries) ListIntimacoesByProcesso(ctx context.Context, arg ListIntimaco
 			&i.Content,
 			&i.Type,
 			&i.Status,
+			&i.UserStatus,
 			&i.Source,
 			&i.SourceUrl,
 			&i.CnjNumber,
@@ -507,8 +601,15 @@ const listProcessos = `-- name: ListProcessos :many
 
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       cr.claim_value,
+       -- responsável do processo: assigned at case level (court_case), shared across
+       -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
+       -- leaves assigned_user_id/name NULL, never dropping the record from the list.
+       cc.assigned_user_id, au.name AS assigned_user_name,
        COALESCE(m.text, '') AS last_movement_text, m.occurred_at AS last_movement_at
 FROM court_record cr
+LEFT JOIN court_case cc ON cc.id = cr.case_id
+LEFT JOIN app_user au ON au.id = cc.assigned_user_id
 LEFT JOIN LATERAL (
     SELECT de.text, de.occurred_at
     FROM docket_entry de
@@ -545,6 +646,9 @@ type ListProcessosRow struct {
 	Secrecy          string             `json:"secrecy"`
 	Lifecycle        string             `json:"lifecycle"`
 	Completeness     float32            `json:"completeness"`
+	ClaimValue       pgtype.Numeric     `json:"claim_value"`
+	AssignedUserID   pgtype.UUID        `json:"assigned_user_id"`
+	AssignedUserName *string            `json:"assigned_user_name"`
 	LastMovementText string             `json:"last_movement_text"`
 	LastMovementAt   pgtype.Timestamptz `json:"last_movement_at"`
 }
@@ -586,6 +690,9 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 			&i.Secrecy,
 			&i.Lifecycle,
 			&i.Completeness,
+			&i.ClaimValue,
+			&i.AssignedUserID,
+			&i.AssignedUserName,
 			&i.LastMovementText,
 			&i.LastMovementAt,
 		); err != nil {
@@ -781,4 +888,88 @@ func (q *Queries) ListSyncRunsByJob(ctx context.Context, arg ListSyncRunsByJobPa
 		return nil, err
 	}
 	return items, nil
+}
+
+const summarizeIntimacoes = `-- name: SummarizeIntimacoes :one
+SELECT
+    count(*)::bigint                                                   AS total,
+    count(*) FILTER (WHERE user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS pendentes,
+    0::bigint                                                          AS em_analise,
+    count(*) FILTER (WHERE user_status = 'RESOLVED')::bigint           AS resolvidas,
+    count(*) FILTER (WHERE user_status = 'IGNORED')::bigint            AS ignoradas,
+    0::bigint                                                          AS criticas
+FROM intimation
+WHERE tenant_id = $1
+`
+
+type SummarizeIntimacoesRow struct {
+	Total      int64 `json:"total"`
+	Pendentes  int64 `json:"pendentes"`
+	EmAnalise  int64 `json:"em_analise"`
+	Resolvidas int64 `json:"resolvidas"`
+	Ignoradas  int64 `json:"ignoradas"`
+	Criticas   int64 `json:"criticas"`
+}
+
+// The KPI counts for the intimações inbox header (GET /v1/intimacoes/summary), one
+// aggregate scan over the tenant's intimations grouped by the triagem state
+// (user_status, 0030) — served by intimation(tenant_id, user_status). pendentes are the
+// rows still awaiting triagem (NOT resolved/ignored, i.e. PENDING); resolvidas=RESOLVED;
+// ignoradas=IGNORED. `em_analise` (an AI-in-progress state) and `criticas` (a
+// deadline-proximity derivation) have no source in this slice yet, so they are 0 until
+// Fase 3 / a prazo derivation lands — kept in the projection so the FE contract is
+// stable. tenant-scoped (barrier 1, RLS barrier 2).
+func (q *Queries) SummarizeIntimacoes(ctx context.Context, tenantID uuid.UUID) (SummarizeIntimacoesRow, error) {
+	row := q.db.QueryRow(ctx, summarizeIntimacoes, tenantID)
+	var i SummarizeIntimacoesRow
+	err := row.Scan(
+		&i.Total,
+		&i.Pendentes,
+		&i.EmAnalise,
+		&i.Resolvidas,
+		&i.Ignoradas,
+		&i.Criticas,
+	)
+	return i, err
+}
+
+const summarizeProcessos = `-- name: SummarizeProcessos :one
+SELECT
+    count(*) FILTER (WHERE lifecycle <> 'SUPERSEDED')::bigint          AS total,
+    count(*) FILTER (WHERE lifecycle = 'ACTIVE')::bigint               AS em_andamento,
+    count(*) FILTER (WHERE lifecycle = 'SUSPENDED')::bigint            AS suspensos,
+    count(*) FILTER (WHERE lifecycle = 'ARCHIVED')::bigint             AS arquivados,
+    0::bigint                                                          AS baixados
+FROM court_record
+WHERE tenant_id = $1
+`
+
+type SummarizeProcessosRow struct {
+	Total       int64 `json:"total"`
+	EmAndamento int64 `json:"em_andamento"`
+	Suspensos   int64 `json:"suspensos"`
+	Arquivados  int64 `json:"arquivados"`
+	Baixados    int64 `json:"baixados"`
+}
+
+// The KPI counts for the processes list header (GET /v1/processos/summary), one
+// aggregate scan over the tenant's court_records grouped into the FE's buckets by
+// court_record.lifecycle (ACTIVE|SUSPENDED|ARCHIVED|SUPERSEDED). SUPERSEDED is the
+// internal UNKNOWN placeholder left after a DATAJUD grade re-point (not a user-facing
+// process), so it is EXCLUDED from every bucket and from `total` — the screen counts
+// only real processes. `baixados` has NO lifecycle source in the v0 schema (there is no
+// BAIXADO value; a baixa would surface as ARCHIVED), so it is always 0 until the schema
+// models it — kept in the projection so the FE contract is stable. tenant-scoped
+// (barrier 1, RLS barrier 2).
+func (q *Queries) SummarizeProcessos(ctx context.Context, tenantID uuid.UUID) (SummarizeProcessosRow, error) {
+	row := q.db.QueryRow(ctx, summarizeProcessos, tenantID)
+	var i SummarizeProcessosRow
+	err := row.Scan(
+		&i.Total,
+		&i.EmAndamento,
+		&i.Suspensos,
+		&i.Arquivados,
+		&i.Baixados,
+	)
+	return i, err
 }

@@ -26,6 +26,13 @@ type Querier interface {
 	GetTenantByID(ctx context.Context, id uuid.UUID) (Tenant, error)
 	GetUserByClerkUser(ctx context.Context, clerkUserID string) (AppUser, error)
 	GetUserByID(ctx context.Context, id uuid.UUID) (AppUser, error)
+	// The escritório's team for the responsável selector (and the /organization members
+	// list): every ACTIVE membership of the tenant, joined to its app_user for name/email.
+	// Tenant-scoped by m.tenant_id (barrier 1; RLS is barrier 2 on both tables). Only ACTIVE
+	// rows — a soft-removed member drops out. The role is the membership's own copy (kept in
+	// lockstep with app_user.role by organizationMembership.updated). Ordered by name so the
+	// selector is stable; the team is small, so no cursor.
+	ListOrgMembers(ctx context.Context, tenantID uuid.UUID) ([]ListOrgMembersRow, error)
 	// Soft-delete a membership from an organizationMembership.deleted webhook: flip
 	// ACTIVE→REMOVED and stamp removed_at. WHERE status='ACTIVE' makes it fire at most
 	// once — a replay (already REMOVED) or an unknown clerk id matches no row, so

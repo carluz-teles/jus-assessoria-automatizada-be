@@ -142,6 +142,60 @@ const (
 	IntimationStatusCancelled = "CANCELLED"
 )
 
+// Intimation user-status constants — the triagem workflow state the user drives
+// from the inbox, stored in the SEPARATE `user_status` column (0030), never the
+// DJEN cancellation `status` above. A fresh (or reopened) intimação is PENDING; the
+// user resolves or ignores it. The sync upsert never writes this column, so a
+// re-observation cannot clobber the user's decision. Text validated on the app
+// (CHECK-on-app convention). PENDING is the column default.
+const (
+	IntimationUserStatusPending  = "PENDING"
+	IntimationUserStatusResolved = "RESOLVED"
+	IntimationUserStatusIgnored  = "IGNORED"
+)
+
+// Party role constants — a party's polo in the process (CHECK-on-app enum). The
+// DJEN destinatário's polo maps onto these via partyRoleFromPolo: "A" (ativo =
+// autor) → PLAINTIFF, "P" (passivo = réu) → DEFENDANT, anything else → THIRD_PARTY.
+const (
+	PartyRolePlaintiff  = "PLAINTIFF"
+	PartyRoleDefendant  = "DEFENDANT"
+	PartyRoleThirdParty = "THIRD_PARTY"
+)
+
+// PartySource constants — where a party row came from. v0 derives every party from
+// the DJEN; MANUAL is the (future) manual-entry seam.
+const (
+	PartySourceDJEN   = "DJEN"
+	PartySourceManual = "MANUAL"
+)
+
+// Party is one party of a process (autor/réu/terceiro), materialized so the cockpit
+// can render the AUTOR/RÉU cards. It hangs off the case (shared across graus), deduped
+// by (tenant, case, role, name). Document (CPF/CNPJ) is empty in v0 — the DJEN never
+// discloses it and we never invent one.
+type Party struct {
+	ID       string
+	TenantID string
+	CaseID   string
+	Role     string
+	Name     string
+	Document string
+	Source   string
+}
+
+// PartyCounsel is one advogado representing a Party (nome + OAB número/UF), deduped by
+// (tenant, party, oab, uf). Source records where it came from (DJEN in v0).
+type PartyCounsel struct {
+	ID       string
+	TenantID string
+	PartyID  string
+	Name     string
+	OAB      string
+	UF       string
+	Source   string
+}
+
 // Intimation is one intimação persisted by the sync cycle, deduped within the
 // (tenant, case) scope. This slice does not emit an intimation-observed event
 // (the deadline slice owns that), so the entity is the persisted shape, not an

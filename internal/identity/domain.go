@@ -278,6 +278,14 @@ func (uc *UseCase) GetOrgProfile(ctx context.Context, tenantID string) (*Tenant,
 	return uc.repo.FindTenantByID(ctx, tenantID)
 }
 
+// ListOrgMembers reads the escritório's team — the read model behind GET
+// /v1/organization/members that feeds the responsável selector and the members list. A
+// plain pool read (no tx) scoped to the tenant; open to any authenticated member (like
+// GetOrgProfile). tenantID comes from the verified principal, never the request.
+func (uc *UseCase) ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error) {
+	return uc.repo.ListOrgMembers(ctx, tenantID)
+}
+
 // UpdateOrgProfile persists the escritório's company profile and emits
 // identity.org_profile_updated in the SAME transaction (transactional outbox): the
 // tenant write and the event commit together or not at all. The onboarding gate is

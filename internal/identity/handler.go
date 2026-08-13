@@ -17,6 +17,7 @@ type handlerUC interface {
 	GetMe(ctx context.Context, clerkUserID string) (Me, error)
 	GetOrgProfile(ctx context.Context, tenantID string) (*Tenant, error)
 	UpdateOrgProfile(ctx context.Context, tenantID string, profile OrgProfile) (*Tenant, error)
+	ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error)
 }
 
 // Handler is identity's authenticated HTTP surface (the onboarding endpoints). It
@@ -47,6 +48,7 @@ func (h *Handler) RegisterMe(r fiber.Router) {
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/organization/profile", h.getOrgProfile)
 	r.Put("/organization/profile", middleware.RequireRole(string(RoleAdmin)), h.updateOrgProfile)
+	r.Get("/organization/members", h.listOrgMembers)
 }
 
 // meView is the read model returned by GET /identity/me. tenant_id and
@@ -68,6 +70,21 @@ type profileView struct {
 	Phone                 string     `json:"phone"`
 	Email                 string     `json:"email"`
 	OnboardingCompletedAt *time.Time `json:"onboarding_completed_at"`
+}
+
+// memberView is one row of GET /v1/organization/members — a member of the escritório
+// for the responsável selector / team list.
+type memberView struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	Role  string `json:"role"`
+}
+
+// membersEnvelope is the {data:[...]} response for the members list. The escritório's
+// team is small, so it is returned whole — no cursor pagination.
+type membersEnvelope struct {
+	Data []memberView `json:"data"`
 }
 
 // me handles GET /v1/identity/me: it reads the Clerk user id AuthUser injected and
@@ -122,6 +139,35 @@ func (h *Handler) updateOrgProfile(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(newProfileView(tenant))
+}
+
+// listOrgMembers handles GET /v1/organization/members: the escritório's ACTIVE members
+// for the responsável selector and the /organization team list. Open to any authenticated
+// member (no RequireRole) — a LAWYER also opens the selector. tenant_id comes from the
+// verified principal, never the path or body, so a caller only ever sees its own team.
+func (h *Handler) listOrgMembers(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	members, err := h.uc.ListOrgMembers(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(newMembersEnvelope(members))
+}
+
+// newMembersEnvelope maps the OrgMember read models to the {data:[...]} envelope. It
+// initializes to a non-nil slice so an empty team serializes as [], not null.
+func newMembersEnvelope(members []OrgMember) membersEnvelope {
+	views := make([]memberView, 0, len(members))
+	for _, m := range members {
+		views = append(views, memberView{
+			ID:    m.ID,
+			Name:  m.Name,
+			Email: m.Email,
+			Role:  string(m.Role),
+		})
+	}
+	return membersEnvelope{Data: views}
 }
 
 // newMeView maps the Me read model to its client envelope.

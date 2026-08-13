@@ -328,6 +328,101 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 	return newRows, cancelledRows, nil
 }
 
+// partyRowJSON is one row of the BatchUpsertParties jsonb payload.
+type partyRowJSON struct {
+	CaseID string `json:"case_id"`
+	Role   string `json:"role"`
+	Name   string `json:"name"`
+}
+
+// partyCounselRowJSON is one row of the BatchUpsertPartyCounsels jsonb payload.
+type partyCounselRowJSON struct {
+	PartyID string `json:"party_id"`
+	Name    string `json:"name"`
+	OAB     string `json:"oab"`
+	UF      string `json:"uf"`
+}
+
+// UpsertParties materializes a window's partes (autor/réu/terceiro + advogados) in the
+// caller's tx: ONE bulk party upsert (idempotent on tenant+case+role+name, returning
+// each row's id whether inserted or pre-existing), then ONE bulk counsel upsert keyed to
+// those ids (idempotent on tenant+party+oab+uf). A re-observation of the same
+// communication re-lands the exact same rows — no duplicates, no dedup breakage. Parties
+// with the same (case, role, name) within the batch collapse to one row; their counsels
+// all attach to that one id.
+func (r *pgRepository) UpsertParties(ctx context.Context, tx database.Tx, params []PartyParams) error {
+	if len(params) == 0 {
+		return nil
+	}
+	tid, err := uuid.Parse(params[0].TenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	q := acquisitiondb.New(tx)
+
+	// 1. Bulk-upsert the parties (dedup identical (case, role, name) within the batch so
+	// jsonb_to_recordset never feeds ON CONFLICT the same row twice in one statement,
+	// which Postgres rejects — "affect row a second time").
+	rows := make([]partyRowJSON, 0, len(params))
+	seen := make(map[string]bool, len(params))
+	for _, p := range params {
+		k := p.CaseID + "\x00" + p.Role + "\x00" + p.Name
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		rows = append(rows, partyRowJSON{CaseID: p.CaseID, Role: p.Role, Name: p.Name})
+	}
+	partyJSON, err := json.Marshal(rows)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	upserted, err := q.BatchUpsertParties(ctx, acquisitiondb.BatchUpsertPartiesParams{TenantID: tid, Parties: partyJSON})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+
+	// 2. Map each returned party back to its id by natural key, then attach every input
+	// party's counsels to that id. Dedup identical (party, oab, uf) within the batch for
+	// the same reason as above.
+	idByKey := make(map[string]uuid.UUID, len(upserted))
+	for _, row := range upserted {
+		idByKey[row.CaseID.String()+"\x00"+row.Role+"\x00"+row.Name] = row.ID
+	}
+	counselRows := make([]partyCounselRowJSON, 0)
+	seenCounsel := make(map[string]bool)
+	for _, p := range params {
+		partyID, ok := idByKey[p.CaseID+"\x00"+p.Role+"\x00"+p.Name]
+		if !ok {
+			continue // defensive: the upsert returns every key, so this cannot happen
+		}
+		for _, c := range p.Counsels {
+			k := partyID.String() + "\x00" + oabKey(c.OAB, c.UF)
+			if seenCounsel[k] {
+				continue
+			}
+			seenCounsel[k] = true
+			counselRows = append(counselRows, partyCounselRowJSON{
+				PartyID: partyID.String(),
+				Name:    c.Name,
+				OAB:     c.OAB,
+				UF:      c.UF,
+			})
+		}
+	}
+	if len(counselRows) == 0 {
+		return nil
+	}
+	counselJSON, err := json.Marshal(counselRows)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	if err := q.BatchUpsertPartyCounsels(ctx, acquisitiondb.BatchUpsertPartyCounselsParams{TenantID: tid, Counsels: counselJSON}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
 // rawArrayOrEmpty embeds the parser's recipients JSON array as-is (jsonb_to_recordset
 // maps a JSON string array to text[]); an empty/absent value becomes [] (→ empty text[],
 // never NULL), matching recipientsOrEmpty's empty-array-on-nil behavior.

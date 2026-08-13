@@ -11,8 +11,15 @@
 -- page passes ('', zero-uuid).
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       cr.claim_value,
+       -- responsável do processo: assigned at case level (court_case), shared across
+       -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
+       -- leaves assigned_user_id/name NULL, never dropping the record from the list.
+       cc.assigned_user_id, au.name AS assigned_user_name,
        COALESCE(m.text, '') AS last_movement_text, m.occurred_at AS last_movement_at
 FROM court_record cr
+LEFT JOIN court_case cc ON cc.id = cr.case_id
+LEFT JOIN app_user au ON au.id = cc.assigned_user_id
 LEFT JOIN LATERAL (
     SELECT de.text, de.occurred_at
     FROM docket_entry de
@@ -27,13 +34,39 @@ WHERE cr.tenant_id = $1
 ORDER BY cr.cnj_number, cr.id
 LIMIT $2;
 
+-- name: GetProcesso :one
+-- One process by id, for the FE deep-link into the processes detail (a process not on
+-- the loaded list page). SAME projection as ListProcessos — the record's fields, its
+-- last andamento via the LATERAL, and claim_value — so it maps to the same ProcessoView.
+-- Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
+-- placeholder is still reachable by direct link. A foreign or unknown id yields no row
+-- (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
+SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
+       cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       cr.claim_value,
+       -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
+       -- an unassigned case still returns the record with NULL assigned_user_id/name.
+       cc.assigned_user_id, au.name AS assigned_user_name,
+       COALESCE(m.text, '') AS last_movement_text, m.occurred_at AS last_movement_at
+FROM court_record cr
+LEFT JOIN court_case cc ON cc.id = cr.case_id
+LEFT JOIN app_user au ON au.id = cc.assigned_user_id
+LEFT JOIN LATERAL (
+    SELECT de.text, de.occurred_at
+    FROM docket_entry de
+    WHERE de.court_record_id = cr.id
+    ORDER BY de.occurred_at DESC
+    LIMIT 1
+) m ON true
+WHERE cr.id = $1 AND cr.tenant_id = $2;
+
 -- name: ListIntimacoes :many
 -- The intimações inbox: the tenant's intimations, newest availability first, with
 -- the court record's number/court/degree joined in. Descending keyset on
 -- (made_available_at, id); the first page passes the max sentinel
 -- ('9999-12-31', max-uuid).
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
-       i.content, i.type, i.status, i.source, i.source_url,
+       i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
@@ -44,14 +77,20 @@ ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
 
 -- name: GetIntimacao :one
--- One intimation by id, for the FE deep-link into the inbox detail (an intimation not
--- on the loaded list page). SAME projection as ListIntimacoes — the record's
--- number/court/degree joined in — so it maps to the same IntimacaoView. Scoped by
--- tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404 upstream,
--- never nil,nil). Read-only, off the write path.
+-- One intimation by id, for the FE deep-link into the inbox DETAIL screen (an intimation
+-- not on the loaded list page). It is a SUPERSET of the list projection: it carries the
+-- list fields (so it still maps a full IntimacaoView) PLUS the detail-only extras the
+-- inbox row omits —
+--   • content       — the FULL teor (not the 500-rune preview the list truncates);
+--   • judging_body  — the court record's órgão julgador (court_record.judging_body, 0014);
+--   • recipients    — the addressee jsonb list (every destinatário + matched-OAB flag);
+--   • user_status   — the triagem state (PENDING|RESOLVED|IGNORED), so the detail can
+--                     render the resolve/ignore/reopen affordance.
+-- Scoped by tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404
+-- upstream, never nil,nil). Read-only, off the write path.
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
-       i.content, i.type, i.status, i.source, i.source_url,
-       cr.cnj_number, cr.court, cr.degree
+       i.content, i.type, i.status, i.user_status, i.source, i.source_url,
+       i.recipients, cr.cnj_number, cr.court, cr.degree, cr.judging_body
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.id = $1 AND i.tenant_id = $2;
@@ -106,7 +145,7 @@ WHERE de.court_record_id = @court_record_id::uuid
 -- served by intimation(court_record_id, made_available_at DESC) — the first page
 -- passes the max sentinel ('9999-12-31', max-uuid).
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
-       i.content, i.type, i.status, i.source, i.source_url,
+       i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
@@ -192,3 +231,41 @@ LIMIT 1000;
 -- The reconciliations totals: how many intimations the tenant holds (paired with
 -- CountActiveCourtRecordsByTenant for the processes side).
 SELECT count(*) FROM intimation WHERE tenant_id = $1;
+
+-- name: SummarizeProcessos :one
+-- The KPI counts for the processes list header (GET /v1/processos/summary), one
+-- aggregate scan over the tenant's court_records grouped into the FE's buckets by
+-- court_record.lifecycle (ACTIVE|SUSPENDED|ARCHIVED|SUPERSEDED). SUPERSEDED is the
+-- internal UNKNOWN placeholder left after a DATAJUD grade re-point (not a user-facing
+-- process), so it is EXCLUDED from every bucket and from `total` — the screen counts
+-- only real processes. `baixados` has NO lifecycle source in the v0 schema (there is no
+-- BAIXADO value; a baixa would surface as ARCHIVED), so it is always 0 until the schema
+-- models it — kept in the projection so the FE contract is stable. tenant-scoped
+-- (barrier 1, RLS barrier 2).
+SELECT
+    count(*) FILTER (WHERE lifecycle <> 'SUPERSEDED')::bigint          AS total,
+    count(*) FILTER (WHERE lifecycle = 'ACTIVE')::bigint               AS em_andamento,
+    count(*) FILTER (WHERE lifecycle = 'SUSPENDED')::bigint            AS suspensos,
+    count(*) FILTER (WHERE lifecycle = 'ARCHIVED')::bigint             AS arquivados,
+    0::bigint                                                          AS baixados
+FROM court_record
+WHERE tenant_id = $1;
+
+-- name: SummarizeIntimacoes :one
+-- The KPI counts for the intimações inbox header (GET /v1/intimacoes/summary), one
+-- aggregate scan over the tenant's intimations grouped by the triagem state
+-- (user_status, 0030) — served by intimation(tenant_id, user_status). pendentes are the
+-- rows still awaiting triagem (NOT resolved/ignored, i.e. PENDING); resolvidas=RESOLVED;
+-- ignoradas=IGNORED. `em_analise` (an AI-in-progress state) and `criticas` (a
+-- deadline-proximity derivation) have no source in this slice yet, so they are 0 until
+-- Fase 3 / a prazo derivation lands — kept in the projection so the FE contract is
+-- stable. tenant-scoped (barrier 1, RLS barrier 2).
+SELECT
+    count(*)::bigint                                                   AS total,
+    count(*) FILTER (WHERE user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS pendentes,
+    0::bigint                                                          AS em_analise,
+    count(*) FILTER (WHERE user_status = 'RESOLVED')::bigint           AS resolvidas,
+    count(*) FILTER (WHERE user_status = 'IGNORED')::bigint            AS ignoradas,
+    0::bigint                                                          AS criticas
+FROM intimation
+WHERE tenant_id = $1;

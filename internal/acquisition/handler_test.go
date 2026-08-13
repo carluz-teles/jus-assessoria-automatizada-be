@@ -44,6 +44,18 @@ type fakeHandlerUC struct {
 	listResp     []*Integration
 	gotTenantID  string
 	gotSources   []string
+	// Responsável write path (AssignResponsible): what the handler forwarded, and an
+	// optional canned error to drive the failure branches.
+	gotAssignTenant string
+	gotAssignRecord string
+	gotAssignUser   *string
+	assignErr       error
+	// Triagem write path: what the handler forwarded (tenant, id) and which verb was
+	// called, plus an optional canned error to drive the failure branch.
+	gotTriageTenant string
+	gotTriageID     string
+	gotTriageVerb   string
+	triageErr       error
 }
 
 func (f *fakeHandlerUC) ActivateIntegration(_ context.Context, tenantID string, sources []string, _ Scope) ([]*Integration, error) {
@@ -57,6 +69,28 @@ func (f *fakeHandlerUC) ListIntegrations(_ context.Context, tenantID string) ([]
 	return f.listResp, nil
 }
 
+func (f *fakeHandlerUC) AssignResponsible(_ context.Context, tenantID, courtRecordID string, assignedUserID *string) error {
+	f.gotAssignTenant = tenantID
+	f.gotAssignRecord = courtRecordID
+	f.gotAssignUser = assignedUserID
+	return f.assignErr
+}
+
+func (f *fakeHandlerUC) ResolveIntimacao(_ context.Context, tenantID, intimationID string) error {
+	f.gotTriageTenant, f.gotTriageID, f.gotTriageVerb = tenantID, intimationID, "resolve"
+	return f.triageErr
+}
+
+func (f *fakeHandlerUC) IgnoreIntimacao(_ context.Context, tenantID, intimationID string) error {
+	f.gotTriageTenant, f.gotTriageID, f.gotTriageVerb = tenantID, intimationID, "ignore"
+	return f.triageErr
+}
+
+func (f *fakeHandlerUC) ReopenIntimacao(_ context.Context, tenantID, intimationID string) error {
+	f.gotTriageTenant, f.gotTriageID, f.gotTriageVerb = tenantID, intimationID, "reopen"
+	return f.triageErr
+}
+
 // fakeReader is a no-op read port for the write-path handler tests (the read
 // routes have their own coverage).
 type fakeReader struct{}
@@ -65,12 +99,16 @@ func (fakeReader) Processos(context.Context, ProcessosQuery) (ProcessosResult, e
 	return ProcessosResult{}, nil
 }
 
+func (fakeReader) Processo(context.Context, string, string) (ProcessoView, error) {
+	return ProcessoView{}, nil
+}
+
 func (fakeReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
 	return IntimacoesResult{}, nil
 }
 
-func (fakeReader) Intimacao(context.Context, string, string) (IntimacaoView, error) {
-	return IntimacaoView{}, nil
+func (fakeReader) Intimacao(context.Context, string, string) (IntimacaoDetailView, error) {
+	return IntimacaoDetailView{}, nil
 }
 
 func (fakeReader) Andamentos(context.Context, AndamentosQuery) (AndamentosResult, error) {
@@ -79,6 +117,18 @@ func (fakeReader) Andamentos(context.Context, AndamentosQuery) (AndamentosResult
 
 func (fakeReader) IntimacoesByProcesso(context.Context, IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
 	return IntimacoesByProcessoResult{}, nil
+}
+
+func (fakeReader) Partes(context.Context, string, string) (PartesView, error) {
+	return PartesView{}, nil
+}
+
+func (fakeReader) ProcessosSummary(context.Context, string) (ProcessosSummaryView, error) {
+	return ProcessosSummaryView{}, nil
+}
+
+func (fakeReader) IntimacoesSummary(context.Context, string) (IntimacoesSummaryView, error) {
+	return IntimacoesSummaryView{}, nil
 }
 
 func (fakeReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
@@ -261,21 +311,39 @@ type recordingReader struct {
 	intiRes      IntimacoesByProcessoResult
 	gotIntiQuery IntimacoesByProcessoQuery
 	// GET /v1/intimacoes/:id — capture the forwarded (tenant, id) and return a canned
-	// view or a typed error (a nil intiOneErr means the view is returned).
-	intiOneRes    IntimacaoView
+	// detail view or a typed error (a nil intiOneErr means the view is returned).
+	intiOneRes    IntimacaoDetailView
 	intiOneErr    error
 	gotIntiOneTID string
 	gotIntiOneID  string
+	// Summary reads — canned views the handler wraps into the summary responses.
+	procSummary ProcessosSummaryView
+	intiSummary IntimacoesSummaryView
+	// GET /v1/processos/:id — capture the forwarded (tenant, id) and return a canned
+	// view or a typed error (a nil procOneErr means the view is returned).
+	procOneRes    ProcessoView
+	procOneErr    error
+	gotProcOneTID string
+	gotProcOneID  string
+	// GET /v1/processos/:id/partes — capture the forwarded (tenant, court_record) and
+	// return a canned view.
+	partesRes      PartesView
+	gotPartesTID   string
+	gotPartesCRID  string
 }
 
 func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (ProcessosResult, error) {
 	r.gotQuery = q
 	return r.res, nil
 }
+func (r *recordingReader) Processo(_ context.Context, tenantID, id string) (ProcessoView, error) {
+	r.gotProcOneTID, r.gotProcOneID = tenantID, id
+	return r.procOneRes, r.procOneErr
+}
 func (r *recordingReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
 	return IntimacoesResult{}, nil
 }
-func (r *recordingReader) Intimacao(_ context.Context, tenantID, id string) (IntimacaoView, error) {
+func (r *recordingReader) Intimacao(_ context.Context, tenantID, id string) (IntimacaoDetailView, error) {
 	r.gotIntiOneTID, r.gotIntiOneID = tenantID, id
 	return r.intiOneRes, r.intiOneErr
 }
@@ -286,6 +354,16 @@ func (r *recordingReader) Andamentos(_ context.Context, q AndamentosQuery) (Anda
 func (r *recordingReader) IntimacoesByProcesso(_ context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
 	r.gotIntiQuery = q
 	return r.intiRes, nil
+}
+func (r *recordingReader) Partes(_ context.Context, tenantID, courtRecordID string) (PartesView, error) {
+	r.gotPartesTID, r.gotPartesCRID = tenantID, courtRecordID
+	return r.partesRes, nil
+}
+func (r *recordingReader) ProcessosSummary(context.Context, string) (ProcessosSummaryView, error) {
+	return r.procSummary, nil
+}
+func (r *recordingReader) IntimacoesSummary(context.Context, string) (IntimacoesSummaryView, error) {
+	return r.intiSummary, nil
 }
 func (r *recordingReader) ImportStatus(context.Context, string) (ImportStatusView, error) {
 	return ImportStatusView{}, nil
@@ -378,6 +456,36 @@ func TestHandler_ListProcessos_EnvelopeHasTotals(t *testing.T) {
 	for _, want := range []string{`"total_count":32`, `"total":1247`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("envelope missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// --- read route: /v1/processos/:id/partes -----------------------------------
+
+// GET /v1/processos/:id/partes forwards the path :id (court_record id) and the tenant
+// (from the principal, never the query) to the read port, and returns the bucketed view.
+func TestHandler_ListPartes_ForwardsAndReturnsBuckets(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{partesRes: PartesView{
+		Autor: []PartyView{{Name: "AUTOR", Counsels: []PartyCounselView{{Name: "ADV", OAB: "111", UF: "SP"}}}},
+		Reu:   []PartyView{{Name: "REU", Counsels: []PartyCounselView{}}},
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-42/partes", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	if rd.gotPartesCRID != "cr-42" {
+		t.Errorf("court_record = %q, want cr-42 (from path)", rd.gotPartesCRID)
+	}
+	if rd.gotPartesTID != "tenant-9" {
+		t.Errorf("tenant = %q, want tenant-9 (from principal)", rd.gotPartesTID)
+	}
+	for _, want := range []string{`"autor"`, `"reu"`, `"terceiros"`, `"AUTOR"`, `"oab":"111"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
 		}
 	}
 }
@@ -707,18 +815,25 @@ func TestHandler_ListIntimacoesByProcesso_CursorRoundTrip(t *testing.T) {
 // --- read route: GET /v1/intimacoes/:id (deep-link to one intimation) --------
 
 // GET /v1/intimacoes/:id forwards the path :id and the principal's tenant (never the
-// path/query) to the read port and returns the IntimacaoView as the whole payload —
-// 200, no list envelope.
+// path/query) to the read port and returns the IntimacaoDetailView as the whole payload —
+// 200, no list envelope. The detail carries the FULL content, judging_body and the
+// triagem user_status alongside the list fields.
 func TestHandler_GetIntimacao_OK(t *testing.T) {
 	t.Parallel()
 
-	rd := &recordingReader{intiOneRes: IntimacaoView{
-		ID:        "018f0000-0000-7000-8000-000000000abc",
-		CNJNumber: "0004567-11.2023.8.26.0001",
-		Court:     "TJSP",
-		Degree:    "G1",
-		Status:    "PENDING",
-		Source:    "DJEN",
+	rd := &recordingReader{intiOneRes: IntimacaoDetailView{
+		IntimacaoView: IntimacaoView{
+			ID:         "018f0000-0000-7000-8000-000000000abc",
+			CNJNumber:  "0004567-11.2023.8.26.0001",
+			Court:      "TJSP",
+			Degree:     "G1",
+			Status:     IntimationStatusActive,
+			UserStatus: IntimationUserStatusPending,
+			Source:     "DJEN",
+		},
+		Content:     "teor completo da intimação, sem truncar",
+		JudgingBody: "2ª Vara Cível",
+		Recipients:  json.RawMessage(`[{"name":"Fulano","matched":true}]`),
 	}}
 	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
 
@@ -733,7 +848,15 @@ func TestHandler_GetIntimacao_OK(t *testing.T) {
 	if rd.gotIntiOneID != "018f0000-0000-7000-8000-000000000abc" {
 		t.Errorf("id forwarded = %q, want the path :id", rd.gotIntiOneID)
 	}
-	for _, want := range []string{`"cnj_number":"0004567-11.2023.8.26.0001"`, `"status":"PENDING"`} {
+	// The detail carries the list fields AND the deep-link extras (full content,
+	// judging_body, recipients, user_status).
+	for _, want := range []string{
+		`"cnj_number":"0004567-11.2023.8.26.0001"`,
+		`"user_status":"PENDING"`,
+		`"content":"teor completo da intimação, sem truncar"`,
+		`"judging_body":"2ª Vara Cível"`,
+		`"recipients":[{"name":"Fulano","matched":true}]`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %s\ngot: %s", want, body)
 		}
@@ -775,5 +898,267 @@ func TestHandler_GetIntimacao_InvalidID_400(t *testing.T) {
 	}
 	if !strings.Contains(body, string(apperr.KindInvalid)) {
 		t.Errorf("body missing kind %q\ngot: %s", apperr.KindInvalid, body)
+	}
+}
+
+// --- read route: GET /v1/processos/:id (deep-link to one process) ------------
+
+// GET /v1/processos/:id forwards the path :id and the principal's tenant (never the
+// path/query) to the read port and returns the ProcessoView as the whole payload —
+// 200, no list envelope, and claim_value (valor da causa) is carried on the wire.
+func TestHandler_GetProcesso_OK(t *testing.T) {
+	t.Parallel()
+
+	claim := "150000.00"
+	rd := &recordingReader{procOneRes: ProcessoView{
+		ID:         "018f0000-0000-7000-8000-000000000abc",
+		CNJNumber:  "0004567-11.2023.8.26.0001",
+		Court:      "TJSP",
+		Degree:     "G1",
+		Lifecycle:  "ACTIVE",
+		ClaimValue: &claim,
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet,
+		"/v1/processos/018f0000-0000-7000-8000-000000000abc", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	if rd.gotProcOneTID != "tenant-9" {
+		t.Errorf("tenant forwarded = %q, want tenant-9 (from principal)", rd.gotProcOneTID)
+	}
+	if rd.gotProcOneID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("id forwarded = %q, want the path :id", rd.gotProcOneID)
+	}
+	for _, want := range []string{`"cnj_number":"0004567-11.2023.8.26.0001"`, `"claim_value":"150000.00"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+	// The single view is returned bare, not wrapped in the list {data:[...]} envelope.
+	if strings.Contains(body, `"data"`) {
+		t.Errorf("GET /:id must not use the list envelope\ngot: %s", body)
+	}
+}
+
+// A miss — or a foreign tenant's id — is the read model's typed ErrProcessoNotFound
+// → 404 with the {kind,...} envelope, never a 500 or an empty 200.
+func TestHandler_GetProcesso_NotFound_404(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{procOneErr: ErrProcessoNotFound}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet,
+		"/v1/processos/018f0000-0000-7000-8000-000000000abc", "", "jwt")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", status, body)
+	}
+	if !strings.Contains(body, string(apperr.KindNotFound)) {
+		t.Errorf("body missing kind %q\ngot: %s", apperr.KindNotFound, body)
+	}
+}
+
+// A non-uuid :id is client input → the read model's typed KindInvalid → 400, not a 500.
+func TestHandler_GetProcesso_InvalidID_400(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{procOneErr: apperr.NewInvalid("id de processo inválido")}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/not-a-uuid", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+	if !strings.Contains(body, string(apperr.KindInvalid)) {
+		t.Errorf("body missing kind %q\ngot: %s", apperr.KindInvalid, body)
+	}
+}
+
+// --- PUT /v1/processos/:id/responsavel ---------------------------------------
+
+// A valid assign body → 200 with the re-read ProcessoView (the FE reidrates the header).
+// The handler forwards the principal's tenant and the path :id to the write use case,
+// then reads the fresh view through the read port.
+func TestHandler_AssignResponsible_OK(t *testing.T) {
+	t.Parallel()
+
+	userID := "018f0000-0000-7000-8000-0000000000aa"
+	userName := "Dra. Ana"
+	rd := &recordingReader{procOneRes: ProcessoView{
+		ID:               "018f0000-0000-7000-8000-000000000abc",
+		CNJNumber:        "0004567-11.2023.8.26.0001",
+		AssignedUserID:   &userID,
+		AssignedUserName: &userName,
+	}}
+	uc := &fakeHandlerUC{}
+	app := newAppWithReader(uc, rd, "LAWYER", "tenant-9")
+
+	body := `{"user_id":"` + userID + `"}`
+	status, resp := do(t, app, http.MethodPut,
+		"/v1/processos/018f0000-0000-7000-8000-000000000abc/responsavel", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resp)
+	}
+	if uc.gotAssignTenant != "tenant-9" {
+		t.Errorf("tenant forwarded = %q, want tenant-9 (from principal)", uc.gotAssignTenant)
+	}
+	if uc.gotAssignRecord != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("record forwarded = %q, want the path :id", uc.gotAssignRecord)
+	}
+	if uc.gotAssignUser == nil || *uc.gotAssignUser != userID {
+		t.Errorf("user forwarded = %v, want %q", uc.gotAssignUser, userID)
+	}
+	// The re-read view is the whole payload (with the fresh responsável), no list envelope.
+	for _, want := range []string{`"assigned_user_id":"` + userID + `"`, `"assigned_user_name":"Dra. Ana"`} {
+		if !strings.Contains(resp, want) {
+			t.Errorf("body missing %s\ngot: %s", want, resp)
+		}
+	}
+}
+
+// A null user_id (desatribuir) is valid → 200, and the handler forwards a nil user.
+func TestHandler_AssignResponsible_Unassign_OK(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{procOneRes: ProcessoView{ID: "018f0000-0000-7000-8000-000000000abc"}}
+	uc := &fakeHandlerUC{}
+	app := newAppWithReader(uc, rd, "LAWYER", "tenant-9")
+
+	status, resp := do(t, app, http.MethodPut,
+		"/v1/processos/018f0000-0000-7000-8000-000000000abc/responsavel", `{"user_id":null}`, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resp)
+	}
+	if uc.gotAssignUser != nil {
+		t.Errorf("user forwarded = %v, want nil (desatribuir)", uc.gotAssignUser)
+	}
+}
+
+// A malformed user_id (not a uuid) is rejected at the edge by Validate → 400, before the
+// use case is ever called.
+func TestHandler_AssignResponsible_InvalidBody_400(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newAppWithReader(uc, &recordingReader{}, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodPut,
+		"/v1/processos/018f0000-0000-7000-8000-000000000abc/responsavel", `{"user_id":"not-a-uuid"}`, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+	if uc.gotAssignRecord != "" {
+		t.Errorf("use case was called on an invalid body (record=%q)", uc.gotAssignRecord)
+	}
+}
+
+// --- triagem routes: POST /v1/intimacoes/:id/{resolve,ignore,reopen} ---------
+
+// The three triagem verbs forward the path :id and the principal's tenant to the write use
+// case (the right verb per route), then return the re-read detail view — 200, no envelope.
+func TestHandler_TriageIntimacao_Verbs_OK(t *testing.T) {
+	t.Parallel()
+
+	const id = "018f0000-0000-7000-8000-000000000abc"
+	tests := []struct {
+		route    string
+		wantVerb string
+	}{
+		{"resolve", "resolve"},
+		{"ignore", "ignore"},
+		{"reopen", "reopen"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.route, func(t *testing.T) {
+			t.Parallel()
+
+			rd := &recordingReader{intiOneRes: IntimacaoDetailView{
+				IntimacaoView: IntimacaoView{ID: id, UserStatus: IntimationUserStatusResolved},
+			}}
+			uc := &fakeHandlerUC{}
+			app := newAppWithReader(uc, rd, "LAWYER", "tenant-9")
+
+			status, body := do(t, app, http.MethodPost, "/v1/intimacoes/"+id+"/"+tt.route, "", "jwt")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+			}
+			if uc.gotTriageVerb != tt.wantVerb {
+				t.Errorf("verb called = %q, want %q", uc.gotTriageVerb, tt.wantVerb)
+			}
+			if uc.gotTriageTenant != "tenant-9" || uc.gotTriageID != id {
+				t.Errorf("forwarded (tenant, id) = (%q, %q), want (tenant-9, %q)", uc.gotTriageTenant, uc.gotTriageID, id)
+			}
+			// The response is the fresh detail view (re-read), not a list envelope.
+			if strings.Contains(body, `"data"`) {
+				t.Errorf("triagem response must not use the list envelope\ngot: %s", body)
+			}
+		})
+	}
+}
+
+// A miss/foreign id from the write use case is the typed ErrIntimationNotFound → 404, and
+// the read (re-read) is never reached.
+func TestHandler_TriageIntimacao_NotFound_404(t *testing.T) {
+	t.Parallel()
+
+	const id = "018f0000-0000-7000-8000-000000000abc"
+	uc := &fakeHandlerUC{triageErr: ErrIntimationNotFound}
+	app := newAppWithReader(uc, &recordingReader{}, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodPost, "/v1/intimacoes/"+id+"/resolve", "", "jwt")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", status, body)
+	}
+}
+
+// --- summary routes: GET /v1/{processos,intimacoes}/summary ------------------
+
+// GET /v1/processos/summary returns the bucketed lifecycle counts as a bare read model
+// (no list envelope), tenant-scoped.
+func TestHandler_ProcessosSummary_OK(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{procSummary: ProcessosSummaryView{
+		Total: 42, EmAndamento: 30, Suspensos: 5, Arquivados: 7, Baixados: 0,
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/summary", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	for _, want := range []string{`"total":42`, `"em_andamento":30`, `"suspensos":5`, `"arquivados":7`, `"baixados":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `"data"`) {
+		t.Errorf("summary must not use the list envelope\ngot: %s", body)
+	}
+}
+
+// GET /v1/intimacoes/summary returns the triagem-bucketed counts (em_analise/criticas are
+// 0 for now) as a bare read model. It must NOT be shadowed by the /:id param route.
+func TestHandler_IntimacoesSummary_OK(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{intiSummary: IntimacoesSummaryView{
+		Total: 20, Pendentes: 12, EmAnalise: 0, Resolvidas: 6, Ignoradas: 2, Criticas: 0,
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes/summary", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	// If the :id route had shadowed /summary, "summary" would reach GetIntimacao as an id
+	// and yield a 400 (non-uuid) — so a 200 with these buckets proves the route order.
+	for _, want := range []string{`"total":20`, `"pendentes":12`, `"resolvidas":6`, `"ignoradas":2`, `"em_analise":0`, `"criticas":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
 	}
 }

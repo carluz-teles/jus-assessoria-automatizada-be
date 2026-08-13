@@ -51,6 +51,10 @@ type Repository interface {
 	// UpdateOrgProfile persists the company profile onto the caller's tenant inside
 	// the caller's tx and returns the saved tenant. Scoped by tenant id (WHERE id).
 	UpdateOrgProfile(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error)
+	// ListOrgMembers reads the tenant's ACTIVE members (the responsável selector / team
+	// list) on the pool, scoped by tenant id. A screen read, no tx; the set is small, so
+	// it returns the whole slice with no cursor.
+	ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -108,6 +112,30 @@ func (r *pgRepository) FindTenantByID(ctx context.Context, tenantID string) (*Te
 		return nil, database.WrapInfra(err)
 	}
 	return tenantToEntity(row)
+}
+
+// ListOrgMembers reads the tenant's ACTIVE members on the pool (a screen read, no tx).
+// tenantID is the internal uuid (a string on the entity), parsed back here. An empty
+// team is an empty (never nil) slice, so the endpoint serializes data:[], not null.
+func (r *pgRepository) ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListOrgMembers(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	members := make([]OrgMember, 0, len(rows))
+	for _, row := range rows {
+		members = append(members, OrgMember{
+			ID:    row.ID.String(),
+			Name:  derefString(row.Name),
+			Email: row.Email,
+			Role:  Role(row.Role),
+		})
+	}
+	return members, nil
 }
 
 // UpsertUser provisions or refreshes an app_user inside the caller's tx. tenantID

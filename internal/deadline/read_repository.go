@@ -337,6 +337,7 @@ func (r *pgReadRepository) ListTasksByProcesso(ctx context.Context, q TasksByPro
 			CourtRecordID:  uuidText(row.CourtRecordID),
 			CompletedAt:    timestampPtr(row.CompletedAt),
 			sortDue:        row.SortDue.Time,
+			doneItems:      int(row.DoneItems),
 		})
 	}
 	return out, nil
@@ -421,6 +422,7 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 			CourtRecordID:  uuidText(row.CourtRecordID),
 			CompletedAt:    timestampPtr(row.CompletedAt),
 			sortDue:        row.SortDue.Time,
+			doneItems:      int(row.DoneItems),
 		})
 	}
 	return out, nil
@@ -467,6 +469,136 @@ func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64,
 		return 0, 0, database.WrapInfra(err)
 	}
 	return totalCount, total, nil
+}
+
+// GetTaskDetail reads one task's own fields for the detail view on the pool, filtered by
+// tenant_id. A miss — or a foreign tenant's row — maps to the typed ErrTaskNotFound (→ 404),
+// never (nil, nil). The checklist + progress are separate reads (a task with no items still
+// resolves). display_status is derived in the use case, not here.
+func (r *pgReadRepository) GetTaskDetail(ctx context.Context, tenantID, id string) (TaskDetailView, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return TaskDetailView{}, err
+	}
+	taskID, err := parseUUID(id)
+	if err != nil {
+		return TaskDetailView{}, err
+	}
+
+	row, err := r.q.GetTaskDetail(ctx, deadlinedb.GetTaskDetailParams{ID: taskID, TenantID: tid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TaskDetailView{}, ErrTaskNotFound
+	}
+	if err != nil {
+		return TaskDetailView{}, database.WrapInfra(err)
+	}
+
+	return TaskDetailView{
+		ID:             row.ID.String(),
+		Title:          row.Title,
+		Description:    derefString(row.Description),
+		Kind:           derefString(row.Kind),
+		DueDate:        datePtr(row.DueDate),
+		Status:         row.Status,
+		Source:         row.Source,
+		AssigneeUserID: uuidText(row.AssigneeUserID),
+		DeadlineID:     uuidText(row.DeadlineID),
+		IntimationID:   uuidText(row.IntimationID),
+		CourtRecordID:  uuidText(row.CourtRecordID),
+		CompletedAt:    timestampPtr(row.CompletedAt),
+	}, nil
+}
+
+// ListTaskItems reads one task's ordered checklist on the pool, filtered by tenant_id and
+// task_id. An itemless task yields an empty slice (never an error).
+func (r *pgReadRepository) ListTaskItems(ctx context.Context, tenantID, taskID string) ([]TaskItemView, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	tkid, err := parseUUID(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.q.ListTaskItems(ctx, deadlinedb.ListTaskItemsParams{TaskID: tkid, TenantID: tid})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]TaskItemView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, TaskItemView{
+			ID:        row.ID.String(),
+			Title:     row.Title,
+			Position:  int(row.Position),
+			Done:      row.Done,
+			DoneAt:    timestampPtr(row.DoneAt),
+			CreatedAt: row.CreatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
+// TaskItemProgress reads one task's {done, total} checklist tally on the pool, filtered by
+// tenant_id and task_id. An itemless task yields {0, 0}.
+func (r *pgReadRepository) TaskItemProgress(ctx context.Context, tenantID, taskID string) (TaskProgress, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return TaskProgress{}, err
+	}
+	tkid, err := parseUUID(taskID)
+	if err != nil {
+		return TaskProgress{}, err
+	}
+
+	row, err := r.q.GetTaskItemProgress(ctx, deadlinedb.GetTaskItemProgressParams{TaskID: tkid, TenantID: tid})
+	if err != nil {
+		return TaskProgress{}, database.WrapInfra(err)
+	}
+	return TaskProgress{Done: int(row.Done), Total: int(row.Total)}, nil
+}
+
+// PrazosSummary reads the tenant's prazos KPI counts on the pool (a single aggregated row),
+// filtered by tenant_id. The buckets are computed in SQL (thresholds at PrazosSummary).
+func (r *pgReadRepository) PrazosSummary(ctx context.Context, tenantID string) (PrazosSummary, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return PrazosSummary{}, err
+	}
+	row, err := r.q.GetPrazosSummary(ctx, tid)
+	if err != nil {
+		return PrazosSummary{}, database.WrapInfra(err)
+	}
+	return PrazosSummary{
+		Total:     int(row.Total),
+		Criticos:  int(row.Criticos),
+		Vencendo:  int(row.Vencendo),
+		Abertos:   int(row.Abertos),
+		Futuros:   int(row.Futuros),
+		Vencidos:  int(row.Vencidos),
+		Cumpridos: int(row.Cumpridos),
+	}, nil
+}
+
+// TasksSummary reads the tenant's tasks KPI counts on the pool (a single aggregated row),
+// filtered by tenant_id. The buckets use the same display_status derivation as the read views,
+// computed in SQL against CURRENT_DATE.
+func (r *pgReadRepository) TasksSummary(ctx context.Context, tenantID string) (TasksSummary, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return TasksSummary{}, err
+	}
+	row, err := r.q.GetTasksSummary(ctx, tid)
+	if err != nil {
+		return TasksSummary{}, database.WrapInfra(err)
+	}
+	return TasksSummary{
+		Abertas:    int(row.Abertas),
+		EmExecucao: int(row.EmExecucao),
+		Concluidas: int(row.Concluidas),
+		Atrasadas:  int(row.Atrasadas),
+	}, nil
 }
 
 // optionalFilterUUID parses an optional assignee filter: "" is no filter (a NULL pgtype.UUID the

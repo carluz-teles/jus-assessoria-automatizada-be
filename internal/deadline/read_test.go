@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // --- read use-case unit tests (recording readRepo) --------------------------
@@ -39,6 +40,18 @@ type recordingReadRepo struct {
 	tasksTotal       int64
 	lastTasksQuery   TasksQuery
 	lastTasksCountQ  TasksQuery
+
+	taskDetailView TaskDetailView
+	taskDetailErr  error
+	lastDetailTID  string
+	lastDetailID   string
+	taskItems      []TaskItemView
+	itemsErr       error
+	taskProgress   TaskProgress
+	progressErr    error
+	prazosSummary  PrazosSummary
+	tasksSummary   TasksSummary
+	lastSummaryTID string
 }
 
 func (r *recordingReadRepo) ListPrazosByProcesso(_ context.Context, q PrazosByProcessoQuery) ([]PrazoView, error) {
@@ -87,6 +100,29 @@ func (r *recordingReadRepo) ListTasks(_ context.Context, q TasksQuery) ([]TaskVi
 func (r *recordingReadRepo) CountTasks(_ context.Context, q TasksQuery) (int64, int64, error) {
 	r.lastTasksCountQ = q
 	return r.tasksTotalCount, r.tasksTotal, nil
+}
+
+func (r *recordingReadRepo) GetTaskDetail(_ context.Context, tenantID, id string) (TaskDetailView, error) {
+	r.lastDetailTID, r.lastDetailID = tenantID, id
+	return r.taskDetailView, r.taskDetailErr
+}
+
+func (r *recordingReadRepo) ListTaskItems(_ context.Context, _, _ string) ([]TaskItemView, error) {
+	return r.taskItems, r.itemsErr
+}
+
+func (r *recordingReadRepo) TaskItemProgress(_ context.Context, _, _ string) (TaskProgress, error) {
+	return r.taskProgress, r.progressErr
+}
+
+func (r *recordingReadRepo) PrazosSummary(_ context.Context, tenantID string) (PrazosSummary, error) {
+	r.lastSummaryTID = tenantID
+	return r.prazosSummary, nil
+}
+
+func (r *recordingReadRepo) TasksSummary(_ context.Context, tenantID string) (TasksSummary, error) {
+	r.lastSummaryTID = tenantID
+	return r.tasksSummary, nil
 }
 
 // PrazosByProcesso forwards the process (court_record) and keyset cursor to the repo,
@@ -307,5 +343,146 @@ func TestReadUseCase_Tasks_ForwardsFiltersAndWiresTotals(t *testing.T) {
 	if !res.HasMore || len(res.Items) != 2 || res.TotalCount != 4 || res.Total != 30 {
 		t.Errorf("result = hasMore %v / items %d / totals %d,%d, want true/2/4,30",
 			res.HasMore, len(res.Items), res.TotalCount, res.Total)
+	}
+}
+
+// --- TaskDetail + display_status + summaries --------------------------------
+
+// TestReadUseCase_TaskDetail_AssemblesItemsProgressAndDisplayStatus proves the detail read model
+// folds the task's fields, its ordered checklist and the {done,total} progress together, and derives
+// display_status from (status, progress, due_date) against the pinned clock.
+func TestReadUseCase_TaskDetail_AssemblesItemsProgressAndDisplayStatus(t *testing.T) {
+	t.Parallel()
+
+	today := time.Date(2024, 3, 20, 12, 0, 0, 0, time.UTC)
+	due := today.AddDate(0, 0, 5) // future → not overdue
+	repo := &recordingReadRepo{
+		taskDetailView: TaskDetailView{ID: "t-1", Title: "Contestar", Status: "OPEN", DueDate: &due},
+		taskItems: []TaskItemView{
+			{ID: "i-1", Title: "Ler", Position: 0, Done: true},
+			{ID: "i-2", Title: "Redigir", Position: 1, Done: false},
+		},
+		taskProgress: TaskProgress{Done: 1, Total: 2},
+	}
+	uc := NewReadUseCase(repo, WithReadClock(func() time.Time { return today }))
+
+	view, err := uc.TaskDetail(context.Background(), "tenant-9", "t-1")
+	if err != nil {
+		t.Fatalf("TaskDetail: %v", err)
+	}
+	if repo.lastDetailTID != "tenant-9" || repo.lastDetailID != "t-1" {
+		t.Errorf("forwarded (tenant,id) = (%q,%q), want (tenant-9,t-1)", repo.lastDetailTID, repo.lastDetailID)
+	}
+	if len(view.Items) != 2 || view.Items[0].ID != "i-1" {
+		t.Errorf("items = %+v, want the 2 checklist rows ordered", view.Items)
+	}
+	if view.Progress.Done != 1 || view.Progress.Total != 2 {
+		t.Errorf("progress = %+v, want {1,2}", view.Progress)
+	}
+	// OPEN, not overdue, one item done → Em execução.
+	if view.DisplayStatus != string(DisplayEmExecucao) {
+		t.Errorf("display_status = %q, want %q", view.DisplayStatus, DisplayEmExecucao)
+	}
+}
+
+// TestReadUseCase_TaskDetail_ItemlessTaskEmptySlice proves an itemless task resolves with an empty
+// (non-nil) checklist, {0,0} progress and an Aberta display_status.
+func TestReadUseCase_TaskDetail_ItemlessTaskEmptySlice(t *testing.T) {
+	t.Parallel()
+
+	today := time.Date(2024, 3, 20, 12, 0, 0, 0, time.UTC)
+	repo := &recordingReadRepo{
+		taskDetailView: TaskDetailView{ID: "t-1", Status: "OPEN"},
+		taskItems:      nil,
+		taskProgress:   TaskProgress{},
+	}
+	uc := NewReadUseCase(repo, WithReadClock(func() time.Time { return today }))
+
+	view, err := uc.TaskDetail(context.Background(), "tenant-9", "t-1")
+	if err != nil {
+		t.Fatalf("TaskDetail: %v", err)
+	}
+	if view.Items == nil || len(view.Items) != 0 {
+		t.Errorf("items = %v, want an empty non-nil slice", view.Items)
+	}
+	if view.DisplayStatus != string(DisplayAberta) {
+		t.Errorf("display_status = %q, want %q", view.DisplayStatus, DisplayAberta)
+	}
+}
+
+// TestReadUseCase_TaskDetail_NotFound proves a miss on the task row is the repo's typed
+// ErrTaskNotFound (→ 404): the items/progress reads never run.
+func TestReadUseCase_TaskDetail_NotFound(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{taskDetailErr: ErrTaskNotFound}
+	uc := NewReadUseCase(repo)
+
+	_, err := uc.TaskDetail(context.Background(), "tenant-9", "missing")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("error = %v, want ErrTaskNotFound", err)
+	}
+}
+
+// TestReadUseCase_Tasks_DecoratesDisplayStatus proves the LIST read decorates each row's
+// display_status from its status + done-item count + due_date (the additive field the new tabs read).
+func TestReadUseCase_Tasks_DecoratesDisplayStatus(t *testing.T) {
+	t.Parallel()
+
+	today := time.Date(2024, 3, 20, 12, 0, 0, 0, time.UTC)
+	overdue := today.AddDate(0, 0, -2)
+	future := today.AddDate(0, 0, 2)
+
+	rows := []TaskView{
+		{ID: "done", Status: "DONE"},
+		{ID: "atrasada", Status: "OPEN", DueDate: &overdue},
+		{ID: "exec", Status: "OPEN", DueDate: &future, doneItems: 2},
+		{ID: "aberta", Status: "OPEN", DueDate: &future, doneItems: 0},
+	}
+	repo := &recordingReadRepo{tasksAgendaRows: rows, tasksTotalCount: 4, tasksTotal: 4}
+	uc := NewReadUseCase(repo, WithReadClock(func() time.Time { return today }))
+
+	res, err := uc.Tasks(context.Background(), TasksQuery{TenantID: "t-1", Limit: 10})
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	want := map[string]string{
+		"done":     string(DisplayConcluida),
+		"atrasada": string(DisplayAtrasada),
+		"exec":     string(DisplayEmExecucao),
+		"aberta":   string(DisplayAberta),
+	}
+	for _, row := range res.Items {
+		if row.DisplayStatus != want[row.ID] {
+			t.Errorf("row %q display_status = %q, want %q", row.ID, row.DisplayStatus, want[row.ID])
+		}
+	}
+}
+
+// TestReadUseCase_Summaries_PassThroughTenant proves both summaries forward the tenant and return
+// the repo's aggregated counts unchanged (single-object read models).
+func TestReadUseCase_Summaries_PassThroughTenant(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{
+		prazosSummary: PrazosSummary{Total: 10, Criticos: 2, Vencendo: 3, Abertos: 6, Futuros: 1, Vencidos: 2, Cumpridos: 2},
+		tasksSummary:  TasksSummary{Abertas: 4, EmExecucao: 3, Concluidas: 5, Atrasadas: 1},
+	}
+	uc := NewReadUseCase(repo)
+
+	ps, err := uc.PrazosSummary(context.Background(), "tenant-9")
+	if err != nil {
+		t.Fatalf("PrazosSummary: %v", err)
+	}
+	if repo.lastSummaryTID != "tenant-9" || ps.Total != 10 || ps.Criticos != 2 || ps.Cumpridos != 2 {
+		t.Errorf("prazos summary = %+v (tid %q), want the canned counts for tenant-9", ps, repo.lastSummaryTID)
+	}
+
+	ts, err := uc.TasksSummary(context.Background(), "tenant-9")
+	if err != nil {
+		t.Fatalf("TasksSummary: %v", err)
+	}
+	if ts.Abertas != 4 || ts.EmExecucao != 3 || ts.Concluidas != 5 || ts.Atrasadas != 1 {
+		t.Errorf("tasks summary = %+v, want the canned counts", ts)
 	}
 }

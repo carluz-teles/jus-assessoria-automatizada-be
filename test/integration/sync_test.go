@@ -164,6 +164,41 @@ func TestSync_DocketEntry_OnConflictDoNothing(t *testing.T) {
 	}
 }
 
+// I-party: the party materialization is idempotent — two deliveries of the same window
+// leave exactly the fixture's parties (2: autor + réu) and advogados (1, on the autor),
+// deduped by (tenant, case, role, name) and (tenant, party, oab, uf). Re-observation
+// neither duplicates nor breaks dedup. Both rows carry the tenant (RLS-isolated).
+func TestSync_Parties_UpsertIdempotent(t *testing.T) {
+	pool := newPool(t)
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-sync-party", 0)
+	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+
+	uc := newSyncUC(pool)
+	ctx := context.Background()
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
+		t.Fatalf("second delivery: %v", err)
+	}
+
+	if n := countRows(t, pool, `SELECT count(*) FROM party WHERE tenant_id=$1`, tenantID); n != 2 {
+		t.Fatalf("party rows = %d, want 2 (autor + réu, deduped on re-sync)", n)
+	}
+	if n := countRows(t, pool,
+		`SELECT count(*) FROM party_counsel pc JOIN party p ON p.id = pc.party_id
+		 WHERE p.tenant_id=$1`, tenantID); n != 1 {
+		t.Fatalf("party_counsel rows = %d, want 1 (the autor's advogado, deduped on re-sync)", n)
+	}
+	// The counsel hangs off the PLAINTIFF party, resolved to the process's case.
+	if n := countRows(t, pool,
+		`SELECT count(*) FROM party_counsel pc JOIN party p ON p.id = pc.party_id
+		 WHERE p.tenant_id=$1 AND p.role='PLAINTIFF' AND pc.oab='123456' AND pc.uf='SP'`, tenantID); n != 1 {
+		t.Fatalf("plaintiff advogado 123456/SP rows = %d, want 1", n)
+	}
+}
+
 // I4: sync_completed is written in the same transaction as the OK run — after a
 // successful cycle, the outbox holds one sync_completed referencing the run,
 // plus the observed events (court_record ×1, docket_entry ×2).

@@ -108,6 +108,11 @@ type stubSyncRepo struct {
 	intimCourt     string
 	intimCancelled []IntimationChange
 
+	// party upsert recorder: partyCalls counts the calls, partyParams captures the last
+	// batch — the party-materialization test asserts the resolved case_id/role/counsels.
+	partyCalls  int
+	partyParams []PartyParams
+
 	updates []SyncRunOutcome
 	// closedRuns models the sync_run's status=RUNNING compare-and-swap: the first
 	// close of a given run id wins (closed=true), any later close of the SAME id
@@ -237,6 +242,12 @@ func (s *stubSyncRepo) UpsertIntimations(_ context.Context, _ database.Tx, param
 		})
 	}
 	return newRows, s.intimCancelled, nil
+}
+
+func (s *stubSyncRepo) UpsertParties(_ context.Context, _ database.Tx, params []PartyParams) error {
+	s.partyCalls++
+	s.partyParams = params
+	return nil
 }
 
 // syncRequestedEvent builds a valid sync_requested event for the default tenant,
@@ -521,6 +532,81 @@ func TestSyncUseCase_NewIntimation_EmitsObserved(t *testing.T) {
 	}
 	if ev.EventID == "" {
 		t.Error("event_id empty, want a fresh event id (events.Base)")
+	}
+}
+
+// U-party-1: the sync cycle materializes the parsed parties in the SAME tx, resolving
+// each to its court_record's case_id (via the find-or-create map), and carries the
+// advogados. Asserts UpsertParties is called once with the resolved case and counsel.
+func TestSyncUseCase_MaterializesParties(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{syncRunID: "run-1"}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	uc := NewSyncUseCase(repo, &fakeOutbox{}, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	if err := uc.OnSyncRequested(context.Background(), syncRequestedEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+
+	if repo.partyCalls != 1 {
+		t.Fatalf("UpsertParties calls = %d, want 1", repo.partyCalls)
+	}
+	if len(repo.partyParams) != 2 {
+		t.Fatalf("party params = %d, want 2 (autor + réu)", len(repo.partyParams))
+	}
+	// stubCourtRecord keys the case id off the natural key, so every party resolves to
+	// the SAME case as its record — this is the tx-time case_id resolution under test.
+	wantCase := "case-0000001-11.2024.8.26.0100-" + DegreeG1
+	var sawPlaintiffWithCounsel bool
+	for _, p := range repo.partyParams {
+		if p.TenantID != testTenant {
+			t.Errorf("party %q tenant = %q, want %q", p.Name, p.TenantID, testTenant)
+		}
+		if p.CaseID != wantCase {
+			t.Errorf("party %q case_id = %q, want %q (resolved via find-or-create map)", p.Name, p.CaseID, wantCase)
+		}
+		if p.Role == PartyRolePlaintiff && len(p.Counsels) == 1 && p.Counsels[0].OAB == "123456" {
+			sawPlaintiffWithCounsel = true
+		}
+	}
+	if !sawPlaintiffWithCounsel {
+		t.Error("the PLAINTIFF party should carry its advogado 123456/SP")
+	}
+}
+
+// U-party-2: a blocked (entitlement-gated) record contributes NO party — its case was
+// never created, so a party hanging off it must be dropped (fail-closed, like docket).
+func TestSyncUseCase_BlockedRecord_DropsItsParties(t *testing.T) {
+	t.Parallel()
+
+	// Two records; the tenant is AT its ceiling (limit 0, active 0 → the first NEW record
+	// is blocked). twoRecordFixture carries no parties, so add one on the blocked record.
+	fixture := twoRecordFixture(SourceDJEN)
+	fixture.Parties = []ParsedParty{{
+		CNJNumber: fixture.CourtRecords[0].CNJNumber,
+		Degree:    fixture.CourtRecords[0].Degree,
+		Role:      PartyRolePlaintiff,
+		Name:      "AUTOR BLOCKED",
+	}}
+
+	repo := &stubSyncRepo{syncRunID: "run-1"}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: fixture}
+	checker := &stubEntitlementChecker{limit: 0}
+	uc := NewSyncUseCase(repo, &fakeOutbox{}, uow, orchestratorWith(SourceDJEN, conn), parser, WithEntitlementChecker(checker))
+
+	if err := uc.OnSyncRequested(context.Background(), nonBackfillSyncEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+	// The party's record was blocked → no party param reaches the repo.
+	for _, p := range repo.partyParams {
+		if p.Name == "AUTOR BLOCKED" {
+			t.Errorf("party on a blocked record was upserted, want dropped")
+		}
 	}
 }
 

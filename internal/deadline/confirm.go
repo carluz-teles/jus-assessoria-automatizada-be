@@ -251,6 +251,13 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 			return err
 		}
 
+		// TODO(checklist-template): seed a default checklist (Ler intimação, Analisar documentos,
+		// Definir estratégia, Redigir, Revisar, Aprovar, Protocolar, Conferir) on the created tasks
+		// when kind is MANIFESTACAO/peça. DELIBERATELY NOT DONE here: the confirm has REPLACE (upsert)
+		// semantics on re-confirm — auto-seeding items would either duplicate on every re-confirm or
+		// need a "seed only on first confirm" guard, both of which complicate the coração do produto.
+		// The FE can offer the template via POST /v1/tasks/:id/items after confirm (low risk, explicit).
+
 		result = ConfirmResult{Deadline: confirmed, Tasks: tasks}
 		return nil
 	})

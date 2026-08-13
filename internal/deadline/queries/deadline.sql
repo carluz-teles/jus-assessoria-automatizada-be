@@ -187,6 +187,71 @@ RETURNING id;
 DELETE FROM task
 WHERE deadline_id = $1 AND tenant_id = $2;
 
+-- ── task_item write path (checklist / subtarefas, §4/§10) ────────────────────
+-- The Tarefas screen's checklist: a task grows N ordered items the user ticks off. Every
+-- write is keyed by the parent task and scoped to tenant_id (barrier 1, on top of RLS
+-- barrier 2). The parent-task guard (TaskExistsInTenant) turns a foreign/unknown task_id
+-- into a typed 404 BEFORE any item write, so an item can never be grafted onto another
+-- tenant's task.
+
+-- name: TaskExistsInTenant :one
+-- Guard the item writes: does this task exist in the tenant? POST /v1/tasks/:id/items
+-- checks it BEFORE inserting so a foreign/unknown :id is a typed ErrTaskNotFound (→ 404) at
+-- the mapper, not a phantom item on nothing (or a raw FK error). $1 = id, $2 = tenant_id.
+SELECT id
+FROM task
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: NextTaskItemPosition :one
+-- The position a newly appended checklist item takes: one past the current max within the
+-- task (0 when the checklist is empty). Scoped to tenant_id (barrier 1). Keeps positions
+-- gap-free-ish on append (the FE may later rewrite them to reorder). $1 = task_id, $2 =
+-- tenant_id.
+SELECT COALESCE(MAX(position) + 1, 0)::int AS next_position
+FROM task_item
+WHERE task_id = $1 AND tenant_id = $2;
+
+-- name: InsertTaskItem :one
+-- Append one checklist item to a task (POST /v1/tasks/:id/items). Born done=false (the
+-- default), done_at NULL. tenant_id/task_id come from the request context + the guarded
+-- parent; position is the computed append slot. Returns the whole row so the handler renders
+-- it without a re-read. $1 = tenant_id, $2 = task_id, $3 = title, $4 = position.
+INSERT INTO task_item (tenant_id, task_id, title, position)
+VALUES ($1, $2, $3, $4)
+RETURNING id, task_id, title, position, done, done_at, created_at;
+
+-- name: GetTaskItemForUpdate :one
+-- Load a checklist item's current {title, done} before the partial PATCH (PATCH
+-- /v1/tasks/:id/items/:itemId), keyed by (item id, parent task id) and scoped to tenant_id
+-- (barrier 1). Binding task_id too means an itemId under a DIFFERENT task is a miss (→ 404),
+-- not a cross-task edit. A missing row → pgx.ErrNoRows → typed ErrTaskItemNotFound at the
+-- mapper. $1 = id, $2 = task_id, $3 = tenant_id.
+SELECT id, task_id, title, done
+FROM task_item
+WHERE id = $1 AND task_id = $2 AND tenant_id = $3;
+
+-- name: UpdateTaskItem :one
+-- Write the merged {title, done, done_at} of a checklist item (PATCH …/items/:itemId),
+-- keyed by (id, task_id, tenant_id) (barrier 1). done_at is set/cleared by the use case to
+-- match done (a real time when done flips true, NULL when it flips false). A no-match → 404
+-- at the mapper. Returns the whole row so the handler renders it without a re-read. $1 = id,
+-- $2 = task_id, $3 = tenant_id, $4 = title, $5 = done, $6 = done_at.
+UPDATE task_item
+SET title   = $4,
+    done    = $5,
+    done_at = $6
+WHERE id = $1 AND task_id = $2 AND tenant_id = $3
+RETURNING id, task_id, title, position, done, done_at, created_at;
+
+-- name: DeleteTaskItem :one
+-- Remove one checklist item (DELETE …/items/:itemId), keyed by (id, task_id, tenant_id)
+-- (barrier 1). Returns the deleted id so a no-match (foreign/unknown item) → pgx.ErrNoRows →
+-- typed ErrTaskItemNotFound at the mapper (→ 404), never a silent 204 on nothing. $1 = id,
+-- $2 = task_id, $3 = tenant_id.
+DELETE FROM task_item
+WHERE id = $1 AND task_id = $2 AND tenant_id = $3
+RETURNING id;
+
 -- name: GetDeadlineForAdjust :one
 -- Load a prazo's FULL adjustable state — the F2 ajuste manual (§9: PATCH /v1/prazos/:id)
 -- reads it BEFORE the recompute: start_date is the fixed anchor the calendar re-counts

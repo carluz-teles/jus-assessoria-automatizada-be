@@ -27,6 +27,9 @@ type reader interface {
 	Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
 	TasksByProcesso(ctx context.Context, q TasksByProcessoQuery) (TasksByProcessoResult, error)
 	Tasks(ctx context.Context, q TasksQuery) (TasksResult, error)
+	TaskDetail(ctx context.Context, tenantID, id string) (TaskDetailView, error)
+	PrazosSummary(ctx context.Context, tenantID string) (PrazosSummary, error)
+	TasksSummary(ctx context.Context, tenantID string) (TasksSummary, error)
 }
 
 // writer is the narrow port the Handler uses from the write use case — the F2 confirmation
@@ -42,6 +45,9 @@ type writer interface {
 	UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task, error)
 	MarkTaskDone(ctx context.Context, tenantID, taskID string) (TaskTransition, error)
 	DismissTask(ctx context.Context, tenantID, taskID string) (TaskTransition, error)
+	CreateTaskItem(ctx context.Context, cmd CreateTaskItemCommand) (*TaskItem, error)
+	UpdateTaskItem(ctx context.Context, cmd UpdateTaskItemCommand) (*TaskItem, error)
+	DeleteTaskItem(ctx context.Context, tenantID, taskID, itemID string) error
 }
 
 // Handler is the deadline HTTP surface. It owns its routing; the api only composes by
@@ -66,6 +72,9 @@ func NewHandler(reader reader, writer writer) *Handler {
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/processos/:id/prazos", h.listPrazosByProcesso)
 	r.Get("/prazos", h.listPrazos)
+	// The static /prazos/summary is registered BEFORE the /prazos/:id param route so Fiber
+	// never captures "summary" as an :id (static beats param at the same depth by declaration order).
+	r.Get("/prazos/summary", h.getPrazosSummary)
 	r.Get("/prazos/:id", h.getPrazo)
 	r.Post("/prazos/confirm", h.confirmPrazo)
 	r.Patch("/prazos/:id", h.adjustPrazo)
@@ -73,10 +82,17 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/prazos/:id/missed", h.markPrazoMissed)
 	r.Get("/processos/:id/tasks", h.listTasksByProcesso)
 	r.Get("/tasks", h.listTasks)
+	// Same static-before-param ordering for /tasks/summary vs /tasks/:id.
+	r.Get("/tasks/summary", h.getTasksSummary)
+	r.Get("/tasks/:id", h.getTask)
 	r.Post("/tasks", h.createTask)
 	r.Patch("/tasks/:id", h.updateTask)
 	r.Post("/tasks/:id/done", h.markTaskDone)
 	r.Post("/tasks/:id/dismiss", h.dismissTask)
+	// Checklist / subtarefas of a task (§4/§10).
+	r.Post("/tasks/:id/items", h.createTaskItem)
+	r.Patch("/tasks/:id/items/:itemId", h.updateTaskItem)
+	r.Delete("/tasks/:id/items/:itemId", h.deleteTaskItem)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending scan (soonest vencimento
@@ -407,6 +423,107 @@ func (h *Handler) dismissTask(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(newTaskTransitionResponse(res))
+}
+
+// getTask handles GET /v1/tasks/:id: the task detail read model — the task's fields, its ordered
+// checklist, the {done, total} progress and the derived display_status. tenant_id comes from the
+// principal; a miss (or a foreign tenant's id) is the repo's typed ErrTaskNotFound → 404.
+func (h *Handler) getTask(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.TaskDetail(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// getPrazosSummary handles GET /v1/prazos/summary: the tenant's prazos KPI counts (a single
+// aggregated object). tenant_id comes from the principal; the read is tenant-scoped.
+func (h *Handler) getPrazosSummary(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.PrazosSummary(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// getTasksSummary handles GET /v1/tasks/summary: the tenant's tasks KPI counts (a single
+// aggregated object, the display_status buckets). tenant_id comes from the principal.
+func (h *Handler) getTasksSummary(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.TasksSummary(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// createTaskItem handles POST /v1/tasks/:id/items: append one checklist item to a task. It
+// validates the body, then persists the item (appended last, done=false) in one tx, returning 201
+// with the created item. tenant_id comes from the principal and the task id from the path (never
+// the body). A foreign/unknown task id is the use case's typed ErrTaskItemNotFound → 404.
+func (h *Handler) createTaskItem(c *fiber.Ctx) error {
+	var req CreateTaskItemRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	item, err := h.writer.CreateTaskItem(c.UserContext(), req.toCommand(tenantID, c.Params("id")))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(newTaskItemView(item))
+}
+
+// updateTaskItem handles PATCH /v1/tasks/:id/items/:itemId: toggle/rename one checklist item. It
+// validates the partial body, then merges + updates the item in one tx (setting/clearing done_at
+// per done), returning 200 with the saved item. tenant_id/task id/item id come from the principal
+// + path. A miss is the use case's typed ErrTaskItemNotFound → 404.
+func (h *Handler) updateTaskItem(c *fiber.Ctx) error {
+	var req UpdateTaskItemRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	item, err := h.writer.UpdateTaskItem(c.UserContext(), req.toCommand(tenantID, c.Params("id"), c.Params("itemId")))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newTaskItemView(item))
+}
+
+// deleteTaskItem handles DELETE /v1/tasks/:id/items/:itemId: remove one checklist item. No body —
+// the ids come from the path and tenant_id from the principal. A miss is the use case's typed
+// ErrTaskItemNotFound → 404; a successful delete is 204 No Content.
+func (h *Handler) deleteTaskItem(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	if err := h.writer.DeleteTaskItem(c.UserContext(), tenantID, c.Params("id"), c.Params("itemId")); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// newTaskItemView renders a persisted *TaskItem (a create/patch write result) as the wire shape.
+// done_at is null while the item is undone; it mirrors the read model's TaskItemView so a checklist
+// item looks identical read or written.
+func newTaskItemView(item *TaskItem) TaskItemView {
+	return TaskItemView{
+		ID:        item.ID,
+		Title:     item.Title,
+		Position:  item.Position,
+		Done:      item.Done,
+		DoneAt:    item.DoneAt,
+		CreatedAt: item.CreatedAt,
+	}
 }
 
 // isKnownStatus reports whether s is a member of the closed prazo status set (the DB

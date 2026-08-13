@@ -148,6 +148,26 @@ type IntimationParams struct {
 	SyncRunID string
 }
 
+// PartyParams is one party to upsert (idempotent on tenant+case+role+name) with its
+// advogados. The DJEN materializes the process's partes so the cockpit renders the
+// AUTOR/RÉU cards; a re-observation of the same communication upserts the same rows
+// without duplicating. Counsels are the party's advogados, deduped on
+// tenant+party+oab+uf. Source is always DJEN in v0.
+type PartyParams struct {
+	TenantID string
+	CaseID   string
+	Role     string
+	Name     string
+	Counsels []PartyCounselParams
+}
+
+// PartyCounselParams is one advogado of a PartyParams (nome + OAB número/UF).
+type PartyCounselParams struct {
+	Name string
+	OAB  string
+	UF   string
+}
+
 // IntimationChange is one intimação the upsert reported as event-worthy: either
 // FIRST inserted (→ intimation.observed) or transitioned ACTIVE → CANCELLED (→
 // intimation.cancelled). Court is DENORMALIZED from the intimation's court_record
@@ -182,6 +202,12 @@ type syncRepo interface {
 	// → observed) and those it transitioned ACTIVE → CANCELLED (cancelledRows, →
 	// cancelled), so the use case emits the right event per change in the same tx.
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error)
+	// UpsertParties materializes the process's partes (autor/réu/terceiro + advogados)
+	// idempotently on tenant+case+role+name (party) and tenant+party+oab+uf (counsel),
+	// so a re-observation neither duplicates nor breaks dedup. No event is emitted (no
+	// cross-slice consumer in v0 — the cockpit reads them straight), so it returns only
+	// an error.
+	UpsertParties(ctx context.Context, tx database.Tx, params []PartyParams) error
 }
 
 // EntitlementChecker resolves a tenant's ceiling on ACTIVE processes — the v0
@@ -510,6 +536,17 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		}
 		intimationsNew := len(newIntim)
 
+		// Materialize the process's partes (autor/réu + advogados) in the same tx, resolved
+		// to their case via the find-or-create map. Idempotent: a re-observation upserts the
+		// same rows. A record gated by the entitlement ceiling contributes no party (blocked).
+		partyParams, err := partyParamsFor(ev.TenantID, parsed.Parties, records, blocked)
+		if err != nil {
+			return err
+		}
+		if err := uc.repo.UpsertParties(ctx, tx, partyParams); err != nil {
+			return err
+		}
+
 		itemsNew := len(newDocket)
 		itemsDeduped := len(docketParams) - itemsNew
 
@@ -713,6 +750,38 @@ func intimationParamsFor(tenantID, syncRunID string, intims []ParsedIntimation, 
 			CancelReason:    pn.CancelReason,
 			Recipients:      pn.Recipients,
 			SyncRunID:       syncRunID,
+		})
+	}
+	return params, nil
+}
+
+// partyParamsFor resolves each parsed party to its case id via the find-or-create
+// map, under the event's tenant. Same blocked-drop and fail-closed rules as docket
+// entries/intimations: a party whose record was gated by the entitlement ceiling is
+// dropped, and one naming a record that is neither created nor blocked aborts the
+// cycle. A party with an empty name (a counsel-only placeholder from the parser) is
+// kept — its counsel still materializes under the placeholder role.
+func partyParamsFor(tenantID string, parties []ParsedParty, records map[string]*CourtRecord, blocked map[string]bool) ([]PartyParams, error) {
+	params := make([]PartyParams, 0, len(parties))
+	for _, pp := range parties {
+		key := recordKey(pp.CNJNumber, pp.Degree)
+		if blocked[key] {
+			continue
+		}
+		cr, ok := records[key]
+		if !ok {
+			return nil, fmt.Errorf("party %q references unknown court record %s/%s", pp.Name, pp.CNJNumber, pp.Degree)
+		}
+		counsels := make([]PartyCounselParams, 0, len(pp.Counsels))
+		for _, c := range pp.Counsels {
+			counsels = append(counsels, PartyCounselParams{Name: c.Name, OAB: c.OAB, UF: c.UF})
+		}
+		params = append(params, PartyParams{
+			TenantID: tenantID,
+			CaseID:   cr.CaseID,
+			Role:     pp.Role,
+			Name:     pp.Name,
+			Counsels: counsels,
 		})
 	}
 	return params, nil

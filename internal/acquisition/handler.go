@@ -22,16 +22,30 @@ const roleAdmin = "ADMIN"
 type handlerUC interface {
 	ActivateIntegration(ctx context.Context, tenantID string, sources []string, scope Scope) ([]*Integration, error)
 	ListIntegrations(ctx context.Context, tenantID string) ([]*Integration, error)
+	// AssignResponsible sets/clears the responsável on the process behind a court_record
+	// :id, in one tx. It returns only an error; the handler re-reads the ProcessoView
+	// through the read port so the FE reidrates the header from the fresh row.
+	AssignResponsible(ctx context.Context, tenantID, courtRecordID string, assignedUserID *string) error
+	// Triagem da intimação: move the intimation's user_status to RESOLVED / IGNORED /
+	// PENDING in one tx. Each returns only an error; the handler re-reads the detail view
+	// through the read port so the FE reidrates the row from the fresh state.
+	ResolveIntimacao(ctx context.Context, tenantID, intimationID string) error
+	IgnoreIntimacao(ctx context.Context, tenantID, intimationID string) error
+	ReopenIntimacao(ctx context.Context, tenantID, intimationID string) error
 }
 
 // reader is the narrow port the Handler uses from the read use case — the
 // keyset-paginated screen reads (each returns the page plus whether more remain).
 type reader interface {
 	Processos(ctx context.Context, q ProcessosQuery) (ProcessosResult, error)
+	Processo(ctx context.Context, tenantID, id string) (ProcessoView, error)
 	Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error)
-	Intimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error)
+	Intimacao(ctx context.Context, tenantID, id string) (IntimacaoDetailView, error)
 	Andamentos(ctx context.Context, q AndamentosQuery) (AndamentosResult, error)
 	IntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error)
+	Partes(ctx context.Context, tenantID, courtRecordID string) (PartesView, error)
+	ProcessosSummary(ctx context.Context, tenantID string) (ProcessosSummaryView, error)
+	IntimacoesSummary(ctx context.Context, tenantID string) (IntimacoesSummaryView, error)
 	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error)
 	ReconciliationDetail(ctx context.Context, tenantID, jobID string) (ReconciliationDetailView, error)
@@ -61,10 +75,19 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/acquisition/reconciliations/:jobId", h.reconciliationDetail)
 	r.Get("/acquisition/sync-runs/:syncRunId/items", h.syncRunItems)
 	r.Get("/processos", h.listProcessos)
+	// summary before :id so the static "/summary" segment is never shadowed by the param.
+	r.Get("/processos/summary", h.processosSummary)
+	r.Get("/processos/:id", h.getProcesso)
+	r.Put("/processos/:id/responsavel", h.assignResponsible)
 	r.Get("/processos/:id/andamentos", h.listAndamentos)
 	r.Get("/processos/:id/intimacoes", h.listIntimacoesByProcesso)
+	r.Get("/processos/:id/partes", h.listPartes)
 	r.Get("/intimacoes", h.listIntimacoes)
+	r.Get("/intimacoes/summary", h.intimacoesSummary)
 	r.Get("/intimacoes/:id", h.getIntimacao)
+	r.Post("/intimacoes/:id/resolve", h.resolveIntimacao)
+	r.Post("/intimacoes/:id/ignore", h.ignoreIntimacao)
+	r.Post("/intimacoes/:id/reopen", h.reopenIntimacao)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending processos scan
@@ -246,6 +269,107 @@ func (h *Handler) getIntimacao(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(view)
 }
 
+// resolveIntimacao / ignoreIntimacao / reopenIntimacao handle the POST triagem actions on
+// GET /v1/intimacoes/:id/{resolve,ignore,reopen}: move the intimation's user_status and
+// answer 200 with the fresh detail view (re-read through the read port), so the FE
+// reidrates the row from the persisted state. tenant_id comes from the principal, never
+// the path/body; a miss or a foreign tenant's id is the write's typed 404, a non-uuid id
+// its typed 400. No body — the verb is the whole intent.
+func (h *Handler) resolveIntimacao(c *fiber.Ctx) error {
+	return h.triageIntimacao(c, h.uc.ResolveIntimacao)
+}
+
+func (h *Handler) ignoreIntimacao(c *fiber.Ctx) error {
+	return h.triageIntimacao(c, h.uc.IgnoreIntimacao)
+}
+
+func (h *Handler) reopenIntimacao(c *fiber.Ctx) error {
+	return h.triageIntimacao(c, h.uc.ReopenIntimacao)
+}
+
+// triageIntimacao is the shared body of the three triagem handlers: run the action in one
+// tx, then re-read and return the detail view. The action func is the use case's
+// Resolve/Ignore/Reopen — same signature — so the three handlers differ only by the verb.
+func (h *Handler) triageIntimacao(c *fiber.Ctx, action func(ctx context.Context, tenantID, intimationID string) error) error {
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	if err := action(c.UserContext(), tenantID, id); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	view, err := h.reader.Intimacao(c.UserContext(), tenantID, id)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// processosSummary handles GET /v1/processos/summary: the processes list KPI counts
+// (bucketed by court_record lifecycle) for the tenant. A single read model (no cursor
+// envelope). tenant_id comes from the principal.
+func (h *Handler) processosSummary(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.ProcessosSummary(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// intimacoesSummary handles GET /v1/intimacoes/summary: the intimações inbox KPI counts
+// (bucketed by triagem state) for the tenant. A single read model (no cursor envelope).
+// tenant_id comes from the principal.
+func (h *Handler) intimacoesSummary(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.IntimacoesSummary(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// getProcesso handles GET /v1/processos/:id: one process for the FE deep-link (open the
+// detail of a process not on the loaded list page). The view is the whole payload — one
+// ProcessoView, same shape as a list row (including claim_value) — so it is returned
+// without a list envelope. tenant_id comes from the principal, never the path/body: a
+// miss or a foreign tenant's id is the read model's typed 404, a non-uuid id its typed 400.
+func (h *Handler) getProcesso(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.Processo(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// assignResponsible handles PUT /v1/processos/:id/responsavel: set (or clear, with a null
+// user_id) the responsável for the process behind the court_record :id. The write runs in
+// one tx (resolve record→case, guard the user is a member, assign); then the handler
+// re-reads the ProcessoView through the read port and answers 200 with it, so the FE
+// reidrates the header from the fresh row rather than trusting a client echo. tenant_id
+// comes from the principal, never the body — a foreign/unknown :id is the write's typed
+// 404, a malformed body (non-uuid user_id) its typed 400.
+func (h *Handler) assignResponsible(c *fiber.Ctx) error {
+	var req AssignResponsibleRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	if err := h.uc.AssignResponsible(c.UserContext(), tenantID, id, req.UserID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	view, err := h.reader.Processo(c.UserContext(), tenantID, id)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
 // listAndamentos handles GET /v1/processos/:id/andamentos: the "Andamentos" tab of one
 // process — its docket entries, newest first, keyset paginated (?limit, ?cursor). The
 // :id is the court_record id (the same id /processos returns); tenant_id comes from the
@@ -299,6 +423,21 @@ func (h *Handler) listIntimacoesByProcesso(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(newIntimacoesByProcessoPage(res, limit))
+}
+
+// listPartes handles GET /v1/processos/:id/partes: the "Partes" cards of one process —
+// its autor/réu/terceiros with each party's advogados, bucketed by role. The :id is the
+// court_record id (the same id /processos returns); tenant_id comes from the principal,
+// and the read is tenant-scoped so a foreign :id yields three empty buckets. The view is
+// the whole payload (no cursor — the party set per process is tiny), so it is returned
+// without an envelope. A non-uuid :id is the read model's typed 400.
+func (h *Handler) listPartes(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.Partes(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
 }
 
 // newProcessosPage wraps the processos read model in the cursor envelope; the next

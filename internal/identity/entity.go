@@ -89,6 +89,17 @@ type Me struct {
 	OnboardingCompletedAt *time.Time
 }
 
+// OrgMember is one row of the escritório's team read model (GET
+// /v1/organization/members): the app_user id/name/email plus its membership role. It
+// feeds the responsável selector and the /organization members list. A pure read DTO —
+// it carries only what the screen renders, never the aggregate.
+type OrgMember struct {
+	ID    string
+	Name  string
+	Email string
+	Role  Role
+}
+
 // AppUser mirrors a Clerk User, already linked to its tenant (1 user = 1
 // escritório). TenantID is the internal uuid, never the Clerk org id.
 type AppUser struct {

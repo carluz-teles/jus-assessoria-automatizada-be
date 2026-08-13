@@ -139,6 +139,70 @@ func TestTask_Insertable(t *testing.T) {
 	}
 }
 
+// TestTaskItem_InsertableAndCascades proves migration 0031's task_item table exists, accepts a
+// minimal checklist row (defaulting done=false), and CASCADEs when its parent task is deleted —
+// the checklist has no life of its own. All inside a rolled-back tx (the DB stays clean).
+func TestTaskItem_InsertableAndCascades(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tenantID := seedDeadlineTenant(ctx, t, tx)
+
+	var taskID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO task (tenant_id, title, source)
+		VALUES ($1, 'Contestar', 'RULE') RETURNING id`, tenantID).Scan(&taskID); err != nil {
+		t.Fatalf("inserting parent task: %v", err)
+	}
+
+	var done bool
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO task_item (tenant_id, task_id, title, position)
+		VALUES ($1, $2, 'Ler intimação', 0) RETURNING done`, tenantID, taskID).Scan(&done); err != nil {
+		t.Fatalf("inserting minimal task_item: %v", err)
+	}
+	if done {
+		t.Errorf("expected task_item.done to default to false, got true")
+	}
+
+	// Deleting the parent task CASCADEs the checklist away.
+	if _, err := tx.Exec(ctx, `DELETE FROM task WHERE id = $1`, taskID); err != nil {
+		t.Fatalf("deleting parent task: %v", err)
+	}
+	var remaining int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM task_item WHERE task_id = $1`, taskID).Scan(&remaining); err != nil {
+		t.Fatalf("counting orphaned items: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("expected the checklist to CASCADE-delete with its task, %d items remain", remaining)
+	}
+}
+
+// TestTaskItem_RLSPolicyExists asserts task_item carries the tenant_isolation RLS policy (barrier
+// 2), like every user table — the migration must not ship a tenant-scoped table without it.
+func TestTaskItem_RLSPolicyExists(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM pg_policies
+		WHERE schemaname = 'public' AND tablename = 'task_item' AND policyname = 'tenant_isolation'
+	)`).Scan(&exists); err != nil {
+		t.Fatalf("checking task_item RLS policy: %v", err)
+	}
+	if !exists {
+		t.Error("expected task_item to carry the tenant_isolation RLS policy after 0031")
+	}
+}
+
 // deadlineParents holds the ids of the parent chain a deadline row needs (FKs).
 type deadlineParents struct {
 	tenantID      uuid.UUID

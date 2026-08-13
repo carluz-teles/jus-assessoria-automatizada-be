@@ -569,6 +569,199 @@ func (r *pgRepository) MarkDeadlineStatus(ctx context.Context, tx database.Tx, d
 	return flipped.String(), nil
 }
 
+// EnsureTaskInTenant confirms the parent task exists in the tenant inside the caller's tx
+// (the guard the checklist create runs first). A miss — or a foreign tenant's task — yields
+// pgx.ErrNoRows, mapped to the typed ErrTaskItemNotFound (→ 404) so an item is never grafted
+// onto a non-existent or foreign task.
+func (r *pgRepository) EnsureTaskInTenant(ctx context.Context, tx database.Tx, taskID, tenantID string) error {
+	id, err := parseUUID(taskID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).TaskExistsInTenant(ctx, deadlinedb.TaskExistsInTenantParams{ID: id, TenantID: tenant})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrTaskItemNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// NextTaskItemPosition returns the append slot (max(position)+1, or 0 when empty) for a task's
+// checklist inside the caller's tx, scoped to (taskID, tenantID). The COALESCE means an empty
+// checklist never yields NULL, so there is no not-found here.
+func (r *pgRepository) NextTaskItemPosition(ctx context.Context, tx database.Tx, taskID, tenantID string) (int, error) {
+	id, err := parseUUID(taskID)
+	if err != nil {
+		return 0, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return 0, err
+	}
+
+	pos, err := deadlinedb.New(tx).NextTaskItemPosition(ctx, deadlinedb.NextTaskItemPositionParams{TaskID: id, TenantID: tenant})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(pos), nil
+}
+
+// InsertTaskItem persists one checklist item inside the caller's tx and returns it with its
+// DB-assigned id (echoing the entity, like InsertTask). tenant_id/task_id are NOT NULL; the item
+// is born done=false with done_at NULL (the insert sets neither). The mapper absorbs the driver
+// types on the returned row.
+func (r *pgRepository) InsertTaskItem(ctx context.Context, tx database.Tx, item *TaskItem) (*TaskItem, error) {
+	tenant, err := parseUUID(item.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	taskID, err := parseUUID(item.TaskID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).InsertTaskItem(ctx, deadlinedb.InsertTaskItemParams{
+		TenantID: tenant,
+		TaskID:   taskID,
+		Title:    item.Title,
+		Position: int32(item.Position),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &TaskItem{
+		ID:        row.ID.String(),
+		TenantID:  item.TenantID,
+		TaskID:    row.TaskID.String(),
+		Title:     row.Title,
+		Position:  int(row.Position),
+		Done:      row.Done,
+		DoneAt:    timestampPtr(row.DoneAt),
+		CreatedAt: row.CreatedAt.Time,
+	}, nil
+}
+
+// GetTaskItemForUpdate loads a checklist item's editable {title, done} by (itemID, taskID)
+// inside the caller's tx, filtered by tenantID (barrier 1). A miss — including an item under a
+// different task — maps to the typed ErrTaskItemNotFound (never nil, nil).
+func (r *pgRepository) GetTaskItemForUpdate(ctx context.Context, tx database.Tx, itemID, taskID, tenantID string) (*TaskItemForUpdate, error) {
+	id, err := parseUUID(itemID)
+	if err != nil {
+		return nil, err
+	}
+	task, err := parseUUID(taskID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).GetTaskItemForUpdate(ctx, deadlinedb.GetTaskItemForUpdateParams{
+		ID:       id,
+		TaskID:   task,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTaskItemNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &TaskItemForUpdate{
+		ID:     row.ID.String(),
+		TaskID: row.TaskID.String(),
+		Title:  row.Title,
+		Done:   row.Done,
+	}, nil
+}
+
+// UpdateTaskItem writes the merged {title, done, done_at} keyed by (item, task, tenant) inside
+// the caller's tx (barrier 1). A no-match (the row vanished mid-tx) yields pgx.ErrNoRows, mapped
+// to the typed ErrTaskItemNotFound. On a hit it returns the full saved item (from RETURNING) so
+// the handler renders it without a re-read; the mapper absorbs the driver types.
+func (r *pgRepository) UpdateTaskItem(ctx context.Context, tx database.Tx, p UpdateTaskItemParams) (*TaskItem, error) {
+	id, err := parseUUID(p.ItemID)
+	if err != nil {
+		return nil, err
+	}
+	task, err := parseUUID(p.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).UpdateTaskItem(ctx, deadlinedb.UpdateTaskItemParams{
+		ID:       id,
+		TaskID:   task,
+		TenantID: tenant,
+		Title:    p.Title,
+		Done:     p.Done,
+		DoneAt:   pgOptionalTimestamptz(p.DoneAt),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTaskItemNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &TaskItem{
+		ID:        row.ID.String(),
+		TenantID:  p.TenantID,
+		TaskID:    row.TaskID.String(),
+		Title:     row.Title,
+		Position:  int(row.Position),
+		Done:      row.Done,
+		DoneAt:    timestampPtr(row.DoneAt),
+		CreatedAt: row.CreatedAt.Time,
+	}, nil
+}
+
+// DeleteTaskItem removes one checklist item keyed by (item, task, tenant) inside the caller's tx
+// (barrier 1). The RETURNING id means a no-match (foreign/unknown item) yields pgx.ErrNoRows,
+// mapped to the typed ErrTaskItemNotFound (→ 404) — never a silent success on nothing.
+func (r *pgRepository) DeleteTaskItem(ctx context.Context, tx database.Tx, itemID, taskID, tenantID string) error {
+	id, err := parseUUID(itemID)
+	if err != nil {
+		return err
+	}
+	task, err := parseUUID(taskID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).DeleteTaskItem(ctx, deadlinedb.DeleteTaskItemParams{
+		ID:       id,
+		TaskID:   task,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrTaskItemNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
 // GetDeadlineForCheck re-reads the prazo by id inside the caller's tx, filtered by tenantID
 // (barrier 1). A missing id — or one in another tenant — maps to the typed
 // ErrDeadlineNotFound (never nil, nil); a NULL kind returns "". The mapper absorbs the

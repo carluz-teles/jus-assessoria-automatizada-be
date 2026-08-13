@@ -62,6 +62,7 @@ type CourtCase struct {
 	PrimaryCourtRecordID pgtype.UUID        `json:"primary_court_record_id"`
 	MergedIntoID         pgtype.UUID        `json:"merged_into_id"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 }
 
 type CourtRecord struct {
@@ -195,6 +196,7 @@ type Intimation struct {
 	CancelledAt     pgtype.Date `json:"cancelled_at"`
 	CancelReason    *string     `json:"cancel_reason"`
 	SyncRunID       pgtype.UUID `json:"sync_run_id"`
+	UserStatus      string      `json:"user_status"`
 }
 
 type Membership struct {
@@ -250,6 +252,28 @@ type Outbox struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	PublishedAt    pgtype.Timestamptz `json:"published_at"`
 	ProcessAt      pgtype.Timestamptz `json:"process_at"`
+}
+
+type Party struct {
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	CaseID    uuid.UUID          `json:"case_id"`
+	Role      string             `json:"role"`
+	Name      string             `json:"name"`
+	Document  *string            `json:"document"`
+	Source    string             `json:"source"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type PartyCounsel struct {
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	PartyID   uuid.UUID          `json:"party_id"`
+	Name      string             `json:"name"`
+	Oab       string             `json:"oab"`
+	Uf        string             `json:"uf"`
+	Source    string             `json:"source"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type Petition struct {
@@ -339,6 +363,17 @@ type Task struct {
 	CreatedBy      pgtype.UUID        `json:"created_by"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type TaskItem struct {
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	TaskID    uuid.UUID          `json:"task_id"`
+	Title     string             `json:"title"`
+	Position  int32              `json:"position"`
+	Done      bool               `json:"done"`
+	DoneAt    pgtype.Timestamptz `json:"done_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type Tenant struct {

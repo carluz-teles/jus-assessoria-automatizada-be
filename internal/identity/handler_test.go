@@ -51,6 +51,10 @@ type fakeHandlerUC struct {
 	gotReadTenantID    string
 	orgProfileErr      error
 	orgProfileReadFlag bool
+
+	members           []OrgMember
+	gotMembersTenant  string
+	membersErr        error
 }
 
 func (f *fakeHandlerUC) GetMe(_ context.Context, clerkUserID string) (Me, error) {
@@ -68,6 +72,11 @@ func (f *fakeHandlerUC) UpdateOrgProfile(_ context.Context, tenantID string, pro
 	f.gotTenantID = tenantID
 	f.gotProfile = profile
 	return f.profile, f.profileErr
+}
+
+func (f *fakeHandlerUC) ListOrgMembers(_ context.Context, tenantID string) ([]OrgMember, error) {
+	f.gotMembersTenant = tenantID
+	return f.members, f.membersErr
 }
 
 // newMeApp mounts GET /identity/me under AuthUser (tenant-less), mirroring the
@@ -469,5 +478,64 @@ func TestHandler_UpdateProfile_InvalidBody_400(t *testing.T) {
 				t.Fatal("use case ran on invalid input")
 			}
 		})
+	}
+}
+
+// --- GET /organization/members -----------------------------------------------
+
+// The members list is open to any authenticated member (a LAWYER opens the responsável
+// selector too) → 200 with the {data:[...]} envelope; tenant comes from the principal.
+func TestHandler_ListOrgMembers_200(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{members: []OrgMember{
+		{ID: "u-1", Name: "Dra. Ana", Email: "ana@e.com", Role: RoleAdmin},
+		{ID: "u-2", Name: "Dr. Bruno", Email: "bruno@e.com", Role: RoleLawyer},
+	}}
+	app := newProfileApp(uc, string(RoleLawyer), "tenant-42")
+
+	status, body := do(t, app, http.MethodGet, "/v1/organization/members", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if uc.gotMembersTenant != "tenant-42" {
+		t.Errorf("tenant forwarded = %q, want tenant-42 (from principal)", uc.gotMembersTenant)
+	}
+	for _, want := range []string{`"data"`, `"id":"u-1"`, `"name":"Dra. Ana"`, `"email":"bruno@e.com"`, `"role":"LAWYER"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// An empty team serializes as data:[] (not null), so the FE selector renders an empty list.
+func TestHandler_ListOrgMembers_Empty_200(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{members: []OrgMember{}}
+	app := newProfileApp(uc, string(RoleLawyer), "tenant-42")
+
+	status, body := do(t, app, http.MethodGet, "/v1/organization/members", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if !strings.Contains(body, `"data":[]`) {
+		t.Errorf("empty team should serialize as data:[], got: %s", body)
+	}
+}
+
+// No bearer token → 401 at the Auth boundary; the handler never runs.
+func TestHandler_ListOrgMembers_NoToken_401(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newProfileApp(uc, string(RoleLawyer), "tenant-42")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/organization/members", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if uc.gotMembersTenant != "" {
+		t.Fatal("use case ran despite a missing token")
 	}
 }

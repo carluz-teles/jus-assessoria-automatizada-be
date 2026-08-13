@@ -30,6 +30,19 @@ var (
 	// (nil, nil) so the handler answers a typed 404, never a 500 or an empty 200.
 	ErrIntimationNotFound = apperr.NewNotFound("intimação não encontrada")
 
+	// ErrProcessoNotFound — no court record matched the (id, tenant) of a GET
+	// /v1/processos/:id deep-link: the row is unknown or belongs to another tenant
+	// (invisible under this tenant's scope). The read repo returns it instead of
+	// (nil, nil) so the handler answers a typed 404, never a 500 or an empty 200.
+	ErrProcessoNotFound = apperr.NewNotFound("processo não encontrado")
+
+	// ErrResponsibleNotMember — the user_id a PUT /processos/:id/responsavel names is
+	// not an app_user of the caller's escritório (a foreign or unknown user). It is
+	// invalid client input (→ 400), not a 404 on the process: the process is real, the
+	// proposed responsável is not one of ours. Guards against pinning a process on
+	// someone outside the tenant. Only checked for a non-null assignee (desatribuir skips).
+	ErrResponsibleNotMember = apperr.NewInvalid("usuário não é membro do escritório")
+
 	// ErrSyncRunNotFound — no sync_run matched an event_id lookup. On a re-delivery
 	// of an already-marked event the sync use case treats it defensively as a
 	// closed/absent run: a no-op ack, never a reopen.

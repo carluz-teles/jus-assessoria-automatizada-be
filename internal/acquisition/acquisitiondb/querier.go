@@ -21,6 +21,16 @@ type Querier interface {
 	// different tenants never block each other; hashtext is int4, widened to the int8
 	// pg_advisory_xact_lock expects.
 	AcquireTenantWriteLock(ctx context.Context, tenantID string) error
+	// Membership guard for the assign write: is $1 an app_user of tenant $2? Used only when
+	// a non-null user_id is being assigned (desatribuir skips it). A false result → the
+	// typed "usuário não é membro do escritório" (→ 404/invalid) so a caller cannot pin a
+	// process on a user outside their escritório.
+	AppUserExistsInTenant(ctx context.Context, arg AppUserExistsInTenantParams) (bool, error)
+	// Set (or clear, when $2 is NULL) the responsável on a court_case, tenant-scoped
+	// (barrier 1, with RLS as barrier 2). The case_id is the one resolved from the
+	// court_record above; the WHERE ties the write to the caller's own tenant so a mismatched
+	// (case, tenant) touches nothing. Idempotent — re-assigning the same user is a no-op write.
+	AssignCaseResponsible(ctx context.Context, arg AssignCaseResponsibleParams) error
 	// backfill_job queries (acquisition slice).
 	// The backfill listener reacts to integration_activated: on the FIRST activation
 	// of an integration it creates one backfill_job and emits the sync slices. These
@@ -71,6 +81,23 @@ type Querier interface {
 	//   • court — denormalized from the row's court_record (a join), so the producer
 	//     derives uf via ufFromTribunal at emission.
 	BatchUpsertIntimations(ctx context.Context, arg BatchUpsertIntimationsParams) ([]BatchUpsertIntimationsRow, error)
+	// parties.sql (acquisition slice) — the process's partes (autor/réu/terceiro) and
+	// their advogados, materialized from the DJEN so the cockpit renders the AUTOR/RÉU
+	// cards. Two write paths (idempotent bulk upserts, run in the sync tx) and one read
+	// (the /processos/:id/partes deep-read). All tenant-scoped (barrier 1) on top of RLS.
+	// Upsert MANY parties in one round-trip from a jsonb array of {case_id, role, name}.
+	// Idempotent on the natural key (tenant, case, role, name): a re-observation of the
+	// same communication re-lands the same rows. ON CONFLICT DO UPDATE (a no-op touch of
+	// name) rather than DO NOTHING so the RETURNING yields the row id whether it was just
+	// inserted OR already existed — the caller needs every party's id to attach its
+	// advogados. document stays NULL (v0 never discloses CPF/CNPJ); source is DJEN.
+	// RETURNING role+name lets the caller map each party id back to its parsed counsels.
+	BatchUpsertParties(ctx context.Context, arg BatchUpsertPartiesParams) ([]BatchUpsertPartiesRow, error)
+	// Upsert MANY advogados in one round-trip from a jsonb array of {party_id, name, oab,
+	// uf}. Idempotent on (tenant, party, oab, uf): ON CONFLICT DO NOTHING, so a re-observation
+	// neither duplicates nor errors. source is DJEN. The name is refreshed only on insert
+	// (a DO NOTHING leaves the existing row) — an advogado's OAB is the stable identity.
+	BatchUpsertPartyCounsels(ctx context.Context, arg BatchUpsertPartyCounselsParams) error
 	// Push a record's next_sync_at forward as its re-poll is enqueued, so the next tick
 	// does not re-enqueue it; if the resync never lands, it falls due again after the
 	// interval (at-least-once).
@@ -132,6 +159,17 @@ type Querier interface {
 	// closing it (so the cycle resumes it), while a closed (OK/FAILED) run is a no-op
 	// ack. A miss (pgx.ErrNoRows) is the typed ErrSyncRunNotFound.
 	FindSyncRunByEventID(ctx context.Context, eventID *string) (FindSyncRunByEventIDRow, error)
+	// responsável do processo (case-level) — the write path for PUT
+	// /v1/processos/:id/responsavel. All three run inside the caller's tx (UoW +
+	// SET LOCAL app.tenant_id), so RLS is a second barrier under the explicit
+	// tenant_id filters here. No outbox event yet — auditoria/evento is a future
+	// slice (there is no consumer), so this is a bare projection write.
+	// Resolve the court_case behind a court_record :id, tenant-scoped (barrier 1). The FE
+	// addresses a process by its court_record id (the same id /processos returns), but the
+	// responsável lives on court_case — so the write must hop record → case first. No row
+	// (unknown id or a foreign tenant's record) → pgx.ErrNoRows, mapped to ErrProcessoNotFound
+	// (→ 404) upstream, never nil,nil.
+	GetCaseIDByCourtRecord(ctx context.Context, arg GetCaseIDByCourtRecordParams) (uuid.UUID, error)
 	// Resolve a court record by its natural key inside the caller's tx. A miss
 	// (pgx.ErrNoRows) is how FindOrCreateCourtRecord learns it must create one.
 	GetCourtRecordByKey(ctx context.Context, arg GetCourtRecordByKeyParams) (GetCourtRecordByKeyRow, error)
@@ -142,17 +180,30 @@ type Querier interface {
 	// so sqlc stays happy (it does not model multi-arg unnest).
 	GetCourtRecordsByKeys(ctx context.Context, arg GetCourtRecordsByKeysParams) ([]GetCourtRecordsByKeysRow, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
-	// One intimation by id, for the FE deep-link into the inbox detail (an intimation not
-	// on the loaded list page). SAME projection as ListIntimacoes — the record's
-	// number/court/degree joined in — so it maps to the same IntimacaoView. Scoped by
-	// tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404 upstream,
-	// never nil,nil). Read-only, off the write path.
+	// One intimation by id, for the FE deep-link into the inbox DETAIL screen (an intimation
+	// not on the loaded list page). It is a SUPERSET of the list projection: it carries the
+	// list fields (so it still maps a full IntimacaoView) PLUS the detail-only extras the
+	// inbox row omits —
+	//   • content       — the FULL teor (not the 500-rune preview the list truncates);
+	//   • judging_body  — the court record's órgão julgador (court_record.judging_body, 0014);
+	//   • recipients    — the addressee jsonb list (every destinatário + matched-OAB flag);
+	//   • user_status   — the triagem state (PENDING|RESOLVED|IGNORED), so the detail can
+	//                     render the resolve/ignore/reopen affordance.
+	// Scoped by tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404
+	// upstream, never nil,nil). Read-only, off the write path.
 	GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error)
 	// The tenant's most recent backfill job — status + tallies — for the import-status
 	// read (the FE banner "importando seus processos…"). Newest job wins (a re-activation
 	// opens a new job). No job ever → no row; the read use case maps that to NONE (not
 	// importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
 	GetLatestBackfillStatus(ctx context.Context, tenantID uuid.UUID) (GetLatestBackfillStatusRow, error)
+	// One process by id, for the FE deep-link into the processes detail (a process not on
+	// the loaded list page). SAME projection as ListProcessos — the record's fields, its
+	// last andamento via the LATERAL, and claim_value — so it maps to the same ProcessoView.
+	// Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
+	// placeholder is still reachable by direct link. A foreign or unknown id yields no row
+	// (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
+	GetProcesso(ctx context.Context, arg GetProcessoParams) (GetProcessoRow, error)
 	// One import's reconciliação header (the detail screen), same shape/aggregation as
 	// ListReconciliations but for a single backfill_job.
 	GetReconciliation(ctx context.Context, arg GetReconciliationParams) (GetReconciliationRow, error)
@@ -246,6 +297,13 @@ type Querier interface {
 	ListIntimacoesByProcesso(ctx context.Context, arg ListIntimacoesByProcessoParams) ([]ListIntimacoesByProcessoRow, error)
 	// The intimations a window first discovered (collapse), newest availability first.
 	ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoesBySyncRunParams) ([]ListIntimacoesBySyncRunRow, error)
+	// The /processos/:id/partes deep-read: every party of the process behind a court_record
+	// :id, with its advogados aggregated as a jsonb array (name/oab/uf), in one round-trip.
+	// Isolation: court_record → court_case resolves the case, scoped by tenant_id (barrier 1);
+	// a foreign or unknown :id resolves to no case and yields no rows. Ordered by role then
+	// name so the caller buckets autor/réu/terceiro deterministically. counsels defaults to
+	// an empty jsonb array (never NULL) when a party has no advogado.
+	ListPartiesByProcesso(ctx context.Context, arg ListPartiesByProcessoParams) ([]ListPartiesByProcessoRow, error)
 	// read-model queries (acquisition slice) — the screen reads, kept OFF the write
 	// path (docs: "leitura de tela usa read model, DTO por query dedicada"). Each is
 	// tenant-scoped (barrier 1) and keyset-paginated on a stable (sort_key, id) pair
@@ -294,6 +352,38 @@ type Querier interface {
 	// Unicidade de intimation é (tenant, case_id, hash), so swapping court_record_id never
 	// breaks dedup (same case). Returns the number of rows moved.
 	RepointIntimations(ctx context.Context, arg RepointIntimationsParams) (int64, error)
+	// triagem da intimação — the write path for POST /v1/intimacoes/:id/{resolve,
+	// ignore,reopen}. The user drives the intimation's workflow state (user_status,
+	// 0030), SEPARATE from the DJEN cancellation `status`. Runs inside the caller's tx
+	// (UoW + SET LOCAL app.tenant_id), so RLS is a second barrier under the explicit
+	// tenant_id filter. No outbox event yet — there is no consumer of a triagem fact —
+	// so this is a bare projection write (a future slice can emit in this same tx).
+	// Set the intimation's triagem state (user_status) to $3, tenant-scoped (barrier 1,
+	// RLS barrier 2). The three actions map to the three target states: resolve→RESOLVED,
+	// ignore→IGNORED, reopen→PENDING. Only user_status is touched — the DJEN `status`
+	// (ACTIVE/CANCELLED) is left alone. A zero-row result (unknown id or a foreign tenant's
+	// row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound (→ 404), never nil,nil.
+	// Idempotent: re-resolving an already-RESOLVED row rewrites the same value.
+	SetIntimationUserStatus(ctx context.Context, arg SetIntimationUserStatusParams) (uuid.UUID, error)
+	// The KPI counts for the intimações inbox header (GET /v1/intimacoes/summary), one
+	// aggregate scan over the tenant's intimations grouped by the triagem state
+	// (user_status, 0030) — served by intimation(tenant_id, user_status). pendentes are the
+	// rows still awaiting triagem (NOT resolved/ignored, i.e. PENDING); resolvidas=RESOLVED;
+	// ignoradas=IGNORED. `em_analise` (an AI-in-progress state) and `criticas` (a
+	// deadline-proximity derivation) have no source in this slice yet, so they are 0 until
+	// Fase 3 / a prazo derivation lands — kept in the projection so the FE contract is
+	// stable. tenant-scoped (barrier 1, RLS barrier 2).
+	SummarizeIntimacoes(ctx context.Context, tenantID uuid.UUID) (SummarizeIntimacoesRow, error)
+	// The KPI counts for the processes list header (GET /v1/processos/summary), one
+	// aggregate scan over the tenant's court_records grouped into the FE's buckets by
+	// court_record.lifecycle (ACTIVE|SUSPENDED|ARCHIVED|SUPERSEDED). SUPERSEDED is the
+	// internal UNKNOWN placeholder left after a DATAJUD grade re-point (not a user-facing
+	// process), so it is EXCLUDED from every bucket and from `total` — the screen counts
+	// only real processes. `baixados` has NO lifecycle source in the v0 schema (there is no
+	// BAIXADO value; a baixa would surface as ARCHIVED), so it is always 0 until the schema
+	// models it — kept in the projection so the FE contract is stable. tenant-scoped
+	// (barrier 1, RLS barrier 2).
+	SummarizeProcessos(ctx context.Context, tenantID uuid.UUID) (SummarizeProcessosRow, error)
 	// Merge-path only: retire the UNKNOWN placeholder after its intimations moved onto the
 	// pre-existing graded record. It no longer represents a live process (the graded record
 	// does), so it drops out of the ACTIVE count and the scheduler (next_sync_at NULL).

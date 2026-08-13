@@ -67,6 +67,15 @@ type djenComunicacao struct {
 	MotivoCancelamento   *string            `json:"motivo_cancelamento"`
 	Ativo                bool               `json:"ativo"`
 	Advogados            []djenAdvogadoLink `json:"destinatarioadvogados"`
+	// Destinatarios are the parties this communication addressed: {nome, polo}, polo
+	// "A" (ativo = autor) / "P" (passivo = réu). Mapped to the party materialization
+	// (parseParties); it was HISTORICALLY discarded (recipients only carried advogados).
+	Destinatarios []djenDestinatario `json:"destinatarios"`
+}
+
+type djenDestinatario struct {
+	Nome string `json:"nome"`
+	Polo string `json:"polo"`
 }
 
 type djenAdvogadoLink struct {
@@ -112,6 +121,7 @@ func (p *DJENParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult, e
 	records := make(map[string]ParsedCourtRecord)
 	ordered := make([]ParsedCourtRecord, 0)
 	intimations := make([]ParsedIntimation, 0, len(payload.Items))
+	parties := make([]ParsedParty, 0, len(payload.Items))
 
 	for _, rawItem := range payload.Items {
 		var item djenComunicacao
@@ -124,6 +134,10 @@ func (p *DJENParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult, e
 			continue
 		}
 		intimations = append(intimations, intim)
+		// The parties (destinatarios + their advogados) of this communication. Emitted
+		// only for a kept item so a skipped (unparseable) one never seeds a party whose
+		// record was never produced. Deduped downstream by the DB's unique constraints.
+		parties = append(parties, parseParties(item)...)
 
 		key := recordKey(item.NumeroProcesso, DegreeUnknown)
 		if _, seen := records[key]; !seen {
@@ -143,7 +157,119 @@ func (p *DJENParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult, e
 	return ParsedResult{
 		CourtRecords: ordered,
 		Intimations:  intimations,
+		Parties:      parties,
 	}, nil
+}
+
+// parseParties maps one communication's destinatários to ParsedParty, attaching the
+// communication's advogados to the right party. The DJEN does NOT link an advogado to
+// a specific destinatário, so we infer: the advogados of a communication represent the
+// destinatários of that SAME communication. When every destinatário shares one polo,
+// the advogados are that polo's counsel and attach to each of those parties. When the
+// destinatários are mixed (more than one polo) — so the polo is not inferible — we
+// attach the advogados to the DEFENDANT (the adverse party) by default, matching the
+// most common DJEN shape where the réu is the one being intimated with counsel; this
+// is a documented approximation, not a fact. An item with no destinatário but with
+// advogados falls back to a single DEFENDANT party carrying them, so the counsel is
+// never dropped. Duplicate parties across communications are deduped by the DB.
+func parseParties(item djenComunicacao) []ParsedParty {
+	counsels := parsedCounsels(item.Advogados)
+
+	// Group the destinatários by role, preserving first-seen order per role and
+	// deduping the same (role, name) within this communication.
+	roles := make([]string, 0, len(item.Destinatarios))
+	byRole := make(map[string][]string) // role → ordered unique names
+	seen := make(map[string]bool)
+	for _, d := range item.Destinatarios {
+		if d.Nome == "" {
+			continue
+		}
+		role := partyRoleFromPolo(d.Polo)
+		k := role + "\x00" + d.Nome
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		if _, ok := byRole[role]; !ok {
+			roles = append(roles, role)
+		}
+		byRole[role] = append(byRole[role], d.Nome)
+	}
+
+	// No named party but advogados present: keep the counsel on a DEFENDANT placeholder
+	// rather than lose it (the adverse party is the safe default — see the doc above).
+	if len(roles) == 0 {
+		if len(counsels) == 0 {
+			return nil
+		}
+		return []ParsedParty{{
+			CNJNumber: item.NumeroProcesso,
+			Degree:    DegreeUnknown,
+			Role:      PartyRoleDefendant,
+			Counsels:  counsels,
+		}}
+	}
+
+	// The advogados attach to the destinatários' party when the polo is inferible (a
+	// single polo across the communication); otherwise to the DEFENDANT by default.
+	counselRole := roles[0]
+	if len(roles) > 1 {
+		counselRole = PartyRoleDefendant
+	}
+
+	out := make([]ParsedParty, 0, len(item.Destinatarios))
+	for _, role := range roles {
+		for _, name := range byRole[role] {
+			party := ParsedParty{
+				CNJNumber: item.NumeroProcesso,
+				Degree:    DegreeUnknown,
+				Role:      role,
+				Name:      name,
+			}
+			if role == counselRole {
+				party.Counsels = counsels
+			}
+			out = append(out, party)
+		}
+	}
+	return out
+}
+
+// parsedCounsels maps the DJEN destinatarioadvogados to ParsedCounsel, dropping an
+// entry with no OAB (the dedup key) and deduping by (oab, uf). Never nil-guards: an
+// empty result is an empty slice.
+func parsedCounsels(advs []djenAdvogadoLink) []ParsedCounsel {
+	out := make([]ParsedCounsel, 0, len(advs))
+	seen := make(map[string]bool, len(advs))
+	for _, a := range advs {
+		if a.Advogado.NumeroOAB == "" {
+			continue
+		}
+		k := oabKey(a.Advogado.NumeroOAB, a.Advogado.UFOAB)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, ParsedCounsel{
+			Name: a.Advogado.Nome,
+			OAB:  a.Advogado.NumeroOAB,
+			UF:   a.Advogado.UFOAB,
+		})
+	}
+	return out
+}
+
+// partyRoleFromPolo maps a DJEN destinatário polo to the party role enum: "A" (ativo =
+// autor) → PLAINTIFF, "P" (passivo = réu) → DEFENDANT, anything else → THIRD_PARTY.
+func partyRoleFromPolo(polo string) string {
+	switch strings.ToUpper(strings.TrimSpace(polo)) {
+	case "A":
+		return PartyRolePlaintiff
+	case "P":
+		return PartyRoleDefendant
+	default:
+		return PartyRoleThirdParty
+	}
 }
 
 // parseIntimation maps one communication to a ParsedIntimation, deriving the

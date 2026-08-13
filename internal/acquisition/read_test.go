@@ -16,17 +16,33 @@ type recordingReadRepo struct {
 	procTotal      int64
 	lastProcQuery  ProcessosQuery
 	procSearchSeen string
-	andRows        []AndamentoView
-	andTotal       int64
-	lastAndQuery   AndamentosQuery
-	intiRows       []IntimacaoView
-	intiTotal      int64
-	lastIntiQuery  IntimacoesByProcessoQuery
+	// GetProcesso deep-link — capture the forwarded (tenant, id) and return a canned view.
+	procOneRes    ProcessoView
+	gotProcOneTID string
+	gotProcOneID  string
+	andRows       []AndamentoView
+	andTotal      int64
+	lastAndQuery  AndamentosQuery
+	intiRows      []IntimacaoView
+	intiTotal     int64
+	lastIntiQuery IntimacoesByProcessoQuery
+	// Partes deep-read — capture the forwarded (tenant, court_record) and return canned rows.
+	partesRows    []PartyRow
+	gotPartesTID  string
+	gotPartesCRID string
+	// Summary reads — canned views the ReadUseCase forwards verbatim.
+	procSummary ProcessosSummaryView
+	intiSummary IntimacoesSummaryView
 }
 
 func (r *recordingReadRepo) ListProcessos(_ context.Context, q ProcessosQuery) ([]ProcessoView, error) {
 	r.lastProcQuery = q
 	return r.procRows, nil
+}
+
+func (r *recordingReadRepo) GetProcesso(_ context.Context, tenantID, id string) (ProcessoView, error) {
+	r.gotProcOneTID, r.gotProcOneID = tenantID, id
+	return r.procOneRes, nil
 }
 
 func (r *recordingReadRepo) CountProcessos(_ context.Context, _, search string) (int64, int64, error) {
@@ -37,15 +53,25 @@ func (r *recordingReadRepo) CountProcessos(_ context.Context, _, search string) 
 func (r *recordingReadRepo) ListIntimacoes(context.Context, IntimacoesQuery) ([]IntimacaoView, error) {
 	return nil, nil
 }
-func (r *recordingReadRepo) GetIntimacao(context.Context, string, string) (IntimacaoView, error) {
-	return IntimacaoView{}, nil
+func (r *recordingReadRepo) GetIntimacao(context.Context, string, string) (IntimacaoDetailView, error) {
+	return IntimacaoDetailView{}, nil
 }
 func (r *recordingReadRepo) CountIntimacoes(context.Context, string, string) (int64, int64, error) {
 	return 0, 0, nil
 }
+func (r *recordingReadRepo) SummarizeProcessos(context.Context, string) (ProcessosSummaryView, error) {
+	return r.procSummary, nil
+}
+func (r *recordingReadRepo) SummarizeIntimacoes(context.Context, string) (IntimacoesSummaryView, error) {
+	return r.intiSummary, nil
+}
 func (r *recordingReadRepo) ListAndamentosByProcesso(_ context.Context, q AndamentosQuery) ([]AndamentoView, error) {
 	r.lastAndQuery = q
 	return r.andRows, nil
+}
+func (r *recordingReadRepo) ListPartesByProcesso(_ context.Context, tenantID, courtRecordID string) ([]PartyRow, error) {
+	r.gotPartesTID, r.gotPartesCRID = tenantID, courtRecordID
+	return r.partesRows, nil
 }
 func (r *recordingReadRepo) CountAndamentosByProcesso(context.Context, string, string) (int64, error) {
 	return r.andTotal, nil
@@ -123,6 +149,89 @@ func TestReadUseCase_Processos_WiresTotals(t *testing.T) {
 	}
 	if res.TotalCount != 32 || res.Total != 1247 {
 		t.Errorf("totals = (%d, %d), want (32, 1247)", res.TotalCount, res.Total)
+	}
+}
+
+// Processo (the deep-link) is a plain delegation: it forwards (tenant, id) verbatim to
+// the repo and returns the canned ProcessoView — including claim_value — untouched (no
+// pagination policy).
+func TestReadUseCase_Processo_ForwardsAndReturnsView(t *testing.T) {
+	t.Parallel()
+
+	claim := "150000.00"
+	repo := &recordingReadRepo{procOneRes: ProcessoView{
+		ID:         "cr-7",
+		CNJNumber:  "0001111-22.2024.8.26.0100",
+		ClaimValue: &claim,
+	}}
+	uc := NewReadUseCase(repo)
+
+	view, err := uc.Processo(context.Background(), "tenant-9", "cr-7")
+	if err != nil {
+		t.Fatalf("Processo: %v", err)
+	}
+	if repo.gotProcOneTID != "tenant-9" || repo.gotProcOneID != "cr-7" {
+		t.Errorf("forwarded (tenant, id) = (%q, %q), want (tenant-9, cr-7)", repo.gotProcOneTID, repo.gotProcOneID)
+	}
+	if view.ID != "cr-7" || view.CNJNumber != "0001111-22.2024.8.26.0100" {
+		t.Errorf("view not returned verbatim: %+v", view)
+	}
+	if view.ClaimValue == nil || *view.ClaimValue != "150000.00" {
+		t.Errorf("claim_value = %v, want 150000.00", view.ClaimValue)
+	}
+}
+
+// Partes forwards (tenant, court_record) to the repo and buckets the flat rows by role
+// into the AUTOR/RÉU/TERCEIROS lists the cockpit renders — with each party's advogados.
+func TestReadUseCase_Partes_BucketsByRole(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{partesRows: []PartyRow{
+		{Role: PartyRolePlaintiff, PartyView: PartyView{
+			Name:     "AUTOR",
+			Counsels: []PartyCounselView{{Name: "ADV", OAB: "111", UF: "SP"}},
+		}},
+		{Role: PartyRoleDefendant, PartyView: PartyView{Name: "REU", Counsels: []PartyCounselView{}}},
+		{Role: PartyRoleThirdParty, PartyView: PartyView{Name: "TERCEIRO", Counsels: []PartyCounselView{}}},
+	}}
+	uc := NewReadUseCase(repo)
+
+	view, err := uc.Partes(context.Background(), "tenant-3", "cr-9")
+	if err != nil {
+		t.Fatalf("Partes: %v", err)
+	}
+	if repo.gotPartesTID != "tenant-3" || repo.gotPartesCRID != "cr-9" {
+		t.Errorf("forwarded (tenant, court_record) = (%q, %q), want (tenant-3, cr-9)", repo.gotPartesTID, repo.gotPartesCRID)
+	}
+	if len(view.Autor) != 1 || view.Autor[0].Name != "AUTOR" {
+		t.Errorf("autor bucket = %+v, want one AUTOR", view.Autor)
+	}
+	if len(view.Autor) == 1 && (len(view.Autor[0].Counsels) != 1 || view.Autor[0].Counsels[0].OAB != "111") {
+		t.Errorf("autor counsels = %+v, want one 111/SP", view.Autor[0].Counsels)
+	}
+	if len(view.Reu) != 1 || view.Reu[0].Name != "REU" {
+		t.Errorf("réu bucket = %+v, want one REU", view.Reu)
+	}
+	if len(view.Terceiros) != 1 || view.Terceiros[0].Name != "TERCEIRO" {
+		t.Errorf("terceiros bucket = %+v, want one TERCEIRO", view.Terceiros)
+	}
+}
+
+// An empty read (a foreign or partyless process) yields three initialized empty lists,
+// never nil — so the JSON payload is three arrays, not nulls.
+func TestReadUseCase_Partes_EmptyIsThreeArrays(t *testing.T) {
+	t.Parallel()
+
+	uc := NewReadUseCase(&recordingReadRepo{partesRows: nil})
+	view, err := uc.Partes(context.Background(), "tenant-3", "cr-x")
+	if err != nil {
+		t.Fatalf("Partes: %v", err)
+	}
+	if view.Autor == nil || view.Reu == nil || view.Terceiros == nil {
+		t.Errorf("empty buckets must be initialized: %+v", view)
+	}
+	if len(view.Autor)+len(view.Reu)+len(view.Terceiros) != 0 {
+		t.Errorf("expected all buckets empty, got %+v", view)
 	}
 }
 
@@ -235,5 +344,88 @@ func TestReadUseCase_IntimacoesByProcesso_NoNextPage(t *testing.T) {
 	}
 	if len(res.Items) != 1 {
 		t.Errorf("len(Items) = %d, want 1", len(res.Items))
+	}
+}
+
+// The responsável fields ride the ProcessoView through the read use case: when the
+// repo's deep-link row carries an assigned user, the view surfaces both id and name (the
+// FE renders the header from a single read). The mapping pgtype.UUID/*string → *string
+// lives in the repo (a DB concern); here we prove the view field flows through untouched.
+func TestReadUseCase_Processo_CarriesResponsible(t *testing.T) {
+	t.Parallel()
+
+	userID := "018f0000-0000-7000-8000-0000000000aa"
+	userName := "Dra. Ana"
+	repo := &recordingReadRepo{procOneRes: ProcessoView{
+		ID:               "cr-7",
+		AssignedUserID:   &userID,
+		AssignedUserName: &userName,
+	}}
+	uc := NewReadUseCase(repo)
+
+	view, err := uc.Processo(context.Background(), "tenant-9", "cr-7")
+	if err != nil {
+		t.Fatalf("Processo: %v", err)
+	}
+	if view.AssignedUserID == nil || *view.AssignedUserID != userID {
+		t.Errorf("assigned_user_id = %v, want %q", view.AssignedUserID, userID)
+	}
+	if view.AssignedUserName == nil || *view.AssignedUserName != userName {
+		t.Errorf("assigned_user_name = %v, want %q", view.AssignedUserName, userName)
+	}
+}
+
+// An unassigned process surfaces nil responsável fields (JSON null), not a zero string.
+func TestReadUseCase_Processo_UnassignedIsNil(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{procOneRes: ProcessoView{ID: "cr-7"}}
+	uc := NewReadUseCase(repo)
+
+	view, err := uc.Processo(context.Background(), "tenant-9", "cr-7")
+	if err != nil {
+		t.Fatalf("Processo: %v", err)
+	}
+	if view.AssignedUserID != nil || view.AssignedUserName != nil {
+		t.Errorf("unassigned view carries responsável: id=%v name=%v", view.AssignedUserID, view.AssignedUserName)
+	}
+}
+
+// --- summaries ---------------------------------------------------------------
+
+// ProcessosSummary passes the repo's bucketed counts through verbatim (the read use case
+// adds no policy — it is a straight delegate).
+func TestReadUseCase_ProcessosSummary_PassesThrough(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{procSummary: ProcessosSummaryView{
+		Total: 42, EmAndamento: 30, Suspensos: 5, Arquivados: 7, Baixados: 0,
+	}}
+	uc := NewReadUseCase(repo)
+
+	got, err := uc.ProcessosSummary(context.Background(), "tenant-9")
+	if err != nil {
+		t.Fatalf("ProcessosSummary: %v", err)
+	}
+	if got != (ProcessosSummaryView{Total: 42, EmAndamento: 30, Suspensos: 5, Arquivados: 7, Baixados: 0}) {
+		t.Errorf("summary = %+v, want the repo's counts verbatim", got)
+	}
+}
+
+// IntimacoesSummary passes the repo's triagem-bucketed counts through verbatim.
+func TestReadUseCase_IntimacoesSummary_PassesThrough(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{intiSummary: IntimacoesSummaryView{
+		Total: 20, Pendentes: 12, EmAnalise: 0, Resolvidas: 6, Ignoradas: 2, Criticas: 0,
+	}}
+	uc := NewReadUseCase(repo)
+
+	got, err := uc.IntimacoesSummary(context.Background(), "tenant-9")
+	if err != nil {
+		t.Fatalf("IntimacoesSummary: %v", err)
+	}
+	if got != (IntimacoesSummaryView{Total: 20, Pendentes: 12, Resolvidas: 6, Ignoradas: 2}) {
+		t.Errorf("summary = %+v, want the repo's counts verbatim", got)
 	}
 }

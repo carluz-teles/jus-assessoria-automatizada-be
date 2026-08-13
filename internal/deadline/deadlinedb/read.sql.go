@@ -204,6 +204,198 @@ func (q *Queries) GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow
 	return i, err
 }
 
+const getPrazosSummary = `-- name: GetPrazosSummary :one
+
+SELECT
+  count(*)::bigint AS total,
+  count(*) FILTER (
+    WHERE d.status IN ('OPEN', 'PENDING') AND (d.end_date - CURRENT_DATE) <= 1
+  )::bigint AS criticos,
+  count(*) FILTER (
+    WHERE d.status IN ('OPEN', 'PENDING') AND (d.end_date - CURRENT_DATE) BETWEEN 0 AND 3
+  )::bigint AS vencendo,
+  count(*) FILTER (WHERE d.status IN ('OPEN', 'PENDING'))::bigint AS abertos,
+  count(*) FILTER (
+    WHERE d.status IN ('OPEN', 'PENDING') AND d.start_date > CURRENT_DATE
+  )::bigint AS futuros,
+  count(*) FILTER (
+    WHERE d.status = 'MISSED'
+       OR (d.status IN ('OPEN', 'PENDING') AND (d.end_date - CURRENT_DATE) < 0)
+  )::bigint AS vencidos,
+  count(*) FILTER (WHERE d.status = 'MET')::bigint AS cumpridos
+FROM deadline d
+WHERE d.tenant_id = $1::uuid
+`
+
+type GetPrazosSummaryRow struct {
+	Total     int64 `json:"total"`
+	Criticos  int64 `json:"criticos"`
+	Vencendo  int64 `json:"vencendo"`
+	Abertos   int64 `json:"abertos"`
+	Futuros   int64 `json:"futuros"`
+	Vencidos  int64 `json:"vencidos"`
+	Cumpridos int64 `json:"cumpridos"`
+}
+
+// ── KPI summaries (GET /v1/prazos/summary, GET /v1/tasks/summary) ────────────
+// Single-object read models for the Tarefas/Prazos cockpit KPIs, aggregated per tenant. Both
+// follow the intimacoes/summary precedent (0030): one query, count(*) FILTER per bucket, no
+// pagination. The buckets' semantics are documented at the read.go DTOs.
+// The prazos KPI counts, derived from deadline.status + days_left ((end_date - CURRENT_DATE)),
+// scoped to tenant_id (barrier 1). The buckets (thresholds documented at PrazosSummary in
+// read.go): criticos = OPEN/PENDING with days_left <= 1; vencendo = OPEN/PENDING with days_left
+// in 0..3; abertos = every OPEN/PENDING; futuros = OPEN/PENDING starting in the future
+// (start_date > today); vencidos = MISSED or an OPEN/PENDING already past (days_left < 0);
+// cumpridos = MET. CANCELLED is counted only in total. $1 = tenant_id.
+func (q *Queries) GetPrazosSummary(ctx context.Context, tenantID uuid.UUID) (GetPrazosSummaryRow, error) {
+	row := q.db.QueryRow(ctx, getPrazosSummary, tenantID)
+	var i GetPrazosSummaryRow
+	err := row.Scan(
+		&i.Total,
+		&i.Criticos,
+		&i.Vencendo,
+		&i.Abertos,
+		&i.Futuros,
+		&i.Vencidos,
+		&i.Cumpridos,
+	)
+	return i, err
+}
+
+const getTaskDetail = `-- name: GetTaskDetail :one
+
+SELECT t.id, t.title, t.description, t.kind, t.due_date,
+       t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
+       t.court_record_id, t.completed_at
+FROM task t
+WHERE t.id = $1::uuid AND t.tenant_id = $2::uuid
+`
+
+type GetTaskDetailParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetTaskDetailRow struct {
+	ID             uuid.UUID          `json:"id"`
+	Title          string             `json:"title"`
+	Description    *string            `json:"description"`
+	Kind           *string            `json:"kind"`
+	DueDate        pgtype.Date        `json:"due_date"`
+	Status         string             `json:"status"`
+	Source         string             `json:"source"`
+	AssigneeUserID pgtype.UUID        `json:"assignee_user_id"`
+	DeadlineID     pgtype.UUID        `json:"deadline_id"`
+	IntimationID   pgtype.UUID        `json:"intimation_id"`
+	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+// ── task detail + checklist (GET /v1/tasks/:id) ─────────────────────────────
+// The task detail screen (docs/erd-prazos.md, a Tarefa aberta): the task's own fields + its
+// ordered checklist + the {done, total} progress the derived display_status reads. All
+// tenant-scoped (barrier 1). display_status is DERIVED in Go (read.go), not here — the SQL
+// returns the raw ingredients (status, due_date, and the progress counts).
+// The task's own fields for the detail view, keyed by id and scoped to tenant_id (barrier 1).
+// A miss (foreign/unknown id) → pgx.ErrNoRows → typed ErrTaskNotFound (→ 404) at the mapper,
+// never (nil, nil). The checklist + progress are separate queries (a task with no items still
+// resolves). $1 = id, $2 = tenant_id.
+func (q *Queries) GetTaskDetail(ctx context.Context, arg GetTaskDetailParams) (GetTaskDetailRow, error) {
+	row := q.db.QueryRow(ctx, getTaskDetail, arg.ID, arg.TenantID)
+	var i GetTaskDetailRow
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.Description,
+		&i.Kind,
+		&i.DueDate,
+		&i.Status,
+		&i.Source,
+		&i.AssigneeUserID,
+		&i.DeadlineID,
+		&i.IntimationID,
+		&i.CourtRecordID,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
+const getTaskItemProgress = `-- name: GetTaskItemProgress :one
+SELECT count(*) FILTER (WHERE done)::bigint AS done,
+       count(*)::bigint                     AS total
+FROM task_item
+WHERE task_id = $1::uuid AND tenant_id = $2::uuid
+`
+
+type GetTaskItemProgressParams struct {
+	TaskID   uuid.UUID `json:"task_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetTaskItemProgressRow struct {
+	Done  int64 `json:"done"`
+	Total int64 `json:"total"`
+}
+
+// The {done, total} progress of one task's checklist (the detail view's progress bar + the
+// Em execução signal for display_status). Scoped to (task_id, tenant_id) (barrier 1). An empty
+// checklist yields {0, 0}. $1 = task_id, $2 = tenant_id.
+func (q *Queries) GetTaskItemProgress(ctx context.Context, arg GetTaskItemProgressParams) (GetTaskItemProgressRow, error) {
+	row := q.db.QueryRow(ctx, getTaskItemProgress, arg.TaskID, arg.TenantID)
+	var i GetTaskItemProgressRow
+	err := row.Scan(&i.Done, &i.Total)
+	return i, err
+}
+
+const getTasksSummary = `-- name: GetTasksSummary :one
+SELECT
+  count(*) FILTER (WHERE t.status = 'DONE')::bigint AS concluidas,
+  count(*) FILTER (
+    WHERE t.status = 'OPEN' AND t.due_date IS NOT NULL AND t.due_date < CURRENT_DATE
+  )::bigint AS atrasadas,
+  count(*) FILTER (
+    WHERE t.status = 'OPEN'
+      AND NOT (t.due_date IS NOT NULL AND t.due_date < CURRENT_DATE)
+      AND p.done_items > 0
+  )::bigint AS em_execucao,
+  count(*) FILTER (
+    WHERE t.status = 'OPEN'
+      AND NOT (t.due_date IS NOT NULL AND t.due_date < CURRENT_DATE)
+      AND p.done_items = 0
+  )::bigint AS abertas
+FROM task t
+LEFT JOIN LATERAL (
+  SELECT count(*) FILTER (WHERE ti.done) AS done_items
+  FROM task_item ti
+  WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
+) p ON true
+WHERE t.tenant_id = $1::uuid
+`
+
+type GetTasksSummaryRow struct {
+	Concluidas int64 `json:"concluidas"`
+	Atrasadas  int64 `json:"atrasadas"`
+	EmExecucao int64 `json:"em_execucao"`
+	Abertas    int64 `json:"abertas"`
+}
+
+// The tasks KPI counts, derived from the SAME display_status logic the detail/list views use,
+// scoped to tenant_id (barrier 1). em_execucao needs the checklist progress, so a LEFT JOIN
+// LATERAL folds each task's done-item count in. Buckets (DISMISSED excluded, mirrors the derived
+// display_status): concluidas = DONE; atrasadas = OPEN with due_date < today; em_execucao = OPEN,
+// not yet due, with at least one done item; abertas = OPEN, not yet due, no done item. $1 = tenant_id.
+func (q *Queries) GetTasksSummary(ctx context.Context, tenantID uuid.UUID) (GetTasksSummaryRow, error) {
+	row := q.db.QueryRow(ctx, getTasksSummary, tenantID)
+	var i GetTasksSummaryRow
+	err := row.Scan(
+		&i.Concluidas,
+		&i.Atrasadas,
+		&i.EmExecucao,
+		&i.Abertas,
+	)
+	return i, err
+}
+
 const listPrazos = `-- name: ListPrazos :many
 SELECT d.id, d.kind, d.end_date,
        (d.end_date - CURRENT_DATE)::int AS days_left,
@@ -463,12 +655,71 @@ func (q *Queries) ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProc
 	return items, nil
 }
 
+const listTaskItems = `-- name: ListTaskItems :many
+SELECT id, task_id, title, position, done, done_at, created_at
+FROM task_item
+WHERE task_id = $1::uuid AND tenant_id = $2::uuid
+ORDER BY position ASC, id ASC
+`
+
+type ListTaskItemsParams struct {
+	TaskID   uuid.UUID `json:"task_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type ListTaskItemsRow struct {
+	ID        uuid.UUID          `json:"id"`
+	TaskID    uuid.UUID          `json:"task_id"`
+	Title     string             `json:"title"`
+	Position  int32              `json:"position"`
+	Done      bool               `json:"done"`
+	DoneAt    pgtype.Timestamptz `json:"done_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// One task's checklist, ordered by position (the detail view). Scoped to (task_id, tenant_id)
+// (barrier 1). An empty checklist is 0 rows (not an error). $1 = task_id, $2 = tenant_id.
+func (q *Queries) ListTaskItems(ctx context.Context, arg ListTaskItemsParams) ([]ListTaskItemsRow, error) {
+	rows, err := q.db.Query(ctx, listTaskItems, arg.TaskID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTaskItemsRow
+	for rows.Next() {
+		var i ListTaskItemsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Title,
+			&i.Position,
+			&i.Done,
+			&i.DoneAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTasks = `-- name: ListTasks :many
 SELECT t.id, t.title, t.description, t.kind, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
-       t.court_record_id, t.completed_at
+       t.court_record_id, t.completed_at,
+       -- done_items feeds the derived display_status (see ListTasksByProcesso).
+       COALESCE(p.done_items, 0)::bigint AS done_items
 FROM task t
+LEFT JOIN LATERAL (
+  SELECT count(*) FILTER (WHERE ti.done) AS done_items
+  FROM task_item ti
+  WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
+) p ON true
 WHERE t.tenant_id = $1::uuid
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
@@ -504,6 +755,7 @@ type ListTasksRow struct {
 	IntimationID   pgtype.UUID        `json:"intimation_id"`
 	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	DoneItems      int64              `json:"done_items"`
 }
 
 // The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
@@ -544,6 +796,7 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTas
 			&i.IntimationID,
 			&i.CourtRecordID,
 			&i.CompletedAt,
+			&i.DoneItems,
 		); err != nil {
 			return nil, err
 		}
@@ -560,8 +813,16 @@ const listTasksByProcesso = `-- name: ListTasksByProcesso :many
 SELECT t.id, t.title, t.description, t.kind, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
-       t.court_record_id, t.completed_at
+       t.court_record_id, t.completed_at,
+       -- done_items feeds the derived display_status (Em execução once any item is ticked);
+       -- the FE bucket reads it via display_status, not this raw count.
+       COALESCE(p.done_items, 0)::bigint AS done_items
 FROM task t
+LEFT JOIN LATERAL (
+  SELECT count(*) FILTER (WHERE ti.done) AS done_items
+  FROM task_item ti
+  WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
+) p ON true
 WHERE t.court_record_id = $1::uuid
   AND t.tenant_id = $2::uuid
   AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($3::date, $4::uuid)
@@ -591,6 +852,7 @@ type ListTasksByProcessoRow struct {
 	IntimationID   pgtype.UUID        `json:"intimation_id"`
 	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	DoneItems      int64              `json:"done_items"`
 }
 
 // ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
@@ -635,6 +897,7 @@ func (q *Queries) ListTasksByProcesso(ctx context.Context, arg ListTasksByProces
 			&i.IntimationID,
 			&i.CourtRecordID,
 			&i.CompletedAt,
+			&i.DoneItems,
 		); err != nil {
 			return nil, err
 		}

@@ -119,5 +119,20 @@ func stubFixture(source string) ParsedResult {
 			Content:         "Intimação para manifestação",
 			Source:          source,
 		}},
+		Parties: []ParsedParty{
+			{
+				CNJNumber: cnj,
+				Degree:    DegreeG1,
+				Role:      PartyRolePlaintiff,
+				Name:      "AUTOR STUB",
+				Counsels:  []ParsedCounsel{{Name: "ADV STUB", OAB: "123456", UF: "SP"}},
+			},
+			{
+				CNJNumber: cnj,
+				Degree:    DegreeG1,
+				Role:      PartyRoleDefendant,
+				Name:      "REU STUB",
+			},
+		},
 	}
 }

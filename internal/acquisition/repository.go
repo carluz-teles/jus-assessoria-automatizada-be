@@ -52,6 +52,10 @@ type Repository interface {
 	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error)
+	// UpsertParties materializes the process's partes (autor/réu/terceiro + advogados)
+	// idempotently in the sync tx (repository_batch.go). No event — the cockpit reads
+	// them straight (no cross-slice consumer in v0).
+	UpsertParties(ctx context.Context, tx database.Tx, params []PartyParams) error
 
 	// DATAJUD enrichment — the in-place grade (FIX B) plus the merge fallback for a
 	// rare grade conflict. The enrichment use case depends on the narrow enrichRepo
@@ -67,15 +71,33 @@ type Repository interface {
 	DueCourtRecordsForResync(ctx context.Context, tx database.Tx, limit int) ([]DueRecord, error)
 	ClaimCourtRecordResync(ctx context.Context, tx database.Tx, recordID string, nextSyncAt time.Time) error
 
+	// Responsável do processo (case-level) — the assign write path. The resolve hops
+	// court_record → court_case; the membership guard checks the target user belongs to
+	// the tenant; the update sets/clears assigned_user_id. All tx-taking (the use case
+	// owns the tx+RLS boundary). No outbox event yet — auditoria/evento is a future slice.
+	ResolveCaseIDByCourtRecord(ctx context.Context, tx database.Tx, tenantID, courtRecordID string) (caseID string, err error)
+	AppUserInTenant(ctx context.Context, tx database.Tx, tenantID, appUserID string) (bool, error)
+	AssignCaseResponsible(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) error
+
+	// Triagem da intimação (user_status) — the resolve/ignore/reopen write path. It
+	// sets ONLY user_status (the DJEN cancellation `status` is untouched), tenant-scoped;
+	// a miss/foreign row surfaces as ErrIntimationNotFound. Tx-taking (the use case owns
+	// the tx+RLS boundary). No outbox event yet — a future slice.
+	SetIntimationUserStatus(ctx context.Context, tx database.Tx, tenantID, intimationID, userStatus string) error
+
 	// Screen reads — the keyset-paginated read models (off the write path). The read
 	// use case depends on the narrow readRepo view of these.
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
+	GetProcesso(ctx context.Context, tenantID, id string) (ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
-	GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error)
+	GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoDetailView, error)
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
+	ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	SummarizeProcessos(ctx context.Context, tenantID string) (ProcessosSummaryView, error)
+	SummarizeIntimacoes(ctx context.Context, tenantID string) (IntimacoesSummaryView, error)
 	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	CountIntimacoesByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
@@ -1006,6 +1028,88 @@ func (r *pgRepository) ClaimCourtRecordResync(ctx context.Context, tx database.T
 	return database.WrapInfra(err)
 }
 
+// ResolveCaseIDByCourtRecord resolves the court_case behind a court_record inside the
+// caller's tx, scoped by tenant_id (barrier 1, RLS barrier 2). The FE addresses a process
+// by its court_record id, but the responsável lives on court_case, so the write hops
+// record → case first. A miss — unknown id or a foreign tenant's record — is the typed
+// ErrProcessoNotFound (→ 404), never (nil, nil).
+func (r *pgRepository) ResolveCaseIDByCourtRecord(ctx context.Context, tx database.Tx, tenantID, courtRecordID string) (string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	rid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		return "", apperr.NewInvalid("id de processo inválido")
+	}
+	caseID, err := acquisitiondb.New(tx).GetCaseIDByCourtRecord(ctx, acquisitiondb.GetCaseIDByCourtRecordParams{
+		ID:       rid,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrProcessoNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return caseID.String(), nil
+}
+
+// AppUserInTenant reports whether appUserID is an app_user of tenantID, inside the
+// caller's tx. It is the membership guard for the assign write (only consulted for a
+// non-null user_id); a non-uuid user id is client input → the typed KindInvalid.
+func (r *pgRepository) AppUserInTenant(ctx context.Context, tx database.Tx, tenantID, appUserID string) (bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(appUserID)
+	if err != nil {
+		return false, apperr.NewInvalid("id de usuário inválido")
+	}
+	present, err := acquisitiondb.New(tx).AppUserExistsInTenant(ctx, acquisitiondb.AppUserExistsInTenantParams{
+		ID:       uid,
+		TenantID: tid,
+	})
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	return present, nil
+}
+
+// AssignCaseResponsible sets (or clears, when assignedUserID is nil) the responsável on a
+// court_case inside the caller's tx, scoped by tenant_id (barrier 1, RLS barrier 2). The
+// caseID is the one ResolveCaseIDByCourtRecord returned; the WHERE ties the write to the
+// caller's own tenant so a mismatched (case, tenant) touches nothing.
+func (r *pgRepository) AssignCaseResponsible(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	cid, err := uuid.Parse(caseID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+
+	// A nil user_id is desatribuir → SQL NULL; a non-nil one is validated (parsed) here,
+	// though AppUserInTenant already resolved it upstream.
+	var assigned pgtype.UUID
+	if assignedUserID != nil {
+		uid, err := uuid.Parse(*assignedUserID)
+		if err != nil {
+			return apperr.NewInvalid("id de usuário inválido")
+		}
+		assigned = pgtype.UUID{Bytes: uid, Valid: true}
+	}
+
+	err = acquisitiondb.New(tx).AssignCaseResponsible(ctx, acquisitiondb.AssignCaseResponsibleParams{
+		ID:             cid,
+		AssignedUserID: assigned,
+		TenantID:       tid,
+	})
+	return database.WrapInfra(err)
+}
+
 // ListProcessos reads the tenant's live processes (keyset-paginated) on the pool,
 // filtered by tenant_id (isolation barrier 1) like the other screen reads. The
 // caller passes a sentinel cursor for the first page.
@@ -1043,11 +1147,56 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 			Secrecy:          row.Secrecy,
 			Lifecycle:        row.Lifecycle,
 			Completeness:     row.Completeness,
+			ClaimValue:       numericStr(row.ClaimValue),
+			AssignedUserID:   uuidStrPtr(row.AssignedUserID),
+			AssignedUserName: row.AssignedUserName,
 			LastMovementText: row.LastMovementText,
 			LastMovementAt:   timestampPtr(row.LastMovementAt),
 		})
 	}
 	return out, nil
+}
+
+// GetProcesso reads one process by id on the pool for the FE deep-link, scoped by
+// tenant_id (isolation barrier 1). It mirrors the ListProcessos row→ProcessoView
+// mapping (sqlc gives each query its own row type, so the projection maps in place). A
+// non-uuid :id is client input → the typed KindInvalid (→ 400); a miss — or a foreign
+// tenant's row — is the typed ErrProcessoNotFound (→ 404), never (nil, nil).
+func (r *pgRepository) GetProcesso(ctx context.Context, tenantID, id string) (ProcessoView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return ProcessoView{}, database.WrapInfra(err)
+	}
+	pid, err := uuid.Parse(id)
+	if err != nil {
+		return ProcessoView{}, apperr.NewInvalid("id de processo inválido")
+	}
+	row, err := r.q.GetProcesso(ctx, acquisitiondb.GetProcessoParams{ID: pid, TenantID: tid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProcessoView{}, ErrProcessoNotFound
+	}
+	if err != nil {
+		return ProcessoView{}, database.WrapInfra(err)
+	}
+	return ProcessoView{
+		ID:               row.ID.String(),
+		CaseID:           row.CaseID.String(),
+		CNJNumber:        row.CnjNumber,
+		Court:            row.Court,
+		Degree:           row.Degree,
+		Class:            deref(row.Class),
+		Subject:          deref(row.Subject),
+		JudgingBody:      deref(row.JudgingBody),
+		FiledAt:          datePtr(row.FiledAt),
+		Secrecy:          row.Secrecy,
+		Lifecycle:        row.Lifecycle,
+		Completeness:     row.Completeness,
+		ClaimValue:       numericStr(row.ClaimValue),
+		AssignedUserID:   uuidStrPtr(row.AssignedUserID),
+		AssignedUserName: row.AssignedUserName,
+		LastMovementText: row.LastMovementText,
+		LastMovementAt:   timestampPtr(row.LastMovementAt),
+	}, nil
 }
 
 // ListIntimacoes reads the tenant's intimation inbox (keyset-paginated, newest
@@ -1084,6 +1233,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 			Degree:          row.Degree,
 			Type:            deref(row.Type),
 			Status:          row.Status,
+			UserStatus:      row.UserStatus,
 			Source:          row.Source,
 			SourceURL:       deref(row.SourceUrl),
 			MadeAvailableAt: row.MadeAvailableAt.Time,
@@ -1100,35 +1250,43 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 // mapping (sqlc gives each query its own row type, so the projection maps in place). A
 // non-uuid :id is client input → the typed KindInvalid (→ 400); a miss — or a foreign
 // tenant's row — is the typed ErrIntimationNotFound (→ 404), never (nil, nil).
-func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error) {
+func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoDetailView, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
-		return IntimacaoView{}, database.WrapInfra(err)
+		return IntimacaoDetailView{}, database.WrapInfra(err)
 	}
 	iid, err := uuid.Parse(id)
 	if err != nil {
-		return IntimacaoView{}, apperr.NewInvalid("id de intimação inválido")
+		return IntimacaoDetailView{}, apperr.NewInvalid("id de intimação inválido")
 	}
 	row, err := r.q.GetIntimacao(ctx, acquisitiondb.GetIntimacaoParams{ID: iid, TenantID: tid})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return IntimacaoView{}, ErrIntimationNotFound
+		return IntimacaoDetailView{}, ErrIntimationNotFound
 	}
 	if err != nil {
-		return IntimacaoView{}, database.WrapInfra(err)
+		return IntimacaoDetailView{}, database.WrapInfra(err)
 	}
-	return IntimacaoView{
-		ID:              row.ID.String(),
-		CNJNumber:       row.CnjNumber,
-		Court:           row.Court,
-		Degree:          row.Degree,
-		Type:            deref(row.Type),
-		Status:          row.Status,
-		Source:          row.Source,
-		SourceURL:       deref(row.SourceUrl),
-		MadeAvailableAt: row.MadeAvailableAt.Time,
-		PublishedAt:     row.PublishedAt.Time,
-		DeadlineStartAt: row.DeadlineStartAt.Time,
-		ContentPreview:  contentPreview(row.Content),
+	return IntimacaoDetailView{
+		IntimacaoView: IntimacaoView{
+			ID:              row.ID.String(),
+			CNJNumber:       row.CnjNumber,
+			Court:           row.Court,
+			Degree:          row.Degree,
+			Type:            deref(row.Type),
+			Status:          row.Status,
+			UserStatus:      row.UserStatus,
+			Source:          row.Source,
+			SourceURL:       deref(row.SourceUrl),
+			MadeAvailableAt: row.MadeAvailableAt.Time,
+			PublishedAt:     row.PublishedAt.Time,
+			DeadlineStartAt: row.DeadlineStartAt.Time,
+			// The detail carries the FULL teor below, but ContentPreview stays populated so
+			// the embedded IntimacaoView is a complete list row (nothing the FE reads breaks).
+			ContentPreview: contentPreview(row.Content),
+		},
+		Content:     row.Content,
+		JudgingBody: deref(row.JudgingBody),
+		Recipients:  rawArrayOrEmpty(json.RawMessage(row.Recipients)),
 	}, nil
 }
 
@@ -1201,6 +1359,63 @@ func (r *pgRepository) CountAndamentosByProcesso(ctx context.Context, tenantID, 
 	return total, nil
 }
 
+// ListPartesByProcesso reads the process's parties (behind the court_record) with
+// their advogados aggregated per party, on the pool. Tenant isolation (barrier 1) is
+// the direct tenant_id filter, and the case is resolved from the court_record inside
+// the query (a foreign/unknown :id resolves to no case → no rows). The advogados arrive
+// as a jsonb array (pgx scans the jsonb column into []byte for the interface{} target),
+// unmarshaled here into the counsel views; an empty array (party with no advogado) maps
+// to an initialized empty slice, never nil.
+func (r *pgRepository) ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	crid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		// A non-uuid :id is client input → the typed KindInvalid (→ 400), mirroring the
+		// other court_record deep-reads.
+		return nil, apperr.NewInvalid("id de processo inválido")
+	}
+	rows, err := r.q.ListPartiesByProcesso(ctx, acquisitiondb.ListPartiesByProcessoParams{
+		TenantID:      tid,
+		CourtRecordID: crid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]PartyRow, 0, len(rows))
+	for _, row := range rows {
+		counsels, cerr := decodeCounsels(row.Counsels)
+		if cerr != nil {
+			return nil, database.WrapInfra(cerr)
+		}
+		out = append(out, PartyRow{
+			Role: row.Role,
+			PartyView: PartyView{
+				Name:     row.Name,
+				Document: row.Document,
+				Counsels: counsels,
+			},
+		})
+	}
+	return out, nil
+}
+
+// decodeCounsels unmarshals the jsonb_agg advogados column (cast to text in the query,
+// so pgx scans a JSON string) into the counsel views. An empty/absent value maps to an
+// initialized empty slice so the wire shape is always an array, never null.
+func decodeCounsels(raw string) ([]PartyCounselView, error) {
+	counsels := []PartyCounselView{}
+	if raw == "" {
+		return counsels, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &counsels); err != nil {
+		return nil, err
+	}
+	return counsels, nil
+}
+
 // ListIntimacoesByProcesso reads one process's intimations (keyset-paginated, newest
 // availability first) on the pool. intimation carries its own tenant_id, so tenant
 // isolation (barrier 1) is the direct filter alongside court_record_id; the join only
@@ -1242,6 +1457,7 @@ func (r *pgRepository) ListIntimacoesByProcesso(ctx context.Context, q Intimacoe
 			Degree:          row.Degree,
 			Type:            deref(row.Type),
 			Status:          row.Status,
+			UserStatus:      row.UserStatus,
 			Source:          row.Source,
 			SourceURL:       deref(row.SourceUrl),
 			MadeAvailableAt: row.MadeAvailableAt.Time,
@@ -1337,6 +1553,75 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, tenantID, search str
 	return filtered, total, nil
 }
 
+// SummarizeProcessos reads the processes list KPI counts (bucketed by court_record
+// lifecycle) on the pool, tenant-scoped. One aggregate scan; off the write path.
+func (r *pgRepository) SummarizeProcessos(ctx context.Context, tenantID string) (ProcessosSummaryView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return ProcessosSummaryView{}, database.WrapInfra(err)
+	}
+	row, err := r.q.SummarizeProcessos(ctx, tid)
+	if err != nil {
+		return ProcessosSummaryView{}, database.WrapInfra(err)
+	}
+	return ProcessosSummaryView{
+		Total:       row.Total,
+		EmAndamento: row.EmAndamento,
+		Suspensos:   row.Suspensos,
+		Arquivados:  row.Arquivados,
+		Baixados:    row.Baixados,
+	}, nil
+}
+
+// SummarizeIntimacoes reads the intimações inbox KPI counts (bucketed by triagem
+// state, user_status) on the pool, tenant-scoped. One aggregate scan; off the write path.
+func (r *pgRepository) SummarizeIntimacoes(ctx context.Context, tenantID string) (IntimacoesSummaryView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return IntimacoesSummaryView{}, database.WrapInfra(err)
+	}
+	row, err := r.q.SummarizeIntimacoes(ctx, tid)
+	if err != nil {
+		return IntimacoesSummaryView{}, database.WrapInfra(err)
+	}
+	return IntimacoesSummaryView{
+		Total:      row.Total,
+		Pendentes:  row.Pendentes,
+		EmAnalise:  row.EmAnalise,
+		Resolvidas: row.Resolvidas,
+		Ignoradas:  row.Ignoradas,
+		Criticas:   row.Criticas,
+	}, nil
+}
+
+// SetIntimationUserStatus sets ONLY the intimation's triagem state (user_status) inside
+// the caller's tx, tenant-scoped (barrier 1, RLS barrier 2). The DJEN cancellation
+// `status` column is untouched, so a routine re-observation cannot clobber the user's
+// decision. A zero-row UPDATE (unknown id or a foreign tenant's row) surfaces as
+// pgx.ErrNoRows → ErrIntimationNotFound (→ 404), never a silent no-op.
+func (r *pgRepository) SetIntimationUserStatus(ctx context.Context, tx database.Tx, tenantID, intimationID, userStatus string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	iid, err := uuid.Parse(intimationID)
+	if err != nil {
+		return apperr.NewInvalid("id de intimação inválido")
+	}
+	_, err = acquisitiondb.New(tx).SetIntimationUserStatus(ctx, acquisitiondb.SetIntimationUserStatusParams{
+		ID:         iid,
+		TenantID:   tid,
+		UserStatus: userStatus,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrIntimationNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
 // newCourtRecordEntity assembles the CourtRecord the use case works with from the
 // resolved ids and the request's natural-key fields.
 func newCourtRecordEntity(id, caseID uuid.UUID, params FindOrCreateCourtRecordParams) *CourtRecord {
@@ -1416,6 +1701,35 @@ func timestampPtr(ts pgtype.Timestamptz) *time.Time {
 	}
 	t := ts.Time
 	return &t
+}
+
+// numericStr lifts a nullable numeric column (claim_value, the valor da causa) to a
+// *string for a read model — nil on NULL, so an absent value serializes as JSON null.
+// The value is carried as a decimal string (not a float64) to preserve precision; the
+// driver's Value() yields that string form.
+func numericStr(n pgtype.Numeric) *string {
+	if !n.Valid {
+		return nil
+	}
+	v, err := n.Value()
+	if err != nil {
+		return nil
+	}
+	if s, ok := v.(string); ok {
+		return &s
+	}
+	return nil
+}
+
+// uuidStrPtr lifts a nullable uuid column (assigned_user_id, the responsável) to a
+// *string for a read model — nil on NULL, so an unassigned process serializes the id as
+// JSON null rather than the zero uuid.
+func uuidStrPtr(u pgtype.UUID) *string {
+	if !u.Valid {
+		return nil
+	}
+	s := uuid.UUID(u.Bytes).String()
+	return &s
 }
 
 // contentPreviewLen bounds the intimation teor preview the inbox list carries; the
