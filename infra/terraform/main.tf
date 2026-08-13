@@ -57,6 +57,8 @@ locals {
       APP_BILLING_SUCCESS_URL = var.billing_success_url
       APP_BILLING_CANCEL_URL  = var.billing_cancel_url
       APP_BILLING_RETURN_URL  = var.billing_return_url
+      # OpenRouter (geração LLM): o endpoint de sugestão de tarefas é síncrono no api.
+      OPENROUTER_API_KEY = var.openrouter_api_key
     })
     # worker-ingestao: roda o listener de notifications (e-mail via Resend) e o
     # backfill/sync DJEN por-OAB (on-demand no onboarding). Todo egress DJEN sai pelo

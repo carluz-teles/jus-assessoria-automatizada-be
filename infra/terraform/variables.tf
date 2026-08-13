@@ -166,3 +166,13 @@ variable "voyage_api_key" {
   sensitive = true
   default   = ""
 }
+
+# ---- OpenRouter (geração LLM do advisory — só o api consome, no endpoint síncrono) ----
+# Opcional: sem a chave o endpoint de sugestão devolve erro no ponto de uso; o boot não morre.
+# O modelo/base_url ficam no default do código (OPENROUTER_MODEL/BASE_URL), então só a chave é
+# segredo.
+variable "openrouter_api_key" {
+  type      = string
+  sensitive = true
+  default   = ""
+}

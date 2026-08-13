@@ -93,6 +93,8 @@ jobs:
       S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
       # Voyage (embeddings do worker-documents). Opcional: sem o secret, a indexação não sobe.
       VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+      # OpenRouter (geração LLM do advisory — sugestão de tarefas etc.). Opcional.
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3

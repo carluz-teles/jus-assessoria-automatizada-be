@@ -125,6 +125,16 @@ type Config struct {
 	// típo nunca liga o custo por engano.
 	OCREngine string `env:"OCR_ENGINE" envDefault:"tesseract"`
 
+	// OpenRouter — provedor de GERAÇÃO (LLM) do advisory. Roteia N modelos num endpoint
+	// OpenAI-compatível; começamos com um modelo LIGHT baratíssimo pra tarefas estreitas +
+	// structured output (ex.: intimação → tarefas sugeridas). Só a chave é segredo; MODEL e
+	// BASE_URL têm default sensato, trocáveis por env sem redeploy (o tiering do §7: light aqui,
+	// strong pra peça). Opcional no agregado — o adapter valida a chave no ponto de uso (Generate
+	// devolve Invalid) e o binário que não gera não morre por falta dela.
+	OpenRouterAPIKey  string `env:"OPENROUTER_API_KEY"`
+	OpenRouterModel   string `env:"OPENROUTER_MODEL" envDefault:"mistralai/mistral-small-24b-instruct-2501"`
+	OpenRouterBaseURL string `env:"OPENROUTER_BASE_URL" envDefault:"https://openrouter.ai/api/v1"`
+
 	// Calendário de prazos.
 	// HolidaySeedYearsAhead — quantos anos ALÉM do corrente o seeder nacional de
 	// feriados pré-carrega no boot do api (via BrasilAPI). 2 = ano corrente + 2.

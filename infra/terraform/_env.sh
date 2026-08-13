@@ -49,4 +49,5 @@ export TF_VAR_s3_region="$S3_REGION"
 export TF_VAR_s3_bucket="$S3_BUCKET"
 export TF_VAR_s3_access_key="$S3_ACCESS_KEY"
 export TF_VAR_s3_secret_key="$S3_SECRET_KEY"
-export TF_VAR_voyage_api_key="${VOYAGE_API_KEY:-}" # opcional: vazio = worker-documents sem indexação
+export TF_VAR_voyage_api_key="${VOYAGE_API_KEY:-}"         # opcional: vazio = worker-documents sem indexação
+export TF_VAR_openrouter_api_key="${OPENROUTER_API_KEY:-}" # opcional: vazio = api sem sugestão por LLM
