@@ -263,6 +263,18 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 			return err
 		}
 
+		// Um prazo NASCIDO já vencido — a carência D+1 (startOfDay(end)+1) já passou no
+		// momento da criação, típico do backfill de uma intimação histórica — nasce
+		// MISSED, não PENDING. Sem isto o carência missed_check (agendado só para ETAs
+		// FUTURAS em scheduleChecks) nunca é enfileirado e o prazo ficaria PENDING para
+		// sempre — o "prazo órfão". Silencioso por decisão: NÃO emitimos deadline.missed
+		// (um prazo que nunca esteve aberto não gera aviso "Prazo vencido"); o
+		// deadline.opened abaixo registra o fato, e o status já reflete o vencimento.
+		status := StatusPending
+		if carencia := startOfDay(endDate).AddDate(0, 0, 1); !carencia.After(uc.now()) {
+			status = StatusMissed
+		}
+
 		d := &Deadline{
 			TenantID:        ev.TenantID,
 			CourtRecordID:   ev.CourtRecordID,
@@ -274,7 +286,7 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 			HolidaysApplied: holidays,
 			StartDate:       start,
 			EndDate:         endDate,
-			Status:          StatusPending,
+			Status:          status,
 			Source:          SourceRule,
 			RulesVersion:    rule.RulesVersion,
 		}

@@ -521,7 +521,10 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 	repo := &mockRepo{class: "Procedimento Comum Cível", rule: citacaoRule(), insertID: deadlineID}
 	cal := &fakeCalendar{endDate: end, holidays: []time.Time{holiday}}
 	outbox := &fakeOutbox{}
-	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+	// Relógio ANTES do fim do prazo → nasce PENDING (o born-MISSED só vale depois da
+	// carência D+1 — ver TestOnIntimationObserved_OverdueBornMissed).
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{},
+		WithClock(func() time.Time { return time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC) }))
 
 	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
 		t.Fatalf("OnIntimationObserved() error = %v", err)
@@ -575,14 +578,13 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 		t.Errorf("ResolveRule got type/court/version = %q/%q/%q", repo.gotRuleType, repo.gotRuleCourt, repo.gotRuleVersion)
 	}
 
-	// Exactly one deadline.opened, aggregate = the new deadline id (a parseable uuid).
-	if len(outbox.published) != 1 {
-		t.Fatalf("published events = %d, want 1", len(outbox.published))
+	// Exactly one deadline.opened (o agendamento dos checks tem teste próprio), aggregate =
+	// o novo deadline id (uuid parseável).
+	openeds := publishedOfType[DeadlineOpened](outbox)
+	if len(openeds) != 1 {
+		t.Fatalf("deadline.opened publicados = %d, want 1", len(openeds))
 	}
-	opened, ok := outbox.published[0].(DeadlineOpened)
-	if !ok {
-		t.Fatalf("published[0] type = %T, want DeadlineOpened", outbox.published[0])
-	}
+	opened := openeds[0]
 	if opened.Type() != TypeDeadlineOpened || opened.AggregateType() != aggregateTypeDeadline {
 		t.Errorf("event type/aggregate = %q/%q", opened.Type(), opened.AggregateType())
 	}
@@ -594,6 +596,47 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 	}
 	if opened.Kind != KindContestacao || opened.EndDate != "2024-02-06" || opened.Counting != "BUSINESS" {
 		t.Errorf("opened kind/end/counting = %q/%q/%q", opened.Kind, opened.EndDate, opened.Counting)
+	}
+}
+
+// TestOnIntimationObserved_OverdueBornMissed cobre o "prazo órfão" do backfill: quando a
+// intimação é histórica e o prazo já NASCE vencido (a carência D+1 já passou no now da
+// criação), ele nasce MISSED — não PENDING — senão o missed_check (agendado só para ETAs
+// futuras em scheduleChecks) nunca é enfileirado e o prazo ficaria PENDING para sempre. É
+// silencioso: emite só deadline.opened, nunca um deadline.missed nem checks agendados.
+func TestOnIntimationObserved_OverdueBornMissed(t *testing.T) {
+	ev := observedFixture()
+	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC) // ~2 anos após o fim → carência passou
+
+	repo := &mockRepo{class: "Procedimento Comum Cível", rule: citacaoRule(), insertID: uuid.NewString()}
+	cal := &fakeCalendar{endDate: end}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{},
+		WithClock(func() time.Time { return now }))
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	if repo.inserted == nil {
+		t.Fatal("expected a deadline to be inserted")
+	}
+	if repo.inserted.Status != StatusMissed {
+		t.Errorf("Status = %q, want MISSED (nascido já vencido)", repo.inserted.Status)
+	}
+	// Silencioso: só deadline.opened; nenhum deadline.missed, missed_check ou reminder_check.
+	if got := len(outbox.published); got != 1 {
+		t.Fatalf("published events = %d, want 1 (só deadline.opened)", got)
+	}
+	if _, ok := outbox.published[0].(DeadlineOpened); !ok {
+		t.Errorf("published[0] = %T, want DeadlineOpened", outbox.published[0])
+	}
+	if n := len(publishedOfType[DeadlineMissedCheck](outbox)); n != 0 {
+		t.Errorf("missed_check agendados = %d, want 0 (marca no passado)", n)
+	}
+	if n := len(publishedOfType[DeadlineReminderCheck](outbox)); n != 0 {
+		t.Errorf("reminder_check agendados = %d, want 0 (marcas no passado)", n)
 	}
 }
 
