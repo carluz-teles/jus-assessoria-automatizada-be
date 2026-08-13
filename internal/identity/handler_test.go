@@ -52,9 +52,9 @@ type fakeHandlerUC struct {
 	orgProfileErr      error
 	orgProfileReadFlag bool
 
-	members           []OrgMember
-	gotMembersTenant  string
-	membersErr        error
+	members          []OrgMember
+	gotMembersTenant string
+	membersErr       error
 }
 
 func (f *fakeHandlerUC) GetMe(_ context.Context, clerkUserID string) (Me, error) {

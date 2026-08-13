@@ -327,9 +327,9 @@ type recordingReader struct {
 	gotProcOneID  string
 	// GET /v1/processos/:id/partes — capture the forwarded (tenant, court_record) and
 	// return a canned view.
-	partesRes      PartesView
-	gotPartesTID   string
-	gotPartesCRID  string
+	partesRes     PartesView
+	gotPartesTID  string
+	gotPartesCRID string
 }
 
 func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (ProcessosResult, error) {
