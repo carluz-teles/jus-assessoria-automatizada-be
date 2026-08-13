@@ -16,43 +16,47 @@ import (
 // discovers a process it lands a court_record with degree=UNKNOWN (DJEN never
 // discloses the grau). This use case fetches that process from DATAJUD by number,
 // which reveals the grade and the court's own view (classe/assunto/órgão/
-// ajuizamento/sigilo/movimentos), and performs the placeholder+merge: it finds or
-// creates the GRADED court_record in the same case, re-points the placeholder's
-// intimations onto it, retires the placeholder (SUPERSEDED), and attaches the
-// movimentos as docket entries. DATAJUD is enrichment-only — it never discovers —
-// so it is not an activatable integration; this event is its sole trigger.
+// ajuizamento/sigilo/movimentos), and GRADES THE PLACEHOLDER IN PLACE: it mutates
+// the existing court_record (ev.CourtRecordID) to the real degree + DATAJUD fields
+// on the SAME id, so the intimations, deadlines and docket already anchored to it
+// stay correct — zero orphan, zero duplicate (FIX B). The one row it cannot mutate
+// in place is a rare pre-existing graded record at that grade (the (tenant, cnj,
+// degree) UNIQUE): there it MERGES the placeholder's intimations onto the graded
+// record and retires the placeholder. DATAJUD is enrichment-only — it never
+// discovers — so it is not an activatable integration; this event is its sole trigger.
 
 // consumerEnrichment is this listener's identity in processed_event (per-consumer
 // dedup, independent of the sync consumer that produced the event).
 const consumerEnrichment = "acquisition.enrichment"
 
-// GradedRecordParams find-or-creates the graded court record and refreshes the
-// DATAJUD-authoritative fields. It is the enrichment counterpart of
-// FindOrCreateCourtRecordParams, minus the entitlement gate (grading an already
-// tracked process consumes no new plan slot).
-type GradedRecordParams struct {
-	TenantID     string
-	CaseID       string
-	CNJNumber    string
-	Degree       string
-	Court        string
-	Class        string
-	Subject      string
-	JudgingBody  string
-	FiledAt      time.Time
-	Secrecy      string
-	Completeness float32
-	// NextSyncAt seeds the re-poll schedule; it is written only when the graded
-	// record is first created (the query ignores it on a refresh), so the scheduler
-	// owns re-scheduling thereafter.
-	NextSyncAt time.Time
+// GradeParams grades ONE court_record in place: it names the row to mutate
+// (CourtRecordID — the DJEN UNKNOWN placeholder) and the DATAJUD-authoritative
+// fields to write onto that same id. It is not entitlement-gated (grading an
+// already-tracked process consumes no new plan slot). NextSyncAt seeds the re-poll
+// schedule only when the row still has none; an existing schedule (the scheduler's
+// claim) is preserved.
+type GradeParams struct {
+	TenantID      string
+	CourtRecordID string
+	Degree        string
+	Court         string
+	Class         string
+	Subject       string
+	JudgingBody   string
+	FiledAt       time.Time
+	Secrecy       string
+	Completeness  float32
+	NextSyncAt    time.Time
 }
 
-// enrichRepo is the narrow persistence port the enrichment use case drives:
-// the grade merge (upsert graded + re-point + supersede) and the movimento upsert.
+// enrichRepo is the narrow persistence port the enrichment use case drives: grading
+// the placeholder in place (UpdateCourtRecordGrade), the conflict lookup that guards
+// the (tenant, cnj, degree) UNIQUE (GetCourtRecordByKey), the merge fallback for that
+// rare conflict (re-point + supersede), and the movimento upsert.
 type enrichRepo interface {
 	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
-	UpsertGradedCourtRecord(ctx context.Context, tx database.Tx, params GradedRecordParams) (*CourtRecord, error)
+	GetCourtRecordByKey(ctx context.Context, tx database.Tx, tenantID, cnjNumber, degree string) (record *CourtRecord, found bool, err error)
+	UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*CourtRecord, error)
 	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
 	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
@@ -84,11 +88,11 @@ func NewEnrichmentUseCase(repo enrichRepo, outbox publisher, uow database.UnitOf
 }
 
 // OnCourtRecordObserved enriches one observed court record via DATAJUD. It serves
-// two triggers with one path: a fresh DJEN discovery (degree=UNKNOWN → grade +
-// placeholder+merge) and a scheduler re-poll of an already-graded record
-// (degree=G1/G2/… → refresh its movimentos). Both fetch and parse outside any
-// transaction, then commit in one unit of work; the merge-vs-refresh split falls
-// out of whether the graded record differs from the observed one. An observation
+// two triggers with one path: a fresh DJEN discovery (degree=UNKNOWN → grade the
+// placeholder in place) and a scheduler re-poll of an already-graded record
+// (degree=G1/G2/… → refresh its fields + movimentos). Both fetch and parse outside
+// any transaction, then commit in one unit of work; either way the record's id is
+// stable, so its children stay anchored. An observation
 // missing the keys a by-number fetch needs is a no-op ack. A fetch fault is
 // retryable (asynq re-delivers — a DATAJUD rate-limit is transient); a parse fault
 // archives the task (SkipRetry); a process not yet in DATAJUD is a no-op ack.
@@ -139,16 +143,18 @@ func (uc *EnrichmentUseCase) OnCourtRecordObserved(ctx context.Context, ev Court
 	return uc.applyEnrichment(ctx, ev, graded, parsed.DocketEntries)
 }
 
-// applyEnrichment commits the placeholder+merge in one unit of work: dedup the
-// event, upsert the graded record, move the placeholder's intimations onto it,
-// retire the placeholder, upsert the DATAJUD movimentos as docket entries, and
-// emit docket_entry_observed for the new ones — all atomically.
+// applyEnrichment commits the in-place grade in one unit of work: dedup the event,
+// resolve which record to grade (the placeholder itself, or — on the rare grade
+// conflict — a pre-existing graded record it merges into), grade that record,
+// upsert the DATAJUD movimentos as docket entries, and emit docket_entry_observed
+// for the new ones — all atomically.
 func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecordObserved, graded ParsedCourtRecord, movimentos []ParsedDocketEntry) error {
 	applied := false
 	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		// Take the per-tenant write lock FIRST (before the dedup row write) so this
-		// graded-record merge never deadlocks against a concurrent sync slice writing
-		// the same tenant's court_records. The DATAJUD fetch already ran outside this tx.
+		// grade write never deadlocks against a concurrent sync slice writing the same
+		// tenant's court_records. The DATAJUD fetch already ran outside this tx. Holding
+		// it also makes the read-then-write conflict check below race-free per tenant.
 		if err := uc.repo.AcquireTenantWriteLock(ctx, tx, ev.TenantID); err != nil {
 			return err
 		}
@@ -161,37 +167,50 @@ func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecord
 			return nil
 		}
 
-		gradedRec, err := uc.repo.UpsertGradedCourtRecord(ctx, tx, GradedRecordParams{
-			TenantID:     ev.TenantID,
-			CaseID:       ev.CaseID,
-			CNJNumber:    graded.CNJNumber,
-			Degree:       graded.Degree,
-			Court:        graded.Court,
-			Class:        graded.Class,
-			Subject:      graded.Subject,
-			JudgingBody:  graded.JudgingBody,
-			FiledAt:      graded.FiledAt,
-			Secrecy:      graded.Secrecy,
-			Completeness: graded.Completeness,
-			// Seeds the re-poll schedule on the FIRST grade (ignored by the query on a
-			// refresh, so the scheduler's claim owns re-scheduling afterward).
-			NextSyncAt: uc.now().Add(defaultSyncInterval),
-		})
+		// FIX B — grade the observed record IN PLACE. The row we mutate keeps
+		// ev.CourtRecordID, so its intimations/deadlines/docket stay anchored (no orphan,
+		// no duplicate). Mutating the placeholder's degree would violate the
+		// (tenant, cnj, degree) UNIQUE only if a DIFFERENT record already holds this
+		// grade; detect that first and merge into it instead. In the common grade
+		// (no existing graded record) and the scheduler refresh (the record IS itself
+		// the graded record), the target is simply ev.CourtRecordID.
+		target := ev.CourtRecordID
+		existing, found, err := uc.repo.GetCourtRecordByKey(ctx, tx, ev.TenantID, ev.CNJNumber, graded.Degree)
 		if err != nil {
 			return err
 		}
-
-		// Placeholder+merge: the observed UNKNOWN record and the graded record are
-		// distinct rows (UNKNOWN vs G1/G2). Move the placeholder's intimations onto the
-		// graded record and retire the placeholder. DJEN discovery produces no docket
-		// entries, so the placeholder never has any to re-point.
-		if gradedRec.ID != ev.CourtRecordID {
-			if _, err := uc.repo.RepointIntimations(ctx, tx, ev.TenantID, ev.CourtRecordID, gradedRec.ID); err != nil {
+		if found && existing.ID != ev.CourtRecordID {
+			// Rare conflict: a graded record already holds this (tenant, cnj, degree).
+			// Merge the placeholder INTO it — move its intimations onto the graded record
+			// and retire the placeholder. DJEN discovery produces no docket entries, so the
+			// placeholder never has any to re-point; the DATAJUD movimentos below land on
+			// the graded record (the new target).
+			if _, err := uc.repo.RepointIntimations(ctx, tx, ev.TenantID, ev.CourtRecordID, existing.ID); err != nil {
 				return err
 			}
 			if err := uc.repo.SupersedeCourtRecord(ctx, tx, ev.TenantID, ev.CourtRecordID); err != nil {
 				return err
 			}
+			target = existing.ID
+		}
+
+		gradedRec, err := uc.repo.UpdateCourtRecordGrade(ctx, tx, GradeParams{
+			TenantID:      ev.TenantID,
+			CourtRecordID: target,
+			Degree:        graded.Degree,
+			Court:         graded.Court,
+			Class:         graded.Class,
+			Subject:       graded.Subject,
+			JudgingBody:   graded.JudgingBody,
+			FiledAt:       graded.FiledAt,
+			Secrecy:       graded.Secrecy,
+			Completeness:  graded.Completeness,
+			// Seeds the re-poll schedule when the row has none yet (COALESCE keeps an
+			// existing schedule, so the scheduler's claim owns re-scheduling afterward).
+			NextSyncAt: uc.now().Add(defaultSyncInterval),
+		})
+		if err != nil {
+			return err
 		}
 
 		newDocket, err := uc.repo.UpsertDocketEntries(ctx, tx, enrichDocketParams(gradedRec.ID, movimentos))

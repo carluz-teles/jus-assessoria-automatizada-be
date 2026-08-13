@@ -130,7 +130,7 @@ func (p *DATAJUDParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult
 		entries = append(entries, ParsedDocketEntry{
 			CNJNumber:   src.NumeroProcesso,
 			Degree:      degree,
-			Hash:        datajudMovimentoHash(src.Tribunal, src.NumeroProcesso, degree, mov),
+			Hash:        datajudMovimentoHash(src.Tribunal, src.NumeroProcesso, mov),
 			OccurredAt:  occurred,
 			ObservedAt:  p.now(),
 			Source:      SourceDATAJUD,
@@ -148,11 +148,15 @@ func (p *DATAJUDParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult
 }
 
 // datajudMovimentoHash derives the docket-entry dedup key: DATAJUD gives no hash of
-// its own, so it is sha256(tribunal|number|grau|dataHora|codigo|nome) — stable, so a
-// re-fetch of the same process dedups its movimentos.
-func datajudMovimentoHash(tribunal, numero, grau string, mov datajudMovimento) string {
+// its own, so it is sha256(tribunal|number|dataHora|codigo|nome) — stable, so a
+// re-fetch of the same process dedups its movimentos. The grau is deliberately OUT of
+// the key: with FIX B there is one court_record per CNJ (the placeholder is graded in
+// place, not duplicated), and docket_entry's UNIQUE (court_record_id, hash) already
+// separates records — so hashing the grau would only re-duplicate a movimento the
+// moment DATAJUD reveals or changes the grade.
+func datajudMovimentoHash(tribunal, numero string, mov datajudMovimento) string {
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		tribunal, numero, grau, mov.DataHora, strconv.Itoa(mov.Codigo), mov.Nome,
+		tribunal, numero, mov.DataHora, strconv.Itoa(mov.Codigo), mov.Nome,
 	}, "|")))
 	return hex.EncodeToString(sum[:])
 }

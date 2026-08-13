@@ -1,46 +1,56 @@
 -- enrichment cycle queries (acquisition slice).
 -- DATAJUD enrichment reacts to court_record_observed for a DJEN placeholder
--- (degree=UNKNOWN): it fetches the process by number, reveals the grau, and does
--- the placeholder+merge — find/create the GRADED court_record in the same case,
--- re-point the placeholder's intimations onto it, and mark the placeholder
--- SUPERSEDED. DJEN discovery produces no docket entries, so the placeholder never
--- has any to re-point; DATAJUD's movimentos attach directly to the graded record
--- (InsertDocketEntry, sync.sql).
+-- (degree=UNKNOWN): it fetches the process by number, reveals the grau, and GRADES
+-- THE PLACEHOLDER IN PLACE — a single UPDATE that mutates the existing court_record
+-- (ev.CourtRecordID) to the real degree + DATAJUD-authoritative fields on the SAME
+-- id (UpdateCourtRecordGrade). Because the id never changes, the intimations,
+-- deadlines and docket entries already anchored to it stay correct — no orphan, no
+-- duplicate (FIX B). The (tenant, cnj, degree) UNIQUE means the ONE case that cannot
+-- graduate in place is a rare pre-existing graded record at that grade: the use case
+-- detects it first (GetCourtRecordByKey, sync.sql) and MERGES the placeholder into it
+-- instead — RepointIntimations moves the placeholder's intimations onto the graded
+-- record and SupersedeCourtRecord retires the placeholder (DJEN discovery produces no
+-- docket entries, so the placeholder never has any to re-point).
 
--- name: UpsertGradedCourtRecord :one
--- Find-or-create the graded court_record on its natural key (tenant, cnj, degree)
--- and refresh the fields DATAJUD is authoritative for. Unlike the discovery path
--- this is NOT gated by the entitlement limit: the process is already tracked (the
--- UNKNOWN placeholder counted against the plan), so grading it must not consume a
--- second slot. case_id is only written on insert (a pre-existing graded record
--- keeps its case); RETURNING carries both so the caller re-points onto this row.
--- next_sync_at is seeded on the INSERT only (the record enters the re-poll
--- schedule when first graded); a refresh (DO UPDATE) leaves it untouched, so the
--- scheduler owns re-scheduling via its claim.
-INSERT INTO court_record
-    (tenant_id, case_id, cnj_number, degree, court, class, subject, judging_body, filed_at, secrecy, completeness, next_sync_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-ON CONFLICT (tenant_id, cnj_number, degree) DO UPDATE SET
-    class = EXCLUDED.class,
-    subject = EXCLUDED.subject,
-    judging_body = EXCLUDED.judging_body,
-    filed_at = EXCLUDED.filed_at,
-    secrecy = EXCLUDED.secrecy,
-    completeness = EXCLUDED.completeness
+-- name: UpdateCourtRecordGrade :one
+-- Grade a court_record IN PLACE: mutate the row named by @court_record_id — the DJEN
+-- UNKNOWN placeholder — to the DATAJUD-revealed degree and the fields DATAJUD is
+-- authoritative for, keeping the SAME id. Because the id is stable, every child
+-- already anchored to it (intimation, deadline, docket_entry) remains correct, which
+-- is the whole point of FIX B. It also serves the scheduler re-poll of an
+-- already-graded record: the degree is unchanged there (the caller guards the
+-- grade-mismatch case), so this just refreshes the authoritative fields. next_sync_at
+-- is seeded only when the row still has none (first grade); an existing schedule — the
+-- scheduler's own claim — is preserved via COALESCE, so the scheduler keeps owning the
+-- re-poll cadence. case_id is never touched (the record keeps its Pasta). RETURNING
+-- carries id + case_id for the caller. The (tenant, cnj, degree) UNIQUE requires the
+-- caller to ensure no OTHER record already holds @degree (the merge path handles that).
+UPDATE court_record SET
+    degree = @degree,
+    court = @court,
+    class = @class,
+    subject = @subject,
+    judging_body = @judging_body,
+    filed_at = @filed_at,
+    secrecy = @secrecy,
+    completeness = @completeness,
+    next_sync_at = COALESCE(next_sync_at, @next_sync_at)
+WHERE id = @court_record_id AND tenant_id = @tenant_id
 RETURNING id, case_id;
 
 -- name: RepointIntimations :execrows
--- Move the placeholder's intimations onto the graded record. Unicidade de
--- intimation é (tenant, case_id, hash), so swapping court_record_id never breaks
--- dedup (same case). Returns the number of rows moved.
+-- Merge-path only: move the placeholder's intimations onto a PRE-EXISTING graded
+-- record when grading in place would violate the (tenant, cnj, degree) UNIQUE.
+-- Unicidade de intimation é (tenant, case_id, hash), so swapping court_record_id never
+-- breaks dedup (same case). Returns the number of rows moved.
 UPDATE intimation
 SET court_record_id = @to_court_record_id
 WHERE tenant_id = @tenant_id AND court_record_id = @from_court_record_id;
 
 -- name: SupersedeCourtRecord :exec
--- Retire the UNKNOWN placeholder after its children moved: it no longer represents
--- a live process (the graded record does), so it drops out of the ACTIVE count and
--- the scheduler (next_sync_at NULL).
+-- Merge-path only: retire the UNKNOWN placeholder after its intimations moved onto the
+-- pre-existing graded record. It no longer represents a live process (the graded record
+-- does), so it drops out of the ACTIVE count and the scheduler (next_sync_at NULL).
 UPDATE court_record
 SET lifecycle = 'SUPERSEDED', next_sync_at = NULL
 WHERE tenant_id = $1 AND id = $2;

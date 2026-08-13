@@ -4,8 +4,9 @@
 // CNJ APIs, driven by real OABs: DJEN discovers communications by OAB over a
 // window → court records (degree UNKNOWN) + intimations land → each observed
 // record is enriched via DATAJUD (by number) → the grade is revealed and the
-// placeholder+merge runs (graded record, intimations re-pointed, placeholder
-// SUPERSEDED, movimentos as docket entries).
+// placeholder is GRADED IN PLACE (FIX B): the same court_record id is mutated to
+// the real degree and carries the movimentos, so its intimations stay anchored —
+// no duplicate record, no SUPERSEDED placeholder.
 //
 // It hits the internet (comunicaapi.pje.jus.br + api-publica.datajud.cnj.jus.br),
 // so it is guarded by the `integration` tag AND is resilient: a WAF 403 or an
@@ -150,23 +151,32 @@ func TestE2E_DJEN_DATAJUD(t *testing.T) {
 		`SELECT count(*) FROM court_record WHERE tenant_id=$1 AND lifecycle='SUPERSEDED'`, tenantID)
 	docket := countRows(t, pool,
 		`SELECT count(*) FROM docket_entry de JOIN court_record cr ON cr.id=de.court_record_id WHERE cr.tenant_id=$1`, tenantID)
-	t.Logf("── Final: %d graded (ACTIVE), %d superseded placeholders, %d docket entries; %d/%d DATAJUD hits",
+	t.Logf("── Final: %d graded (ACTIVE), %d superseded, %d docket entries; %d/%d DATAJUD hits",
 		graded, superseded, docket, hits, len(observed))
 
-	// If DATAJUD had at least one hit, the placeholder+merge must have produced a
-	// graded ACTIVE record, retired the placeholder, and attached movimentos — and
-	// every graded record's intimations must have followed it (none left on a
-	// superseded placeholder).
+	// FIX B — a DATAJUD hit grades the placeholder IN PLACE: it becomes a graded ACTIVE
+	// record on the SAME id and carries the movimentos, so a hit must yield a graded
+	// record and docket entries, keep the tenant's total record count equal to what
+	// discovery found (no duplicate), and produce NO SUPERSEDED placeholders — the
+	// intimations never move, so none can be orphaned.
 	if hits > 0 {
-		if graded == 0 || superseded == 0 || docket == 0 {
-			t.Errorf("a DATAJUD hit did not complete the merge: graded=%d superseded=%d docket=%d", graded, superseded, docket)
+		if graded == 0 || docket == 0 {
+			t.Errorf("a DATAJUD hit did not grade in place: graded=%d docket=%d", graded, docket)
 		}
+		if superseded != 0 {
+			t.Errorf("FIX B grades in place, but %d records were SUPERSEDED (create-new+retire regression)", superseded)
+		}
+		total := countRows(t, pool, `SELECT count(*) FROM court_record WHERE tenant_id=$1`, tenantID)
+		if total != discovered {
+			t.Errorf("court_record count = %d after enrichment, want %d (in-place grade must not duplicate)", total, discovered)
+		}
+		// Every intimation stays anchored to a live (non-SUPERSEDED) record.
 		orphaned := countRows(t, pool,
 			`SELECT count(*) FROM intimation i
 			 JOIN court_record cr ON cr.id=i.court_record_id
 			 WHERE i.tenant_id=$1 AND cr.lifecycle='SUPERSEDED'`, tenantID)
 		if orphaned != 0 {
-			t.Errorf("%d intimations left on a SUPERSEDED placeholder — re-point failed", orphaned)
+			t.Errorf("%d intimations left on a SUPERSEDED placeholder — grade did not stay in place", orphaned)
 		}
 		// A graded record carries a next_sync_at (it entered the re-poll schedule).
 		scheduled := countRows(t, pool,
@@ -175,7 +185,7 @@ func TestE2E_DJEN_DATAJUD(t *testing.T) {
 			t.Error("no graded record has next_sync_at — it will never be re-polled")
 		}
 	} else {
-		t.Log("no DATAJUD hits this run (processes not yet indexed) — merge assertions skipped")
+		t.Log("no DATAJUD hits this run (processes not yet indexed) — grade assertions skipped")
 	}
 
 	// ── Phase 3: the screen reads (what the FE renders) ────────────────────────
