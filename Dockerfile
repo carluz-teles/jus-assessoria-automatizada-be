@@ -31,8 +31,14 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SVC}
 # that svc). Debian slim + poppler-utils (pdftoppm) + tesseract-ocr + the Portuguese
 # language pack (tesseract-ocr-por). Same binary/migrations/ENTRYPOINT shape and a
 # non-root user, so nothing else about how the service runs changes.
+#
+# ca-certificates + tzdata are baked into the distroless static image but NOT into
+# debian-slim — without ca-certificates every outbound TLS (OTLP metrics/traces, the
+# Voyage embeddings API, the R2 presigned GET/PUT) fails with "x509: certificate signed
+# by unknown authority". They restore parity with the distroless runtime.
 FROM debian:bookworm-slim AS runtime-ocr
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates tzdata \
         tesseract-ocr tesseract-ocr-por poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --no-create-home --uid 10001 appuser
