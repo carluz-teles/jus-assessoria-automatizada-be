@@ -8,14 +8,19 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/hibiken/asynq"
 
+	"github.com/jusassessoria/platform/internal/extraction"
+	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
+	"github.com/jusassessoria/platform/lib/storage"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
@@ -72,12 +77,66 @@ func run(logger *slog.Logger) error {
 		LogLevel:    asynq.ErrorLevel,
 	})
 
-	// Feature slices register their listeners on this mux, e.g.
-	//   mux.HandleFunc("documents.ocr.requested", listener.Handle)
-	// Observe wraps EVERY handler (consumer span + failure log) — a future
-	// documents listener inherits the instrumentation for free.
+	// Observe wraps EVERY handler (consumer span + failure log), so both pipeline
+	// listeners inherit the instrumentation for free.
 	mux := asynq.NewServeMux()
 	mux.Use(events.Observe(logger))
+
+	// Documentos pipeline (Fatia 5–7) runs here on the "documents" queue: extraction
+	// (document.uploaded → PDF text / Claude-vision OCR → document.extracted) and
+	// indexing (document.extracted → chunk → Voyage embeddings → document.ready). Both
+	// need object storage, so they mount only when S3 is configured (like the api's
+	// document handler); without it the worker still boots idle instead of crash-looping.
+	if cfg.S3Enabled() {
+		storageClient, err := storage.New(ctx, storage.Options{
+			Endpoint:  cfg.S3Endpoint,
+			Region:    cfg.S3Region,
+			Bucket:    cfg.S3Bucket,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+		})
+		if err != nil {
+			return fmt.Errorf("init storage: %w", err)
+		}
+		outbox := events.NewOutbox()
+		uow := database.NewUnitOfWork(pool)
+		// A generous client timeout: the OCR/embedding calls are network-bound and slow.
+		httpClient := &http.Client{Timeout: 2 * time.Minute}
+
+		// Fatia 5+6 — text-layer extraction + Claude vision OCR fallback. The Anthropic
+		// key is required config; the slice builds its own vision client from it.
+		extraction.RegisterExtractionListeners(mux, extraction.Deps{
+			UoW:             uow,
+			Storage:         storageClient,
+			Outbox:          outbox,
+			AnthropicAPIKey: cfg.AnthropicKey,
+			HTTPClient:      httpClient,
+		})
+
+		// Fatia 7 — chunking + Voyage embeddings + pgvector. The Voyage key is optional
+		// config: when unset, skip the indexing listener (extraction still works
+		// standalone) rather than crash-loop; when set but invalid, fail boot so the
+		// misconfig surfaces instead of silently failing at embed time.
+		if cfg.VoyageAPIKey == "" {
+			logger.Warn("VOYAGE_API_KEY unset — document indexing listener not registered")
+		} else {
+			embedder, err := indexing.NewVoyageEmbedder(cfg.VoyageAPIKey, cfg.VoyageModel, cfg.VoyageEmbedDim, httpClient)
+			if err != nil {
+				return fmt.Errorf("init voyage embedder: %w", err)
+			}
+			indexing.RegisterIndexingListeners(mux, indexing.Deps{
+				UOW:      uow,
+				Storage:  storageClient,
+				Outbox:   outbox,
+				Embedder: embedder,
+				EmbedDim: cfg.VoyageEmbedDim,
+			})
+			logger.Info("document indexing listener registered")
+		}
+		logger.Info("documents extraction listener registered", "bucket", cfg.S3Bucket)
+	} else {
+		logger.Warn("S3 not configured — documents pipeline listeners not registered")
+	}
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)

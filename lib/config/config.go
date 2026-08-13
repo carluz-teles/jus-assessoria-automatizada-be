@@ -104,6 +104,18 @@ type Config struct {
 	S3AccessKey string `env:"S3_ACCESS_KEY"`
 	S3SecretKey string `env:"S3_SECRET_KEY"`
 
+	// Voyage — provedor de embeddings da fatia de indexação/retrieval de documentos
+	// (só o worker-documents, onde roda o listener de indexing, os consome). O
+	// milestone escolheu Voyage voyage-3.5-lite/vector(1024) (Anthropic não tem API de
+	// embeddings). Opcionais no agregado pelo mesmo motivo do Stripe/S3/Resend:
+	// mantê-los opcionais preserva o boot dos demais binários (api/scheduler/relay),
+	// que não geram embeddings. O adapter Voyage valida a presença da chave no ponto
+	// de uso (Embed devolve Invalid) e falha rápido se faltar. VOYAGE_MODEL/EMBED_DIM
+	// têm default sensato (o modelo/dim do milestone), então só a chave é um segredo.
+	VoyageAPIKey   string `env:"VOYAGE_API_KEY"`
+	VoyageModel    string `env:"VOYAGE_MODEL" envDefault:"voyage-4-lite"`
+	VoyageEmbedDim int    `env:"VOYAGE_EMBED_DIM" envDefault:"1024"`
+
 	// Calendário de prazos.
 	// HolidaySeedYearsAhead — quantos anos ALÉM do corrente o seeder nacional de
 	// feriados pré-carrega no boot do api (via BrasilAPI). 2 = ano corrente + 2.

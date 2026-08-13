@@ -262,7 +262,13 @@ func queueFor(typ string) string {
 		// handler-not-found), NOT "default", so the rows don't pile up in a Redis queue no
 		// worker drains.
 		return "ingestao"
-	case "documents":
+	case "documents", "document":
+		// The document slice PRODUCES document.* (singular prefix: document.uploaded,
+		// .extracted, .ready, .failed — the ingest→extract→OCR→chunk→embed pipeline) and
+		// worker-documents serves the "documents" queue where the extraction + indexing
+		// listeners are mounted. Route BOTH the singular "document" and legacy plural
+		// "documents" prefixes there — without the singular case they fall to "default",
+		// which no worker consumes, and the whole pipeline silently stalls.
 		return "documents"
 	case "ai":
 		return "ai"
@@ -280,7 +286,7 @@ func maxRetryFor(typ string) int {
 	switch prefix(typ) {
 	case "ingestao", "acquisition":
 		return 25
-	case "documents":
+	case "documents", "document":
 		return 10
 	case "ai":
 		return 3
