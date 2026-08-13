@@ -1,6 +1,8 @@
 package indexing
 
 import (
+	"log/slog"
+
 	"github.com/hibiken/asynq"
 
 	"github.com/jusassessoria/platform/lib/database"
@@ -28,6 +30,10 @@ type Deps struct {
 	Embedder Embedder
 	// EmbedDim is cfg.VoyageEmbedDim — the dimensionality stamped on each chunk row (provenance).
 	EmbedDim int
+	// Logger is the worker's structured logger, threaded into the use case for the
+	// successful-indexing telemetry line ("document indexed"). Required (the worker always holds
+	// one); nil would panic on the first log.
+	Logger *slog.Logger
 }
 
 // RegisterIndexingListeners builds the indexing use case from deps and mounts its consumer on the
@@ -39,8 +45,8 @@ type Deps struct {
 // event, worker-documents' asynq server must serve whatever queue the relay routes document.* to.
 // That routing is the composer's concern (it lives in lib/events, outside this fatia's ownership);
 // this slice only registers the task-type handler on the mux it is given.
-func RegisterIndexingListeners(mux *asynq.ServeMux, deps Deps) {
-	uc := NewUseCase(
+func RegisterIndexingListeners(mux *asynq.ServeMux, deps Deps) error {
+	uc, err := NewUseCase(
 		NewStorageReader(deps.Storage, nil),
 		deps.Embedder,
 		deps.UOW,
@@ -48,6 +54,11 @@ func RegisterIndexingListeners(mux *asynq.ServeMux, deps Deps) {
 		NewRepository(),
 		deps.Outbox,
 		deps.EmbedDim,
+		deps.Logger,
 	)
+	if err != nil {
+		return err
+	}
 	NewListener(uc).Register(mux)
+	return nil
 }

@@ -1,6 +1,7 @@
 package extraction
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/hibiken/asynq"
@@ -34,6 +35,10 @@ type Deps struct {
 	OCREngine       string       // "tesseract" (default, free) | "claude"; unset → tesseract
 	AnthropicAPIKey string       // used to build the real vision client only when OCREngine=="claude"
 	HTTPClient      *http.Client // optional: nil → defaulted
+	// Logger is the worker's structured logger, threaded into the use case for the
+	// successful-extraction telemetry line ("document extracted"). Required (the worker
+	// always holds one); nil would panic on the first log.
+	Logger *slog.Logger
 }
 
 // RegisterExtractionListeners composes the extraction slice and mounts its handler on mux.
@@ -41,7 +46,7 @@ type Deps struct {
 // is one line in the worker's composition. It selects the OCR adapter (deterministic Tesseract
 // by default, Claude vision opt-in, or an injected fake), wires the text-layer+OCR dispatcher,
 // and hands the use case to the listener.
-func RegisterExtractionListeners(mux *asynq.ServeMux, deps Deps) {
+func RegisterExtractionListeners(mux *asynq.ServeMux, deps Deps) error {
 	var ocr TextExtractor
 	switch {
 	case deps.Vision != nil: // test/override: use the injected vision client
@@ -55,6 +60,10 @@ func RegisterExtractionListeners(mux *asynq.ServeMux, deps Deps) {
 	extractor := NewDispatchExtractor(NewTextLayerExtractor(), ocr)
 	store := NewStorage(deps.Storage, deps.HTTPClient)
 
-	uc := NewUseCase(deps.UoW, store, NewRepository(), extractor, NewDedup(), deps.Outbox)
+	uc, err := NewUseCase(deps.UoW, store, NewRepository(), extractor, NewDedup(), deps.Outbox, deps.Logger)
+	if err != nil {
+		return err
+	}
 	NewListener(uc).Register(mux)
+	return nil
 }

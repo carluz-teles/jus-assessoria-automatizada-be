@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/jusassessoria/platform/lib/apperr"
@@ -171,7 +173,11 @@ func longText(n int) string {
 
 // newUC assembles a UseCase over the given fakes with dim=4.
 func newUC(reader objectReader, embed Embedder, uow unitOfWork, dedup deduper, repo repository, ob outbox) *UseCase {
-	return NewUseCase(reader, embed, uow, dedup, repo, ob, 4)
+	uc, err := NewUseCase(reader, embed, uow, dedup, repo, ob, 4, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		panic("indexing test: NewUseCase: " + err.Error())
+	}
+	return uc
 }
 
 // --- tests ------------------------------------------------------------------

@@ -14,6 +14,7 @@ import (
 
 	"github.com/hibiken/asynq"
 
+	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/extraction"
 	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/lib/config"
@@ -107,14 +108,17 @@ func run(logger *slog.Logger) error {
 		// adapter: "tesseract" (default) is deterministic and free (the runtime-ocr image
 		// ships pdftoppm + tesseract); "claude" is opt-in Claude vision, which uses the
 		// Anthropic key (passed through, consumed only when the engine is "claude").
-		extraction.RegisterExtractionListeners(mux, extraction.Deps{
+		if err := extraction.RegisterExtractionListeners(mux, extraction.Deps{
 			UoW:             uow,
 			Storage:         storageClient,
 			Outbox:          outbox,
 			OCREngine:       cfg.OCREngine,
 			AnthropicAPIKey: cfg.AnthropicKey,
 			HTTPClient:      httpClient,
-		})
+			Logger:          logger,
+		}); err != nil {
+			return fmt.Errorf("register extraction listeners: %w", err)
+		}
 
 		// Fatia 7 — chunking + Voyage embeddings + pgvector. The Voyage key is optional
 		// config: when unset, skip the indexing listener (extraction still works
@@ -127,15 +131,28 @@ func run(logger *slog.Logger) error {
 			if err != nil {
 				return fmt.Errorf("init voyage embedder: %w", err)
 			}
-			indexing.RegisterIndexingListeners(mux, indexing.Deps{
+			if err := indexing.RegisterIndexingListeners(mux, indexing.Deps{
 				UOW:      uow,
 				Storage:  storageClient,
 				Outbox:   outbox,
 				Embedder: embedder,
 				EmbedDim: cfg.VoyageEmbedDim,
-			})
+				Logger:   logger,
+			}); err != nil {
+				return fmt.Errorf("register indexing listeners: %w", err)
+			}
 			logger.Info("document indexing listener registered")
 		}
+
+		// Terminal lifecycle observer: consumes document.ready / document.failed (which had NO
+		// consumer → asynq logged "handler not found" and retried them 10×). It acks them and is
+		// the pipeline's success/failure telemetry sink (logs + metrics per outcome/stage).
+		observer, err := document.NewLifecycleObserver(logger)
+		if err != nil {
+			return fmt.Errorf("build document lifecycle observer: %w", err)
+		}
+		observer.Register(mux)
+
 		logger.Info("documents extraction listener registered", "bucket", cfg.S3Bucket)
 	} else {
 		logger.Warn("S3 not configured — documents pipeline listeners not registered")

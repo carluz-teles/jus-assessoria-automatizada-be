@@ -4,11 +4,68 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/obs"
 )
+
+// Metric names for the extraction stage — the "Tesseract worked" signal. Dotted + prefixed like
+// asynq.queue.depth so the backend groups the document.* family together. duration_ms + pages
+// are distributions faceted by the extractor that produced them; total counts outcomes.
+const (
+	metricExtractionDuration = "document.extraction.duration_ms"
+	metricExtractionPages    = "document.extraction.pages"
+	metricExtractionTotal    = "document.extraction.total"
+)
+
+// extractionMetrics holds the instruments built once at construction (via obs.Meter(), mirroring
+// lib/events/queue_metrics.go). Kept in a struct so the use case records against the same
+// instrument across events.
+type extractionMetrics struct {
+	duration metric.Int64Histogram
+	pages    metric.Int64Histogram
+	total    metric.Int64Counter
+}
+
+// newExtractionMetrics builds the extraction instruments once. Instrument creation can fail; the
+// error is surfaced so the worker fails boot loudly (fail-fast) instead of dropping telemetry.
+func newExtractionMetrics() (*extractionMetrics, error) {
+	meter := obs.Meter()
+
+	duration, err := meter.Int64Histogram(
+		metricExtractionDuration,
+		metric.WithDescription("Wall-clock duration of the extractor call, in milliseconds, by extractor."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("extraction: create %s histogram: %w", metricExtractionDuration, err)
+	}
+
+	pages, err := meter.Int64Histogram(
+		metricExtractionPages,
+		metric.WithDescription("Pages extracted per document, by extractor."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("extraction: create %s histogram: %w", metricExtractionPages, err)
+	}
+
+	total, err := meter.Int64Counter(
+		metricExtractionTotal,
+		metric.WithDescription("Extraction attempts, by extractor and outcome (ok|failed)."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("extraction: create %s counter: %w", metricExtractionTotal, err)
+	}
+
+	return &extractionMetrics{duration: duration, pages: pages, total: total}, nil
+}
 
 // textKeySuffix is appended to the document's storage_key to derive the object key the
 // per-page text JSON is written to (the pinned intermediate-text location). Kept as a
@@ -71,11 +128,29 @@ type UseCase struct {
 	extractor TextExtractor
 	dedup     deduper
 	outbox    publisher
+	logger    *slog.Logger
+	metrics   *extractionMetrics
 }
 
-// NewUseCase wires the use case to its ports. The worker composes it; tests inject fakes.
-func NewUseCase(uow database.UnitOfWork, store objectStore, repo docRepo, extractor TextExtractor, dedup deduper, outbox publisher) *UseCase {
-	return &UseCase{uow: uow, store: store, repo: repo, extractor: extractor, dedup: dedup, outbox: outbox}
+// NewUseCase wires the use case to its ports and builds its metric instruments once. The worker
+// composes it (passing its logger); tests inject fakes with a discard logger. It returns an error
+// only if instrument creation fails, so the worker fails boot loudly rather than dropping
+// telemetry.
+func NewUseCase(uow database.UnitOfWork, store objectStore, repo docRepo, extractor TextExtractor, dedup deduper, outbox publisher, logger *slog.Logger) (*UseCase, error) {
+	metrics, err := newExtractionMetrics()
+	if err != nil {
+		return nil, err
+	}
+	return &UseCase{
+		uow:       uow,
+		store:     store,
+		repo:      repo,
+		extractor: extractor,
+		dedup:     dedup,
+		outbox:    outbox,
+		logger:    logger,
+		metrics:   metrics,
+	}, nil
 }
 
 // OnDocumentUploaded is the pipeline entry point: from one document.uploaded it extracts
@@ -126,10 +201,35 @@ func (uc *UseCase) OnDocumentUploaded(ctx context.Context, ev DocumentUploaded) 
 
 	// The extraction itself runs OUTSIDE a tx (no DB held while the OCR round-trips). Any
 	// fault here routes to the FAILED path, which opens its own tx.
-	textKey, pages, hasTextLayer, version, err := uc.extract(ctx, ev)
+	textKey, pages, hasTextLayer, version, durationMS, err := uc.extract(ctx, ev)
 	if err != nil {
 		return uc.fail(ctx, ev, err)
 	}
+
+	// Success telemetry — the "Tesseract worked" signal. The consumer span already exists
+	// (events.Observe); enrich it with the extraction dimensions, record the distributions +
+	// the ok outcome, and log the one happy-path line (the pipeline's per-document proof).
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(
+		attribute.String("extractor.version", version),
+		attribute.Int("document.pages", pages),
+		attribute.Bool("document.has_text_layer", hasTextLayer),
+	)
+	extractorAttr := metric.WithAttributes(attribute.String("extractor", version))
+	uc.metrics.duration.Record(ctx, durationMS, extractorAttr)
+	uc.metrics.pages.Record(ctx, int64(pages), extractorAttr)
+	uc.metrics.total.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("extractor", version),
+		attribute.String("outcome", "ok"),
+	))
+	uc.logger.LogAttrs(ctx, slog.LevelInfo, "document extracted",
+		slog.String("document_id", ev.DocumentID),
+		slog.String("tenant_id", ev.TenantID),
+		slog.String("extractor_version", version),
+		slog.Int("pages", pages),
+		slog.Bool("has_text_layer", hasTextLayer),
+		slog.Int64("duration_ms", durationMS),
+	)
 
 	// Finalize + publish in one tx: the EXTRACTED transition and the document.extracted row
 	// commit together (transactional outbox).
@@ -154,26 +254,30 @@ func (uc *UseCase) OnDocumentUploaded(ctx context.Context, ev DocumentUploaded) 
 // <storage_key>.text.json and returns the text key + the extraction metadata. It is the
 // tx-free heart of the pipeline (the network + CPU work); its errors are typed so the
 // caller can build the FAILED message.
-func (uc *UseCase) extract(ctx context.Context, ev DocumentUploaded) (textKey string, pages int, hasTextLayer bool, version string, err error) {
+func (uc *UseCase) extract(ctx context.Context, ev DocumentUploaded) (textKey string, pages int, hasTextLayer bool, version string, durationMS int64, err error) {
 	pdf, err := uc.store.Get(ctx, ev.StorageKey)
 	if err != nil {
-		return "", 0, false, "", err
+		return "", 0, false, "", 0, err
 	}
 
+	// Measure duration_ms strictly around the extractor call (the CPU/OCR work the metric
+	// tracks) — storage fetch/put are separate concerns not attributed to the extractor.
+	start := time.Now()
 	pageTexts, hasTextLayer, version, err := uc.extractor.Extract(ctx, pdf)
+	durationMS = time.Since(start).Milliseconds()
 	if err != nil {
-		return "", 0, false, "", err
+		return "", 0, false, "", durationMS, err
 	}
 
 	textKey = ev.StorageKey + textKeySuffix
 	body, err := json.Marshal(textDocument{ExtractorVersion: version, Pages: pageTexts})
 	if err != nil {
-		return "", 0, false, "", apperr.NewInfra("extraction: marshal text json", err)
+		return "", 0, false, "", durationMS, apperr.NewInfra("extraction: marshal text json", err)
 	}
 	if err := uc.store.Put(ctx, textKey, body, "application/json"); err != nil {
-		return "", 0, false, "", err
+		return "", 0, false, "", durationMS, err
 	}
-	return textKey, len(pageTexts), hasTextLayer, version, nil
+	return textKey, len(pageTexts), hasTextLayer, version, durationMS, nil
 }
 
 // fail records the terminal FAILED state for the document and emits document.failed, then
@@ -182,6 +286,16 @@ func (uc *UseCase) extract(ctx context.Context, ev DocumentUploaded) (textKey st
 // joined so the log shows both — but the returned error still wraps the original cause, so
 // the retry/archive decision keys off the real fault, not the audit write.
 func (uc *UseCase) fail(ctx context.Context, ev DocumentUploaded, cause error) error {
+	// Failure telemetry: the metric only (Observe already logs the error — don't double-log).
+	// The extractor is unknown on failure (the extractor call may not have returned a version),
+	// so the counter carries an empty extractor facet + the failed outcome; the span records
+	// the faulted stage.
+	uc.metrics.total.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("extractor", ""),
+		attribute.String("outcome", "failed"),
+	))
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("document.stage", stageExtraction))
+
 	errorJSON, _ := json.Marshal(struct {
 		Stage   string `json:"stage"`
 		Message string `json:"message"`

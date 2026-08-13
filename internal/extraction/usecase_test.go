@@ -4,12 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
+
+// newTestUseCase builds the extraction use case with a discard logger. NewUseCase now returns an
+// error only if metric-instrument creation fails; on the test no-op meter it never does, but we
+// fatal on it rather than ignore so a real regression surfaces.
+func newTestUseCase(t *testing.T, uow database.UnitOfWork, store objectStore, repo docRepo, ex TextExtractor, dedup deduper, outbox publisher) *UseCase {
+	t.Helper()
+	uc, err := NewUseCase(uow, store, repo, ex, dedup, outbox, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewUseCase: %v", err)
+	}
+	return uc
+}
 
 // --- fakes ------------------------------------------------------------------
 
@@ -153,7 +167,7 @@ func TestOnDocumentUploaded_TextLayerHappyPath(t *testing.T) {
 		hasTextLayer: true,
 		version:      "pdftext-v1",
 	}
-	uc := NewUseCase(uow, store, repo, extractor, &fakeDedup{}, outbox)
+	uc := newTestUseCase(t, uow, store, repo, extractor, &fakeDedup{}, outbox)
 
 	ev := uploadedFixture()
 	if err := uc.OnDocumentUploaded(context.Background(), ev); err != nil {
@@ -216,7 +230,7 @@ func TestOnDocumentUploaded_OCRFallback(t *testing.T) {
 		hasTextLayer: false,
 		version:      "claude-ocr-opus-4-8",
 	}
-	uc := NewUseCase(uow, store, repo, extractor, &fakeDedup{}, outbox)
+	uc := newTestUseCase(t, uow, store, repo, extractor, &fakeDedup{}, outbox)
 
 	if err := uc.OnDocumentUploaded(context.Background(), uploadedFixture()); err != nil {
 		t.Fatalf("err = %v, want nil", err)
@@ -267,7 +281,7 @@ func TestOnDocumentUploaded_Failure(t *testing.T) {
 			uow := &fakeUOW{}
 			repo := &fakeRepo{}
 			outbox := &fakeOutbox{}
-			uc := NewUseCase(uow, tt.store, repo, tt.extr, &fakeDedup{}, outbox)
+			uc := newTestUseCase(t, uow, tt.store, repo, tt.extr, &fakeDedup{}, outbox)
 
 			err := uc.OnDocumentUploaded(context.Background(), uploadedFixture())
 
@@ -307,7 +321,7 @@ func TestOnDocumentUploaded_Idempotency(t *testing.T) {
 	repo := &fakeRepo{}
 	outbox := &fakeOutbox{}
 	extractor := &fakeExtractor{pages: []PageText{{Page: 1}}, hasTextLayer: true, version: "pdftext-v1"}
-	uc := NewUseCase(uow, store, repo, extractor, &fakeDedup{seen: true}, outbox)
+	uc := newTestUseCase(t, uow, store, repo, extractor, &fakeDedup{seen: true}, outbox)
 
 	if err := uc.OnDocumentUploaded(context.Background(), uploadedFixture()); err != nil {
 		t.Fatalf("err = %v, want nil (replay acks)", err)
@@ -337,7 +351,7 @@ func TestOnDocumentUploaded_Idempotency(t *testing.T) {
 // event's tenant (RLS barrier) — never an empty or foreign scope.
 func TestOnDocumentUploaded_TenantScopedTx(t *testing.T) {
 	uow := &fakeUOW{}
-	uc := NewUseCase(uow, &fakeStore{getBytes: []byte("pdf")}, &fakeRepo{},
+	uc := newTestUseCase(t, uow, &fakeStore{getBytes: []byte("pdf")}, &fakeRepo{},
 		&fakeExtractor{pages: []PageText{{Page: 1}}, hasTextLayer: true, version: "pdftext-v1"},
 		&fakeDedup{}, &fakeOutbox{})
 

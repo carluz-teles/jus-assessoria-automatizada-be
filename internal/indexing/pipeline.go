@@ -4,10 +4,55 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/obs"
 )
+
+// Metric names for the indexing stage — the mirror of the extraction signal, lighter. Dotted +
+// prefixed like asynq.queue.depth so the backend groups the document.* family together.
+const (
+	metricIndexingDuration = "document.indexing.duration_ms"
+	metricIndexingTotal    = "document.indexing.total"
+)
+
+// indexingMetrics holds the instruments built once at construction (via obs.Meter(), mirroring
+// lib/events/queue_metrics.go).
+type indexingMetrics struct {
+	duration metric.Int64Histogram
+	total    metric.Int64Counter
+}
+
+// newIndexingMetrics builds the indexing instruments once. Instrument creation can fail; the
+// error is surfaced so the worker fails boot loudly (fail-fast) instead of dropping telemetry.
+func newIndexingMetrics() (*indexingMetrics, error) {
+	meter := obs.Meter()
+
+	duration, err := meter.Int64Histogram(
+		metricIndexingDuration,
+		metric.WithDescription("Wall-clock duration of the indexing pipeline (read+chunk+embed), in milliseconds."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("indexing: create %s histogram: %w", metricIndexingDuration, err)
+	}
+
+	total, err := meter.Int64Counter(
+		metricIndexingTotal,
+		metric.WithDescription("Indexing attempts, by outcome (ok|failed)."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("indexing: create %s counter: %w", metricIndexingTotal, err)
+	}
+
+	return &indexingMetrics{duration: duration, total: total}, nil
+}
 
 // pipeline.go is the indexing fatia's use case — the async entry point behind the listener. On
 // one document.extracted it: reads the extracted-text JSON from storage, chunks each page,
@@ -21,20 +66,38 @@ import (
 // boundary, the dedup guard, the chunk/status repository and the outbox producer. The listener
 // delegates to it; the binary composes the concrete adapters.
 type UseCase struct {
-	reader objectReader
-	embed  Embedder
-	uow    unitOfWork
-	dedup  deduper
-	repo   repository
-	outbox outbox
-	dim    int
+	reader  objectReader
+	embed   Embedder
+	uow     unitOfWork
+	dedup   deduper
+	repo    repository
+	outbox  outbox
+	dim     int
+	logger  *slog.Logger
+	metrics *indexingMetrics
 }
 
-// NewUseCase wires the pipeline to its ports. dim is the expected embedding dimensionality
-// (config VOYAGE_EMBED_DIM) stamped on each chunk row; it is provenance/stat only — the repo
-// writes whatever the embedder returns.
-func NewUseCase(reader objectReader, embed Embedder, uow unitOfWork, dedup deduper, repo repository, ob outbox, dim int) *UseCase {
-	return &UseCase{reader: reader, embed: embed, uow: uow, dedup: dedup, repo: repo, outbox: ob, dim: dim}
+// NewUseCase wires the pipeline to its ports and builds its metric instruments once. dim is the
+// expected embedding dimensionality (config VOYAGE_EMBED_DIM) stamped on each chunk row; it is
+// provenance/stat only — the repo writes whatever the embedder returns. logger is the worker's
+// structured logger; it returns an error only if instrument creation fails, so the worker fails
+// boot loudly rather than dropping telemetry.
+func NewUseCase(reader objectReader, embed Embedder, uow unitOfWork, dedup deduper, repo repository, ob outbox, dim int, logger *slog.Logger) (*UseCase, error) {
+	metrics, err := newIndexingMetrics()
+	if err != nil {
+		return nil, err
+	}
+	return &UseCase{
+		reader:  reader,
+		embed:   embed,
+		uow:     uow,
+		dedup:   dedup,
+		repo:    repo,
+		outbox:  ob,
+		dim:     dim,
+		logger:  logger,
+		metrics: metrics,
+	}, nil
 }
 
 // OnDocumentExtracted is the whole pipeline for one document.extracted. It splits into two
@@ -44,14 +107,30 @@ func NewUseCase(reader objectReader, embed Embedder, uow unitOfWork, dedup dedup
 // published, and the original error is returned so the listener maps it to asynq's retry (a
 // transient embed/storage fault retries; a terminal one is archived).
 func (uc *UseCase) OnDocumentExtracted(ctx context.Context, ev DocumentExtracted) error {
-	if err := uc.index(ctx, ev); err != nil {
+	start := time.Now()
+	err := uc.index(ctx, ev)
+	durationMS := time.Since(start).Milliseconds()
+	if err != nil {
 		// Best-effort failure recording: flip the document to FAILED + publish document.failed in
 		// a separate tx. If THAT fails too, prefer surfacing the original cause (the failure the
 		// operator needs) — the fail write is retryable on the next delivery. The original error
 		// is always returned so the listener drives asynq's retry/archive decision.
 		uc.recordFailure(ctx, ev, err)
+		uc.metrics.total.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", "failed")))
+		trace.SpanFromContext(ctx).SetAttributes(attribute.String("document.stage", "indexing"))
 		return err
 	}
+	// Telemetry: the indexing-specific signal is wall-clock duration (read+chunk+embed+persist);
+	// chunk_count/embedding_model come with document.ready (the lifecycle observer). The span
+	// attr + "document indexed" log let an operator SEE the stage completing per document.
+	uc.metrics.duration.Record(ctx, durationMS)
+	uc.metrics.total.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", "ok")))
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("document.id", ev.DocumentID))
+	uc.logger.LogAttrs(ctx, slog.LevelInfo, "document indexed",
+		slog.String("document_id", ev.DocumentID),
+		slog.String("tenant_id", ev.TenantID),
+		slog.Int64("duration_ms", durationMS),
+	)
 	return nil
 }
 
