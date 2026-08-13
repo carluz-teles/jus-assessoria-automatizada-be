@@ -9,27 +9,43 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 )
 
-// fakeEnrichRepo records the enrichment persistence calls and returns a graded
-// record with a fixed id distinct from the placeholder, so the merge path runs.
+// fakeEnrichRepo records the enrichment persistence calls. GetCourtRecordByKey
+// answers the grade-conflict lookup: by default a miss (found=false → grade in
+// place); set existing/existingFound to simulate a pre-existing graded record (→ the
+// merge path). UpdateCourtRecordGrade echoes back a record keyed on the SAME id it was
+// asked to mutate, so a test can assert the id never changed.
 type fakeEnrichRepo struct {
-	gradedParams  GradedRecordParams
-	gradedCalls   int
-	repointFrom   string
-	repointTo     string
-	repointCalls  int
+	existing      *CourtRecord // GetCourtRecordByKey result
+	existingFound bool
+	getByKeyCalls int
+
+	updateParams GradeParams
+	updateCalls  int
+
+	repointFrom  string
+	repointTo    string
+	repointCalls int
+
 	supersedeID   string
 	supersedeCall int
-	docketParams  []DocketEntryParams
+
+	docketParams []DocketEntryParams
 }
 
 func (r *fakeEnrichRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, _ string) error {
 	return nil
 }
 
-func (r *fakeEnrichRepo) UpsertGradedCourtRecord(_ context.Context, _ database.Tx, p GradedRecordParams) (*CourtRecord, error) {
-	r.gradedCalls++
-	r.gradedParams = p
-	return &CourtRecord{ID: "graded-1", TenantID: p.TenantID, CaseID: p.CaseID, CNJNumber: p.CNJNumber, Degree: p.Degree, Court: p.Court}, nil
+func (r *fakeEnrichRepo) GetCourtRecordByKey(_ context.Context, _ database.Tx, _, _, _ string) (*CourtRecord, bool, error) {
+	r.getByKeyCalls++
+	return r.existing, r.existingFound, nil
+}
+
+func (r *fakeEnrichRepo) UpdateCourtRecordGrade(_ context.Context, _ database.Tx, p GradeParams) (*CourtRecord, error) {
+	r.updateCalls++
+	r.updateParams = p
+	// Grade in place: the returned record keeps the id it was asked to mutate.
+	return &CourtRecord{ID: p.CourtRecordID, TenantID: p.TenantID, Degree: p.Degree, Court: p.Court}, nil
 }
 
 func (r *fakeEnrichRepo) RepointIntimations(_ context.Context, _ database.Tx, _, from, to string) (int, error) {
@@ -80,13 +96,15 @@ func enrichmentUnderTest(repo enrichRepo, outbox publisher, uow database.UnitOfW
 	return NewEnrichmentUseCase(repo, outbox, uow, orch, NewDATAJUDParser())
 }
 
-// TestEnrichment_PlaceholderMerge is the happy path: a DJEN placeholder is graded,
-// its intimations re-pointed, the placeholder superseded, and the movimentos land
-// as docket entries with an observed event each.
-func TestEnrichment_PlaceholderMerge(t *testing.T) {
+// TestEnrichment_GraduatesInPlace is the FIX B happy path: a DJEN placeholder is
+// graded IN PLACE — UpdateCourtRecordGrade is called on the SAME id (ev.CourtRecordID),
+// the degree becomes the real grade, and NO record is created, re-pointed or
+// superseded. The movimentos land as docket entries on that same id with an observed
+// event each.
+func TestEnrichment_GraduatesInPlace(t *testing.T) {
 	t.Parallel()
 
-	repo := &fakeEnrichRepo{}
+	repo := &fakeEnrichRepo{} // no existing graded record → grade in place
 	outbox := &fakeOutbox{}
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}} // first sighting
 	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
@@ -96,25 +114,59 @@ func TestEnrichment_PlaceholderMerge(t *testing.T) {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
 
-	if repo.gradedCalls != 1 || repo.gradedParams.Degree != "G1" {
-		t.Errorf("graded upsert = %d calls, degree %q; want 1 call, G1", repo.gradedCalls, repo.gradedParams.Degree)
+	if repo.updateCalls != 1 || repo.updateParams.CourtRecordID != "unknown-1" || repo.updateParams.Degree != "G1" {
+		t.Errorf("grade update = %d calls, id %q degree %q; want 1 call on unknown-1 → G1",
+			repo.updateCalls, repo.updateParams.CourtRecordID, repo.updateParams.Degree)
 	}
-	if repo.repointCalls != 1 || repo.repointFrom != "unknown-1" || repo.repointTo != "graded-1" {
-		t.Errorf("repoint = %d calls, %s→%s; want 1, unknown-1→graded-1", repo.repointCalls, repo.repointFrom, repo.repointTo)
-	}
-	if repo.supersedeCall != 1 || repo.supersedeID != "unknown-1" {
-		t.Errorf("supersede = %d calls, id %q; want 1, unknown-1", repo.supersedeCall, repo.supersedeID)
+	if repo.repointCalls != 0 || repo.supersedeCall != 0 {
+		t.Errorf("common grade must not re-point/supersede: repoint=%d supersede=%d", repo.repointCalls, repo.supersedeCall)
 	}
 	if len(repo.docketParams) == 0 {
 		t.Fatal("no movimentos upserted as docket entries")
 	}
 	for _, p := range repo.docketParams {
-		if p.CourtRecordID != "graded-1" {
-			t.Errorf("docket attached to %q, want the graded record", p.CourtRecordID)
+		if p.CourtRecordID != "unknown-1" {
+			t.Errorf("docket attached to %q, want the graded-in-place record unknown-1", p.CourtRecordID)
 		}
 	}
 	if got := countByType(outbox.published)[TypeDocketEntryObserved]; got != len(repo.docketParams) {
 		t.Errorf("docket_entry_observed events = %d, want %d", got, len(repo.docketParams))
+	}
+}
+
+// TestEnrichment_ConflictMerges proves the rare fallback: when a graded record already
+// holds this (tenant, cnj, degree) — grading the placeholder in place would violate the
+// UNIQUE — the placeholder's intimations are re-pointed onto the existing graded record,
+// the placeholder is superseded, and the grade/movimentos land on the existing record.
+func TestEnrichment_ConflictMerges(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{
+		existing:      &CourtRecord{ID: "graded-existing", Degree: "G1"},
+		existingFound: true,
+	}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
+
+	err := enrichmentUnderTest(repo, outbox, uow, payload).OnCourtRecordObserved(context.Background(), placeholderObserved())
+	if err != nil {
+		t.Fatalf("OnCourtRecordObserved: %v", err)
+	}
+
+	if repo.repointCalls != 1 || repo.repointFrom != "unknown-1" || repo.repointTo != "graded-existing" {
+		t.Errorf("repoint = %d calls, %s→%s; want 1, unknown-1→graded-existing", repo.repointCalls, repo.repointFrom, repo.repointTo)
+	}
+	if repo.supersedeCall != 1 || repo.supersedeID != "unknown-1" {
+		t.Errorf("supersede = %d calls, id %q; want 1, unknown-1", repo.supersedeCall, repo.supersedeID)
+	}
+	if repo.updateCalls != 1 || repo.updateParams.CourtRecordID != "graded-existing" {
+		t.Errorf("grade update = %d calls on id %q; want 1 on graded-existing", repo.updateCalls, repo.updateParams.CourtRecordID)
+	}
+	for _, p := range repo.docketParams {
+		if p.CourtRecordID != "graded-existing" {
+			t.Errorf("docket attached to %q, want the existing graded record", p.CourtRecordID)
+		}
 	}
 }
 
@@ -135,8 +187,8 @@ func TestEnrichment_SkipsMissingKeys(t *testing.T) {
 	if err := uc.OnCourtRecordObserved(context.Background(), ev); err != nil {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
-	if conn.fetchCalls != 0 || repo.gradedCalls != 0 {
-		t.Errorf("guard failed: fetches=%d gradedCalls=%d, want 0/0", conn.fetchCalls, repo.gradedCalls)
+	if conn.fetchCalls != 0 || repo.updateCalls != 0 {
+		t.Errorf("guard failed: fetches=%d updateCalls=%d, want 0/0", conn.fetchCalls, repo.updateCalls)
 	}
 }
 
@@ -161,31 +213,36 @@ func TestEnrichment_SkipsGradeMismatch(t *testing.T) {
 	if conn.fetchCalls != 1 {
 		t.Errorf("expected a fetch before the mismatch check, got %d", conn.fetchCalls)
 	}
-	if repo.gradedCalls != 0 {
-		t.Errorf("grade mismatch still merged (gradedCalls=%d), want 0", repo.gradedCalls)
+	if repo.updateCalls != 0 {
+		t.Errorf("grade mismatch still graded (updateCalls=%d), want 0", repo.updateCalls)
 	}
 }
 
 // TestEnrichment_ResyncRefresh proves the re-poll path: a graded record observed
-// again (same grade) refreshes its movimentos WITHOUT re-pointing or superseding
-// (the graded record is itself the target).
+// again (same grade) refreshes its fields/movimentos WITHOUT changing the degree,
+// re-pointing or superseding — GetCourtRecordByKey resolves the record to ITSELF, so
+// the in-place update targets the same id.
 func TestEnrichment_ResyncRefresh(t *testing.T) {
 	t.Parallel()
 
-	repo := &fakeEnrichRepo{}
+	repo := &fakeEnrichRepo{
+		existing:      &CourtRecord{ID: "graded-1", Degree: "G1"}, // the key resolves to the record itself
+		existingFound: true,
+	}
 	outbox := &fakeOutbox{}
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
 
 	ev := placeholderObserved()
 	ev.Degree = "G1"              // already graded
-	ev.CourtRecordID = "graded-1" // and IS the record the fake upsert returns
+	ev.CourtRecordID = "graded-1" // and IS the record the key lookup returns
 
 	if err := enrichmentUnderTest(repo, outbox, uow, payload).OnCourtRecordObserved(context.Background(), ev); err != nil {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
-	if repo.gradedCalls != 1 {
-		t.Errorf("graded refresh = %d, want 1", repo.gradedCalls)
+	if repo.updateCalls != 1 || repo.updateParams.CourtRecordID != "graded-1" || repo.updateParams.Degree != "G1" {
+		t.Errorf("graded refresh = %d calls on id %q degree %q; want 1 on graded-1 → G1",
+			repo.updateCalls, repo.updateParams.CourtRecordID, repo.updateParams.Degree)
 	}
 	if repo.repointCalls != 0 || repo.supersedeCall != 0 {
 		t.Errorf("resync must not re-point/supersede: repoint=%d supersede=%d", repo.repointCalls, repo.supersedeCall)
@@ -207,8 +264,8 @@ func TestEnrichment_DuplicateIsNoOp(t *testing.T) {
 	if err := enrichmentUnderTest(repo, &fakeOutbox{}, uow, payload).OnCourtRecordObserved(context.Background(), placeholderObserved()); err != nil {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
-	if repo.gradedCalls != 0 {
-		t.Errorf("duplicate delivery still merged (gradedCalls=%d), want 0", repo.gradedCalls)
+	if repo.updateCalls != 0 {
+		t.Errorf("duplicate delivery still graded (updateCalls=%d), want 0", repo.updateCalls)
 	}
 }
 
@@ -222,7 +279,7 @@ func TestEnrichment_NoHitsIsAck(t *testing.T) {
 	if err := enrichmentUnderTest(repo, &fakeOutbox{}, &stubBackfillUoW{tx: stubTx{rows: 1}}, payload).OnCourtRecordObserved(context.Background(), placeholderObserved()); err != nil {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
-	if repo.gradedCalls != 0 {
-		t.Errorf("empty DATAJUD result still graded (gradedCalls=%d), want 0", repo.gradedCalls)
+	if repo.updateCalls != 0 {
+		t.Errorf("empty DATAJUD result still graded (updateCalls=%d), want 0", repo.updateCalls)
 	}
 }

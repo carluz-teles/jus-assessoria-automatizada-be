@@ -99,6 +99,47 @@ func TestDATAJUDParserHashStable(t *testing.T) {
 	}
 }
 
+// TestDATAJUDMovimentoHashGradeIndependent proves #4: the movimento hash no longer
+// depends on the grau, so the SAME movimento seen at different grades (G1 vs G2)
+// derives the SAME hash — with FIX B's single record per CNJ, a grade reveal/change
+// must not re-duplicate an andamento. It still distinguishes a different movimento.
+func TestDATAJUDMovimentoHashGradeIndependent(t *testing.T) {
+	t.Parallel()
+
+	body := func(grau string) []byte {
+		return []byte(`{"hits":{"hits":[{"_source":{` +
+			`"numeroProcesso":"50007978720168210156","tribunal":"TJRS","grau":"` + grau + `",` +
+			`"movimentos":[{"codigo":123,"nome":"Juntada de Petição","dataHora":"2026-01-02T10:00:00Z"}]}}]}}`)
+	}
+	p := newTestDATAJUDParser(time.Unix(0, 0))
+
+	g1, err := p.Parse(context.Background(), RawPayload{Source: SourceDATAJUD, Body: body("G1")})
+	if err != nil {
+		t.Fatalf("Parse G1: %v", err)
+	}
+	g2, err := p.Parse(context.Background(), RawPayload{Source: SourceDATAJUD, Body: body("G2")})
+	if err != nil {
+		t.Fatalf("Parse G2: %v", err)
+	}
+	if len(g1.DocketEntries) != 1 || len(g2.DocketEntries) != 1 {
+		t.Fatalf("want one movimento each, got G1=%d G2=%d", len(g1.DocketEntries), len(g2.DocketEntries))
+	}
+	// The records grade differently, but the movimento hash is identical.
+	if g1.CourtRecords[0].Degree != "G1" || g2.CourtRecords[0].Degree != "G2" {
+		t.Fatalf("record grades not distinct: G1=%q G2=%q", g1.CourtRecords[0].Degree, g2.CourtRecords[0].Degree)
+	}
+	if g1.DocketEntries[0].Hash != g2.DocketEntries[0].Hash {
+		t.Errorf("grade changed the movimento hash: %q (G1) vs %q (G2)", g1.DocketEntries[0].Hash, g2.DocketEntries[0].Hash)
+	}
+
+	// A genuinely different movimento (different codigo) must still hash differently.
+	mov := datajudMovimento{Codigo: 123, Nome: "Juntada de Petição", DataHora: "2026-01-02T10:00:00Z"}
+	other := datajudMovimento{Codigo: 456, Nome: "Conclusão", DataHora: "2026-01-02T10:00:00Z"}
+	if datajudMovimentoHash("TJRS", "50007978720168210156", mov) == datajudMovimentoHash("TJRS", "50007978720168210156", other) {
+		t.Error("distinct movimentos collided to the same hash")
+	}
+}
+
 func TestSecrecyFromNivel(t *testing.T) {
 	t.Parallel()
 

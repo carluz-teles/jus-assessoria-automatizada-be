@@ -35,6 +35,13 @@ var (
 	// closed/absent run: a no-op ack, never a reopen.
 	ErrSyncRunNotFound = apperr.NewNotFound("sync run not found")
 
+	// ErrCourtRecordNotFound — the court_record an in-place grade targets vanished
+	// between the fetch and the UPDATE (deleted, or invisible under this tenant's
+	// RLS). UpdateCourtRecordGrade returns it instead of (nil, nil) so the enrichment
+	// never silently drops a grade; in practice the per-tenant write lock makes it
+	// unreachable (the row was just observed/looked up in the same tx).
+	ErrCourtRecordNotFound = apperr.NewNotFound("court record not found")
+
 	// ErrProcessLimitReached — the tenant is already at its plan's
 	// active_process_limit (the v0 billing entitlement), so the sync cycle must not
 	// create a NEW court record (→ 403). It surfaces ONLY on the MISS path of

@@ -166,7 +166,11 @@ func (m *mockRepo) MatchPublicationsForTenantSince(_ context.Context, _ database
 	return nil, nil
 }
 
-func (m *mockRepo) UpsertGradedCourtRecord(_ context.Context, _ database.Tx, _ GradedRecordParams) (*CourtRecord, error) {
+func (m *mockRepo) GetCourtRecordByKey(_ context.Context, _ database.Tx, _, _, _ string) (*CourtRecord, bool, error) {
+	return nil, false, nil
+}
+
+func (m *mockRepo) UpdateCourtRecordGrade(_ context.Context, _ database.Tx, _ GradeParams) (*CourtRecord, error) {
 	return nil, nil
 }
 

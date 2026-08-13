@@ -53,9 +53,12 @@ type Repository interface {
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error)
 
-	// DATAJUD enrichment — the placeholder+merge grade reconciliation. The
-	// enrichment use case depends on the narrow enrichRepo view of these.
-	UpsertGradedCourtRecord(ctx context.Context, tx database.Tx, params GradedRecordParams) (*CourtRecord, error)
+	// DATAJUD enrichment — the in-place grade (FIX B) plus the merge fallback for a
+	// rare grade conflict. The enrichment use case depends on the narrow enrichRepo
+	// view of these. GetCourtRecordByKey is the conflict lookup (natural-key resolve);
+	// UpdateCourtRecordGrade mutates the placeholder in place.
+	GetCourtRecordByKey(ctx context.Context, tx database.Tx, tenantID, cnjNumber, degree string) (record *CourtRecord, found bool, err error)
+	UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*CourtRecord, error)
 	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
 	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
 
@@ -848,44 +851,77 @@ func (r *pgRepository) ReplaceWatchedOABs(ctx context.Context, tx database.Tx, t
 
 // UpsertIntimations is the SET-BASED bulk upsert — see repository_batch.go.
 
-// UpsertGradedCourtRecord find-or-creates the graded court record inside the
-// caller's tx (natural key tenant+cnj+degree, in the given case) and refreshes the
-// DATAJUD-authoritative fields, returning the entity the enrichment re-points onto.
-// It is NOT entitlement-gated: grading an already-tracked process must not consume
-// a second plan slot.
-func (r *pgRepository) UpsertGradedCourtRecord(ctx context.Context, tx database.Tx, params GradedRecordParams) (*CourtRecord, error) {
+// GetCourtRecordByKey resolves a court record by its natural key (tenant, cnj,
+// degree) inside the caller's tx, returning found=false (not an error) on a miss so
+// the enrichment can branch on "does a graded record already hold this grade?" (the
+// merge guard for the (tenant, cnj, degree) UNIQUE). Scoped by tenant_id (RLS
+// barrier 1).
+func (r *pgRepository) GetCourtRecordByKey(ctx context.Context, tx database.Tx, tenantID, cnjNumber, degree string) (*CourtRecord, bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, false, database.WrapInfra(err)
+	}
+	row, err := acquisitiondb.New(tx).GetCourtRecordByKey(ctx, acquisitiondb.GetCourtRecordByKeyParams{
+		TenantID:  tid,
+		CnjNumber: cnjNumber,
+		Degree:    degree,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, database.WrapInfra(err)
+	}
+	return &CourtRecord{
+		ID:        row.ID.String(),
+		TenantID:  tenantID,
+		CaseID:    row.CaseID.String(),
+		CNJNumber: cnjNumber,
+		Degree:    degree,
+	}, true, nil
+}
+
+// UpdateCourtRecordGrade grades a court_record IN PLACE inside the caller's tx: it
+// mutates the row named by params.CourtRecordID — the DJEN UNKNOWN placeholder — to
+// the DATAJUD-revealed degree and authoritative fields, keeping the SAME id so every
+// child already anchored to it stays correct (FIX B). It is NOT entitlement-gated
+// (the process already counted against the plan as a placeholder). A miss (the row
+// vanished under RLS or was deleted) is the typed ErrCourtRecordNotFound, never
+// (nil, nil).
+func (r *pgRepository) UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*CourtRecord, error) {
 	tid, err := uuid.Parse(params.TenantID)
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	caseID, err := uuid.Parse(params.CaseID)
+	rid, err := uuid.Parse(params.CourtRecordID)
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	row, err := acquisitiondb.New(tx).UpsertGradedCourtRecord(ctx, acquisitiondb.UpsertGradedCourtRecordParams{
-		TenantID:     tid,
-		CaseID:       caseID,
-		CnjNumber:    params.CNJNumber,
-		Degree:       params.Degree,
-		Court:        params.Court,
-		Class:        nullString(params.Class),
-		Subject:      nullString(params.Subject),
-		JudgingBody:  nullString(params.JudgingBody),
-		FiledAt:      nullDate(params.FiledAt),
-		Secrecy:      params.Secrecy,
-		Completeness: params.Completeness,
-		NextSyncAt:   pgtype.Timestamptz{Time: params.NextSyncAt, Valid: !params.NextSyncAt.IsZero()},
+	row, err := acquisitiondb.New(tx).UpdateCourtRecordGrade(ctx, acquisitiondb.UpdateCourtRecordGradeParams{
+		CourtRecordID: rid,
+		TenantID:      tid,
+		Degree:        params.Degree,
+		Court:         params.Court,
+		Class:         nullString(params.Class),
+		Subject:       nullString(params.Subject),
+		JudgingBody:   nullString(params.JudgingBody),
+		FiledAt:       nullDate(params.FiledAt),
+		Secrecy:       params.Secrecy,
+		Completeness:  params.Completeness,
+		NextSyncAt:    pgtype.Timestamptz{Time: params.NextSyncAt, Valid: !params.NextSyncAt.IsZero()},
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCourtRecordNotFound
+	}
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
 	return &CourtRecord{
-		ID:        row.ID.String(),
-		TenantID:  params.TenantID,
-		CaseID:    row.CaseID.String(),
-		CNJNumber: params.CNJNumber,
-		Degree:    params.Degree,
-		Court:     params.Court,
+		ID:       row.ID.String(),
+		TenantID: params.TenantID,
+		CaseID:   row.CaseID.String(),
+		Degree:   params.Degree,
+		Court:    params.Court,
 	}, nil
 }
 
