@@ -24,8 +24,29 @@ COPY . .
 ARG SVC=api
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SVC}
 
-# ---- final stage: minimal, non-root, no shell --------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+# ---- runtime-ocr stage: for worker-documents (needs the OCR toolchain) -------
+# The default distroless/static image has no shell and can't run external binaries,
+# so worker-documents — which shells out to pdftoppm + tesseract for deterministic,
+# free OCR — targets THIS stage instead (cd.yml sets `target: runtime-ocr` only for
+# that svc). Debian slim + poppler-utils (pdftoppm) + tesseract-ocr + the Portuguese
+# language pack (tesseract-ocr-por). Same binary/migrations/ENTRYPOINT shape and a
+# non-root user, so nothing else about how the service runs changes.
+FROM debian:bookworm-slim AS runtime-ocr
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tesseract-ocr tesseract-ocr-por poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --no-create-home --uid 10001 appuser
+WORKDIR /app
+COPY --from=build /out/app /app/app
+COPY migrations/ /app/migrations/
+USER appuser
+ENTRYPOINT ["/app/app"]
+
+# ---- runtime stage (DEFAULT): minimal, non-root, no shell --------------------
+# LAST stage = the implicit target for a target-less build, so the other five
+# services (and any `docker build` without --target) keep the same lean distroless
+# static image they had before. Only worker-documents overrides to runtime-ocr.
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 WORKDIR /app
 
 # Just this service's binary. The migrations ride along too: only the api applies

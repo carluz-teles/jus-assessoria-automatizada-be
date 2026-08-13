@@ -83,6 +83,9 @@ services:
     <<: *worker
     build:
       context: .
+      # Needs the OCR toolchain (pdftoppm + tesseract) → the Debian runtime-ocr stage,
+      # not the default distroless runtime the other services use.
+      target: runtime-ocr
       args:
         SVC: worker-documents
     image: jus-worker-documents:local

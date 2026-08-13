@@ -14,11 +14,15 @@ import (
 // bump (a library change that alters extraction) makes a re-extraction auditable.
 const textLayerVersion = "pdftext-v1"
 
-// minTextLayerChars is the floor of total extracted characters below which a PDF is judged
-// to have NO usable text layer (a scan). Below it, Extract reports hasTextLayer=false so the
-// dispatcher routes to OCR. A handful of stray characters (page numbers baked into a scan's
-// OCR-less overlay) must not defeat the OCR fallback, hence a non-zero floor rather than "> 0".
-const minTextLayerChars = 16
+// minCharsPerPage is the density floor: the AVERAGE non-whitespace characters per page below
+// which a PDF is judged to have NO usable text layer (a scan) and Extract reports
+// hasTextLayer=false so the dispatcher routes to OCR. Density, not a total-chars floor,
+// because a scanned court PDF often carries a thin PJe text-layer header stamp on every page
+// (~30–90 chars/page); a 71-page scan then totals ~2100 chars and defeats any fixed total
+// floor while carrying zero body text. A real text page has hundreds–thousands of chars, so
+// the average cleanly separates a stamped scan (below the floor → OCR) from a text document
+// (above it → keep the text layer).
+const minCharsPerPage = 100
 
 // TextLayerExtractor is the Fatia 5 adapter: it reads embedded text per page from a PDF's
 // text layer using the pure-Go ledongthuc/pdf reader (no cgo, no external binary). If the
@@ -35,10 +39,11 @@ var _ TextExtractor = (*TextLayerExtractor)(nil)
 // Extract reads per-page text from the PDF's text layer. It opens the bytes as an
 // io.ReaderAt (no temp file), iterates pages 1..NumPage, and collects each page's plain
 // text. A page with no Contents (a blank/scan page) yields an empty PageText — the page
-// count still reflects the real document. hasTextLayer is true only when the total
-// non-whitespace text clears minTextLayerChars; otherwise the document is a scan and the
-// caller routes to OCR. A malformed PDF the reader cannot open is a terminal invalid (a
-// retry re-reads the same bytes).
+// count still reflects the real document. hasTextLayer is true only when the average
+// non-whitespace chars per page clears minCharsPerPage (see hasUsableTextLayer); otherwise
+// the document is a scan (or a scan with a thin per-page stamp) and the caller routes to OCR.
+// A malformed PDF the reader cannot open is a terminal invalid (a retry re-reads the same
+// bytes).
 func (*TextLayerExtractor) Extract(_ context.Context, data []byte) ([]PageText, bool, string, error) {
 	reader, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -55,14 +60,25 @@ func (*TextLayerExtractor) Extract(_ context.Context, data []byte) ([]PageText, 
 		pages = append(pages, PageText{Page: i, Text: text})
 	}
 
-	return pages, total >= minTextLayerChars, textLayerVersion, nil
+	return pages, hasUsableTextLayer(total, numPages), textLayerVersion, nil
+}
+
+// hasUsableTextLayer decides — from the total non-whitespace chars and the page count alone —
+// whether a PDF's text layer is real or just a scan's stamp. It is a pure helper so the density
+// rule is unit-testable without a PDF fixture. hasTextLayer is true only when the document has
+// at least one page AND the average chars per page clears minCharsPerPage: a stamped 71-page
+// scan (~66 chars/page) falls below and routes to OCR, while a dense text document (hundreds–
+// thousands of chars/page) stays above and keeps its text layer. A 0-page document is never
+// "usable" (guards the division).
+func hasUsableTextLayer(total, numPages int) bool {
+	return numPages > 0 && total/numPages >= minCharsPerPage
 }
 
 // pagePlainText renders one page's text layer as plain text, row by row (GetTextByRow
 // preserves reading order: words within a row joined by spaces, rows by newlines). A null
 // page or a page with no Contents (a scan) yields "". Errors from a single page are swallowed
 // to "" rather than failing the whole document — a partial extraction still routes to OCR via
-// the total-chars floor if it comes up empty.
+// the density floor if it comes up empty.
 func pagePlainText(p pdf.Page) string {
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == pdf.Null {
 		return ""

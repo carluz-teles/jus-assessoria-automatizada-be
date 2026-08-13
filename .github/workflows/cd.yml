@@ -43,6 +43,9 @@ jobs:
         with:
           context: .
           build-args: SVC=${{ matrix.svc }}
+          # worker-documents shells out to pdftoppm + tesseract for OCR, so it needs the
+          # Debian runtime-ocr stage; every other svc uses the default distroless runtime.
+          target: ${{ matrix.svc == 'worker-documents' && 'runtime-ocr' || 'runtime' }}
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/jus-${{ matrix.svc }}:${{ github.sha }}

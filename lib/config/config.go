@@ -116,6 +116,15 @@ type Config struct {
 	VoyageModel    string `env:"VOYAGE_MODEL" envDefault:"voyage-4-lite"`
 	VoyageEmbedDim int    `env:"VOYAGE_EMBED_DIM" envDefault:"1024"`
 
+	// OCREngine seleciona o adapter de OCR da fatia de extração (só o worker-documents o
+	// consome). "tesseract" (default) roda OCR determinístico e GRÁTIS por shell-out
+	// (pdftoppm + tesseract, embutidos na imagem runtime-ocr) — sem chave, sem custo por
+	// página; é o que lê os scans do PJe. "claude" volta pro OCR via Claude vision, que
+	// exige ANTHROPIC_API_KEY e cobra por documento (opt-in, pra casos que o Tesseract não
+	// resolve). Um valor desconhecido cai no Tesseract (o padrão seguro/grátis), então um
+	// típo nunca liga o custo por engano.
+	OCREngine string `env:"OCR_ENGINE" envDefault:"tesseract"`
+
 	// Calendário de prazos.
 	// HolidaySeedYearsAhead — quantos anos ALÉM do corrente o seeder nacional de
 	// feriados pré-carrega no boot do api (via BrasilAPI). 2 = ano corrente + 2.

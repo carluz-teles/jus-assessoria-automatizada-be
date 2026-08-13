@@ -103,12 +103,15 @@ func run(logger *slog.Logger) error {
 		// A generous client timeout: the OCR/embedding calls are network-bound and slow.
 		httpClient := &http.Client{Timeout: 2 * time.Minute}
 
-		// Fatia 5+6 — text-layer extraction + Claude vision OCR fallback. The Anthropic
-		// key is required config; the slice builds its own vision client from it.
+		// Fatia 5+6 — text-layer extraction + OCR fallback. OCR_ENGINE picks the OCR
+		// adapter: "tesseract" (default) is deterministic and free (the runtime-ocr image
+		// ships pdftoppm + tesseract); "claude" is opt-in Claude vision, which uses the
+		// Anthropic key (passed through, consumed only when the engine is "claude").
 		extraction.RegisterExtractionListeners(mux, extraction.Deps{
 			UoW:             uow,
 			Storage:         storageClient,
 			Outbox:          outbox,
+			OCREngine:       cfg.OCREngine,
 			AnthropicAPIKey: cfg.AnthropicKey,
 			HTTPClient:      httpClient,
 		})

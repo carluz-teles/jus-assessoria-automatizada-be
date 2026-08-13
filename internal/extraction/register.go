@@ -21,31 +21,38 @@ type StoragePresigner = presigner
 
 // Deps carries everything RegisterExtractionListeners needs from the worker's composition
 // root. All are ports/values the worker already holds: the unit of work (tenant-scoped write
-// txs), the storage presigner, the transactional outbox, and the OCR credential. Exactly ONE
-// of Vision / AnthropicAPIKey is required — inject a Vision fake in tests, or the API key in
-// production (the slice builds the real Anthropic client from it, so the worker needs no SDK
-// import). HTTPClient is optional (nil → a defaulted client).
+// txs), the storage presigner, the transactional outbox, and the OCR selection/credential.
+// OCREngine picks the OCR adapter: "tesseract" (the default) needs NO key — it shells out to
+// the deterministic, free OCR binaries baked into the runtime-ocr image; AnthropicAPIKey is
+// used ONLY when OCREngine=="claude" (opt-in Claude-vision OCR). Vision overrides both — inject
+// a fake in tests. HTTPClient is optional (nil → a defaulted client).
 type Deps struct {
 	UoW             database.UnitOfWork
 	Storage         StoragePresigner
 	Outbox          publisher
 	Vision          visionClient // optional: inject to override the OCR client (tests/fakes)
-	AnthropicAPIKey string       // used to build the real vision client when Vision is nil
+	OCREngine       string       // "tesseract" (default, free) | "claude"; unset → tesseract
+	AnthropicAPIKey string       // used to build the real vision client only when OCREngine=="claude"
 	HTTPClient      *http.Client // optional: nil → defaulted
 }
 
 // RegisterExtractionListeners composes the extraction slice and mounts its handler on mux.
 // The worker calls this once with a fully-populated Deps; adding this slice's async surface
-// is one line in the worker's composition. It builds the OCR client from Deps.Vision (if
-// set) else Deps.AnthropicAPIKey, wires the text-layer+OCR dispatcher, and hands the use case
-// to the listener.
+// is one line in the worker's composition. It selects the OCR adapter (deterministic Tesseract
+// by default, Claude vision opt-in, or an injected fake), wires the text-layer+OCR dispatcher,
+// and hands the use case to the listener.
 func RegisterExtractionListeners(mux *asynq.ServeMux, deps Deps) {
-	vision := deps.Vision
-	if vision == nil {
-		vision = NewAnthropicVision(deps.AnthropicAPIKey)
+	var ocr TextExtractor
+	switch {
+	case deps.Vision != nil: // test/override: use the injected vision client
+		ocr = NewOCRExtractor(deps.Vision)
+	case deps.OCREngine == "claude": // opt-in: paid Claude-vision OCR
+		ocr = NewOCRExtractor(NewAnthropicVision(deps.AnthropicAPIKey))
+	default: // "tesseract" (default) or unset — deterministic, free, no key
+		ocr = NewTesseractOCR()
 	}
 
-	extractor := NewDispatchExtractor(NewTextLayerExtractor(), NewOCRExtractor(vision))
+	extractor := NewDispatchExtractor(NewTextLayerExtractor(), ocr)
 	store := NewStorage(deps.Storage, deps.HTTPClient)
 
 	uc := NewUseCase(deps.UoW, store, NewRepository(), extractor, NewDedup(), deps.Outbox)
