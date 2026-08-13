@@ -146,6 +146,14 @@ type Document struct {
 	ExtractedAt      pgtype.Timestamptz `json:"extracted_at"`
 	ExtractorVersion *string            `json:"extractor_version"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	Status           string             `json:"status"`
+	MimeType         *string            `json:"mime_type"`
+	SizeBytes        *int64             `json:"size_bytes"`
+	Checksum         *string            `json:"checksum"`
+	Title            *string            `json:"title"`
+	OriginalFilename *string            `json:"original_filename"`
+	Error            []byte             `json:"error"`
+	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
 }
 
 type Draft struct {

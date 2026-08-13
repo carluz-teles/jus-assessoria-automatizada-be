@@ -9,6 +9,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
+	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -43,6 +44,7 @@ type routerDeps struct {
 	identity             *identity.Handler
 	acquisition          *acquisition.Handler
 	deadline             *deadline.Handler
+	document             *document.Handler
 	lookup               *lookup.Handler
 }
 
@@ -151,6 +153,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// test's fixture (which wires no domain use cases) still builds.
 	if deps.deadline != nil {
 		deps.deadline.RegisterV1(v1)
+	}
+
+	// document owns its /v1 Documentos routes (the presigned upload/complete/download, the aba,
+	// the detail and the soft delete) and mounts them via RegisterV1 — the api only composes.
+	// Nil-guarded so the router test's fixture (which wires no domain use cases) still builds,
+	// and so a boot without S3 configured (no write use case) leaves the slice unmounted.
+	if deps.document != nil {
+		deps.document.RegisterV1(v1)
 	}
 
 	// notifications owns its authenticated /v1 in-app inbox routes (list/badge/

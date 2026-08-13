@@ -19,6 +19,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
+	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -192,20 +193,36 @@ func run(logger *slog.Logger) error {
 	// client and mounts the handler.
 	lookupHandler := lookup.NewHandler(lookup.NewBrasilAPIClient())
 
-	// Storage is optional at v0: only wired when S3 is fully configured. No route
-	// consumes it yet — the upload slice injects it — so it is built to fail fast
-	// on bad credentials at boot and logged as ready.
+	// Storage is optional at v0: only wired when S3 is fully configured. The Documentos
+	// slice (Fatia 1) consumes it — the presigned upload/download — so when storage is
+	// present the document write use case + handler are built off it (repo + storage +
+	// shared outbox + unit of work), mirroring the deadline composition. Built to fail
+	// fast on bad credentials at boot and logged as ready. Without S3 the slice stays
+	// unmounted (documentHandler nil → the router nil-guard skips it).
+	var documentHandler *document.Handler
 	if cfg.S3Enabled() {
-		if _, err := storage.New(ctx, storage.Options{
+		storageClient, err := storage.New(ctx, storage.Options{
 			Endpoint:  cfg.S3Endpoint,
 			Region:    cfg.S3Region,
 			Bucket:    cfg.S3Bucket,
 			AccessKey: cfg.S3AccessKey,
 			SecretKey: cfg.S3SecretKey,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("init storage: %w", err)
 		}
 		logger.Info("storage configured", "bucket", cfg.S3Bucket)
+
+		documentWriteUC := document.NewUseCase(
+			document.NewRepository(),
+			storageClient,
+			events.NewOutbox(),
+			uow,
+		)
+		documentHandler = document.NewHandler(
+			document.NewReadUseCase(document.NewReadRepository(pool)),
+			documentWriteUC,
+		)
 	}
 
 	// 5. Router — the testable seam; no I/O happens here.
@@ -222,6 +239,7 @@ func run(logger *slog.Logger) error {
 		identity:             identityHandler,
 		acquisition:          acquisitionHandler,
 		deadline:             deadlineHandler,
+		document:             documentHandler,
 		lookup:               lookupHandler,
 	})
 
