@@ -12,6 +12,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
 )
@@ -66,6 +67,10 @@ func (fakeReader) Processos(context.Context, ProcessosQuery) (ProcessosResult, e
 
 func (fakeReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
 	return IntimacoesResult{}, nil
+}
+
+func (fakeReader) Intimacao(context.Context, string, string) (IntimacaoView, error) {
+	return IntimacaoView{}, nil
 }
 
 func (fakeReader) Andamentos(context.Context, AndamentosQuery) (AndamentosResult, error) {
@@ -255,6 +260,12 @@ type recordingReader struct {
 	gotAndQuery  AndamentosQuery
 	intiRes      IntimacoesByProcessoResult
 	gotIntiQuery IntimacoesByProcessoQuery
+	// GET /v1/intimacoes/:id — capture the forwarded (tenant, id) and return a canned
+	// view or a typed error (a nil intiOneErr means the view is returned).
+	intiOneRes    IntimacaoView
+	intiOneErr    error
+	gotIntiOneTID string
+	gotIntiOneID  string
 }
 
 func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (ProcessosResult, error) {
@@ -263,6 +274,10 @@ func (r *recordingReader) Processos(_ context.Context, q ProcessosQuery) (Proces
 }
 func (r *recordingReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
 	return IntimacoesResult{}, nil
+}
+func (r *recordingReader) Intimacao(_ context.Context, tenantID, id string) (IntimacaoView, error) {
+	r.gotIntiOneTID, r.gotIntiOneID = tenantID, id
+	return r.intiOneRes, r.intiOneErr
 }
 func (r *recordingReader) Andamentos(_ context.Context, q AndamentosQuery) (AndamentosResult, error) {
 	r.gotAndQuery = q
@@ -686,5 +701,79 @@ func TestHandler_ListIntimacoesByProcesso_CursorRoundTrip(t *testing.T) {
 	}
 	if rd.gotIntiQuery.LastID != last.ID {
 		t.Errorf("page 2 LastID = %q, want %q", rd.gotIntiQuery.LastID, last.ID)
+	}
+}
+
+// --- read route: GET /v1/intimacoes/:id (deep-link to one intimation) --------
+
+// GET /v1/intimacoes/:id forwards the path :id and the principal's tenant (never the
+// path/query) to the read port and returns the IntimacaoView as the whole payload —
+// 200, no list envelope.
+func TestHandler_GetIntimacao_OK(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{intiOneRes: IntimacaoView{
+		ID:        "018f0000-0000-7000-8000-000000000abc",
+		CNJNumber: "0004567-11.2023.8.26.0001",
+		Court:     "TJSP",
+		Degree:    "G1",
+		Status:    "PENDING",
+		Source:    "DJEN",
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet,
+		"/v1/intimacoes/018f0000-0000-7000-8000-000000000abc", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	if rd.gotIntiOneTID != "tenant-9" {
+		t.Errorf("tenant forwarded = %q, want tenant-9 (from principal)", rd.gotIntiOneTID)
+	}
+	if rd.gotIntiOneID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("id forwarded = %q, want the path :id", rd.gotIntiOneID)
+	}
+	for _, want := range []string{`"cnj_number":"0004567-11.2023.8.26.0001"`, `"status":"PENDING"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+	// The single view is returned bare, not wrapped in the list {data:[...]} envelope.
+	if strings.Contains(body, `"data"`) {
+		t.Errorf("GET /:id must not use the list envelope\ngot: %s", body)
+	}
+}
+
+// A miss — or a foreign tenant's id — is the read model's typed ErrIntimationNotFound
+// → 404 with the {kind,...} envelope, never a 500 or an empty 200.
+func TestHandler_GetIntimacao_NotFound_404(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{intiOneErr: ErrIntimationNotFound}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet,
+		"/v1/intimacoes/018f0000-0000-7000-8000-000000000abc", "", "jwt")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", status, body)
+	}
+	if !strings.Contains(body, string(apperr.KindNotFound)) {
+		t.Errorf("body missing kind %q\ngot: %s", apperr.KindNotFound, body)
+	}
+}
+
+// A non-uuid :id is client input → the read model's typed KindInvalid → 400, not a 500.
+func TestHandler_GetIntimacao_InvalidID_400(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{intiOneErr: apperr.NewInvalid("id de intimação inválido")}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes/not-a-uuid", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+	if !strings.Contains(body, string(apperr.KindInvalid)) {
+		t.Errorf("body missing kind %q\ngot: %s", apperr.KindInvalid, body)
 	}
 }

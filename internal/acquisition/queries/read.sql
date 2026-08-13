@@ -43,6 +43,19 @@ WHERE i.tenant_id = $1
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
 
+-- name: GetIntimacao :one
+-- One intimation by id, for the FE deep-link into the inbox detail (an intimation not
+-- on the loaded list page). SAME projection as ListIntimacoes — the record's
+-- number/court/degree joined in — so it maps to the same IntimacaoView. Scoped by
+-- tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404 upstream,
+-- never nil,nil). Read-only, off the write path.
+SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
+       i.content, i.type, i.status, i.source, i.source_url,
+       cr.cnj_number, cr.court, cr.degree
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.id = $1 AND i.tenant_id = $2;
+
 -- name: CountProcessosMatchingSearch :one
 -- The filtered "X" of the processes screen's "X de Y" counter: how many ACTIVE court
 -- records match the search term (cnj_number ILIKE, trigram-indexed). Called only when
