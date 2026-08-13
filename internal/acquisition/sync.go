@@ -671,6 +671,11 @@ func (uc *SyncUseCase) publishObserved(ctx context.Context, tx database.Tx, ev S
 	for _, cr := range records {
 		evs = append(evs, newCourtRecordObserved(ev, syncRunID, cr))
 	}
+	// NOTE: docket_entry_observed for backfill records is suppressed in the ENRICHMENT
+	// path (enrichment.go), where the flood actually originates — DATAJUD movimentos.
+	// Discovery (DJEN) produces no docket entries, so this loop is empty in a real
+	// backfill; it is left intact so a discovery connector that DID yield docket entries
+	// keeps its per-entry event (invariant preserved).
 	for _, de := range newDocket {
 		evs = append(evs, newDocketEntryObserved(ev, syncRunID, de))
 	}
@@ -852,6 +857,9 @@ func newCourtRecordObserved(ev SyncRequested, syncRunID string, cr *CourtRecord)
 		CNJNumber:     cr.CNJNumber,
 		Degree:        cr.Degree,
 		Court:         cr.Court,
+		// Carry the origin backfill (empty for a live sync) so the enrichment consumer
+		// can suppress the per-andamento docket_entry_observed for backfill records.
+		BackfillJobID: ev.BackfillJobID,
 	}
 }
 

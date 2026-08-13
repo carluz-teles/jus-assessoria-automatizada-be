@@ -140,6 +140,14 @@ type CourtRecordObserved struct {
 	// Court is the tribunal sigla — the DATAJUD enrichment consumer needs it to pick
 	// the per-tribunal index (api_publica_<sigla>) when it fetches by number.
 	Court string `json:"court"`
+	// BackfillJobID denormalizes the origin backfill onto the event when this record
+	// was discovered by an onboarding backfill (empty for a live sync or a scheduler
+	// re-poll). The enrichment consumer reads it to SUPPRESS the per-andamento
+	// docket_entry_observed for backfill-originated records: their only consumer is the
+	// notifications aviso, which is already silenced during onboarding (the single
+	// import_finished aviso stands in for the burst), so emitting them only floods the
+	// outbox. The andamentos are still persisted — only the notify-trigger event is skipped.
+	BackfillJobID string `json:"backfill_job_id,omitempty"`
 }
 
 var _ events.Event = CourtRecordObserved{}

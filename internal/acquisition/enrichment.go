@@ -217,14 +217,21 @@ func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecord
 		if err != nil {
 			return err
 		}
-		// One batch insert: a DATAJUD process with a long movimento history fans out many
-		// docket_entry_observed; the per-event loop held the advisory lock for each.
-		evs := make([]events.Event, 0, len(newDocket))
-		for _, de := range newDocket {
-			evs = append(evs, newDocketEntryObservedFromEnrich(ev, de))
-		}
-		if err := uc.outbox.PublishBatch(ctx, tx, evs); err != nil {
-			return err
+		// A backfill-originated record emits NO docket_entry_observed: its only consumer is
+		// the new_andamento aviso, already silenced during onboarding (the import_finished
+		// aviso stands in for the burst). Emitting them just floods the outbox — a DATAJUD
+		// process with a long movimento history fans out tens of thousands, starving the
+		// relay and the sync_completed events that finalize the very backfill. The docket
+		// rows are already persisted above; only the notify-trigger event is skipped. A live
+		// sync / scheduler re-poll (BackfillJobID == "") still emits, so real-time avisos work.
+		if ev.BackfillJobID == "" {
+			evs := make([]events.Event, 0, len(newDocket))
+			for _, de := range newDocket {
+				evs = append(evs, newDocketEntryObservedFromEnrich(ev, de))
+			}
+			if err := uc.outbox.PublishBatch(ctx, tx, evs); err != nil {
+				return err
+			}
 		}
 		applied = true
 		return nil

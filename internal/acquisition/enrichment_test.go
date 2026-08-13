@@ -134,6 +134,39 @@ func TestEnrichment_GraduatesInPlace(t *testing.T) {
 	}
 }
 
+// TestEnrichment_BackfillSuppressesDocketEvents proves the outbox-flood fix: when the
+// observed record came from an onboarding backfill (BackfillJobID set), the enrichment
+// still GRADES the record and PERSISTS the movimentos as docket entries, but emits NO
+// docket_entry_observed — the per-andamento aviso is silenced during onboarding anyway,
+// so the events would only flood the relay and starve the backfill's own sync_completed.
+func TestEnrichment_BackfillSuppressesDocketEvents(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
+
+	ev := placeholderObserved()
+	ev.BackfillJobID = "backfill-1" // discovered by an onboarding backfill
+
+	if err := enrichmentUnderTest(repo, outbox, uow, payload).OnCourtRecordObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnCourtRecordObserved: %v", err)
+	}
+
+	// The record is still graded and the movimentos still land as docket entries…
+	if repo.updateCalls != 1 {
+		t.Errorf("grade update = %d calls; want 1 (grading happens regardless of backfill)", repo.updateCalls)
+	}
+	if len(repo.docketParams) == 0 {
+		t.Fatal("movimentos must still be persisted as docket entries during a backfill")
+	}
+	// …but NO docket_entry_observed is emitted for a backfill-originated record.
+	if got := countByType(outbox.published)[TypeDocketEntryObserved]; got != 0 {
+		t.Errorf("docket_entry_observed events = %d, want 0 (suppressed for backfill)", got)
+	}
+}
+
 // TestEnrichment_ConflictMerges proves the rare fallback: when a graded record already
 // holds this (tenant, cnj, degree) — grading the placeholder in place would violate the
 // UNIQUE — the placeholder's intimations are re-pointed onto the existing graded record,
