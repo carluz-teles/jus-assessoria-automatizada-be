@@ -156,3 +156,13 @@ variable "s3_secret_key" {
   type      = string
   sensitive = true
 }
+
+# ---- Voyage AI (embeddings — o worker-documents indexa os chunks dos documentos) ----
+# Opcional: sem a chave o worker-documents sobe sem o listener de INDEXAÇÃO (a extração/OCR
+# ainda roda). O modelo/dim ficam no default do código (voyage-4-lite / 1024), então só a
+# chave é segredo.
+variable "voyage_api_key" {
+  type      = string
+  sensitive = true
+  default   = ""
+}

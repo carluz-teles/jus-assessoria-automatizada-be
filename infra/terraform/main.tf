@@ -77,8 +77,19 @@ locals {
       INGESTION_ENABLED    = "false"
     })
     # Skeletons por ora — só a base (config.Load exige os 5 required).
-    "worker-ai"           = local.base_vars
-    "worker-documents"    = local.base_vars
+    "worker-ai" = local.base_vars
+    # worker-documents: pipeline de documentos (extração/OCR + chunk/embedding). Precisa de
+    # storage (lê o PDF, grava o texto extraído, baixa) + a chave Voyage (embeddings). O
+    # ANTHROPIC_API_KEY (OCR via Claude vision) já vem na base. Sem VOYAGE_API_KEY o binário
+    # sobe e só a indexação fica de fora (a extração roda) — ver cmd/worker-documents/main.go.
+    "worker-documents" = merge(local.base_vars, {
+      S3_ENDPOINT    = var.s3_endpoint
+      S3_REGION      = var.s3_region
+      S3_BUCKET      = var.s3_bucket
+      S3_ACCESS_KEY  = var.s3_access_key
+      S3_SECRET_KEY  = var.s3_secret_key
+      VOYAGE_API_KEY = var.voyage_api_key
+    })
     "worker-outbox-relay" = local.base_vars
     # scheduler: re-poll dos court_records due (enrichment DATAJUD). A ingestão nacional
     # bulk está DESLIGADA (INGESTION_ENABLED=false) — voltamos pro per-OAB on-demand, que
