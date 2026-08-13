@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,6 +39,27 @@ func newDeadlineUC(pool *pgxpool.Pool) *deadline.UseCase {
 		events.NewOutbox(),
 		deadline.NewDedup(),
 		database.NewUnitOfWork(pool),
+	)
+}
+
+// deadlineTestNow pins "now" to the fixture era (noon on the 2024-03-04 start these tests
+// derive from). The born-MISSED rule (um prazo cuja carência já passou nasce MISSED, não
+// PENDING órfão — cf0946b) makes fixed-2024 fixtures nascerem MISSED sob o relógio real
+// (2026+); pinning the clock antes do vencimento os deixa nascer PENDING — o caminho normal
+// que estes testes querem exercitar (o overdue-at-birth é um cenário à parte).
+var deadlineTestNow = time.Date(2024, 3, 4, 12, 0, 0, 0, time.UTC)
+
+// newDeadlineUCAt is newDeadlineUC with a pinned clock (see deadlineTestNow). Use it in the
+// tests that assert a DERIVED PENDING status; the relative-date reminder tests keep the real
+// clock via newDeadlineUC.
+func newDeadlineUCAt(pool *pgxpool.Pool, now time.Time) *deadline.UseCase {
+	return deadline.NewUseCase(
+		deadline.NewRepository(),
+		calendar.New(calendar.NewStore(pool)),
+		events.NewOutbox(),
+		deadline.NewDedup(),
+		database.NewUnitOfWork(pool),
+		deadline.WithClock(func() time.Time { return now }),
 	)
 }
 
@@ -94,7 +116,7 @@ func TestDeadline_Observed_DerivesPendingDeadlineAndEvent(t *testing.T) {
 
 	// INTIMACAO on a cível court → the seeded MANIFESTACAO/5/BUSINESS rule.
 	ev := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
-	if err := newDeadlineUC(pool).OnIntimationObserved(ctx, ev); err != nil {
+	if err := newDeadlineUCAt(pool, deadlineTestNow).OnIntimationObserved(ctx, ev); err != nil {
 		t.Fatalf("OnIntimationObserved() error = %v", err)
 	}
 

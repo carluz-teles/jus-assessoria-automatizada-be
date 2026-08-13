@@ -264,7 +264,7 @@ func TestDeadline_MissedCheck_PendingNoOp(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
-	uc := newDeadlineUC(pool)
+	uc := newDeadlineUCAt(pool, deadlineTestNow)
 
 	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
 	if err := uc.OnIntimationObserved(ctx, obs); err != nil {

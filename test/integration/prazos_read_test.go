@@ -60,7 +60,7 @@ func TestPrazosRead_ThreeEndpoints_ReturnDerivedDeadline(t *testing.T) {
 
 	// INTIMACAO on a cível court → the seeded MANIFESTACAO/5/BUSINESS rule, end 2024-03-11.
 	ev := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
-	if err := newDeadlineUC(pool).OnIntimationObserved(ctx, ev); err != nil {
+	if err := newDeadlineUCAt(pool, deadlineTestNow).OnIntimationObserved(ctx, ev); err != nil {
 		t.Fatalf("OnIntimationObserved() error = %v", err)
 	}
 	deadlineID := deadlineIDFor(ctx, t, pool, p.intimationID)

@@ -47,7 +47,7 @@ func TestDeadline_Adjust_RecomputesEndAndEmitsUpdated(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
-	uc := newDeadlineUC(pool)
+	uc := newDeadlineUCAt(pool, deadlineTestNow)
 
 	// Seed the PENDING prazo (INTIMACAO/TJSP → MANIFESTACAO/5/BUSINESS → end 2024-03-11).
 	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
@@ -184,7 +184,7 @@ func TestDeadline_TransitionGuards(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
-	uc := newDeadlineUC(pool)
+	uc := newDeadlineUCAt(pool, deadlineTestNow)
 
 	// A PENDING prazo (never confirmed) cannot be marked met.
 	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
