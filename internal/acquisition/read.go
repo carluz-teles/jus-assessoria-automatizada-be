@@ -247,6 +247,7 @@ const reconciliationRunsLimit = 60
 type readRepo interface {
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error)
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
@@ -415,4 +416,12 @@ func (uc *ReadUseCase) Intimacoes(ctx context.Context, q IntimacoesQuery) (Intim
 		return IntimacoesResult{}, err
 	}
 	return IntimacoesResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+}
+
+// Intimacao returns one intimation by id for the FE deep-link (open the detail of an
+// intimation not on the loaded inbox page). A plain pool read scoped to the tenant — no
+// pagination policy — so it delegates straight to the repo, which maps a miss/foreign
+// row to the typed 404 and a non-uuid id to the typed 400.
+func (uc *ReadUseCase) Intimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error) {
+	return uc.repo.GetIntimacao(ctx, tenantID, id)
 }

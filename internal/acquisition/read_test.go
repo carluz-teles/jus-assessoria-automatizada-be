@@ -37,6 +37,9 @@ func (r *recordingReadRepo) CountProcessos(_ context.Context, _, search string) 
 func (r *recordingReadRepo) ListIntimacoes(context.Context, IntimacoesQuery) ([]IntimacaoView, error) {
 	return nil, nil
 }
+func (r *recordingReadRepo) GetIntimacao(context.Context, string, string) (IntimacaoView, error) {
+	return IntimacaoView{}, nil
+}
 func (r *recordingReadRepo) CountIntimacoes(context.Context, string, string) (int64, int64, error) {
 	return 0, 0, nil
 }

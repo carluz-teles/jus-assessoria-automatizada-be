@@ -24,6 +24,12 @@ var (
 	// longer exists. The completion counter treats it as a no-op ack, never a retry.
 	ErrBackfillJobNotFound = apperr.NewNotFound("backfill job not found")
 
+	// ErrIntimationNotFound — no intimation matched the (id, tenant) of a GET
+	// /v1/intimacoes/:id deep-link: the row is unknown or belongs to another tenant
+	// (invisible under this tenant's scope). The read repo returns it instead of
+	// (nil, nil) so the handler answers a typed 404, never a 500 or an empty 200.
+	ErrIntimationNotFound = apperr.NewNotFound("intimação não encontrada")
+
 	// ErrSyncRunNotFound — no sync_run matched an event_id lookup. On a re-delivery
 	// of an already-marked event the sync use case treats it defensively as a
 	// closed/absent run: a no-op ack, never a reopen.

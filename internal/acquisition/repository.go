@@ -68,6 +68,7 @@ type Repository interface {
 	// use case depends on the narrow readRepo view of these.
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
 	ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([]IntimacaoView, error)
+	GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error)
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
 	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
@@ -1056,6 +1057,43 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		})
 	}
 	return out, nil
+}
+
+// GetIntimacao reads one intimation by id on the pool for the FE deep-link, scoped by
+// tenant_id (isolation barrier 1). It mirrors the ListIntimacoes row→IntimacaoView
+// mapping (sqlc gives each query its own row type, so the projection maps in place). A
+// non-uuid :id is client input → the typed KindInvalid (→ 400); a miss — or a foreign
+// tenant's row — is the typed ErrIntimationNotFound (→ 404), never (nil, nil).
+func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return IntimacaoView{}, database.WrapInfra(err)
+	}
+	iid, err := uuid.Parse(id)
+	if err != nil {
+		return IntimacaoView{}, apperr.NewInvalid("id de intimação inválido")
+	}
+	row, err := r.q.GetIntimacao(ctx, acquisitiondb.GetIntimacaoParams{ID: iid, TenantID: tid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return IntimacaoView{}, ErrIntimationNotFound
+	}
+	if err != nil {
+		return IntimacaoView{}, database.WrapInfra(err)
+	}
+	return IntimacaoView{
+		ID:              row.ID.String(),
+		CNJNumber:       row.CnjNumber,
+		Court:           row.Court,
+		Degree:          row.Degree,
+		Type:            deref(row.Type),
+		Status:          row.Status,
+		Source:          row.Source,
+		SourceURL:       deref(row.SourceUrl),
+		MadeAvailableAt: row.MadeAvailableAt.Time,
+		PublishedAt:     row.PublishedAt.Time,
+		DeadlineStartAt: row.DeadlineStartAt.Time,
+		ContentPreview:  contentPreview(row.Content),
+	}, nil
 }
 
 // ListAndamentosByProcesso reads one process's docket entries (keyset-paginated,

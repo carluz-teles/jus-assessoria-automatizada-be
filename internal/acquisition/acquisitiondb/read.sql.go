@@ -111,6 +111,60 @@ func (q *Queries) CountProcessosMatchingSearch(ctx context.Context, arg CountPro
 	return count, err
 }
 
+const getIntimacao = `-- name: GetIntimacao :one
+SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
+       i.content, i.type, i.status, i.source, i.source_url,
+       cr.cnj_number, cr.court, cr.degree
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.id = $1 AND i.tenant_id = $2
+`
+
+type GetIntimacaoParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetIntimacaoRow struct {
+	ID              uuid.UUID   `json:"id"`
+	MadeAvailableAt pgtype.Date `json:"made_available_at"`
+	PublishedAt     pgtype.Date `json:"published_at"`
+	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
+	Content         string      `json:"content"`
+	Type            *string     `json:"type"`
+	Status          string      `json:"status"`
+	Source          string      `json:"source"`
+	SourceUrl       *string     `json:"source_url"`
+	CnjNumber       string      `json:"cnj_number"`
+	Court           string      `json:"court"`
+	Degree          string      `json:"degree"`
+}
+
+// One intimation by id, for the FE deep-link into the inbox detail (an intimation not
+// on the loaded list page). SAME projection as ListIntimacoes — the record's
+// number/court/degree joined in — so it maps to the same IntimacaoView. Scoped by
+// tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404 upstream,
+// never nil,nil). Read-only, off the write path.
+func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error) {
+	row := q.db.QueryRow(ctx, getIntimacao, arg.ID, arg.TenantID)
+	var i GetIntimacaoRow
+	err := row.Scan(
+		&i.ID,
+		&i.MadeAvailableAt,
+		&i.PublishedAt,
+		&i.DeadlineStartAt,
+		&i.Content,
+		&i.Type,
+		&i.Status,
+		&i.Source,
+		&i.SourceUrl,
+		&i.CnjNumber,
+		&i.Court,
+		&i.Degree,
+	)
+	return i, err
+}
+
 const getReconciliation = `-- name: GetReconciliation :one
 SELECT b.id, i.source, b.status, b.window_from, b.window_to,
        b.total_slices, b.slices_ok, b.slices_error, b.created_at AS started_at,

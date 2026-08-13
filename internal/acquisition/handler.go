@@ -29,6 +29,7 @@ type handlerUC interface {
 type reader interface {
 	Processos(ctx context.Context, q ProcessosQuery) (ProcessosResult, error)
 	Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error)
+	Intimacao(ctx context.Context, tenantID, id string) (IntimacaoView, error)
 	Andamentos(ctx context.Context, q AndamentosQuery) (AndamentosResult, error)
 	IntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error)
 	ImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
@@ -63,6 +64,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/processos/:id/andamentos", h.listAndamentos)
 	r.Get("/processos/:id/intimacoes", h.listIntimacoesByProcesso)
 	r.Get("/intimacoes", h.listIntimacoes)
+	r.Get("/intimacoes/:id", h.getIntimacao)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending processos scan
@@ -228,6 +230,20 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(newIntimacoesPage(res, limit))
+}
+
+// getIntimacao handles GET /v1/intimacoes/:id: one intimation for the FE deep-link (open
+// the detail of an intimation not on the loaded inbox page). The view is the whole
+// payload — one IntimacaoView, same shape as a list row — so it is returned without a
+// list envelope. tenant_id comes from the principal, never the path/body: a miss or a
+// foreign tenant's id is the read model's typed 404, a non-uuid id its typed 400.
+func (h *Handler) getIntimacao(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.Intimacao(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
 }
 
 // listAndamentos handles GET /v1/processos/:id/andamentos: the "Andamentos" tab of one

@@ -142,6 +142,12 @@ type Querier interface {
 	// so sqlc stays happy (it does not model multi-arg unnest).
 	GetCourtRecordsByKeys(ctx context.Context, arg GetCourtRecordsByKeysParams) ([]GetCourtRecordsByKeysRow, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
+	// One intimation by id, for the FE deep-link into the inbox detail (an intimation not
+	// on the loaded list page). SAME projection as ListIntimacoes — the record's
+	// number/court/degree joined in — so it maps to the same IntimacaoView. Scoped by
+	// tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404 upstream,
+	// never nil,nil). Read-only, off the write path.
+	GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error)
 	// The tenant's most recent backfill job — status + tallies — for the import-status
 	// read (the FE banner "importando seus processos…"). Newest job wins (a re-activation
 	// opens a new job). No job ever → no row; the read use case maps that to NONE (not

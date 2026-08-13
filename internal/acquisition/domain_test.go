@@ -194,6 +194,10 @@ func (m *mockRepo) ListIntimacoes(_ context.Context, _ IntimacoesQuery) ([]Intim
 	return nil, nil
 }
 
+func (m *mockRepo) GetIntimacao(_ context.Context, _, _ string) (IntimacaoView, error) {
+	return IntimacaoView{}, nil
+}
+
 func (m *mockRepo) CountProcessos(_ context.Context, _, _ string) (int64, int64, error) {
 	return 0, 0, nil
 }
