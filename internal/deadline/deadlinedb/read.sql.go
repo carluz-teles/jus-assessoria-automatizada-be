@@ -204,6 +204,63 @@ func (q *Queries) GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow
 	return i, err
 }
 
+const getPrazoSuggestContext = `-- name: GetPrazoSuggestContext :one
+SELECT d.kind, d.days, d.counting, d.notification_id,
+       cr.court, cr.degree, cr.class, cr.subject,
+       i.type AS intimation_type,
+       LEFT(i.content, 4000) AS intimation_text
+FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
+JOIN intimation i ON i.id = d.notification_id
+WHERE d.id = $1::uuid AND d.tenant_id = $2::uuid
+`
+
+type GetPrazoSuggestContextParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetPrazoSuggestContextRow struct {
+	Kind           *string   `json:"kind"`
+	Days           int32     `json:"days"`
+	Counting       string    `json:"counting"`
+	NotificationID uuid.UUID `json:"notification_id"`
+	Court          string    `json:"court"`
+	Degree         string    `json:"degree"`
+	Class          *string   `json:"class"`
+	Subject        *string   `json:"subject"`
+	IntimationType *string   `json:"intimation_type"`
+	IntimationText string    `json:"intimation_text"`
+}
+
+// The advisory CASE CONTEXT for one prazo — the input the AI "intimação → tarefas sugeridas"
+// read (suggest.go) feeds the versioned meta-prompt with. This is NOT a screen DTO (it never
+// serializes to the FE): it is an internal read that gathers, in one tenant-scoped hop, the
+// prazo's own signals (kind/days/counting) PLUS the richer context the composer specializes on —
+// the process's court/degree/class/subject (court_record) and the origin intimação's type + teor
+// (intimation). deadline.notification_id is NOT NULL (every prazo is born from an intimação), so
+// both JOINs are inner. The teor is truncated to a bound so a long (often HTML) intimação never
+// blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Tenant-
+// scoped (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at
+// the repo, never (nil, nil).
+func (q *Queries) GetPrazoSuggestContext(ctx context.Context, arg GetPrazoSuggestContextParams) (GetPrazoSuggestContextRow, error) {
+	row := q.db.QueryRow(ctx, getPrazoSuggestContext, arg.ID, arg.TenantID)
+	var i GetPrazoSuggestContextRow
+	err := row.Scan(
+		&i.Kind,
+		&i.Days,
+		&i.Counting,
+		&i.NotificationID,
+		&i.Court,
+		&i.Degree,
+		&i.Class,
+		&i.Subject,
+		&i.IntimationType,
+		&i.IntimationText,
+	)
+	return i, err
+}
+
 const getPrazosSummary = `-- name: GetPrazosSummary :one
 
 SELECT

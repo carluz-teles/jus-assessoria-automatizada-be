@@ -103,6 +103,26 @@ SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
 FROM deadline d
 WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid;
 
+-- name: GetPrazoSuggestContext :one
+-- The advisory CASE CONTEXT for one prazo — the input the AI "intimação → tarefas sugeridas"
+-- read (suggest.go) feeds the versioned meta-prompt with. This is NOT a screen DTO (it never
+-- serializes to the FE): it is an internal read that gathers, in one tenant-scoped hop, the
+-- prazo's own signals (kind/days/counting) PLUS the richer context the composer specializes on —
+-- the process's court/degree/class/subject (court_record) and the origin intimação's type + teor
+-- (intimation). deadline.notification_id is NOT NULL (every prazo is born from an intimação), so
+-- both JOINs are inner. The teor is truncated to a bound so a long (often HTML) intimação never
+-- blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Tenant-
+-- scoped (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at
+-- the repo, never (nil, nil).
+SELECT d.kind, d.days, d.counting, d.notification_id,
+       cr.court, cr.degree, cr.class, cr.subject,
+       i.type AS intimation_type,
+       LEFT(i.content, 4000) AS intimation_text
+FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
+JOIN intimation i ON i.id = d.notification_id
+WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid;
+
 -- ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
 -- The task agenda reads soonest-due first, but due_date is NULLABLE (an undated backlog
 -- task). Decisão travada: undated tasks sort LAST (a task with no date has no urgency, so it

@@ -39,10 +39,11 @@ type Suggestion struct {
 	Tasks          []SuggestedTask
 }
 
-// prazoReader is the narrow read the suggester needs — one prazo detail by id, tenant-scoped.
+// prazoReader is the narrow read the suggester needs — one prazo's advisory case context by id,
+// tenant-scoped (prazo signals + the process's court_record + the origin intimação's teor).
 // *ReadUseCase satisfies it, so the worker composes the existing read use case here.
 type prazoReader interface {
-	Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
+	SuggestContext(ctx context.Context, tenantID, id string) (PrazoSuggestContext, error)
 }
 
 // SuggestUseCase composes the meta-prompt for the case and calls the LLM. It depends only on
@@ -103,17 +104,24 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 		return Suggestion{Tasks: []SuggestedTask{}}, nil
 	}
 
-	prazo, err := uc.reader.Prazo(ctx, tenantID, prazoID)
+	prazo, err := uc.reader.SuggestContext(ctx, tenantID, prazoID)
 	if err != nil {
 		return Suggestion{}, err
 	}
 
+	// The richest signals — the process's court/degree/class/subject and the intimação's own teor —
+	// specialize the instruction-set (erd-ai-advisory.md §3). Any that come empty (a NULL column,
+	// an intimação without a type) the composer simply omits, so a sparse case still composes.
 	composed, err := uc.composer.Compose(advisory.AgentSuggestTasks, advisory.CaseContext{
-		PrazoKind: prazo.Kind,
-		PrazoDays: prazo.Days,
-		Counting:  prazo.Counting,
-		// Court/Class/IntimationType/IntimationText: richer signals are a later enhancement;
-		// the composer omits the empty ones, so v0 suggests from kind/days/counting.
+		Court:          prazo.Court,
+		Degree:         prazo.Degree,
+		Class:          prazo.Class,
+		Subject:        prazo.Subject,
+		IntimationType: prazo.IntimationType,
+		IntimationText: prazo.IntimationText,
+		PrazoKind:      prazo.Kind,
+		PrazoDays:      prazo.Days,
+		Counting:       prazo.Counting,
 	})
 	if err != nil {
 		return Suggestion{}, err

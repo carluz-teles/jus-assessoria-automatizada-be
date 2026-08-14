@@ -71,6 +71,26 @@ type PrazoDetailView struct {
 	Confirmed       bool      `json:"confirmed"`
 }
 
+// PrazoSuggestContext is the advisory case context the AI suggester (suggest.go) composes the
+// meta-prompt from — NOT a wire DTO (it never serializes to the FE). It carries the prazo's own
+// signals (Kind/Days/Counting) plus the richer context erd-ai-advisory.md §3 specializes on: the
+// process's Court/Degree/Class/Subject (court_record) and the origin intimação's Type + Text (the
+// truncated teor). IntimationID is kept for provenance capture. Class/Subject/IntimationType are
+// "" when NULL in the DB and IntimationText is "" only for an empty teor — the composer omits
+// whatever comes empty, so a sparse case degrades gracefully instead of producing dangling labels.
+type PrazoSuggestContext struct {
+	Kind           string
+	Days           int
+	Counting       string
+	IntimationID   string
+	Court          string
+	Degree         string
+	Class          string
+	Subject        string
+	IntimationType string
+	IntimationText string
+}
+
 // TaskView is one row of a task list — BOTH the process's Tasks tab (GET
 // /v1/processos/:id/tasks) and the global agenda (GET /v1/tasks, "meus prazos"). It is the
 // single wire shape for a task (the write handlers render it too, from the saved entity), so a
@@ -277,6 +297,10 @@ type readRepo interface {
 	ListPrazosByIntimacao(ctx context.Context, tenantID, intimationID string) ([]AgendaPrazoView, error)
 	CountPrazos(ctx context.Context, q PrazosQuery) (totalCount, total int64, err error)
 	GetPrazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
+	// GetPrazoSuggestContext reads the advisory case context for one prazo (the AI suggester's
+	// dedicated read: prazo signals + court_record + intimação teor), scoped to tenantID (barrier
+	// 1). A miss is the typed ErrDeadlineNotFound (→ 404).
+	GetPrazoSuggestContext(ctx context.Context, tenantID, id string) (PrazoSuggestContext, error)
 	ListTasksByProcesso(ctx context.Context, q TasksByProcessoQuery) ([]TaskView, error)
 	CountTasksByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	ListTasks(ctx context.Context, q TasksQuery) ([]TaskView, error)
@@ -385,6 +409,14 @@ func (uc *ReadUseCase) PrazosByIntimacao(ctx context.Context, tenantID, intimati
 // 404) when the id resolves to no row in the tenant.
 func (uc *ReadUseCase) Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error) {
 	return uc.repo.GetPrazo(ctx, tenantID, id)
+}
+
+// SuggestContext returns the advisory case context the AI suggester composes the meta-prompt from
+// (prazo signals + the process's court_record + the origin intimação's teor), or the repo's typed
+// ErrDeadlineNotFound (→ 404) when the id resolves to no row in the tenant. A thin pass-through
+// (no pagination): it is a single tenant-scoped read.
+func (uc *ReadUseCase) SuggestContext(ctx context.Context, tenantID, id string) (PrazoSuggestContext, error) {
+	return uc.repo.GetPrazoSuggestContext(ctx, tenantID, id)
 }
 
 // TasksByProcesso returns up to q.Limit of a process's tasks (soonest due first, undated last),

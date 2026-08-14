@@ -32,6 +32,9 @@ type recordingReadRepo struct {
 	lastGetTID string
 	lastGetID  string
 
+	suggestContext PrazoSuggestContext
+	suggestErr     error
+
 	tasksByProcRows  []TaskView
 	tasksByProcTotal int64
 	lastTasksByProcQ TasksByProcessoQuery
@@ -81,6 +84,11 @@ func (r *recordingReadRepo) CountPrazos(_ context.Context, q PrazosQuery) (int64
 func (r *recordingReadRepo) GetPrazo(_ context.Context, tenantID, id string) (PrazoDetailView, error) {
 	r.lastGetTID, r.lastGetID = tenantID, id
 	return r.detailView, r.detailErr
+}
+
+func (r *recordingReadRepo) GetPrazoSuggestContext(_ context.Context, tenantID, id string) (PrazoSuggestContext, error) {
+	r.lastGetTID, r.lastGetID = tenantID, id
+	return r.suggestContext, r.suggestErr
 }
 
 func (r *recordingReadRepo) ListTasksByProcesso(_ context.Context, q TasksByProcessoQuery) ([]TaskView, error) {

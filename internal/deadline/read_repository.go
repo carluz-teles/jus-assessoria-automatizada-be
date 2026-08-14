@@ -289,6 +289,43 @@ func (r *pgReadRepository) GetPrazo(ctx context.Context, tenantID, id string) (P
 	}, nil
 }
 
+// GetPrazoSuggestContext reads the advisory case context for one prazo on the pool, filtered by
+// tenant_id (barrier 1): the prazo's own signals plus the process's court_record and the origin
+// intimação's type + truncated teor. A miss — or a foreign tenant's row — maps to the typed
+// ErrDeadlineNotFound (→ 404), never (nil, nil). The mapper derefs the nullable columns
+// (kind/class/subject/type) to "" so an absent signal drops out of the composed prompt.
+func (r *pgReadRepository) GetPrazoSuggestContext(ctx context.Context, tenantID, id string) (PrazoSuggestContext, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return PrazoSuggestContext{}, err
+	}
+	pid, err := parseUUID(id)
+	if err != nil {
+		return PrazoSuggestContext{}, err
+	}
+
+	row, err := r.q.GetPrazoSuggestContext(ctx, deadlinedb.GetPrazoSuggestContextParams{ID: pid, TenantID: tid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PrazoSuggestContext{}, ErrDeadlineNotFound
+	}
+	if err != nil {
+		return PrazoSuggestContext{}, database.WrapInfra(err)
+	}
+
+	return PrazoSuggestContext{
+		Kind:           derefString(row.Kind),
+		Days:           int(row.Days),
+		Counting:       row.Counting,
+		IntimationID:   row.NotificationID.String(),
+		Court:          row.Court,
+		Degree:         row.Degree,
+		Class:          derefString(row.Class),
+		Subject:        derefString(row.Subject),
+		IntimationType: derefString(row.IntimationType),
+		IntimationText: row.IntimationText,
+	}, nil
+}
+
 // ListTasksByProcesso reads one process's tasks (ascending keyset by the coalesced due_date,
 // soonest first / undated last) on the pool, filtered by tenant_id and court_record_id. The
 // caller passes the min sentinel cursor for the first page.
