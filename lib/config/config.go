@@ -132,7 +132,7 @@ type Config struct {
 	// strong pra peça). Opcional no agregado — o adapter valida a chave no ponto de uso (Generate
 	// devolve Invalid) e o binário que não gera não morre por falta dela.
 	OpenRouterAPIKey  string `env:"OPENROUTER_API_KEY"`
-	OpenRouterModel   string `env:"OPENROUTER_MODEL" envDefault:"mistralai/mistral-small-24b-instruct-2501"`
+	OpenRouterModel   string `env:"OPENROUTER_MODEL" envDefault:"openai/gpt-4o-mini"`
 	OpenRouterBaseURL string `env:"OPENROUTER_BASE_URL" envDefault:"https://openrouter.ai/api/v1"`
 
 	// Calendário de prazos.

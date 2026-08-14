@@ -244,7 +244,7 @@ func newAppWithWriter(rd reader, wr writer, tenant string) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{tenant: tenant}))
-	NewHandler(rd, wr).RegisterV1(v1)
+	NewHandler(rd, wr, nil).RegisterV1(v1)
 	return app
 }
 

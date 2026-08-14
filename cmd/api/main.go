@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
@@ -29,6 +30,7 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
+	"github.com/jusassessoria/platform/lib/llm"
 	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/storage"
 	"github.com/jusassessoria/platform/lib/telemetry"
@@ -150,9 +152,25 @@ func run(logger *slog.Logger) error {
 		deadline.NewDedup(),
 		uow,
 	)
+	deadlineReadUC := deadline.NewReadUseCase(deadline.NewReadRepository(pool))
+	// AI task suggestion (on-demand): the meta-prompt composer + the LLM generator (OpenRouter),
+	// injected into a read-side use case. The generator is OPTIONAL — nil when OPENROUTER_API_KEY
+	// is unset, so the endpoint returns no suggestions and the F2 form still works (no boot fail).
+	var taskGenerator llm.Generator
+	if cfg.OpenRouterAPIKey != "" {
+		g, err := llm.NewOpenRouterGenerator(cfg.OpenRouterAPIKey, cfg.OpenRouterBaseURL, cfg.OpenRouterModel, nil)
+		if err != nil {
+			return fmt.Errorf("init openrouter generator: %w", err)
+		}
+		taskGenerator = g
+	} else {
+		logger.Warn("OPENROUTER_API_KEY unset — AI task suggestions disabled (F2 works, no pre-fill)")
+	}
+	deadlineSuggestUC := deadline.NewSuggestUseCase(deadlineReadUC, advisory.NewTemplateComposer(), taskGenerator)
 	deadlineHandler := deadline.NewHandler(
-		deadline.NewReadUseCase(deadline.NewReadRepository(pool)),
+		deadlineReadUC,
 		deadlineWriteUC,
+		deadlineSuggestUC,
 	)
 
 	// Billing wiring: the slice owns the domain; the binary only assembles it

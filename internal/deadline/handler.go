@@ -53,15 +53,24 @@ type writer interface {
 // Handler is the deadline HTTP surface. It owns its routing; the api only composes by
 // calling RegisterV1.
 type Handler struct {
-	reader reader
-	writer writer
+	reader    reader
+	writer    writer
+	suggester suggester
 }
 
-// NewHandler wires the handler to the prazos read use case and the F2 confirmation write
-// use case. Both are injected as narrow ports so the binary composes them (the api mounts
-// this handler once) and tests substitute fakes.
-func NewHandler(reader reader, writer writer) *Handler {
-	return &Handler{reader: reader, writer: writer}
+// suggester is the narrow port for the on-demand AI task suggestion (GET
+// /prazos/:id/suggested-tasks). OPTIONAL — nil when the LLM is unconfigured — so the endpoint
+// returns an empty list instead of failing, and the F2 form still works.
+type suggester interface {
+	SuggestTasks(ctx context.Context, tenantID, prazoID string) ([]SuggestedTask, error)
+}
+
+// NewHandler wires the handler to the prazos read use case, the F2 confirmation write use
+// case, and the (optional) AI task suggester. All are injected as narrow ports so the binary
+// composes them (the api mounts this handler once) and tests substitute fakes. suggester may
+// be nil when OpenRouter is unconfigured.
+func NewHandler(reader reader, writer writer, suggester suggester) *Handler {
+	return &Handler{reader: reader, writer: writer, suggester: suggester}
 }
 
 // RegisterV1 mounts the prazos routes on the /v1 group: three reads open to any
@@ -76,6 +85,8 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	// never captures "summary" as an :id (static beats param at the same depth by declaration order).
 	r.Get("/prazos/summary", h.getPrazosSummary)
 	r.Get("/prazos/:id", h.getPrazo)
+	// AI task suggestion (on-demand): pre-fills the F2 form. Deeper path than /prazos/:id.
+	r.Get("/prazos/:id/suggested-tasks", h.getSuggestedTasks)
 	r.Post("/prazos/confirm", h.confirmPrazo)
 	r.Patch("/prazos/:id", h.adjustPrazo)
 	r.Post("/prazos/:id/met", h.markPrazoMet)
@@ -192,6 +203,32 @@ func (h *Handler) getPrazo(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// suggestedTasksResponse is the endpoint body: the pinned {suggested_tasks:[{title,kind}]} the
+// FE reads to pre-fill the F2 form.
+type suggestedTasksResponse struct {
+	SuggestedTasks []SuggestedTask `json:"suggested_tasks"`
+}
+
+// getSuggestedTasks handles GET /v1/prazos/:id/suggested-tasks: the on-demand AI suggestions
+// that pre-fill the F2 "Aprovar tudo" form. When the suggester is unconfigured (no LLM key) it
+// returns an empty list (200) — the form still opens and the lawyer types the tasks. A missing/
+// foreign prazo → the use case's ErrDeadlineNotFound → 404; an LLM fault is surfaced typed.
+// tenant_id comes from the verified principal.
+func (h *Handler) getSuggestedTasks(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	if h.suggester == nil {
+		return c.Status(fiber.StatusOK).JSON(suggestedTasksResponse{SuggestedTasks: []SuggestedTask{}})
+	}
+	tasks, err := h.suggester.SuggestTasks(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if tasks == nil {
+		tasks = []SuggestedTask{}
+	}
+	return c.Status(fiber.StatusOK).JSON(suggestedTasksResponse{SuggestedTasks: tasks})
 }
 
 // confirmPrazo handles POST /v1/prazos/confirm: the F2 "Aprovar tudo" (§9). It validates
