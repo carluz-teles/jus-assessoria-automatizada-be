@@ -153,6 +153,30 @@ func (q *Queries) GetCourtRecordCourt(ctx context.Context, arg GetCourtRecordCou
 	return court, err
 }
 
+const getDeadlineEndDate = `-- name: GetDeadlineEndDate :one
+SELECT end_date
+FROM deadline
+WHERE id = $1 AND tenant_id = $2
+`
+
+type GetDeadlineEndDateParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Read ONLY a prazo's end_date by id, scoped to tenant_id (barrier 1, on top of RLS barrier 2).
+// The task write path (POST /v1/tasks, PATCH /v1/tasks/:id) reads it inside its tx to enforce
+// ERD §4's task invariant: a task's due_date cannot fall after its prazo's end_date. It is a
+// deliberately narrow read (one column) — the caller needs the end_date alone, not the whole
+// prazo. A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper,
+// never (zero, nil). $1 = id, $2 = tenant_id.
+func (q *Queries) GetDeadlineEndDate(ctx context.Context, arg GetDeadlineEndDateParams) (pgtype.Date, error) {
+	row := q.db.QueryRow(ctx, getDeadlineEndDate, arg.ID, arg.TenantID)
+	var end_date pgtype.Date
+	err := row.Scan(&end_date)
+	return end_date, err
+}
+
 const getDeadlineForAdjust = `-- name: GetDeadlineForAdjust :one
 SELECT id, court_record_id, start_date, status, kind, days, counting, doubled, doubled_reason
 FROM deadline
@@ -339,7 +363,7 @@ func (q *Queries) GetTaskForTransition(ctx context.Context, arg GetTaskForTransi
 }
 
 const getTaskForUpdate = `-- name: GetTaskForUpdate :one
-SELECT id, status, title, description, kind, due_date, assignee_user_id
+SELECT id, status, title, description, kind, due_date, assignee_user_id, deadline_id
 FROM task
 WHERE id = $1 AND tenant_id = $2
 `
@@ -357,6 +381,7 @@ type GetTaskForUpdateRow struct {
 	Kind           *string     `json:"kind"`
 	DueDate        pgtype.Date `json:"due_date"`
 	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+	DeadlineID     pgtype.UUID `json:"deadline_id"`
 }
 
 // Load a task's editable state — the manual ajuste (§9: PATCH /v1/tasks/:id) reads it BEFORE
@@ -364,7 +389,9 @@ type GetTaskForUpdateRow struct {
 // replace). Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A
 // missing id in the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper (→ 404),
 // never (nil, nil). $1 = id, $2 = tenant_id (from the principal). status is carried for the
-// caller even though PATCH never changes it (edit is orthogonal to the lifecycle).
+// caller even though PATCH never changes it (edit is orthogonal to the lifecycle). deadline_id
+// is carried so the edit can enforce ERD §4's due_date ≤ end_date invariant when it touches
+// the task's own date.
 func (q *Queries) GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdateParams) (GetTaskForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getTaskForUpdate, arg.ID, arg.TenantID)
 	var i GetTaskForUpdateRow
@@ -376,6 +403,7 @@ func (q *Queries) GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdatePara
 		&i.Kind,
 		&i.DueDate,
 		&i.AssigneeUserID,
+		&i.DeadlineID,
 	)
 	return i, err
 }

@@ -143,12 +143,14 @@ type CreateTaskRequest struct {
 }
 
 // Validate enforces the edge rules: a non-empty title, a well-formed optional due_date (empty is
-// allowed — a task may be undated), and well-formed optional uuids for the context FKs + assignee
+// allowed — a task may be undated), a well-formed optional kind (empty = uncategorized, a present
+// non-empty one must be a TaskKind), and well-formed optional uuids for the context FKs + assignee
 // (empty = absent). A failure is a 400 at the edge (KindInvalid) via httpx.WriteValidationError.
 func (r CreateTaskRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Title, validation.Required),
 		validation.Field(&r.DueDate, validation.Date(time.DateOnly)),
+		validation.Field(&r.Kind, validation.By(validTaskKindRule)),
 		validation.Field(&r.CourtRecordID, validation.By(uuidIfPresent)),
 		validation.Field(&r.DeadlineID, validation.By(uuidIfPresent)),
 		validation.Field(&r.IntimationID, validation.By(uuidIfPresent)),
@@ -188,14 +190,15 @@ type UpdateTaskRequest struct {
 }
 
 // Validate enforces the edge rules for the fields that ARE present (a nil field is a no-op): a
-// present title must be non-empty, a present due_date must be a wire date or "" (clear), and a
-// present assignee must be a uuid or "" (unassign). The rules are custom (validation.By) rather
-// than ozzo's built-ins because those skip a nil pointer AND a present zero — here a PRESENT
-// title must not be blank.
+// present title must be non-empty, a present due_date must be a wire date or "" (clear), a present
+// kind must be a TaskKind or "" (clear), and a present assignee must be a uuid or "" (unassign).
+// The rules are custom (validation.By) rather than ozzo's built-ins because those skip a nil
+// pointer AND a present zero — here a PRESENT title must not be blank.
 func (r UpdateTaskRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Title, validation.By(nonEmptyIfPresent)),
 		validation.Field(&r.DueDate, validation.By(wireDateOrClearIfPresent)),
+		validation.Field(&r.Kind, validation.By(validTaskKindIfPresent)),
 		validation.Field(&r.AssigneeUserID, validation.By(uuidOrClearIfPresent)),
 	)
 }
@@ -314,6 +317,33 @@ func uuidOrClearIfPresent(value any) error {
 	}
 	if _, err := uuid.Parse(*s); err != nil {
 		return errors.New("must be a valid uuid")
+	}
+	return nil
+}
+
+// validTaskKindRule rejects a PRESENT, non-empty task kind outside the closed TaskKind set
+// (entity.go); an empty value is a no-op (an uncategorized task). It backs the CREATE body.
+func validTaskKindRule(value any) error {
+	s, _ := value.(string)
+	if s == "" {
+		return nil
+	}
+	if !validTaskKind(s) {
+		return errors.New("must be one of ANALISE, PECA, PROTOCOLO, PROVIDENCIA, CIENCIA")
+	}
+	return nil
+}
+
+// validTaskKindIfPresent accepts an absent (nil) kind, a present "" (clear the kind), or a present
+// valid TaskKind; anything else is a client error. It is the pointer counterpart of
+// validTaskKindRule, backing the PATCH body.
+func validTaskKindIfPresent(value any) error {
+	s, ok := value.(*string)
+	if !ok || s == nil || *s == "" {
+		return nil
+	}
+	if !validTaskKind(*s) {
+		return errors.New("must be one of ANALISE, PECA, PROTOCOLO, PROVIDENCIA, CIENCIA")
 	}
 	return nil
 }

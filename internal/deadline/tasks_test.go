@@ -23,7 +23,7 @@ func TestCreateTask_InsertsManualOpenAndEmits(t *testing.T) {
 	assignee := uuid.NewString()
 	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
 
-	repo := &mockRepo{}
+	repo := &mockRepo{deadlineEndDate: time.Date(2024, 3, 31, 0, 0, 0, 0, time.UTC)}
 	outbox := &fakeOutbox{}
 	uow := &fakeUOW{}
 	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, uow)
@@ -92,6 +92,80 @@ func TestCreateTask_AvulsaTaskHasNoContext(t *testing.T) {
 	}
 	if len(publishedOfType[TaskCreated](outbox)) != 1 {
 		t.Error("task.created not emitted for an avulsa task")
+	}
+}
+
+// TestCreateTask_DueDateWithinDeadline is the happy path of the task invariant (ERD §4): a task
+// linked to a prazo whose due_date is on/before the prazo's end_date inserts normally and emits
+// task.created. The narrow GetDeadlineEndDate read happens inside the tx, tenant-scoped.
+func TestCreateTask_DueDateWithinDeadline(t *testing.T) {
+	tenantID := uuid.NewString()
+	deadlineID := uuid.NewString()
+	end := time.Date(2024, 3, 20, 0, 0, 0, 0, time.UTC)
+	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{deadlineEndDate: end}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if _, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: tenantID, UserID: uuid.NewString(), DeadlineID: deadlineID,
+		Title: "Peça", DueDate: &due,
+	}); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if repo.deadlineEndDateCalls != 1 || repo.gotDeadlineEndDateID != deadlineID || repo.gotDeadlineEndDateTenant != tenantID {
+		t.Errorf("GetDeadlineEndDate calls/id/tenant = %d/%q/%q, want 1/%q/%q",
+			repo.deadlineEndDateCalls, repo.gotDeadlineEndDateID, repo.gotDeadlineEndDateTenant, deadlineID, tenantID)
+	}
+	if repo.insertTaskCalls != 1 || len(publishedOfType[TaskCreated](outbox)) != 1 {
+		t.Errorf("InsertTask/published = %d/%d, want 1/1", repo.insertTaskCalls, len(publishedOfType[TaskCreated](outbox)))
+	}
+}
+
+// TestCreateTask_DueDateAfterDeadlineEnd rejects a task whose due_date falls AFTER the prazo's
+// end_date (ERD §4): the write is refused BEFORE persisting — nothing inserts, nothing emits —
+// with a typed KindInvalid (→ 400) reporting the offending dates.
+func TestCreateTask_DueDateAfterDeadlineEnd(t *testing.T) {
+	end := time.Date(2024, 3, 20, 0, 0, 0, 0, time.UTC)
+	due := time.Date(2024, 3, 25, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{deadlineEndDate: end}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	_, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: uuid.NewString(), UserID: uuid.NewString(), DeadlineID: uuid.NewString(),
+		Title: "Peça", DueDate: &due,
+	})
+	ae, ok := apperr.From(err)
+	if !ok || ae.Kind != apperr.KindInvalid {
+		t.Errorf("error = %v, want KindInvalid", err)
+	}
+	if repo.insertTaskCalls != 0 || len(outbox.published) != 0 {
+		t.Errorf("insert/published = %d/%d, want 0/0 on a refused write", repo.insertTaskCalls, len(outbox.published))
+	}
+}
+
+// TestCreateTask_DanglingDeadlineID fails the write: a task pointing at a deadline that is
+// missing/foreign surfaces the repo's typed ErrDeadlineNotFound — a dangling deadline_id is a
+// hard fault, never a silent acceptance.
+func TestCreateTask_DanglingDeadlineID(t *testing.T) {
+	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	repo := &mockRepo{deadlineEndDateErr: ErrDeadlineNotFound}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	_, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: uuid.NewString(), UserID: uuid.NewString(), DeadlineID: uuid.NewString(),
+		Title: "Peça", DueDate: &due,
+	})
+	ae, ok := apperr.From(err)
+	if !ok || ae.Kind != apperr.KindNotFound {
+		t.Errorf("error = %v, want KindNotFound", err)
+	}
+	if repo.insertTaskCalls != 0 || len(outbox.published) != 0 {
+		t.Errorf("insert/published = %d/%d, want 0/0", repo.insertTaskCalls, len(outbox.published))
 	}
 }
 
@@ -203,6 +277,71 @@ func TestUpdateTask_NotFound(t *testing.T) {
 	}
 	if repo.updateTaskCalls != 0 || len(outbox.published) != 0 {
 		t.Errorf("update/published = %d/%d, want 0/0 on not-found", repo.updateTaskCalls, len(outbox.published))
+	}
+}
+
+// TestUpdateTask_DueDateWithinDeadline proves PATCH can move a task's due_date anywhere on/before
+// its prazo's end_date: the merged date is validated against the prazo's end_date (ERD §4) and the
+// update proceeds, emitting task.updated. The deadline read is keyed by the task's OWN stored
+// deadline_id, not the body.
+func TestUpdateTask_DueDateWithinDeadline(t *testing.T) {
+	tenantID := uuid.NewString()
+	taskID := uuid.NewString()
+	deadlineID := uuid.NewString()
+	end := time.Date(2024, 3, 20, 0, 0, 0, 0, time.UTC)
+	due := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{
+		taskForUpdate: &TaskForUpdate{
+			ID: taskID, Status: TaskStatusOpen, Title: "antigo", Kind: "PECA", DeadlineID: deadlineID,
+		},
+		deadlineEndDate: end,
+		updatedTask:     &Task{ID: taskID, Title: "antigo", Status: TaskStatusOpen, Source: SourceManual},
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	dueWire := due.Format("2006-01-02")
+	if _, err := uc.UpdateTask(context.Background(), UpdateTaskCommand{
+		TenantID: tenantID, TaskID: taskID, DueDate: &dueWire,
+	}); err != nil {
+		t.Fatalf("UpdateTask() error = %v", err)
+	}
+	if repo.deadlineEndDateCalls != 1 || repo.gotDeadlineEndDateID != deadlineID || repo.gotDeadlineEndDateTenant != tenantID {
+		t.Errorf("GetDeadlineEndDate calls/id/tenant = %d/%q/%q, want 1/%q/%q",
+			repo.deadlineEndDateCalls, repo.gotDeadlineEndDateID, repo.gotDeadlineEndDateTenant, deadlineID, tenantID)
+	}
+	if repo.updateTaskCalls != 1 || len(publishedOfType[TaskUpdated](outbox)) != 1 {
+		t.Errorf("UpdateTask/published = %d/%d, want 1/1", repo.updateTaskCalls, len(publishedOfType[TaskUpdated](outbox)))
+	}
+}
+
+// TestUpdateTask_DueDateAfterDeadlineEnd rejects a PATCH that moves the task's due_date past its
+// prazo's end_date: nothing updates, nothing emits, with a typed KindInvalid (→ 400).
+func TestUpdateTask_DueDateAfterDeadlineEnd(t *testing.T) {
+	deadlineID := uuid.NewString()
+	end := time.Date(2024, 3, 20, 0, 0, 0, 0, time.UTC)
+	due := time.Date(2024, 3, 25, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{
+		taskForUpdate: &TaskForUpdate{
+			ID: uuid.NewString(), Status: TaskStatusOpen, Title: "antigo", Kind: "PECA", DeadlineID: deadlineID,
+		},
+		deadlineEndDate: end,
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	dueWire := due.Format("2006-01-02")
+	_, err := uc.UpdateTask(context.Background(), UpdateTaskCommand{
+		TenantID: uuid.NewString(), TaskID: uuid.NewString(), DueDate: &dueWire,
+	})
+	ae, ok := apperr.From(err)
+	if !ok || ae.Kind != apperr.KindInvalid {
+		t.Errorf("error = %v, want KindInvalid", err)
+	}
+	if repo.updateTaskCalls != 0 || len(outbox.published) != 0 {
+		t.Errorf("update/published = %d/%d, want 0/0", repo.updateTaskCalls, len(outbox.published))
 	}
 }
 

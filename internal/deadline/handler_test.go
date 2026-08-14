@@ -1187,6 +1187,7 @@ func TestHandler_CreateTask_Validation_400(t *testing.T) {
 		{"missing title", `{"description":"x"}`},
 		{"bad due_date", `{"title":"x","due_date":"01/02/2024"}`},
 		{"bad deadline id", `{"title":"x","deadline_id":"not-a-uuid"}`},
+		{"bad kind", `{"title":"x","kind":"OUTRO_ENUM"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1246,6 +1247,7 @@ func TestHandler_UpdateTask_Validation_400(t *testing.T) {
 		{"blank title", `{"title":""}`},
 		{"bad due_date", `{"due_date":"2024/03/15"}`},
 		{"bad assignee", `{"assignee_user_id":"nope"}`},
+		{"bad kind", `{"kind":"OUTRO_ENUM"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

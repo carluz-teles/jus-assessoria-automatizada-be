@@ -128,8 +128,10 @@ RETURNING id;
 -- replace). Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A
 -- missing id in the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper (→ 404),
 -- never (nil, nil). $1 = id, $2 = tenant_id (from the principal). status is carried for the
--- caller even though PATCH never changes it (edit is orthogonal to the lifecycle).
-SELECT id, status, title, description, kind, due_date, assignee_user_id
+-- caller even though PATCH never changes it (edit is orthogonal to the lifecycle). deadline_id
+-- is carried so the edit can enforce ERD §4's due_date ≤ end_date invariant when it touches
+-- the task's own date.
+SELECT id, status, title, description, kind, due_date, assignee_user_id, deadline_id
 FROM task
 WHERE id = $1 AND tenant_id = $2;
 
@@ -309,6 +311,17 @@ RETURNING id;
 -- ErrDeadlineNotFound at the mapper, never (nil, nil). $1 = id, $2 = tenant_id, both from
 -- the trusted scheduled-event payload.
 SELECT id, status, end_date, court_record_id, kind, counting
+FROM deadline
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: GetDeadlineEndDate :one
+-- Read ONLY a prazo's end_date by id, scoped to tenant_id (barrier 1, on top of RLS barrier 2).
+-- The task write path (POST /v1/tasks, PATCH /v1/tasks/:id) reads it inside its tx to enforce
+-- ERD §4's task invariant: a task's due_date cannot fall after its prazo's end_date. It is a
+-- deliberately narrow read (one column) — the caller needs the end_date alone, not the whole
+-- prazo. A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper,
+-- never (zero, nil). $1 = id, $2 = tenant_id.
+SELECT end_date
 FROM deadline
 WHERE id = $1 AND tenant_id = $2;
 

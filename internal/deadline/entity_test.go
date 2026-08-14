@@ -71,3 +71,37 @@ func TestDeriveDisplayStatus_FourCases(t *testing.T) {
 		})
 	}
 }
+
+// --- TaskKind (the closed task taxonomy) --------------------------------------
+
+// TestValidTaskKind proves the closed TaskKind set: every constant is valid, the empty kind
+// (an uncategorized task) is valid, and anything outside — the old/foreign taxonomies, a
+// partial-match or a whitespace variant — is rejected. This is the guard that turns the
+// silent kind mismatch between the advisory taxonomy and the task write path into a loud 400.
+func TestValidTaskKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		kind string
+		want bool
+	}{
+		{string(TaskKindAnalise), true},
+		{string(TaskKindPeca), true},
+		{string(TaskKindProtocolo), true},
+		{string(TaskKindProvidencia), true},
+		{string(TaskKindCiencia), true},
+		{"", true}, // uncategorized task
+		{"OUTRO_ENUM", false},
+		{"REVIEW_DEADLINE", false}, // the removed confirm taxonomy
+		{"PECA ", false},           // no whitespace variant
+		{"peca", false},            // exact case only
+	}
+	for _, tt := range tests {
+		t.Run(tt.kind, func(t *testing.T) {
+			t.Parallel()
+			if got := validTaskKind(tt.kind); got != tt.want {
+				t.Errorf("validTaskKind(%q) = %v, want %v", tt.kind, got, tt.want)
+			}
+		})
+	}
+}

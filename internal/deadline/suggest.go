@@ -19,9 +19,10 @@ import (
 // the F2 form still works (the lawyer types the tasks manually).
 
 // SuggestedTask is one AI-suggested action for the F2 form: a short imperative title, a short
-// kind (ANALISE|PECA|PROTOCOLO|PROVIDENCIA|CIENCIA…) and a short actionable description. It
-// mirrors the task shape the form submits (POST /v1/tasks), so the FE drops each suggestion
-// straight into a task row.
+// kind and a short actionable description. It mirrors the task shape the form submits (POST
+// /v1/tasks), so the FE drops each suggestion straight into a task row. The kind carries the
+// closed TaskKind taxonomy (entity.go: ANALISE|PECA|PROTOCOLO|PROVIDENCIA|CIENCIA) — the same
+// set the advisory prompt constrains the model to and the task edge validation enforces.
 type SuggestedTask struct {
 	Title       string `json:"title"`
 	Kind        string `json:"kind"`

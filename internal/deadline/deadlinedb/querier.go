@@ -8,6 +8,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
@@ -66,6 +67,13 @@ type Querier interface {
 	// missing record → pgx.ErrNoRows → typed not-found at the mapper. court is NOT NULL.
 	// $1 = id, $2 = tenant_id, both from the trusted principal's request context.
 	GetCourtRecordCourt(ctx context.Context, arg GetCourtRecordCourtParams) (string, error)
+	// Read ONLY a prazo's end_date by id, scoped to tenant_id (barrier 1, on top of RLS barrier 2).
+	// The task write path (POST /v1/tasks, PATCH /v1/tasks/:id) reads it inside its tx to enforce
+	// ERD §4's task invariant: a task's due_date cannot fall after its prazo's end_date. It is a
+	// deliberately narrow read (one column) — the caller needs the end_date alone, not the whole
+	// prazo. A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper,
+	// never (zero, nil). $1 = id, $2 = tenant_id.
+	GetDeadlineEndDate(ctx context.Context, arg GetDeadlineEndDateParams) (pgtype.Date, error)
 	// Load a prazo's FULL adjustable state — the F2 ajuste manual (§9: PATCH /v1/prazos/:id)
 	// reads it BEFORE the recompute: start_date is the fixed anchor the calendar re-counts
 	// from, court_record_id feeds the court lookup (recompute UF), and the CURRENT
@@ -146,7 +154,9 @@ type Querier interface {
 	// replace). Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A
 	// missing id in the tenant → pgx.ErrNoRows → typed ErrTaskNotFound at the mapper (→ 404),
 	// never (nil, nil). $1 = id, $2 = tenant_id (from the principal). status is carried for the
-	// caller even though PATCH never changes it (edit is orthogonal to the lifecycle).
+	// caller even though PATCH never changes it (edit is orthogonal to the lifecycle). deadline_id
+	// is carried so the edit can enforce ERD §4's due_date ≤ end_date invariant when it touches
+	// the task's own date.
 	GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdateParams) (GetTaskForUpdateRow, error)
 	// Load a checklist item's current {title, done} before the partial PATCH (PATCH
 	// /v1/tasks/:id/items/:itemId), keyed by (item id, parent task id) and scoped to tenant_id

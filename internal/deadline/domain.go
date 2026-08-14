@@ -64,6 +64,12 @@ type Repository interface {
 	// so the confirm no longer owns the task lifecycle. Only the title is needed (the delta keys
 	// off title alone). A prazo with no tasks yields an empty slice, never an error.
 	ListTaskTitlesByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) ([]string, error)
+	// GetDeadlineEndDate reads ONLY a prazo's end_date by its id, scoped to tenantID (barrier 1).
+	// The task write path (POST/PATCH /v1/tasks) reads it inside its tx to enforce ERD §4's task
+	// invariant: a task's due_date cannot fall after its prazo's end_date. It is a deliberately
+	// narrow read — the caller needs the end_date alone, not the whole prazo. A missing id in the
+	// tenant is ErrDeadlineNotFound (→ 404), never (zero, nil).
+	GetDeadlineEndDate(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (time.Time, error)
 	// InsertTask persists one task inside the caller's tx and returns it with its DB-assigned
 	// id (echoing the entity, like InsertDeadline). Scoping is via the entity's TenantID + RLS.
 	// Reused by BOTH the F2 confirm (the N approved tasks) and the manual CREATE (POST /v1/tasks).

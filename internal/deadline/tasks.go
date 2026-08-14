@@ -2,8 +2,10 @@ package deadline
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
@@ -62,6 +64,7 @@ type TaskForUpdate struct {
 	Kind           string
 	DueDate        *time.Time
 	AssigneeUserID string
+	DeadlineID     string
 }
 
 // UpdateTaskParams is the repo port's input for the UpdateTask UPDATE — the merged editable
@@ -93,6 +96,9 @@ type TaskTransition struct {
 func (uc *UseCase) CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task, error) {
 	var created *Task
 	err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		if err := uc.validateTaskDueDate(ctx, tx, cmd.DeadlineID, cmd.TenantID, cmd.DueDate); err != nil {
+			return err
+		}
 		saved, err := uc.repo.InsertTask(ctx, tx, &Task{
 			TenantID:       cmd.TenantID,
 			CourtRecordID:  cmd.CourtRecordID,
@@ -158,6 +164,10 @@ func (uc *UseCase) UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task
 		dueDate := cur.DueDate
 		if cmd.DueDate != nil {
 			dueDate = parseOptionalWireDate(*cmd.DueDate) // "" → nil (clear), a wire date → set
+		}
+
+		if err := uc.validateTaskDueDate(ctx, tx, cur.DeadlineID, cmd.TenantID, dueDate); err != nil {
+			return err
 		}
 
 		saved, err := uc.repo.UpdateTask(ctx, tx, UpdateTaskParams{
@@ -252,4 +262,27 @@ func newTaskTransitionEvent(target TaskStatus, taskID string) events.Event {
 		return newTaskCompleted(taskID)
 	}
 	return newTaskDismissed(taskID)
+}
+
+// validateTaskDueDate enforces ERD §4's task invariant: a task linked to a prazo (DeadlineID)
+// cannot carry a due_date after that prazo's end_date. A nil dueDate (avulsa/undated task, or a
+// PATCH that clears the date) is a no-op. deadlineID empty means an avulsa task — no prazo bound,
+// so no check. A violation is a typed KindInvalid (→ 400), reported with the offending
+// values so the FE can point at the field. It runs INSIDE the caller's tx (the task write path
+// validates before persisting) and REUSES the narrow GetDeadlineEndDate read (a missing prazo is
+// the repo's typed ErrDeadlineNotFound — a dangling deadline_id is a hard fault, never a silent
+// acceptance).
+func (uc *UseCase) validateTaskDueDate(ctx context.Context, tx database.Tx, deadlineID, tenantID string, dueDate *time.Time) error {
+	if deadlineID == "" || dueDate == nil {
+		return nil
+	}
+	endDate, err := uc.repo.GetDeadlineEndDate(ctx, tx, deadlineID, tenantID)
+	if err != nil {
+		return err
+	}
+	if dueDate.After(endDate) {
+		return apperr.NewInvalid(fmt.Sprintf("task due_date %s is after the deadline end_date %s",
+			dueDate.Format(time.DateOnly), endDate.Format(time.DateOnly)))
+	}
+	return nil
 }

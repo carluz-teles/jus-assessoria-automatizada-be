@@ -89,7 +89,7 @@ type Task struct {
 	IntimationID   string
 	Title          string
 	Description    string
-	Kind           string
+	Kind           string // the TaskKind taxonomy (ANALISE|PECA|…); "" = uncategorized
 	DueDate        *time.Time // optional own date (≤ Deadline.EndDate when present)
 	Status         TaskStatus
 	Source         Source
@@ -108,6 +108,36 @@ const (
 	TaskStatusDone      TaskStatus = "DONE"
 	TaskStatusDismissed TaskStatus = "DISMISSED"
 )
+
+// TaskKind is the task category — the SINGLE source of truth for the taxonomy the
+// advisory sugere (internal/advisory prompt: ANALISE|PECA|PROTOCOLO|PROVIDENCIA|CIENCIA)
+// and the edge validation of task.kind (validation.go) both enforce. A task may carry no
+// kind at all (an avulsa/uncategorized task — kind is NULL in the DB), so the empty string
+// is legal; any NON-empty kind must be one of these. The enum is text + app validation,
+// mirroring the deadline kinds above (no DB CHECK, per the project convention).
+type TaskKind string
+
+const (
+	TaskKindAnalise     TaskKind = "ANALISE"
+	TaskKindPeca        TaskKind = "PECA"
+	TaskKindProtocolo   TaskKind = "PROTOCOLO"
+	TaskKindProvidencia TaskKind = "PROVIDENCIA"
+	TaskKindCiencia     TaskKind = "CIENCIA"
+)
+
+// validTaskKind reports whether a task kind is acceptable: one of the closed set, or the empty
+// kind (an uncategorized task — kind is NULL in the DB). The caller decides whether it wants to
+// require a kind at all; the edge rules treat "" as a no-op.
+func validTaskKind(k string) bool {
+	if k == "" {
+		return true
+	}
+	switch TaskKind(k) {
+	case TaskKindAnalise, TaskKindPeca, TaskKindProtocolo, TaskKindProvidencia, TaskKindCiencia:
+		return true
+	}
+	return false
+}
 
 // TaskItem is one checklist step of a task (docs/erd-prazos.md §4/§10, the Tarefas screen):
 // a small, orderable, tickable subtarefa ("Ler intimação", "Redigir", …). 1 task → N items

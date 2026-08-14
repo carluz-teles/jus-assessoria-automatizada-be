@@ -351,6 +351,7 @@ func (r *pgRepository) GetTaskForUpdate(ctx context.Context, tx database.Tx, tas
 		Kind:           derefString(row.Kind),
 		DueDate:        datePtr(row.DueDate),
 		AssigneeUserID: uuidText(row.AssigneeUserID),
+		DeadlineID:     uuidText(row.DeadlineID),
 	}, nil
 }
 
@@ -796,6 +797,34 @@ func (r *pgRepository) GetDeadlineForCheck(ctx context.Context, tx database.Tx, 
 		Kind:          derefString(row.Kind),
 		Counting:      Counting(row.Counting),
 	}, nil
+}
+
+// GetDeadlineEndDate reads ONLY a prazo's end_date inside the caller's tx, filtered by tenantID
+// (barrier 1). The task write path (POST/PATCH /v1/tasks) uses it to enforce ERD §4's task
+// invariant (a task's due_date cannot fall after its prazo's end_date). A missing id — or one in
+// another tenant — maps to the typed ErrDeadlineNotFound (never zero, nil); the mapper absorbs
+// the pgtype.Date so the use case sees a pure time.Time.
+func (r *pgRepository) GetDeadlineEndDate(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (time.Time, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	endDate, err := deadlinedb.New(tx).GetDeadlineEndDate(ctx, deadlinedb.GetDeadlineEndDateParams{
+		ID:       id,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrDeadlineNotFound
+	}
+	if err != nil {
+		return time.Time{}, database.WrapInfra(err)
+	}
+	return endDate.Time, nil
 }
 
 // MarkMissed auto-flips the prazo to MISSED inside the caller's tx, filtered by tenantID

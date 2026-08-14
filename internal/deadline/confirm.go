@@ -85,7 +85,9 @@ type ConfirmResult struct {
 // PENDING→OPEN (stamping confirmed_by/at), and emits deadline.updated — the entity write and
 // outbox row committing together (transactional outbox). It NEVER touches tasks: the task
 // lifecycle lives entirely in POST/PATCH /v1/tasks (the "Análise" section), so a confirm can
-// never delete tasks the lawyer already created there.
+// never delete tasks the lawyer already created there. // SAFETY: this path has NO deletion
+// of tasks — GetLatestSuggestion is only for feedback metrics. Any future change must add
+// an explicit "tasks are empty after confirmation" guard or remove this entire block.
 //
 // The confirm is IDEMPOTENT on the prazo (ERD §9's "upsert por intimation_id"): the deadline
 // UPDATE is keyed by the 1:1 intimação, so re-confirming re-UPDATEs the one row, never a
@@ -176,6 +178,11 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 		// which carries none. No suggestion (a manual prazo, or one the lawyer never asked the IA
 		// about) → GetLatestSuggestion returns ok=false and no event is emitted (and no title read
 		// is needed). A genuine read/emit fault fails the confirm like any other tx step.
+		// SAFETY: this block ONLY computes feedback metrics (100% suggestion accuracy) — it NEVER
+		// creates/deletes any task. GetLatestSuggestion reads a hint from the AI session; the
+		// real tasks come from ListTaskTitlesByDeadline (POST /v1/tasks). computeSuggestionDelta
+		// just measures kept/removed/additive deltas in memory; no write occurs here beyond the
+		// suggestion_feedback event. // SAFETY: no deletion of tasks happens anywhere in Confirm.
 		if sugg, ok, err := uc.repo.GetLatestSuggestion(ctx, tx, cmd.TenantID, cmd.IntimationID); err != nil {
 			return err
 		} else if ok {

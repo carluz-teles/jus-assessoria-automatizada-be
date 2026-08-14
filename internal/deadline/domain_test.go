@@ -71,6 +71,8 @@ type mockRepo struct {
 	// task write path (5b)
 	taskForUpdate     *TaskForUpdate
 	taskForUpdateErr  error
+	deadlineEndDate   time.Time
+	deadlineEndDateErr error
 	updatedTask       *Task
 	updateTaskErr     error
 	taskTransition    TaskStatus
@@ -130,6 +132,9 @@ type mockRepo struct {
 	gotTaskUpdateID       string
 	gotTaskUpdateTenantID string
 	taskForUpdateCalls    int
+	gotDeadlineEndDateID  string
+	gotDeadlineEndDateTenant string
+	deadlineEndDateCalls  int
 	gotUpdateTaskParams   UpdateTaskParams
 	updateTaskCalls       int
 	gotTaskTransitionID   string
@@ -198,6 +203,13 @@ func (m *mockRepo) GetDeadlineForCheck(_ context.Context, _ database.Tx, deadlin
 	m.gotCheckID = deadlineID
 	m.gotCheckTenantID = tenantID
 	return m.checkResult, m.checkErr
+}
+
+func (m *mockRepo) GetDeadlineEndDate(_ context.Context, _ database.Tx, deadlineID, tenantID string) (time.Time, error) {
+	m.gotDeadlineEndDateID = deadlineID
+	m.gotDeadlineEndDateTenant = tenantID
+	m.deadlineEndDateCalls++
+	return m.deadlineEndDate, m.deadlineEndDateErr
 }
 
 func (m *mockRepo) MarkMissed(_ context.Context, _ database.Tx, deadlineID, tenantID string) (string, error) {
