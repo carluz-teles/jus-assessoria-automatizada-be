@@ -251,6 +251,22 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 			return err
 		}
 
+		// Feedback loop (camada 2, erd-ai-advisory): if the IA suggested tasks for this prazo,
+		// measure the DELTA between what it suggested and what the human just confirmed
+		// (kept/removed/added) and emit it in the SAME tx — the fact commits atomically with the
+		// confirm. No suggestion (a manual prazo, or one the lawyer never asked the IA about) →
+		// GetLatestSuggestion returns ok=false and no event is emitted. A genuine read/emit fault
+		// fails the confirm like any other tx step (the tx is poisoned anyway); the common
+		// "no suggestion" case is NOT an error, so a manual prazo confirms unaffected.
+		if sugg, ok, err := uc.repo.GetLatestSuggestion(ctx, tx, cmd.TenantID, cmd.IntimationID); err != nil {
+			return err
+		} else if ok {
+			delta := computeSuggestionDelta(sugg, cmd.Tasks)
+			if err := uc.outbox.Publish(ctx, tx, newSuggestionFeedback(deadlineID, cmd.IntimationID, delta)); err != nil {
+				return err
+			}
+		}
+
 		// TODO(checklist-template): seed a default checklist (Ler intimação, Analisar documentos,
 		// Definir estratégia, Redigir, Revisar, Aprovar, Protocolar, Conferir) on the created tasks
 		// when kind is MANIFESTACAO/peça. DELIBERATELY NOT DONE here: the confirm has REPLACE (upsert)

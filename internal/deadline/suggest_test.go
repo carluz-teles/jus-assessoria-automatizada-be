@@ -2,6 +2,7 @@ package deadline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -29,10 +30,22 @@ func (f *fakeGen) GenerateJSON(_ context.Context, req llm.Request) ([]byte, erro
 	return f.out, f.err
 }
 
+type fakeStore struct {
+	got   SuggestionRecord
+	calls int
+	err   error
+}
+
+func (f *fakeStore) SaveSuggestion(_ context.Context, _ string, rec SuggestionRecord) (string, error) {
+	f.calls++
+	f.got = rec
+	return "sugg-id", f.err
+}
+
 // A nil generator (OpenRouter unconfigured) yields no suggestions and no error — the F2 form
 // still opens.
 func TestSuggestTasks_NilGenerator_Empty(t *testing.T) {
-	uc := NewSuggestUseCase(fakePrazoReader{}, advisory.NewTemplateComposer(), nil)
+	uc := NewSuggestUseCase(fakePrazoReader{}, advisory.NewTemplateComposer(), nil, nil, "")
 	tasks, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
@@ -48,7 +61,7 @@ func TestSuggestTasks_HappyPath(t *testing.T) {
 	gen := &fakeGen{out: []byte(`{"tasks":[{"title":"Redigir contestação","kind":"PECA"},{"title":"Protocolar","kind":"PROTOCOLO"}]}`)}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoDetailView{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
-		advisory.NewTemplateComposer(), gen,
+		advisory.NewTemplateComposer(), gen, nil, "",
 	)
 	tasks, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
@@ -66,9 +79,53 @@ func TestSuggestTasks_HappyPath(t *testing.T) {
 	}
 }
 
+// With a store configured, the suggester captures provenance (feedback loop, camada 1): the
+// exact suggested tasks, the composed prompt_version and the model, keyed to the prazo +
+// intimação — the raw material the confirm diffs against the human's choice.
+func TestSuggestTasks_PersistsProvenance(t *testing.T) {
+	gen := &fakeGen{out: []byte(`{"tasks":[{"title":"Redigir contestação","kind":"PECA"}]}`)}
+	store := &fakeStore{}
+	uc := NewSuggestUseCase(
+		fakePrazoReader{view: PrazoDetailView{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS", IntimationID: "int-1"}},
+		advisory.NewTemplateComposer(), gen, store, "openai/gpt-4o-mini",
+	)
+	if _, err := uc.SuggestTasks(context.Background(), "t", "prazo-1"); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("SaveSuggestion calls = %d, want 1", store.calls)
+	}
+	if store.got.DeadlineID != "prazo-1" || store.got.IntimationID != "int-1" {
+		t.Errorf("provenance ids = {%q, %q}, want {prazo-1, int-1}", store.got.DeadlineID, store.got.IntimationID)
+	}
+	if store.got.Model != "openai/gpt-4o-mini" || store.got.PromptVersion == "" {
+		t.Errorf("provenance model/version = {%q, %q}", store.got.Model, store.got.PromptVersion)
+	}
+	if len(store.got.Tasks) != 1 || store.got.Tasks[0].Title != "Redigir contestação" {
+		t.Errorf("persisted tasks = %+v", store.got.Tasks)
+	}
+}
+
+// A store fault must NOT break the F2: the suggestions still return (best-effort provenance).
+func TestSuggestTasks_StoreErrorIsNonFatal(t *testing.T) {
+	gen := &fakeGen{out: []byte(`{"tasks":[{"title":"Protocolar","kind":"PROTOCOLO"}]}`)}
+	store := &fakeStore{err: errors.New("db down")}
+	uc := NewSuggestUseCase(
+		fakePrazoReader{view: PrazoDetailView{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
+		advisory.NewTemplateComposer(), gen, store, "m",
+	)
+	tasks, err := uc.SuggestTasks(context.Background(), "t", "p")
+	if err != nil {
+		t.Fatalf("err = %v, want nil (store fault is non-fatal)", err)
+	}
+	if len(tasks) != 1 {
+		t.Errorf("tasks = %v, want the suggestion despite the store error", tasks)
+	}
+}
+
 // A missing prazo surfaces the read's typed not-found (→ 404 at the edge).
 func TestSuggestTasks_PrazoNotFound(t *testing.T) {
-	uc := NewSuggestUseCase(fakePrazoReader{err: ErrDeadlineNotFound}, advisory.NewTemplateComposer(), &fakeGen{})
+	uc := NewSuggestUseCase(fakePrazoReader{err: ErrDeadlineNotFound}, advisory.NewTemplateComposer(), &fakeGen{}, nil, "")
 	if _, err := uc.SuggestTasks(context.Background(), "t", "p"); err == nil {
 		t.Fatal("err = nil, want ErrDeadlineNotFound")
 	}

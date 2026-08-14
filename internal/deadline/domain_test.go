@@ -48,6 +48,12 @@ type mockRepo struct {
 	confirmErr       error
 	insertTaskErr    error
 
+	// feedback loop (suggestion delta at confirm, camada 2)
+	latestSuggestion      SuggestionRecord
+	latestSuggestionOK    bool
+	latestSuggestionErr   error
+	latestSuggestionCalls int
+
 	// adjust + manual transition path (5c)
 	adjustResult       *DeadlineForAdjust
 	adjustErr          error
@@ -178,6 +184,11 @@ func (m *mockRepo) RevokeDeadlineByIntimation(_ context.Context, _ database.Tx, 
 	m.gotRevokeIntimationID = intimationID
 	m.gotRevokeTenantID = tenantID
 	return m.revokeResult, m.revokeErr
+}
+
+func (m *mockRepo) GetLatestSuggestion(_ context.Context, _ database.Tx, _, _ string) (SuggestionRecord, bool, error) {
+	m.latestSuggestionCalls++
+	return m.latestSuggestion, m.latestSuggestionOK, m.latestSuggestionErr
 }
 
 func (m *mockRepo) GetDeadlineForCheck(_ context.Context, _ database.Tx, deadlineID, tenantID string) (*DeadlineForCheck, error) {

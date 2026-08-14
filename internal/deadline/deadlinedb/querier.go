@@ -99,6 +99,12 @@ type Querier interface {
 	// never (nil, nil): confirming an intimação with no derived prazo is a 404 at the edge.
 	// $1 = intimation_id (the notification_id column), $2 = tenant_id (from the principal).
 	GetDeadlineForConfirm(ctx context.Context, arg GetDeadlineForConfirmParams) (GetDeadlineForConfirmRow, error)
+	// Lê a sugestão MAIS RECENTE de um prazo, pela intimação 1:1 e escopada por tenant_id
+	// (barrier 1). O confirm (F2 "Aprovar tudo") a carrega para medir o DELTA entre o que a IA
+	// sugeriu e o que o humano confirmou. Sem sugestão (prazo manual, IA nunca usada) NÃO há
+	// linha → pgx.ErrNoRows → o use case trata como "sem feedback" (não emite evento). $1 =
+	// intimation_id, $2 = tenant_id.
+	GetLatestTaskSuggestion(ctx context.Context, arg GetLatestTaskSuggestionParams) (GetLatestTaskSuggestionRow, error)
 	// The audit/detail view of one prazo (GET /v1/prazos/:id): every field the "por quê"
 	// popover needs — the full holidays_applied, the rules_version that derived the days,
 	// the origin intimation_id, and start/end/days/counting/doubled. Tenant-scoped (barrier
@@ -174,6 +180,12 @@ type Querier interface {
 	// parent; position is the computed append slot. Returns the whole row so the handler renders
 	// it without a re-read. $1 = tenant_id, $2 = task_id, $3 = title, $4 = position.
 	InsertTaskItem(ctx context.Context, arg InsertTaskItemParams) (InsertTaskItemRow, error)
+	// Grava a proveniência de UMA rodada de sugestão da IA (feedback loop, camada 1). Chamada
+	// no caminho de LEITURA (GET /v1/prazos/:id/suggested-tasks), logo após o LLM devolver as
+	// tarefas: registra COM QUE prompt_version e COM QUE model foram geradas, e o payload exato
+	// (suggested jsonb: [{title, kind}, …]). É best-effort — uma falha aqui não quebra o F2.
+	// Retorna o id para log/telemetria. $1..$6 são as colunas na ordem do INSERT.
+	InsertTaskSuggestion(ctx context.Context, arg InsertTaskSuggestionParams) (uuid.UUID, error)
 	// The global agenda (GET /v1/prazos): the tenant's prazos, soonest vencimento first,
 	// with the process context (cnj_number/court) joined in. Optional filters: @status ('' =
 	// all) and an end_date window [@from_date, @to_date] (NULL = open bound). Ascending

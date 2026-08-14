@@ -366,3 +366,86 @@ func TestConfirm_TaskDueDateAfterEndDate(t *testing.T) {
 			repo.confirmCalls, repo.insertTaskCalls, len(outbox.published))
 	}
 }
+
+// TestConfirm_EmitsSuggestionFeedbackDelta proves the feedback loop's camada 2: when the
+// prazo had an AI suggestion, the confirm measures the delta between what the IA suggested
+// and what the human confirmed (kept/removed/added) and emits it as deadline.suggestion_feedback
+// in the SAME tx. Suggested {Protocolar contestação, Analisar sentença}; confirmed
+// {Protocolar contestação, Falar com cliente} → kept 1, removed 1, added 1.
+func TestConfirm_EmitsSuggestionFeedbackDelta(t *testing.T) {
+	p := newConfirmParents()
+	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)
+
+	repo := confirmRepo(p, start, "TJSP")
+	repo.latestSuggestionOK = true
+	repo.latestSuggestion = SuggestionRecord{
+		PromptVersion: "suggest_tasks/v1",
+		Model:         "openai/gpt-4o-mini",
+		Tasks: []SuggestedTask{
+			{Title: "Protocolar contestação", Kind: "PECA"},
+			{Title: "Analisar sentença", Kind: "ANALISE"},
+		},
+	}
+	cal := &fakeCalendar{endDate: end}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+
+	cmd := confirmCmd(p) // one task: "Protocolar contestação" (kept)
+	cmd.Tasks = append(cmd.Tasks, ConfirmTaskInput{Title: "Falar com cliente", Kind: "PROVIDENCIA"})
+
+	if _, err := uc.Confirm(context.Background(), cmd); err != nil {
+		t.Fatalf("Confirm() error = %v", err)
+	}
+	if repo.latestSuggestionCalls != 1 {
+		t.Fatalf("GetLatestSuggestion calls = %d, want 1", repo.latestSuggestionCalls)
+	}
+
+	fb := publishedOfType[SuggestionFeedback](outbox)
+	if len(fb) != 1 {
+		t.Fatalf("suggestion.feedback events = %d, want 1", len(fb))
+	}
+	f := fb[0]
+	if f.Type() != TypeSuggestionFeedback || f.AggregateType() != aggregateTypeDeadline || f.AggregateID() != p.deadlineID {
+		t.Errorf("feedback type/aggregate = %q/%q/%q", f.Type(), f.AggregateType(), f.AggregateID())
+	}
+	if f.PromptVersion != "suggest_tasks/v1" || f.Model != "openai/gpt-4o-mini" {
+		t.Errorf("feedback provenance = %q/%q", f.PromptVersion, f.Model)
+	}
+	if f.SuggestedCount != 2 || f.ConfirmedCount != 2 {
+		t.Errorf("feedback counts suggested/confirmed = %d/%d, want 2/2", f.SuggestedCount, f.ConfirmedCount)
+	}
+	if len(f.Kept) != 1 || f.Kept[0] != "Protocolar contestação" {
+		t.Errorf("kept = %v, want [Protocolar contestação]", f.Kept)
+	}
+	if len(f.Removed) != 1 || f.Removed[0] != "Analisar sentença" {
+		t.Errorf("removed = %v, want [Analisar sentença]", f.Removed)
+	}
+	if len(f.Added) != 1 || f.Added[0] != "Falar com cliente" {
+		t.Errorf("added = %v, want [Falar com cliente]", f.Added)
+	}
+}
+
+// TestConfirm_NoSuggestion_NoFeedback: a prazo the lawyer never asked the IA about (or one
+// confirmed before the suggester existed) emits NO feedback event — the confirm is unaffected.
+func TestConfirm_NoSuggestion_NoFeedback(t *testing.T) {
+	p := newConfirmParents()
+	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)
+
+	repo := confirmRepo(p, start, "TJSP")
+	repo.latestSuggestionOK = false // no suggestion on record
+	cal := &fakeCalendar{endDate: end}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if _, err := uc.Confirm(context.Background(), confirmCmd(p)); err != nil {
+		t.Fatalf("Confirm() error = %v", err)
+	}
+	if repo.latestSuggestionCalls != 1 {
+		t.Fatalf("GetLatestSuggestion calls = %d, want 1 (always checked)", repo.latestSuggestionCalls)
+	}
+	if fb := publishedOfType[SuggestionFeedback](outbox); len(fb) != 0 {
+		t.Errorf("suggestion.feedback events = %d, want 0 (no suggestion)", len(fb))
+	}
+}

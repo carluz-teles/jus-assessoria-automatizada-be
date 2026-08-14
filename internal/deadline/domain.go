@@ -149,6 +149,13 @@ type Repository interface {
 	// safe no-op. On a hit it returns the revoked prazo so deadline.revoked commits in the
 	// same tx.
 	RevokeDeadlineByIntimation(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*RevokedDeadline, error)
+	// GetLatestSuggestion loads the most recent AI suggestion for the prazo (by the 1:1
+	// intimação, scoped to tenantID — barrier 1) so the F2 confirm can diff it against the
+	// human's confirmed tasks (feedback loop, camada 2). Unlike the other reads a MISS is
+	// NOT an error: a prazo the lawyer never asked the IA about (or one confirmed before the
+	// suggester existed) simply has no suggestion, so it returns ok=false, nil — the confirm
+	// then emits no feedback event. Read inside the confirm's tx so it sees the same snapshot.
+	GetLatestSuggestion(ctx context.Context, tx database.Tx, tenantID, intimationID string) (rec SuggestionRecord, ok bool, err error)
 }
 
 // deduper is the consumer-side idempotency guard port. It marks (consumer, eventID)

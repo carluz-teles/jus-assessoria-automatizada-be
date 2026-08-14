@@ -3,6 +3,7 @@ package deadline
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/lib/apperr"
@@ -37,13 +38,18 @@ type prazoReader interface {
 type SuggestUseCase struct {
 	reader   prazoReader
 	composer advisory.PromptComposer
-	gen      llm.Generator // optional: nil when OpenRouter is unconfigured
+	gen      llm.Generator   // optional: nil when OpenRouter is unconfigured
+	store    SuggestionStore // optional: nil skips provenance capture (feedback loop, camada 1)
+	model    string          // provenance: the model the generator answers with by default
 }
 
 // NewSuggestUseCase wires the suggester. gen may be nil (no LLM configured) — SuggestTasks then
-// returns no suggestions instead of failing, so the F2 form degrades gracefully.
-func NewSuggestUseCase(reader prazoReader, composer advisory.PromptComposer, gen llm.Generator) *SuggestUseCase {
-	return &SuggestUseCase{reader: reader, composer: composer, gen: gen}
+// returns no suggestions instead of failing, so the F2 form degrades gracefully. store may be
+// nil (no provenance capture); when present, each suggestion batch is persisted (best-effort)
+// so the confirm can later diff it against the human's choice (feedback loop). model is the
+// generator's default model, recorded as provenance alongside the composed prompt_version.
+func NewSuggestUseCase(reader prazoReader, composer advisory.PromptComposer, gen llm.Generator, store SuggestionStore, model string) *SuggestUseCase {
+	return &SuggestUseCase{reader: reader, composer: composer, gen: gen, store: store, model: model}
 }
 
 // suggestTasksSchema constrains the model's output to { tasks: [ { title, kind } ] } via
@@ -112,5 +118,23 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 	if parsed.Tasks == nil {
 		parsed.Tasks = []SuggestedTask{}
 	}
+
+	// Feedback loop (camada 1): capture WHAT the IA suggested, with WHICH prompt_version and
+	// model, so the confirm can later measure the delta against the human's choice. Best-effort
+	// by design: this is a GET that pre-fills a form, and provenance is a background concern —
+	// a persist fault must never cost the lawyer the suggestions, so we log and return them.
+	if uc.store != nil && len(parsed.Tasks) > 0 {
+		if _, err := uc.store.SaveSuggestion(ctx, tenantID, SuggestionRecord{
+			DeadlineID:    prazoID,
+			IntimationID:  prazo.IntimationID,
+			PromptVersion: composed.PromptVersion,
+			Model:         uc.model,
+			Tasks:         parsed.Tasks,
+		}); err != nil {
+			slog.WarnContext(ctx, "deadline: persist suggestion provenance failed",
+				slog.String("prazo_id", prazoID), slog.Any("error", err))
+		}
+	}
+
 	return parsed.Tasks, nil
 }

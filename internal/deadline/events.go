@@ -508,3 +508,54 @@ func (TaskDismissed) AggregateType() string { return aggregateTypeTask }
 func newTaskDismissed(taskID string) TaskDismissed {
 	return TaskDismissed{Base: events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: taskID}, TaskID: taskID}
 }
+
+// TypeSuggestionFeedback is the dotted id this slice PRODUCES at the F2 confirm when the
+// prazo had an AI suggestion (feedback loop, camada 2): the delta between what the IA
+// suggested and what the human confirmed. Its "deadline" prefix routes it like the other
+// domain facts (→ "deadline"/ingestao at the relay, archived as handler-not-found today):
+// its consumer — the aggregation that scores a prompt_version's kept/removed/added over
+// time — is a later slice, so it is an orphan-for-now, which is safe. The aggregate is the
+// deadline (aggregate_id = deadline id), so its stream orders by the prazo.
+const TypeSuggestionFeedback = "deadline.suggestion_feedback"
+
+// SuggestionFeedback announces one measured delta between an AI suggestion and the human
+// confirmation. It carries the provenance (PromptVersion, Model) so a consumer can bucket
+// deltas per prompt version + model without reading anything back, the counts, and the
+// legible title sets (Kept/Removed/Added). This is the raw material of "quão confiável foi
+// a IA" and, downstream, of refining the versioned prompt.
+type SuggestionFeedback struct {
+	events.Base
+	DeadlineID     string   `json:"deadline_id"`
+	IntimationID   string   `json:"intimation_id"`
+	PromptVersion  string   `json:"prompt_version"`
+	Model          string   `json:"model"`
+	SuggestedCount int      `json:"suggested_count"`
+	ConfirmedCount int      `json:"confirmed_count"`
+	Kept           []string `json:"kept"`
+	Removed        []string `json:"removed"`
+	Added          []string `json:"added"`
+}
+
+var _ events.Event = SuggestionFeedback{}
+
+func (SuggestionFeedback) Type() string          { return TypeSuggestionFeedback }
+func (SuggestionFeedback) AggregateType() string { return aggregateTypeDeadline }
+
+// newSuggestionFeedback builds the produced event from the confirmed prazo's ids and the
+// computed delta. aggregate_id is the deadline id (a uuid, satisfying the outbox's uuid NOT
+// NULL); the event id is a fresh uuid v7 (the consumer dedup key), mirroring the other
+// deadline facts.
+func newSuggestionFeedback(deadlineID, intimationID string, d SuggestionDelta) SuggestionFeedback {
+	return SuggestionFeedback{
+		Base:           events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		DeadlineID:     deadlineID,
+		IntimationID:   intimationID,
+		PromptVersion:  d.PromptVersion,
+		Model:          d.Model,
+		SuggestedCount: d.SuggestedCount,
+		ConfirmedCount: d.ConfirmedCount,
+		Kept:           d.Kept,
+		Removed:        d.Removed,
+		Added:          d.Added,
+	}
+}

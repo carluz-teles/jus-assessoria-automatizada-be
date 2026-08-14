@@ -48,11 +48,14 @@ type CaseLink struct {
 }
 
 type Chunk struct {
-	ID         uuid.UUID        `json:"id"`
-	DocumentID uuid.UUID        `json:"document_id"`
-	Page       int32            `json:"page"`
-	Text       string           `json:"text"`
-	Embedding  *pgvector.Vector `json:"embedding"`
+	ID             uuid.UUID        `json:"id"`
+	DocumentID     uuid.UUID        `json:"document_id"`
+	Page           int32            `json:"page"`
+	Text           string           `json:"text"`
+	Embedding      *pgvector.Vector `json:"embedding"`
+	EmbeddingModel *string          `json:"embedding_model"`
+	Dim            *int32           `json:"dim"`
+	ChunkHash      *string          `json:"chunk_hash"`
 }
 
 type CourtCase struct {
@@ -382,6 +385,17 @@ type TaskItem struct {
 	Done      bool               `json:"done"`
 	DoneAt    pgtype.Timestamptz `json:"done_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type TaskSuggestion struct {
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	DeadlineID    uuid.UUID          `json:"deadline_id"`
+	IntimationID  uuid.UUID          `json:"intimation_id"`
+	PromptVersion string             `json:"prompt_version"`
+	Model         string             `json:"model"`
+	Suggested     []byte             `json:"suggested"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
 type Tenant struct {

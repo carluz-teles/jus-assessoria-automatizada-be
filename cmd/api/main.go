@@ -166,7 +166,13 @@ func run(logger *slog.Logger) error {
 	} else {
 		logger.Warn("OPENROUTER_API_KEY unset — AI task suggestions disabled (F2 works, no pre-fill)")
 	}
-	deadlineSuggestUC := deadline.NewSuggestUseCase(deadlineReadUC, advisory.NewTemplateComposer(), taskGenerator)
+	// The suggester also captures provenance (feedback loop, camada 1): every suggestion batch
+	// is persisted (best-effort) via its own tx so the confirm can later diff it against the
+	// lawyer's confirmed tasks. The model string is recorded alongside the prompt_version.
+	deadlineSuggestUC := deadline.NewSuggestUseCase(
+		deadlineReadUC, advisory.NewTemplateComposer(), taskGenerator,
+		deadline.NewSuggestionStore(uow), cfg.OpenRouterModel,
+	)
 	deadlineHandler := deadline.NewHandler(
 		deadlineReadUC,
 		deadlineWriteUC,

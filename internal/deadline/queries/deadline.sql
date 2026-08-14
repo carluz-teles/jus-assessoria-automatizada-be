@@ -336,3 +336,28 @@ UPDATE deadline
 SET status = 'CANCELLED'
 WHERE notification_id = $1 AND tenant_id = $2 AND status <> 'CANCELLED'
 RETURNING id, court_record_id;
+
+-- name: InsertTaskSuggestion :one
+-- Grava a proveniência de UMA rodada de sugestão da IA (feedback loop, camada 1). Chamada
+-- no caminho de LEITURA (GET /v1/prazos/:id/suggested-tasks), logo após o LLM devolver as
+-- tarefas: registra COM QUE prompt_version e COM QUE model foram geradas, e o payload exato
+-- (suggested jsonb: [{title, kind}, …]). É best-effort — uma falha aqui não quebra o F2.
+-- Retorna o id para log/telemetria. $1..$6 são as colunas na ordem do INSERT.
+INSERT INTO task_suggestion (
+    tenant_id, deadline_id, intimation_id, prompt_version, model, suggested
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+RETURNING id;
+
+-- name: GetLatestTaskSuggestion :one
+-- Lê a sugestão MAIS RECENTE de um prazo, pela intimação 1:1 e escopada por tenant_id
+-- (barrier 1). O confirm (F2 "Aprovar tudo") a carrega para medir o DELTA entre o que a IA
+-- sugeriu e o que o humano confirmou. Sem sugestão (prazo manual, IA nunca usada) NÃO há
+-- linha → pgx.ErrNoRows → o use case trata como "sem feedback" (não emite evento). $1 =
+-- intimation_id, $2 = tenant_id.
+SELECT id, prompt_version, model, suggested
+FROM task_suggestion
+WHERE intimation_id = $1 AND tenant_id = $2
+ORDER BY created_at DESC
+LIMIT 1;

@@ -2,6 +2,7 @@ package deadline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -857,4 +858,45 @@ func (r *pgRepository) RevokeDeadlineByIntimation(ctx context.Context, tx databa
 		ID:            row.ID.String(),
 		CourtRecordID: row.CourtRecordID.String(),
 	}, nil
+}
+
+// GetLatestSuggestion reads the most recent AI suggestion for a prazo (by the 1:1
+// intimação, scoped to tenantID — barrier 1) inside the caller's tx, for the F2 confirm's
+// delta. A MISS is not an error: no suggestion means the lawyer never asked the IA (or the
+// prazo predates the suggester), so it returns (zero, false, nil) and the confirm emits no
+// feedback. The suggested jsonb is the exact [{title, kind}, …] the model returned; a
+// malformed payload (should never happen — the write goes through the same slice) is a
+// typed infra error, not a panic.
+func (r *pgRepository) GetLatestSuggestion(ctx context.Context, tx database.Tx, tenantID, intimationID string) (SuggestionRecord, bool, error) {
+	intID, err := parseUUID(intimationID)
+	if err != nil {
+		return SuggestionRecord{}, false, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return SuggestionRecord{}, false, err
+	}
+
+	row, err := deadlinedb.New(tx).GetLatestTaskSuggestion(ctx, deadlinedb.GetLatestTaskSuggestionParams{
+		IntimationID: intID,
+		TenantID:     tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SuggestionRecord{}, false, nil
+	}
+	if err != nil {
+		return SuggestionRecord{}, false, database.WrapInfra(err)
+	}
+
+	var tasks []SuggestedTask
+	if err := json.Unmarshal(row.Suggested, &tasks); err != nil {
+		return SuggestionRecord{}, false, database.WrapInfra(err)
+	}
+
+	return SuggestionRecord{
+		IntimationID:  intimationID,
+		PromptVersion: row.PromptVersion,
+		Model:         row.Model,
+		Tasks:         tasks,
+	}, true, nil
 }

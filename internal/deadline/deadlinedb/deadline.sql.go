@@ -295,6 +295,43 @@ func (q *Queries) GetDeadlineForConfirm(ctx context.Context, arg GetDeadlineForC
 	return i, err
 }
 
+const getLatestTaskSuggestion = `-- name: GetLatestTaskSuggestion :one
+SELECT id, prompt_version, model, suggested
+FROM task_suggestion
+WHERE intimation_id = $1 AND tenant_id = $2
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+type GetLatestTaskSuggestionParams struct {
+	IntimationID uuid.UUID `json:"intimation_id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+}
+
+type GetLatestTaskSuggestionRow struct {
+	ID            uuid.UUID `json:"id"`
+	PromptVersion string    `json:"prompt_version"`
+	Model         string    `json:"model"`
+	Suggested     []byte    `json:"suggested"`
+}
+
+// Lê a sugestão MAIS RECENTE de um prazo, pela intimação 1:1 e escopada por tenant_id
+// (barrier 1). O confirm (F2 "Aprovar tudo") a carrega para medir o DELTA entre o que a IA
+// sugeriu e o que o humano confirmou. Sem sugestão (prazo manual, IA nunca usada) NÃO há
+// linha → pgx.ErrNoRows → o use case trata como "sem feedback" (não emite evento). $1 =
+// intimation_id, $2 = tenant_id.
+func (q *Queries) GetLatestTaskSuggestion(ctx context.Context, arg GetLatestTaskSuggestionParams) (GetLatestTaskSuggestionRow, error) {
+	row := q.db.QueryRow(ctx, getLatestTaskSuggestion, arg.IntimationID, arg.TenantID)
+	var i GetLatestTaskSuggestionRow
+	err := row.Scan(
+		&i.ID,
+		&i.PromptVersion,
+		&i.Model,
+		&i.Suggested,
+	)
+	return i, err
+}
+
 const getTaskForTransition = `-- name: GetTaskForTransition :one
 SELECT id, status
 FROM task
@@ -557,6 +594,43 @@ func (q *Queries) InsertTaskItem(ctx context.Context, arg InsertTaskItemParams) 
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const insertTaskSuggestion = `-- name: InsertTaskSuggestion :one
+INSERT INTO task_suggestion (
+    tenant_id, deadline_id, intimation_id, prompt_version, model, suggested
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+RETURNING id
+`
+
+type InsertTaskSuggestionParams struct {
+	TenantID      uuid.UUID `json:"tenant_id"`
+	DeadlineID    uuid.UUID `json:"deadline_id"`
+	IntimationID  uuid.UUID `json:"intimation_id"`
+	PromptVersion string    `json:"prompt_version"`
+	Model         string    `json:"model"`
+	Suggested     []byte    `json:"suggested"`
+}
+
+// Grava a proveniência de UMA rodada de sugestão da IA (feedback loop, camada 1). Chamada
+// no caminho de LEITURA (GET /v1/prazos/:id/suggested-tasks), logo após o LLM devolver as
+// tarefas: registra COM QUE prompt_version e COM QUE model foram geradas, e o payload exato
+// (suggested jsonb: [{title, kind}, …]). É best-effort — uma falha aqui não quebra o F2.
+// Retorna o id para log/telemetria. $1..$6 são as colunas na ordem do INSERT.
+func (q *Queries) InsertTaskSuggestion(ctx context.Context, arg InsertTaskSuggestionParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertTaskSuggestion,
+		arg.TenantID,
+		arg.DeadlineID,
+		arg.IntimationID,
+		arg.PromptVersion,
+		arg.Model,
+		arg.Suggested,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const markDeadlineStatus = `-- name: MarkDeadlineStatus :one
