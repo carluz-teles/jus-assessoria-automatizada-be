@@ -70,7 +70,7 @@ const (
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD
 // version (never silently mixed with a new one). This is the axis the A/B improvement turns on.
-const suggestTasksVersion = "suggest_tasks/v1"
+const suggestTasksVersion = "suggest_tasks/v2"
 
 // TemplateComposer is the deterministic v0 composer: templates + context injection, no LLM. It is
 // stateless.
@@ -101,10 +101,14 @@ func composeSuggestTasks(c CaseContext) Composed {
 	var sys strings.Builder
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro. A partir de uma intimação e do prazo dela " +
-			"derivado, liste as tarefas OBJETIVAS e ACIONÁVEIS que o advogado deve executar para " +
-			"cumprir o prazo. Cada tarefa tem um título curto e imperativo e um kind (categoria curta, " +
-			"ex.: ANALISE, PECA, PROTOCOLO, PROVIDENCIA, CIENCIA). Não invente fatos que não estejam no " +
-			"contexto; prefira tarefas genéricas a suposições. Não repita tarefas.",
+			"derivado, produza NA MESMA resposta três saídas: (1) um `summary` — \"O que aconteceu\": " +
+			"resumo objetivo do que a intimação comunica; (2) uma `recommendation` — \"O que fazer\": os " +
+			"próximos passos recomendados ao advogado, em texto corrido; (3) as tarefas OBJETIVAS e " +
+			"ACIONÁVEIS que o advogado deve executar para cumprir o prazo. Cada tarefa tem um `title` " +
+			"curto e imperativo, um `kind` (categoria curta, um destes valores exatos: ANALISE, PECA, " +
+			"PROTOCOLO, PROVIDENCIA, CIENCIA) e uma `description` curta e acionável. Não invente fatos " +
+			"que não estejam no contexto; prefira tarefas genéricas a suposições. Não repita tarefas. " +
+			"Se faltar contexto, mantenha `summary` e `recommendation` como string vazia em vez de supor.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório (exemplos e preferências):\n")
@@ -140,7 +144,7 @@ func composeSuggestTasks(c CaseContext) Composed {
 	} else {
 		usr.WriteString(strings.Join(lines, "\n"))
 	}
-	usr.WriteString("\n\nListe as tarefas sugeridas.")
+	usr.WriteString("\n\nProduza o resumo, a recomendação e as tarefas sugeridas.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: suggestTasksVersion}
 }

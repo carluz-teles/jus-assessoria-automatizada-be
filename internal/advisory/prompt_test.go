@@ -21,11 +21,22 @@ func TestTemplateComposer_SuggestTasks(t *testing.T) {
 		t.Fatalf("Compose() error = %v", err)
 	}
 
-	if out.PromptVersion != "suggest_tasks/v1" {
-		t.Errorf("PromptVersion = %q, want suggest_tasks/v1", out.PromptVersion)
+	if out.PromptVersion != "suggest_tasks/v2" {
+		t.Errorf("PromptVersion = %q, want suggest_tasks/v2", out.PromptVersion)
 	}
 	if strings.TrimSpace(out.System) == "" || strings.TrimSpace(out.User) == "" {
 		t.Fatalf("empty system/user: system=%q user=%q", out.System, out.User)
+	}
+	// v2 contract: the system instructs the three outputs of one LLM call — the "O que
+	// aconteceu" summary, the "O que fazer" recommendation, and a per-task description.
+	for _, want := range []string{"summary", "recommendation", "description"} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("system prompt missing %q output instruction\n---\n%s", want, out.System)
+		}
+	}
+	// The kind enum is unchanged — no invented values.
+	if !strings.Contains(out.System, "ANALISE") || !strings.Contains(out.System, "CIENCIA") {
+		t.Errorf("system prompt dropped the existing kind enum\n---\n%s", out.System)
 	}
 	// Context injected.
 	for _, want := range []string{"TJSP", "Procedimento Comum", "INTIMACAO", "CONTESTACAO", "15 dias úteis", "Fica o réu intimado"} {

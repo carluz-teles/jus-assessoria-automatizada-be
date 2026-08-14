@@ -18,12 +18,25 @@ import (
 // generator is optional — when OpenRouter is unconfigured (no key), it returns no suggestions so
 // the F2 form still works (the lawyer types the tasks manually).
 
-// SuggestedTask is one AI-suggested action for the F2 form: a short imperative title + a short
-// kind (ANALISE|PECA|PROTOCOLO|PROVIDENCIA|CIENCIA…). It mirrors the ConfirmTaskInput shape the
-// form submits, so the FE drops each suggestion straight into a task row.
+// SuggestedTask is one AI-suggested action for the F2 form: a short imperative title, a short
+// kind (ANALISE|PECA|PROTOCOLO|PROVIDENCIA|CIENCIA…) and a short actionable description. It
+// mirrors the ConfirmTaskInput shape the form submits, so the FE drops each suggestion straight
+// into a task row.
 type SuggestedTask struct {
-	Title string `json:"title"`
-	Kind  string `json:"kind"`
+	Title       string `json:"title"`
+	Kind        string `json:"kind"`
+	Description string `json:"description"`
+}
+
+// Suggestion is the whole answer of one suggest_tasks LLM call: the "O que aconteceu" summary
+// (what the intimação communicates), the "O que fazer" recommendation (the recommended next
+// steps) and the list of suggested tasks. Summary/Recommendation are response-only (pass-through):
+// they are NOT persisted as provenance — only Tasks is (see SaveSuggestion). Both strings may be
+// empty ("") when the LLM is unconfigured, which is a valid, non-error answer.
+type Suggestion struct {
+	Summary        string
+	Recommendation string
+	Tasks          []SuggestedTask
 }
 
 // prazoReader is the narrow read the suggester needs — one prazo detail by id, tenant-scoped.
@@ -52,40 +65,47 @@ func NewSuggestUseCase(reader prazoReader, composer advisory.PromptComposer, gen
 	return &SuggestUseCase{reader: reader, composer: composer, gen: gen, store: store, model: model}
 }
 
-// suggestTasksSchema constrains the model's output to { tasks: [ { title, kind } ] } via
-// OpenRouter's json_schema structured output (strict). additionalProperties:false + required make
-// the shape exact, so the parse below never sees a surprise field.
+// suggestTasksSchema constrains the model's output to
+// { summary, recommendation, tasks: [ { title, kind, description } ] } via OpenRouter's
+// json_schema structured output (strict). additionalProperties:false + required at both levels
+// make the shape exact, so the parse below never sees a surprise field and the three v2 outputs
+// (summary/recommendation/description) can never be silently omitted.
 var suggestTasksSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
+    "summary":        { "type": "string" },
+    "recommendation": { "type": "string" },
     "tasks": {
       "type": "array",
       "items": {
         "type": "object",
         "properties": {
-          "title": { "type": "string" },
-          "kind":  { "type": "string" }
+          "title":       { "type": "string" },
+          "kind":        { "type": "string" },
+          "description": { "type": "string" }
         },
-        "required": ["title", "kind"],
+        "required": ["title", "kind", "description"],
         "additionalProperties": false
       }
     }
   },
-  "required": ["tasks"],
+  "required": ["summary", "recommendation", "tasks"],
   "additionalProperties": false
 }`)
 
-// SuggestTasks returns the AI-suggested tasks for a prazo. A missing/foreign prazo → the read's
-// typed ErrDeadlineNotFound (→ 404). With no generator configured it returns an empty slice (no
-// error) so the F2 form still opens. An LLM/parse fault surfaces typed (the handler maps it).
-func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID string) ([]SuggestedTask, error) {
+// SuggestTasks returns the AI Suggestion for a prazo — the summary, the recommendation and the
+// suggested tasks, from one LLM call. A missing/foreign prazo → the read's typed
+// ErrDeadlineNotFound (→ 404). With no generator configured it returns an empty Suggestion (empty
+// strings + empty task slice, no error) so the F2 form still opens. An LLM/parse fault surfaces
+// typed (the handler maps it).
+func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID string) (Suggestion, error) {
 	if uc.gen == nil {
-		return []SuggestedTask{}, nil
+		return Suggestion{Tasks: []SuggestedTask{}}, nil
 	}
 
 	prazo, err := uc.reader.Prazo(ctx, tenantID, prazoID)
 	if err != nil {
-		return nil, err
+		return Suggestion{}, err
 	}
 
 	composed, err := uc.composer.Compose(advisory.AgentSuggestTasks, advisory.CaseContext{
@@ -96,7 +116,7 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 		// the composer omits the empty ones, so v0 suggests from kind/days/counting.
 	})
 	if err != nil {
-		return nil, err
+		return Suggestion{}, err
 	}
 
 	out, err := uc.gen.GenerateJSON(ctx, llm.Request{
@@ -106,14 +126,16 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 		SchemaName: "suggested_tasks",
 	})
 	if err != nil {
-		return nil, err
+		return Suggestion{}, err
 	}
 
 	var parsed struct {
-		Tasks []SuggestedTask `json:"tasks"`
+		Summary        string          `json:"summary"`
+		Recommendation string          `json:"recommendation"`
+		Tasks          []SuggestedTask `json:"tasks"`
 	}
 	if err := json.Unmarshal(out, &parsed); err != nil {
-		return nil, apperr.NewInfra("deadline: parse suggested tasks", err)
+		return Suggestion{}, apperr.NewInfra("deadline: parse suggested tasks", err)
 	}
 	if parsed.Tasks == nil {
 		parsed.Tasks = []SuggestedTask{}
@@ -122,7 +144,8 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 	// Feedback loop (camada 1): capture WHAT the IA suggested, with WHICH prompt_version and
 	// model, so the confirm can later measure the delta against the human's choice. Best-effort
 	// by design: this is a GET that pre-fills a form, and provenance is a background concern —
-	// a persist fault must never cost the lawyer the suggestions, so we log and return them.
+	// a persist fault must never cost the lawyer the suggestions, so we log and return them. Only
+	// the tasks are provenance; summary/recommendation are response-only (pass-through).
 	if uc.store != nil && len(parsed.Tasks) > 0 {
 		if _, err := uc.store.SaveSuggestion(ctx, tenantID, SuggestionRecord{
 			DeadlineID:    prazoID,
@@ -136,5 +159,9 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 		}
 	}
 
-	return parsed.Tasks, nil
+	return Suggestion{
+		Summary:        parsed.Summary,
+		Recommendation: parsed.Recommendation,
+		Tasks:          parsed.Tasks,
+	}, nil
 }

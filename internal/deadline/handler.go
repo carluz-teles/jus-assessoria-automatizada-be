@@ -62,7 +62,7 @@ type Handler struct {
 // /prazos/:id/suggested-tasks). OPTIONAL — nil when the LLM is unconfigured — so the endpoint
 // returns an empty list instead of failing, and the F2 form still works.
 type suggester interface {
-	SuggestTasks(ctx context.Context, tenantID, prazoID string) ([]SuggestedTask, error)
+	SuggestTasks(ctx context.Context, tenantID, prazoID string) (Suggestion, error)
 }
 
 // NewHandler wires the handler to the prazos read use case, the F2 confirmation write use
@@ -205,30 +205,38 @@ func (h *Handler) getPrazo(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(view)
 }
 
-// suggestedTasksResponse is the endpoint body: the pinned {suggested_tasks:[{title,kind}]} the
-// FE reads to pre-fill the F2 form.
+// suggestedTasksResponse is the endpoint body: the single Análise object the FE renders — the
+// "O que aconteceu" summary, the "O que fazer" recommendation and the suggested tasks
+// ({title,kind,description}). It is not paginated (no list envelope): one LLM call, one object.
 type suggestedTasksResponse struct {
+	Summary        string          `json:"summary"`
+	Recommendation string          `json:"recommendation"`
 	SuggestedTasks []SuggestedTask `json:"suggested_tasks"`
 }
 
-// getSuggestedTasks handles GET /v1/prazos/:id/suggested-tasks: the on-demand AI suggestions
-// that pre-fill the F2 "Aprovar tudo" form. When the suggester is unconfigured (no LLM key) it
-// returns an empty list (200) — the form still opens and the lawyer types the tasks. A missing/
-// foreign prazo → the use case's ErrDeadlineNotFound → 404; an LLM fault is surfaced typed.
+// getSuggestedTasks handles GET /v1/prazos/:id/suggested-tasks: the on-demand AI "Análise" that
+// feeds the intimação detail. When the suggester is unconfigured (no LLM key) it returns empty
+// strings + an empty list (200) — the section still renders and the lawyer types the tasks. A
+// missing/foreign prazo → the use case's ErrDeadlineNotFound → 404; an LLM fault is surfaced typed.
 // tenant_id comes from the verified principal.
 func (h *Handler) getSuggestedTasks(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	if h.suggester == nil {
 		return c.Status(fiber.StatusOK).JSON(suggestedTasksResponse{SuggestedTasks: []SuggestedTask{}})
 	}
-	tasks, err := h.suggester.SuggestTasks(c.UserContext(), tenantID, c.Params("id"))
+	sugg, err := h.suggester.SuggestTasks(c.UserContext(), tenantID, c.Params("id"))
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
+	tasks := sugg.Tasks
 	if tasks == nil {
 		tasks = []SuggestedTask{}
 	}
-	return c.Status(fiber.StatusOK).JSON(suggestedTasksResponse{SuggestedTasks: tasks})
+	return c.Status(fiber.StatusOK).JSON(suggestedTasksResponse{
+		Summary:        sugg.Summary,
+		Recommendation: sugg.Recommendation,
+		SuggestedTasks: tasks,
+	})
 }
 
 // confirmPrazo handles POST /v1/prazos/confirm: the F2 "Aprovar tudo" (§9). It validates

@@ -231,6 +231,17 @@ func (w *recordingWriter) DeleteTaskItem(_ context.Context, tenantID, taskID, it
 	return w.deleteItemErr
 }
 
+// recordingSuggester implements the handler's suggester port, returning a canned Suggestion
+// (or error) so the endpoint's DTO mapping can be asserted without an LLM.
+type recordingSuggester struct {
+	res Suggestion
+	err error
+}
+
+func (s recordingSuggester) SuggestTasks(context.Context, string, string) (Suggestion, error) {
+	return s.res, s.err
+}
+
 // newApp builds an app whose /v1 group mirrors production: Auth resolves a principal with
 // the given tenant, then the deadline routes mount under it. It uses a throwaway writer —
 // the read tests never hit the confirm route; newAppWithWriter injects a specific one.
@@ -240,11 +251,22 @@ func newApp(rd reader, tenant string) *fiber.App {
 
 // newAppWithWriter is newApp with an explicit writer, for the confirm-route tests.
 func newAppWithWriter(rd reader, wr writer, tenant string) *fiber.App {
+	return newAppWith(rd, wr, nil, tenant)
+}
+
+// newAppWithSuggester is newApp with an explicit suggester, for the suggested-tasks tests. A nil
+// suggester exercises the LLM-unconfigured degradation.
+func newAppWithSuggester(rd reader, sg suggester, tenant string) *fiber.App {
+	return newAppWith(rd, &recordingWriter{}, sg, tenant)
+}
+
+// newAppWith wires the handler with the given ports under the Auth boundary.
+func newAppWith(rd reader, wr writer, sg suggester, tenant string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{tenant: tenant}))
-	NewHandler(rd, wr, nil).RegisterV1(v1)
+	NewHandler(rd, wr, sg).RegisterV1(v1)
 	return app
 }
 
@@ -622,6 +644,57 @@ func TestHandler_GetPrazo_NotFound_404(t *testing.T) {
 	}
 	if !strings.Contains(body, string(apperr.KindNotFound)) {
 		t.Errorf("body missing kind %q\ngot: %s", apperr.KindNotFound, body)
+	}
+}
+
+// --- GET /v1/prazos/:id/suggested-tasks --------------------------------------
+
+// The endpoint returns the single Suggestion object: summary + recommendation at the top and
+// each task carrying its description (the v2 contract, one LLM call, no list envelope).
+func TestHandler_SuggestedTasks_ReturnsSummaryRecommendationAndDescriptions(t *testing.T) {
+	t.Parallel()
+
+	sg := recordingSuggester{res: Suggestion{
+		Summary:        "O réu foi citado para contestar.",
+		Recommendation: "Elaborar e protocolar a contestação em 15 dias úteis.",
+		Tasks: []SuggestedTask{
+			{Title: "Redigir contestação", Kind: "PECA", Description: "Elaborar a peça de defesa."},
+		},
+	}}
+	app := newAppWithSuggester(&recordingReader{}, sg, "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/prazos/d-1/suggested-tasks", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	for _, want := range []string{
+		`"summary":"O réu foi citado para contestar."`,
+		`"recommendation":"Elaborar e protocolar a contestação em 15 dias úteis."`,
+		`"description":"Elaborar a peça de defesa."`,
+		`"title":"Redigir contestação"`,
+		`"kind":"PECA"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// With no suggester (LLM unconfigured) the endpoint still answers 200 with empty strings and an
+// empty (non-null) list — the form degrades gracefully.
+func TestHandler_SuggestedTasks_NoSuggester_Empty(t *testing.T) {
+	t.Parallel()
+
+	app := newApp(&recordingReader{}, "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/prazos/d-1/suggested-tasks", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	for _, want := range []string{`"summary":""`, `"recommendation":""`, `"suggested_tasks":[]`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
 	}
 }
 

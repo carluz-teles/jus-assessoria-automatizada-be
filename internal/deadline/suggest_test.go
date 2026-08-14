@@ -46,33 +46,53 @@ func (f *fakeStore) SaveSuggestion(_ context.Context, _ string, rec SuggestionRe
 // still opens.
 func TestSuggestTasks_NilGenerator_Empty(t *testing.T) {
 	uc := NewSuggestUseCase(fakePrazoReader{}, advisory.NewTemplateComposer(), nil, nil, "")
-	tasks, err := uc.SuggestTasks(context.Background(), "t", "p")
+	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	if len(tasks) != 0 {
-		t.Errorf("tasks = %v, want empty", tasks)
+	if sugg.Summary != "" || sugg.Recommendation != "" {
+		t.Errorf("summary/recommendation = {%q, %q}, want empty", sugg.Summary, sugg.Recommendation)
+	}
+	if sugg.Tasks == nil || len(sugg.Tasks) != 0 {
+		t.Errorf("tasks = %v, want an empty (non-nil) slice", sugg.Tasks)
 	}
 }
 
 // Happy path: the composer builds the prompt from the prazo's kind/days/counting, the generator
-// returns the schema-constrained JSON, and it parses into SuggestedTask.
+// returns the schema-constrained JSON, and it parses into the Suggestion (summary + recommendation
+// + tasks, each with a description).
 func TestSuggestTasks_HappyPath(t *testing.T) {
-	gen := &fakeGen{out: []byte(`{"tasks":[{"title":"Redigir contestação","kind":"PECA"},{"title":"Protocolar","kind":"PROTOCOLO"}]}`)}
+	gen := &fakeGen{out: []byte(`{"summary":"O réu foi citado para contestar.","recommendation":"Elaborar e protocolar a contestação em 15 dias úteis.","tasks":[{"title":"Redigir contestação","kind":"PECA","description":"Elaborar a peça de defesa."},{"title":"Protocolar","kind":"PROTOCOLO","description":"Protocolar a contestação no PJe."}]}`)}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoDetailView{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
 		advisory.NewTemplateComposer(), gen, nil, "",
 	)
-	tasks, err := uc.SuggestTasks(context.Background(), "t", "p")
+	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	if len(tasks) != 2 || tasks[0].Title != "Redigir contestação" || tasks[0].Kind != "PECA" {
-		t.Errorf("tasks = %+v", tasks)
+	if sugg.Summary != "O réu foi citado para contestar." {
+		t.Errorf("summary = %q", sugg.Summary)
+	}
+	if sugg.Recommendation != "Elaborar e protocolar a contestação em 15 dias úteis." {
+		t.Errorf("recommendation = %q", sugg.Recommendation)
+	}
+	if len(sugg.Tasks) != 2 ||
+		sugg.Tasks[0].Title != "Redigir contestação" ||
+		sugg.Tasks[0].Kind != "PECA" ||
+		sugg.Tasks[0].Description != "Elaborar a peça de defesa." {
+		t.Errorf("tasks = %+v", sugg.Tasks)
 	}
 	// The composer's prompt + schema reached the generator with the case context injected.
 	if gen.gotReq.SchemaName != "suggested_tasks" || len(gen.gotReq.Schema) == 0 {
 		t.Errorf("request schema not set: name=%q schema_len=%d", gen.gotReq.SchemaName, len(gen.gotReq.Schema))
+	}
+	// The schema constrains the v2 shape: summary + recommendation (top-level) and a per-task
+	// description are all required, so a compliant model can never omit them.
+	for _, want := range []string{"summary", "recommendation", "description"} {
+		if !strings.Contains(string(gen.gotReq.Schema), want) {
+			t.Errorf("schema missing %q field\n---\n%s", want, gen.gotReq.Schema)
+		}
 	}
 	if !strings.Contains(gen.gotReq.User, "CONTESTACAO") || !strings.Contains(gen.gotReq.User, "15 dias úteis") {
 		t.Errorf("user prompt missing case context:\n%s", gen.gotReq.User)
@@ -83,7 +103,7 @@ func TestSuggestTasks_HappyPath(t *testing.T) {
 // exact suggested tasks, the composed prompt_version and the model, keyed to the prazo +
 // intimação — the raw material the confirm diffs against the human's choice.
 func TestSuggestTasks_PersistsProvenance(t *testing.T) {
-	gen := &fakeGen{out: []byte(`{"tasks":[{"title":"Redigir contestação","kind":"PECA"}]}`)}
+	gen := &fakeGen{out: []byte(`{"summary":"s","recommendation":"r","tasks":[{"title":"Redigir contestação","kind":"PECA","description":"d"}]}`)}
 	store := &fakeStore{}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoDetailView{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS", IntimationID: "int-1"}},
@@ -108,18 +128,18 @@ func TestSuggestTasks_PersistsProvenance(t *testing.T) {
 
 // A store fault must NOT break the F2: the suggestions still return (best-effort provenance).
 func TestSuggestTasks_StoreErrorIsNonFatal(t *testing.T) {
-	gen := &fakeGen{out: []byte(`{"tasks":[{"title":"Protocolar","kind":"PROTOCOLO"}]}`)}
+	gen := &fakeGen{out: []byte(`{"summary":"s","recommendation":"r","tasks":[{"title":"Protocolar","kind":"PROTOCOLO","description":"d"}]}`)}
 	store := &fakeStore{err: errors.New("db down")}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoDetailView{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
 		advisory.NewTemplateComposer(), gen, store, "m",
 	)
-	tasks, err := uc.SuggestTasks(context.Background(), "t", "p")
+	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
 		t.Fatalf("err = %v, want nil (store fault is non-fatal)", err)
 	}
-	if len(tasks) != 1 {
-		t.Errorf("tasks = %v, want the suggestion despite the store error", tasks)
+	if len(sugg.Tasks) != 1 {
+		t.Errorf("tasks = %v, want the suggestion despite the store error", sugg.Tasks)
 	}
 }
 
