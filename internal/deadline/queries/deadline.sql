@@ -176,16 +176,19 @@ SET status = sqlc.arg(new_status), completed_at = sqlc.arg(completed_at)
 WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id) AND status = sqlc.arg(current_status)
 RETURNING id;
 
--- name: DeleteTasksByDeadline :exec
--- Drop every task of a confirmed prazo, the REPLACE step of the F2 confirm (§9: the
--- confirm is an "upsert idempotente por intimation_id"). Confirm runs this in the SAME tx
--- right after ConfirmDeadline and BEFORE re-inserting the submitted tasks, so re-confirming
--- the same intimação leaves EXACTLY the last submit's set instead of accumulating +N rows
--- each call. Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A first confirm (no
--- prior tasks) deletes nothing — a clean no-op, never an error. $1 = deadline_id, $2 =
+-- name: ListTaskTitlesByDeadline :many
+-- List the titles of the tasks that CURRENTLY exist for a confirmed prazo, by deadline_id and
+-- scoped to tenant_id (barrier 1, on top of RLS barrier 2). The F2 confirm reads it INSIDE its
+-- tx to measure the AI-suggestion delta (feedback loop, camada 2) against the tasks that REALLY
+-- exist — the Análise section creates them via POST /v1/tasks, so the confirm no longer owns the
+-- task lifecycle and must not diff against a submitted set. Only the title is read (the delta
+-- keys off title alone). No rows → an empty slice (a prazo confirmed before any task was created),
+-- never an error. ORDER BY created_at keeps the result deterministic. $1 = deadline_id, $2 =
 -- tenant_id, both from the confirm tx (the id ConfirmDeadline returned + the principal).
-DELETE FROM task
-WHERE deadline_id = $1 AND tenant_id = $2;
+SELECT title
+FROM task
+WHERE deadline_id = $1 AND tenant_id = $2
+ORDER BY created_at;
 
 -- ── task_item write path (checklist / subtarefas, §4/§10) ────────────────────
 -- The Tarefas screen's checklist: a task grows N ordered items the user ticks off. Every

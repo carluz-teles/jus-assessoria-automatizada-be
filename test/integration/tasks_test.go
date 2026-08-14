@@ -33,9 +33,10 @@ func firstPageTasksByProcesso(ctx context.Context, t *testing.T, reader *deadlin
 	return res
 }
 
-// TSK1: confirm a prazo with two tasks (one assigned to userA), then read them back — the process
-// tab returns both, and the agenda filtered by assignee=userA ("meus prazos") returns only the
-// assigned one. Proves the read models + the assignee filter over genuinely-written task rows.
+// TSK1: confirm a prazo, then create two tasks for it via CreateTask (one assigned to userA),
+// then read them back — the process tab returns both, and the agenda filtered by assignee=userA
+// ("meus prazos") returns only the assigned one. Proves the read models + the assignee filter
+// over genuinely-written task rows.
 func TestTasks_Read_TabAndAgendaAssigneeFilter(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
@@ -44,13 +45,16 @@ func TestTasks_Read_TabAndAgendaAssigneeFilter(t *testing.T) {
 	reader := newDeadlineReader(pool)
 	tenant := p.tenantID.String()
 
-	// Seed the PENDING prazo, then confirm with two tasks — one assigned to userA, one bare.
+	// Seed the PENDING prazo and confirm it (no tasks — those come from POST /v1/tasks).
 	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")
 	if err := uc.OnIntimationObserved(ctx, obs); err != nil {
 		t.Fatalf("OnIntimationObserved: %v", err)
 	}
-	userA := uuid.NewString()
-	dueA := mustDate(t, "2024-03-10")
+	var deadlineID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM deadline WHERE notification_id = $1`, p.intimationID).Scan(&deadlineID); err != nil {
+		t.Fatalf("read pending deadline: %v", err)
+	}
 	if _, err := uc.Confirm(ctx, deadline.ConfirmCommand{
 		TenantID:     tenant,
 		UserID:       uuid.NewString(),
@@ -58,12 +62,27 @@ func TestTasks_Read_TabAndAgendaAssigneeFilter(t *testing.T) {
 		Kind:         deadline.KindContestacao,
 		Days:         10,
 		Counting:     deadline.CountingBusiness,
-		Tasks: []deadline.ConfirmTaskInput{
-			{Title: "Protocolar contestação", Kind: "PECA", DueDate: &dueA, AssigneeUserID: userA},
-			{Title: "Dar ciência ao cliente"},
-		},
 	}); err != nil {
 		t.Fatalf("Confirm: %v", err)
+	}
+
+	// Create two tasks for the prazo (the Análise section, POST /v1/tasks): one assigned to
+	// userA + dated, one bare.
+	userA := uuid.NewString()
+	dueA := mustDate(t, "2024-03-10")
+	if _, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenant, UserID: uuid.NewString(), CourtRecordID: p.courtRecordID.String(),
+		DeadlineID: deadlineID, IntimationID: p.intimationID.String(),
+		Title: "Protocolar contestação", Kind: "PECA", DueDate: &dueA, AssigneeUserID: userA,
+	}); err != nil {
+		t.Fatalf("CreateTask (assigned): %v", err)
+	}
+	if _, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenant, UserID: uuid.NewString(), CourtRecordID: p.courtRecordID.String(),
+		DeadlineID: deadlineID, IntimationID: p.intimationID.String(),
+		Title: "Dar ciência ao cliente",
+	}); err != nil {
+		t.Fatalf("CreateTask (bare): %v", err)
 	}
 
 	// The process tab returns both tasks (all statuses, no filter).

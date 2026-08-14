@@ -12,13 +12,13 @@ import (
 )
 
 // ConfirmRequest is the POST /v1/prazos/confirm body (docs/erd-prazos.md §9): the 1:1
-// intimação, the confirmed legal prazo, and the N tasks. tenant_id / confirmed_by are NOT
-// here — they come from the verified principal. The recomputed end_date is server-derived,
-// so it is not accepted either.
+// intimação and the confirmed legal prazo. It carries NO tasks — the task lifecycle moved to
+// POST/PATCH /v1/tasks (the "Análise" section), so the confirm only confirms the prazo itself.
+// tenant_id / confirmed_by are NOT here — they come from the verified principal. The recomputed
+// end_date is server-derived, so it is not accepted either.
 type ConfirmRequest struct {
-	IntimationID string               `json:"intimation_id"`
-	Deadline     ConfirmDeadlineBody  `json:"deadline"`
-	Tasks        []ConfirmTaskRequest `json:"tasks"`
+	IntimationID string              `json:"intimation_id"`
+	Deadline     ConfirmDeadlineBody `json:"deadline"`
 }
 
 // ConfirmDeadlineBody is the {kind, days, counting, doubled, doubled_reason} the F2 form
@@ -32,27 +32,13 @@ type ConfirmDeadlineBody struct {
 	DoubledReason string `json:"doubled_reason"`
 }
 
-// ConfirmTaskRequest is one action item the F2 submits. Title is required; the rest are
-// optional. DueDate is the wire date (2006-01-02) — its ≤ end_date bound is checked in the
-// use case (the recomputed end_date is only known there), not here.
-type ConfirmTaskRequest struct {
-	Title          string `json:"title"`
-	Kind           string `json:"kind"`
-	Description    string `json:"description"`
-	DueDate        string `json:"due_date"`
-	AssigneeUserID string `json:"assignee_user_id"`
-}
-
 // Validate enforces the edge boundary rules via ozzo (method-based, not struct tags): a
-// well-formed intimation_id, a positive day count, a valid counting, and every task's
-// title non-empty with a well-formed optional due_date. Cross-field/semantic rules that
-// need the recomputed end_date (due_date ≤ end_date) are deferred to the use case. A
-// failure is a 400 at the edge (KindInvalid) via httpx.WriteValidationError.
+// well-formed intimation_id, a positive day count, and a valid counting. A failure is a 400
+// at the edge (KindInvalid) via httpx.WriteValidationError.
 func (r ConfirmRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.IntimationID, validation.Required, validation.By(isUUID)),
 		validation.Field(&r.Deadline),
-		validation.Field(&r.Tasks),
 	)
 }
 
@@ -64,16 +50,6 @@ func (b ConfirmDeadlineBody) Validate() error {
 		validation.Field(&b.Days, validation.Required, validation.Min(1)),
 		validation.Field(&b.Counting, validation.Required,
 			validation.In(string(CountingBusiness), string(CountingCalendar))),
-	)
-}
-
-// Validate enforces one task's rules: a non-empty title and, when present, a wire-format
-// due_date (empty is allowed — a task may be undated). Declaring Validate on the task lets
-// ozzo validate each element of Tasks automatically.
-func (t ConfirmTaskRequest) Validate() error {
-	return validation.ValidateStruct(&t,
-		validation.Field(&t.Title, validation.Required),
-		validation.Field(&t.DueDate, validation.Date(time.DateOnly)),
 	)
 }
 
@@ -354,19 +330,8 @@ func isUUID(value any) error {
 }
 
 // toCommand maps the validated request + the principal's ids into the use-case command.
-// TenantID and UserID come from the principal (never the body); the wire due_dates are
-// parsed here (Validate already guaranteed the format) into optional times.
+// TenantID and UserID come from the principal (never the body). The confirm carries no tasks.
 func (r ConfirmRequest) toCommand(tenantID, userID string) ConfirmCommand {
-	tasks := make([]ConfirmTaskInput, 0, len(r.Tasks))
-	for _, t := range r.Tasks {
-		tasks = append(tasks, ConfirmTaskInput{
-			Title:          t.Title,
-			Kind:           t.Kind,
-			Description:    t.Description,
-			DueDate:        parseOptionalWireDate(t.DueDate),
-			AssigneeUserID: t.AssigneeUserID,
-		})
-	}
 	return ConfirmCommand{
 		TenantID:      tenantID,
 		UserID:        userID,
@@ -376,7 +341,6 @@ func (r ConfirmRequest) toCommand(tenantID, userID string) ConfirmCommand {
 		Counting:      Counting(r.Deadline.Counting),
 		Doubled:       r.Deadline.Doubled,
 		DoubledReason: r.Deadline.DoubledReason,
-		Tasks:         tasks,
 	}
 }
 

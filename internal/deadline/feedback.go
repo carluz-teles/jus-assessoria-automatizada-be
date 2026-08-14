@@ -52,14 +52,16 @@ type SuggestionDelta struct {
 	Added          []string
 }
 
-// computeSuggestionDelta diffs the stored suggestion against the confirmed tasks by
-// normalized title (lowercased, whitespace-collapsed) — the coarse but honest v1 match.
-// It is pure: the confirm calls it inside its tx and hands the result to the outbox. A nil
-// record (no suggestion for this prazo) is handled by the CALLER (it simply does not emit).
-func computeSuggestionDelta(rec SuggestionRecord, confirmed []ConfirmTaskInput) SuggestionDelta {
-	confirmedKeys := make(map[string]bool, len(confirmed))
-	for _, t := range confirmed {
-		confirmedKeys[normalizeTitle(t.Title)] = true
+// computeSuggestionDelta diffs the stored suggestion against the titles of the tasks that
+// REALLY exist for the prazo (read fresh at confirm from the deadline's tasks, created via the
+// Análise section), by normalized title (lowercased, whitespace-collapsed) — the coarse but
+// honest v1 match. It is pure: the confirm calls it inside its tx and hands the result to the
+// outbox. A nil record (no suggestion for this prazo) is handled by the CALLER (it simply does
+// not emit).
+func computeSuggestionDelta(rec SuggestionRecord, confirmedTitles []string) SuggestionDelta {
+	confirmedKeys := make(map[string]bool, len(confirmedTitles))
+	for _, title := range confirmedTitles {
+		confirmedKeys[normalizeTitle(title)] = true
 	}
 	suggestedKeys := make(map[string]bool, len(rec.Tasks))
 	for _, t := range rec.Tasks {
@@ -70,7 +72,7 @@ func computeSuggestionDelta(rec SuggestionRecord, confirmed []ConfirmTaskInput) 
 		PromptVersion:  rec.PromptVersion,
 		Model:          rec.Model,
 		SuggestedCount: len(rec.Tasks),
-		ConfirmedCount: len(confirmed),
+		ConfirmedCount: len(confirmedTitles),
 		Kept:           []string{},
 		Removed:        []string{},
 		Added:          []string{},
@@ -95,15 +97,15 @@ func computeSuggestionDelta(rec SuggestionRecord, confirmed []ConfirmTaskInput) 
 
 	// A confirmed task the IA never suggested is one the human added — the signal for a gap
 	// in the prompt (something the model consistently misses).
-	seenConfirmed := make(map[string]bool, len(confirmed))
-	for _, t := range confirmed {
-		key := normalizeTitle(t.Title)
+	seenConfirmed := make(map[string]bool, len(confirmedTitles))
+	for _, title := range confirmedTitles {
+		key := normalizeTitle(title)
 		if seenConfirmed[key] {
 			continue
 		}
 		seenConfirmed[key] = true
 		if !suggestedKeys[key] {
-			delta.Added = append(delta.Added, t.Title)
+			delta.Added = append(delta.Added, title)
 		}
 	}
 

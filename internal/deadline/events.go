@@ -376,11 +376,11 @@ func deadlineUpdatedEvent(id, kind string, endDate time.Time, counting Counting,
 	}
 }
 
-// TypeTaskCreated is the dotted id this slice PRODUCES per task at the F2 confirmation
+// TypeTaskCreated is the dotted id this slice PRODUCES per task created via POST /v1/tasks
 // (docs/erd-prazos.md §7: task.created {task_id, deadline_id?, court_record_id, due_date,
-// assignee_user_id?} — a aprovação grava deadline (1) e task (N) na MESMA tx). Its "task"
-// prefix routes it to the default work at the relay; its consumer (task read models /
-// "meus prazos") is a later slice, so it is an orphan-for-now, which is safe.
+// assignee_user_id?}). Tasks are created there (the "Análise" section), independently of the
+// F2 confirm. Its "task" prefix routes it to the default work at the relay; its consumer (task
+// read models / "meus prazos") is a later slice, so it is an orphan-for-now, which is safe.
 const TypeTaskCreated = "task.created"
 
 // aggregateTypeTask places task.created on the TASK aggregate (its own stream), unlike the
@@ -404,16 +404,9 @@ var _ events.Event = TaskCreated{}
 func (TaskCreated) Type() string          { return TypeTaskCreated }
 func (TaskCreated) AggregateType() string { return aggregateTypeTask }
 
-// newTaskCreated builds the produced event from a confirmed (F2) task. It funnels through
-// the shared taskCreatedEvent builder so the F2 confirm and the manual CREATE (5b, POST
-// /v1/tasks) announce a new task with a SINGLE construction — the contract has one source.
-func newTaskCreated(t ConfirmedTask) TaskCreated {
-	return taskCreatedEvent(t.ID, t.DeadlineID, t.CourtRecordID, t.AssigneeUserID, t.DueDate)
-}
-
-// newTaskCreatedFromTask builds the same produced event from a persisted *Task — the manual
-// CREATE path (POST /v1/tasks), where the task is an entity, not a ConfirmedTask. Same
-// builder as the confirm path (no parallel construction to drift).
+// newTaskCreatedFromTask builds the produced event from a persisted *Task — the CREATE path
+// (POST /v1/tasks). Tasks are created only there now (the F2 confirm no longer creates them),
+// so this is the single construction site for task.created.
 func newTaskCreatedFromTask(t *Task) TaskCreated {
 	return taskCreatedEvent(t.ID, t.DeadlineID, t.CourtRecordID, t.AssigneeUserID, t.DueDate)
 }
@@ -456,7 +449,7 @@ func (TaskUpdated) Type() string          { return TypeTaskUpdated }
 func (TaskUpdated) AggregateType() string { return aggregateTypeTask }
 
 // newTaskUpdated builds the produced event from the patched task's id. Fresh uuid v7 event id
-// (the consumer dedup key); aggregate_id is the task id, mirroring newTaskCreated.
+// (the consumer dedup key); aggregate_id is the task id, mirroring newTaskCreatedFromTask.
 func newTaskUpdated(taskID string) TaskUpdated {
 	return TaskUpdated{Base: events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: taskID}, TaskID: taskID}
 }

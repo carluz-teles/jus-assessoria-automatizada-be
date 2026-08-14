@@ -53,6 +53,11 @@ type mockRepo struct {
 	latestSuggestionOK    bool
 	latestSuggestionErr   error
 	latestSuggestionCalls int
+	taskTitles            []string
+	taskTitlesErr         error
+	taskTitlesCalls       int
+	gotTitlesDeadlineID   string
+	gotTitlesTenantID     string
 
 	// adjust + manual transition path (5c)
 	adjustResult       *DeadlineForAdjust
@@ -112,9 +117,6 @@ type mockRepo struct {
 	confirmCalls          int
 	insertedTasks         []*Task
 	insertTaskCalls       int
-	gotDeleteDeadlineID   string
-	gotDeleteTenantID     string
-	deleteTasksCalls      int
 	gotAdjustID           string
 	gotAdjustTenantID     string
 	adjustReadCalls       int
@@ -228,16 +230,15 @@ func (m *mockRepo) ConfirmDeadline(_ context.Context, _ database.Tx, p ConfirmDe
 	return m.confirmID, m.confirmRecordID, nil
 }
 
-// DeleteTasksByDeadline models the REPLACE step: it drops the confirmed prazo's live tasks
-// (clearing insertedTasks) before the confirm re-inserts the submitted set, so insertedTasks
-// reflects only the last submit — the way a real DELETE + re-INSERT would. Records the count
-// and the (deadlineID, tenantID) scoping so a test can assert the 2-barrier key.
-func (m *mockRepo) DeleteTasksByDeadline(_ context.Context, _ database.Tx, deadlineID, tenantID string) error {
-	m.deleteTasksCalls++
-	m.gotDeleteDeadlineID = deadlineID
-	m.gotDeleteTenantID = tenantID
-	m.insertedTasks = nil
-	return nil
+// ListTaskTitlesByDeadline models the confirm's read of the tasks that REALLY exist for the
+// prazo (the feedback delta diffs the suggestion against these, not the confirm body). Returns
+// the configured titles and records the (deadlineID, tenantID) scoping so a test can assert the
+// 2-barrier key.
+func (m *mockRepo) ListTaskTitlesByDeadline(_ context.Context, _ database.Tx, deadlineID, tenantID string) ([]string, error) {
+	m.taskTitlesCalls++
+	m.gotTitlesDeadlineID = deadlineID
+	m.gotTitlesTenantID = tenantID
+	return m.taskTitles, m.taskTitlesErr
 }
 
 // GetDeadlineForAdjust returns the configured adjustable state and records the (id, tenant)

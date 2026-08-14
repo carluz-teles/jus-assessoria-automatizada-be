@@ -731,8 +731,7 @@ func TestHandler_Confirm_ForwardsCommandFromPrincipal(t *testing.T) {
 	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
 
 	body := `{"intimation_id":"018f0000-0000-7000-8000-000000000abc",
-		"deadline":{"kind":"CONTESTACAO","days":15,"counting":"BUSINESS","doubled":false},
-		"tasks":[{"title":"Contestar","due_date":"2024-02-01"}]}`
+		"deadline":{"kind":"CONTESTACAO","days":15,"counting":"BUSINESS","doubled":false}}`
 	status, resBody := doJSON(t, app, http.MethodPost, "/v1/prazos/confirm", "jwt", body)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
@@ -747,16 +746,14 @@ func TestHandler_Confirm_ForwardsCommandFromPrincipal(t *testing.T) {
 	if cmd.IntimationID != "018f0000-0000-7000-8000-000000000abc" || cmd.Days != 15 || cmd.Counting != CountingBusiness {
 		t.Errorf("command = %+v", cmd)
 	}
-	if len(cmd.Tasks) != 1 || cmd.Tasks[0].Title != "Contestar" || cmd.Tasks[0].DueDate == nil {
-		t.Errorf("tasks = %+v, want one dated 'Contestar'", cmd.Tasks)
-	}
 	if !strings.Contains(resBody, `"id":"d-1"`) || !strings.Contains(resBody, `"status":"OPEN"`) {
 		t.Errorf("response missing confirmed deadline\ngot: %s", resBody)
 	}
 }
 
-// A malformed body (bad counting, non-positive days, empty task title, bad uuid) is a 400
-// with the {kind,...} envelope, and the use case is never called.
+// A malformed body (bad counting, non-positive days, bad uuid) is a 400 with the {kind,...}
+// envelope, and the use case is never called. Task validation is no longer part of the confirm
+// (tasks moved to POST /v1/tasks), so the body carries no tasks.
 func TestHandler_Confirm_Validation_400(t *testing.T) {
 	t.Parallel()
 
@@ -764,11 +761,9 @@ func TestHandler_Confirm_Validation_400(t *testing.T) {
 		name string
 		body string
 	}{
-		{"bad counting", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":15,"counting":"WEEKLY"},"tasks":[]}`},
-		{"days zero", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":0,"counting":"BUSINESS"},"tasks":[]}`},
-		{"empty task title", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[{"title":""}]}`},
-		{"bad intimation id", `{"intimation_id":"not-a-uuid","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[]}`},
-		{"bad due_date", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":5,"counting":"BUSINESS"},"tasks":[{"title":"x","due_date":"01/02/2024"}]}`},
+		{"bad counting", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":15,"counting":"WEEKLY"}}`},
+		{"days zero", `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","deadline":{"days":0,"counting":"BUSINESS"}}`},
+		{"bad intimation id", `{"intimation_id":"not-a-uuid","deadline":{"days":5,"counting":"BUSINESS"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

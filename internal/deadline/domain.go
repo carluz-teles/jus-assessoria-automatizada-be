@@ -57,13 +57,13 @@ type Repository interface {
 	// notification_id), never a second prazo. A no-match is ErrDeadlineNotFound. Returns the
 	// confirmed prazo id and the record it hangs on (RETURNING id, court_record_id).
 	ConfirmDeadline(ctx context.Context, tx database.Tx, p ConfirmDeadlineParams) (deadlineID, courtRecordID string, err error)
-	// DeleteTasksByDeadline drops every task of the confirmed prazo inside the caller's tx,
-	// scoped to (deadlineID, tenantID) (barrier 1 + RLS). Confirm calls it right after
-	// ConfirmDeadline and BEFORE the InsertTask loop, giving the confirm REPLACE semantics
-	// (ERD §9 "upsert idempotente por intimation_id"): re-confirming leaves exactly the last
-	// submit's tasks instead of accumulating a new set each call. A no-match deletes nothing
-	// (an empty first confirm is a clean no-op), so it never errors on absence.
-	DeleteTasksByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) error
+	// ListTaskTitlesByDeadline reads the titles of the tasks that CURRENTLY exist for the
+	// confirmed prazo inside the caller's tx, scoped to (deadlineID, tenantID) (barrier 1 +
+	// RLS). The F2 confirm reads it to measure the AI-suggestion delta (feedback loop, camada 2)
+	// against the tasks that REALLY exist — the Análise section creates them via POST /v1/tasks,
+	// so the confirm no longer owns the task lifecycle. Only the title is needed (the delta keys
+	// off title alone). A prazo with no tasks yields an empty slice, never an error.
+	ListTaskTitlesByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) ([]string, error)
 	// InsertTask persists one task inside the caller's tx and returns it with its DB-assigned
 	// id (echoing the entity, like InsertDeadline). Scoping is via the entity's TenantID + RLS.
 	// Reused by BOTH the F2 confirm (the N approved tasks) and the manual CREATE (POST /v1/tasks).

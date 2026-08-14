@@ -20,8 +20,8 @@ import (
 
 // SuggestedTask is one AI-suggested action for the F2 form: a short imperative title, a short
 // kind (ANALISE|PECA|PROTOCOLO|PROVIDENCIA|CIENCIA…) and a short actionable description. It
-// mirrors the ConfirmTaskInput shape the form submits, so the FE drops each suggestion straight
-// into a task row.
+// mirrors the task shape the form submits (POST /v1/tasks), so the FE drops each suggestion
+// straight into a task row.
 type SuggestedTask struct {
 	Title       string `json:"title"`
 	Kind        string `json:"kind"`

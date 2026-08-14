@@ -100,28 +100,6 @@ func (q *Queries) DeleteTaskItem(ctx context.Context, arg DeleteTaskItemParams) 
 	return id, err
 }
 
-const deleteTasksByDeadline = `-- name: DeleteTasksByDeadline :exec
-DELETE FROM task
-WHERE deadline_id = $1 AND tenant_id = $2
-`
-
-type DeleteTasksByDeadlineParams struct {
-	DeadlineID pgtype.UUID `json:"deadline_id"`
-	TenantID   uuid.UUID   `json:"tenant_id"`
-}
-
-// Drop every task of a confirmed prazo, the REPLACE step of the F2 confirm (§9: the
-// confirm is an "upsert idempotente por intimation_id"). Confirm runs this in the SAME tx
-// right after ConfirmDeadline and BEFORE re-inserting the submitted tasks, so re-confirming
-// the same intimação leaves EXACTLY the last submit's set instead of accumulating +N rows
-// each call. Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A first confirm (no
-// prior tasks) deletes nothing — a clean no-op, never an error. $1 = deadline_id, $2 =
-// tenant_id, both from the confirm tx (the id ConfirmDeadline returned + the principal).
-func (q *Queries) DeleteTasksByDeadline(ctx context.Context, arg DeleteTasksByDeadlineParams) error {
-	_, err := q.db.Exec(ctx, deleteTasksByDeadline, arg.DeadlineID, arg.TenantID)
-	return err
-}
-
 const getCourtRecordClass = `-- name: GetCourtRecordClass :one
 
 SELECT class
@@ -631,6 +609,46 @@ func (q *Queries) InsertTaskSuggestion(ctx context.Context, arg InsertTaskSugges
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const listTaskTitlesByDeadline = `-- name: ListTaskTitlesByDeadline :many
+SELECT title
+FROM task
+WHERE deadline_id = $1 AND tenant_id = $2
+ORDER BY created_at
+`
+
+type ListTaskTitlesByDeadlineParams struct {
+	DeadlineID pgtype.UUID `json:"deadline_id"`
+	TenantID   uuid.UUID   `json:"tenant_id"`
+}
+
+// List the titles of the tasks that CURRENTLY exist for a confirmed prazo, by deadline_id and
+// scoped to tenant_id (barrier 1, on top of RLS barrier 2). The F2 confirm reads it INSIDE its
+// tx to measure the AI-suggestion delta (feedback loop, camada 2) against the tasks that REALLY
+// exist — the Análise section creates them via POST /v1/tasks, so the confirm no longer owns the
+// task lifecycle and must not diff against a submitted set. Only the title is read (the delta
+// keys off title alone). No rows → an empty slice (a prazo confirmed before any task was created),
+// never an error. ORDER BY created_at keeps the result deterministic. $1 = deadline_id, $2 =
+// tenant_id, both from the confirm tx (the id ConfirmDeadline returned + the principal).
+func (q *Queries) ListTaskTitlesByDeadline(ctx context.Context, arg ListTaskTitlesByDeadlineParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listTaskTitlesByDeadline, arg.DeadlineID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var title string
+		if err := rows.Scan(&title); err != nil {
+			return nil, err
+		}
+		items = append(items, title)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const markDeadlineStatus = `-- name: MarkDeadlineStatus :one

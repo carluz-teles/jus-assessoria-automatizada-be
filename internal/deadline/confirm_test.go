@@ -45,10 +45,9 @@ func confirmRepo(p confirmParents, start time.Time, court string) *mockRepo {
 	}
 }
 
-// confirmCmd is a well-formed CONTESTACAO/15/BUSINESS confirmation with one dated,
-// assigned task; tests override the fields they exercise.
+// confirmCmd is a well-formed CONTESTACAO/15/BUSINESS confirmation; tests override the fields
+// they exercise. The confirm carries no tasks — those are managed via POST/PATCH /v1/tasks.
 func confirmCmd(p confirmParents) ConfirmCommand {
-	due := time.Date(2024, 2, 5, 0, 0, 0, 0, time.UTC)
 	return ConfirmCommand{
 		TenantID:     p.tenantID,
 		UserID:       p.userID,
@@ -56,9 +55,6 @@ func confirmCmd(p confirmParents) ConfirmCommand {
 		Kind:         KindContestacao,
 		Days:         15,
 		Counting:     CountingBusiness,
-		Tasks: []ConfirmTaskInput{
-			{Title: "Protocolar contestação", Kind: "PECA", DueDate: &due, AssigneeUserID: uuid.NewString()},
-		},
 	}
 }
 
@@ -142,7 +138,6 @@ func TestConfirm_CalendarCounting(t *testing.T) {
 
 	cmd := confirmCmd(p)
 	cmd.Counting = CountingCalendar
-	cmd.Tasks = nil
 	if _, err := uc.Confirm(context.Background(), cmd); err != nil {
 		t.Fatalf("Confirm() error = %v", err)
 	}
@@ -168,7 +163,6 @@ func TestConfirm_DoubledDoublesRawDays(t *testing.T) {
 	cmd.Days = 15
 	cmd.Doubled = true
 	cmd.DoubledReason = "FAZENDA_183"
-	cmd.Tasks = nil
 	if _, err := uc.Confirm(context.Background(), cmd); err != nil {
 		t.Fatalf("Confirm() error = %v", err)
 	}
@@ -181,11 +175,12 @@ func TestConfirm_DoubledDoublesRawDays(t *testing.T) {
 	}
 }
 
-// TestConfirm_InsertsTasksWithConfirmFields proves the N tasks are inserted MANUAL/OPEN,
-// created_by the principal, carrying the prazo's context ids, and that one task.created is
-// emitted per task with a parseable uuid aggregate; the unassigned/undated task keeps its
-// optional fields empty.
-func TestConfirm_InsertsTasksWithConfirmFields(t *testing.T) {
+// TestConfirm_DoesNotTouchTasks is the bug's regression floor: the confirm no longer owns the
+// task lifecycle (tasks are created via POST /v1/tasks, the "Análise" section), so a confirm
+// must NEVER create — nor delete — tasks. Even re-confirming the same intimação leaves the
+// prazo's tasks untouched. It emits only deadline.updated (plus, when applicable, the feedback
+// delta), never a task.created.
+func TestConfirm_DoesNotTouchTasks(t *testing.T) {
 	p := newConfirmParents()
 	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)
@@ -194,64 +189,27 @@ func TestConfirm_InsertsTasksWithConfirmFields(t *testing.T) {
 	outbox := &fakeOutbox{}
 	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
 
-	due := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
-	assignee := uuid.NewString()
-	cmd := confirmCmd(p)
-	cmd.Tasks = []ConfirmTaskInput{
-		{Title: "Peça", Kind: "PECA", Description: "minutar", DueDate: &due, AssigneeUserID: assignee},
-		{Title: "Ciência"}, // undated, unassigned
-	}
-
-	res, err := uc.Confirm(context.Background(), cmd)
-	if err != nil {
-		t.Fatalf("Confirm() error = %v", err)
-	}
-
-	if repo.insertTaskCalls != 2 || len(repo.insertedTasks) != 2 {
-		t.Fatalf("InsertTask calls = %d, want 2", repo.insertTaskCalls)
-	}
-	first := repo.insertedTasks[0]
-	if first.Status != TaskStatusOpen || first.Source != SourceManual || first.CreatedBy != p.userID {
-		t.Errorf("task status/source/created_by = %q/%q/%q, want OPEN/MANUAL/%q", first.Status, first.Source, first.CreatedBy, p.userID)
-	}
-	if first.TenantID != p.tenantID || first.DeadlineID != p.deadlineID || first.CourtRecordID != p.courtRecordID || first.IntimationID != p.intimationID {
-		t.Error("task context ids (tenant/deadline/court_record/intimation) not carried")
-	}
-	if first.AssigneeUserID != assignee || first.DueDate == nil || !first.DueDate.Equal(due) {
-		t.Errorf("task assignee/due = %q/%v, want %q/%v", first.AssigneeUserID, first.DueDate, assignee, due)
-	}
-	if second := repo.insertedTasks[1]; second.AssigneeUserID != "" || second.DueDate != nil {
-		t.Errorf("undated/unassigned task carried assignee/due = %q/%v, want empty/nil", second.AssigneeUserID, second.DueDate)
-	}
-
-	// Exactly one deadline.updated + one task.created per task, each with a uuid aggregate.
-	updated := publishedOfType[DeadlineUpdated](outbox)
-	created := publishedOfType[TaskCreated](outbox)
-	if len(updated) != 1 || len(created) != 2 {
-		t.Fatalf("events deadline.updated=%d task.created=%d, want 1/2", len(updated), len(created))
-	}
-	u := updated[0]
-	if u.Type() != TypeDeadlineUpdated || u.AggregateType() != aggregateTypeDeadline || u.AggregateID() != p.deadlineID {
-		t.Errorf("deadline.updated type/aggregate = %q/%q/%q", u.Type(), u.AggregateType(), u.AggregateID())
-	}
-	if u.Kind != KindContestacao || u.EndDate != "2024-02-06" || u.Counting != "BUSINESS" || u.Status != "OPEN" {
-		t.Errorf("deadline.updated payload = %+v", u)
-	}
-	for _, tc := range created {
-		if tc.Type() != TypeTaskCreated || tc.AggregateType() != aggregateTypeTask {
-			t.Errorf("task.created type/aggregate = %q/%q", tc.Type(), tc.AggregateType())
+	// Confirm the same intimação twice — the prazo already has tasks (created via the Análise
+	// section); the confirm must not create or drop any of them.
+	for i := 0; i < 2; i++ {
+		res, err := uc.Confirm(context.Background(), confirmCmd(p))
+		if err != nil {
+			t.Fatalf("Confirm() #%d error = %v", i, err)
 		}
-		if _, err := uuid.Parse(tc.AggregateID()); err != nil {
-			t.Errorf("task.created aggregate is not a uuid: %v", err)
-		}
-		if tc.DeadlineID != p.deadlineID || tc.CourtRecordID != p.courtRecordID {
-			t.Errorf("task.created deadline/court_record = %q/%q, want %q/%q", tc.DeadlineID, tc.CourtRecordID, p.deadlineID, p.courtRecordID)
+		if res.Deadline.Status != StatusOpen {
+			t.Errorf("result deadline status = %q, want OPEN", res.Deadline.Status)
 		}
 	}
 
-	// The result mirrors what was persisted/emitted.
-	if len(res.Tasks) != 2 || res.Deadline.Status != StatusOpen {
-		t.Errorf("result tasks=%d deadline.status=%q, want 2/OPEN", len(res.Tasks), res.Deadline.Status)
+	if repo.insertTaskCalls != 0 {
+		t.Errorf("InsertTask calls = %d, want 0 (confirm never creates tasks)", repo.insertTaskCalls)
+	}
+	if got := len(publishedOfType[TaskCreated](outbox)); got != 0 {
+		t.Errorf("task.created events = %d, want 0 (confirm never creates tasks)", got)
+	}
+	// Only deadline.updated is emitted (one per confirm); no suggestion on record → no feedback.
+	if got := len(publishedOfType[DeadlineUpdated](outbox)); got != 2 {
+		t.Errorf("deadline.updated events = %d, want 2 (one per confirm)", got)
 	}
 }
 
@@ -265,7 +223,6 @@ func TestConfirm_ReConfirmIsUpdateNotInsert(t *testing.T) {
 	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
 
 	cmd := confirmCmd(p)
-	cmd.Tasks = nil
 	for i := 0; i < 2; i++ {
 		if _, err := uc.Confirm(context.Background(), cmd); err != nil {
 			t.Fatalf("Confirm() #%d error = %v", i, err)
@@ -273,52 +230,6 @@ func TestConfirm_ReConfirmIsUpdateNotInsert(t *testing.T) {
 	}
 	if repo.confirmCalls != 2 || repo.insertCalls != 0 {
 		t.Errorf("confirm/insertDeadline calls = %d/%d, want 2/0 (re-confirm re-UPDATEs, never inserts)", repo.confirmCalls, repo.insertCalls)
-	}
-}
-
-// TestConfirm_ReConfirmReplacesTasks proves the REPLACE semantics on tasks (ERD §9 "upsert
-// idempotente por intimation_id"): every confirm deletes the prazo's tasks BEFORE re-inserting
-// the submitted set, so re-confirming the same intimação leaves EXACTLY the last submit's tasks
-// — never the accumulated 2N. An empty task set clears them (delete, no insert).
-func TestConfirm_ReConfirmReplacesTasks(t *testing.T) {
-	p := newConfirmParents()
-	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
-	repo := confirmRepo(p, start, "TJSP")
-	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
-
-	cmd := confirmCmd(p)
-	cmd.Tasks = []ConfirmTaskInput{{Title: "Peça"}, {Title: "Ciência"}}
-
-	// Confirm the same intimação twice, each submitting 2 tasks.
-	for i := 0; i < 2; i++ {
-		if _, err := uc.Confirm(context.Background(), cmd); err != nil {
-			t.Fatalf("Confirm() #%d error = %v", i, err)
-		}
-	}
-	// One delete per confirm, and the live set is the last submit's 2 tasks — not 4.
-	if repo.deleteTasksCalls != 2 {
-		t.Errorf("DeleteTasksByDeadline calls = %d, want 2 (one per confirm)", repo.deleteTasksCalls)
-	}
-	if len(repo.insertedTasks) != 2 {
-		t.Errorf("live tasks after re-confirm = %d, want 2 (replaced, not accumulated)", len(repo.insertedTasks))
-	}
-	// The delete is keyed by the confirmed deadline id and scoped to the tenant (barrier 1).
-	if repo.gotDeleteDeadlineID != p.deadlineID || repo.gotDeleteTenantID != p.tenantID {
-		t.Errorf("delete keyed by deadline/tenant = %q/%q, want %q/%q",
-			repo.gotDeleteDeadlineID, repo.gotDeleteTenantID, p.deadlineID, p.tenantID)
-	}
-
-	// Re-confirming with NO tasks clears the deadline's tasks (delete runs, nothing re-inserted).
-	empty := confirmCmd(p)
-	empty.Tasks = nil
-	if _, err := uc.Confirm(context.Background(), empty); err != nil {
-		t.Fatalf("Confirm() empty error = %v", err)
-	}
-	if repo.deleteTasksCalls != 3 {
-		t.Errorf("DeleteTasksByDeadline calls = %d, want 3 (empty confirm still replaces)", repo.deleteTasksCalls)
-	}
-	if len(repo.insertedTasks) != 0 {
-		t.Errorf("live tasks after empty confirm = %d, want 0 (cleared)", len(repo.insertedTasks))
 	}
 }
 
@@ -341,37 +252,13 @@ func TestConfirm_DeadlineNotFound(t *testing.T) {
 	}
 }
 
-// TestConfirm_TaskDueDateAfterEndDate proves the ERD §4 cross-field invariant: a task
-// due_date past the recomputed end_date is a KindInvalid (→ 400), aborting before any
-// confirm/task write or event.
-func TestConfirm_TaskDueDateAfterEndDate(t *testing.T) {
-	p := newConfirmParents()
-	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)
-	repo := confirmRepo(p, start, "TJSP")
-	outbox := &fakeOutbox{}
-	uc := NewUseCase(repo, &fakeCalendar{endDate: end}, outbox, &fakeDedup{}, &fakeUOW{})
-
-	tooLate := time.Date(2024, 2, 7, 0, 0, 0, 0, time.UTC) // after end
-	cmd := confirmCmd(p)
-	cmd.Tasks = []ConfirmTaskInput{{Title: "Atrasada", DueDate: &tooLate}}
-
-	_, err := uc.Confirm(context.Background(), cmd)
-	ae, ok := apperr.From(err)
-	if !ok || ae.Kind != apperr.KindInvalid {
-		t.Errorf("error = %v, want KindInvalid", err)
-	}
-	if repo.confirmCalls != 0 || repo.insertTaskCalls != 0 || len(outbox.published) != 0 {
-		t.Errorf("confirm/insertTask/published = %d/%d/%d, want 0/0/0 when a task due_date is past end_date",
-			repo.confirmCalls, repo.insertTaskCalls, len(outbox.published))
-	}
-}
-
-// TestConfirm_EmitsSuggestionFeedbackDelta proves the feedback loop's camada 2: when the
-// prazo had an AI suggestion, the confirm measures the delta between what the IA suggested
-// and what the human confirmed (kept/removed/added) and emits it as deadline.suggestion_feedback
-// in the SAME tx. Suggested {Protocolar contestação, Analisar sentença}; confirmed
-// {Protocolar contestação, Falar com cliente} → kept 1, removed 1, added 1.
+// TestConfirm_EmitsSuggestionFeedbackDelta proves the feedback loop's camada 2 AFTER the
+// redesign: the delta is measured against the tasks that REALLY exist for the prazo (read via
+// ListTaskTitlesByDeadline — the Análise section created them via POST /v1/tasks), NOT against
+// the confirm body (which now carries none). The lawyer approved 2 of the 3 suggested tasks
+// and added one of their own. Suggested {Protocolar contestação, Analisar sentença, Juntar
+// procuração}; real tasks {Protocolar contestação, Analisar sentença, Falar com cliente} →
+// kept 2, removed 1, added 1. The read is keyed by the confirmed deadline id, scoped to tenant.
 func TestConfirm_EmitsSuggestionFeedbackDelta(t *testing.T) {
 	p := newConfirmParents()
 	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
@@ -385,20 +272,29 @@ func TestConfirm_EmitsSuggestionFeedbackDelta(t *testing.T) {
 		Tasks: []SuggestedTask{
 			{Title: "Protocolar contestação", Kind: "PECA"},
 			{Title: "Analisar sentença", Kind: "ANALISE"},
+			{Title: "Juntar procuração", Kind: "PROVIDENCIA"},
 		},
 	}
+	// The tasks that really exist for the prazo (created via the Análise section): 2 of the
+	// suggested ones were kept, plus one the lawyer wrote.
+	repo.taskTitles = []string{"Protocolar contestação", "Analisar sentença", "Falar com cliente"}
 	cal := &fakeCalendar{endDate: end}
 	outbox := &fakeOutbox{}
 	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
 
-	cmd := confirmCmd(p) // one task: "Protocolar contestação" (kept)
-	cmd.Tasks = append(cmd.Tasks, ConfirmTaskInput{Title: "Falar com cliente", Kind: "PROVIDENCIA"})
-
-	if _, err := uc.Confirm(context.Background(), cmd); err != nil {
+	if _, err := uc.Confirm(context.Background(), confirmCmd(p)); err != nil {
 		t.Fatalf("Confirm() error = %v", err)
 	}
 	if repo.latestSuggestionCalls != 1 {
 		t.Fatalf("GetLatestSuggestion calls = %d, want 1", repo.latestSuggestionCalls)
+	}
+	// The confirmed set came from the real tasks, keyed by the deadline id and scoped to tenant.
+	if repo.taskTitlesCalls != 1 {
+		t.Fatalf("ListTaskTitlesByDeadline calls = %d, want 1", repo.taskTitlesCalls)
+	}
+	if repo.gotTitlesDeadlineID != p.deadlineID || repo.gotTitlesTenantID != p.tenantID {
+		t.Errorf("titles read keyed by deadline/tenant = %q/%q, want %q/%q",
+			repo.gotTitlesDeadlineID, repo.gotTitlesTenantID, p.deadlineID, p.tenantID)
 	}
 
 	fb := publishedOfType[SuggestionFeedback](outbox)
@@ -412,17 +308,57 @@ func TestConfirm_EmitsSuggestionFeedbackDelta(t *testing.T) {
 	if f.PromptVersion != "suggest_tasks/v1" || f.Model != "openai/gpt-4o-mini" {
 		t.Errorf("feedback provenance = %q/%q", f.PromptVersion, f.Model)
 	}
-	if f.SuggestedCount != 2 || f.ConfirmedCount != 2 {
-		t.Errorf("feedback counts suggested/confirmed = %d/%d, want 2/2", f.SuggestedCount, f.ConfirmedCount)
+	if f.SuggestedCount != 3 || f.ConfirmedCount != 3 {
+		t.Errorf("feedback counts suggested/confirmed = %d/%d, want 3/3", f.SuggestedCount, f.ConfirmedCount)
 	}
-	if len(f.Kept) != 1 || f.Kept[0] != "Protocolar contestação" {
-		t.Errorf("kept = %v, want [Protocolar contestação]", f.Kept)
+	if len(f.Kept) != 2 || f.Kept[0] != "Protocolar contestação" || f.Kept[1] != "Analisar sentença" {
+		t.Errorf("kept = %v, want [Protocolar contestação, Analisar sentença]", f.Kept)
 	}
-	if len(f.Removed) != 1 || f.Removed[0] != "Analisar sentença" {
-		t.Errorf("removed = %v, want [Analisar sentença]", f.Removed)
+	if len(f.Removed) != 1 || f.Removed[0] != "Juntar procuração" {
+		t.Errorf("removed = %v, want [Juntar procuração]", f.Removed)
 	}
 	if len(f.Added) != 1 || f.Added[0] != "Falar com cliente" {
 		t.Errorf("added = %v, want [Falar com cliente]", f.Added)
+	}
+}
+
+// TestConfirm_SuggestionButNoTasks proves the "no tasks associated" edge (TDD): a prazo with
+// an AI suggestion but confirmed before the lawyer created any task via the Análise section.
+// The confirm still succeeds; the delta reports every suggestion as removed (0 kept, 0 added).
+func TestConfirm_SuggestionButNoTasks(t *testing.T) {
+	p := newConfirmParents()
+	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)
+
+	repo := confirmRepo(p, start, "TJSP")
+	repo.latestSuggestionOK = true
+	repo.latestSuggestion = SuggestionRecord{
+		PromptVersion: "suggest_tasks/v1",
+		Model:         "openai/gpt-4o-mini",
+		Tasks:         []SuggestedTask{{Title: "Protocolar contestação", Kind: "PECA"}},
+	}
+	repo.taskTitles = nil // no tasks created yet
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{endDate: end}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	res, err := uc.Confirm(context.Background(), confirmCmd(p))
+	if err != nil {
+		t.Fatalf("Confirm() error = %v", err)
+	}
+	if res.Deadline.Status != StatusOpen {
+		t.Errorf("result deadline status = %q, want OPEN", res.Deadline.Status)
+	}
+
+	fb := publishedOfType[SuggestionFeedback](outbox)
+	if len(fb) != 1 {
+		t.Fatalf("suggestion.feedback events = %d, want 1", len(fb))
+	}
+	f := fb[0]
+	if f.ConfirmedCount != 0 || len(f.Kept) != 0 || len(f.Added) != 0 {
+		t.Errorf("with no real tasks: confirmed/kept/added = %d/%d/%d, want 0/0/0", f.ConfirmedCount, len(f.Kept), len(f.Added))
+	}
+	if len(f.Removed) != 1 || f.Removed[0] != "Protocolar contestação" {
+		t.Errorf("removed = %v, want [Protocolar contestação] (all suggestions removed)", f.Removed)
 	}
 }
 
@@ -444,6 +380,10 @@ func TestConfirm_NoSuggestion_NoFeedback(t *testing.T) {
 	}
 	if repo.latestSuggestionCalls != 1 {
 		t.Fatalf("GetLatestSuggestion calls = %d, want 1 (always checked)", repo.latestSuggestionCalls)
+	}
+	// No suggestion → the confirmed tasks are never read (the delta would have no baseline).
+	if repo.taskTitlesCalls != 0 {
+		t.Errorf("ListTaskTitlesByDeadline calls = %d, want 0 (skipped when no suggestion)", repo.taskTitlesCalls)
 	}
 	if fb := publishedOfType[SuggestionFeedback](outbox); len(fb) != 0 {
 		t.Errorf("suggestion.feedback events = %d, want 0 (no suggestion)", len(fb))

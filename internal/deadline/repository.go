@@ -239,30 +239,30 @@ func (r *pgRepository) ConfirmDeadline(ctx context.Context, tx database.Tx, p Co
 	return row.ID.String(), row.CourtRecordID.String(), nil
 }
 
-// DeleteTasksByDeadline drops the confirmed prazo's tasks inside the caller's tx, scoped to
-// (deadlineID, tenantID) (barrier 1 + RLS barrier 2). It is the REPLACE step of the F2
-// confirm: the use case runs it right after ConfirmDeadline and before the InsertTask loop,
-// so re-confirming the same intimação leaves only the last submit's tasks (ERD §9's upsert
-// semantics) instead of accumulating +N rows. deadline_id is a nullable column (mapper lifts
-// it to pgtype.UUID); tenant_id is NOT NULL. Deleting no row (a first confirm) is a clean
-// success, not an error.
-func (r *pgRepository) DeleteTasksByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) error {
+// ListTaskTitlesByDeadline reads the titles of the tasks currently associated with the
+// confirmed prazo inside the caller's tx, scoped to (deadlineID, tenantID) (barrier 1 + RLS
+// barrier 2). The F2 confirm reads it to diff the AI suggestion against the tasks that really
+// exist (feedback loop, camada 2). deadline_id is a nullable column (mapper lifts it to
+// pgtype.UUID); tenant_id is NOT NULL. A prazo with no tasks yields an empty slice (sqlc's
+// :many never returns pgx.ErrNoRows), so absence is a clean empty result, not an error.
+func (r *pgRepository) ListTaskTitlesByDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) ([]string, error) {
 	id, err := pgUUID(deadlineID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tenant, err := parseUUID(tenantID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if err := deadlinedb.New(tx).DeleteTasksByDeadline(ctx, deadlinedb.DeleteTasksByDeadlineParams{
+	titles, err := deadlinedb.New(tx).ListTaskTitlesByDeadline(ctx, deadlinedb.ListTaskTitlesByDeadlineParams{
 		DeadlineID: id,
 		TenantID:   tenant,
-	}); err != nil {
-		return database.WrapInfra(err)
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
 	}
-	return nil
+	return titles, nil
 }
 
 // InsertTask persists one task inside the caller's tx and returns it with its DB-assigned id

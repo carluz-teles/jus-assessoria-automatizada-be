@@ -240,11 +240,12 @@ func (h *Handler) getSuggestedTasks(c *fiber.Ctx) error {
 }
 
 // confirmPrazo handles POST /v1/prazos/confirm: the F2 "Aprovar tudo" (§9). It validates
-// the body, then confirms the prazo (PENDING→OPEN, recomputed) and creates the N tasks in
-// one tx, returning 200 with the confirmed prazo + created tasks. tenant_id and
-// confirmed_by come from the verified principal, never the body — so the write cannot be
-// spoofed onto another tenant. A missing prazo for the intimação is the use case's typed
-// ErrDeadlineNotFound → 404; a bad body is a 400 with the {kind,message,details} envelope.
+// the body, then confirms the prazo (PENDING→OPEN, recomputed) in one tx, returning 200 with
+// the confirmed prazo. It does NOT create tasks — those are managed via POST/PATCH /v1/tasks
+// (the "Análise" section). tenant_id and confirmed_by come from the verified principal, never
+// the body — so the write cannot be spoofed onto another tenant. A missing prazo for the
+// intimação is the use case's typed ErrDeadlineNotFound → 404; a bad body is a 400 with the
+// {kind,message,details} envelope.
 func (h *Handler) confirmPrazo(c *fiber.Ctx) error {
 	var req ConfirmRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -626,12 +627,12 @@ func validateOptionalDate(s string) (string, error) {
 	return s, nil
 }
 
-// confirmResponse is the POST /prazos/confirm payload: the confirmed prazo + the created
-// tasks. It is a purpose-built write DTO (not the read-model detail view — that is 5b's
-// concern), so the F2 screen can render the result without a follow-up read.
+// confirmResponse is the POST /prazos/confirm payload: the confirmed prazo. It is a
+// purpose-built write DTO (not the read-model detail view — that is 5b's concern), so the F2
+// screen can render the result without a follow-up read. It carries no tasks — those are
+// created independently via POST /v1/tasks (the "Análise" section), not by the confirm.
 type confirmResponse struct {
 	Deadline confirmedDeadlineView `json:"deadline"`
-	Tasks    []confirmedTaskView   `json:"tasks"`
 }
 
 // confirmedDeadlineView is the confirmed prazo in the response — the recomputed,
@@ -652,47 +653,10 @@ type confirmedDeadlineView struct {
 	ConfirmedBy     string    `json:"confirmed_by"`
 }
 
-// confirmedTaskView is one created task in the response, with its DB-assigned id. due_date
-// is the wire date (omitted when the task has none); assignee_user_id is omitted when
-// unassigned.
-type confirmedTaskView struct {
-	ID             string `json:"id"`
-	DeadlineID     string `json:"deadline_id"`
-	CourtRecordID  string `json:"court_record_id"`
-	IntimationID   string `json:"intimation_id"`
-	Title          string `json:"title"`
-	Description    string `json:"description,omitempty"`
-	Kind           string `json:"kind,omitempty"`
-	DueDate        string `json:"due_date,omitempty"`
-	Status         string `json:"status"`
-	Source         string `json:"source"`
-	AssigneeUserID string `json:"assignee_user_id,omitempty"`
-}
-
 // newConfirmResponse maps the use case's ConfirmResult to the client-facing payload. The
-// holidays audit and the wire dates are formatted here; the Tasks slice is always
-// initialized so an empty result serializes as [] rather than null.
+// holidays audit and the wire dates are formatted here.
 func newConfirmResponse(res ConfirmResult) confirmResponse {
 	d := res.Deadline
-	tasks := make([]confirmedTaskView, 0, len(res.Tasks))
-	for _, t := range res.Tasks {
-		tv := confirmedTaskView{
-			ID:             t.ID,
-			DeadlineID:     t.DeadlineID,
-			CourtRecordID:  t.CourtRecordID,
-			IntimationID:   t.IntimationID,
-			Title:          t.Title,
-			Description:    t.Description,
-			Kind:           t.Kind,
-			Status:         string(t.Status),
-			Source:         string(t.Source),
-			AssigneeUserID: t.AssigneeUserID,
-		}
-		if t.DueDate != nil {
-			tv.DueDate = t.DueDate.Format(time.DateOnly)
-		}
-		tasks = append(tasks, tv)
-	}
 	return confirmResponse{
 		Deadline: confirmedDeadlineView{
 			ID:              d.ID,
@@ -709,7 +673,6 @@ func newConfirmResponse(res ConfirmResult) confirmResponse {
 			HolidaysApplied: formatDates(d.HolidaysApplied),
 			ConfirmedBy:     d.ConfirmedBy,
 		},
-		Tasks: tasks,
 	}
 }
 

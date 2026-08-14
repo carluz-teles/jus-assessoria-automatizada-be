@@ -48,14 +48,6 @@ type Querier interface {
 	// typed ErrTaskItemNotFound at the mapper (→ 404), never a silent 204 on nothing. $1 = id,
 	// $2 = task_id, $3 = tenant_id.
 	DeleteTaskItem(ctx context.Context, arg DeleteTaskItemParams) (uuid.UUID, error)
-	// Drop every task of a confirmed prazo, the REPLACE step of the F2 confirm (§9: the
-	// confirm is an "upsert idempotente por intimation_id"). Confirm runs this in the SAME tx
-	// right after ConfirmDeadline and BEFORE re-inserting the submitted tasks, so re-confirming
-	// the same intimação leaves EXACTLY the last submit's set instead of accumulating +N rows
-	// each call. Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A first confirm (no
-	// prior tasks) deletes nothing — a clean no-op, never an error. $1 = deadline_id, $2 =
-	// tenant_id, both from the confirm tx (the id ConfirmDeadline returned + the principal).
-	DeleteTasksByDeadline(ctx context.Context, arg DeleteTasksByDeadlineParams) error
 	// deadline slice queries (the prazos CREATION path). Every write and read runs inside
 	// the use case's transaction so RLS scopes it to the event's tenant (barrier 2) on top
 	// of the explicit tenant filter (barrier 1). Absence is a typed error at the mapper,
@@ -228,6 +220,15 @@ type Querier interface {
 	// One task's checklist, ordered by position (the detail view). Scoped to (task_id, tenant_id)
 	// (barrier 1). An empty checklist is 0 rows (not an error). $1 = task_id, $2 = tenant_id.
 	ListTaskItems(ctx context.Context, arg ListTaskItemsParams) ([]ListTaskItemsRow, error)
+	// List the titles of the tasks that CURRENTLY exist for a confirmed prazo, by deadline_id and
+	// scoped to tenant_id (barrier 1, on top of RLS barrier 2). The F2 confirm reads it INSIDE its
+	// tx to measure the AI-suggestion delta (feedback loop, camada 2) against the tasks that REALLY
+	// exist — the Análise section creates them via POST /v1/tasks, so the confirm no longer owns the
+	// task lifecycle and must not diff against a submitted set. Only the title is read (the delta
+	// keys off title alone). No rows → an empty slice (a prazo confirmed before any task was created),
+	// never an error. ORDER BY created_at keeps the result deterministic. $1 = deadline_id, $2 =
+	// tenant_id, both from the confirm tx (the id ConfirmDeadline returned + the principal).
+	ListTaskTitlesByDeadline(ctx context.Context, arg ListTaskTitlesByDeadlineParams) ([]string, error)
 	// The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 	// first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
 	// assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]

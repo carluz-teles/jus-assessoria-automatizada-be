@@ -3,9 +3,10 @@
 // Deadline confirm integration tests — prove the F2 "Aprovar tudo" write path (slice 5a,
 // docs/erd-prazos.md §9) end to end against a REAL Postgres: seed a PENDING prazo via the
 // creation path, then Confirm it and assert — in ONE tx — the prazo flips to OPEN with the
-// RECOMPUTED end_date (through the real judicial calendar) + confirmed_by/at, the N tasks
-// land in the task table, and a deadline.updated + one task.created per task commit to the
-// outbox. These drive the real use case (real repo + calendar + outbox + uow), the same
+// RECOMPUTED end_date (through the real judicial calendar) + confirmed_by/at and a
+// deadline.updated commits to the outbox. The confirm NEVER touches tasks: those are managed
+// via POST/PATCH /v1/tasks (the "Análise" section), so a confirm must not create — nor delete —
+// task rows. These drive the real use case (real repo + calendar + outbox + uow), the same
 // composition cmd/api mounts for the confirm route.
 package integration_test
 
@@ -32,10 +33,10 @@ func mustDate(t *testing.T, s string) time.Time {
 
 // DLC1: seed intimation.observed → PENDING prazo (INTIMACAO on TJSP → the seeded
 // MANIFESTACAO/5/BUSINESS rule, end 2024-03-11), then Confirm with a DIFFERENT day count
-// (10 BUSINESS) + two tasks. The prazo must flip to OPEN with a RECOMPUTED end (2024-03-18,
-// not the PENDING 2024-03-11), stamped confirmed_by/at, and the two tasks + the
-// deadline.updated + two task.created must all be committed.
-func TestDeadline_Confirm_FlipsOpenRecomputesAndWritesTasks(t *testing.T) {
+// (10 BUSINESS). The prazo must flip to OPEN with a RECOMPUTED end (2024-03-18, not the
+// PENDING 2024-03-11), stamped confirmed_by/at, with a single deadline.updated committed — and
+// NO tasks nor task.created, since the confirm no longer owns the task lifecycle.
+func TestDeadline_Confirm_FlipsOpenRecomputes(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
@@ -57,10 +58,8 @@ func TestDeadline_Confirm_FlipsOpenRecomputesAndWritesTasks(t *testing.T) {
 		t.Fatalf("pending end_date = %q, want 2024-03-11 (5 business days)", pendingEnd)
 	}
 
-	// The human confirms: CONTESTACAO, 10 dias úteis, one dated+assigned task and one bare.
+	// The human confirms: CONTESTACAO, 10 dias úteis. No tasks — those are managed via /v1/tasks.
 	userID := uuid.NewString()
-	assignee := uuid.NewString()
-	due := mustDate(t, "2024-03-15")
 	cmd := deadline.ConfirmCommand{
 		TenantID:     p.tenantID.String(),
 		UserID:       userID,
@@ -68,17 +67,13 @@ func TestDeadline_Confirm_FlipsOpenRecomputesAndWritesTasks(t *testing.T) {
 		Kind:         deadline.KindContestacao,
 		Days:         10,
 		Counting:     deadline.CountingBusiness,
-		Tasks: []deadline.ConfirmTaskInput{
-			{Title: "Protocolar contestação", Kind: "PECA", DueDate: &due, AssigneeUserID: assignee},
-			{Title: "Dar ciência ao cliente"},
-		},
 	}
 	res, err := uc.Confirm(ctx, cmd)
 	if err != nil {
 		t.Fatalf("Confirm() error = %v", err)
 	}
-	if res.Deadline.ID != deadlineID || len(res.Tasks) != 2 {
-		t.Errorf("result deadline/tasks = %q/%d, want %q/2", res.Deadline.ID, len(res.Tasks), deadlineID)
+	if res.Deadline.ID != deadlineID {
+		t.Errorf("result deadline = %q, want %q", res.Deadline.ID, deadlineID)
 	}
 
 	// The prazo flipped to OPEN with the recomputed end + the approved fields + the stamp.
@@ -110,39 +105,15 @@ func TestDeadline_Confirm_FlipsOpenRecomputesAndWritesTasks(t *testing.T) {
 		t.Error("confirmed_at = NULL, want a timestamp")
 	}
 
-	// The two tasks landed with the confirm context (OPEN, MANUAL, created_by, FKs).
+	// The confirm created NO tasks — the task lifecycle lives in /v1/tasks.
 	var taskCount int
-	if err := pool.QueryRow(ctx, `
-		SELECT count(*) FROM task
-		WHERE deadline_id = $1 AND tenant_id = $2 AND intimation_id = $3
-		  AND court_record_id = $4 AND status = 'OPEN' AND source = 'MANUAL' AND created_by = $5`,
-		deadlineID, p.tenantID, p.intimationID, p.courtRecordID, userID).Scan(&taskCount); err != nil {
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM task WHERE deadline_id = $1 AND tenant_id = $2`,
+		deadlineID, p.tenantID).Scan(&taskCount); err != nil {
 		t.Fatalf("count tasks: %v", err)
 	}
-	if taskCount != 2 {
-		t.Errorf("task rows = %d, want 2 (OPEN/MANUAL/created_by/FKs)", taskCount)
-	}
-
-	// The dated+assigned task carries its due_date + assignee; the bare one has neither.
-	var datedAssigned int
-	if err := pool.QueryRow(ctx, `
-		SELECT count(*) FROM task
-		WHERE deadline_id = $1 AND due_date = '2024-03-15' AND assignee_user_id = $2 AND title = 'Protocolar contestação'`,
-		deadlineID, assignee).Scan(&datedAssigned); err != nil {
-		t.Fatalf("count dated task: %v", err)
-	}
-	if datedAssigned != 1 {
-		t.Errorf("dated+assigned task rows = %d, want 1", datedAssigned)
-	}
-	var bare int
-	if err := pool.QueryRow(ctx, `
-		SELECT count(*) FROM task
-		WHERE deadline_id = $1 AND title = 'Dar ciência ao cliente' AND due_date IS NULL AND assignee_user_id IS NULL`,
-		deadlineID).Scan(&bare); err != nil {
-		t.Fatalf("count bare task: %v", err)
-	}
-	if bare != 1 {
-		t.Errorf("bare task rows = %d, want 1 (no due_date, no assignee)", bare)
+	if taskCount != 0 {
+		t.Errorf("task rows = %d, want 0 (confirm never creates tasks)", taskCount)
 	}
 
 	// Exactly one deadline.updated (aggregate = deadline id), payload OPEN + recomputed end.
@@ -167,7 +138,7 @@ func TestDeadline_Confirm_FlipsOpenRecomputesAndWritesTasks(t *testing.T) {
 		t.Errorf("deadline.updated end/status/counting = %q/%q/%q, want 2024-03-18/OPEN/BUSINESS", updEnd, updStatus, updCounting)
 	}
 
-	// Two task.created (aggregate_type = task), both pointing at the confirmed prazo.
+	// The confirm emitted NO task.created — it does not create tasks.
 	var taskCreatedCount int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*) FROM outbox
@@ -175,16 +146,16 @@ func TestDeadline_Confirm_FlipsOpenRecomputesAndWritesTasks(t *testing.T) {
 		deadline.TypeTaskCreated, deadlineID).Scan(&taskCreatedCount); err != nil {
 		t.Fatalf("count task.created: %v", err)
 	}
-	if taskCreatedCount != 2 {
-		t.Errorf("task.created rows = %d, want 2", taskCreatedCount)
+	if taskCreatedCount != 0 {
+		t.Errorf("task.created rows = %d, want 0 (confirm never creates tasks)", taskCreatedCount)
 	}
 }
 
-// DLC3: re-confirming the same intimação REPLACES its tasks (ERD §9's "upsert idempotente
-// por intimation_id") instead of accumulating them. Seed a PENDING prazo, confirm it twice
-// with N=2 tasks each, and assert the live task rows for the prazo stay N (=2), never 2N (=4)
-// — proving DeleteTasksByDeadline runs in the confirm tx before the re-insert.
-func TestDeadline_Confirm_ReConfirmReplacesTasks(t *testing.T) {
+// DLC3 is the bug's end-to-end regression: tasks created via the Análise section (POST
+// /v1/tasks) MUST survive a confirm — the confirm no longer deletes the prazo's tasks. Seed a
+// PENDING prazo, create 2 tasks tied to it via CreateTask, then confirm the prazo TWICE and
+// assert the 2 tasks still exist (never dropped to 0, the data-loss the fix prevents).
+func TestDeadline_Confirm_DoesNotDeleteExistingTasks(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
@@ -202,50 +173,45 @@ func TestDeadline_Confirm_ReConfirmReplacesTasks(t *testing.T) {
 		t.Fatalf("read pending deadline: %v", err)
 	}
 
+	// The lawyer creates 2 tasks for the prazo via the Análise section (POST /v1/tasks).
+	tenant := p.tenantID.String()
+	userID := uuid.NewString()
+	for _, title := range []string{"Protocolar contestação", "Dar ciência ao cliente"} {
+		if _, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+			TenantID:      tenant,
+			UserID:        userID,
+			CourtRecordID: p.courtRecordID.String(),
+			DeadlineID:    deadlineID,
+			IntimationID:  p.intimationID.String(),
+			Title:         title,
+		}); err != nil {
+			t.Fatalf("CreateTask(%q): %v", title, err)
+		}
+	}
+
 	cmd := deadline.ConfirmCommand{
-		TenantID:     p.tenantID.String(),
-		UserID:       uuid.NewString(),
+		TenantID:     tenant,
+		UserID:       userID,
 		IntimationID: p.intimationID.String(),
 		Kind:         deadline.KindContestacao,
 		Days:         10,
 		Counting:     deadline.CountingBusiness,
-		Tasks: []deadline.ConfirmTaskInput{
-			{Title: "Protocolar contestação", Kind: "PECA"},
-			{Title: "Dar ciência ao cliente"},
-		},
 	}
 
-	// Confirm the same intimação TWICE with 2 tasks each.
+	// Confirm the same intimação TWICE — the tasks must survive both confirms untouched.
 	for i := 0; i < 2; i++ {
 		if _, err := uc.Confirm(ctx, cmd); err != nil {
 			t.Fatalf("Confirm() #%d error = %v", i, err)
 		}
-	}
-
-	// The prazo has EXACTLY 2 live tasks — the last submit — not the accumulated 4.
-	var taskCount int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM task WHERE deadline_id = $1 AND tenant_id = $2`,
-		deadlineID, p.tenantID).Scan(&taskCount); err != nil {
-		t.Fatalf("count tasks: %v", err)
-	}
-	if taskCount != 2 {
-		t.Errorf("task rows after re-confirm = %d, want 2 (replaced, not accumulated 2N)", taskCount)
-	}
-
-	// A final confirm with NO tasks clears them (REPLACE with an empty set).
-	empty := cmd
-	empty.Tasks = nil
-	if _, err := uc.Confirm(ctx, empty); err != nil {
-		t.Fatalf("Confirm() empty error = %v", err)
-	}
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM task WHERE deadline_id = $1 AND tenant_id = $2`,
-		deadlineID, p.tenantID).Scan(&taskCount); err != nil {
-		t.Fatalf("count tasks after empty confirm: %v", err)
-	}
-	if taskCount != 0 {
-		t.Errorf("task rows after empty confirm = %d, want 0 (cleared)", taskCount)
+		var taskCount int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM task WHERE deadline_id = $1 AND tenant_id = $2`,
+			deadlineID, p.tenantID).Scan(&taskCount); err != nil {
+			t.Fatalf("count tasks after confirm #%d: %v", i, err)
+		}
+		if taskCount != 2 {
+			t.Errorf("task rows after confirm #%d = %d, want 2 (confirm must not delete tasks)", i, taskCount)
+		}
 	}
 }
 
