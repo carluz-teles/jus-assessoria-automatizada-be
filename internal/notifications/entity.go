@@ -77,6 +77,10 @@ const (
 	// TypeDeadlineMissedAviso — a prazo was auto-marked MISSED at the D+1 carência
 	// (deadline.missed).
 	TypeDeadlineMissedAviso = "deadline_missed"
+	// TypeTrialEndingSoonAviso — a tenant's trial is approaching its end
+	// (billing.trial_ending_soon, fatia 2). This is the aviso's `type` column,
+	// distinct from the dotted EVENT id TypeTrialEndingSoon in events.go.
+	TypeTrialEndingSoonAviso = "trial_ending_soon"
 )
 
 // Notification is the local aviso: someone (RecipientUserID, empty for a

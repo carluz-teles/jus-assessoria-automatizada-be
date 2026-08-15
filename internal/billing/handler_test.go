@@ -45,9 +45,20 @@ type fakeHandlerUC struct {
 	sub         *Subscription
 	plans       []StripePlan
 	err         error
+	// now backs Now() — the trial_status/days_until_trial_end tests pin it;
+	// every other test leaves it zero, which falls back to time.Now() (the exact
+	// value never matters when sub.Status is not trialing).
+	now time.Time
 
 	gotTenantID string
 	gotPriceID  string
+}
+
+func (f *fakeHandlerUC) Now() time.Time {
+	if f.now.IsZero() {
+		return time.Now()
+	}
+	return f.now
 }
 
 func (f *fakeHandlerUC) StartCheckout(_ context.Context, tenantID, priceID string) (string, error) {
@@ -253,6 +264,77 @@ func TestHandler_Subscription_Admin_200(t *testing.T) {
 		t.Fatalf("unexpected subscription body: %s", body)
 	}
 }
+
+// AC (fatia 2): the subscription view's trial_status/days_until_trial_end cover
+// all four states — computed against the use case's Now(), never wall-clock time.
+func TestHandler_Subscription_TrialStatus(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		sub            *Subscription
+		wantTrialField string
+		wantDaysField  string // "" when days_until_trial_end must be absent/null
+	}{
+		{
+			name:           "active subscription (never trialed) → not_in_trial, no days field",
+			sub:            &Subscription{Plan: "pro", Status: StatusActive, ActiveProcessLimit: 50},
+			wantTrialField: `"trial_status":"not_in_trial"`,
+			wantDaysField:  `"days_until_trial_end":null`,
+		},
+		{
+			name: "trialing, 5 days left → trial_active",
+			sub: &Subscription{
+				Plan: "starter", Status: StatusTrialing, ActiveProcessLimit: 20,
+				TrialEndsAt: timePtr(now.AddDate(0, 0, 5)),
+			},
+			wantTrialField: `"trial_status":"trial_active"`,
+			wantDaysField:  `"days_until_trial_end":5`,
+		},
+		{
+			name: "trialing, 2 days left (the lead window) → trial_ending_soon",
+			sub: &Subscription{
+				Plan: "starter", Status: StatusTrialing, ActiveProcessLimit: 20,
+				TrialEndsAt: timePtr(now.AddDate(0, 0, 2)),
+			},
+			wantTrialField: `"trial_status":"trial_ending_soon"`,
+			wantDaysField:  `"days_until_trial_end":2`,
+		},
+		{
+			name: "trialing, trial_ends_at already past → trial_expired",
+			sub: &Subscription{
+				Plan: "starter", Status: StatusTrialing, ActiveProcessLimit: 20,
+				TrialEndsAt: timePtr(now.AddDate(0, 0, -1)),
+			},
+			wantTrialField: `"trial_status":"trial_expired"`,
+			wantDaysField:  `"days_until_trial_end":-1`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			uc := &fakeHandlerUC{sub: tt.sub, now: now}
+			app := newApp(uc, roleAdmin, "tenant-1")
+
+			status, body := do(t, app, http.MethodGet, "/v1/billing/subscription", "", "jwt")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", status, body)
+			}
+			if !strings.Contains(body, tt.wantTrialField) {
+				t.Fatalf("body = %s, want to contain %s", body, tt.wantTrialField)
+			}
+			if tt.wantDaysField != "" && !strings.Contains(body, tt.wantDaysField) {
+				t.Fatalf("body = %s, want to contain %s", body, tt.wantDaysField)
+			}
+		})
+	}
+}
+
+// timePtr is a small test helper for the *time.Time fields Subscription carries.
+func timePtr(t time.Time) *time.Time { return &t }
 
 // AC3: a tenant that never checked out surfaces ErrSubscriptionNotFound as a 404.
 func TestHandler_Subscription_NotFound_404(t *testing.T) {

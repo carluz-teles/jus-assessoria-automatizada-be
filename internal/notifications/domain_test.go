@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/lib/database"
@@ -253,6 +254,17 @@ func deadlineMissed(eventID string) DeadlineMissed {
 		Base:       baseWithID(eventID),
 		TenantID:   tenantID,
 		DeadlineID: "deadline-uuid",
+	}
+}
+
+var trialEndsAtFixture = time.Date(2026, 3, 13, 0, 0, 0, 0, time.UTC)
+
+func trialEndingSoon(eventID string, daysLeft int) TrialEndingSoon {
+	return TrialEndingSoon{
+		Base:        baseWithID(eventID),
+		TenantID:    tenantID,
+		TrialEndsAt: trialEndsAtFixture,
+		DaysLeft:    daysLeft,
 	}
 }
 
@@ -760,6 +772,82 @@ func TestInAppUseCase_OnDeadlineMissed_ReplayIsNoOp(t *testing.T) {
 
 	if err := uc.OnDeadlineMissed(context.Background(), deadlineMissed("evt-ms-dup")); err != nil {
 		t.Fatalf("OnDeadlineMissed: %v", err)
+	}
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	if len(pub.channels) != 0 {
+		t.Fatalf("replay pushed %d times, want 0", len(pub.channels))
+	}
+}
+
+// fatia 2: a billing.trial_ending_soon creates one trial-ending-soon aviso + one IN_APP
+// delivery QUEUED, tenant-level, in the tenant-scoped tx, and pushes it once. The body
+// varies by days_left: "hoje" at 0, "em N dia(s)" otherwise — same split as due_soon.
+func TestInAppUseCase_OnTrialEndingSoon_CreatesAviso(t *testing.T) {
+	tests := []struct {
+		name     string
+		daysLeft int
+		wantBody string
+	}{
+		{name: "termina hoje", daysLeft: 0, wantBody: trialEndingSoonTodayBody},
+		{name: "termina em 2 dias", daysLeft: 2, wantBody: "Seu período de teste termina em 2 dia(s)."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := repoInApp()
+			dedup := &fakeDedup{}
+			uow := &fakeUOW{}
+			pub := &fakePublisher{}
+			uc := NewInAppUseCase(repo, dedup, uow, pub)
+
+			if err := uc.OnTrialEndingSoon(context.Background(), trialEndingSoon("evt-tr-1", tt.daysLeft)); err != nil {
+				t.Fatalf("OnTrialEndingSoon: %v", err)
+			}
+
+			if len(repo.insertedNotif) != 1 {
+				t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+			}
+			notif := repo.insertedNotif[0]
+			if notif.Type != TypeTrialEndingSoonAviso || notif.Status != StatusCreated || notif.RecipientUserID != "" {
+				t.Fatalf("notification = %+v, want trial_ending_soon/CREATED/tenant-level", notif)
+			}
+			if notif.Title != trialEndingSoonTitle || notif.Body != tt.wantBody {
+				t.Fatalf("title/body = %q / %q, want %q / %q", notif.Title, notif.Body, trialEndingSoonTitle, tt.wantBody)
+			}
+			if notif.Payload["days_left"] != tt.daysLeft {
+				t.Fatalf("payload = %v, want days_left", notif.Payload)
+			}
+			if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Channel != ChannelInApp || repo.insertedDelivery[0].Status != DeliveryQueued {
+				t.Fatalf("inserted delivery = %+v, want one IN_APP/QUEUED", repo.insertedDelivery)
+			}
+			if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+				t.Fatalf("uow scopes = %v, want one %q", uow.scopes, tenantID)
+			}
+			if len(dedup.marked) != 1 || dedup.marked[0] != "evt-tr-1" || dedup.consumers[0] != consumerTrialEndingSoon {
+				t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-tr-1] under %q", dedup.marked, dedup.consumers, consumerTrialEndingSoon)
+			}
+			push := assertPushedOnce(t, pub)
+			if push["id"] != notifID || push["type"] != TypeTrialEndingSoonAviso || push["title"] != trialEndingSoonTitle || push["body"] != tt.wantBody {
+				t.Fatalf("push = %v, want the trial_ending_soon aviso", push)
+			}
+		})
+	}
+}
+
+// fatia 2: a replay of a billing.trial_ending_soon (dedup already seen) is a pure no-op —
+// no aviso, no delivery, no push.
+func TestInAppUseCase_OnTrialEndingSoon_ReplayIsNoOp(t *testing.T) {
+	repo := repoInApp()
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran on a replay")
+		return nil, nil
+	}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{}, pub)
+
+	if err := uc.OnTrialEndingSoon(context.Background(), trialEndingSoon("evt-tr-dup", 2)); err != nil {
+		t.Fatalf("OnTrialEndingSoon: %v", err)
 	}
 	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
 		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)

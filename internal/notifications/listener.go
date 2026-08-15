@@ -19,13 +19,15 @@ type notifyUC interface {
 	OnNotificationRequested(ctx context.Context, ev NotificationRequested) error
 }
 
-// inAppUC is the port for the in-app consumers: the two acquisition events (slice 1a) and
-// the two deadline events (fatia 4c) this slice turns into IN_APP avisos.
+// inAppUC is the port for the in-app consumers: the two acquisition events (slice 1a),
+// the two deadline events (fatia 4c) and the billing trial event (fatia 2) this slice
+// turns into IN_APP avisos.
 type inAppUC interface {
 	OnBackfillFinished(ctx context.Context, ev BackfillFinished) error
 	OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error
 	OnDeadlineDueSoon(ctx context.Context, ev DeadlineDueSoon) error
 	OnDeadlineMissed(ctx context.Context, ev DeadlineMissed) error
+	OnTrialEndingSoon(ctx context.Context, ev TrialEndingSoon) error
 }
 
 // Listener is notifications' asynq consumer. It holds no transport state; the use
@@ -52,6 +54,7 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeDocketEntryObserved, l.handleDocketEntryObserved)
 	mux.HandleFunc(TypeDeadlineDueSoon, l.handleDeadlineDueSoon)
 	mux.HandleFunc(TypeDeadlineMissed, l.handleDeadlineMissed)
+	mux.HandleFunc(TypeTrialEndingSoon, l.handleTrialEndingSoon)
 }
 
 // handleNotificationRequested is the asynq.HandlerFunc for notification.requested. It
@@ -111,4 +114,15 @@ func (l *Listener) handleDeadlineMissed(ctx context.Context, t *asynq.Task) erro
 		return err
 	}
 	return l.inApp.OnDeadlineMissed(ctx, ev)
+}
+
+// handleTrialEndingSoon is the asynq.HandlerFunc for billing.trial_ending_soon
+// (fatia 2). It decodes the payload and hands off to the in-app use case (→ a
+// trial-ending-soon aviso). Same error contract as the other handlers.
+func (l *Listener) handleTrialEndingSoon(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[TrialEndingSoon](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnTrialEndingSoon(ctx, ev)
 }

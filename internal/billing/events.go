@@ -1,10 +1,12 @@
 package billing
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/lib/events"
 )
 
@@ -147,4 +149,135 @@ func derefTime(t *time.Time) time.Time {
 		return time.Time{}
 	}
 	return *t
+}
+
+// --- consumed: identity.tenant_provisioned (fatia 2) -------------------------
+
+// TypeTenantProvisioned is the dotted id this slice CONSUMES. Only the const
+// crosses the boundary from identity (the producer); the payload SHAPE is
+// redefined LOCALLY as TenantProvisioned below, so this slice never imports
+// identity's event struct (pattern (b), mirroring how the deadline/notifications
+// slices consume each other's scheduled-check facts).
+const TypeTenantProvisioned = identity.TypeTenantProvisioned
+
+// TenantProvisioned is the LOCAL decode shape of identity.tenant_provisioned: the
+// tenant a trial subscription should be started for. Only ever DECODED here
+// (events.Decode needs no interface), so it carries no Type()/AggregateType().
+// Base yields the event id this slice dedups the trial provisioning on — identity
+// mints it as a STABLE key per tenant, so an at-least-once replay (a Clerk webhook
+// redelivery) collapses to the SAME id here, never a second trial.
+type TenantProvisioned struct {
+	events.Base
+	TenantID string `json:"tenant_id"`
+}
+
+// --- produced/consumed: the trial-ending-soon flow (fatia 2) -----------------
+
+// trialEndingSoonLeadDays is how many days before trial_ends_at the scheduled
+// check fires, and the threshold GetSubscription's trial_status read model uses
+// to report "trial_ending_soon" — the same number drives both, so the check and
+// the read model never disagree about what "soon" means.
+const trialEndingSoonLeadDays = 2
+
+const (
+	// TypeTrialEndingSoonCheck is the dotted id of the INTERNAL, SCHEDULED
+	// self-message this slice both PRODUCES (at trial start) and CONSUMES (at the
+	// ETA, trialEndingSoonLeadDays before trial_ends_at). It carries no aviso
+	// itself: when it fires the handler RE-READS the subscription's CURRENT state
+	// and only THEN emits the real trial_ending_soon — so a trial converted or
+	// canceled between provisioning and the mark never sends a stale aviso.
+	TypeTrialEndingSoonCheck = "billing.trial_ending_soon_check"
+	// TypeTrialEndingSoon is the dotted id of the REAL aviso this slice PRODUCES
+	// when a trial_ending_soon_check fires on a subscription still trialing within
+	// the window. Its consumer is notifications.
+	TypeTrialEndingSoon = "billing.trial_ending_soon"
+)
+
+// TrialEndingSoonCheck is the trial's scheduled self-message, mirroring the
+// deadline slice's DeadlineReminderCheck (see internal/deadline/events.go). Its
+// idempotency key is the STABLE "trial-ending-soon:{subscription_id}" — it
+// doubles as the asynq TaskID (schedule-once, the relay dedups a re-derive) and
+// the fire handler's processed_event dedup key (process-once). TrialEndsAt is the
+// value AT SCHEDULING TIME; the fire handler re-reads the subscription rather
+// than trusting it, since it may be stale by the time the mark fires. processAt is
+// UNEXPORTED so it never serializes — it only feeds ProcessAt() at publish time.
+type TrialEndingSoonCheck struct {
+	events.Base
+	TenantID       string    `json:"tenant_id"`
+	SubscriptionID string    `json:"subscription_id"`
+	TrialEndsAt    time.Time `json:"trial_ends_at"`
+	processAt      time.Time
+}
+
+var (
+	_ events.Event          = TrialEndingSoonCheck{}
+	_ events.ScheduledEvent = TrialEndingSoonCheck{}
+)
+
+func (TrialEndingSoonCheck) Type() string          { return TypeTrialEndingSoonCheck }
+func (TrialEndingSoonCheck) AggregateType() string { return aggregateTypeTenant }
+
+// ProcessAt opts the check INTO future delivery (docs erd-backend §4c; repo
+// directive: ETA work is a scheduled task, not polling): start-of-day(trial_ends_at)
+// minus trialEndingSoonLeadDays calendar days.
+func (e TrialEndingSoonCheck) ProcessAt() (time.Time, bool) { return e.processAt, true }
+
+// newTrialEndingSoonCheck builds the trial's single scheduled mark. aggregate_id
+// is the tenant (every billing event's aggregate); the event id is the STABLE
+// per-subscription key described on TrialEndingSoonCheck.
+func newTrialEndingSoonCheck(tenantID, subscriptionID string, trialEndsAt time.Time) TrialEndingSoonCheck {
+	return TrialEndingSoonCheck{
+		Base:           events.Base{EventID: fmt.Sprintf("trial-ending-soon:%s", subscriptionID), Aggregate: tenantID},
+		TenantID:       tenantID,
+		SubscriptionID: subscriptionID,
+		TrialEndsAt:    trialEndsAt,
+		processAt:      startOfDay(trialEndsAt).AddDate(0, 0, -trialEndingSoonLeadDays),
+	}
+}
+
+// TrialEndingSoon is the REAL aviso, emitted when a trial_ending_soon_check fires
+// on a subscription re-checked as still trialing and inside the window. The
+// payload is deliberately MINIMAL (TenantID, TrialEndsAt, DaysLeft) — no plan name,
+// price or Stripe id: notifications does not need the catalog to render the
+// e-mail, and this keeps the payload stable across catalog changes.
+type TrialEndingSoon struct {
+	events.Base
+	TenantID    string    `json:"tenant_id"`
+	TrialEndsAt time.Time `json:"trial_ends_at"`
+	DaysLeft    int       `json:"days_left"`
+}
+
+var _ events.Event = TrialEndingSoon{}
+
+func (TrialEndingSoon) Type() string          { return TypeTrialEndingSoon }
+func (TrialEndingSoon) AggregateType() string { return aggregateTypeTenant }
+
+// newTrialEndingSoon builds the real aviso from the re-checked subscription's
+// state. Fresh uuid v7 event id (the consumer dedup key) — unlike the check, this
+// is a genuinely new fact each time it fires, so it needs no stable key.
+func newTrialEndingSoon(tenantID string, trialEndsAt time.Time, daysLeft int) TrialEndingSoon {
+	return TrialEndingSoon{
+		Base:        events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: tenantID},
+		TenantID:    tenantID,
+		TrialEndsAt: trialEndsAt,
+		DaysLeft:    daysLeft,
+	}
+}
+
+// startOfDay collapses a civil date to midnight in its own location — the anchor
+// of the check's ETA math, mirroring the deadline slice's identical helper
+// (internal/deadline/domain.go's startOfDay). trial_ends_at already carries no
+// meaningful time-of-day component for this purpose, so this just normalizes it.
+func startOfDay(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
+// daysUntil returns the whole number of calendar days between now and t (t's own
+// date minus now's), on start-of-day boundaries — negative once t's date is in
+// the past. Shared by OnTrialEndingSoonCheck's re-check (domain.go) and the
+// subscription read model's trial_status/days_until_trial_end (handler.go), so
+// the two never disagree about what "N days left" means.
+func daysUntil(t, now time.Time) int {
+	return int(startOfDay(t).Sub(startOfDay(now)).Hours() / 24)
 }

@@ -275,6 +275,16 @@ func TestQueueFor(t *testing.T) {
 		{"document.failed", "documents"},
 		{"ai.revisao.requested", "ai"},
 		{"notification.requested", "notifications"},
+		// Trial provisioning (fatia 2): billing has no dedicated server, so it shares the
+		// "notifications" queue with the main worker's mux. identity.tenant_provisioned
+		// carries the "identity" prefix (unrouted otherwise); the billing.* pair carry
+		// "billing" (also unrouted by the prefix switch below).
+		{"identity.tenant_provisioned", "notifications"},
+		{"billing.trial_ending_soon_check", "notifications"},
+		{"billing.trial_ending_soon", "notifications"},
+		// The rest of the billing domain has no async consumer today — stays on "default"
+		// (an orphan, same as before this fatia).
+		{"billing.subscription_activated", "default"},
 		{"minuta.revised", "default"},
 		{"nodot", "default"},
 		{"", "default"},

@@ -5,14 +5,30 @@ import (
 	"errors"
 	"log/slog"
 	"math"
+	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
 
-// consumerBilling is the processed_event consumer name this slice dedups under.
-// Each consumer dedups independently (docs §4c.3), so it is billing-specific.
-const consumerBilling = "billing"
+// processed_event consumer names this slice dedups under (docs §4c.3: dedup is
+// per-consumer, so marking one event never blocks another consumer of the same
+// event). consumerBilling is the webhook path (Stripe events); the other two are
+// the async listener's (fatia 2), kept distinct from it and from each other so a
+// tenant_provisioned replay and a trial_ending_soon_check redelivery dedup
+// independently.
+const (
+	consumerBilling               = "billing"
+	consumerBillingTrialProvision = "billing-trial-provision"
+	consumerBillingTrialEndSoon   = "billing-trial-ending-soon"
+)
+
+// starterPlanCode is the plan a fresh trial starts on: the lowest paid tier
+// (Starter). A pragmatic default until the product exposes plan choice at signup —
+// it only pins which catalog row subscription.plan_id references; the trial's own
+// ceiling (TrialPolicy.ActiveProcessLimit) is resolved independently and may
+// differ from the Starter plan's own MaxProcesses.
+const starterPlanCode = "starter"
 
 // publisher is the narrow outbox port the use case needs — the producer half of
 // the transactional outbox. *events.Outbox satisfies it structurally.
@@ -51,6 +67,10 @@ type UseCase struct {
 	dedup    deduper
 	uow      database.UnitOfWork
 	checkout CheckoutConfig
+	// now is the reference clock trial provisioning/read-model math compares
+	// against; it defaults to time.Now and is overridable in tests via WithClock
+	// (mirroring internal/deadline/domain.go's identical seam).
+	now func() time.Time
 }
 
 // Option configures optional UseCase collaborators. Kept variadic so the webhook
@@ -64,16 +84,29 @@ func WithCheckoutConfig(c CheckoutConfig) Option {
 	return func(uc *UseCase) { uc.checkout = c }
 }
 
+// WithClock overrides the reference clock trial provisioning (trial_ends_at) and
+// the subscription read model (trial_status/days_until_trial_end) use. Production
+// leaves the default (time.Now); tests pin it to assert deterministically.
+func WithClock(now func() time.Time) Option {
+	return func(uc *UseCase) { uc.now = now }
+}
+
 // NewUseCase wires the use cases to their repository, Stripe gateway, outbox
 // publisher, dedup guard and unit of work. Optional collaborators (the checkout
-// config) arrive through Options so existing callers stay source-compatible.
+// config, the clock) arrive through Options so existing callers stay
+// source-compatible; the clock defaults to time.Now.
 func NewUseCase(repo Repository, gateway StripeGateway, outbox publisher, dedup deduper, uow database.UnitOfWork, opts ...Option) *UseCase {
-	uc := &UseCase{repo: repo, gateway: gateway, outbox: outbox, dedup: dedup, uow: uow}
+	uc := &UseCase{repo: repo, gateway: gateway, outbox: outbox, dedup: dedup, uow: uow, now: time.Now}
 	for _, opt := range opts {
 		opt(uc)
 	}
 	return uc
 }
+
+// Now returns the use case's reference clock — the handler's read model
+// (trial_status/days_until_trial_end) uses it so "now" is computed in exactly one
+// place, never re-derived independently at the edge.
+func (uc *UseCase) Now() time.Time { return uc.now() }
 
 // HandleWebhook verifies a raw Stripe webhook and projects its effect. It is the
 // whole entry point behind POST /webhooks/stripe: verify the signature over the
@@ -343,6 +376,120 @@ func (uc *UseCase) OpenPortal(ctx context.Context, tenantID string) (string, err
 // fresh). A tenant that never checked out gets ErrSubscriptionNotFound (→ 404).
 func (uc *UseCase) GetSubscription(ctx context.Context, tenantID string) (*Subscription, error) {
 	return uc.repo.FindByTenant(ctx, tenantID)
+}
+
+// OnTenantProvisioned handles one identity.tenant_provisioned (fatia 2): it
+// starts the tenant's trial subscription. identity.ProvisionTenant publishes this
+// event on EVERY UpsertTenant call (create AND replay — UpsertTenant is idempotent
+// ON CONFLICT DO UPDATE, and detecting insert-vs-update on the producer side is
+// unnecessary complexity), with a STABLE event id per tenant, so dedup here —
+// exactly the at-least-once pattern billing already uses for Stripe webhooks — is
+// what makes a replay a no-op instead of a second trial.
+//
+// Steps, all in one tx:
+//  1. dedup — a replay marks nothing new and returns before any write;
+//  2. resolve the default trial policy — no default configured is an operational
+//     misconfiguration, so it fails LOUD (ErrNoDefaultTrialPolicy) rather than
+//     silently starting a trial with no defined length;
+//  3. resolve the Starter plan (the trial's default catalog row);
+//  4. compute trial_ends_at = now + trial_policy.TrialDays;
+//  5. upsert the subscription (trialing, the trial's OWN ActiveProcessLimit — NOT
+//     the Starter plan's — trial_ends_at);
+//  6. publish subscription_activated (reused, unchanged shape) + the scheduled
+//     trial_ending_soon_check, both in the same tx.
+func (uc *UseCase) OnTenantProvisioned(ctx context.Context, ev TenantProvisioned) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerBillingTrialProvision, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		policy, err := uc.repo.FindDefaultTrialPolicy(ctx, tx)
+		if err != nil {
+			// ErrNoDefaultTrialPolicy included: a missing default trial policy is a
+			// catalog misconfiguration, never a silent "no trial" fallback.
+			return err
+		}
+
+		plan, err := uc.repo.FindPlanByCode(ctx, tx, starterPlanCode)
+		if err != nil {
+			return err
+		}
+
+		trialEndsAt := uc.now().AddDate(0, 0, policy.TrialDays)
+
+		saved, err := uc.repo.UpsertSubscription(ctx, tx, UpsertParams{
+			TenantID:           ev.TenantID,
+			Status:             StatusTrialing,
+			Plan:               plan.Name,
+			ActiveProcessLimit: policy.ActiveProcessLimit,
+			PlanID:             &plan.ID,
+			TrialEndsAt:        &trialEndsAt,
+		})
+		if err != nil {
+			return err
+		}
+
+		if err := uc.outbox.Publish(ctx, tx, newSubscriptionActivated(saved)); err != nil {
+			return err
+		}
+		return uc.outbox.Publish(ctx, tx, newTrialEndingSoonCheck(saved.TenantID, saved.ID, trialEndsAt))
+	})
+}
+
+// OnTrialEndingSoonCheck handles one billing.trial_ending_soon_check (fatia 2):
+// the trial's single scheduled mark fired at its ETA. It RE-READS the
+// subscription's CURRENT state rather than trusting the check's payload — a trial
+// converted (checkout completed) or canceled between provisioning and the mark
+// must never send a stale "your trial is ending" aviso. Only a subscription STILL
+// trialing, with trial_ends_at still inside the lead window, gets the real event;
+// every other case (converted, canceled, or a trial_ends_at pushed further out
+// than the check assumed) is a silent no-op.
+//
+// Steps:
+//  1. dedup — a redelivered task returns before any write;
+//  2. re-read the subscription by tenant;
+//  3. status != trialing, or trial_ends_at unset/outside the window → no-op;
+//  4. otherwise emit trial_ending_soon in the SAME tx.
+func (uc *UseCase) OnTrialEndingSoonCheck(ctx context.Context, ev TrialEndingSoonCheck) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerBillingTrialEndSoon, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		sub, err := uc.repo.FindByTenant(ctx, ev.TenantID)
+		if errors.Is(err, ErrSubscriptionNotFound) {
+			// Should not happen (the mark is scheduled off a just-provisioned
+			// subscription), but a gone row is nothing to warn about — never fail
+			// loud on a stale mark.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if sub.Status != StatusTrialing || sub.TrialEndsAt == nil {
+			// Converted (checkout completed), canceled, or — defensively — a row
+			// with no trial window: nothing to warn about.
+			return nil
+		}
+
+		daysLeft := daysUntil(*sub.TrialEndsAt, uc.now())
+		if daysLeft < 0 || daysLeft > trialEndingSoonLeadDays {
+			// Already expired, or trial_ends_at moved further out than the check
+			// assumed (a policy/plan change extended the trial) — the CURRENT state
+			// is outside the "ending soon" window, so stay silent.
+			return nil
+		}
+
+		return uc.outbox.Publish(ctx, tx, newTrialEndingSoon(ev.TenantID, *sub.TrialEndsAt, daysLeft))
+	})
 }
 
 // ListPlans returns the active plan catalog read LIVE from Stripe (StripePlan) —

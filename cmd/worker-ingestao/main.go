@@ -271,6 +271,16 @@ func run(logger *slog.Logger) error {
 	inAppUC := notifications.NewInAppUseCase(notifRepo, notifDedup, uow, pubsub.NewRedisPubSub(pubsubClient))
 	notifications.NewListener(notifyUC, inAppUC).Register(mux)
 
+	// billing (fatia 2): consume identity.tenant_provisioned (start the tenant's trial)
+	// and the scheduled billing.trial_ending_soon_check (re-check + warn). This is the
+	// FIRST asynq consumer billing needs (it was webhook-only until now); both types
+	// route to "notifications" (see lib/events' queueFor) so they ride the main mux
+	// rather than a new dedicated server — the work is light and low-volume. The
+	// gateway is nil: neither handler ever calls Stripe (that is the webhook path,
+	// wired separately in cmd/api).
+	billingUC := billing.NewUseCase(billing.NewRepository(pool), nil, outbox, billing.NewDedup(), uow)
+	billing.NewListener(billingUC).Register(mux)
+
 	// deadline (slice 2c): consume acquisition.intimation.observed and derive the prazo
 	// deterministically (rules layer → the shared judicial calendar `cal`), persisting it
 	// PENDING and emitting deadline.opened in one idempotent tx. The use case is built here,

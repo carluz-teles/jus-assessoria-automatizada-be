@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/hibiken/asynq"
 
@@ -28,18 +29,21 @@ func (s *spyNotifyUC) OnNotificationRequested(_ context.Context, ev Notification
 // spyInAppUC records the decoded events and returns a preset error, so the two in-app
 // handlers can be asserted in isolation from the use case.
 type spyInAppUC struct {
-	backfill    BackfillFinished
-	docket      DocketEntryObserved
-	dueSoon     DeadlineDueSoon
-	missed      DeadlineMissed
-	backfillN   int
-	docketN     int
-	dueSoonN    int
-	missedN     int
-	backfillErr error
-	docketErr   error
-	dueSoonErr  error
-	missedErr   error
+	backfill     BackfillFinished
+	docket       DocketEntryObserved
+	dueSoon      DeadlineDueSoon
+	missed       DeadlineMissed
+	trialEndSoon TrialEndingSoon
+	backfillN    int
+	docketN      int
+	dueSoonN     int
+	missedN      int
+	trialEndN    int
+	backfillErr  error
+	docketErr    error
+	dueSoonErr   error
+	missedErr    error
+	trialEndErr  error
 }
 
 func (s *spyInAppUC) OnBackfillFinished(_ context.Context, ev BackfillFinished) error {
@@ -64,6 +68,12 @@ func (s *spyInAppUC) OnDeadlineMissed(_ context.Context, ev DeadlineMissed) erro
 	s.missedN++
 	s.missed = ev
 	return s.missedErr
+}
+
+func (s *spyInAppUC) OnTrialEndingSoon(_ context.Context, ev TrialEndingSoon) error {
+	s.trialEndN++
+	s.trialEndSoon = ev
+	return s.trialEndErr
 }
 
 // A well-formed notification.requested task is decoded and dispatched to the use case
@@ -317,5 +327,53 @@ func TestListener_HandleDeadlineMissed_UseCaseErrorPropagates(t *testing.T) {
 	}
 	if err := l.handleDeadlineMissed(context.Background(), asynq.NewTask(TypeDeadlineMissed, payload)); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the use-case error", err)
+	}
+}
+
+// A well-formed billing.trial_ending_soon task is decoded and dispatched to the
+// in-app use case with its fields intact.
+func TestListener_HandleTrialEndingSoon_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	trialEndsAt := time.Date(2026, 3, 13, 0, 0, 0, 0, time.UTC)
+	ev := TrialEndingSoon{
+		Base:        events.Base{EventID: "evt-tr", Aggregate: "tenant-5"},
+		TenantID:    "tenant-5",
+		TrialEndsAt: trialEndsAt,
+		DaysLeft:    2,
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+	if err := l.handleTrialEndingSoon(context.Background(), asynq.NewTask(TypeTrialEndingSoon, payload)); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if inApp.trialEndN != 1 {
+		t.Fatalf("use case called %d times, want 1", inApp.trialEndN)
+	}
+	if inApp.trialEndSoon.TenantID != "tenant-5" || inApp.trialEndSoon.DaysLeft != 2 || !inApp.trialEndSoon.TrialEndsAt.Equal(trialEndsAt) {
+		t.Fatalf("dispatched event = %+v", inApp.trialEndSoon)
+	}
+}
+
+// A malformed billing.trial_ending_soon payload wraps asynq.SkipRetry (archived), and the
+// use case is never called.
+func TestListener_HandleTrialEndingSoon_BadPayloadSkipsRetry(t *testing.T) {
+	t.Parallel()
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+
+	err := l.handleTrialEndingSoon(context.Background(), asynq.NewTask(TypeTrialEndingSoon, []byte("{bad")))
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("err = %v, want it to wrap asynq.SkipRetry", err)
+	}
+	if inApp.trialEndN != 0 {
+		t.Fatalf("use case called %d times on a decode fault, want 0", inApp.trialEndN)
 	}
 }

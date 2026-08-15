@@ -1,14 +1,24 @@
 package identity
 
-import "github.com/jusassessoria/platform/lib/events"
+import (
+	"fmt"
+
+	"github.com/jusassessoria/platform/lib/events"
+)
 
 // Event contracts for the identity slice. Other slices may import these structs
 // as the shape they consume — they are the only identity types allowed to cross
 // a slice boundary (slices communicate by event, never by entity/repo).
 //
-// TenantProvisioned/UserProvisioned are plain shapes not yet published (the
-// producer wiring lands with the consumer that needs them). OrgProfileUpdated IS
-// published — the onboarding profile write emits it through the outbox.
+// UserProvisioned is a plain shape not yet published (the producer wiring lands
+// with the consumer that needs them). TenantProvisioned/OrgProfileUpdated ARE
+// published — ProvisionTenant emits the former, the onboarding profile write the
+// latter, both through the outbox.
+
+// TypeTenantProvisioned is the dotted id of the event emitted after a tenant is
+// created or synced from Clerk (ProvisionTenant, domain.go). Its aggregate is the
+// tenant. billing (fatia 2) consumes it to start the tenant's trial subscription.
+const TypeTenantProvisioned = "identity.tenant_provisioned"
 
 // TypeOrgProfileUpdated is the dotted id of the event emitted when an escritório's
 // company profile is saved during onboarding. Its aggregate is the tenant.
@@ -38,10 +48,36 @@ const notifyTypeMemberJoined = "member_joined"
 
 const aggregateTypeTenant = "tenant"
 
-// TenantProvisioned is emitted after a tenant is created or synced from Clerk.
+// TenantProvisioned is emitted, in the SAME transaction as UpsertTenant, after a
+// tenant is created or synced from Clerk (ProvisionTenant). UpsertTenant is
+// idempotent (ON CONFLICT (clerk_org_id) DO UPDATE), so an at-least-once webhook
+// replay calls ProvisionTenant again — rather than trying to detect insert-vs-
+// update here, this always publishes, and the EventID is a STABLE key derived from
+// TenantID alone (not a fresh uuid per publish): every replay for the same tenant
+// mints the identical event id, so a consumer's SeenOrMark dedup (the same
+// at-least-once pattern billing already uses for Stripe webhooks) collapses the
+// replays into a single effect, exactly like the deadline slice's scheduled marks.
 type TenantProvisioned struct {
-	TenantID   string
-	ClerkOrgID string
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	ClerkOrgID string `json:"clerk_org_id"`
+}
+
+var _ events.Event = TenantProvisioned{}
+
+func (TenantProvisioned) Type() string          { return TypeTenantProvisioned }
+func (TenantProvisioned) AggregateType() string { return aggregateTypeTenant }
+
+// newTenantProvisioned builds the event for a (re)provisioned tenant. The event id
+// is the stable "tenant-provisioned:{tenant_id}" key (see TenantProvisioned's
+// doc) — deliberately NOT a fresh uuid, so every replay of the same tenant's
+// provisioning dedups to one effect downstream.
+func newTenantProvisioned(tenant *Tenant) TenantProvisioned {
+	return TenantProvisioned{
+		Base:       events.Base{EventID: fmt.Sprintf("tenant-provisioned:%s", tenant.ID), Aggregate: tenant.ID},
+		TenantID:   tenant.ID,
+		ClerkOrgID: tenant.ClerkOrgID,
+	}
 }
 
 // UserProvisioned is emitted after an app_user is created or synced from Clerk.

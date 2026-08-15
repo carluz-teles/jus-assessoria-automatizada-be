@@ -41,7 +41,10 @@ func (uc *UseCase) ProvisionTenant(ctx context.Context, clerkOrgID, name string)
 	err := uc.uow.Do(ctx, "", func(tx database.Tx) error {
 		var err error
 		tenant, err = uc.repo.UpsertTenant(ctx, tx, clerkOrgID, name)
-		return err
+		if err != nil {
+			return err
+		}
+		return uc.outbox.Publish(ctx, tx, newTenantProvisioned(tenant))
 	})
 	if err != nil {
 		return nil, err

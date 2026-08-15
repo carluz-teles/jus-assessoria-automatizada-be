@@ -246,6 +246,17 @@ func queueFor(typ string) string {
 	if typ == "deadline.due_soon" || typ == "deadline.missed" {
 		return "notifications"
 	}
+	// The trial provisioning flow (fatia 2) shares the "notifications" queue too: billing
+	// has no dedicated asynq server (it was webhook-only before this fatia), and the work is
+	// light/low-volume (one provisioning + one scheduled check per tenant), so it rides the
+	// main worker's mux alongside the notifications listener instead of standing up a new
+	// dedicated server. identity.tenant_provisioned carries the "identity" prefix (would
+	// otherwise fall to "default", which no worker drains — silently stalling every trial);
+	// billing.trial_ending_soon_check/trial_ending_soon carry "billing" (also unrouted by
+	// the prefix switch below). Must match worker-ingestao's billing.NewListener wiring.
+	if typ == "identity.tenant_provisioned" || typ == "billing.trial_ending_soon_check" || typ == "billing.trial_ending_soon" {
+		return "notifications"
+	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":
 		// The acquisition slice's events (integration_activated, sync_requested,

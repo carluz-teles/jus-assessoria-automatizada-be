@@ -227,6 +227,12 @@ const (
 	deadlineDueSoonBody      = "Prazo vence em %d dia(s)."
 	deadlineMissedTitle      = "Prazo vencido"
 	deadlineMissedBody       = "Um prazo venceu sem confirmação."
+
+	// Trial aviso (fatia 2). The body varies by days_left the same way
+	// deadlineDueSoonBody does (0 → "hoje").
+	trialEndingSoonTitle     = "Período de teste terminando"
+	trialEndingSoonTodayBody = "Seu período de teste termina hoje."
+	trialEndingSoonBody      = "Seu período de teste termina em %d dia(s)."
 )
 
 // InAppUseCase turns two acquisition events into IN_APP avisos (slice 1a): a
@@ -416,6 +422,41 @@ func (uc *InAppUseCase) OnDeadlineMissed(ctx context.Context, ev DeadlineMissed)
 	return nil
 }
 
+// OnTrialEndingSoon handles one billing.trial_ending_soon (fatia 2). In the
+// event's tenant scope it dedups FIRST (so the event is consumed exactly once),
+// then records a trial-ending-soon aviso whose body reports how many days remain.
+// Same dedup-then-record shape as OnDeadlineDueSoon; billing's fire handler
+// already re-checked the subscription's live state before emitting this event, so
+// this consumer trusts the payload as-is.
+func (uc *InAppUseCase) OnTrialEndingSoon(ctx context.Context, ev TrialEndingSoon) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerTrialEndingSoon, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		title, body := renderTrialEndingSoon(ev.DaysLeft)
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeTrialEndingSoonAviso, title, body, map[string]any{
+			"trial_ends_at": ev.TrialEndsAt,
+			"days_left":     ev.DaysLeft,
+		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	uc.publish(ctx, ev.TenantID, TypeTrialEndingSoon, created)
+	return nil
+}
+
 // renderDeadlineDueSoon materializes the due_soon title/body from days_left. The title is
 // fixed; the body is the "hoje" text at zero, else the "em N dia(s)" text — so the aviso
 // tells the user exactly how much runway is left without opening the prazo.
@@ -424,6 +465,15 @@ func renderDeadlineDueSoon(daysLeft int) (title, body string) {
 		return deadlineDueSoonTitle, deadlineDueSoonTodayBody
 	}
 	return deadlineDueSoonTitle, fmt.Sprintf(deadlineDueSoonBody, daysLeft)
+}
+
+// renderTrialEndingSoon materializes the trial_ending_soon title/body from
+// days_left, mirroring renderDeadlineDueSoon's "hoje" vs "em N dia(s)" split.
+func renderTrialEndingSoon(daysLeft int) (title, body string) {
+	if daysLeft == 0 {
+		return trialEndingSoonTitle, trialEndingSoonTodayBody
+	}
+	return trialEndingSoonTitle, fmt.Sprintf(trialEndingSoonBody, daysLeft)
 }
 
 // record writes the tenant-level aviso fact (CREATED) and its single IN_APP delivery

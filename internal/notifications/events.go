@@ -1,7 +1,10 @@
 package notifications
 
 import (
+	"time"
+
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/lib/events"
 )
@@ -53,6 +56,26 @@ type DeadlineMissed struct {
 	events.Base
 	TenantID   string `json:"tenant_id"`
 	DeadlineID string `json:"deadline_id"`
+}
+
+// The billing-produced event this slice ALSO consumes (fatia 2). Same
+// consumed-event mold as the deadline events above: only the type CONST crosses
+// the boundary (TypeTrialEndingSoon = billing.…), the payload SHAPE is redefined
+// LOCALLY below, so this slice never imports billing's event struct. A contract
+// round-trip test (events_test.go) guards the shape. The import is acyclic
+// (billing does not import notifications).
+const TypeTrialEndingSoon = billing.TypeTrialEndingSoon
+
+// TrialEndingSoon is the LOCAL decode shape of billing.trial_ending_soon: a
+// tenant's trial approaching its end. TenantID scopes the aviso (barrier 1);
+// TrialEndsAt + DaysLeft are what the lembrete text needs. Only ever DECODED here
+// (events.Decode needs no interface), so it carries no events.Event method. Base
+// yields the event id for dedup.
+type TrialEndingSoon struct {
+	events.Base
+	TenantID    string    `json:"tenant_id"`
+	TrialEndsAt time.Time `json:"trial_ends_at"`
+	DaysLeft    int       `json:"days_left"`
 }
 
 // TypeNotificationRequested is the dotted id this slice consumes. Its "notification"

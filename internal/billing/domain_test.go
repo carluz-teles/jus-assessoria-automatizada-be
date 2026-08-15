@@ -744,6 +744,267 @@ func TestEffectiveEntitlement(t *testing.T) {
 	}
 }
 
+// --- OnTenantProvisioned (fatia 2: trial provisioning) -----------------------
+
+var defaultTrialPolicy = &TrialPolicy{
+	Name: "default", IsDefault: true, TrialDays: 14, ActiveProcessLimit: 20, Active: true,
+}
+
+var starterPlan = &Plan{ID: "plan-starter", Code: starterPlanCode, Name: "starter", MaxProcesses: intPtr(10), PricePerProcessCents: 50}
+
+// AC: a fresh identity.tenant_provisioned starts a trialing subscription on the
+// Starter plan, with the TRIAL policy's own ActiveProcessLimit (not the plan's),
+// trial_ends_at = now + TrialDays, and publishes subscription_activated +
+// trial_ending_soon_check in the same unit of work.
+func TestUseCase_OnTenantProvisioned_ProvisionsTrial(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var gotParams UpsertParams
+	repo := &mockRepo{
+		defaultTrial: func(context.Context, database.Tx) (*TrialPolicy, error) { return defaultTrialPolicy, nil },
+		findPlanByCode: func(_ context.Context, _ database.Tx, code string) (*Plan, error) {
+			if code != starterPlanCode {
+				t.Fatalf("plan code = %q, want %q", code, starterPlanCode)
+			}
+			return starterPlan, nil
+		},
+		upsert: func(_ context.Context, _ database.Tx, p UpsertParams) (*Subscription, error) {
+			gotParams = p
+			return &Subscription{
+				ID: "sub-1", TenantID: p.TenantID, Plan: p.Plan, Status: p.Status,
+				ActiveProcessLimit: p.ActiveProcessLimit, PlanID: p.PlanID, TrialEndsAt: p.TrialEndsAt,
+			}, nil
+		},
+	}
+	outbox := &recordingOutbox{}
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, &mockGateway{}, outbox, dedup, uow, WithClock(func() time.Time { return now }))
+
+	ev := TenantProvisioned{Base: events.Base{EventID: "tenant-provisioned:tenant-1"}, TenantID: "tenant-1"}
+	if err := uc.OnTenantProvisioned(context.Background(), ev); err != nil {
+		t.Fatalf("OnTenantProvisioned: %v", err)
+	}
+
+	if uow.scope != "tenant-1" {
+		t.Fatalf("uow scope = %q, want tenant-1", uow.scope)
+	}
+	if gotParams.Status != StatusTrialing || gotParams.ActiveProcessLimit != defaultTrialPolicy.ActiveProcessLimit {
+		t.Fatalf("upsert = %+v, want trialing with the TRIAL policy's limit (%d)", gotParams, defaultTrialPolicy.ActiveProcessLimit)
+	}
+	if gotParams.PlanID == nil || *gotParams.PlanID != starterPlan.ID {
+		t.Fatalf("upsert plan_id = %v, want the resolved Starter plan %q", gotParams.PlanID, starterPlan.ID)
+	}
+	wantTrialEndsAt := now.AddDate(0, 0, defaultTrialPolicy.TrialDays)
+	if gotParams.TrialEndsAt == nil || !gotParams.TrialEndsAt.Equal(wantTrialEndsAt) {
+		t.Fatalf("upsert trial_ends_at = %v, want %v", gotParams.TrialEndsAt, wantTrialEndsAt)
+	}
+
+	if len(outbox.published) != 2 {
+		t.Fatalf("published %d events, want 2 (subscription_activated + trial_ending_soon_check)", len(outbox.published))
+	}
+	if outbox.published[0].Type() != TypeSubscriptionActivated {
+		t.Fatalf("event[0] type = %q, want %q", outbox.published[0].Type(), TypeSubscriptionActivated)
+	}
+	check, ok := outbox.published[1].(TrialEndingSoonCheck)
+	if !ok || check.Type() != TypeTrialEndingSoonCheck {
+		t.Fatalf("event[1] = %+v, want TrialEndingSoonCheck", outbox.published[1])
+	}
+	if check.SubscriptionID != "sub-1" || !check.TrialEndsAt.Equal(wantTrialEndsAt) {
+		t.Fatalf("trial_ending_soon_check = %+v, want subscription sub-1 / trial_ends_at %v", check, wantTrialEndsAt)
+	}
+
+	if len(dedup.marked) != 1 || dedup.marked[0] != ev.EventID {
+		t.Fatalf("dedup marked = %v, want [%s]", dedup.marked, ev.EventID)
+	}
+}
+
+// AC: a replay (dedup reports seen) neither queries the catalog nor upserts —
+// the trial is provisioned exactly once, no matter how many times identity
+// redelivers tenant_provisioned for the same tenant.
+func TestUseCase_OnTenantProvisioned_DedupReplayIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{
+		defaultTrial: func(context.Context, database.Tx) (*TrialPolicy, error) {
+			t.Fatal("trial policy looked up on a replay")
+			return nil, nil
+		},
+		upsert: func(context.Context, database.Tx, UpsertParams) (*Subscription, error) {
+			t.Fatal("upsert ran on a replay")
+			return nil, nil
+		},
+	}
+	outbox := &recordingOutbox{}
+	uc := NewUseCase(repo, &mockGateway{}, outbox, &fakeDedup{seen: true}, &fakeUOW{})
+
+	ev := TenantProvisioned{Base: events.Base{EventID: "tenant-provisioned:tenant-1"}, TenantID: "tenant-1"}
+	if err := uc.OnTenantProvisioned(context.Background(), ev); err != nil {
+		t.Fatalf("OnTenantProvisioned: %v", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Fatalf("published = %+v, want none on replay", outbox.published)
+	}
+}
+
+// AC: no default trial policy configured fails LOUD (ErrNoDefaultTrialPolicy) —
+// an operational misconfiguration, never a silent "no trial" fallback — and
+// writes nothing (no plan lookup, no upsert, no publish).
+func TestUseCase_OnTenantProvisioned_NoDefaultTrialPolicy_FailsLoud(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{
+		defaultTrial: func(context.Context, database.Tx) (*TrialPolicy, error) { return nil, ErrNoDefaultTrialPolicy },
+		findPlanByCode: func(context.Context, database.Tx, string) (*Plan, error) {
+			t.Fatal("plan looked up despite no default trial policy")
+			return nil, nil
+		},
+		upsert: func(context.Context, database.Tx, UpsertParams) (*Subscription, error) {
+			t.Fatal("upsert ran despite no default trial policy")
+			return nil, nil
+		},
+	}
+	outbox := &recordingOutbox{}
+	uc := NewUseCase(repo, &mockGateway{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	ev := TenantProvisioned{Base: events.Base{EventID: "tenant-provisioned:tenant-1"}, TenantID: "tenant-1"}
+	err := uc.OnTenantProvisioned(context.Background(), ev)
+	if !errors.Is(err, ErrNoDefaultTrialPolicy) {
+		t.Fatalf("err = %v, want ErrNoDefaultTrialPolicy", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Fatalf("published = %+v, want none", outbox.published)
+	}
+}
+
+// AC: the Starter plan referenced by starterPlanCode missing from the catalog
+// (ErrPlanNotFound) fails LOUD too — same "misconfiguration, not a silent
+// fallback" contract as the missing default trial policy above — and writes
+// nothing (no upsert, no publish) despite the trial policy having resolved
+// fine.
+func TestUseCase_OnTenantProvisioned_StarterPlanNotFound_FailsLoud(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{
+		defaultTrial: func(context.Context, database.Tx) (*TrialPolicy, error) { return defaultTrialPolicy, nil },
+		findPlanByCode: func(_ context.Context, _ database.Tx, code string) (*Plan, error) {
+			if code != starterPlanCode {
+				t.Fatalf("plan code = %q, want %q", code, starterPlanCode)
+			}
+			return nil, ErrPlanNotFound
+		},
+		upsert: func(context.Context, database.Tx, UpsertParams) (*Subscription, error) {
+			t.Fatal("upsert ran despite the Starter plan being unresolved")
+			return nil, nil
+		},
+	}
+	outbox := &recordingOutbox{}
+	uc := NewUseCase(repo, &mockGateway{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	ev := TenantProvisioned{Base: events.Base{EventID: "tenant-provisioned:tenant-1"}, TenantID: "tenant-1"}
+	err := uc.OnTenantProvisioned(context.Background(), ev)
+	if !errors.Is(err, ErrPlanNotFound) {
+		t.Fatalf("err = %v, want ErrPlanNotFound", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Fatalf("published = %+v, want none", outbox.published)
+	}
+}
+
+// --- OnTrialEndingSoonCheck (fatia 2: the trial's scheduled re-check) --------
+
+// AC: a subscription still trialing, inside the lead window, re-checked at fire
+// time publishes the REAL trial_ending_soon with the CURRENT trial_ends_at/days
+// left — never the stale values the check's own payload carried.
+func TestUseCase_OnTrialEndingSoonCheck_StillTrialingPublishes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	currentTrialEndsAt := now.AddDate(0, 0, 2) // exactly at the lead window
+	repo := &mockRepo{
+		findByTenant: func(context.Context, string) (*Subscription, error) {
+			return &Subscription{TenantID: "tenant-1", Status: StatusTrialing, TrialEndsAt: &currentTrialEndsAt}, nil
+		},
+	}
+	outbox := &recordingOutbox{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, &mockGateway{}, outbox, &fakeDedup{}, uow, WithClock(func() time.Time { return now }))
+
+	ev := TrialEndingSoonCheck{
+		Base: events.Base{EventID: "trial-ending-soon:sub-1"}, TenantID: "tenant-1", SubscriptionID: "sub-1",
+		TrialEndsAt: now.AddDate(0, 0, 1), // stale — the fire handler must re-read, not trust this
+	}
+	if err := uc.OnTrialEndingSoonCheck(context.Background(), ev); err != nil {
+		t.Fatalf("OnTrialEndingSoonCheck: %v", err)
+	}
+
+	if len(outbox.published) != 1 {
+		t.Fatalf("published %d events, want 1", len(outbox.published))
+	}
+	got, ok := outbox.published[0].(TrialEndingSoon)
+	if !ok {
+		t.Fatalf("published[0] = %+v, want TrialEndingSoon", outbox.published[0])
+	}
+	if got.TenantID != "tenant-1" || got.DaysLeft != 2 || !got.TrialEndsAt.Equal(currentTrialEndsAt) {
+		t.Fatalf("trial_ending_soon = %+v, want tenant-1/2 days/%v (the RE-READ state)", got, currentTrialEndsAt)
+	}
+}
+
+// AC: a subscription no longer trialing (converted or canceled between
+// provisioning and the mark's ETA) is a silent no-op — never a stale aviso.
+func TestUseCase_OnTrialEndingSoonCheck_NoLongerTrialing_NoOp(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		sub  *Subscription
+	}{
+		{name: "converted to active", sub: &Subscription{TenantID: "tenant-1", Status: StatusActive}},
+		{name: "canceled", sub: &Subscription{TenantID: "tenant-1", Status: StatusCanceled}},
+		{name: "trialing with no trial_ends_at (defensive)", sub: &Subscription{TenantID: "tenant-1", Status: StatusTrialing}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := &mockRepo{findByTenant: func(context.Context, string) (*Subscription, error) { return tt.sub, nil }}
+			outbox := &recordingOutbox{}
+			uc := NewUseCase(repo, &mockGateway{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+			ev := TrialEndingSoonCheck{Base: events.Base{EventID: "trial-ending-soon:sub-1"}, TenantID: "tenant-1"}
+			if err := uc.OnTrialEndingSoonCheck(context.Background(), ev); err != nil {
+				t.Fatalf("OnTrialEndingSoonCheck: %v", err)
+			}
+			if len(outbox.published) != 0 {
+				t.Fatalf("published = %+v, want none", outbox.published)
+			}
+		})
+	}
+}
+
+// AC: a replay (dedup reports seen) never re-reads the subscription or republishes.
+func TestUseCase_OnTrialEndingSoonCheck_DedupReplayIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{
+		findByTenant: func(context.Context, string) (*Subscription, error) {
+			t.Fatal("subscription read on a replay")
+			return nil, nil
+		},
+	}
+	outbox := &recordingOutbox{}
+	uc := NewUseCase(repo, &mockGateway{}, outbox, &fakeDedup{seen: true}, &fakeUOW{})
+
+	ev := TrialEndingSoonCheck{Base: events.Base{EventID: "trial-ending-soon:sub-1"}, TenantID: "tenant-1"}
+	if err := uc.OnTrialEndingSoonCheck(context.Background(), ev); err != nil {
+		t.Fatalf("OnTrialEndingSoonCheck: %v", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Fatalf("published = %+v, want none on replay", outbox.published)
+	}
+}
+
 // AC: applySubscription resolves the plan LOCALLY (repo, inside the tx), never
 // via the gateway; a price id with no matching local plan fails loud with
 // ErrPlanUnresolved rather than projecting a zeroed entitlement.

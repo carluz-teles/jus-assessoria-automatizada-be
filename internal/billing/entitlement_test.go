@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
 )
@@ -59,9 +60,12 @@ func (r *entitlementRepo) FindDefaultTrialPolicy(context.Context, database.Tx) (
 // AC3 + success + error propagation + the Status gap this fatia closes: the
 // adapter maps ErrSubscriptionNotFound to a fail-closed limit of 0, revokes the
 // entitlement (limit 0) on canceled/past_due REGARDLESS of the stored
-// active_process_limit (the gap: this used to ignore Status entirely), resolves
-// active/trialing through the plan via effectiveEntitlement, and propagates any
-// other (infra) error unchanged — never folding it to 0.
+// active_process_limit (the gap: this used to ignore Status entirely), also
+// revokes it for a trialing subscription whose TrialEndsAt has already passed
+// (the follow-up gap: Status alone never flips off trialing when the trial
+// lapses without conversion), resolves active/within-trial through the plan
+// via effectiveEntitlement, and propagates any other (infra) error unchanged —
+// never folding it to 0.
 func TestEntitlementAdapter_ActiveProcessLimit(t *testing.T) {
 	t.Parallel()
 
@@ -69,6 +73,12 @@ func TestEntitlementAdapter_ActiveProcessLimit(t *testing.T) {
 	planID := "plan-growth"
 	growthPlan := &Plan{ID: planID, MaxProcesses: intPtr(500), PricePerProcessCents: 35}
 	enterprisePlan := &Plan{ID: planID, MaxProcesses: nil, PricePerProcessCents: 15}
+
+	// fixedNow pins ActiveProcessLimit's "now" so the TrialEndsAt-vs-now cases
+	// below are deterministic instead of racing the real wall clock.
+	fixedNow := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	future := fixedNow.Add(24 * time.Hour)
+	past := fixedNow.Add(-24 * time.Hour)
 
 	tests := []struct {
 		name      string
@@ -108,12 +118,30 @@ func TestEntitlementAdapter_ActiveProcessLimit(t *testing.T) {
 			wantErr:   nil,
 		},
 		{
-			name: "trialing subscription resolves its limit via the plan",
+			name: "trialing subscription with no TrialEndsAt resolves its limit via the plan",
 			repo: &entitlementRepo{
 				sub:  &Subscription{Status: StatusTrialing, PlanID: &planID},
 				plan: growthPlan,
 			},
 			wantLimit: 500,
+			wantErr:   nil,
+		},
+		{
+			name: "trialing subscription within its trial window resolves its limit via the plan",
+			repo: &entitlementRepo{
+				sub:  &Subscription{Status: StatusTrialing, PlanID: &planID, TrialEndsAt: &future},
+				plan: growthPlan,
+			},
+			wantLimit: 500,
+			wantErr:   nil,
+		},
+		{
+			name: "trialing subscription past its TrialEndsAt is fail-closed limit 0, same as canceled",
+			repo: &entitlementRepo{
+				sub:  &Subscription{Status: StatusTrialing, PlanID: &planID, TrialEndsAt: &past},
+				plan: growthPlan,
+			},
+			wantLimit: 0,
 			wantErr:   nil,
 		},
 		{
@@ -144,7 +172,7 @@ func TestEntitlementAdapter_ActiveProcessLimit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			adapter := NewEntitlementAdapter(tt.repo)
+			adapter := NewEntitlementAdapter(tt.repo, WithEntitlementClock(func() time.Time { return fixedNow }))
 			got, err := adapter.ActiveProcessLimit(context.Background(), "tenant-1")
 
 			if tt.wantErr == nil && err != nil {

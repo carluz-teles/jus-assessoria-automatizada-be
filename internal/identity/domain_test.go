@@ -175,6 +175,40 @@ func TestUseCase_ProvisionTenant(t *testing.T) {
 		}
 	})
 
+	t.Run("publishes tenant_provisioned in the same tx, with a stable event id across replays", func(t *testing.T) {
+		repo := &mockRepo{
+			upsertTenant: func(_ context.Context, _ database.Tx, _, _ string) (*Tenant, error) {
+				return want, nil // ON CONFLICT ... DO UPDATE always yields the row
+			},
+		}
+		outbox := &recordingOutbox{}
+		uc := NewUseCase(repo, outbox, &fakeUOW{})
+
+		if _, err := uc.ProvisionTenant(ctx, "org_abc", "Escritório"); err != nil {
+			t.Fatalf("ProvisionTenant() error = %v", err)
+		}
+		if _, err := uc.ProvisionTenant(ctx, "org_abc", "Escritório"); err != nil {
+			t.Fatalf("ProvisionTenant() (replay) error = %v", err)
+		}
+
+		if len(outbox.published) != 2 {
+			t.Fatalf("published %d events, want 2 (one tenant_provisioned per call)", len(outbox.published))
+		}
+		first, ok := outbox.published[0].(TenantProvisioned)
+		if !ok || first.TenantID != want.ID || first.ClerkOrgID != want.ClerkOrgID {
+			t.Fatalf("event[0] = %+v, want TenantProvisioned for %+v", outbox.published[0], want)
+		}
+		second, ok := outbox.published[1].(TenantProvisioned)
+		if !ok {
+			t.Fatalf("event[1] = %+v, want TenantProvisioned", outbox.published[1])
+		}
+		// A consumer dedups by IdempotencyKey — a replay must mint the SAME key so
+		// billing's SeenOrMark collapses it into one trial provisioning, never two.
+		if first.IdempotencyKey() != second.IdempotencyKey() {
+			t.Fatalf("idempotency key drifted across replays: %q vs %q", first.IdempotencyKey(), second.IdempotencyKey())
+		}
+	})
+
 	t.Run("propagates a commit failure unwrapped", func(t *testing.T) {
 		boom := errors.New("commit failed")
 		repo := &mockRepo{
@@ -464,9 +498,13 @@ func TestUseCase_OnMembershipCreated(t *testing.T) {
 		if !upsertMCalled {
 			t.Fatal("membership was not upserted after provisioning the tenant")
 		}
-		// AC5: the join still emits its two events exactly once (member_joined + notification).
-		if len(outbox.published) != 2 {
-			t.Fatalf("published %d events, want 2 (member_joined + notification.requested)", len(outbox.published))
+		// AC5: provisioning the tenant emits tenant_provisioned (fatia 2, ProvisionTenant),
+		// then the join still emits its two events exactly once (member_joined + notification).
+		if len(outbox.published) != 3 {
+			t.Fatalf("published %d events, want 3 (tenant_provisioned + member_joined + notification.requested)", len(outbox.published))
+		}
+		if ev, ok := outbox.published[0].(TenantProvisioned); !ok || ev.TenantID != provisioned.ID {
+			t.Fatalf("event[0] = %+v, want TenantProvisioned for %q", outbox.published[0], provisioned.ID)
 		}
 	})
 
