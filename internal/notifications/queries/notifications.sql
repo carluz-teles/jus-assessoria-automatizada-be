@@ -137,6 +137,36 @@ WHERE n.tenant_id = @tenant_id::uuid
   )
 ON CONFLICT (notification_id, user_id) DO NOTHING;
 
+-- name: FindPreferenceChannels :one
+-- Resolve the recipient's saved channel override for (tenant, user, type), inside
+-- the caller's tx — the routing check OnNotificationRequested makes before sending.
+-- No row means "no override": the mapper turns pgx.ErrNoRows into a typed
+-- not-found the use case reads as the default (every channel enabled), never a
+-- silently-empty slice that would suppress every channel by accident.
+SELECT channels FROM notification_preference
+WHERE tenant_id = $1 AND app_user_id = $2 AND type = $3;
+
+-- name: ListPreferences :many
+-- The caller's own saved overrides (GET /v1/notifications/preferences), on the
+-- pool — a screen read, no tx. Types the user never touched are absent (the
+-- default applies implicitly); the FE reconciles against its own static list of
+-- notification types. tenant_id ($1) is barrier 1; RLS is barrier 2.
+SELECT * FROM notification_preference
+WHERE tenant_id = $1 AND app_user_id = $2
+ORDER BY type;
+
+-- name: UpsertPreference :one
+-- Save the caller's full enabled-channel set for one type (PUT
+-- /v1/notifications/preferences), inside the caller's tx. Idempotent: a repeat PUT
+-- with the same channels is a harmless no-op write; ON CONFLICT replaces the set
+-- whole (channels is not a delta).
+INSERT INTO notification_preference (tenant_id, app_user_id, type, channels)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (tenant_id, app_user_id, type) DO UPDATE
+   SET channels = EXCLUDED.channels,
+       updated_at = now()
+RETURNING *;
+
 -- name: FindDeliveryByProviderMessageID :one
 -- Locate a delivery by the provider's message id (the Resend email id), on the
 -- pool. A provider bounce/complaint webhook carries no tenant, so this read crosses

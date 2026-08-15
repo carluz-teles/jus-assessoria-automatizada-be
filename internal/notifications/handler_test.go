@@ -75,14 +75,46 @@ func (f *fakeReader) MarkAllRead(_ context.Context, tenantID, userID string) err
 	return f.markAllErr
 }
 
+// fakePrefs records the scope the handler passed and returns canned results, so the
+// preference handler tests exercise routing/envelope/status without a database.
+type fakePrefs struct {
+	getResp []NotificationPreference
+	getErr  error
+	setResp *NotificationPreference
+	setErr  error
+
+	gotTenant   string
+	gotUser     string
+	gotType     string
+	gotChannels []string
+}
+
+func (f *fakePrefs) GetPreferences(_ context.Context, tenantID, appUserID string) ([]NotificationPreference, error) {
+	f.gotTenant, f.gotUser = tenantID, appUserID
+	return f.getResp, f.getErr
+}
+
+func (f *fakePrefs) SetPreference(_ context.Context, tenantID, appUserID, notifType string, channels []string) (*NotificationPreference, error) {
+	f.gotTenant, f.gotUser, f.gotType, f.gotChannels = tenantID, appUserID, notifType, channels
+	return f.setResp, f.setErr
+}
+
 // newApp builds an app whose /v1 group mirrors production: Auth resolves a principal
-// with the given user/tenant, then the notifications routes mount under it.
+// with the given user/tenant, then the notifications routes mount under it. Tests
+// that only exercise the inbox routes pass a zero-value fakePrefs implicitly — use
+// newAppWithPrefs for the preference routes.
 func newApp(r reader, user, tenant string) *fiber.App {
+	return newAppWithPrefs(r, &fakePrefs{}, user, tenant)
+}
+
+// newAppWithPrefs is newApp with an explicit prefsUC double, for the preference
+// route tests.
+func newAppWithPrefs(r reader, prefs prefsUC, user, tenant string) *fiber.App {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{user: user, tenant: tenant}))
-	NewHandler(r, closedSubscriber{}).Register(v1)
+	NewHandler(r, closedSubscriber{}, prefs).Register(v1)
 	return app
 }
 
@@ -91,6 +123,31 @@ func do(t *testing.T, app *fiber.App, method, path, bearer string) (int, string)
 	t.Helper()
 
 	req := httptest.NewRequest(method, path, nil)
+	if bearer != "" {
+		req.Header.Set(fiber.HeaderAuthorization, "Bearer "+bearer)
+	}
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, string(raw)
+}
+
+// doBody is do, plus a JSON request body — for the PUT preferences route.
+func doBody(t *testing.T, app *fiber.App, method, path, body, bearer string) (int, string) {
+	t.Helper()
+
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if bearer != "" {
 		req.Header.Set(fiber.HeaderAuthorization, "Bearer "+bearer)
 	}
@@ -298,5 +355,149 @@ func TestHandler_MarkAllRead_204(t *testing.T) {
 	}
 	if !fr.markedAll || fr.gotTenant != "tenant-2" || fr.gotUser != "u-2" {
 		t.Fatalf("markAll = %v scope (%q,%q), want true (tenant-2,u-2)", fr.markedAll, fr.gotTenant, fr.gotUser)
+	}
+}
+
+// --- GET/PUT /v1/notifications/preferences ------------------------------------
+
+// AC2: GET returns the caller's saved overrides, scoped to the principal
+// (tenant_id/app_user_id never come from the request).
+func TestHandler_GetPreferences_200(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{getResp: []NotificationPreference{{Type: "member_joined", Channels: []string{"IN_APP"}}}}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	status, body := do(t, app, http.MethodGet, "/v1/notifications/preferences", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if fp.gotTenant != "tenant-1" || fp.gotUser != "u-1" {
+		t.Fatalf("scope = (%q, %q), want (tenant-1, u-1)", fp.gotTenant, fp.gotUser)
+	}
+	if !strings.Contains(body, `"type":"member_joined"`) || !strings.Contains(body, `"channels":["IN_APP"]`) {
+		t.Fatalf("body missing saved override: %s", body)
+	}
+}
+
+// AC2: no overrides saved → 200 with data:[], never null.
+func TestHandler_GetPreferences_Empty_200(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	status, body := do(t, app, http.MethodGet, "/v1/notifications/preferences", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if !strings.Contains(body, `"data":[]`) {
+		t.Errorf("empty preferences should serialize as data:[], got: %s", body)
+	}
+}
+
+// No bearer token → 401; the use case never runs.
+func TestHandler_GetPreferences_NoToken_401(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/notifications/preferences", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if fp.gotTenant != "" {
+		t.Fatal("use case ran despite a missing token")
+	}
+}
+
+// AC2: PUT saves the caller's own preference — tenant_id/app_user_id come from the
+// principal, never the body (the request carries no such fields to spoof).
+func TestHandler_SetPreference_200(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{setResp: &NotificationPreference{Type: "member_joined", Channels: []string{"IN_APP"}}}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	body := `{"type":"member_joined","channels":["IN_APP"]}`
+	status, resp := doBody(t, app, http.MethodPut, "/v1/notifications/preferences", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, resp)
+	}
+	if fp.gotTenant != "tenant-1" || fp.gotUser != "u-1" || fp.gotType != "member_joined" {
+		t.Fatalf("scope = (%q, %q, %q), want (tenant-1, u-1, member_joined)", fp.gotTenant, fp.gotUser, fp.gotType)
+	}
+	if len(fp.gotChannels) != 1 || fp.gotChannels[0] != "IN_APP" {
+		t.Fatalf("channels = %v, want [IN_APP]", fp.gotChannels)
+	}
+}
+
+// AC2: an empty channels array is a VALID explicit full opt-out, not a validation
+// error.
+func TestHandler_SetPreference_EmptyChannels_200(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{setResp: &NotificationPreference{Type: "member_joined", Channels: []string{}}}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	body := `{"type":"member_joined","channels":[]}`
+	status, resp := doBody(t, app, http.MethodPut, "/v1/notifications/preferences", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, resp)
+	}
+	if fp.gotChannels == nil || len(fp.gotChannels) != 0 {
+		t.Fatalf("channels = %v, want an empty (non-nil) slice", fp.gotChannels)
+	}
+}
+
+// AC2: an unknown channel value → 400; the use case never runs.
+func TestHandler_SetPreference_InvalidChannel_400(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	body := `{"type":"member_joined","channels":["FAX"]}`
+	status, resp := doBody(t, app, http.MethodPut, "/v1/notifications/preferences", body, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, resp)
+	}
+	if fp.gotType != "" {
+		t.Fatal("use case ran on an invalid channel")
+	}
+}
+
+// AC2: a missing type → 400; the use case never runs.
+func TestHandler_SetPreference_MissingType_400(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	body := `{"channels":["EMAIL"]}`
+	status, resp := doBody(t, app, http.MethodPut, "/v1/notifications/preferences", body, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, resp)
+	}
+	if fp.gotType != "" {
+		t.Fatal("use case ran despite a missing type")
+	}
+}
+
+// No bearer token → 401; the use case never runs.
+func TestHandler_SetPreference_NoToken_401(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	body := `{"type":"member_joined","channels":["EMAIL"]}`
+	status, _ := doBody(t, app, http.MethodPut, "/v1/notifications/preferences", body, "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if fp.gotType != "" {
+		t.Fatal("use case ran despite a missing token")
 	}
 }

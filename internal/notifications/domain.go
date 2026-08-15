@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
@@ -125,6 +126,23 @@ func (uc *NotifyUseCase) OnNotificationRequested(ctx context.Context, ev Notific
 			return err
 		}
 
+		if enabled, err := uc.channelEnabled(ctx, tx, ev.TenantID, recipient, ev.Type, ChannelEmail); err != nil {
+			return err
+		} else if !enabled {
+			// The recipient opted this type out of EMAIL: the notification fact above
+			// still committed (it stays visible wherever it is visible today — the
+			// preference only ever gates the SEND), but no delivery is queued and no
+			// e-mail goes out. Recorded as SKIPPED, not FAILED: nothing went wrong.
+			_, err := uc.repo.InsertDelivery(ctx, tx, InsertDeliveryParams{
+				NotificationID: notif.ID,
+				TenantID:       ev.TenantID,
+				Channel:        ChannelEmail,
+				Status:         DeliverySkipped,
+				Error:          skippedByPreferenceReason,
+			})
+			return err
+		}
+
 		delivery, err := uc.repo.InsertDelivery(ctx, tx, InsertDeliveryParams{
 			NotificationID: notif.ID,
 			TenantID:       ev.TenantID,
@@ -174,6 +192,29 @@ func (uc *NotifyUseCase) resolveEmail(ctx context.Context, tx database.Tx, ev No
 	return email, nil
 }
 
+// channelEnabled reports whether channel is enabled for (tenantID, recipientID,
+// notifType), consulting notification_preference inside the caller's tx (RLS
+// scopes it to the event's tenant, same as resolveEmail). ErrPreferenceNotFound —
+// the recipient never overrode this type — is the default: every channel is
+// enabled, so a tenant that never touches preferences behaves exactly as before
+// this slice existed. recipientID empty (a tenant-level aviso) also defaults to
+// enabled: preferences are per-user, and a tenant-level aviso has no single user
+// to look one up for.
+func (uc *NotifyUseCase) channelEnabled(ctx context.Context, tx database.Tx, tenantID, recipientID, notifType, channel string) (bool, error) {
+	if recipientID == "" {
+		return true, nil
+	}
+
+	channels, err := uc.repo.FindPreferenceChannels(ctx, tx, tenantID, recipientID, notifType)
+	if errors.Is(err, ErrPreferenceNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(channels, channel), nil
+}
+
 // deliver sends the e-mail (outside any tx) and records the outcome in its own
 // tenant-scoped tx. A send failure is not returned: it is logged once and stored as
 // a FAILED delivery (single-handling rule — the error becomes state, not a
@@ -207,6 +248,50 @@ func (uc *NotifyUseCase) deliver(ctx context.Context, p pendingSend) error {
 		})
 		return err
 	})
+}
+
+// skippedByPreferenceReason is the delivery.error text recorded when the recipient
+// explicitly opted this type out of the channel — a human-readable reason, not a
+// sentinel, mirroring noRecipientEmailReason.
+const skippedByPreferenceReason = "recipient opted this type out of this channel"
+
+// PreferenceUseCase backs GET/PUT /v1/notifications/preferences: the caller's own
+// saved channel overrides. It depends on the Repository and UnitOfWork interfaces,
+// never a concrete implementation (docs §2.5).
+type PreferenceUseCase struct {
+	repo Repository
+	uow  database.UnitOfWork
+}
+
+// NewPreferenceUseCase wires the preference use case to its repository and unit of
+// work.
+func NewPreferenceUseCase(repo Repository, uow database.UnitOfWork) *PreferenceUseCase {
+	return &PreferenceUseCase{repo: repo, uow: uow}
+}
+
+// GetPreferences reads the caller's saved overrides — a plain pool read (no tx),
+// scoped to (tenantID, appUserID) from the verified principal, never the request.
+func (uc *PreferenceUseCase) GetPreferences(ctx context.Context, tenantID, appUserID string) ([]NotificationPreference, error) {
+	return uc.repo.ListPreferences(ctx, tenantID, appUserID)
+}
+
+// SetPreference saves the caller's full enabled-channel set for one notification
+// type. tenantID/appUserID come from the verified principal, never the body — a
+// caller can only ever set their OWN preference. channels is the whole set, not a
+// delta (ON CONFLICT in the query replaces it); an empty slice is valid and means
+// "no channel enabled for this type" (an explicit full opt-out), distinct from no
+// row at all (the default, every channel enabled).
+func (uc *PreferenceUseCase) SetPreference(ctx context.Context, tenantID, appUserID, notifType string, channels []string) (*NotificationPreference, error) {
+	var pref *NotificationPreference
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		var err error
+		pref, err = uc.repo.UpsertPreference(ctx, tx, tenantID, appUserID, notifType, channels)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pref, nil
 }
 
 // Materialized PT text for the in-app avisos (slice 1a). The in-app channel has no

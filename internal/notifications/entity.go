@@ -36,13 +36,18 @@ const (
 	DeliveryFailed     DeliveryStatus = "FAILED"
 	DeliveryBounced    DeliveryStatus = "BOUNCED"
 	DeliveryComplained DeliveryStatus = "COMPLAINED"
+	// DeliverySkipped — the recipient's notification_preference explicitly excluded
+	// this channel for the aviso's type. Distinct from FAILED (nothing went wrong;
+	// the user asked not to be reached this way) so the audit trail — and any future
+	// "why didn't I get this e-mail" support flow — can tell the two apart.
+	DeliverySkipped DeliveryStatus = "SKIPPED"
 )
 
 // Valid reports whether s is a known delivery status. The zero value ("") is
 // invalid on purpose, so an unset status never silently passes as a real one.
 func (s DeliveryStatus) Valid() bool {
 	return s == DeliveryQueued || s == DeliverySent || s == DeliveryFailed ||
-		s == DeliveryBounced || s == DeliveryComplained
+		s == DeliveryBounced || s == DeliveryComplained || s == DeliverySkipped
 }
 
 // Channel values stored on a delivery. ChannelEmail is the async-send channel (the
@@ -100,6 +105,21 @@ type Notification struct {
 	// ReadAt lived here in slice 1a as a tenant-wide flag; read state is now per-user
 	// (the notification_read table, migration 0018), so it is off the aggregate.
 	CreatedAt time.Time
+}
+
+// NotificationPreference is one user's saved channel override for one aviso type
+// (docs/erd-sistemas-auxiliares.md §6): Channels is the FULL enabled set for
+// (TenantID, AppUserID, Type), not a delta. Its absence — no row for a given
+// (user, type) — is NOT modeled here: the repository surfaces that as a typed
+// not-found the routing use case reads as "every channel enabled" (the pre-slice
+// default), so a tenant that never touches preferences behaves unchanged.
+type NotificationPreference struct {
+	ID        string
+	TenantID  string
+	AppUserID string
+	Type      string
+	Channels  []string
+	UpdatedAt time.Time
 }
 
 // NotificationDelivery is one channel's attempt to deliver a Notification.

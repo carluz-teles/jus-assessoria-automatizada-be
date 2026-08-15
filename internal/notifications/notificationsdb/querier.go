@@ -20,6 +20,12 @@ type Querier interface {
 	// caller then scopes the status update to that tenant (barrier 2). No row → the
 	// mapper maps pgx.ErrNoRows to a typed not-found (an unknown id the webhook acks).
 	FindDeliveryByProviderMessageID(ctx context.Context, providerMessageID *string) (NotificationDelivery, error)
+	// Resolve the recipient's saved channel override for (tenant, user, type), inside
+	// the caller's tx — the routing check OnNotificationRequested makes before sending.
+	// No row means "no override": the mapper turns pgx.ErrNoRows into a typed
+	// not-found the use case reads as the default (every channel enabled), never a
+	// silently-empty slice that would suppress every channel by accident.
+	FindPreferenceChannels(ctx context.Context, arg FindPreferenceChannelsParams) ([]string, error)
 	// Resolve the recipient's e-mail by internal app_user id, scoped to the tenant
 	// (WHERE + RLS). No row → the mapper maps pgx.ErrNoRows to a typed not-found, and
 	// the use case records a FAILED delivery rather than dropping the aviso.
@@ -52,6 +58,11 @@ type Querier interface {
 	// cursor ('9999-…', max-uuid) for the first page, so there is no conditional WHERE.
 	// tenant_id ($1) is barrier 1; RLS is barrier 2.
 	ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error)
+	// The caller's own saved overrides (GET /v1/notifications/preferences), on the
+	// pool — a screen read, no tx. Types the user never touched are absent (the
+	// default applies implicitly); the FE reconciles against its own static list of
+	// notification types. tenant_id ($1) is barrier 1; RLS is barrier 2.
+	ListPreferences(ctx context.Context, arg ListPreferencesParams) ([]NotificationPreference, error)
 	// Record read receipts for every aviso visible to the user that they have not read
 	// yet, in the caller's tx. Idempotent: a re-run inserts nothing (the NOT EXISTS
 	// filter plus the ON CONFLICT floor).
@@ -70,6 +81,11 @@ type Querier interface {
 	// No row (a delivery from another tenant) → the mapper maps pgx.ErrNoRows to a
 	// typed not-found.
 	UpdateDeliveryStatus(ctx context.Context, arg UpdateDeliveryStatusParams) (NotificationDelivery, error)
+	// Save the caller's full enabled-channel set for one type (PUT
+	// /v1/notifications/preferences), inside the caller's tx. Idempotent: a repeat PUT
+	// with the same channels is a harmless no-op write; ON CONFLICT replaces the set
+	// whole (channels is not a delta).
+	UpsertPreference(ctx context.Context, arg UpsertPreferenceParams) (NotificationPreference, error)
 }
 
 var _ Querier = (*Queries)(nil)

@@ -81,6 +81,23 @@ type Repository interface {
 	NotificationVisibleTo(ctx context.Context, tx database.Tx, notificationID, tenantID, userID string) (bool, error)
 	MarkRead(ctx context.Context, tx database.Tx, notificationID, tenantID, userID string) error
 	MarkAllRead(ctx context.Context, tx database.Tx, tenantID, userID string) error
+
+	// Notification preferences (fatia 6). FindPreferenceChannels runs inside the
+	// caller's tx — the OnNotificationRequested routing check joins the tenant scope
+	// already open for the send; ListPreferences/UpsertPreference back the
+	// GET/PUT /v1/notifications/preferences screen.
+	//
+	// FindPreferenceChannels resolves the saved override for (tenant, user, type).
+	// A missing row is the typed ErrPreferenceNotFound, never (nil, nil) — the
+	// caller reads that as "every channel enabled" (the default), not "none".
+	FindPreferenceChannels(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string) ([]string, error)
+	// ListPreferences reads the caller's own saved overrides on the pool (a screen
+	// read, no tx). Types never touched are simply absent from the result.
+	ListPreferences(ctx context.Context, tenantID, appUserID string) ([]NotificationPreference, error)
+	// UpsertPreference saves the caller's full enabled-channel set for one type
+	// inside the caller's tx. channels is the whole set, not a delta (ON CONFLICT
+	// replaces it).
+	UpsertPreference(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string, channels []string) (*NotificationPreference, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for the
@@ -214,6 +231,84 @@ func (r *pgRepository) FindRecipientEmail(ctx context.Context, tx database.Tx, t
 		return "", database.WrapInfra(err)
 	}
 	return email, nil
+}
+
+// FindPreferenceChannels reads inside the caller's tx (so RLS scopes it to the
+// event's tenant, matching resolveEmail's pattern). A no-row result is the typed
+// ErrPreferenceNotFound.
+func (r *pgRepository) FindPreferenceChannels(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string) ([]string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(appUserID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	channels, err := notificationsdb.New(tx).FindPreferenceChannels(ctx, notificationsdb.FindPreferenceChannelsParams{
+		TenantID:  tid,
+		AppUserID: uid,
+		Type:      notifType,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrPreferenceNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return channels, nil
+}
+
+// ListPreferences reads the caller's saved overrides on the pool (a screen read, no
+// tx). An empty result is an empty (never nil) slice, so the endpoint serializes
+// data:[], not null.
+func (r *pgRepository) ListPreferences(ctx context.Context, tenantID, appUserID string) ([]NotificationPreference, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(appUserID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	rows, err := r.q.ListPreferences(ctx, notificationsdb.ListPreferencesParams{
+		TenantID:  tid,
+		AppUserID: uid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]NotificationPreference, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, *preferenceToEntity(row))
+	}
+	return out, nil
+}
+
+// UpsertPreference saves the full channel set inside the caller's tx. RETURNING
+// always yields a row (an upsert), so there is no not-found branch here.
+func (r *pgRepository) UpsertPreference(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string, channels []string) (*NotificationPreference, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(appUserID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	row, err := notificationsdb.New(tx).UpsertPreference(ctx, notificationsdb.UpsertPreferenceParams{
+		TenantID:  tid,
+		AppUserID: uid,
+		Type:      notifType,
+		Channels:  channels,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return preferenceToEntity(row), nil
 }
 
 // FindDeliveryByProviderMessageID reads the delivery bearing the provider's message
