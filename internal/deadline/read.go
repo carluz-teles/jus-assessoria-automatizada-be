@@ -78,6 +78,12 @@ type PrazoDetailView struct {
 // truncated teor). IntimationID is kept for provenance capture. Class/Subject/IntimationType are
 // "" when NULL in the DB and IntimationText is "" only for an empty teor — the composer omits
 // whatever comes empty, so a sparse case degrades gracefully instead of producing dangling labels.
+//
+// AISummary/AIRecommendation/AISummaryGeneratedAt (migration 0036) are the PERSISTED "O que
+// aconteceu"/"O que fazer" summary: NULL (AISummaryGeneratedAt == nil) until the suggester's
+// first successful LLM call for this prazo, frozen thereafter (sync-on-first-GET, write-once —
+// no invalidation path). AISummaryGeneratedAt is the single source of truth for "already
+// persisted" the use case branches on; AISummary/AIRecommendation are "" until then.
 type PrazoSuggestContext struct {
 	Kind           string
 	Days           int
@@ -89,6 +95,10 @@ type PrazoSuggestContext struct {
 	Subject        string
 	IntimationType string
 	IntimationText string
+
+	AISummary            string
+	AIRecommendation     string
+	AISummaryGeneratedAt *time.Time
 }
 
 // TaskView is one row of a task list — BOTH the process's Tasks tab (GET

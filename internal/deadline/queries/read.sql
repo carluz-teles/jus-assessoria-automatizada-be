@@ -111,13 +111,17 @@ WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid;
 -- the process's court/degree/class/subject (court_record) and the origin intimação's type + teor
 -- (intimation). deadline.notification_id is NOT NULL (every prazo is born from an intimação), so
 -- both JOINs are inner. The teor is truncated to a bound so a long (often HTML) intimação never
--- blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Tenant-
--- scoped (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at
--- the repo, never (nil, nil).
+-- blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Also carries
+-- the PERSISTED ai_summary/ai_recommendation/ai_summary_generated_at (migration 0036, sync-on-
+-- first-GET: NULL until the first successful LLM call, frozen thereafter) so the suggester can
+-- serve the cached summary/recommendation instead of asking the model again. Tenant-scoped
+-- (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at the
+-- repo, never (nil, nil).
 SELECT d.kind, d.days, d.counting, d.notification_id,
        cr.court, cr.degree, cr.class, cr.subject,
        i.type AS intimation_type,
-       LEFT(i.content, 4000) AS intimation_text
+       LEFT(i.content, 4000) AS intimation_text,
+       d.ai_summary, d.ai_recommendation, d.ai_summary_generated_at
 FROM deadline d
 JOIN court_record cr ON cr.id = d.court_record_id
 JOIN intimation i ON i.id = d.notification_id

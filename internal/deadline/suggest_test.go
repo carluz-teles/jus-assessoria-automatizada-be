@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/lib/llm"
@@ -42,10 +43,28 @@ func (f *fakeStore) SaveSuggestion(_ context.Context, _ string, rec SuggestionRe
 	return "sugg-id", f.err
 }
 
+type fakeSummaryStore struct {
+	calls             int
+	gotTenantID       string
+	gotDeadlineID     string
+	gotSummary        string
+	gotRecommendation string
+	err               error
+}
+
+func (f *fakeSummaryStore) SaveAISummary(_ context.Context, tenantID, deadlineID, summary, recommendation string) error {
+	f.calls++
+	f.gotTenantID = tenantID
+	f.gotDeadlineID = deadlineID
+	f.gotSummary = summary
+	f.gotRecommendation = recommendation
+	return f.err
+}
+
 // A nil generator (OpenRouter unconfigured) yields no suggestions and no error — the F2 form
 // still opens.
 func TestSuggestTasks_NilGenerator_Empty(t *testing.T) {
-	uc := NewSuggestUseCase(fakePrazoReader{}, advisory.NewTemplateComposer(), nil, nil, "")
+	uc := NewSuggestUseCase(fakePrazoReader{}, advisory.NewTemplateComposer(), nil, nil, nil, "")
 	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
@@ -65,7 +84,7 @@ func TestSuggestTasks_HappyPath(t *testing.T) {
 	gen := &fakeGen{out: []byte(`{"summary":"O réu foi citado para contestar.","recommendation":"Elaborar e protocolar a contestação em 15 dias úteis.","tasks":[{"title":"Redigir contestação","kind":"PECA","description":"Elaborar a peça de defesa."},{"title":"Protocolar","kind":"PROTOCOLO","description":"Protocolar a contestação no PJe."}]}`)}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoSuggestContext{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
-		advisory.NewTemplateComposer(), gen, nil, "",
+		advisory.NewTemplateComposer(), gen, nil, nil, "",
 	)
 	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
@@ -117,7 +136,7 @@ func TestSuggestTasks_InjectsRicherCaseContext(t *testing.T) {
 			IntimationType: "CITACAO",
 			IntimationText: "Fica o réu citado para apresentar defesa no prazo legal.",
 		}},
-		advisory.NewTemplateComposer(), gen, nil, "",
+		advisory.NewTemplateComposer(), gen, nil, nil, "",
 	)
 	if _, err := uc.SuggestTasks(context.Background(), "t", "p"); err != nil {
 		t.Fatalf("err = %v, want nil", err)
@@ -143,7 +162,7 @@ func TestSuggestTasks_EmptyContextFields_NoError(t *testing.T) {
 	gen := &fakeGen{out: []byte(`{"summary":"","recommendation":"","tasks":[]}`)}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoSuggestContext{Kind: "RECURSO", Days: 15, Counting: "BUSINESS"}},
-		advisory.NewTemplateComposer(), gen, nil, "",
+		advisory.NewTemplateComposer(), gen, nil, nil, "",
 	)
 	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
@@ -170,7 +189,7 @@ func TestSuggestTasks_PersistsProvenance(t *testing.T) {
 	store := &fakeStore{}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoSuggestContext{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS", IntimationID: "int-1"}},
-		advisory.NewTemplateComposer(), gen, store, "openai/gpt-4o-mini",
+		advisory.NewTemplateComposer(), gen, store, nil, "openai/gpt-4o-mini",
 	)
 	if _, err := uc.SuggestTasks(context.Background(), "t", "prazo-1"); err != nil {
 		t.Fatalf("err = %v, want nil", err)
@@ -195,7 +214,7 @@ func TestSuggestTasks_StoreErrorIsNonFatal(t *testing.T) {
 	store := &fakeStore{err: errors.New("db down")}
 	uc := NewSuggestUseCase(
 		fakePrazoReader{view: PrazoSuggestContext{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
-		advisory.NewTemplateComposer(), gen, store, "m",
+		advisory.NewTemplateComposer(), gen, store, nil, "m",
 	)
 	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
 	if err != nil {
@@ -206,9 +225,87 @@ func TestSuggestTasks_StoreErrorIsNonFatal(t *testing.T) {
 	}
 }
 
+// The write-through (migration 0036): the FIRST time a prazo is summarized (no persisted
+// ai_summary — AISummaryGeneratedAt is nil), the fresh LLM answer is written through the
+// summaryStore, and the response still carries the fresh values.
+func TestSuggestTasks_FirstOpen_PersistsSummary(t *testing.T) {
+	gen := &fakeGen{out: []byte(`{"summary":"O réu foi citado.","recommendation":"Contestar.","tasks":[{"title":"Redigir contestação","kind":"PECA","description":"d"}]}`)}
+	summaryStore := &fakeSummaryStore{}
+	uc := NewSuggestUseCase(
+		fakePrazoReader{view: PrazoSuggestContext{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
+		advisory.NewTemplateComposer(), gen, nil, summaryStore, "",
+	)
+	sugg, err := uc.SuggestTasks(context.Background(), "tenant-1", "prazo-1")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if sugg.Summary != "O réu foi citado." || sugg.Recommendation != "Contestar." {
+		t.Errorf("summary/recommendation = {%q, %q}, want the fresh LLM answer", sugg.Summary, sugg.Recommendation)
+	}
+	if summaryStore.calls != 1 {
+		t.Fatalf("SaveAISummary calls = %d, want 1", summaryStore.calls)
+	}
+	if summaryStore.gotTenantID != "tenant-1" || summaryStore.gotDeadlineID != "prazo-1" {
+		t.Errorf("persisted ids = {%q, %q}, want {tenant-1, prazo-1}", summaryStore.gotTenantID, summaryStore.gotDeadlineID)
+	}
+	if summaryStore.gotSummary != "O réu foi citado." || summaryStore.gotRecommendation != "Contestar." {
+		t.Errorf("persisted summary/recommendation = {%q, %q}", summaryStore.gotSummary, summaryStore.gotRecommendation)
+	}
+}
+
+// Serve-from-cache: once PrazoSuggestContext already carries a persisted ai_summary
+// (AISummaryGeneratedAt set), SuggestTasks returns the PERSISTED summary/recommendation — NOT
+// whatever the LLM answers this time — while the suggested TASKS are still the fresh LLM answer.
+// The summaryStore is never called again (write-once, no invalidation).
+func TestSuggestTasks_AlreadyPersisted_ServesCachedSummary(t *testing.T) {
+	gen := &fakeGen{out: []byte(`{"summary":"resumo diferente desta vez","recommendation":"recomendação diferente","tasks":[{"title":"Protocolar","kind":"PROTOCOLO","description":"d"}]}`)}
+	summaryStore := &fakeSummaryStore{}
+	generatedAt := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	uc := NewSuggestUseCase(
+		fakePrazoReader{view: PrazoSuggestContext{
+			Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS",
+			AISummary:            "O réu foi citado (resumo original).",
+			AIRecommendation:     "Contestar (recomendação original).",
+			AISummaryGeneratedAt: &generatedAt,
+		}},
+		advisory.NewTemplateComposer(), gen, nil, summaryStore, "",
+	)
+	sugg, err := uc.SuggestTasks(context.Background(), "tenant-1", "prazo-1")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if sugg.Summary != "O réu foi citado (resumo original)." || sugg.Recommendation != "Contestar (recomendação original)." {
+		t.Errorf("summary/recommendation = {%q, %q}, want the persisted (cached) values", sugg.Summary, sugg.Recommendation)
+	}
+	if len(sugg.Tasks) != 1 || sugg.Tasks[0].Title != "Protocolar" {
+		t.Errorf("tasks = %+v, want the FRESH suggested tasks (only summary/recommendation freeze)", sugg.Tasks)
+	}
+	if summaryStore.calls != 0 {
+		t.Errorf("SaveAISummary calls = %d, want 0 (write-once — already persisted)", summaryStore.calls)
+	}
+}
+
+// A summaryStore fault must NOT break the F2: the fresh suggestion still returns (best-effort
+// persistence), mirroring TestSuggestTasks_StoreErrorIsNonFatal for the provenance store.
+func TestSuggestTasks_SummaryStoreErrorIsNonFatal(t *testing.T) {
+	gen := &fakeGen{out: []byte(`{"summary":"s","recommendation":"r","tasks":[{"title":"Protocolar","kind":"PROTOCOLO","description":"d"}]}`)}
+	summaryStore := &fakeSummaryStore{err: errors.New("db down")}
+	uc := NewSuggestUseCase(
+		fakePrazoReader{view: PrazoSuggestContext{Kind: "CONTESTACAO", Days: 15, Counting: "BUSINESS"}},
+		advisory.NewTemplateComposer(), gen, nil, summaryStore, "",
+	)
+	sugg, err := uc.SuggestTasks(context.Background(), "t", "p")
+	if err != nil {
+		t.Fatalf("err = %v, want nil (summary store fault is non-fatal)", err)
+	}
+	if sugg.Summary != "s" || sugg.Recommendation != "r" {
+		t.Errorf("summary/recommendation = {%q, %q}, want the fresh answer despite the store error", sugg.Summary, sugg.Recommendation)
+	}
+}
+
 // A missing prazo surfaces the read's typed not-found (→ 404 at the edge).
 func TestSuggestTasks_PrazoNotFound(t *testing.T) {
-	uc := NewSuggestUseCase(fakePrazoReader{err: ErrDeadlineNotFound}, advisory.NewTemplateComposer(), &fakeGen{}, nil, "")
+	uc := NewSuggestUseCase(fakePrazoReader{err: ErrDeadlineNotFound}, advisory.NewTemplateComposer(), &fakeGen{}, nil, nil, "")
 	if _, err := uc.SuggestTasks(context.Background(), "t", "p"); err == nil {
 		t.Fatal("err = nil, want ErrDeadlineNotFound")
 	}

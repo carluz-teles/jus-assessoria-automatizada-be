@@ -168,10 +168,12 @@ func run(logger *slog.Logger) error {
 	}
 	// The suggester also captures provenance (feedback loop, camada 1): every suggestion batch
 	// is persisted (best-effort) via its own tx so the confirm can later diff it against the
-	// lawyer's confirmed tasks. The model string is recorded alongside the prompt_version.
+	// lawyer's confirmed tasks. The model string is recorded alongside the prompt_version. It
+	// also write-throughs the "O que aconteceu"/"O que fazer" summary (migration 0036) the FIRST
+	// time a prazo is summarized, so later opens serve the cache instead of asking the LLM again.
 	deadlineSuggestUC := deadline.NewSuggestUseCase(
 		deadlineReadUC, advisory.NewTemplateComposer(), taskGenerator,
-		deadline.NewSuggestionStore(uow), cfg.OpenRouterModel,
+		deadline.NewSuggestionStore(uow), deadline.NewAISummaryStore(uow), cfg.OpenRouterModel,
 	)
 	deadlineHandler := deadline.NewHandler(
 		deadlineReadUC,

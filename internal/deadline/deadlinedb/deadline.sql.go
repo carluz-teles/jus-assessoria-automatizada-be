@@ -881,6 +881,42 @@ func (q *Queries) RevokeDeadlineByIntimation(ctx context.Context, arg RevokeDead
 	return i, err
 }
 
+const setDeadlineAISummary = `-- name: SetDeadlineAISummary :execrows
+UPDATE deadline
+SET ai_summary = $1,
+    ai_recommendation = $2,
+    ai_summary_generated_at = now()
+WHERE id = $3 AND tenant_id = $4 AND ai_summary IS NULL
+`
+
+type SetDeadlineAISummaryParams struct {
+	AiSummary        *string   `json:"ai_summary"`
+	AiRecommendation *string   `json:"ai_recommendation"`
+	ID               uuid.UUID `json:"id"`
+	TenantID         uuid.UUID `json:"tenant_id"`
+}
+
+// Write-through, best-effort persist of the "O que aconteceu"/"O que fazer" summary
+// (migration 0036), called from the read path (GET /v1/prazos/:id/suggested-tasks) right
+// after the LLM answers, ONLY the first time (the suggester checks
+// GetPrazoSuggestContext.ai_summary_generated_at first). `ai_summary IS NULL` makes this
+// write-once/idempotent at the DB layer too: a redelivered or racing call is a safe no-op
+// (0 rows affected, not an error) — no invalidation/regenerate path exists by design.
+// Scoped to tenant_id (barrier 1, on top of RLS barrier 2). $1 = summary, $2 =
+// recommendation, $3 = deadline id, $4 = tenant_id.
+func (q *Queries) SetDeadlineAISummary(ctx context.Context, arg SetDeadlineAISummaryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setDeadlineAISummary,
+		arg.AiSummary,
+		arg.AiRecommendation,
+		arg.ID,
+		arg.TenantID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const taskExistsInTenant = `-- name: TaskExistsInTenant :one
 
 SELECT id

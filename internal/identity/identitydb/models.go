@@ -90,23 +90,26 @@ type CourtRecord struct {
 }
 
 type Deadline struct {
-	ID              uuid.UUID          `json:"id"`
-	CourtRecordID   uuid.UUID          `json:"court_record_id"`
-	NotificationID  uuid.UUID          `json:"notification_id"`
-	StartDate       pgtype.Date        `json:"start_date"`
-	EndDate         pgtype.Date        `json:"end_date"`
-	Days            int32              `json:"days"`
-	Counting        string             `json:"counting"`
-	Doubled         bool               `json:"doubled"`
-	HolidaysApplied []byte             `json:"holidays_applied"`
-	Status          string             `json:"status"`
-	TenantID        uuid.UUID          `json:"tenant_id"`
-	Kind            *string            `json:"kind"`
-	Source          string             `json:"source"`
-	ConfirmedBy     pgtype.UUID        `json:"confirmed_by"`
-	ConfirmedAt     pgtype.Timestamptz `json:"confirmed_at"`
-	DoubledReason   *string            `json:"doubled_reason"`
-	RulesVersion    string             `json:"rules_version"`
+	ID                   uuid.UUID          `json:"id"`
+	CourtRecordID        uuid.UUID          `json:"court_record_id"`
+	NotificationID       uuid.UUID          `json:"notification_id"`
+	StartDate            pgtype.Date        `json:"start_date"`
+	EndDate              pgtype.Date        `json:"end_date"`
+	Days                 int32              `json:"days"`
+	Counting             string             `json:"counting"`
+	Doubled              bool               `json:"doubled"`
+	HolidaysApplied      []byte             `json:"holidays_applied"`
+	Status               string             `json:"status"`
+	TenantID             uuid.UUID          `json:"tenant_id"`
+	Kind                 *string            `json:"kind"`
+	Source               string             `json:"source"`
+	ConfirmedBy          pgtype.UUID        `json:"confirmed_by"`
+	ConfirmedAt          pgtype.Timestamptz `json:"confirmed_at"`
+	DoubledReason        *string            `json:"doubled_reason"`
+	RulesVersion         string             `json:"rules_version"`
+	AiSummary            *string            `json:"ai_summary"`
+	AiRecommendation     *string            `json:"ai_recommendation"`
+	AiSummaryGeneratedAt pgtype.Timestamptz `json:"ai_summary_generated_at"`
 }
 
 type DeadlineRule struct {

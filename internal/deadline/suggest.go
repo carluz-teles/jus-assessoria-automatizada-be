@@ -41,30 +41,44 @@ type Suggestion struct {
 }
 
 // prazoReader is the narrow read the suggester needs — one prazo's advisory case context by id,
-// tenant-scoped (prazo signals + the process's court_record + the origin intimação's teor).
-// *ReadUseCase satisfies it, so the worker composes the existing read use case here.
+// tenant-scoped (prazo signals + the process's court_record + the origin intimação's teor, plus
+// any already-persisted ai_summary/ai_recommendation). *ReadUseCase satisfies it, so the worker
+// composes the existing read use case here.
 type prazoReader interface {
 	SuggestContext(ctx context.Context, tenantID, id string) (PrazoSuggestContext, error)
+}
+
+// aiSummaryStore persists the "O que aconteceu"/"O que fazer" summary (migration 0036) the FIRST
+// time a prazo is summarized — sync-on-first-GET, write-once (no invalidation path). Like
+// SuggestionStore it is a separate port from the write Repository because it writes on the READ
+// path and the persist is best-effort: a failure here must never break the F2 pre-fill. Its
+// implementation (pgAISummaryStore) owns its own unit of work, mirroring pgSuggestionStore.
+type aiSummaryStore interface {
+	SaveAISummary(ctx context.Context, tenantID, deadlineID, summary, recommendation string) error
 }
 
 // SuggestUseCase composes the meta-prompt for the case and calls the LLM. It depends only on
 // ports (the prazo reader, the prompt composer, the generator) so tests inject fakes and the LLM
 // is never hit under test.
 type SuggestUseCase struct {
-	reader   prazoReader
-	composer advisory.PromptComposer
-	gen      llm.Generator   // optional: nil when OpenRouter is unconfigured
-	store    SuggestionStore // optional: nil skips provenance capture (feedback loop, camada 1)
-	model    string          // provenance: the model the generator answers with by default
+	reader       prazoReader
+	composer     advisory.PromptComposer
+	gen          llm.Generator   // optional: nil when OpenRouter is unconfigured
+	store        SuggestionStore // optional: nil skips provenance capture (feedback loop, camada 1)
+	summaryStore aiSummaryStore  // optional: nil skips the ai_summary write-through (migration 0036)
+	model        string          // provenance: the model the generator answers with by default
 }
 
 // NewSuggestUseCase wires the suggester. gen may be nil (no LLM configured) — SuggestTasks then
 // returns no suggestions instead of failing, so the F2 form degrades gracefully. store may be
 // nil (no provenance capture); when present, each suggestion batch is persisted (best-effort)
-// so the confirm can later diff it against the human's choice (feedback loop). model is the
-// generator's default model, recorded as provenance alongside the composed prompt_version.
-func NewSuggestUseCase(reader prazoReader, composer advisory.PromptComposer, gen llm.Generator, store SuggestionStore, model string) *SuggestUseCase {
-	return &SuggestUseCase{reader: reader, composer: composer, gen: gen, store: store, model: model}
+// so the confirm can later diff it against the human's choice (feedback loop). summaryStore may
+// be nil (no summary persistence); when present, the FIRST summary/recommendation for a prazo is
+// written through (best-effort) so later opens serve it from the DB instead of asking the LLM
+// again. model is the generator's default model, recorded as provenance alongside the composed
+// prompt_version.
+func NewSuggestUseCase(reader prazoReader, composer advisory.PromptComposer, gen llm.Generator, store SuggestionStore, summaryStore aiSummaryStore, model string) *SuggestUseCase {
+	return &SuggestUseCase{reader: reader, composer: composer, gen: gen, store: store, summaryStore: summaryStore, model: model}
 }
 
 // suggestTasksSchema constrains the model's output to
@@ -100,6 +114,14 @@ var suggestTasksSchema = json.RawMessage(`{
 // ErrDeadlineNotFound (→ 404). With no generator configured it returns an empty Suggestion (empty
 // strings + empty task slice, no error) so the F2 form still opens. An LLM/parse fault surfaces
 // typed (the handler maps it).
+//
+// Summary/Recommendation persistence (migration 0036, sync-on-first-GET): the suggested TASKS are
+// ALWAYS regenerated fresh on every call (the LLM is always asked), but the summary/recommendation
+// freeze after the first successful answer — a prazo whose PrazoSuggestContext already carries
+// AISummaryGeneratedAt serves the PERSISTED summary/recommendation instead of the model's fresh
+// (and possibly slightly different) retelling, so "O que aconteceu" reads identically across
+// opens. The first time, the fresh answer is written through (best-effort). No invalidation path
+// exists — this is write-once by design.
 func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID string) (Suggestion, error) {
 	if uc.gen == nil {
 		return Suggestion{Tasks: []SuggestedTask{}}, nil
@@ -150,6 +172,22 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 		parsed.Tasks = []SuggestedTask{}
 	}
 
+	// Summary/recommendation: serve the PERSISTED text once it exists (frozen at the first
+	// successful answer — AISummaryGeneratedAt is the single source of truth for "already
+	// persisted"); otherwise take the fresh answer and write it through, best-effort, so the
+	// NEXT open serves the cache instead of asking the LLM again. A store fault must never cost
+	// the lawyer the suggestions — log and keep the fresh (unpersisted) answer.
+	summary, recommendation := parsed.Summary, parsed.Recommendation
+	switch {
+	case prazo.AISummaryGeneratedAt != nil:
+		summary, recommendation = prazo.AISummary, prazo.AIRecommendation
+	case uc.summaryStore != nil:
+		if err := uc.summaryStore.SaveAISummary(ctx, tenantID, prazoID, parsed.Summary, parsed.Recommendation); err != nil {
+			slog.WarnContext(ctx, "deadline: persist ai summary failed",
+				slog.String("prazo_id", prazoID), slog.Any("error", err))
+		}
+	}
+
 	// Feedback loop (camada 1): capture WHAT the IA suggested, with WHICH prompt_version and
 	// model, so the confirm can later measure the delta against the human's choice. Best-effort
 	// by design: this is a GET that pre-fills a form, and provenance is a background concern —
@@ -169,8 +207,8 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 	}
 
 	return Suggestion{
-		Summary:        parsed.Summary,
-		Recommendation: parsed.Recommendation,
+		Summary:        summary,
+		Recommendation: recommendation,
 		Tasks:          parsed.Tasks,
 	}, nil
 }

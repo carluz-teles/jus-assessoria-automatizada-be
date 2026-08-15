@@ -377,3 +377,18 @@ FROM task_suggestion
 WHERE intimation_id = $1 AND tenant_id = $2
 ORDER BY created_at DESC
 LIMIT 1;
+
+-- name: SetDeadlineAISummary :execrows
+-- Write-through, best-effort persist of the "O que aconteceu"/"O que fazer" summary
+-- (migration 0036), called from the read path (GET /v1/prazos/:id/suggested-tasks) right
+-- after the LLM answers, ONLY the first time (the suggester checks
+-- GetPrazoSuggestContext.ai_summary_generated_at first). `ai_summary IS NULL` makes this
+-- write-once/idempotent at the DB layer too: a redelivered or racing call is a safe no-op
+-- (0 rows affected, not an error) — no invalidation/regenerate path exists by design.
+-- Scoped to tenant_id (barrier 1, on top of RLS barrier 2). $1 = summary, $2 =
+-- recommendation, $3 = deadline id, $4 = tenant_id.
+UPDATE deadline
+SET ai_summary = $1,
+    ai_recommendation = $2,
+    ai_summary_generated_at = now()
+WHERE id = $3 AND tenant_id = $4 AND ai_summary IS NULL;

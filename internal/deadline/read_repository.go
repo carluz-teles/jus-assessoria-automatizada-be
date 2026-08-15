@@ -323,6 +323,10 @@ func (r *pgReadRepository) GetPrazoSuggestContext(ctx context.Context, tenantID,
 		Subject:        derefString(row.Subject),
 		IntimationType: derefString(row.IntimationType),
 		IntimationText: row.IntimationText,
+
+		AISummary:            derefString(row.AiSummary),
+		AIRecommendation:     derefString(row.AiRecommendation),
+		AISummaryGeneratedAt: timestampPtr(row.AiSummaryGeneratedAt),
 	}, nil
 }
 

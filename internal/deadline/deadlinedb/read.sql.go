@@ -208,7 +208,8 @@ const getPrazoSuggestContext = `-- name: GetPrazoSuggestContext :one
 SELECT d.kind, d.days, d.counting, d.notification_id,
        cr.court, cr.degree, cr.class, cr.subject,
        i.type AS intimation_type,
-       LEFT(i.content, 4000) AS intimation_text
+       LEFT(i.content, 4000) AS intimation_text,
+       d.ai_summary, d.ai_recommendation, d.ai_summary_generated_at
 FROM deadline d
 JOIN court_record cr ON cr.id = d.court_record_id
 JOIN intimation i ON i.id = d.notification_id
@@ -221,16 +222,19 @@ type GetPrazoSuggestContextParams struct {
 }
 
 type GetPrazoSuggestContextRow struct {
-	Kind           *string   `json:"kind"`
-	Days           int32     `json:"days"`
-	Counting       string    `json:"counting"`
-	NotificationID uuid.UUID `json:"notification_id"`
-	Court          string    `json:"court"`
-	Degree         string    `json:"degree"`
-	Class          *string   `json:"class"`
-	Subject        *string   `json:"subject"`
-	IntimationType *string   `json:"intimation_type"`
-	IntimationText string    `json:"intimation_text"`
+	Kind                 *string            `json:"kind"`
+	Days                 int32              `json:"days"`
+	Counting             string             `json:"counting"`
+	NotificationID       uuid.UUID          `json:"notification_id"`
+	Court                string             `json:"court"`
+	Degree               string             `json:"degree"`
+	Class                *string            `json:"class"`
+	Subject              *string            `json:"subject"`
+	IntimationType       *string            `json:"intimation_type"`
+	IntimationText       string             `json:"intimation_text"`
+	AiSummary            *string            `json:"ai_summary"`
+	AiRecommendation     *string            `json:"ai_recommendation"`
+	AiSummaryGeneratedAt pgtype.Timestamptz `json:"ai_summary_generated_at"`
 }
 
 // The advisory CASE CONTEXT for one prazo — the input the AI "intimação → tarefas sugeridas"
@@ -240,9 +244,12 @@ type GetPrazoSuggestContextRow struct {
 // the process's court/degree/class/subject (court_record) and the origin intimação's type + teor
 // (intimation). deadline.notification_id is NOT NULL (every prazo is born from an intimação), so
 // both JOINs are inner. The teor is truncated to a bound so a long (often HTML) intimação never
-// blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Tenant-
-// scoped (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at
-// the repo, never (nil, nil).
+// blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Also carries
+// the PERSISTED ai_summary/ai_recommendation/ai_summary_generated_at (migration 0036, sync-on-
+// first-GET: NULL until the first successful LLM call, frozen thereafter) so the suggester can
+// serve the cached summary/recommendation instead of asking the model again. Tenant-scoped
+// (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at the
+// repo, never (nil, nil).
 func (q *Queries) GetPrazoSuggestContext(ctx context.Context, arg GetPrazoSuggestContextParams) (GetPrazoSuggestContextRow, error) {
 	row := q.db.QueryRow(ctx, getPrazoSuggestContext, arg.ID, arg.TenantID)
 	var i GetPrazoSuggestContextRow
@@ -257,6 +264,9 @@ func (q *Queries) GetPrazoSuggestContext(ctx context.Context, arg GetPrazoSugges
 		&i.Subject,
 		&i.IntimationType,
 		&i.IntimationText,
+		&i.AiSummary,
+		&i.AiRecommendation,
+		&i.AiSummaryGeneratedAt,
 	)
 	return i, err
 }

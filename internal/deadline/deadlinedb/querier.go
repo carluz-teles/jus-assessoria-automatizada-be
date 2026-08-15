@@ -118,9 +118,12 @@ type Querier interface {
 	// the process's court/degree/class/subject (court_record) and the origin intimação's type + teor
 	// (intimation). deadline.notification_id is NOT NULL (every prazo is born from an intimação), so
 	// both JOINs are inner. The teor is truncated to a bound so a long (often HTML) intimação never
-	// blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Tenant-
-	// scoped (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at
-	// the repo, never (nil, nil).
+	// blows the prompt or the transfer — LEFT counts characters, so the cut is rune-safe. Also carries
+	// the PERSISTED ai_summary/ai_recommendation/ai_summary_generated_at (migration 0036, sync-on-
+	// first-GET: NULL until the first successful LLM call, frozen thereafter) so the suggester can
+	// serve the cached summary/recommendation instead of asking the model again. Tenant-scoped
+	// (barrier 1): a foreign or unknown id yields no row → typed ErrDeadlineNotFound (404) at the
+	// repo, never (nil, nil).
 	GetPrazoSuggestContext(ctx context.Context, arg GetPrazoSuggestContextParams) (GetPrazoSuggestContextRow, error)
 	// ── KPI summaries (GET /v1/prazos/summary, GET /v1/tasks/summary) ────────────
 	// Single-object read models for the Tarefas/Prazos cockpit KPIs, aggregated per tenant. Both
@@ -311,6 +314,15 @@ type Querier interface {
 	// record it hung on) so deadline.revoked commits in the SAME tx. $1 = intimation_id (the
 	// notification_id column), $2 = tenant_id, both from the trusted event payload.
 	RevokeDeadlineByIntimation(ctx context.Context, arg RevokeDeadlineByIntimationParams) (RevokeDeadlineByIntimationRow, error)
+	// Write-through, best-effort persist of the "O que aconteceu"/"O que fazer" summary
+	// (migration 0036), called from the read path (GET /v1/prazos/:id/suggested-tasks) right
+	// after the LLM answers, ONLY the first time (the suggester checks
+	// GetPrazoSuggestContext.ai_summary_generated_at first). `ai_summary IS NULL` makes this
+	// write-once/idempotent at the DB layer too: a redelivered or racing call is a safe no-op
+	// (0 rows affected, not an error) — no invalidation/regenerate path exists by design.
+	// Scoped to tenant_id (barrier 1, on top of RLS barrier 2). $1 = summary, $2 =
+	// recommendation, $3 = deadline id, $4 = tenant_id.
+	SetDeadlineAISummary(ctx context.Context, arg SetDeadlineAISummaryParams) (int64, error)
 	// ── task_item write path (checklist / subtarefas, §4/§10) ────────────────────
 	// The Tarefas screen's checklist: a task grows N ordered items the user ticks off. Every
 	// write is keyed by the parent task and scoped to tenant_id (barrier 1, on top of RLS
