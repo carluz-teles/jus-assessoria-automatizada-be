@@ -28,8 +28,8 @@ func sign(t *testing.T, secret string, body []byte) string {
 }
 
 // newGateway builds a gateway with the test signing secret; the API client is
-// never called by VerifyWebhook (only ResolvePlan hits the network), so an empty
-// key is fine here.
+// never called by VerifyWebhook (only the checkout/portal/plans methods hit the
+// network), so an empty key is fine here.
 func newGateway() *stripeGateway {
 	return &stripeGateway{webhookSecret: testWebhookSecret}
 }
@@ -302,10 +302,6 @@ func TestStripeGateway_MapsSDKErrors(t *testing.T) {
 		}},
 		{"CreatePortalSession", func(ctx context.Context, g *stripeGateway) error {
 			_, err := g.CreatePortalSession(ctx, "cus_1", "https://app/back")
-			return err
-		}},
-		{"ResolvePlan", func(ctx context.Context, g *stripeGateway) error {
-			_, _, err := g.ResolvePlan(ctx, "price_bad")
 			return err
 		}},
 	}

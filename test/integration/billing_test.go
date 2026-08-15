@@ -8,8 +8,11 @@
 // the subscription table's RLS policy isolates one tenant from another.
 //
 // The Stripe gateway is stubbed (no network, no signing): VerifyWebhook returns a
-// crafted event and ResolvePlan a fixed plan/limit. Everything below the gateway —
-// repo, outbox, dedup, unit of work — is the real thing against the container.
+// crafted event. The plan is resolved from the REAL local catalog (migration
+// 0037's `plan` table, see seedBillingPlan) — plan resolution moved off the
+// gateway into the repository, so exercising it for real is the point of these
+// tests. Everything below the gateway — repo, outbox, dedup, unit of work — is
+// the real thing against the container.
 package integration_test
 
 import (
@@ -28,20 +31,16 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 )
 
-// stubGateway is a billing.StripeGateway that returns a crafted event and a fixed
-// plan, so the integration test drives the real projection without Stripe.
+// stubGateway is a billing.StripeGateway that returns a crafted event, so the
+// integration test drives the real projection without Stripe. Plan resolution no
+// longer lives on the gateway (see seedBillingPlan) — the stub only ever needs to
+// hand back the event.
 type stubGateway struct {
 	event billing.StripeEvent
-	plan  string
-	limit int
 }
 
 func (g stubGateway) VerifyWebhook([]byte, string) (billing.StripeEvent, error) {
 	return g.event, nil
-}
-
-func (g stubGateway) ResolvePlan(context.Context, string) (string, int, error) {
-	return g.plan, g.limit, nil
 }
 
 // The 4-B endpoint methods are unused by the webhook/read-model projection tests
@@ -59,8 +58,24 @@ func (g stubGateway) CreatePortalSession(context.Context, string, string) (strin
 	return "", nil
 }
 
-func (g stubGateway) ListPlans(context.Context) ([]billing.Plan, error) {
+func (g stubGateway) ListPlans(context.Context) ([]billing.StripePlan, error) {
 	return nil, nil
+}
+
+// seedBillingPlan upserts a plan row wired to priceID with the given process
+// ceiling, so applySubscription's local FindPlanByStripePriceID resolves it —
+// idempotent (ON CONFLICT on the UNIQUE stripe_price_id) so every test in this
+// file can call it without colliding on a shared container.
+func seedBillingPlan(t *testing.T, pool *pgxpool.Pool, priceID string, maxProcesses int) {
+	t.Helper()
+
+	mustExec(t, pool, `
+		INSERT INTO plan (code, name, min_processes, max_processes, price_per_process_cents, stripe_price_id)
+		VALUES ('test-pro', 'pro', 1, $2, 35, $1)
+		ON CONFLICT (stripe_price_id) DO UPDATE
+		   SET max_processes = EXCLUDED.max_processes`,
+		priceID, maxProcesses,
+	)
 }
 
 // newBillingUC wires the billing use case against the real container with the
@@ -130,16 +145,18 @@ func createdEvent(eventID, tenantID string, periodEnd time.Time) billing.StripeE
 }
 
 // AC3/AC6: a created event upserts the subscription AND commits
-// subscription_activated in the same tx, with plan + active_process_limit from
-// ResolvePlan; a replay (same event id) neither re-writes nor re-publishes.
+// subscription_activated in the same tx, with plan + active_process_limit
+// resolved from the local plan catalog; a replay (same event id) neither
+// re-writes nor re-publishes.
 func TestBilling_SubscriptionCreated_UpsertAndOutboxSameTx(t *testing.T) {
 	pool := newPool(t)
 	ctx := context.Background()
 	tenantID := uuid.NewString()
 	seedTenant(t, pool, tenantID, "org-billing-created", 0)
+	seedBillingPlan(t, pool, "price_1", 50)
 
 	periodEnd := time.Unix(1893456000, 0).UTC()
-	gw := stubGateway{event: createdEvent("evt_created_1", tenantID, periodEnd), plan: "pro", limit: 50}
+	gw := stubGateway{event: createdEvent("evt_created_1", tenantID, periodEnd)}
 	uc := newBillingUC(pool, gw)
 
 	if err := uc.HandleWebhook(ctx, nil, ""); err != nil {
@@ -202,11 +219,12 @@ func TestBilling_SubscriptionCreated_PublishFailRollsBackAll(t *testing.T) {
 	pool := newPool(t)
 	tenantID := uuid.NewString()
 	seedTenant(t, pool, tenantID, "org-billing-rollback", 0)
+	seedBillingPlan(t, pool, "price_1", 50)
 
 	// failingOutbox (defined in acquisition_test.go) aborts the publish inside the tx.
 	uc := billing.NewUseCase(
 		billing.NewRepository(pool),
-		stubGateway{event: createdEvent("evt_rollback_1", tenantID, time.Unix(1893456000, 0).UTC()), plan: "pro", limit: 50},
+		stubGateway{event: createdEvent("evt_rollback_1", tenantID, time.Unix(1893456000, 0).UTC())},
 		failingOutbox{err: errors.New("outbox unreachable")},
 		billing.NewDedup(),
 		database.NewUnitOfWork(pool),
@@ -235,9 +253,10 @@ func TestBilling_GetSubscription_ReadsProjectionFromPostgres(t *testing.T) {
 	ctx := context.Background()
 	tenantID := uuid.NewString()
 	seedTenant(t, pool, tenantID, "org-billing-getsub", 0)
+	seedBillingPlan(t, pool, "price_1", 50)
 
 	periodEnd := time.Unix(1893456000, 0).UTC()
-	gw := stubGateway{event: createdEvent("evt_getsub_1", tenantID, periodEnd), plan: "pro", limit: 50}
+	gw := stubGateway{event: createdEvent("evt_getsub_1", tenantID, periodEnd)}
 	uc := newBillingUC(pool, gw)
 
 	// A missing tenant is the typed not-found, never (nil, nil).
@@ -285,9 +304,10 @@ func TestBilling_RLS_TenantIsolation(t *testing.T) {
 	tenantB := uuid.NewString()
 	seedTenant(t, pool, tenantA, "org-billing-rls-a", 0)
 	seedTenant(t, pool, tenantB, "org-billing-rls-b", 0)
+	seedBillingPlan(t, pool, "price_1", 50)
 
 	// One subscription for tenant A only.
-	gw := stubGateway{event: createdEvent("evt_rls_a", tenantA, time.Unix(1893456000, 0).UTC()), plan: "pro", limit: 50}
+	gw := stubGateway{event: createdEvent("evt_rls_a", tenantA, time.Unix(1893456000, 0).UTC())}
 	if err := newBillingUC(pool, gw).HandleWebhook(ctx, nil, ""); err != nil {
 		t.Fatalf("HandleWebhook(A): %v", err)
 	}

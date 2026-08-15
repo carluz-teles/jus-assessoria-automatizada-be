@@ -10,16 +10,25 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 )
 
+// intPtr is a small test helper for the *int fields Plan/UpsertParams carry
+// (MaxProcesses, CustomPricePerProcessCents).
+func intPtr(n int) *int { return &n }
+
 // --- test doubles -----------------------------------------------------------
 
 // mockRepo is a hand-written Repository double: each method delegates to a func
 // field, so every test injects exactly the behavior it needs. Unset fields fail
 // loudly (nil call) if a test reaches a path it did not expect.
 type mockRepo struct {
-	upsert         func(ctx context.Context, tx database.Tx, params UpsertParams) (*Subscription, error)
-	updateStatus   func(ctx context.Context, tx database.Tx, tenantID string, status Status) (*Subscription, error)
-	findByCustomer func(ctx context.Context, stripeCustomerID string) (*Subscription, error)
-	findByTenant   func(ctx context.Context, tenantID string) (*Subscription, error)
+	upsert          func(ctx context.Context, tx database.Tx, params UpsertParams) (*Subscription, error)
+	updateStatus    func(ctx context.Context, tx database.Tx, tenantID string, status Status) (*Subscription, error)
+	findByCustomer  func(ctx context.Context, stripeCustomerID string) (*Subscription, error)
+	findByTenant    func(ctx context.Context, tenantID string) (*Subscription, error)
+	findPlanByID    func(ctx context.Context, tx database.Tx, planID string) (*Plan, error)
+	findPlanByPrice func(ctx context.Context, tx database.Tx, priceID string) (*Plan, error)
+	findPlanByCode  func(ctx context.Context, tx database.Tx, code string) (*Plan, error)
+	listPlans       func(ctx context.Context, tx database.Tx) ([]*Plan, error)
+	defaultTrial    func(ctx context.Context, tx database.Tx) (*TrialPolicy, error)
 }
 
 func (m *mockRepo) UpsertSubscription(ctx context.Context, tx database.Tx, params UpsertParams) (*Subscription, error) {
@@ -38,26 +47,47 @@ func (m *mockRepo) FindByTenant(ctx context.Context, tenantID string) (*Subscrip
 	return m.findByTenant(ctx, tenantID)
 }
 
+func (m *mockRepo) FindPlanByID(ctx context.Context, tx database.Tx, planID string) (*Plan, error) {
+	return m.findPlanByID(ctx, tx, planID)
+}
+
+func (m *mockRepo) FindPlanByStripePriceID(ctx context.Context, tx database.Tx, priceID string) (*Plan, error) {
+	return m.findPlanByPrice(ctx, tx, priceID)
+}
+
+func (m *mockRepo) FindPlanByCode(ctx context.Context, tx database.Tx, code string) (*Plan, error) {
+	return m.findPlanByCode(ctx, tx, code)
+}
+
+func (m *mockRepo) ListActivePlans(ctx context.Context, tx database.Tx) ([]*Plan, error) {
+	return m.listPlans(ctx, tx)
+}
+
+func (m *mockRepo) FindDefaultTrialPolicy(ctx context.Context, tx database.Tx) (*TrialPolicy, error) {
+	return m.defaultTrial(ctx, tx)
+}
+
+// findPlanByPriceTo returns a FindPlanByStripePriceID stub yielding a fixed plan.
+func findPlanByPriceTo(plan *Plan) func(context.Context, database.Tx, string) (*Plan, error) {
+	return func(context.Context, database.Tx, string) (*Plan, error) { return plan, nil }
+}
+
 // mockGateway is a StripeGateway double: each method delegates to a func field so
 // a test injects only the behavior its path needs (an unset field nil-panics,
 // proving that path was not expected). verify returns the event a webhook test
-// crafts (no real signing), resolvePlan the plan; the 4-B fields drive the
-// checkout/portal/plans use cases.
+// crafts (no real signing); the 4-B fields drive the checkout/portal/plans use
+// cases. Plan resolution moved to the repo (FindPlanByStripePriceID, see
+// findPlanByPriceTo) — the gateway no longer resolves plans.
 type mockGateway struct {
 	verify         func(payload []byte, sigHeader string) (StripeEvent, error)
-	resolvePlan    func(ctx context.Context, priceID string) (string, int, error)
 	ensureCustomer func(ctx context.Context, tenantID string) (string, error)
 	createCheckout func(ctx context.Context, params CheckoutParams) (string, error)
 	createPortal   func(ctx context.Context, customerID, returnURL string) (string, error)
-	listPlans      func(ctx context.Context) ([]Plan, error)
+	listPlans      func(ctx context.Context) ([]StripePlan, error)
 }
 
 func (m *mockGateway) VerifyWebhook(payload []byte, sigHeader string) (StripeEvent, error) {
 	return m.verify(payload, sigHeader)
-}
-
-func (m *mockGateway) ResolvePlan(ctx context.Context, priceID string) (string, int, error) {
-	return m.resolvePlan(ctx, priceID)
 }
 
 func (m *mockGateway) EnsureCustomer(ctx context.Context, tenantID string) (string, error) {
@@ -72,7 +102,7 @@ func (m *mockGateway) CreatePortalSession(ctx context.Context, customerID, retur
 	return m.createPortal(ctx, customerID, returnURL)
 }
 
-func (m *mockGateway) ListPlans(ctx context.Context) ([]Plan, error) {
+func (m *mockGateway) ListPlans(ctx context.Context) ([]StripePlan, error) {
 	return m.listPlans(ctx)
 }
 
@@ -130,11 +160,6 @@ func (d *fakeDedup) SeenOrMark(_ context.Context, _ database.Tx, _ /*consumer*/,
 	return d.seen, d.err
 }
 
-// resolvePlanTo returns a ResolvePlan stub yielding a fixed plan/limit.
-func resolvePlanTo(plan string, limit int) func(context.Context, string) (string, int, error) {
-	return func(context.Context, string) (string, int, error) { return plan, limit, nil }
-}
-
 // verifyTo returns a VerifyWebhook stub yielding a fixed event.
 func verifyTo(ev StripeEvent) func([]byte, string) (StripeEvent, error) {
 	return func([]byte, string) (StripeEvent, error) { return ev, nil }
@@ -146,6 +171,7 @@ const periodEndUnix = 1893456000 // 2030-01-01T00:00:00Z, a stable non-zero wind
 
 func TestUseCase_HandleWebhook_SubscriptionCreated(t *testing.T) {
 	periodEnd := time.Unix(periodEndUnix, 0).UTC()
+	proPlan := &Plan{ID: "plan-pro", Name: "pro", MaxProcesses: intPtr(50), PricePerProcessCents: 35}
 	var gotParams UpsertParams
 	repo := &mockRepo{
 		upsert: func(_ context.Context, _ database.Tx, p UpsertParams) (*Subscription, error) {
@@ -158,6 +184,7 @@ func TestUseCase_HandleWebhook_SubscriptionCreated(t *testing.T) {
 				ActiveProcessLimit: p.ActiveProcessLimit,
 			}, nil
 		},
+		findPlanByPrice: findPlanByPriceTo(proPlan),
 	}
 	gw := &mockGateway{
 		verify: verifyTo(StripeEvent{
@@ -169,7 +196,6 @@ func TestUseCase_HandleWebhook_SubscriptionCreated(t *testing.T) {
 				PriceID: "price_1", CurrentPeriodEnd: periodEnd,
 			},
 		}),
-		resolvePlan: resolvePlanTo("pro", 50),
 	}
 	outbox := &recordingOutbox{}
 	dedup := &fakeDedup{}
@@ -180,7 +206,8 @@ func TestUseCase_HandleWebhook_SubscriptionCreated(t *testing.T) {
 		t.Fatalf("HandleWebhook: %v", err)
 	}
 
-	// AC3: upsert projects active/trialing + plan + active_process_limit via ResolvePlan.
+	// AC3: upsert projects active/trialing + plan + active_process_limit via the
+	// local plan (FindPlanByStripePriceID + effectiveEntitlement).
 	if gotParams.TenantID != "tenant-uuid" || gotParams.StripeCustomerID != "cus_1" || gotParams.StripeSubscriptionID != "sub_1" {
 		t.Fatalf("upsert ids = %+v", gotParams)
 	}
@@ -209,17 +236,18 @@ func TestUseCase_HandleWebhook_SubscriptionCreated(t *testing.T) {
 }
 
 func TestUseCase_HandleWebhook_SubscriptionUpdated(t *testing.T) {
+	enterprisePlan := &Plan{ID: "plan-enterprise", Name: "enterprise", MaxProcesses: nil, PricePerProcessCents: 15}
 	repo := &mockRepo{
 		upsert: func(_ context.Context, _ database.Tx, p UpsertParams) (*Subscription, error) {
 			return &Subscription{TenantID: p.TenantID, Plan: p.Plan, Status: p.Status}, nil
 		},
+		findPlanByPrice: findPlanByPriceTo(enterprisePlan),
 	}
 	gw := &mockGateway{
 		verify: verifyTo(StripeEvent{
 			ID: "evt_2", Type: EventSubscriptionUpdated, TenantID: "tenant-uuid",
 			Subscription: &StripeSubscription{ID: "sub_1", CustomerID: "cus_1", Status: "past_due", PriceID: "price_2"},
 		}),
-		resolvePlan: resolvePlanTo("enterprise", 200),
 	}
 	outbox := &recordingOutbox{}
 	uc := NewUseCase(repo, gw, outbox, &fakeDedup{}, &fakeUOW{})
@@ -366,7 +394,6 @@ func TestUseCase_HandleWebhook_DedupReplayIsNoOp(t *testing.T) {
 			ID: "evt_dup", Type: EventSubscriptionCreated, TenantID: "tenant-uuid",
 			Subscription: &StripeSubscription{ID: "sub_1", CustomerID: "cus_1", Status: "active", PriceID: "price_1"},
 		}),
-		resolvePlan: resolvePlanTo("pro", 50),
 	}
 	outbox := &recordingOutbox{}
 	dedup := &fakeDedup{seen: true} // already processed
@@ -392,7 +419,6 @@ func TestUseCase_HandleWebhook_MissingTenant(t *testing.T) {
 			ID: "evt_nt", Type: EventSubscriptionCreated, TenantID: "", // metadata absent
 			Subscription: &StripeSubscription{ID: "sub_1", CustomerID: "cus_1", Status: "active", PriceID: "price_1"},
 		}),
-		resolvePlan: resolvePlanTo("pro", 50),
 	}
 	uow := &fakeUOW{}
 	uc := NewUseCase(repo, gw, &recordingOutbox{}, &fakeDedup{}, uow)
@@ -629,8 +655,8 @@ func TestUseCase_GetSubscription_ReadsLocalProjection(t *testing.T) {
 
 // AC4: ListPlans passes the Stripe catalog through unchanged.
 func TestUseCase_ListPlans_ReturnsCatalog(t *testing.T) {
-	want := []Plan{{PriceID: "price_1", Name: "Pro", Amount: 4990, Interval: "month", ActiveProcessLimit: 50}}
-	gw := &mockGateway{listPlans: func(context.Context) ([]Plan, error) { return want, nil }}
+	want := []StripePlan{{PriceID: "price_1", Name: "Pro", Amount: 4990, Interval: "month", ActiveProcessLimit: 50}}
+	gw := &mockGateway{listPlans: func(context.Context) ([]StripePlan, error) { return want, nil }}
 	uc := NewUseCase(&mockRepo{}, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{})
 
 	got, err := uc.ListPlans(context.Background())
@@ -663,5 +689,88 @@ func TestNormalizeStatus(t *testing.T) {
 				t.Errorf("normalizeStatus(%q) = %q, want %q", tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestEffectiveEntitlement covers the sole plan+subscription+override combinator:
+// no override, an override, and the no-ceiling (Enterprise) plan.
+func TestEffectiveEntitlement(t *testing.T) {
+	t.Parallel()
+
+	growthPlan := &Plan{MaxProcesses: intPtr(500), PricePerProcessCents: 35}
+	enterprisePlan := &Plan{MaxProcesses: nil, PricePerProcessCents: 15}
+
+	tests := []struct {
+		name          string
+		sub           *Subscription
+		plan          *Plan
+		wantLimit     int
+		wantPriceCent int
+	}{
+		{
+			name:          "no override uses the plan's table rate and band ceiling",
+			sub:           &Subscription{},
+			plan:          growthPlan,
+			wantLimit:     500,
+			wantPriceCent: 35,
+		},
+		{
+			name:          "a negotiated override wins over the plan's table rate",
+			sub:           &Subscription{CustomPricePerProcessCents: intPtr(22)},
+			plan:          growthPlan,
+			wantLimit:     500,
+			wantPriceCent: 22,
+		},
+		{
+			name:          "no ceiling (Enterprise) resolves to the sentinel limit",
+			sub:           &Subscription{},
+			plan:          enterprisePlan,
+			wantLimit:     unlimitedActiveProcesses,
+			wantPriceCent: 15,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			limit, price := effectiveEntitlement(tt.sub, tt.plan)
+			if limit != tt.wantLimit {
+				t.Errorf("activeProcessLimit = %d, want %d", limit, tt.wantLimit)
+			}
+			if price != tt.wantPriceCent {
+				t.Errorf("pricePerProcessCents = %d, want %d", price, tt.wantPriceCent)
+			}
+		})
+	}
+}
+
+// AC: applySubscription resolves the plan LOCALLY (repo, inside the tx), never
+// via the gateway; a price id with no matching local plan fails loud with
+// ErrPlanUnresolved rather than projecting a zeroed entitlement.
+func TestUseCase_HandleWebhook_SubscriptionCreated_PlanUnresolved(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{
+		upsert: func(context.Context, database.Tx, UpsertParams) (*Subscription, error) {
+			t.Fatal("upsert ran despite an unresolved plan")
+			return nil, nil
+		},
+		findPlanByPrice: func(context.Context, database.Tx, string) (*Plan, error) {
+			return nil, ErrPlanNotFound
+		},
+	}
+	gw := &mockGateway{verify: verifyTo(StripeEvent{
+		ID: "evt_unresolved", Type: EventSubscriptionCreated, TenantID: "tenant-uuid",
+		Subscription: &StripeSubscription{ID: "sub_1", CustomerID: "cus_1", Status: "active", PriceID: "price_unknown"},
+	})}
+	outbox := &recordingOutbox{}
+	uc := NewUseCase(repo, gw, outbox, &fakeDedup{}, &fakeUOW{})
+
+	err := uc.HandleWebhook(context.Background(), nil, "")
+	if !errors.Is(err, ErrPlanUnresolved) {
+		t.Fatalf("err = %v, want ErrPlanUnresolved", err)
+	}
+	if len(outbox.published) != 0 {
+		t.Fatalf("published = %+v, want none", outbox.published)
 	}
 }

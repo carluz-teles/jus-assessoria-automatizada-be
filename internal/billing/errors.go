@@ -40,4 +40,14 @@ var (
 	// (no subscription yet, or one stored without a customer id) (→ 404). Checkout
 	// creates the customer; until then there is nothing to manage.
 	ErrNoStripeCustomer = apperr.NewNotFound("no stripe customer for tenant")
+	// ErrPlanNotFound — no row in the local plan catalog matches the lookup (by
+	// Stripe price id or by code) (→ 404). Raised by the repository; applySubscription
+	// (domain.go) turns a price-id miss into ErrPlanUnresolved, its own 400 that
+	// says the catalog itself is misconfigured rather than "not found".
+	ErrPlanNotFound = apperr.NewNotFound("plan not found")
+	// ErrNoDefaultTrialPolicy — the trial_policy catalog has no row with
+	// is_default=true AND active=true (→ 404, effectively a 5xx-grade
+	// misconfiguration since migration 0038 seeds exactly one). A tenant cannot
+	// start a trial while this holds.
+	ErrNoDefaultTrialPolicy = apperr.NewNotFound("no default trial policy configured")
 )

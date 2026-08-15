@@ -39,10 +39,12 @@ func postStripe(body string) *http.Request {
 // reaches 200 — the HTTP tests care about status, not the projected fields.
 func okRepo() *mockRepo {
 	sub := &Subscription{TenantID: "tenant-uuid", Status: StatusActive}
+	plan := &Plan{ID: "plan-pro", Name: "pro", MaxProcesses: intPtr(50), PricePerProcessCents: 35}
 	return &mockRepo{
-		upsert:         func(context.Context, database.Tx, UpsertParams) (*Subscription, error) { return sub, nil },
-		updateStatus:   func(context.Context, database.Tx, string, Status) (*Subscription, error) { return sub, nil },
-		findByCustomer: func(context.Context, string) (*Subscription, error) { return sub, nil },
+		upsert:          func(context.Context, database.Tx, UpsertParams) (*Subscription, error) { return sub, nil },
+		updateStatus:    func(context.Context, database.Tx, string, Status) (*Subscription, error) { return sub, nil },
+		findByCustomer:  func(context.Context, string) (*Subscription, error) { return sub, nil },
+		findPlanByPrice: findPlanByPriceTo(plan),
 	}
 }
 
@@ -109,7 +111,7 @@ func TestWebhookHandler_Handle(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gw := &mockGateway{verify: tt.verify, resolvePlan: resolvePlanTo("pro", 50)}
+			gw := &mockGateway{verify: tt.verify}
 			uc := NewUseCase(okRepo(), gw, &recordingOutbox{}, &fakeDedup{seen: tt.seen}, &fakeUOW{})
 			h := NewWebhookHandler(uc)
 

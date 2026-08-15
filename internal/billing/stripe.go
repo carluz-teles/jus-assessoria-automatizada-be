@@ -121,35 +121,6 @@ func (g *stripeGateway) VerifyWebhook(payload []byte, sigHeader string) (StripeE
 	return out, nil
 }
 
-// ResolvePlan reads the plan and ACTIVE-process ceiling from the Stripe product
-// behind a price. The product is expanded on the price retrieval so its metadata
-// is populated in one round-trip. A missing/zero/non-numeric active_process_limit
-// is ErrPlanUnresolved (the catalog is misconfigured); the plan is the product's
-// `plan` metadata, falling back to its name.
-func (g *stripeGateway) ResolvePlan(ctx context.Context, priceID string) (string, int, error) {
-	params := &stripe.PriceRetrieveParams{}
-	params.AddExpand("product")
-
-	price, err := g.client.V1Prices.Retrieve(ctx, priceID, params)
-	if err != nil {
-		return "", 0, mapStripeError("resolve stripe price", err)
-	}
-	if price.Product == nil {
-		return "", 0, ErrPlanUnresolved
-	}
-
-	limit, err := strconv.Atoi(price.Product.Metadata[productMetaActiveProcessLimit])
-	if err != nil || limit <= 0 {
-		return "", 0, ErrPlanUnresolved
-	}
-
-	plan := price.Product.Metadata[productMetaPlan]
-	if plan == "" {
-		plan = price.Product.Name
-	}
-	return plan, limit, nil
-}
-
 // EnsureCustomer creates a Stripe Customer stamped with metadata.tenant_id (the
 // key the webhook reads the tenant back from). It always creates: the reuse of an
 // existing customer is the caller's decision (StartCheckout passes the stored id
@@ -219,15 +190,15 @@ func (g *stripeGateway) CreatePortalSession(ctx context.Context, customerID, ret
 }
 
 // ListPlans reads the active plan catalog: active recurring prices with their
-// product expanded in one round-trip. A price is a Plan only when its product is
-// active and carries a usable active_process_limit — a misconfigured product is
-// skipped (not fatal) so one bad catalog entry never hides the rest. The list
-// auto-paginates via V1List.All.
-func (g *stripeGateway) ListPlans(ctx context.Context) ([]Plan, error) {
+// product expanded in one round-trip. A price is a StripePlan only when its
+// product is active and carries a usable active_process_limit — a misconfigured
+// product is skipped (not fatal) so one bad catalog entry never hides the rest.
+// The list auto-paginates via V1List.All.
+func (g *stripeGateway) ListPlans(ctx context.Context) ([]StripePlan, error) {
 	params := &stripe.PriceListParams{Active: stripe.Bool(true)}
 	params.AddExpand("data.product")
 
-	plans := []Plan{}
+	plans := []StripePlan{}
 	for price, err := range g.client.V1Prices.List(ctx, params).All(ctx) {
 		if err != nil {
 			return nil, mapStripeError("list stripe prices", err)
@@ -241,26 +212,26 @@ func (g *stripeGateway) ListPlans(ctx context.Context) ([]Plan, error) {
 	return plans, nil
 }
 
-// toPlan absorbs a Stripe price+product into a Plan, reporting ok=false for a
-// catalog entry the checkout cannot use: no expanded/active product, no recurring
-// interval, or a missing/zero active_process_limit. The name is the product's
-// `plan` metadata, falling back to its display name (mirrors ResolvePlan).
-func toPlan(price *stripe.Price) (Plan, bool) {
+// toPlan absorbs a Stripe price+product into a StripePlan, reporting ok=false for
+// a catalog entry the checkout cannot use: no expanded/active product, no
+// recurring interval, or a missing/zero active_process_limit. The name is the
+// product's `plan` metadata, falling back to its display name.
+func toPlan(price *stripe.Price) (StripePlan, bool) {
 	prod := price.Product
 	if prod == nil || !prod.Active || price.Recurring == nil {
-		return Plan{}, false
+		return StripePlan{}, false
 	}
 
 	limit, err := strconv.Atoi(prod.Metadata[productMetaActiveProcessLimit])
 	if err != nil || limit <= 0 {
-		return Plan{}, false
+		return StripePlan{}, false
 	}
 
 	name := prod.Metadata[productMetaPlan]
 	if name == "" {
 		name = prod.Name
 	}
-	return Plan{
+	return StripePlan{
 		PriceID:            price.ID,
 		Name:               name,
 		Amount:             price.UnitAmount,

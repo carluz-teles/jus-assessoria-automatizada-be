@@ -13,7 +13,7 @@ import (
 )
 
 const findByStripeCustomer = `-- name: FindByStripeCustomer :one
-SELECT id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at FROM subscription
+SELECT id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at, plan_id, custom_price_per_process_cents, trial_ends_at FROM subscription
 WHERE stripe_customer_id = $1
 `
 
@@ -35,12 +35,15 @@ func (q *Queries) FindByStripeCustomer(ctx context.Context, stripeCustomerID *st
 		&i.ActiveProcessLimit,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PlanID,
+		&i.CustomPricePerProcessCents,
+		&i.TrialEndsAt,
 	)
 	return i, err
 }
 
 const findByTenant = `-- name: FindByTenant :one
-SELECT id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at FROM subscription
+SELECT id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at, plan_id, custom_price_per_process_cents, trial_ends_at FROM subscription
 WHERE tenant_id = $1
 `
 
@@ -62,8 +65,153 @@ func (q *Queries) FindByTenant(ctx context.Context, tenantID uuid.UUID) (Subscri
 		&i.ActiveProcessLimit,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PlanID,
+		&i.CustomPricePerProcessCents,
+		&i.TrialEndsAt,
 	)
 	return i, err
+}
+
+const findDefaultTrialPolicy = `-- name: FindDefaultTrialPolicy :one
+SELECT id, name, is_default, trial_days, active_process_limit, active, created_at FROM trial_policy
+WHERE is_default AND active
+`
+
+// The single ACTIVE default trial policy (migration 0038's partial unique index
+// guarantees at most one exists). No row → typed not-found: a tenant cannot start
+// a trial when the catalog has no default configured.
+func (q *Queries) FindDefaultTrialPolicy(ctx context.Context) (TrialPolicy, error) {
+	row := q.db.QueryRow(ctx, findDefaultTrialPolicy)
+	var i TrialPolicy
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.IsDefault,
+		&i.TrialDays,
+		&i.ActiveProcessLimit,
+		&i.Active,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const findPlanByCode = `-- name: FindPlanByCode :one
+SELECT id, code, name, min_processes, max_processes, price_per_process_cents, stripe_price_id, active, created_at, updated_at FROM plan
+WHERE code = $1 AND active
+`
+
+// Resolve a plan by its stable code (starter | growth | scale | enterprise) — used
+// to resolve the plan a trial starts on. No row → typed not-found.
+func (q *Queries) FindPlanByCode(ctx context.Context, code string) (Plan, error) {
+	row := q.db.QueryRow(ctx, findPlanByCode, code)
+	var i Plan
+	err := row.Scan(
+		&i.ID,
+		&i.Code,
+		&i.Name,
+		&i.MinProcesses,
+		&i.MaxProcesses,
+		&i.PricePerProcessCents,
+		&i.StripePriceID,
+		&i.Active,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const findPlanByID = `-- name: FindPlanByID :one
+SELECT id, code, name, min_processes, max_processes, price_per_process_cents, stripe_price_id, active, created_at, updated_at FROM plan
+WHERE id = $1
+`
+
+// Resolve a plan by its own id — the entitlement adapter's lookup for the plan a
+// subscription references (subscription.plan_id). Deliberately NOT filtered by
+// active: deactivating a plan for new sign-ups must not silently strip the
+// entitlement of tenants already subscribed to it. No row → typed not-found (a
+// referenced plan should always exist; a miss is a data fault).
+func (q *Queries) FindPlanByID(ctx context.Context, id uuid.UUID) (Plan, error) {
+	row := q.db.QueryRow(ctx, findPlanByID, id)
+	var i Plan
+	err := row.Scan(
+		&i.ID,
+		&i.Code,
+		&i.Name,
+		&i.MinProcesses,
+		&i.MaxProcesses,
+		&i.PricePerProcessCents,
+		&i.StripePriceID,
+		&i.Active,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const findPlanByStripePriceID = `-- name: FindPlanByStripePriceID :one
+SELECT id, code, name, min_processes, max_processes, price_per_process_cents, stripe_price_id, active, created_at, updated_at FROM plan
+WHERE stripe_price_id = $1 AND active
+`
+
+// Resolve the local plan behind a Stripe price id — the webhook projection's
+// source of the plan catalog now that the BE (not a live Stripe read) owns it. No
+// row → typed not-found (the price is not mapped to any local plan yet, a catalog
+// misconfiguration the caller must not silently paper over).
+func (q *Queries) FindPlanByStripePriceID(ctx context.Context, stripePriceID *string) (Plan, error) {
+	row := q.db.QueryRow(ctx, findPlanByStripePriceID, stripePriceID)
+	var i Plan
+	err := row.Scan(
+		&i.ID,
+		&i.Code,
+		&i.Name,
+		&i.MinProcesses,
+		&i.MaxProcesses,
+		&i.PricePerProcessCents,
+		&i.StripePriceID,
+		&i.Active,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const listActivePlans = `-- name: ListActivePlans :many
+SELECT id, code, name, min_processes, max_processes, price_per_process_cents, stripe_price_id, active, created_at, updated_at FROM plan
+WHERE active
+ORDER BY min_processes
+`
+
+// The active plan catalog, ordered by the process band it prices (min_processes) —
+// the natural reading order for a plans listing.
+func (q *Queries) ListActivePlans(ctx context.Context) ([]Plan, error) {
+	rows, err := q.db.Query(ctx, listActivePlans)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Plan
+	for rows.Next() {
+		var i Plan
+		if err := rows.Scan(
+			&i.ID,
+			&i.Code,
+			&i.Name,
+			&i.MinProcesses,
+			&i.MaxProcesses,
+			&i.PricePerProcessCents,
+			&i.StripePriceID,
+			&i.Active,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateSubscriptionStatus = `-- name: UpdateSubscriptionStatus :one
@@ -71,7 +219,7 @@ UPDATE subscription
    SET status = $2,
        updated_at = now()
  WHERE tenant_id = $1
-RETURNING id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at
+RETURNING id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at, plan_id, custom_price_per_process_cents, trial_ends_at
 `
 
 type UpdateSubscriptionStatusParams struct {
@@ -99,6 +247,9 @@ func (q *Queries) UpdateSubscriptionStatus(ctx context.Context, arg UpdateSubscr
 		&i.ActiveProcessLimit,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PlanID,
+		&i.CustomPricePerProcessCents,
+		&i.TrialEndsAt,
 	)
 	return i, err
 }
@@ -107,37 +258,48 @@ const upsertSubscription = `-- name: UpsertSubscription :one
 
 INSERT INTO subscription (
     tenant_id, stripe_customer_id, stripe_subscription_id,
-    status, plan, current_period_end, active_process_limit
-) VALUES ($1, $2, $3, $4, $5, $6, $7)
+    status, plan, current_period_end, active_process_limit,
+    plan_id, custom_price_per_process_cents, trial_ends_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (tenant_id) DO UPDATE
-   SET stripe_customer_id     = EXCLUDED.stripe_customer_id,
-       stripe_subscription_id = EXCLUDED.stripe_subscription_id,
-       status                 = EXCLUDED.status,
-       plan                   = EXCLUDED.plan,
-       current_period_end     = EXCLUDED.current_period_end,
-       active_process_limit   = EXCLUDED.active_process_limit,
-       updated_at             = now()
-RETURNING id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at
+   SET stripe_customer_id             = EXCLUDED.stripe_customer_id,
+       stripe_subscription_id         = EXCLUDED.stripe_subscription_id,
+       status                         = EXCLUDED.status,
+       plan                           = EXCLUDED.plan,
+       current_period_end             = EXCLUDED.current_period_end,
+       active_process_limit           = EXCLUDED.active_process_limit,
+       plan_id                        = EXCLUDED.plan_id,
+       custom_price_per_process_cents = COALESCE(EXCLUDED.custom_price_per_process_cents, subscription.custom_price_per_process_cents),
+       trial_ends_at                  = COALESCE(EXCLUDED.trial_ends_at, subscription.trial_ends_at),
+       updated_at                     = now()
+RETURNING id, tenant_id, stripe_customer_id, stripe_subscription_id, status, plan, current_period_end, active_process_limit, created_at, updated_at, plan_id, custom_price_per_process_cents, trial_ends_at
 `
 
 type UpsertSubscriptionParams struct {
-	TenantID             uuid.UUID          `json:"tenant_id"`
-	StripeCustomerID     *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID *string            `json:"stripe_subscription_id"`
-	Status               string             `json:"status"`
-	Plan                 *string            `json:"plan"`
-	CurrentPeriodEnd     pgtype.Timestamptz `json:"current_period_end"`
-	ActiveProcessLimit   *int32             `json:"active_process_limit"`
+	TenantID                   uuid.UUID          `json:"tenant_id"`
+	StripeCustomerID           *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID       *string            `json:"stripe_subscription_id"`
+	Status                     string             `json:"status"`
+	Plan                       *string            `json:"plan"`
+	CurrentPeriodEnd           pgtype.Timestamptz `json:"current_period_end"`
+	ActiveProcessLimit         *int32             `json:"active_process_limit"`
+	PlanID                     pgtype.UUID        `json:"plan_id"`
+	CustomPricePerProcessCents *int32             `json:"custom_price_per_process_cents"`
+	TrialEndsAt                pgtype.Timestamptz `json:"trial_ends_at"`
 }
 
-// billing slice queries (subscription projection).
+// billing slice queries (subscription projection + local plan/trial catalog).
 // Writes are idempotent so the Stripe webhook (at-least-once) can replay safely;
 // the consumer-side dedup (processed_event, keyed by the Stripe event id) is the
 // authoritative guard, these upserts are the second line of defence.
 // Project the full subscription state from a customer.subscription.created/updated
 // webhook. Keyed on tenant_id (Stripe Customer = tenant, one row per tenant): the
-// first sighting inserts, every later one refreshes the mutable fields. plan and
-// active_process_limit come resolved from the price's Stripe product metadata.
+// first sighting inserts, every later one refreshes the mutable fields. plan_id is
+// the LOCAL plan resolved from the price id (migration 0037+); active_process_limit
+// stays the domain-resolved entitlement (effectiveEntitlement). custom_price_per_
+// process_cents/trial_ends_at are NOT sourced from the webhook in this fatia — a
+// replay must never clobber a negotiated override or trial window some other path
+// already set, hence COALESCE(EXCLUDED, current) instead of a blind overwrite.
 func (q *Queries) UpsertSubscription(ctx context.Context, arg UpsertSubscriptionParams) (Subscription, error) {
 	row := q.db.QueryRow(ctx, upsertSubscription,
 		arg.TenantID,
@@ -147,6 +309,9 @@ func (q *Queries) UpsertSubscription(ctx context.Context, arg UpsertSubscription
 		arg.Plan,
 		arg.CurrentPeriodEnd,
 		arg.ActiveProcessLimit,
+		arg.PlanID,
+		arg.CustomPricePerProcessCents,
+		arg.TrialEndsAt,
 	)
 	var i Subscription
 	err := row.Scan(
@@ -160,6 +325,9 @@ func (q *Queries) UpsertSubscription(ctx context.Context, arg UpsertSubscription
 		&i.ActiveProcessLimit,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PlanID,
+		&i.CustomPricePerProcessCents,
+		&i.TrialEndsAt,
 	)
 	return i, err
 }

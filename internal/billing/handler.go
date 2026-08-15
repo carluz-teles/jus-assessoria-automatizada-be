@@ -23,7 +23,7 @@ type handlerUC interface {
 	StartCheckout(ctx context.Context, tenantID, priceID string) (string, error)
 	OpenPortal(ctx context.Context, tenantID string) (string, error)
 	GetSubscription(ctx context.Context, tenantID string) (*Subscription, error)
-	ListPlans(ctx context.Context) ([]Plan, error)
+	ListPlans(ctx context.Context) ([]StripePlan, error)
 }
 
 // Handler is the billing HTTP surface for the authenticated /v1 endpoints. It owns
@@ -62,11 +62,17 @@ type portalResponse struct {
 // subscriptionView is the read model for GET /v1/billing/subscription — the fields
 // the UI shows. The internal id and Stripe ids are deliberately absent: the client
 // needs the plan, its lifecycle and entitlement, not the billing wiring.
+//
+// LocalPlanID is additive (fatia 5-A): the local plan (migration 0037) backing
+// the projection, nil for a row not yet re-projected by a webhook since the
+// catalog migrated. trial_status / days_until_trial_end are intentionally NOT
+// added here — that is fatia 5-B (trial), out of scope for this change.
 type subscriptionView struct {
 	Plan               string     `json:"plan"`
 	Status             Status     `json:"status"`
 	CurrentPeriodEnd   *time.Time `json:"current_period_end"`
 	ActiveProcessLimit int        `json:"active_process_limit"`
+	LocalPlanID        *string    `json:"local_plan_id"`
 }
 
 // planView is the read model for one entry of GET /v1/billing/plans. Amount is in
@@ -149,12 +155,13 @@ func newSubscriptionView(sub *Subscription) subscriptionView {
 		Status:             sub.Status,
 		CurrentPeriodEnd:   sub.CurrentPeriodEnd,
 		ActiveProcessLimit: sub.ActiveProcessLimit,
+		LocalPlanID:        sub.PlanID,
 	}
 }
 
 // newPlansEnvelope maps the plans to the client-facing envelope. The data slice is
 // always initialized so an empty catalog serializes as [] rather than null.
-func newPlansEnvelope(plans []Plan) plansEnvelope {
+func newPlansEnvelope(plans []StripePlan) plansEnvelope {
 	views := make([]planView, 0, len(plans))
 	for _, p := range plans {
 		views = append(views, planView{

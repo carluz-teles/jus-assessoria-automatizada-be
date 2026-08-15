@@ -21,6 +21,27 @@ type Querier interface {
 	// checkout/portal flows that need the stored stripe_customer_id. Scoped by tenant_id
 	// (WHERE + RLS). No row → the caller maps pgx.ErrNoRows to a typed not-found.
 	FindByTenant(ctx context.Context, tenantID uuid.UUID) (Subscription, error)
+	// The single ACTIVE default trial policy (migration 0038's partial unique index
+	// guarantees at most one exists). No row → typed not-found: a tenant cannot start
+	// a trial when the catalog has no default configured.
+	FindDefaultTrialPolicy(ctx context.Context) (TrialPolicy, error)
+	// Resolve a plan by its stable code (starter | growth | scale | enterprise) — used
+	// to resolve the plan a trial starts on. No row → typed not-found.
+	FindPlanByCode(ctx context.Context, code string) (Plan, error)
+	// Resolve a plan by its own id — the entitlement adapter's lookup for the plan a
+	// subscription references (subscription.plan_id). Deliberately NOT filtered by
+	// active: deactivating a plan for new sign-ups must not silently strip the
+	// entitlement of tenants already subscribed to it. No row → typed not-found (a
+	// referenced plan should always exist; a miss is a data fault).
+	FindPlanByID(ctx context.Context, id uuid.UUID) (Plan, error)
+	// Resolve the local plan behind a Stripe price id — the webhook projection's
+	// source of the plan catalog now that the BE (not a live Stripe read) owns it. No
+	// row → typed not-found (the price is not mapped to any local plan yet, a catalog
+	// misconfiguration the caller must not silently paper over).
+	FindPlanByStripePriceID(ctx context.Context, stripePriceID *string) (Plan, error)
+	// The active plan catalog, ordered by the process band it prices (min_processes) —
+	// the natural reading order for a plans listing.
+	ListActivePlans(ctx context.Context) ([]Plan, error)
 	// Flip only the lifecycle status (a customer.subscription.deleted → canceled, an
 	// invoice.payment_failed → past_due). It leaves plan / active_process_limit /
 	// current_period_end untouched: those events carry no catalog data, so a status-only
@@ -28,14 +49,18 @@ type Querier interface {
 	// No row (a status event racing ahead of subscription.created) → the caller maps
 	// pgx.ErrNoRows to a typed not-found so Stripe retries.
 	UpdateSubscriptionStatus(ctx context.Context, arg UpdateSubscriptionStatusParams) (Subscription, error)
-	// billing slice queries (subscription projection).
+	// billing slice queries (subscription projection + local plan/trial catalog).
 	// Writes are idempotent so the Stripe webhook (at-least-once) can replay safely;
 	// the consumer-side dedup (processed_event, keyed by the Stripe event id) is the
 	// authoritative guard, these upserts are the second line of defence.
 	// Project the full subscription state from a customer.subscription.created/updated
 	// webhook. Keyed on tenant_id (Stripe Customer = tenant, one row per tenant): the
-	// first sighting inserts, every later one refreshes the mutable fields. plan and
-	// active_process_limit come resolved from the price's Stripe product metadata.
+	// first sighting inserts, every later one refreshes the mutable fields. plan_id is
+	// the LOCAL plan resolved from the price id (migration 0037+); active_process_limit
+	// stays the domain-resolved entitlement (effectiveEntitlement). custom_price_per_
+	// process_cents/trial_ends_at are NOT sourced from the webhook in this fatia — a
+	// replay must never clobber a negotiated override or trial window some other path
+	// already set, hence COALESCE(EXCLUDED, current) instead of a blind overwrite.
 	UpsertSubscription(ctx context.Context, arg UpsertSubscriptionParams) (Subscription, error)
 }
 

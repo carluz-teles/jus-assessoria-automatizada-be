@@ -28,10 +28,6 @@ type StripeGateway interface {
 	// ErrMalformedEvent. Unknown event types verify fine and return a StripeEvent
 	// carrying only Type/ID (the dispatch acks them).
 	VerifyWebhook(payload []byte, sigHeader string) (StripeEvent, error)
-	// ResolvePlan reads the plan and the ACTIVE-process ceiling from the Stripe
-	// product behind a price id (the catalog lives in Stripe product metadata).
-	// A missing/zero active_process_limit is ErrPlanUnresolved.
-	ResolvePlan(ctx context.Context, priceID string) (plan string, activeProcessLimit int, err error)
 	// EnsureCustomer creates a Stripe Customer stamped with metadata.tenant_id so a
 	// later webhook can recover the tenant from the customer→tenant mapping. The
 	// caller (StartCheckout) reuses the customer id already stored on the tenant's
@@ -47,9 +43,10 @@ type StripeGateway interface {
 	// returns the redirect URL the tenant manages its subscription through.
 	CreatePortalSession(ctx context.Context, customerID, returnURL string) (url string, err error)
 	// ListPlans reads the active plan catalog from Stripe (active recurring prices
-	// with their product expanded). Each Plan carries the ACTIVE-process ceiling from
-	// the product metadata; prices whose product lacks a usable limit are skipped.
-	ListPlans(ctx context.Context) ([]Plan, error)
+	// with their product expanded). Each StripePlan carries the ACTIVE-process
+	// ceiling from the product metadata; prices whose product lacks a usable limit
+	// are skipped.
+	ListPlans(ctx context.Context) ([]StripePlan, error)
 }
 
 // CheckoutParams is the input to CreateCheckoutSession — grouped into a struct
@@ -65,11 +62,14 @@ type CheckoutParams struct {
 	TrialDays  int
 }
 
-// Plan is the SDK-agnostic projection of a Stripe price+product the plans endpoint
-// returns: the price id (the checkout key), the product name, the recurring amount
-// and interval, and the ACTIVE-process ceiling read from the product metadata. It
-// is built by the gateway so the domain/handler never touch stripe-go types.
-type Plan struct {
+// StripePlan is the SDK-agnostic projection of a Stripe price+product the plans
+// endpoint returns: the price id (the checkout key), the product name, the
+// recurring amount and interval, and the ACTIVE-process ceiling read from the
+// product metadata. It is built by the gateway so the domain/handler never touch
+// stripe-go types. This is the RAW Stripe catalog ListPlans still reads live; it
+// is distinct from the local Plan (entity.go/migration 0037), which is this BE's
+// own source of truth for the plan catalog used everywhere else in the slice.
+type StripePlan struct {
 	PriceID            string
 	Name               string
 	Amount             int64

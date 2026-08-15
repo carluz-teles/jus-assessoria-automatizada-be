@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -118,11 +119,15 @@ func (uc *UseCase) dispatch(ctx context.Context, ev StripeEvent) error {
 }
 
 // applySubscription projects a customer.subscription.created/updated event: it
-// resolves the plan from Stripe, then upserts the projection and publishes the
-// caller-supplied event in ONE transaction. ResolvePlan runs OUTSIDE the tx — it
-// is an external HTTP call, which must not hold a pooled DB connection. Dedup runs
-// INSIDE the tx: a replay marks nothing new (seen=true) and returns before any
-// write, so the projection and outbox are never duplicated.
+// resolves the LOCAL plan for the price id, then upserts the projection and
+// publishes the caller-supplied event, ALL in one transaction. The plan lookup
+// moved inside the tx (it used to run outside, before a Stripe HTTP call — the
+// reason to keep it off a pooled connection — but it is now a local read, so it
+// is just another statement in the same unit of work). A price id with no local
+// plan is a catalog misconfiguration: fail loud with ErrPlanUnresolved rather than
+// project a subscription with a zeroed entitlement. Dedup runs INSIDE the tx: a
+// replay marks nothing new (seen=true) and returns before any write, so the
+// projection and outbox are never duplicated.
 func (uc *UseCase) applySubscription(ctx context.Context, ev StripeEvent, newEvent func(*Subscription) events.Event) error {
 	if ev.TenantID == "" {
 		return ErrMissingTenant
@@ -130,11 +135,6 @@ func (uc *UseCase) applySubscription(ctx context.Context, ev StripeEvent, newEve
 	sub := ev.Subscription
 	if sub == nil {
 		return ErrMalformedEvent
-	}
-
-	plan, limit, err := uc.gateway.ResolvePlan(ctx, sub.PriceID)
-	if err != nil {
-		return err
 	}
 
 	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
@@ -146,20 +146,62 @@ func (uc *UseCase) applySubscription(ctx context.Context, ev StripeEvent, newEve
 			return nil
 		}
 
+		plan, err := uc.repo.FindPlanByStripePriceID(ctx, tx, sub.PriceID)
+		if errors.Is(err, ErrPlanNotFound) {
+			return ErrPlanUnresolved
+		}
+		if err != nil {
+			return err
+		}
+
+		// No persisted subscription exists yet on a create, and this fatia's
+		// webhook path never carries a custom price override — an empty probe
+		// resolves the plan's own defaults, exactly effectiveEntitlement's
+		// "no override" branch.
+		limit, _ := effectiveEntitlement(&Subscription{}, plan)
+
 		saved, err := uc.repo.UpsertSubscription(ctx, tx, UpsertParams{
 			TenantID:             ev.TenantID,
 			StripeCustomerID:     sub.CustomerID,
 			StripeSubscriptionID: sub.ID,
 			Status:               normalizeStatus(sub.Status),
-			Plan:                 plan,
+			Plan:                 plan.Name,
 			CurrentPeriodEnd:     sub.CurrentPeriodEnd,
 			ActiveProcessLimit:   limit,
+			PlanID:               &plan.ID,
 		})
 		if err != nil {
 			return err
 		}
 		return uc.outbox.Publish(ctx, tx, newEvent(saved))
 	})
+}
+
+// unlimitedActiveProcesses is the sentinel effectiveEntitlement returns for a
+// plan with no process ceiling (Plan.MaxProcesses == nil — the Enterprise band).
+// math.MaxInt32 keeps the value safely representable everywhere the entitlement
+// is compared or stored (e.g. active_process_limit is an int32 column) while
+// still comparing as "no tenant will ever hit this" against any real count.
+const unlimitedActiveProcesses = math.MaxInt32
+
+// effectiveEntitlement is the SOLE place that combines a subscription with its
+// plan (and any negotiated override) into the entitlement actually enforced:
+// activeProcessLimit is the plan's ceiling (unlimitedActiveProcesses when the
+// plan has none); pricePerProcessCents is the tenant's negotiated override when
+// set, else the plan's table rate. No other code in this slice (or its consumers)
+// may re-derive this combination — extend this function instead.
+func effectiveEntitlement(sub *Subscription, plan *Plan) (activeProcessLimit int, pricePerProcessCents int) {
+	activeProcessLimit = unlimitedActiveProcesses
+	if plan.MaxProcesses != nil {
+		activeProcessLimit = *plan.MaxProcesses
+	}
+
+	pricePerProcessCents = plan.PricePerProcessCents
+	if sub.CustomPricePerProcessCents != nil {
+		pricePerProcessCents = *sub.CustomPricePerProcessCents
+	}
+
+	return activeProcessLimit, pricePerProcessCents
 }
 
 // cancelSubscription projects a customer.subscription.deleted event: it flips the
@@ -303,10 +345,12 @@ func (uc *UseCase) GetSubscription(ctx context.Context, tenantID string) (*Subsc
 	return uc.repo.FindByTenant(ctx, tenantID)
 }
 
-// ListPlans returns the active plan catalog from Stripe. It is a thin pass-through
-// to the gateway today (the catalog lives in Stripe), kept as a use case so the
-// handler never touches the gateway and future filtering has a home.
-func (uc *UseCase) ListPlans(ctx context.Context) ([]Plan, error) {
+// ListPlans returns the active plan catalog read LIVE from Stripe (StripePlan) —
+// unchanged behavior for this fatia; migrating this endpoint onto the local Plan
+// catalog is a follow-up out of scope here (see entity.go's package doc). It is a
+// thin pass-through to the gateway, kept as a use case so the handler never
+// touches the gateway and future filtering has a home.
+func (uc *UseCase) ListPlans(ctx context.Context) ([]StripePlan, error) {
 	return uc.gateway.ListPlans(ctx)
 }
 

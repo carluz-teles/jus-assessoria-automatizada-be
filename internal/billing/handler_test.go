@@ -43,7 +43,7 @@ type fakeHandlerUC struct {
 	checkoutURL string
 	portalURL   string
 	sub         *Subscription
-	plans       []Plan
+	plans       []StripePlan
 	err         error
 
 	gotTenantID string
@@ -65,7 +65,7 @@ func (f *fakeHandlerUC) GetSubscription(_ context.Context, tenantID string) (*Su
 	return f.sub, f.err
 }
 
-func (f *fakeHandlerUC) ListPlans(context.Context) ([]Plan, error) {
+func (f *fakeHandlerUC) ListPlans(context.Context) ([]StripePlan, error) {
 	return f.plans, f.err
 }
 
@@ -271,7 +271,7 @@ func TestHandler_Subscription_NotFound_404(t *testing.T) {
 func TestHandler_Plans_Admin_200(t *testing.T) {
 	t.Parallel()
 
-	uc := &fakeHandlerUC{plans: []Plan{
+	uc := &fakeHandlerUC{plans: []StripePlan{
 		{PriceID: "price_1", Name: "Pro", Amount: 4990, Interval: "month", ActiveProcessLimit: 50},
 	}}
 	app := newApp(uc, roleAdmin, "tenant-1")
