@@ -121,8 +121,11 @@ func run(logger *slog.Logger) error {
 	// (repo + shared outbox + unit of work → use case → resolver/webhook/handler).
 	uow := database.NewUnitOfWork(pool)
 	repo := identity.NewRepository(pool)
-	uc := identity.NewUseCase(repo, events.NewOutbox(), uow)
+	// NewClerkVerifier calls clerk.SetKey first — NewClerkMembershipGateway relies
+	// on that package-level key (it builds a zero-valued ClientConfig), so the
+	// verifier must be constructed before the use case wires the gateway.
 	verifier := middleware.NewClerkVerifier(cfg.ClerkSecret, cfg.ClerkIssuer)
+	uc := identity.NewUseCase(repo, events.NewOutbox(), uow, identity.WithMembershipGateway(identity.NewClerkMembershipGateway()))
 	resolver := identity.NewResolver(uc)
 	webhook := identity.NewWebhookHandler(cfg.ClerkWebhookSecret, uc)
 	identityHandler := identity.NewHandler(uc)

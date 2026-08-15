@@ -18,6 +18,7 @@ type handlerUC interface {
 	GetOrgProfile(ctx context.Context, tenantID string) (*Tenant, error)
 	UpdateOrgProfile(ctx context.Context, tenantID string, profile OrgProfile) (*Tenant, error)
 	ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error)
+	RemoveMember(ctx context.Context, tenantID, actorUserID, targetAppUserID string) error
 }
 
 // Handler is identity's authenticated HTTP surface (the onboarding endpoints). It
@@ -49,6 +50,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/organization/profile", h.getOrgProfile)
 	r.Put("/organization/profile", middleware.RequireRole(string(RoleAdmin)), h.updateOrgProfile)
 	r.Get("/organization/members", h.listOrgMembers)
+	r.Delete("/organization/members/:id", middleware.RequireRole(string(RoleAdmin)), h.removeMember)
 }
 
 // meView is the read model returned by GET /identity/me. tenant_id and
@@ -153,6 +155,26 @@ func (h *Handler) listOrgMembers(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(newMembersEnvelope(members))
+}
+
+// removeMember handles DELETE /v1/organization/members/:id: it asks Clerk to
+// revoke the target member's access. RequireRole(ADMIN) guards the route; the
+// use case additionally refuses an admin removing themself (ErrCannotRemoveSelf,
+// → 400) rather than 500ing or silently stranding the caller. tenant_id and the
+// acting user's id come from the verified principal, never the path or body — the
+// path only supplies WHO is being removed.
+func (h *Handler) removeMember(c *fiber.Ctx) error {
+	principal, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing authenticated principal"))
+	}
+
+	targetID := c.Params("id")
+	if err := h.uc.RemoveMember(c.UserContext(), principal.TenantID, principal.UserID, targetID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // newMembersEnvelope maps the OrgMember read models to the {data:[...]} envelope. It

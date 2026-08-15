@@ -26,6 +26,7 @@ type mockRepo struct {
 	getMe            func(ctx context.Context, clerkUserID string) (*Me, error)
 	updateOrgProfile func(ctx context.Context, tx database.Tx, tenantID string, profile OrgProfile) (*Tenant, error)
 	listOrgMembers   func(ctx context.Context, tenantID string) ([]OrgMember, error)
+	findMemberClerk  func(ctx context.Context, tenantID, appUserID string) (string, error)
 }
 
 func (m *mockRepo) UpsertTenant(ctx context.Context, tx database.Tx, clerkOrgID, name string) (*Tenant, error) {
@@ -74,6 +75,10 @@ func (m *mockRepo) UpdateOrgProfile(ctx context.Context, tx database.Tx, tenantI
 
 func (m *mockRepo) ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error) {
 	return m.listOrgMembers(ctx, tenantID)
+}
+
+func (m *mockRepo) FindActiveMemberClerkUser(ctx context.Context, tenantID, appUserID string) (string, error) {
+	return m.findMemberClerk(ctx, tenantID, appUserID)
 }
 
 // fakeUOW is a no-op unit of work: it records the RLS scope the use case asked
@@ -1049,6 +1054,98 @@ func TestUseCase_UpdateOrgProfile(t *testing.T) {
 		}
 		if len(outbox.published) != 0 {
 			t.Fatalf("published %d events, want 0 when the write failed", len(outbox.published))
+		}
+	})
+}
+
+// mockMembershipGateway is a hand-written membershipGateway double: the RemoveMember
+// call delegates to a func field, so each test injects exactly the behavior it needs.
+type mockMembershipGateway struct {
+	removeMember func(ctx context.Context, clerkOrgID, clerkUserID string) error
+	called       bool
+	gotOrgID     string
+	gotUserID    string
+}
+
+func (m *mockMembershipGateway) RemoveMember(ctx context.Context, clerkOrgID, clerkUserID string) error {
+	m.called = true
+	m.gotOrgID = clerkOrgID
+	m.gotUserID = clerkUserID
+	return m.removeMember(ctx, clerkOrgID, clerkUserID)
+}
+
+func TestUseCase_RemoveMember(t *testing.T) {
+	ctx := context.Background()
+	tenant := &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}
+
+	t.Run("revokes the target member on Clerk", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenantByID: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findMemberClerk: func(_ context.Context, tenantID, appUserID string) (string, error) {
+				if tenantID != tenant.ID || appUserID != "target-uuid" {
+					t.Fatalf("lookup scope = (%q, %q), want (%q, target-uuid)", tenantID, appUserID, tenant.ID)
+				}
+				return "user_target", nil
+			},
+		}
+		gateway := &mockMembershipGateway{removeMember: func(context.Context, string, string) error { return nil }}
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{}, WithMembershipGateway(gateway))
+
+		if err := uc.RemoveMember(ctx, tenant.ID, "actor-uuid", "target-uuid"); err != nil {
+			t.Fatalf("RemoveMember() error = %v", err)
+		}
+		if !gateway.called {
+			t.Fatal("gateway.RemoveMember was not called")
+		}
+		if gateway.gotOrgID != tenant.ClerkOrgID || gateway.gotUserID != "user_target" {
+			t.Fatalf("gateway called with (%q, %q), want (%q, user_target)", gateway.gotOrgID, gateway.gotUserID, tenant.ClerkOrgID)
+		}
+	})
+
+	t.Run("an admin cannot remove themself — the gateway is never called", func(t *testing.T) {
+		repo := &mockRepo{}
+		gateway := &mockMembershipGateway{}
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{}, WithMembershipGateway(gateway))
+
+		err := uc.RemoveMember(ctx, tenant.ID, "same-uuid", "same-uuid")
+		if !errors.Is(err, ErrCannotRemoveSelf) {
+			t.Fatalf("error = %v, want ErrCannotRemoveSelf", err)
+		}
+		if gateway.called {
+			t.Fatal("gateway.RemoveMember was called despite the self-removal guard")
+		}
+	})
+
+	t.Run("target has no ACTIVE membership in the tenant — typed not-found propagates", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenantByID: func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findMemberClerk: func(context.Context, string, string) (string, error) {
+				return "", ErrUserNotFound
+			},
+		}
+		gateway := &mockMembershipGateway{}
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{}, WithMembershipGateway(gateway))
+
+		err := uc.RemoveMember(ctx, tenant.ID, "actor-uuid", "stranger-uuid")
+		if !errors.Is(err, ErrUserNotFound) {
+			t.Fatalf("error = %v, want ErrUserNotFound", err)
+		}
+		if gateway.called {
+			t.Fatal("gateway.RemoveMember was called despite the lookup failing")
+		}
+	})
+
+	t.Run("a gateway failure propagates unchanged", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenantByID:  func(context.Context, string) (*Tenant, error) { return tenant, nil },
+			findMemberClerk: func(context.Context, string, string) (string, error) { return "user_target", nil },
+		}
+		boom := errors.New("clerk unreachable")
+		gateway := &mockMembershipGateway{removeMember: func(context.Context, string, string) error { return boom }}
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{}, WithMembershipGateway(gateway))
+
+		if err := uc.RemoveMember(ctx, tenant.ID, "actor-uuid", "target-uuid"); !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
 		}
 	})
 }

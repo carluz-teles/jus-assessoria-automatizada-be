@@ -22,15 +22,32 @@ type publisher interface {
 // Repository interface, the outbox publisher and the UnitOfWork, never on the
 // concrete pg implementation (docs §2.5).
 type UseCase struct {
-	repo   Repository
-	outbox publisher
-	uow    database.UnitOfWork
+	repo    Repository
+	outbox  publisher
+	uow     database.UnitOfWork
+	gateway membershipGateway
+}
+
+// UseCaseOption configures optional UseCase dependencies that most tests never
+// exercise (e.g. the Clerk gateway RemoveMember needs) — a functional option
+// keeps every existing NewUseCase(repo, outbox, uow) call site compiling
+// unchanged instead of forcing a nil gateway through every constructor call.
+type UseCaseOption func(*UseCase)
+
+// WithMembershipGateway wires the port RemoveMember calls to revoke a member on
+// Clerk. Omitted in tests that never call RemoveMember.
+func WithMembershipGateway(gateway membershipGateway) UseCaseOption {
+	return func(uc *UseCase) { uc.gateway = gateway }
 }
 
 // NewUseCase wires the use cases to their repository, outbox publisher and unit
 // of work.
-func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork) *UseCase {
-	return &UseCase{repo: repo, outbox: outbox, uow: uow}
+func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork, opts ...UseCaseOption) *UseCase {
+	uc := &UseCase{repo: repo, outbox: outbox, uow: uow}
+	for _, opt := range opts {
+		opt(uc)
+	}
+	return uc
 }
 
 // ProvisionTenant creates or refreshes the tenant mirroring a Clerk Organization.
@@ -308,6 +325,35 @@ func (uc *UseCase) UpdateOrgProfile(ctx context.Context, tenantID string, profil
 		return nil, err
 	}
 	return tenant, nil
+}
+
+// RemoveMember revokes a member's access on behalf of DELETE
+// /v1/organization/members/:id. An admin cannot remove themself
+// (ErrCannotRemoveSelf) — the webhook path already blocks removing the last admin
+// from Clerk's own UI, but nothing stops an admin from removing THEIR OWN
+// membership through our API, stranding themselves out of the escritório.
+//
+// This only asks Clerk to revoke the membership; it does NOT flip the local
+// membership row or emit identity.member_removed directly — that happens later,
+// idempotently, through the organizationMembership.deleted webhook this call
+// triggers (OnMembershipRemoved), keeping Clerk the single source of truth for
+// who currently belongs to the org.
+func (uc *UseCase) RemoveMember(ctx context.Context, tenantID, actorUserID, targetAppUserID string) error {
+	if targetAppUserID == actorUserID {
+		return ErrCannotRemoveSelf
+	}
+
+	tenant, err := uc.repo.FindTenantByID(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+
+	clerkUserID, err := uc.repo.FindActiveMemberClerkUser(ctx, tenantID, targetAppUserID)
+	if err != nil {
+		return err
+	}
+
+	return uc.gateway.RemoveMember(ctx, tenant.ClerkOrgID, clerkUserID)
 }
 
 // newOrgProfileUpdated builds the event for a saved profile, minting a fresh v7

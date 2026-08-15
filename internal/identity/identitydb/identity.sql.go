@@ -12,6 +12,31 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getActiveMemberClerkUser = `-- name: GetActiveMemberClerkUser :one
+SELECT u.clerk_user_id
+FROM membership m
+JOIN app_user u ON u.id = m.app_user_id AND u.tenant_id = m.tenant_id
+WHERE m.tenant_id = $1 AND m.app_user_id = $2 AND m.status = 'ACTIVE'
+`
+
+type GetActiveMemberClerkUserParams struct {
+	TenantID  uuid.UUID `json:"tenant_id"`
+	AppUserID uuid.UUID `json:"app_user_id"`
+}
+
+// Resolve the Clerk user id behind an ACTIVE membership, scoped to the tenant —
+// the lookup DELETE /v1/organization/members/:id needs before it can ask Clerk to
+// revoke access. Tenant-scoped by m.tenant_id (barrier 1; RLS is barrier 2 on both
+// tables). A REMOVED or foreign membership matches no row, so the caller gets the
+// same not-found as an unknown id — never leaking whether the member exists under
+// another tenant.
+func (q *Queries) GetActiveMemberClerkUser(ctx context.Context, arg GetActiveMemberClerkUserParams) (string, error) {
+	row := q.db.QueryRow(ctx, getActiveMemberClerkUser, arg.TenantID, arg.AppUserID)
+	var clerk_user_id string
+	err := row.Scan(&clerk_user_id)
+	return clerk_user_id, err
+}
+
 const getActiveUserByClerkUser = `-- name: GetActiveUserByClerkUser :one
 SELECT u.id, u.clerk_user_id, u.tenant_id, u.email, u.name, u.role, u.created_at, u.phone FROM app_user u
 JOIN membership m

@@ -11,6 +11,13 @@ import (
 )
 
 type Querier interface {
+	// Resolve the Clerk user id behind an ACTIVE membership, scoped to the tenant —
+	// the lookup DELETE /v1/organization/members/:id needs before it can ask Clerk to
+	// revoke access. Tenant-scoped by m.tenant_id (barrier 1; RLS is barrier 2 on both
+	// tables). A REMOVED or foreign membership matches no row, so the caller gets the
+	// same not-found as an unknown id — never leaking whether the member exists under
+	// another tenant.
+	GetActiveMemberClerkUser(ctx context.Context, arg GetActiveMemberClerkUserParams) (string, error)
 	// Resolve the app_user behind a Clerk user ONLY while it still has an ACTIVE
 	// membership — the authorization gate ResolvePrincipal reads. A soft-removed member
 	// (status REMOVED) yields no row, so the caller maps it to ErrUserNotFound (→ 401),

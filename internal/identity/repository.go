@@ -55,6 +55,11 @@ type Repository interface {
 	// list) on the pool, scoped by tenant id. A screen read, no tx; the set is small, so
 	// it returns the whole slice with no cursor.
 	ListOrgMembers(ctx context.Context, tenantID string) ([]OrgMember, error)
+	// FindActiveMemberClerkUser resolves the Clerk user id behind an ACTIVE
+	// membership, scoped to the tenant — the lookup RemoveMember needs before
+	// asking Clerk to revoke access. A pool read, no tx. A REMOVED or foreign
+	// membership is the typed ErrUserNotFound, never (nil, nil).
+	FindActiveMemberClerkUser(ctx context.Context, tenantID, appUserID string) (string, error)
 }
 
 // pgRepository is the sqlc-backed implementation. q is bound to the pool for
@@ -213,6 +218,33 @@ func (r *pgRepository) UpdateMembershipRole(ctx context.Context, tx database.Tx,
 		return database.WrapInfra(err)
 	}
 	return nil
+}
+
+// FindActiveMemberClerkUser reads on the pool (a resolution read, no tx).
+// tenantID/appUserID are internal uuids (strings on the entity), parsed back
+// here. A missing row (REMOVED membership, or an app_user id from another
+// tenant) is the typed ErrUserNotFound — the caller distinguishes "no such
+// active member" from an infra fault by that sentinel, never by ("", nil).
+func (r *pgRepository) FindActiveMemberClerkUser(ctx context.Context, tenantID, appUserID string) (string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	uid, err := uuid.Parse(appUserID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	clerkUserID, err := r.q.GetActiveMemberClerkUser(ctx, identitydb.GetActiveMemberClerkUserParams{
+		TenantID:  tid,
+		AppUserID: uid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrUserNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return clerkUserID, nil
 }
 
 func (r *pgRepository) FindUserByClerkUser(ctx context.Context, clerkUserID string) (*AppUser, error) {

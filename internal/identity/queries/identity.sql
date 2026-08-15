@@ -102,6 +102,18 @@ UPDATE app_user
    SET role = $2
  WHERE id = (SELECT app_user_id FROM synced);
 
+-- name: GetActiveMemberClerkUser :one
+-- Resolve the Clerk user id behind an ACTIVE membership, scoped to the tenant —
+-- the lookup DELETE /v1/organization/members/:id needs before it can ask Clerk to
+-- revoke access. Tenant-scoped by m.tenant_id (barrier 1; RLS is barrier 2 on both
+-- tables). A REMOVED or foreign membership matches no row, so the caller gets the
+-- same not-found as an unknown id — never leaking whether the member exists under
+-- another tenant.
+SELECT u.clerk_user_id
+FROM membership m
+JOIN app_user u ON u.id = m.app_user_id AND u.tenant_id = m.tenant_id
+WHERE m.tenant_id = $1 AND m.app_user_id = $2 AND m.status = 'ACTIVE';
+
 -- name: GetMeByClerkUser :one
 -- Onboarding read model for GET /identity/me: the caller's internal tenant and
 -- its onboarding gate, joined from app_user by Clerk user id. No row → the
