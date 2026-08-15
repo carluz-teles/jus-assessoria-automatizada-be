@@ -1,0 +1,33 @@
+# Overlay que soma um túnel público na frente do `api`, só para dev local. Existe
+# porque o onboarding depende de um webhook do Clerk (organization.created →
+# provisiona o tenant — internal/identity/webhook.go, rota POST /webhooks/clerk,
+# verificado via svix), e o Clerk (rodando na nuvem) não alcança localhost:8080.
+#
+# ngrok (não cloudflared): o Cloudflare Quick Tunnel depende de QUIC/UDP, que sai
+# degradado neste WSL2 (precheck do cloudflared reporta "QUIC connection failed",
+# cai pra HTTP2 com latência/flakiness o bastante pra o Svix (timeout curto) bater
+# "no response" nas entregas do webhook, mesmo com curl direto respondendo rápido).
+# ngrok usa TCP/TLS puro — sem esse problema. Requer NGROK_AUTHTOKEN (free tier,
+# https://dashboard.ngrok.com/get-started/your-authtoken) em .env (NUNCA commitado).
+#
+# Uso: docker compose -f docker-compose.yml -f docker-compose.fe.yml \
+#        -f docker-compose.tunnel.yml up -d --build
+# (ou `make up-tunnel`). Pegue a URL pública via a API local do ngrok:
+#   curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
+# Cadastre em https://dashboard.clerk.com (instância definite-mite-90) → Webhooks
+# → Add Endpoint → <url>/webhooks/clerk. Isso gera um CLERK_WEBHOOK_SECRET NOVO
+# (endpoint novo, secret novo) — atualize .env e reinicie o api
+# (`docker compose ... up -d api`) pra ele assinar/verificar certo. Só dev local;
+# nenhuma CI depende deste arquivo.
+
+services:
+  tunnel:
+    image: ngrok/ngrok:latest
+    command: http api:8080
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    ports:
+      - "4040:4040"
+    depends_on:
+      - api
+    restart: unless-stopped

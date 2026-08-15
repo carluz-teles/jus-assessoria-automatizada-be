@@ -55,6 +55,38 @@ OpenTelemetry-Go + **otelpgx** · slog · aws-sdk-go-v2 (S3/R2, presigned) · go
 integração (repo contra Postgres real, outbox→relay→listener) via docker compose; e2e poucos.
 TDD para feature/bugfix: escreve o teste do critério de aceite primeiro.
 
+## Ambiente local (docker compose) — como subir a stack pra testar
+
+Três overlays compostos (cada um soma serviços ao anterior — sempre `-f docker-compose.yml -f ...`):
+
+| Comando           | Sobe                                                          | Quando usar |
+|--------------------|----------------------------------------------------------------|-------------|
+| `make up`          | postgres + redis + api + 4 workers + scheduler                | testar só o BE (o padrão) |
+| `make up-full`      | tudo de `up` + `web` (FE, repo irmão `../jus-assessoria-automatizada-fe`, `network_mode: host`, porta 3000) | testar FE+BE juntos — requer os dois repos clonados como irmãos |
+| `make up-tunnel`    | tudo de `up-full` + `tunnel` (ngrok, porta 4040)               | testar signup/onboarding (Clerk precisa alcançar o webhook) |
+
+`make down` / `down-full` / `down-tunnel` derruba cada nível. Nenhum destes overlays roda em CI — são só pra dev local
+(ver `docker-compose.fe.yml`, `docker-compose.tunnel.yml`, comentários nos arquivos têm o porquê de cada decisão).
+
+**Pré-requisito**: `.env` na raiz (copiar de `.env.example`) com `DATABASE_URL`/`REDIS_URL` (irrelevantes pro compose —
+ele sobrescreve pra apontar pros containers — mas exigidos pelo `config.Load`), `CLERK_SECRET_KEY`/`CLERK_ISSUER`,
+`ANTHROPIC_API_KEY` (só precisa existir, não precisa ser válida se não for testar IA de verdade). Pra `up-full`:
++ `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`. Pra `up-tunnel`: + `NGROK_AUTHTOKEN` (free tier — pegar em
+https://dashboard.ngrok.com/get-started/your-authtoken, **não** confundir com a API Key da mesma conta, que
+autentica na REST API do ngrok mas o agente do túnel rejeita com `ERR_NGROK_107`).
+
+**Testar signup + onboarding de ponta a ponta** (a organização/tenant nasce via `createOrganization` no Clerk client-
+side → Clerk dispara webhook `organization.created` → `POST /webhooks/clerk` (rota pública, raiz do app, **não** é
+`/v1/...` — ver `internal/identity/webhook.go:48`) → BE provisiona o tenant → FE poll em `/v1/identity/me` até achar):
+1. `make up-tunnel`, depois `curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'` pra pegar a URL pública.
+2. Cadastrar essa URL + `/webhooks/clerk` como Endpoint em https://dashboard.clerk.com (Webhooks), evento
+   `organization.created` (e `organizationMembership.created` se for testar convite de time). Isso gera um
+   `CLERK_WEBHOOK_SECRET` novo — colar em `.env` e `docker compose ... up -d api` pra recarregar.
+3. A URL do túnel é efêmera por padrão (muda a cada restart do container `tunnel`) — domínio fixo é plano pago do
+   ngrok agora (não é mais free tier). Não reiniciar o container `tunnel` no meio de uma sessão de teste.
+4. Signup: usar e-mail no formato `algo+clerk_test@example.com` (Clerk aceita sem enviar e-mail de verdade) e o
+   código OTP fixo `424242` — funciona porque a chave é `sk_test_...` (instância de dev, sem Turnstile/captcha).
+
 ## Skills do projeto (INVOCAR com a Skill tool antes de codar — não codar de memória)
 `golang-code-style` · `golang-design-patterns` · `golang-error-handling` · `golang-testing`.
 Rote pelo que a mudança toca; invoque só os que se aplicam. Frontend (quando vier): `docs/erd-frontend.md` (ainda não recebido).

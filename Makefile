@@ -1,4 +1,4 @@
-.PHONY: build test test-integration tidy sqlc docker-build up down itest-db
+.PHONY: build test test-integration tidy sqlc docker-build up down up-full down-full up-tunnel down-tunnel itest-db
 
 # Green gate: compila tudo.
 build:
@@ -38,6 +38,23 @@ up:
 # Derruba a stack local.
 down:
 	docker compose down
+
+# Sobe a stack completa + FE (repo irmão ../jus-assessoria-automatizada-fe — ver
+# docker-compose.fe.yml). Só dev local; nenhuma CI depende disto.
+up-full:
+	docker compose -f docker-compose.yml -f docker-compose.fe.yml up -d --build
+
+down-full:
+	docker compose -f docker-compose.yml -f docker-compose.fe.yml down
+
+# Sobe a stack completa + FE + túnel público (cloudflared, sem conta) na frente
+# do api — necessário pro webhook do Clerk (organization.created) alcançar
+# localhost. Ver docker-compose.tunnel.yml pro passo de cadastro no Clerk Dashboard.
+up-tunnel:
+	docker compose -f docker-compose.yml -f docker-compose.fe.yml -f docker-compose.tunnel.yml up -d --build
+
+down-tunnel:
+	docker compose -f docker-compose.yml -f docker-compose.fe.yml -f docker-compose.tunnel.yml down
 
 # Sobe só as dependências efêmeras (postgres + redis em tmpfs) para integração/e2e.
 itest-db:

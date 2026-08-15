@@ -1,0 +1,35 @@
+# Overlay que soma o FE (repo irmão) à stack local (docs/erd-backend.md §5d).
+# Uso: docker compose -f docker-compose.yml -f docker-compose.fe.yml up -d --build
+# (ou `make up-full`). Requer o repo jus-assessoria-automatizada-fe clonado como
+# IRMÃO deste (../jus-assessoria-automatizada-fe). Só serve para dev local — nenhuma
+# pipeline de CI depende deste arquivo (cada repo builda/testa só a si mesmo; ver
+# .github/workflows/ci.yml e o cd.yml de cada repo para o que roda em CI).
+#
+# network_mode: host (Linux/WSL2 — o ambiente deste projeto): o FE faz fetch tanto
+# client-side (browser, no host) quanto server-side (dentro do container, em Server
+# Components — src/app/(app)/layout.tsx e onboarding/page.tsx chamam apiFetch no
+# server também) para a MESMA env NEXT_PUBLIC_API_URL, que é assada em build-time
+# (ARG -> ENV no Dockerfile do FE). Com host network os dois lados enxergam
+# http://localhost:8080 igual — sem isso o container precisaria resolver `api`
+# (nome do serviço, rede da compose) enquanto o browser no host precisa de
+# `localhost`, e NEXT_PUBLIC_* só aceita um valor único, assado no build.
+
+services:
+  web:
+    build:
+      context: ../jus-assessoria-automatizada-fe
+      args:
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+        NEXT_PUBLIC_API_URL: http://localhost:8080
+    image: jus-fe-web:local
+    network_mode: host
+    env_file: .env
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+      # env_file: .env também traz PORT=8080 (do api) — em network_mode: host os
+      # dois containers competem pela mesma porta do host. Sobrescreve pra o
+      # default do Next (3000).
+      PORT: "3000"
+    depends_on:
+      - api
+    restart: unless-stopped
