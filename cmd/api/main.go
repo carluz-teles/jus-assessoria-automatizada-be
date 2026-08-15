@@ -133,7 +133,7 @@ func run(logger *slog.Logger) error {
 	// entitlement-gated (the tenant's ACTIVE-process ceiling, read from billing), so an
 	// over-limit onboarding is refused at the edge.
 	acquisitionRepo := acquisition.NewRepository(pool)
-	acquisitionEntitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
+	acquisitionEntitlement := resolveEntitlementChecker(cfg, billing.NewRepository(pool))
 	acquisitionHandler := acquisition.NewHandler(
 		acquisition.NewUseCase(acquisitionRepo, events.NewOutbox(), uow,
 			acquisition.WithActivationEntitlementChecker(acquisitionEntitlement)),
@@ -300,4 +300,20 @@ func run(logger *slog.Logger) error {
 	)
 
 	return nil
+}
+
+// resolveEntitlementChecker decides which EntitlementChecker acquisition's
+// activation gate uses. TEMPORARY: while config.BillingGateEnabled is false
+// (the default), plan pricing is not yet decided (pending business decision),
+// so it wires acquisition.NewUnlimitedEntitlementChecker() instead of the real
+// billing.EntitlementAdapter — no tenant is blocked. The enforcement logic in
+// billing.EntitlementAdapter is untouched; only this composition decides
+// whether it is consulted. Flip BILLING_GATE_ENABLED=true (or remove the flag
+// entirely, if it stops making sense) once pricing lands.
+func resolveEntitlementChecker(cfg config.Config, repo billing.Repository) acquisition.EntitlementChecker {
+	slog.Info("billing gate", "enabled", cfg.BillingGateEnabled)
+	if !cfg.BillingGateEnabled {
+		return acquisition.NewUnlimitedEntitlementChecker()
+	}
+	return billing.NewEntitlementAdapter(repo)
 }

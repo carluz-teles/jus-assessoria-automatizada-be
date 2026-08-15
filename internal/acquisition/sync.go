@@ -223,15 +223,29 @@ type EntitlementChecker interface {
 	ActiveProcessLimit(ctx context.Context, tenantID string) (int, error)
 }
 
-// unlimitedEntitlement is the default EntitlementChecker a SyncUseCase falls back to
-// when none is injected: it imposes no ceiling. Production ALWAYS wires the billing
-// adapter through WithEntitlementChecker at the worker's composition root; this
-// default only keeps same-package tests that do not exercise gating source-compatible
-// (mirrors the now:time.Now seam).
+// unlimitedEntitlement is the default EntitlementChecker a SyncUseCase (and
+// UseCase, domain.go) falls back to when none is injected: it imposes no
+// ceiling. Production wires the real billing adapter through
+// WithEntitlementChecker/WithActivationEntitlementChecker at the composition
+// root (cmd/api, cmd/worker-ingestao) only when config.BillingGateEnabled is
+// true; it also keeps same-package tests that do not exercise gating
+// source-compatible (mirrors the now:time.Now seam).
 type unlimitedEntitlement struct{}
 
 func (unlimitedEntitlement) ActiveProcessLimit(context.Context, string) (int, error) {
 	return math.MaxInt, nil
+}
+
+// NewUnlimitedEntitlementChecker returns an EntitlementChecker that imposes no
+// ceiling on active processes. Exported so a composition root can wire it
+// explicitly — TEMPORARY: cmd/api and cmd/worker-ingestao inject it in place of
+// the real billing.EntitlementAdapter while config.BillingGateEnabled is false
+// (the default), because plan pricing is not yet decided (pending business
+// decision). It is the exact same fallback UseCase/SyncUseCase already default
+// to when no checker is injected at all — this constructor just lets the
+// composition root make that choice explicit and reversible.
+func NewUnlimitedEntitlementChecker() EntitlementChecker {
+	return unlimitedEntitlement{}
 }
 
 // SyncUseCase reacts to sync_requested by running one fetch→parse→upsert cycle.

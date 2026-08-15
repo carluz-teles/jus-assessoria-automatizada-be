@@ -186,6 +186,18 @@ type Config struct {
 	// nacional UMA vez no boot, em background (o cold-start do store). Ops seta (ex.
 	// 90) pro primeiro carregamento e volta pra 0 depois. Default 0 = sem bootstrap.
 	BootstrapDays int `env:"BOOTSTRAP_DAYS" envDefault:"0"`
+
+	// BillingGateEnabled liga o enforcement do limite de processos ativos
+	// (active_process_limit, billing.EntitlementAdapter) na ativação de integração
+	// (api) e no ciclo de sync (worker-ingestao). TEMPORÁRIO: a precificação dos
+	// planos ainda não foi decidida (decisão de negócio pendente), então o default é
+	// FALSE — ninguém é bloqueado até lá. A lógica de enforcement em si (entity.go,
+	// domain.go, entitlement.go) continua intacta e testada; esta flag só decide se a
+	// composição em cmd/api e cmd/worker-ingestao a invoca ou injeta um checker
+	// ilimitado no lugar (acquisition.NewUnlimitedEntitlementChecker). Religar (ou
+	// remover a flag, se ela deixar de fazer sentido) quando a precificação for
+	// definida.
+	BillingGateEnabled bool `env:"BILLING_GATE_ENABLED" envDefault:"false"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do

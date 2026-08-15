@@ -224,7 +224,7 @@ func run(logger *slog.Logger) error {
 	// The sync use case is entitlement-gated: a window that would take the tenant over its
 	// ACTIVE-process ceiling (from billing) is refused, so the per-OAB backfill honors the
 	// plan limit instead of importing unlimited processes.
-	entitlement := billing.NewEntitlementAdapter(billing.NewRepository(pool))
+	entitlement := resolveEntitlementChecker(cfg, billing.NewRepository(pool))
 	sync := acquisition.NewSyncUseCase(repo, outbox, uow, orchestrator, parser,
 		acquisition.WithEntitlementChecker(entitlement))
 
@@ -385,4 +385,21 @@ func run(logger *slog.Logger) error {
 	)
 
 	return nil
+}
+
+// resolveEntitlementChecker decides which EntitlementChecker the sync cycle
+// uses. TEMPORARY: while config.BillingGateEnabled is false (the default),
+// plan pricing is not yet decided (pending business decision), so it wires
+// acquisition.NewUnlimitedEntitlementChecker() instead of the real
+// billing.EntitlementAdapter — no tenant's backfill/sync is refused for being
+// over a process ceiling. The enforcement logic in billing.EntitlementAdapter
+// is untouched; only this composition decides whether it is consulted. Flip
+// BILLING_GATE_ENABLED=true (or remove the flag entirely, if it stops making
+// sense) once pricing lands.
+func resolveEntitlementChecker(cfg config.Config, repo billing.Repository) acquisition.EntitlementChecker {
+	slog.Info("billing gate", "service", serviceName, "enabled", cfg.BillingGateEnabled)
+	if !cfg.BillingGateEnabled {
+		return acquisition.NewUnlimitedEntitlementChecker()
+	}
+	return billing.NewEntitlementAdapter(repo)
 }
