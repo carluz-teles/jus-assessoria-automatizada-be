@@ -89,7 +89,7 @@ type Task struct {
 	IntimationID   string
 	Title          string
 	Description    string
-	Kind           string // the TaskKind taxonomy (ANALISE|PECA|…); "" = uncategorized
+	Kind           string     // the TaskKind taxonomy (ANALISE|PECA|…); "" = uncategorized
 	DueDate        *time.Time // optional own date (≤ Deadline.EndDate when present)
 	Status         TaskStatus
 	Source         Source
