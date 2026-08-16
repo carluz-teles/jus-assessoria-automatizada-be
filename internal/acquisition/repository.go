@@ -94,8 +94,14 @@ type Repository interface {
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
 	ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error)
-	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
-	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	CountProcessos(ctx context.Context, q ProcessosQuery) (totalCount, total int64, err error)
+	CountIntimacoes(ctx context.Context, q IntimacoesQuery) (totalCount, total int64, err error)
+	// Filter options for the list envelopes — the distinct-value reads that back the
+	// chips. Each is tenant-scoped and matches the list's own context predicate.
+	ListProcessoCourts(ctx context.Context, tenantID string) ([]string, error)
+	ListProcessoDegrees(ctx context.Context, tenantID string) ([]string, error)
+	ListProcessoAssignees(ctx context.Context, tenantID string) ([]AssigneeOption, error)
+	ListIntimacaoCourts(ctx context.Context, tenantID string) ([]string, error)
 	SummarizeProcessos(ctx context.Context, tenantID string) (ProcessosSummaryView, error)
 	SummarizeIntimacoes(ctx context.Context, tenantID string) (IntimacoesSummaryView, error)
 	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
@@ -1123,11 +1129,15 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 		return nil, database.WrapInfra(err)
 	}
 	rows, err := r.q.ListProcessos(ctx, acquisitiondb.ListProcessosParams{
-		TenantID: tid,
-		Limit:    int32(q.Limit),
-		Search:   escapeLike(q.Search),
-		LastCnj:  q.LastCNJ,
-		LastID:   lastID,
+		TenantID:   tid,
+		Limit:      int32(q.Limit),
+		Search:     escapeLike(q.Search),
+		Court:      q.Court,
+		Degree:     q.Degree,
+		Lifecycle:  q.Lifecycle,
+		AssigneeID: nullUUID(q.Assignee),
+		LastCnj:    q.LastCNJ,
+		LastID:     lastID,
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -1218,6 +1228,9 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		TenantID:          tid,
 		Limit:             int32(q.Limit),
 		Search:            escapeLike(q.Search),
+		Type:              q.Type,
+		UserStatus:        q.UserStatus,
+		Court:             q.Court,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
 	})
@@ -1503,24 +1516,32 @@ func escapeLike(s string) string {
 }
 
 // CountProcessos returns the processes screen's "X de Y" totals: totalCount is the
-// current context (filtered by search when present), total the tenant's global ACTIVE
-// count. With no search the two are equal, so a single COUNT (the reused global) fills
-// both; with a search the filtered COUNT is the second read. Tenant-scoped (barrier 1).
-func (r *pgRepository) CountProcessos(ctx context.Context, tenantID, search string) (int64, int64, error) {
-	tid, err := uuid.Parse(tenantID)
+// current context (filtered by the active filters when any is present), total the
+// tenant's count in the screen's context. With no filter the two are equal, so a
+// single COUNT (the reused global) fills both; with a filter the filtered COUNT is
+// the second read. The "Y" follows the lifecycle filter (CountCourtRecordsByLifecycle
+// when ?lifecycle is set, else the ACTIVE default), so "X de Y" stays meaningful —
+// X is always a subset of the lifecycle context. Tenant-scoped (barrier 1).
+func (r *pgRepository) CountProcessos(ctx context.Context, q ProcessosQuery) (int64, int64, error) {
+	tid, err := uuid.Parse(q.TenantID)
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
 	}
-	total, err := r.q.CountActiveCourtRecordsByTenant(ctx, tid)
+
+	total, err := r.countProcessosContext(ctx, tid, q.Lifecycle)
 	if err != nil {
-		return 0, 0, database.WrapInfra(err)
+		return 0, 0, err
 	}
-	if search == "" {
+	if !q.Filtered() {
 		return total, total, nil
 	}
-	filtered, err := r.q.CountProcessosMatchingSearch(ctx, acquisitiondb.CountProcessosMatchingSearchParams{
-		TenantID: tid,
-		Search:   escapeLike(search),
+	filtered, err := r.q.CountProcessosFiltered(ctx, acquisitiondb.CountProcessosFilteredParams{
+		TenantID:   tid,
+		Search:     escapeLike(q.Search),
+		Court:      q.Court,
+		Degree:     q.Degree,
+		Lifecycle:  q.Lifecycle,
+		AssigneeID: nullUUID(q.Assignee),
 	})
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
@@ -1528,11 +1549,28 @@ func (r *pgRepository) CountProcessos(ctx context.Context, tenantID, search stri
 	return filtered, total, nil
 }
 
+// countProcessosContext is the "Y" of the processes counter: the records of the
+// selected lifecycle (the ACTIVE default), so a ?lifecycle filter has a matching
+// universe instead of a stale ACTIVE total.
+func (r *pgRepository) countProcessosContext(ctx context.Context, tid uuid.UUID, lifecycle string) (int64, error) {
+	if lifecycle == "" {
+		return r.q.CountActiveCourtRecordsByTenant(ctx, tid)
+	}
+	total, err := r.q.CountCourtRecordsByLifecycle(ctx, acquisitiondb.CountCourtRecordsByLifecycleParams{
+		TenantID:  tid,
+		Lifecycle: lifecycle,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return total, nil
+}
+
 // CountIntimacoes returns the intimations inbox's "X de Y" totals — the same policy as
 // CountProcessos, over the intimation table (filtered by the joined court record's
-// cnj_number). Tenant-scoped.
-func (r *pgRepository) CountIntimacoes(ctx context.Context, tenantID, search string) (int64, int64, error) {
-	tid, err := uuid.Parse(tenantID)
+// cnj_number plus the type/user_status/court filters). Tenant-scoped.
+func (r *pgRepository) CountIntimacoes(ctx context.Context, q IntimacoesQuery) (int64, int64, error) {
+	tid, err := uuid.Parse(q.TenantID)
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
 	}
@@ -1540,17 +1578,80 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, tenantID, search str
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
 	}
-	if search == "" {
+	if !q.Filtered() {
 		return total, total, nil
 	}
-	filtered, err := r.q.CountIntimacoesMatchingSearch(ctx, acquisitiondb.CountIntimacoesMatchingSearchParams{
-		TenantID: tid,
-		Search:   escapeLike(search),
+	filtered, err := r.q.CountIntimacoesFiltered(ctx, acquisitiondb.CountIntimacoesFilteredParams{
+		TenantID:   tid,
+		Search:     escapeLike(q.Search),
+		Type:       q.Type,
+		UserStatus: q.UserStatus,
+		Court:      q.Court,
 	})
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
 	}
 	return filtered, total, nil
+}
+
+// ListProcessoCourts reads the distinct courts of the tenant's live records (the
+// processes screen's ?court options), ordered by name.
+func (r *pgRepository) ListProcessoCourts(ctx context.Context, tenantID string) ([]string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListProcessoCourts(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return rows, nil
+}
+
+// ListProcessoDegrees reads the distinct degrees of the tenant's live records (the
+// processes screen's ?degree options), ordered by name.
+func (r *pgRepository) ListProcessoDegrees(ctx context.Context, tenantID string) ([]string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListProcessoDegrees(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return rows, nil
+}
+
+// ListProcessoAssignees reads the responsáveis of the tenant's live processes (the
+// ?assignee options), deduped by id and ordered by name.
+func (r *pgRepository) ListProcessoAssignees(ctx context.Context, tenantID string) ([]AssigneeOption, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListProcessoAssignees(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]AssigneeOption, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, AssigneeOption{Name: row.Name, ID: row.ID.String()})
+	}
+	return out, nil
+}
+
+// ListIntimacaoCourts reads the distinct courts of the tenant's intimated records (the
+// inbox's ?court options), ordered by name.
+func (r *pgRepository) ListIntimacaoCourts(ctx context.Context, tenantID string) ([]string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListIntimacaoCourts(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return rows, nil
 }
 
 // SummarizeProcessos reads the processes list KPI counts (bucketed by court_record

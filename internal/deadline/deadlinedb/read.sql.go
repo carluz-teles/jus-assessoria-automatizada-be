@@ -14,26 +14,34 @@ import (
 
 const countPrazos = `-- name: CountPrazos :one
 SELECT count(*) FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
 WHERE d.tenant_id = $1::uuid
   AND ($2::text = '' OR d.status = $2::text)
-  AND ($3::date IS NULL OR d.end_date >= $3::date)
-  AND ($4::date IS NULL OR d.end_date <= $4::date)
+  AND ($3::text = '' OR d.kind = $3::text)
+  AND ($4::text = '' OR cr.court = $4::text)
+  AND ($5::date IS NULL OR d.end_date >= $5::date)
+  AND ($6::date IS NULL OR d.end_date <= $6::date)
 `
 
 type CountPrazosParams struct {
 	TenantID uuid.UUID   `json:"tenant_id"`
 	Status   string      `json:"status"`
+	Kind     string      `json:"kind"`
+	Court    string      `json:"court"`
 	FromDate pgtype.Date `json:"from_date"`
 	ToDate   pgtype.Date `json:"to_date"`
 }
 
 // The filtered "X" of the agenda's "X de Y" counter: how many prazos match the active
-// @status / end_date window. Called only when a filter is present; the unfiltered "Y"
-// reuses CountPrazosByTenant.
+// @status / @kind / @court / end_date window. Called only when a filter is present; the
+// unfiltered "Y" reuses CountPrazosByTenant. The court filter needs the same court_record
+// join as the list, so it never multiplies rows (the join key is the record id).
 func (q *Queries) CountPrazos(ctx context.Context, arg CountPrazosParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countPrazos,
 		arg.TenantID,
 		arg.Status,
+		arg.Kind,
+		arg.Court,
 		arg.FromDate,
 		arg.ToDate,
 	)
@@ -80,26 +88,29 @@ SELECT count(*) FROM task t
 WHERE t.tenant_id = $1::uuid
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
-  AND ($4::date IS NULL OR t.due_date >= $4::date)
-  AND ($5::date IS NULL OR t.due_date <= $5::date)
+  AND ($4::text = '' OR t.source = $4::text)
+  AND ($5::date IS NULL OR t.due_date >= $5::date)
+  AND ($6::date IS NULL OR t.due_date <= $6::date)
 `
 
 type CountTasksParams struct {
 	TenantID   uuid.UUID   `json:"tenant_id"`
 	Status     string      `json:"status"`
 	AssigneeID pgtype.UUID `json:"assignee_id"`
+	Source     string      `json:"source"`
 	FromDate   pgtype.Date `json:"from_date"`
 	ToDate     pgtype.Date `json:"to_date"`
 }
 
 // The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
-// @status / @assignee_id / window. Called only when a filter is present; the unfiltered "Y"
-// reuses CountTasksByTenant.
+// @status / @assignee_id / @source / window. Called only when a filter is present; the
+// unfiltered "Y" reuses CountTasksByTenant.
 func (q *Queries) CountTasks(ctx context.Context, arg CountTasksParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countTasks,
 		arg.TenantID,
 		arg.Status,
 		arg.AssigneeID,
+		arg.Source,
 		arg.FromDate,
 		arg.ToDate,
 	)
@@ -463,6 +474,72 @@ func (q *Queries) GetTasksSummary(ctx context.Context, tenantID uuid.UUID) (GetT
 	return i, err
 }
 
+const listPrazoCourts = `-- name: ListPrazoCourts :many
+SELECT DISTINCT cr.court
+FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
+WHERE d.tenant_id = $1::uuid
+  AND cr.court <> ''
+ORDER BY LOWER(cr.court) ASC
+`
+
+// Selectable ?court values for the prazos agenda: the distinct courts of the tenant's
+// intimated court records (the same join the list uses), ordered by name.
+func (q *Queries) ListPrazoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listPrazoCourts, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var court string
+		if err := rows.Scan(&court); err != nil {
+			return nil, err
+		}
+		items = append(items, court)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPrazoKinds = `-- name: ListPrazoKinds :many
+
+SELECT DISTINCT d.kind
+FROM deadline d
+WHERE d.tenant_id = $1::uuid
+  AND d.kind <> ''
+ORDER BY LOWER(d.kind) ASC
+`
+
+// ── filter options (the envelope's selectable sets) ──────────────────────────
+// Distinct-value reads that back the prazos/tasks agenda envelopes' filter chips.
+// Each is tenant-scoped (barrier 1) and mirrors the list's own predicates, so the
+// options reflect what the list can actually show. Empty values are skipped in Go.
+// Selectable ?kind values for the prazos agenda: the distinct kinds of the tenant's
+// prazos, ordered by name.
+func (q *Queries) ListPrazoKinds(ctx context.Context, tenantID uuid.UUID) ([]*string, error) {
+	rows, err := q.db.Query(ctx, listPrazoKinds, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*string
+	for rows.Next() {
+		var kind *string
+		if err := rows.Scan(&kind); err != nil {
+			return nil, err
+		}
+		items = append(items, kind)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPrazos = `-- name: ListPrazos :many
 SELECT d.id, d.kind, d.end_date,
        (d.end_date - CURRENT_DATE)::int AS days_left,
@@ -474,16 +551,20 @@ FROM deadline d
 JOIN court_record cr ON cr.id = d.court_record_id
 WHERE d.tenant_id = $1::uuid
   AND ($2::text = '' OR d.status = $2::text)
-  AND ($3::date IS NULL OR d.end_date >= $3::date)
-  AND ($4::date IS NULL OR d.end_date <= $4::date)
-  AND (d.end_date, d.id) > ($5::date, $6::uuid)
+  AND ($3::text = '' OR d.kind = $3::text)
+  AND ($4::text = '' OR cr.court = $4::text)
+  AND ($5::date IS NULL OR d.end_date >= $5::date)
+  AND ($6::date IS NULL OR d.end_date <= $6::date)
+  AND (d.end_date, d.id) > ($7::date, $8::uuid)
 ORDER BY d.end_date ASC, d.id ASC
-LIMIT $7
+LIMIT $9
 `
 
 type ListPrazosParams struct {
 	TenantID  uuid.UUID   `json:"tenant_id"`
 	Status    string      `json:"status"`
+	Kind      string      `json:"kind"`
+	Court     string      `json:"court"`
 	FromDate  pgtype.Date `json:"from_date"`
 	ToDate    pgtype.Date `json:"to_date"`
 	LastEnd   pgtype.Date `json:"last_end"`
@@ -510,13 +591,15 @@ type ListPrazosRow struct {
 
 // The global agenda (GET /v1/prazos): the tenant's prazos, soonest vencimento first,
 // with the process context (cnj_number/court) joined in. Optional filters: @status (” =
-// all) and an end_date window [@from_date, @to_date] (NULL = open bound). Ascending
-// keyset on (end_date, id); the first page passes the min sentinel ('0001-01-01',
-// zero-uuid).
+// all), @kind (” = all), @court (” = all), and an end_date window [@from_date, @to_date]
+// (NULL = open bound). Ascending keyset on (end_date, id); the first page passes the min
+// sentinel ('0001-01-01', zero-uuid).
 func (q *Queries) ListPrazos(ctx context.Context, arg ListPrazosParams) ([]ListPrazosRow, error) {
 	rows, err := q.db.Query(ctx, listPrazos,
 		arg.TenantID,
 		arg.Status,
+		arg.Kind,
+		arg.Court,
 		arg.FromDate,
 		arg.ToDate,
 		arg.LastEnd,
@@ -722,6 +805,44 @@ func (q *Queries) ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProc
 	return items, nil
 }
 
+const listTaskAssignees = `-- name: ListTaskAssignees :many
+SELECT DISTINCT t.assignee_user_id, COALESCE(au.name, '') AS name
+FROM task t
+LEFT JOIN app_user au ON au.id = t.assignee_user_id
+WHERE t.tenant_id = $1::uuid
+  AND t.assignee_user_id IS NOT NULL
+ORDER BY LOWER(COALESCE(au.name, '')) ASC
+`
+
+type ListTaskAssigneesRow struct {
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+	Name           string      `json:"name"`
+}
+
+// Selectable ?assignee values for the task agenda ("meus prazos"): the distinct
+// responsáveis of the tenant's tasks, deduped by id, ordered by name. The LEFT JOIN
+// app_user resolves a name when the id is a known user (the column is a bare uuid with
+// no FK); an unknown id yields an empty name — the FE labels it "ID sem nome".
+func (q *Queries) ListTaskAssignees(ctx context.Context, tenantID uuid.UUID) ([]ListTaskAssigneesRow, error) {
+	rows, err := q.db.Query(ctx, listTaskAssignees, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTaskAssigneesRow
+	for rows.Next() {
+		var i ListTaskAssigneesRow
+		if err := rows.Scan(&i.AssigneeUserID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTaskItems = `-- name: ListTaskItems :many
 SELECT id, task_id, title, position, done, done_at, created_at
 FROM task_item
@@ -790,17 +911,19 @@ LEFT JOIN LATERAL (
 WHERE t.tenant_id = $1::uuid
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
-  AND ($4::date IS NULL OR t.due_date >= $4::date)
-  AND ($5::date IS NULL OR t.due_date <= $5::date)
-  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($6::date, $7::uuid)
+  AND ($4::text = '' OR t.source = $4::text)
+  AND ($5::date IS NULL OR t.due_date >= $5::date)
+  AND ($6::date IS NULL OR t.due_date <= $6::date)
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($7::date, $8::uuid)
 ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
-LIMIT $8
+LIMIT $9
 `
 
 type ListTasksParams struct {
 	TenantID   uuid.UUID   `json:"tenant_id"`
 	Status     string      `json:"status"`
 	AssigneeID pgtype.UUID `json:"assignee_id"`
+	Source     string      `json:"source"`
 	FromDate   pgtype.Date `json:"from_date"`
 	ToDate     pgtype.Date `json:"to_date"`
 	LastDue    pgtype.Date `json:"last_due"`
@@ -827,15 +950,17 @@ type ListTasksRow struct {
 
 // The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 // first (undated last). Optional filters: @status (” = all), @assignee_id (NULL = all
-// assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]
-// (NULL = open bound). The window filters on the REAL due_date, so it naturally EXCLUDES
-// undated tasks (NULL >= date is NULL) — a dated-window query wants dated items. Ascending
-// (sort_due, id) keyset; the first page passes the min sentinel ('0001-01-01', zero-uuid).
+// assignees; = principal.UserID for "meus"), @source (” = all), and a due_date window
+// [@from_date, @to_date] (NULL = open bound). The window filters on the REAL due_date, so it
+// naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window query wants dated
+// items. Ascending (sort_due, id) keyset; the first page passes the min sentinel
+// ('0001-01-01', zero-uuid).
 func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error) {
 	rows, err := q.db.Query(ctx, listTasks,
 		arg.TenantID,
 		arg.Status,
 		arg.AssigneeID,
+		arg.Source,
 		arg.FromDate,
 		arg.ToDate,
 		arg.LastDue,

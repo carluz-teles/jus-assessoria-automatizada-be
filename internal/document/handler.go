@@ -294,5 +294,5 @@ func newDocumentsByProcessoPage(res DocumentsByProcessoResult, limit int) httpx.
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[DocumentView]{Data: items, Page: meta}
+	return httpx.Page[DocumentView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }

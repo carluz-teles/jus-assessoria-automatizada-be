@@ -72,8 +72,13 @@ const (
 // Lifecycle constants — a court_record's process-liveness flag. Only ACTIVE counts
 // against the plan ceiling; SUPERSEDED is the UNKNOWN placeholder after a DATAJUD
 // grade reveal re-pointed its children to the graded record (placeholder+merge).
+// SUSPENDED and ARCHIVED are the remaining lifecycle values the schema stores (the
+// KPI summary buckets read them); they are part of the closed set the processos
+// list filter exposes.
 const (
 	LifecycleActive     = "ACTIVE"
+	LifecycleSuspended  = "SUSPENDED"
+	LifecycleArchived   = "ARCHIVED"
 	LifecycleSuperseded = "SUPERSEDED"
 )
 

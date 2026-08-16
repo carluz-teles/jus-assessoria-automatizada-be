@@ -6,6 +6,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
 )
 
@@ -22,10 +23,29 @@ const (
 	maxUUID      = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 )
 
+// notificationsListParams is the inbox route's query-param allowlist
+// (docs/erd-backend.md §4e.3): a client typo or a param belonging to another route is
+// rejected with 400 instead of being silently ignored.
+var notificationsListParams = map[string]struct{}{
+	"type": {}, "unread": {}, "limit": {}, "cursor": {},
+}
+
+// isKnownNotificationType accepts only the closed type set the filter exposes — the
+// handler is the app-level CHECK on the ?type param (notification.type is a plain
+// text column; the closed set lives in the entity constants).
+func isKnownNotificationType(v string) bool {
+	switch v {
+	case TypeImportFinished, TypeNewAndamento, TypeDeadlineDueSoonAviso, TypeDeadlineMissedAviso, TypeTrialEndingSoonAviso:
+		return true
+	default:
+		return false
+	}
+}
+
 // reader is the narrow port the Handler drives from the read use case: the inbox
 // list, the unread badge, and the per-user read receipts.
 type reader interface {
-	List(ctx context.Context, q ListNotificationsQuery) ([]NotificationView, bool, error)
+	List(ctx context.Context, q ListNotificationsQuery) (NotificationsResult, error)
 	UnreadCount(ctx context.Context, tenantID, userID string) (int, error)
 	MarkRead(ctx context.Context, tenantID, userID, notificationID string) error
 	MarkAllRead(ctx context.Context, tenantID, userID string) error
@@ -85,10 +105,20 @@ func (h *Handler) Register(r fiber.Router) {
 
 // list handles GET /v1/notifications: the caller's in-app inbox, newest first, keyset
 // paginated (?limit, ?cursor); ?unread=true filters to the ones this user has not
-// read. tenant_id and user_id come from the principal.
+// read, ?type (a closed set) to one aviso type. A param outside the route's allowlist
+// or an unknown type is a client error → 400. tenant_id and user_id come from the
+// principal.
 func (h *Handler) list(c *fiber.Ctx) error {
+	if err := httpx.RejectUnknownParams(c, notificationsListParams); err != nil {
+		return httpx.WriteError(c, err)
+	}
 	p, _ := httpx.PrincipalFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	typ := c.Query("type")
+	if typ != "" && !isKnownNotificationType(typ) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid type filter"))
+	}
 
 	lastCreated, lastID := maxCreatedAt, maxUUID
 	if tok := c.Query("cursor"); tok != "" {
@@ -99,18 +129,19 @@ func (h *Handler) list(c *fiber.Ctx) error {
 		lastCreated, lastID = cur.LastSortValue, cur.LastID
 	}
 
-	items, hasMore, err := h.reader.List(c.UserContext(), ListNotificationsQuery{
+	res, err := h.reader.List(c.UserContext(), ListNotificationsQuery{
 		TenantID:    p.TenantID,
 		UserID:      p.UserID,
 		LastCreated: lastCreated,
 		LastID:      lastID,
 		UnreadOnly:  c.QueryBool("unread"),
+		Type:        typ,
 		Limit:       limit,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	return c.Status(fiber.StatusOK).JSON(newNotificationsPage(items, hasMore, limit))
+	return c.Status(fiber.StatusOK).JSON(newNotificationsPage(res, limit))
 }
 
 // unreadCount handles GET /v1/notifications/unread-count: the badge count of avisos
@@ -146,13 +177,15 @@ func (h *Handler) markAllRead(c *fiber.Ctx) error {
 }
 
 // newNotificationsPage wraps the inbox read model in the cursor envelope; the next
-// cursor keys off the last row's (created_at, id).
-func newNotificationsPage(items []NotificationView, hasMore bool, limit int) httpx.Page[NotificationView] {
+// cursor keys off the last row's (created_at, id), and the filters block carries the
+// selectable type set.
+func newNotificationsPage(res NotificationsResult, limit int) httpx.Page[NotificationView] {
+	items := res.Items
 	if items == nil {
 		items = []NotificationView{}
 	}
 	meta := httpx.PageMeta{Limit: limit}
-	if hasMore && len(items) > 0 {
+	if res.HasMore && len(items) > 0 {
 		last := items[len(items)-1]
 		tok := httpx.EncodeCursor(httpx.Cursor{
 			LastID:        last.ID,
@@ -160,5 +193,5 @@ func newNotificationsPage(items []NotificationView, hasMore bool, limit int) htt
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[NotificationView]{Data: items, Page: meta}
+	return httpx.Page[NotificationView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }

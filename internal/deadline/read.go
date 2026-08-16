@@ -3,6 +3,8 @@ package deadline
 import (
 	"context"
 	"time"
+
+	"github.com/jusassessoria/platform/lib/httpx"
 )
 
 // read.go is the slice's read side: the prazos screen reads that bypass the write
@@ -165,13 +167,14 @@ type TasksByProcessoQuery struct {
 }
 
 // TasksQuery carries the agenda's ascending keyset cursor plus its optional filters: Status ("" =
-// all), Assignee ("" = all assignees; = principal.UserID for "meus"), and a due_date window
-// [From, To] (each "" = open bound). The dates/assignee are the wire layout; the handler
-// validates them, the repo parses. LastDue is the coalesced sort value (see TasksByProcessoQuery).
+// all), Assignee ("" = all assignees; = principal.UserID for "meus"), Source ("" = all), and a
+// due_date window [From, To] (each "" = open bound). The dates/assignee are the wire layout; the
+// handler validates them, the repo parses. LastDue is the coalesced sort value (see TasksByProcessoQuery).
 type TasksQuery struct {
 	TenantID string
 	Status   string
 	Assignee string
+	Source   string
 	From     string
 	To       string
 	LastDue  string
@@ -179,21 +182,38 @@ type TasksQuery struct {
 	Limit    int
 }
 
+// Filtered reports whether any agenda filter (Status/Assignee/Source/window) is active —
+// the repo uses it to decide when the "X de Y" counter needs the filtered COUNT.
+func (q TasksQuery) Filtered() bool {
+	return q.Status != "" || q.Assignee != "" || q.Source != "" || q.From != "" || q.To != ""
+}
+
+// AssigneeOption is one selectable ?assignee: the responsável's name (the chip label) and user
+// id (the query-param value). Read-model DTO, off the write path.
+type AssigneeOption struct {
+	Name string
+	ID   string
+}
+
 // TasksByProcessoResult is a page of a process's tasks plus its total for the "X de Y" counter.
 // There is no filter on the tab, so a single Total carries both sides (mirrors PrazosByProcessoResult).
+// Filters is always empty on the tab (no chips).
 type TasksByProcessoResult struct {
 	Items   []TaskView
 	HasMore bool
 	Total   int64
+	Filters httpx.Filters
 }
 
 // TasksResult is a page of the task agenda plus the two totals for "X de Y": TotalCount is the
-// current context (filtered by Status/Assignee/window), Total the tenant-wide count.
+// current context (filtered by Status/Assignee/Source/window), Total the tenant-wide count.
+// Filters is the selectable-options block the envelope renders as chips.
 type TasksResult struct {
 	Items      []TaskView
 	HasMore    bool
 	TotalCount int64
 	Total      int64
+	Filters    httpx.Filters
 }
 
 // PrazosByProcessoQuery carries the ascending keyset cursor (the last row's end_date
@@ -208,11 +228,14 @@ type PrazosByProcessoQuery struct {
 }
 
 // PrazosQuery carries the agenda's ascending keyset cursor plus its optional filters:
-// Status ("" = all) and an end_date window [From, To] (each "" = open bound). The
-// dates are the wire layout (2006-01-02); the handler validates them, the repo parses.
+// Status ("" = all), Kind ("" = all), Court ("" = all) and an end_date window [From, To]
+// (each "" = open bound). The dates are the wire layout (2006-01-02); the handler
+// validates them, the repo parses. Kind/Court are free text from the envelope's options.
 type PrazosQuery struct {
 	TenantID string
 	Status   string
+	Kind     string
+	Court    string
 	From     string
 	To       string
 	LastEnd  string
@@ -220,21 +243,31 @@ type PrazosQuery struct {
 	Limit    int
 }
 
+// Filtered reports whether any agenda filter (Status/Kind/Court/window) is active — the
+// repo uses it to decide when the "X de Y" counter needs the filtered COUNT.
+func (q PrazosQuery) Filtered() bool {
+	return q.Status != "" || q.Kind != "" || q.Court != "" || q.From != "" || q.To != ""
+}
+
 // PrazosByProcessoResult is a page of a process's prazos plus its total for the "X de
 // Y" counter. There is no filter on the tab, so a single Total carries both sides.
+// Filters is always empty on the tab (no chips).
 type PrazosByProcessoResult struct {
 	Items   []PrazoView
 	HasMore bool
 	Total   int64
+	Filters httpx.Filters
 }
 
 // PrazosResult is a page of the agenda plus the two totals for "X de Y": TotalCount is
-// the current context (filtered by Status/window), Total the tenant-wide count.
+// the current context (filtered by Status/Kind/Court/window), Total the tenant-wide count.
+// Filters is the selectable-options block the envelope renders as chips.
 type PrazosResult struct {
 	Items      []AgendaPrazoView
 	HasMore    bool
 	TotalCount int64
 	Total      int64
+	Filters    httpx.Filters
 }
 
 // TaskItemView is one checklist item on the task detail screen (GET /v1/tasks/:id): the
@@ -327,6 +360,11 @@ type readRepo interface {
 	PrazosSummary(ctx context.Context, tenantID string) (PrazosSummary, error)
 	// TasksSummary reads the tenant's tasks KPI counts (single object). No pagination.
 	TasksSummary(ctx context.Context, tenantID string) (TasksSummary, error)
+	// Filter options for the agenda envelopes — the distinct-value reads that back the
+	// chips. Each is tenant-scoped and mirrors the list's own predicates.
+	ListPrazoKinds(ctx context.Context, tenantID string) ([]string, error)
+	ListPrazoCourts(ctx context.Context, tenantID string) ([]string, error)
+	ListTaskAssignees(ctx context.Context, tenantID string) ([]AssigneeOption, error)
 }
 
 // ReadUseCase serves the prazos screen reads. It is a pagination policy over readRepo:
@@ -377,12 +415,14 @@ func (uc *ReadUseCase) PrazosByProcesso(ctx context.Context, q PrazosByProcessoQ
 	if err != nil {
 		return PrazosByProcessoResult{}, err
 	}
-	return PrazosByProcessoResult{Items: rows, HasMore: hasMore, Total: total}, nil
+	return PrazosByProcessoResult{Items: rows, HasMore: hasMore, Total: total, Filters: httpx.Filters{}}, nil
 }
 
 // Prazos returns up to q.Limit agenda prazos (soonest first), whether a further page
-// exists, and the "X de Y" totals (filtered by Status/window, plus the tenant-wide
-// total). Same over-fetch policy as PrazosByProcesso.
+// exists, and the "X de Y" totals (filtered by Status/Kind/Court/window, plus the
+// tenant-wide total). Same over-fetch policy as PrazosByProcesso. The envelope's filter
+// options are assembled alongside (the distinct-value reads) so the FE renders the chips
+// without a second request.
 func (uc *ReadUseCase) Prazos(ctx context.Context, q PrazosQuery) (PrazosResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
@@ -398,7 +438,28 @@ func (uc *ReadUseCase) Prazos(ctx context.Context, q PrazosQuery) (PrazosResult,
 	if err != nil {
 		return PrazosResult{}, err
 	}
-	return PrazosResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+	filters, err := uc.prazosFilters(ctx, q.TenantID)
+	if err != nil {
+		return PrazosResult{}, err
+	}
+	return PrazosResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total, Filters: filters}, nil
+}
+
+// prazosFilters assembles the agenda's selectable options: the free-text kind/court
+// options from the distinct-value reads. Each key is omitted when it has no options.
+func (uc *ReadUseCase) prazosFilters(ctx context.Context, tenantID string) (httpx.Filters, error) {
+	kinds, err := uc.repo.ListPrazoKinds(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	courts, err := uc.repo.ListPrazoCourts(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	f := httpx.Filters{}
+	f.Set("kind", httpx.OptionsFromStrings(kinds)...)
+	f.Set("court", httpx.OptionsFromStrings(courts)...)
+	return f, nil
 }
 
 // PrazosByIntimacao returns the prazo derived from one intimação (the F2 lookup, GET
@@ -412,7 +473,7 @@ func (uc *ReadUseCase) PrazosByIntimacao(ctx context.Context, tenantID, intimati
 		return PrazosResult{}, err
 	}
 	n := int64(len(rows))
-	return PrazosResult{Items: rows, HasMore: false, TotalCount: n, Total: n}, nil
+	return PrazosResult{Items: rows, HasMore: false, TotalCount: n, Total: n, Filters: httpx.Filters{}}, nil
 }
 
 // Prazo returns one prazo's audit detail, or the repo's typed ErrDeadlineNotFound (→
@@ -448,12 +509,14 @@ func (uc *ReadUseCase) TasksByProcesso(ctx context.Context, q TasksByProcessoQue
 		return TasksByProcessoResult{}, err
 	}
 	uc.decorateDisplayStatus(rows)
-	return TasksByProcessoResult{Items: rows, HasMore: hasMore, Total: total}, nil
+	return TasksByProcessoResult{Items: rows, HasMore: hasMore, Total: total, Filters: httpx.Filters{}}, nil
 }
 
 // Tasks returns up to q.Limit agenda tasks (soonest due first, undated last), whether a further
-// page exists, and the "X de Y" totals (filtered by Status/Assignee/window, plus the tenant-wide
-// total). Same over-fetch policy as Prazos.
+// page exists, and the "X de Y" totals (filtered by Status/Assignee/Source/window, plus the
+// tenant-wide total). Same over-fetch policy as Prazos. The envelope's filter options are
+// assembled alongside (the distinct-value reads) so the FE renders the chips without a second
+// request.
 func (uc *ReadUseCase) Tasks(ctx context.Context, q TasksQuery) (TasksResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
@@ -470,7 +533,38 @@ func (uc *ReadUseCase) Tasks(ctx context.Context, q TasksQuery) (TasksResult, er
 		return TasksResult{}, err
 	}
 	uc.decorateDisplayStatus(rows)
-	return TasksResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+	filters, err := uc.tasksFilters(ctx, q.TenantID)
+	if err != nil {
+		return TasksResult{}, err
+	}
+	return TasksResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total, Filters: filters}, nil
+}
+
+// tasksFilters assembles the task agenda's selectable options: the closed source set from the
+// entity constants and the free-text assignee options (label==name / value==id) from the
+// distinct-value read. Each key is omitted when it has no options.
+func (uc *ReadUseCase) tasksFilters(ctx context.Context, tenantID string) (httpx.Filters, error) {
+	assignees, err := uc.repo.ListTaskAssignees(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	f := httpx.Filters{}
+	f.SetEnum("source", string(SourceAI), string(SourceRule), string(SourceManual))
+	f.Set("assignee", assigneeOptions(assignees)...)
+	return f, nil
+}
+
+// assigneeOptions maps the repo's {name, id} options to the envelope's label==name /
+// value==id filter options, skipping an empty id (never selectable).
+func assigneeOptions(assignees []AssigneeOption) []httpx.FilterOption {
+	opts := make([]httpx.FilterOption, 0, len(assignees))
+	for _, a := range assignees {
+		if a.ID == "" {
+			continue
+		}
+		opts = append(opts, httpx.FilterOption{Label: a.Name, Value: a.ID})
+	}
+	return opts
 }
 
 // decorateDisplayStatus fills each row's DERIVED display_status from its (status, done-item

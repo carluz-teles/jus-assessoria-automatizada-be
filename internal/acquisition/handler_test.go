@@ -310,6 +310,10 @@ type recordingReader struct {
 	gotAndQuery  AndamentosQuery
 	intiRes      IntimacoesByProcessoResult
 	gotIntiQuery IntimacoesByProcessoQuery
+	// GET /v1/intimacoes — capture the forwarded query and return a canned result so
+	// the top-level envelope (totals + filters options) can be asserted.
+	intiListRes  IntimacoesResult
+	gotIntiListQ IntimacoesQuery
 	// GET /v1/intimacoes/:id — capture the forwarded (tenant, id) and return a canned
 	// detail view or a typed error (a nil intiOneErr means the view is returned).
 	intiOneRes    IntimacaoDetailView
@@ -341,7 +345,7 @@ func (r *recordingReader) Processo(_ context.Context, tenantID, id string) (Proc
 	return r.procOneRes, r.procOneErr
 }
 func (r *recordingReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
-	return IntimacoesResult{}, nil
+	return r.intiListRes, nil
 }
 func (r *recordingReader) Intimacao(_ context.Context, tenantID, id string) (IntimacaoDetailView, error) {
 	r.gotIntiOneTID, r.gotIntiOneID = tenantID, id
@@ -457,6 +461,120 @@ func TestHandler_ListProcessos_EnvelopeHasTotals(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("envelope missing %s\ngot: %s", want, body)
 		}
+	}
+}
+
+// The envelope's filters block is always present and never null: a zero/empty result
+// must serialize filters as {} (the FE renders an empty chip row, not a blank block).
+func TestHandler_ListProcessos_EnvelopeFiltersAlwaysObject(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{res: ProcessosResult{}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if !strings.Contains(body, `"filters":{}`) {
+		t.Errorf("envelope filters not an empty object\ngot: %s", body)
+	}
+}
+
+// GET /v1/intimacoes: the top-level envelope must carry the filters block as a
+// non-null object with the type/user_status/court options the use case assembled —
+// the regression guard for newIntimacoesPage serializing filters as null.
+func TestHandler_ListIntimacoes_EnvelopeFiltersWithOptions(t *testing.T) {
+	t.Parallel()
+
+	f := httpx.Filters{}
+	f.SetEnum("type", IntimationTypeIntimacao, IntimationTypeCitacao)
+	f.SetEnum("user_status", IntimationUserStatusPending, IntimationUserStatusResolved)
+	f.Set("court", httpx.OptionsFromStrings([]string{"TJSP"})...)
+	rd := &recordingReader{intiListRes: IntimacoesResult{Filters: f}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	var env httpx.Page[IntimacaoView]
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatalf("decode envelope: %v; body=%s", err, body)
+	}
+	if env.Filters == nil {
+		t.Fatal("filters is null, want an object with the type/user_status/court options")
+	}
+	if got := len(env.Filters["type"]); got != 2 {
+		t.Errorf("filters.type = %d options, want 2", got)
+	} else if env.Filters["type"][0].Value != IntimationTypeIntimacao || env.Filters["type"][0].Label != IntimationTypeIntimacao {
+		t.Errorf("filters.type[0] = %+v, want label==value %q", env.Filters["type"][0], IntimationTypeIntimacao)
+	}
+	if got := len(env.Filters["user_status"]); got != 2 {
+		t.Errorf("filters.user_status = %d options, want 2", got)
+	}
+	if got := len(env.Filters["court"]); got != 1 || env.Filters["court"][0].Value != "TJSP" {
+		t.Errorf("filters.court = %+v, want the TJSP option", env.Filters["court"])
+	}
+}
+
+// ?court/?lifecycle/?degree/?assignee flow into the ProcessosQuery the handler sends
+// to the read port — the same param set the envelope exposes as chips.
+func TestHandler_ListProcessos_ForwardsFilters(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet,
+		"/v1/processos?court=TJSP&lifecycle=SUSPENDED&degree=PRIMEIRO_GRAU&assignee=018f0000-0000-7000-8000-000000000abc",
+		"", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotQuery.Court != "TJSP" || rd.gotQuery.Degree != "PRIMEIRO_GRAU" {
+		t.Errorf("free-text filters = (%q, %q), want (TJSP, PRIMEIRO_GRAU)", rd.gotQuery.Court, rd.gotQuery.Degree)
+	}
+	if rd.gotQuery.Lifecycle != "SUSPENDED" {
+		t.Errorf("Lifecycle = %q, want SUSPENDED", rd.gotQuery.Lifecycle)
+	}
+	if rd.gotQuery.Assignee != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("Assignee = %q, want the forwarded id", rd.gotQuery.Assignee)
+	}
+}
+
+// A param outside the route's allowlist is a client error → 400, never silently
+// ignored (docs/erd-backend.md §4e.3).
+func TestHandler_ListProcessos_UnknownParam_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/processos?type=CITACAO", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a foreign param", status)
+	}
+}
+
+// ?lifecycle is a closed set: a value outside it (a typo, or a lifecycle that was
+// removed) is a client error → 400, not a silently-empty page.
+func TestHandler_ListProcessos_InvalidLifecycle_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/processos?lifecycle=PAUSED", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an unknown lifecycle", status)
+	}
+}
+
+// ?assignee must be a well-formed user id — a garbage value is a client error → 400.
+func TestHandler_ListProcessos_InvalidAssignee_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/processos?assignee=not-a-uuid", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a malformed assignee", status)
 	}
 }
 

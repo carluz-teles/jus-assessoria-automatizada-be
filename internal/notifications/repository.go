@@ -275,6 +275,7 @@ func (r *pgRepository) ListNotifications(ctx context.Context, q ListNotification
 		Limit:       int32(q.Limit),
 		UserID:      uid,
 		UnreadOnly:  q.UnreadOnly,
+		Type:        q.Type,
 		LastCreated: pgtype.Timestamptz{Time: lastCreated, Valid: true},
 		LastID:      lastID,
 	})

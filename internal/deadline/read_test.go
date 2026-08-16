@@ -3,6 +3,7 @@ package deadline
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,6 +56,10 @@ type recordingReadRepo struct {
 	prazosSummary  PrazosSummary
 	tasksSummary   TasksSummary
 	lastSummaryTID string
+	// Filter-option reads — canned distinct values the use case turns into chips.
+	prazoKinds    []string
+	prazoCourts   []string
+	taskAssignees []AssigneeOption
 }
 
 func (r *recordingReadRepo) ListPrazosByProcesso(_ context.Context, q PrazosByProcessoQuery) ([]PrazoView, error) {
@@ -131,6 +136,112 @@ func (r *recordingReadRepo) PrazosSummary(_ context.Context, tenantID string) (P
 func (r *recordingReadRepo) TasksSummary(_ context.Context, tenantID string) (TasksSummary, error) {
 	r.lastSummaryTID = tenantID
 	return r.tasksSummary, nil
+}
+
+func (r *recordingReadRepo) ListPrazoKinds(context.Context, string) ([]string, error) {
+	return r.prazoKinds, nil
+}
+
+func (r *recordingReadRepo) ListPrazoCourts(context.Context, string) ([]string, error) {
+	return r.prazoCourts, nil
+}
+
+func (r *recordingReadRepo) ListTaskAssignees(context.Context, string) ([]AssigneeOption, error) {
+	return r.taskAssignees, nil
+}
+
+// The prazos agenda envelope's filter options come from the distinct-value reads: kind
+// and court are label==value options (the free-text filters), each key omitted when the
+// read yields nothing.
+func TestReadUseCase_Prazos_AssemblesFilters(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{
+		prazoKinds:  []string{"Aguardando resposta", "Manifestação"},
+		prazoCourts: []string{"TJSP"},
+	}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Prazos(context.Background(), PrazosQuery{TenantID: "t-1", Limit: 20})
+	if err != nil {
+		t.Fatalf("Prazos: %v", err)
+	}
+
+	kinds := res.Filters["kind"]
+	if len(kinds) != 2 || kinds[0].Label != "Aguardando resposta" || kinds[0].Value != "Aguardando resposta" {
+		t.Errorf("kind options = %+v, want label==value", kinds)
+	}
+	courts := res.Filters["court"]
+	if len(courts) != 1 || courts[0].Label != "TJSP" || courts[0].Value != "TJSP" {
+		t.Errorf("court options = %+v, want label==value TJSP", courts)
+	}
+	if _, ok := res.Filters["status"]; ok {
+		t.Error("status key present — the agenda does not render a status chip row")
+	}
+}
+
+// The task agenda envelope's filter options: source is the closed enum set (canonical
+// order) and assignee is label==name/value==id. An assignee without an id is never
+// selectable; a key with no options is omitted.
+func TestReadUseCase_Tasks_AssemblesFilters(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{
+		taskAssignees: []AssigneeOption{{Name: "Ana", ID: "u-1"}, {Name: "Sem Id", ID: ""}},
+	}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Tasks(context.Background(), TasksQuery{TenantID: "t-1", Limit: 20})
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+
+	source := res.Filters["source"]
+	wantSource := []string{string(SourceAI), string(SourceRule), string(SourceManual)}
+	if len(source) != len(wantSource) {
+		t.Fatalf("source options = %+v, want %v", source, wantSource)
+	}
+	for i, want := range wantSource {
+		if source[i].Label != want || source[i].Value != want {
+			t.Errorf("source[%d] = %+v, want label==value %q", i, source[i], want)
+		}
+	}
+	assignees := res.Filters["assignee"]
+	if len(assignees) != 1 || assignees[0].Label != "Ana" || assignees[0].Value != "u-1" {
+		t.Errorf("assignee options = %+v, want only the id-bearing Ana", assignees)
+	}
+}
+
+// The agenda queries are "filtered" once any filter is set — the counter then needs the
+// filtered COUNT.
+func TestAgendaQueries_Filtered(t *testing.T) {
+	t.Parallel()
+
+	for name, q := range map[string]interface{ Filtered() bool }{
+		"prazos none":    PrazosQuery{},
+		"prazos kind":    PrazosQuery{Kind: "Aguardando"},
+		"prazos court":   PrazosQuery{Court: "TJSP"},
+		"tasks none":     TasksQuery{},
+		"tasks source":   TasksQuery{Source: "AI"},
+		"tasks assignee": TasksQuery{Assignee: "u-1"},
+		"tasks window":   TasksQuery{From: "2025-01-01"},
+		"prazos window":  PrazosQuery{To: "2025-12-31"},
+		"prazos status":  PrazosQuery{Status: "OPEN"},
+		"tasks status":   TasksQuery{Status: "OPEN"},
+	} {
+		name, q := name, q
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// A query struct with a filter must report Filtered; the all-empty zero
+			// value must not. Both directions are asserted explicitly so a wrong
+			// implementation fails loudly instead of passing the "return" skip.
+			got := q.Filtered()
+			want := !strings.Contains(name, "none")
+			if got != want {
+				t.Errorf("%s: Filtered() = %v, want %v", name, got, want)
+			}
+		})
+	}
 }
 
 // PrazosByProcesso forwards the process (court_record) and keyset cursor to the repo,

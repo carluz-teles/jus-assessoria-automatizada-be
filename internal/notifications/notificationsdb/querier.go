@@ -47,9 +47,10 @@ type Querier interface {
 	// The in-app inbox for ONE user: the avisos visible to them — tenant-level
 	// (recipient_user_id IS NULL) OR addressed to them — newest first, keyset-paginated
 	// on (created_at, id) descending. `read` is per-user: EXISTS a receipt for THIS user
-	// in notification_read. @unread_only filters to the ones this user has not read. The
-	// caller passes the max sentinel cursor ('9999-…', max-uuid) for the first page, so
-	// there is no conditional WHERE. tenant_id ($1) is barrier 1; RLS is barrier 2.
+	// in notification_read. @unread_only filters to the ones this user has not read;
+	// @type ('' = all) filters to one closed-set type. The caller passes the max sentinel
+	// cursor ('9999-…', max-uuid) for the first page, so there is no conditional WHERE.
+	// tenant_id ($1) is barrier 1; RLS is barrier 2.
 	ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error)
 	// Record read receipts for every aviso visible to the user that they have not read
 	// yet, in the caller's tx. Idempotent: a re-run inserts nothing (the NOT EXISTS

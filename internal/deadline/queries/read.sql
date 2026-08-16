@@ -35,9 +35,9 @@ WHERE d.court_record_id = @court_record_id::uuid
 -- name: ListPrazos :many
 -- The global agenda (GET /v1/prazos): the tenant's prazos, soonest vencimento first,
 -- with the process context (cnj_number/court) joined in. Optional filters: @status ('' =
--- all) and an end_date window [@from_date, @to_date] (NULL = open bound). Ascending
--- keyset on (end_date, id); the first page passes the min sentinel ('0001-01-01',
--- zero-uuid).
+-- all), @kind ('' = all), @court ('' = all), and an end_date window [@from_date, @to_date]
+-- (NULL = open bound). Ascending keyset on (end_date, id); the first page passes the min
+-- sentinel ('0001-01-01', zero-uuid).
 SELECT d.id, d.kind, d.end_date,
        (d.end_date - CURRENT_DATE)::int AS days_left,
        d.counting, d.doubled, d.doubled_reason, d.status,
@@ -48,6 +48,8 @@ FROM deadline d
 JOIN court_record cr ON cr.id = d.court_record_id
 WHERE d.tenant_id = @tenant_id::uuid
   AND (@status::text = '' OR d.status = @status::text)
+  AND (@kind::text = '' OR d.kind = @kind::text)
+  AND (@court::text = '' OR cr.court = @court::text)
   AND (@from_date::date IS NULL OR d.end_date >= @from_date::date)
   AND (@to_date::date IS NULL OR d.end_date <= @to_date::date)
   AND (d.end_date, d.id) > (@last_end::date, @last_id::uuid)
@@ -76,11 +78,15 @@ ORDER BY d.end_date ASC, d.id ASC;
 
 -- name: CountPrazos :one
 -- The filtered "X" of the agenda's "X de Y" counter: how many prazos match the active
--- @status / end_date window. Called only when a filter is present; the unfiltered "Y"
--- reuses CountPrazosByTenant.
+-- @status / @kind / @court / end_date window. Called only when a filter is present; the
+-- unfiltered "Y" reuses CountPrazosByTenant. The court filter needs the same court_record
+-- join as the list, so it never multiplies rows (the join key is the record id).
 SELECT count(*) FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
 WHERE d.tenant_id = @tenant_id::uuid
   AND (@status::text = '' OR d.status = @status::text)
+  AND (@kind::text = '' OR d.kind = @kind::text)
+  AND (@court::text = '' OR cr.court = @court::text)
   AND (@from_date::date IS NULL OR d.end_date >= @from_date::date)
   AND (@to_date::date IS NULL OR d.end_date <= @to_date::date);
 
@@ -171,10 +177,11 @@ WHERE t.court_record_id = @court_record_id::uuid
 -- name: ListTasks :many
 -- The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 -- first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
--- assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]
--- (NULL = open bound). The window filters on the REAL due_date, so it naturally EXCLUDES
--- undated tasks (NULL >= date is NULL) — a dated-window query wants dated items. Ascending
--- (sort_due, id) keyset; the first page passes the min sentinel ('0001-01-01', zero-uuid).
+-- assignees; = principal.UserID for "meus"), @source ('' = all), and a due_date window
+-- [@from_date, @to_date] (NULL = open bound). The window filters on the REAL due_date, so it
+-- naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window query wants dated
+-- items. Ascending (sort_due, id) keyset; the first page passes the min sentinel
+-- ('0001-01-01', zero-uuid).
 SELECT t.id, t.title, t.description, t.kind, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
@@ -190,6 +197,7 @@ LEFT JOIN LATERAL (
 WHERE t.tenant_id = @tenant_id::uuid
   AND (@status::text = '' OR t.status = @status::text)
   AND (sqlc.narg('assignee_id')::uuid IS NULL OR t.assignee_user_id = sqlc.narg('assignee_id')::uuid)
+  AND (@source::text = '' OR t.source = @source::text)
   AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
   AND (@to_date::date IS NULL OR t.due_date <= @to_date::date)
   AND (COALESCE(t.due_date, '9999-12-31'), t.id) > (@last_due::date, @last_id::uuid)
@@ -198,12 +206,13 @@ LIMIT @page_limit;
 
 -- name: CountTasks :one
 -- The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
--- @status / @assignee_id / window. Called only when a filter is present; the unfiltered "Y"
--- reuses CountTasksByTenant.
+-- @status / @assignee_id / @source / window. Called only when a filter is present; the
+-- unfiltered "Y" reuses CountTasksByTenant.
 SELECT count(*) FROM task t
 WHERE t.tenant_id = @tenant_id::uuid
   AND (@status::text = '' OR t.status = @status::text)
   AND (sqlc.narg('assignee_id')::uuid IS NULL OR t.assignee_user_id = sqlc.narg('assignee_id')::uuid)
+  AND (@source::text = '' OR t.source = @source::text)
   AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
   AND (@to_date::date IS NULL OR t.due_date <= @to_date::date);
 
@@ -306,3 +315,39 @@ LEFT JOIN LATERAL (
   WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
 ) p ON true
 WHERE t.tenant_id = @tenant_id::uuid;
+
+-- ── filter options (the envelope's selectable sets) ──────────────────────────
+-- Distinct-value reads that back the prazos/tasks agenda envelopes' filter chips.
+-- Each is tenant-scoped (barrier 1) and mirrors the list's own predicates, so the
+-- options reflect what the list can actually show. Empty values are skipped in Go.
+
+-- name: ListPrazoKinds :many
+-- Selectable ?kind values for the prazos agenda: the distinct kinds of the tenant's
+-- prazos, ordered by name.
+SELECT DISTINCT d.kind
+FROM deadline d
+WHERE d.tenant_id = @tenant_id::uuid
+  AND d.kind <> ''
+ORDER BY LOWER(d.kind) ASC;
+
+-- name: ListPrazoCourts :many
+-- Selectable ?court values for the prazos agenda: the distinct courts of the tenant's
+-- intimated court records (the same join the list uses), ordered by name.
+SELECT DISTINCT cr.court
+FROM deadline d
+JOIN court_record cr ON cr.id = d.court_record_id
+WHERE d.tenant_id = @tenant_id::uuid
+  AND cr.court <> ''
+ORDER BY LOWER(cr.court) ASC;
+
+-- name: ListTaskAssignees :many
+-- Selectable ?assignee values for the task agenda ("meus prazos"): the distinct
+-- responsáveis of the tenant's tasks, deduped by id, ordered by name. The LEFT JOIN
+-- app_user resolves a name when the id is a known user (the column is a bare uuid with
+-- no FK); an unknown id yields an empty name — the FE labels it "ID sem nome".
+SELECT DISTINCT t.assignee_user_id, COALESCE(au.name, '') AS name
+FROM task t
+LEFT JOIN app_user au ON au.id = t.assignee_user_id
+WHERE t.tenant_id = @tenant_id::uuid
+  AND t.assignee_user_id IS NOT NULL
+ORDER BY LOWER(COALESCE(au.name, '')) ASC;

@@ -3,6 +3,8 @@ package document
 import (
 	"context"
 	"time"
+
+	"github.com/jusassessoria/platform/lib/httpx"
 )
 
 // read.go is the slice's read side: the Documentos screen reads that bypass the write use case
@@ -46,11 +48,12 @@ type DocumentsByProcessoQuery struct {
 
 // DocumentsByProcessoResult is a page of a process's documents plus its total for the "X de Y"
 // counter. There is no filter on the aba, so a single Total carries both sides (mirrors the
-// deadline Prazos tab).
+// deadline Prazos tab); Filters is the envelope's chips block, always an empty object here.
 type DocumentsByProcessoResult struct {
 	Items   []DocumentView
 	HasMore bool
 	Total   int64
+	Filters httpx.Filters
 }
 
 // readRepo is the narrow read port the ReadUseCase drives — the keyset list read, its counter,
@@ -93,7 +96,7 @@ func (uc *ReadUseCase) DocumentsByProcesso(ctx context.Context, q DocumentsByPro
 	if err != nil {
 		return DocumentsByProcessoResult{}, err
 	}
-	return DocumentsByProcessoResult{Items: rows, HasMore: hasMore, Total: total}, nil
+	return DocumentsByProcessoResult{Items: rows, HasMore: hasMore, Total: total, Filters: httpx.Filters{}}, nil
 }
 
 // Document returns one document's detail, or the repo's typed ErrDocumentNotFound (→ 404) when

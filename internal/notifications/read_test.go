@@ -47,7 +47,7 @@ func (m *mockReadRepo) MarkAllRead(ctx context.Context, tx database.Tx, tenantID
 
 // AC9(a): List over-fetches one row so it can report hasMore without a COUNT — a
 // full page (>limit rows) trims to limit and signals a next page; a short/exact page
-// is the last one.
+// is the last one. The envelope's type options are always present (the closed set).
 func TestReadUseCase_List(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -72,18 +72,28 @@ func TestReadUseCase_List(t *testing.T) {
 			}
 			uc := NewReadUseCase(repo, &fakeUOW{})
 
-			items, hasMore, err := uc.List(context.Background(), ListNotificationsQuery{Limit: tt.limit})
+			res, err := uc.List(context.Background(), ListNotificationsQuery{Limit: tt.limit})
 			if err != nil {
 				t.Fatalf("List: %v", err)
 			}
 			if gotLimit != tt.limit+1 {
 				t.Errorf("repo limit = %d, want %d (over-fetch by one)", gotLimit, tt.limit+1)
 			}
-			if len(items) != tt.wantItems {
-				t.Errorf("items = %d, want %d", len(items), tt.wantItems)
+			if len(res.Items) != tt.wantItems {
+				t.Errorf("items = %d, want %d", len(res.Items), tt.wantItems)
 			}
-			if hasMore != tt.wantHasMore {
-				t.Errorf("hasMore = %v, want %v", hasMore, tt.wantHasMore)
+			if res.HasMore != tt.wantHasMore {
+				t.Errorf("hasMore = %v, want %v", res.HasMore, tt.wantHasMore)
+			}
+			wantTypes := []string{TypeImportFinished, TypeNewAndamento, TypeDeadlineDueSoonAviso, TypeDeadlineMissedAviso, TypeTrialEndingSoonAviso}
+			types := res.Filters["type"]
+			if len(types) != len(wantTypes) {
+				t.Fatalf("type options = %+v, want %v", types, wantTypes)
+			}
+			for i, want := range wantTypes {
+				if types[i].Label != want || types[i].Value != want {
+					t.Errorf("types[%d] = %+v, want label==value %q", i, types[i], want)
+				}
 			}
 		})
 	}

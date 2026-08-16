@@ -8,7 +8,10 @@
 -- The consolidated processes screen: the tenant's live court records (SUPERSEDED
 -- placeholders drop out), each with its most recent andamento for the "last
 -- movement" column. Ordered by cnj_number then id (ascending keyset): the first
--- page passes ('', zero-uuid).
+-- page passes ('', zero-uuid). Optional filters — @court / @degree (free text from
+-- the DISTINCT options), @lifecycle (a closed set; '' keeps the default ACTIVE
+-- context), @assignee_id (NULL = any; the case-level responsável) — are additive
+-- ANDs, so an absent filter matches everything.
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
        cr.claim_value,
@@ -28,8 +31,12 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) m ON true
 WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
   AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%' ESCAPE '\')
+  AND (@court::text = '' OR cr.court = @court::text)
+  AND (@degree::text = '' OR cr.degree = @degree::text)
+  AND (@lifecycle::text = '' OR cr.lifecycle = @lifecycle::text)
+  AND (@lifecycle::text <> '' OR cr.lifecycle = 'ACTIVE')
+  AND (sqlc.narg('assignee_id')::uuid IS NULL OR cc.assigned_user_id = sqlc.narg('assignee_id')::uuid)
   AND (cr.cnj_number, cr.id) > (@last_cnj::text, @last_id::uuid)
 ORDER BY cr.cnj_number, cr.id
 LIMIT $2;
@@ -64,7 +71,8 @@ WHERE cr.id = $1 AND cr.tenant_id = $2;
 -- The intimações inbox: the tenant's intimations, newest availability first, with
 -- the court record's number/court/degree joined in. Descending keyset on
 -- (made_available_at, id); the first page passes the max sentinel
--- ('9999-12-31', max-uuid).
+-- ('9999-12-31', max-uuid). Optional filters — @court (free text from the DISTINCT
+-- options), @type / @user_status (closed sets) — are additive ANDs.
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree
@@ -72,6 +80,9 @@ FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
   AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%' ESCAPE '\')
+  AND (@type::text = '' OR i.type = @type::text)
+  AND (@user_status::text = '' OR i.user_status = @user_status::text)
+  AND (@court::text = '' OR cr.court = @court::text)
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
@@ -95,23 +106,89 @@ FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.id = $1 AND i.tenant_id = $2;
 
--- name: CountProcessosMatchingSearch :one
--- The filtered "X" of the processes screen's "X de Y" counter: how many ACTIVE court
--- records match the search term (cnj_number ILIKE, trigram-indexed). Called only when
--- ?search is present; the unfiltered "Y" reuses CountActiveCourtRecordsByTenant.
+-- name: CountProcessosFiltered :one
+-- The filtered "X" of the processes screen's "X de Y" counter: how many court records
+-- match the active filters (search on cnj_number ILIKE, court, degree, lifecycle, and
+-- the case-level responsável). Called only when any filter is present; the unfiltered
+-- "Y" is CountActiveCourtRecordsByTenant (or CountCourtRecordsByLifecycle when
+-- ?lifecycle is set). The SAME predicates as ListProcessos (minus the keyset), so the
+-- counter agrees with the page. The LEFT JOIN court_case is needed for the assignee
+-- predicate; the case id is the join key, so it never multiplies rows.
 SELECT count(*) FROM court_record cr
+LEFT JOIN court_case cc ON cc.id = cr.case_id
 WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-  AND cr.cnj_number ILIKE '%' || @search::text || '%' ESCAPE '\';
+  AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%' ESCAPE '\')
+  AND (@court::text = '' OR cr.court = @court::text)
+  AND (@degree::text = '' OR cr.degree = @degree::text)
+  AND (@lifecycle::text = '' OR cr.lifecycle = @lifecycle::text)
+  AND (@lifecycle::text <> '' OR cr.lifecycle = 'ACTIVE')
+  AND (sqlc.narg('assignee_id')::uuid IS NULL OR cc.assigned_user_id = sqlc.narg('assignee_id')::uuid);
 
--- name: CountIntimacoesMatchingSearch :one
+-- name: CountCourtRecordsByLifecycle :one
+-- The "Y" of the counter when the user filters ?lifecycle: how many records the tenant
+-- holds in that lifecycle, so "X de Y" stays meaningful (X ⊆ that lifecycle). ACTIVE —
+-- the screen's default context — keeps the cheaper CountActiveCourtRecordsByTenant.
+SELECT count(*) FROM court_record WHERE tenant_id = $1 AND lifecycle = $2;
+
+-- name: CountIntimacoesFiltered :one
 -- The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
--- whose court record's cnj_number matches the search term. Called only when ?search
--- is present; the unfiltered "Y" reuses CountIntimationsByTenant.
+-- match the active filters (search on the court record's cnj_number, type, user_status,
+-- court). Called only when a filter is present; the unfiltered "Y" reuses
+-- CountIntimationsByTenant. SAME predicates as ListIntimacoes (minus the keyset).
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
-  AND cr.cnj_number ILIKE '%' || @search::text || '%' ESCAPE '\';
+  AND (@search::text = '' OR cr.cnj_number ILIKE '%' || @search || '%' ESCAPE '\')
+  AND (@type::text = '' OR i.type = @type::text)
+  AND (@user_status::text = '' OR i.user_status = @user_status::text)
+  AND (@court::text = '' OR cr.court = @court::text);
+
+-- ── filter options (the envelope's selectable sets) ──────────────────────────
+-- Distinct-value reads that back the list envelopes' filter chips. Each is
+-- tenant-scoped (barrier 1) and matches the list's OWN context predicate (the
+-- processos options restrict to the default ACTIVE lifecycle), so the options
+-- reflect what the list can actually show. Empty values are skipped in Go (a blank
+-- chip is never selectable).
+
+-- name: ListProcessoCourts :many
+-- Selectable ?court values for the processes screen: the distinct courts of the
+-- tenant's live (ACTIVE) records, ordered by name.
+SELECT DISTINCT cr.court
+FROM court_record cr
+WHERE cr.tenant_id = $1
+  AND cr.lifecycle = 'ACTIVE'
+ORDER BY LOWER(cr.court) ASC;
+
+-- name: ListProcessoDegrees :many
+-- Selectable ?degree values for the processes screen: the distinct degrees of the
+-- tenant's live (ACTIVE) records, ordered by name.
+SELECT DISTINCT cr.degree
+FROM court_record cr
+WHERE cr.tenant_id = $1
+  AND cr.lifecycle = 'ACTIVE'
+ORDER BY LOWER(cr.degree) ASC;
+
+-- name: ListProcessoAssignees :many
+-- Selectable ?assignee values for the processes screen: the responsáveis of the
+-- tenant's live processes, joined at case level (court_record → court_case →
+-- app_user) exactly like the list's projection, deduped by id, ordered by name.
+-- The list filters on cc.assigned_user_id, so an unassigned case yields no option.
+SELECT DISTINCT au.id, COALESCE(au.name, '') AS name
+FROM court_record cr
+JOIN court_case cc ON cc.id = cr.case_id
+JOIN app_user au ON au.id = cc.assigned_user_id
+WHERE cr.tenant_id = $1
+  AND cr.lifecycle = 'ACTIVE'
+ORDER BY LOWER(COALESCE(au.name, '')) ASC;
+
+-- name: ListIntimacaoCourts :many
+-- Selectable ?court values for the intimações inbox: the distinct courts of the
+-- tenant's intimated court records, ordered by name.
+SELECT DISTINCT cr.court
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.tenant_id = $1
+ORDER BY LOWER(cr.court) ASC;
 
 -- name: ListAndamentosByProcesso :many
 -- The "Andamentos" tab of one process: the court record's docket entries, newest
