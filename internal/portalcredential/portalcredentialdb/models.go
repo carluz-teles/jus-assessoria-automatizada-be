@@ -2,7 +2,7 @@
 // versions:
 //   sqlc v1.30.0
 
-package documentdb
+package portalcredentialdb
 
 import (
 	"github.com/google/uuid"

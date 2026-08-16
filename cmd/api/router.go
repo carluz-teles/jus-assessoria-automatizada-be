@@ -13,6 +13,7 @@ import (
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
+	"github.com/jusassessoria/platform/internal/portalcredential"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
 )
@@ -46,6 +47,7 @@ type routerDeps struct {
 	deadline             *deadline.Handler
 	document             *document.Handler
 	lookup               *lookup.Handler
+	portalCredential     *portalcredential.Handler
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -184,6 +186,16 @@ func newRouter(deps routerDeps) *fiber.App {
 	// others so the router test fixture builds without a registry.
 	if deps.lookup != nil {
 		deps.lookup.Register(v1)
+	}
+
+	// portalcredential owns the advogado's own /v1/scraping/portal-credential
+	// (PUT/GET/DELETE) and mounts them via RegisterV1 — the api only composes.
+	// Nil-guarded so the router test's fixture (which wires no domain use cases)
+	// still builds, and so a boot without VAULT_KEK_BASE64 configured (no vault,
+	// no write use case) leaves the slice unmounted — the same optional-adapter
+	// convention document/S3 follows.
+	if deps.portalCredential != nil {
+		deps.portalCredential.RegisterV1(v1)
 	}
 
 	return app

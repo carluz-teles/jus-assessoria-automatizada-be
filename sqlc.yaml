@@ -141,6 +141,28 @@ sql:
               import: "github.com/google/uuid"
               type: "UUID"
 
+  # ── portalcredential (Slice): portal_credential + tenant_secret ─────────────
+  # portal_credential is the per-advogado credential vault entry point
+  # (docs/erd-tribunal-scraping.md §4.2); tenant_secret is the generic envelope-
+  # encryption cofre (§6) it points to. Both tables are owned by this slice — it
+  # is the sole producer/consumer of tenant_secret in v0 (see 0042's comment).
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/portalcredential/queries"
+    gen:
+      go:
+        package: "portalcredentialdb"
+        out: "internal/portalcredential/portalcredentialdb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
   # Bloco-modelo (copiar ao criar o próximo slice, ex.: draft):
   # - engine: "postgresql"
   #   schema: "migrations"

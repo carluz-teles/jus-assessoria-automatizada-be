@@ -324,6 +324,21 @@ type Plan struct {
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 }
 
+type PortalCredential struct {
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	AppUserID      uuid.UUID          `json:"app_user_id"`
+	Portal         string             `json:"portal"`
+	Login          string             `json:"login"`
+	CredentialRef  uuid.UUID          `json:"credential_ref"`
+	Status         string             `json:"status"`
+	LastError      *string            `json:"last_error"`
+	LastVerifiedAt pgtype.Timestamptz `json:"last_verified_at"`
+	ConfiguredBy   pgtype.UUID        `json:"configured_by"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ProcessedEvent struct {
 	Consumer    string             `json:"consumer"`
 	EventID     string             `json:"event_id"`
@@ -441,6 +456,17 @@ type Tenant struct {
 	OnboardingCompletedAt pgtype.Timestamptz `json:"onboarding_completed_at"`
 	Phone                 *string            `json:"phone"`
 	Email                 *string            `json:"email"`
+}
+
+type TenantSecret struct {
+	ID         uuid.UUID          `json:"id"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	Ciphertext []byte             `json:"ciphertext"`
+	Nonce      []byte             `json:"nonce"`
+	WrappedDek []byte             `json:"wrapped_dek"`
+	DekNonce   []byte             `json:"dek_nonce"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TrialPolicy struct {
