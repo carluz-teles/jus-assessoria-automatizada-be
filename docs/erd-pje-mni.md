@@ -1,6 +1,17 @@
 # ERD — PJe/MNI (consulta direta ao tribunal, read-only)
 
-> **Status:** desenho (v0 → habilita **partes reais (CPF/CNPJ)**, **autos oficiais** e **andamentos**
+> **Status: PAUSADO (2026-08-16).** Substituído como plano de v0 por `docs/erd-tribunal-scraping.md`
+> (automação de navegador contra o portal do tribunal, credencial pessoal do advogado) — o credenciamento
+> institucional MNI exige um processo burocrático por-escritório (ofício à Presidência, semanas) que se
+> mostrou uma barreira de entrada inaceitável para onboarding de SaaS; pesquisa de mercado confirmou que
+> isso é limite estrutural do setor (até concorrentes grandes exigem o mesmo para dado confidencial), não
+> uma lacuna da nossa implementação. Decisão do dono do produto: a ingestão é commodity/meio — o
+> diferencial do produto é a camada de IA sobre o dado, não o canal de aquisição. **Este documento fica
+> como referência técnica** (o desenho do conector MNI/SOAP continua correto caso o canal oficial volte a
+> fazer sentido — ex.: se um cliente específico já tiver certificado A1 e quiser o caminho oficial) — não
+> é o caminho ativo de implementação agora.
+
+> **Status (histórico, pré-pausa):** desenho (v0 → habilita **partes reais (CPF/CNPJ)**, **autos oficiais** e **andamentos**
 > no Cockpit do Processo, consultando o tribunal pelo protocolo **MNI/CNJ-padrão** — começando por
 > **TJSP eproc** (Juizado Especial Cível). É o **primeiro produtor real** de `party.document` e de
 > `document.origin=COURT`. **100% leitura nesta fatia** — nenhuma escrita no tribunal, nenhum
