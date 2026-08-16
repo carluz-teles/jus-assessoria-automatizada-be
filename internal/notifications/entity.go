@@ -90,7 +90,36 @@ const (
 	// flipped to past_due (billing.payment_failed, fatia 6b). This is the aviso's
 	// `type` column, distinct from the dotted EVENT id TypePaymentFailed in events.go.
 	TypePaymentFailedAviso = "payment_failed"
+	// TypeMemberJoinedAviso — a user joined the escritório (identity.member_joined),
+	// delivered through the generic notification.requested/EMAIL path (NotifyUseCase),
+	// not the in-app record() path the other Type*Aviso consts above go through. Named
+	// here (not just left as a bare string on the producer side) so it can be validated
+	// as a known type on PUT /v1/notifications/preferences — this slice never imports
+	// identity, so the string is duplicated by value, not by reference; it must match
+	// identity's own notifyTypeMemberJoined constant.
+	TypeMemberJoinedAviso = "member_joined"
 )
+
+// validNotificationTypes is the closed set of aviso `type` values a preference can
+// target — every Type*Aviso this slice knows about, whether it renders through the
+// in-app record() path or the generic EMAIL path. ValidNotificationType is the
+// PUT /v1/notifications/preferences guard: a typo'd type is a 400, not a silently
+// saved dead preference that will never match a real aviso.
+var validNotificationTypes = map[string]bool{
+	TypeImportFinished:       true,
+	TypeNewAndamento:         true,
+	TypeDeadlineDueSoonAviso: true,
+	TypeDeadlineMissedAviso:  true,
+	TypeTrialEndingSoonAviso: true,
+	TypePaymentFailedAviso:   true,
+	TypeMemberJoinedAviso:    true,
+}
+
+// ValidNotificationType reports whether t is a known aviso type. The empty string
+// is invalid on purpose, so an unset type never silently passes as a real one.
+func ValidNotificationType(t string) bool {
+	return validNotificationTypes[t]
+}
 
 // Notification is the local aviso: someone (RecipientUserID, empty for a
 // tenant-level aviso) should be told something (Type selects the template, Payload
