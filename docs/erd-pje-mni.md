@@ -11,6 +11,14 @@
 > (as portas `FilingGateway`/`Signer` que **não** implementamos aqui) e o slice `internal/acquisition`
 > (o conector MNI é mais um `source`, no mesmo molde de DJEN/DATAJUD).
 
+> **Revisão (2026-08-16) — modelo de autenticação MNI:** achado de pesquisa (Manual Técnico MNI do TJRJ,
+> mesmo padrão CNJ 2.2.2 que o TJSP usa via `esaj.tjsp.jus.br/mniws/...`) corrige a premissa de auth: a
+> chamada `consultarProcesso` **NÃO** é assinada por certificado ICP-Brasil por-chamada — é **login/senha
+> institucional** (`idConsultante`/`senhaConsultante`) credenciado no nível do **órgão** (CNPJ do
+> escritório / CPF do advogado). §5/§6/§7/§9/§10/§11 revisadas para refletir isso. Certificado ICP-Brasil
+> segue relevante só em (1) provar identidade no credenciamento inicial (burocrático, fora do sistema) e
+> (2) assinar o `conteudo` ao **peticionar** — fatia futura de peticionamento, fora do v0 de consulta.
+
 ---
 
 ## 1. Contexto & objetivo
@@ -27,8 +35,9 @@ está **nomeado mas nunca populado** (`internal/document/entity.go:55`); Documen
 operação **`consultarProcesso`** do MNI e traz: **partes com documento (CPF/CNPJ quando o tribunal
 expõe)**, **andamentos** e **metadados dos autos** (a lista de documentos e o download do inteiro teor,
 alimentando `document.origin=COURT` via a porta `DocumentSource` de `erd-documentos.md`). A consulta é
-**autenticada por certificado ICP-Brasil por-tenant**, configurado explicitamente pelo escritório; uma
-vez configurada, a consulta é **automática por-processo elegível** (mesma filosofia dos re-polls de
+**autenticada por login/senha institucional (`idConsultante`/`senhaConsultante`) por-tenant**, configurado
+explicitamente pelo escritório; uma vez configurada, a consulta é **automática por-processo elegível**
+(mesma filosofia dos re-polls de
 `scheduler.go`). É o subsistema que desfaz o corte deliberado de v0 anterior — *"o Secrets Manager
 pesado do MNI está cortado"* (`docs/fundacao-prd-erd.md:71`).
 
@@ -51,12 +60,13 @@ humana"* — **inegociável mesmo fora do v0** (CONSTRAINT do PM).
 | partes reais | `party.document` (0032) sempre NULL; `party.source` já aceita `MANUAL`, reservável p/ `MNI` | **EXTEND** — MNI é o **1º produtor** de `party.document`; `source` ganha valor `MNI` |
 | documento dos autos | `document.origin=COURT` (`internal/document/entity.go:55`) nomeado, nunca populado; porta `DocumentSource` desenhada em `erd-documentos.md §5` mas sem adapter | **EXTEND** — o MNI é o **1º adapter de `DocumentSource`** e o 1º produtor de `origin=COURT` |
 | cofre de segredo por-tenant | ⚠️ **nada**: `lib/config` (`caarlos0/env/v11`) só env var process-wide; `grep` por kms/vault/pgcrypto-encrypt/pkcs12 → **zero groundwork** | **CREATE** — `credential_ref` ganha seu 1º produtor; precisa de um cofre (§6) |
-| cliente SOAP / assinatura XML / certificado | ⚠️ **nada**: sem SOAP/WSDL, sem XMLDSig, sem manejo de PKCS12/x509 no `go.mod`; MNI é **SOAP**, não REST/JSON como DJEN/DATAJUD | **CREATE** — `lib/mni` (cliente SOAP + WS-Security por certificado) é o maior trabalho novo (§5, §7) |
+| cliente SOAP / autenticação da chamada | ⚠️ **nada**: sem SOAP/WSDL no `go.mod`; MNI é **SOAP**, não REST/JSON como DJEN/DATAJUD. Auth de consulta é **login/senha no envelope** (`idConsultante`/`senhaConsultante`), não XMLDSig/PKCS12 — o que reduz o trabalho vs. a premissa original | **CREATE** — `lib/mni` (cliente SOAP + injeção de login/senha) é o maior trabalho novo (§5, §7); WS-Security/assinatura de certificado fica para a fatia de peticionamento, não o v0 de consulta |
 | peticionamento / assinatura | portas `FilingGateway`/`Signer` **nomeadas** em `erd-pecas.md`, sem impl | **PRESERVE** — fora do v0; não implementar, mas o cofre/certificado desenhados aqui são o insumo delas depois |
 
 Conclusão: o **domínio de aquisição está pronto para receber MNI** (conector/parser/orchestrator/eventos
 não mudam de forma). O trabalho real e **novo** é: (a) `lib/mni` — cliente **SOAP** com autenticação por
-**certificado ICP-Brasil** (zero groundwork hoje); (b) o **cofre de credencial por-tenant** por trás de
+**login/senha institucional** (`idConsultante`/`senhaConsultante` no envelope; zero groundwork SOAP hoje —
+mas **sem** WS-Security/assinatura no v0 de consulta); (b) o **cofre de credencial por-tenant** por trás de
 `credential_ref` (também zero); (c) o **mapa de elegibilidade eproc** (estoque residual eSAJ vs. nativo);
 (d) preencher `party.document` e `origin=COURT` (deltas mínimos em `ParsedParty` + adapter `DocumentSource`).
 
@@ -75,9 +85,11 @@ não mudam de forma). O trabalho real e **novo** é: (a) `lib/mni` — cliente *
 4. **Elegibilidade antes de rede.** Nenhuma tentativa MNI contra processo que ainda está em **eSAJ
    residual**. A decisão (eproc-nativo × eSAJ) é resolvida **localmente** (mapa + heurística de data),
    antes do `Fetch` — evita ruído de falha constante (ACCEPTANCE nº3).
-5. **Certificado nunca em claro.** `credential_ref` aponta para um cofre; o segredo nunca aparece em
-   código, log, outbox, trace ou `scope`. Custódia de certificado ICP-Brasil é a **identidade digital do
-   advogado** — risco jurídico de primeira grandeza (§10).
+5. **Credencial nunca em claro.** `credential_ref` aponta para um cofre; o segredo (par
+   `idConsultante`/`senhaConsultante` no v0 de consulta) nunca aparece em código, log, outbox, trace ou
+   `scope`. Vazamento dá acesso de **leitura** aos processos do escritório — risco de credencial de API,
+   sério mas de classe menor que custódia de identidade digital (§10). *(A custódia de certificado
+   ICP-Brasil como identidade digital só passa a valer na fatia futura de peticionamento.)*
 6. **Origem importa juridicamente.** `document.origin=COURT` (dos autos, via MNI) tem peso probatório que
    UPLOAD não tem, e `party.source=MNI` com `document` preenchido é o dado *confiável* que o produto
    promete. O Cockpit **sinaliza a fonte** (MNI × DJEN × UPLOAD) quando relevante.
@@ -99,11 +111,14 @@ servem. O único DDL **novo** é o **mapa de elegibilidade eproc** e (§6) a **c
     scope pode ficar vazio/mínimo; o que importa é `credential_ref`.
   - `credential_ref text` — **ganha seu 1º produtor real** (aponta pro segredo cifrado; §6). Continua
     NULL para DJEN/DATAJUD.
-  - `status` — reusa o enum existente: `AUTH_FAILED` passa a ser **de fato escrito** quando o certificado
-    expira/é revogado (hoje só reservado); alimenta a sinalização acionável (edge case do PM).
+  - `status` — reusa o enum existente: `AUTH_FAILED` passa a ser **de fato escrito** quando o tribunal
+    rejeita o `idConsultante`/`senhaConsultante` (login/senha inválido ou descredenciado; hoje só
+    reservado); alimenta a sinalização acionável (edge case do PM).
   - **Delta proposto (a confirmar no catálogo):** `credential_meta jsonb` (nullable) — metadados **não
-    secretos** do certificado para a UI acionável: `{subject_cn, issuer, not_after, fingerprint}`. Deixa
-    o Cockpit avisar "certificado vence em N dias / expirado" **sem** tocar o segredo. Nada de chave aqui.
+    secretos** para a UI acionável: `{id_consultante, last_verified_at}` (nunca a senha). Deixa o Cockpit
+    mostrar "conectado como <idConsultante>" e "credencial rejeitada, reconfigure" **sem** tocar o segredo.
+    *(Quando a fatia de peticionamento entrar e um certificado passar a ser custodiado, este `jsonb` pode
+    absorver `{subject_cn, issuer, not_after}` para o aviso de expiração — só então faz sentido.)*
 - **`party`** / **`party_counsel`** (0032) — MNI é o **1º produtor de `party.document`**. Sem DDL: só
   passa a **escrever** o `document` (CPF/CNPJ) e `source='MNI'` (a UNIQUE `(tenant, case, role, name)`
   faz o upsert idempotente — MNI **enriquece** a mesma parte que o DJEN já criou pelo nome, preenchendo
@@ -147,12 +162,12 @@ servem. O único DDL **novo** é o **mapa de elegibilidade eproc** e (§6) a **c
 | Integração | Papel | Porta / estado |
 |---|---|---|
 | **MNI (SOAP/WSDL)** do TJSP eproc | `consultarProcesso` → partes, andamentos, docs; `consultarAvisosPendentes`/`consultarTeorComunicacao` (futuro) | 🔴 **novo/hard** — `lib/mni`: cliente **SOAP** (não há no repo), request/response por WSDL do MNI 2.2.2 do CNJ; **zero groundwork** (`go.mod` sem SOAP) |
-| **Autenticação MNI (ICP-Brasil)** | assinar/autenticar a chamada SOAP com o certificado do advogado | 🔴 **novo/hard** — porta `MNICredentialProvider` (§7); v0 recomendado **certificado A1 (.pfx)** custodiado no cofre **ou** assinador em nuvem (BirdID/VIDaaS/Serpro) via API — **a porta abstrai as duas**; o fornecedor fica **em aberto** (§10) |
-| **Cofre de credencial por-tenant** | onde mora o certificado/segredo cifrado atrás de `credential_ref` | 🔴 **novo** — sem KMS/Vault na infra hoje (Railway+Postgres); v0 recomendado **coluna cifrada no Postgres com envelope encryption** por chave de app (§6) |
+| **Autenticação MNI (login/senha)** | injetar `idConsultante`/`senhaConsultante` na chamada SOAP `consultarProcesso` | 🟡 **novo/médio** — porta `MNICredentialProvider` (§7); é **login/senha institucional** credenciado no órgão (CNPJ do escritório / CPF do advogado), **não** assinatura de certificado por-chamada. Sem WS-Security / XMLDSig no v0 de consulta — só preencher dois campos do envelope. *(Certificado ICP-Brasil só volta na fatia de peticionamento — assinar o `conteudo` da manifestação, `Signer` de `erd-pecas.md`.)* |
+| **Cofre de credencial por-tenant** | onde mora o par login/senha cifrado atrás de `credential_ref` | 🟡 **novo** — sem KMS/Vault na infra hoje (Railway+Postgres); v0 recomendado **coluna cifrada no Postgres com envelope encryption** por chave de app (§6). O material do v0 de consulta é um **par usuário/senha** (classe de segredo de credencial de API), não um `.pfx` de identidade digital |
 | **`DocumentSource`** (`erd-documentos.md`) | baixar o inteiro teor dos autos → `document.origin=COURT` | 🟡 porta desenhada, **1º adapter aqui** (MNI); reusa `lib/storage` + o pipeline de extração/chunk |
 | **`internal/acquisition`** (conector/parser/orchestrator/sync/scheduler) | o pipeline que já roda DJEN/DATAJUD | ✅ existe — só **registrar** o conector/parser MNI (`worker-ingestao/main.go`) |
 | **`eproc_coverage`** (mapa) | decidir elegibilidade sem rede | 🟡 **novo** — tabela seed (§4) |
-| **Painel de Integrações (FE)** | onde o escritório sobe/gere o certificado | 🟡 já antecipado no FE (`src/features/integrations/`: *"Fontes futuras exigirão credencial/login"*) — a casa natural da configuração |
+| **Painel de Integrações (FE)** | onde o escritório informa/gere a credencial (`idConsultante`/`senhaConsultante`) | 🟡 já antecipado no FE (`src/features/integrations/`: *"Fontes futuras exigirão credencial/login"*) — a casa natural da configuração |
 
 **MNI é SOAP, não REST/JSON.** O `RawPayload{Body []byte}` **basta** (é bytes opacos — o XML de resposta
 cabe nele igual ao JSON do DJEN). O `Parser.CanParse` casa por `p.Source == SourceMNI` (igual
@@ -164,36 +179,45 @@ contrato é em `ParsedResult`/`ParsedParty` (§8, campo `Document` + lista de do
 ## 6. Cofre de segredos por-tenant (`credential_ref`)
 
 **Problema:** `credential_ref` nunca teve produtor; `lib/config` só faz env var process-wide — **não
-serve** para um segredo **por-tenant** (o certificado de cada escritório). Não há KMS/Vault na infra
+serve** para um segredo **por-tenant** (a credencial MNI de cada escritório). Não há KMS/Vault na infra
 conhecida (Railway + Postgres; `grep` confirma zero menção de AWS KMS/HashiCorp Vault em `lib`/docs).
+
+**O que se custodia no v0 de consulta:** um **par usuário/senha** (`idConsultante`/`senhaConsultante`),
+credenciado no nível do órgão. É a **mesma classe de segredo** que qualquer credencial de API de terceiro
+que um SaaS já guarda — **não** é a identidade digital de alguém (o `.pfx` ICP-Brasil só entra na fatia de
+peticionamento). Isso torna a custódia estruturalmente mais simples e de menor consequência que a premissa
+original assumia.
 
 **Opções avaliadas:**
 
 - **OPÇÃO A — Coluna cifrada no Postgres, envelope encryption com chave de app (recomendado v0).**
-  O certificado (`.pfx`) e sua senha ficam cifrados numa tabela `tenant_secret` (DEK por-segredo, DEK
+  O par `idConsultante`/`senhaConsultante` fica cifrado numa tabela `tenant_secret` (DEK por-segredo, DEK
   cifrada por uma KEK vinda de env var — `caarlos0/env`, `required`); `credential_ref` aponta a linha.
   - **Prós:** sem infra nova (só Postgres, que já temos); rotação de KEK viável; segredo nunca em claro
     no banco (mesmo com dump); alinha ao `credential_ref` já desenhado; RLS isola por tenant.
   - **Contras:** a KEK é um env var (mesma superfície do resto dos segredos, `fundacao-prd:N9`); não é
-    HSM. Aceitável para v0 dado o estágio — **mas** o material custodiado é sensível (§10).
+    HSM. **Perfeitamente adequado** para um par login/senha — o raciocínio de risco não é mais sobre
+    custodiar um certificado de identidade, e sim sobre custodiar uma credencial de leitura (§10).
 - **OPÇÃO B — Secrets manager dedicado (Vault/AWS Secrets Manager/KMS).**
   - **Prós:** custódia de nível industrial, auditoria, HSM opcional (ideal para certificado ICP-Brasil).
   - **Contras:** **infra nova** que não existe hoje na Railway; custo/operação; é o *"Secrets Manager
     pesado do MNI"* que a v0 anterior **cortou de propósito** (`fundacao-prd:71`). Introduzir agora seria
-    contrariar a skill (não introduzir infra por escalabilidade teórica).
-- **OPÇÃO C — Assinador em nuvem, o segredo nunca toca nossa infra.**
-  O escritório cadastra credenciais de um provedor (BirdID/VIDaaS/Serpro); guardamos só o **token/refresh
-  do provedor** (segredo bem menor), e a assinatura da chamada MNI acontece no provedor.
-  - **Prós:** **nunca custodiamos o `.pfx`** — reduz drasticamente o risco jurídico do §10.
-  - **Contras:** depende do produto decidir o fornecedor (ambiguidade nº3 do PM, **em aberto**); ainda
-    exige o cofre (A) para o token do provedor.
+    contrariar a skill (não introduzir infra por escalabilidade teórica). **Ainda mais desnecessário**
+    agora que o material do v0 é um par login/senha, não um certificado de identidade.
+- **OPÇÃO C — Assinador em nuvem (BirdID/VIDaaS/Serpro).** ⚠️ **Não se aplica ao v0 de CONSULTA.** Um
+  assinador em nuvem resolve **assinatura de certificado**, que a consulta MNI **não usa** — a consulta é
+  autenticada por login/senha no envelope. Esta opção **só volta a fazer sentido na fatia futura de
+  peticionamento**, onde o `conteudo` da manifestação precisa de assinatura ICP-Brasil (aí sim: custodiar
+  `.pfx` × delegar a um assinador em nuvem vira a decisão relevante). Mantida aqui só como marco do que
+  reabre no peticionamento — **fora do escopo desta análise**.
 
-**DECISION:** **Cofre = Opção A** (coluna cifrada, envelope encryption, KEK em env var) como mecanismo
-de custódia; **a natureza do que se custodia** (.pfx próprio × token de assinador em nuvem) é decidida
-pela **porta** `MNICredentialProvider` (§7), que funciona com **A ou C** sem retrabalho de cofre. **A
-Opção B fica explicitamente adiada** (não reintroduzir o secrets manager pesado no v0). **Se** o produto
-escolher assinador em nuvem (C), o material custodiado encolhe (token, não certificado) — e o §10 fica
-muito mais leve. Esse é o caminho que eu **recomendo** ao dono do produto.
+**DECISION:** **Cofre = Opção A** (coluna cifrada, envelope encryption, KEK em env var). Para o v0 de
+consulta o material é um **par `idConsultante`/`senhaConsultante`** — a Opção A é folgadamente suficiente
+para uma credencial de API dessa classe, e não há mais o dilema "custodiar identidade digital" que
+justificaria um assinador em nuvem. **Opção B (secrets manager pesado) adiada** (mantém o corte de
+`fundacao-prd:71`); **Opção C (assinador em nuvem) não é relevante ao v0 de consulta** — reaparece só na
+fatia de peticionamento. A porta `MNICredentialProvider` (§7) permanece o ponto de extensão: hoje entrega
+login/senha; quando o peticionamento chegar, ela é estendida/substituída para lidar com assinatura.
 
 ---
 
@@ -201,23 +225,29 @@ muito mais leve. Esse é o caminho que eu **recomendo** ao dono do produto.
 
 Duas portas novas + reuso das existentes. Nomes propostos (DEV ajusta):
 
-- **`MNICredentialProvider`** (porta nova, em `lib/mni` ou no conector) — abstrai **como a chamada SOAP é
-  autenticada/assinada**, resolvendo o material a partir de `credential_ref`:
+- **`MNICredentialProvider`** (porta nova, em `lib/mni` ou no conector) — resolve a **credencial de
+  consulta** a partir de `credential_ref`, sem expor o segredo ao chamador. No v0 de consulta a auth é
+  **login/senha no envelope**, não assinatura — a porta só entrega o par, o cliente SOAP o injeta:
   ```
-  // Assina/autentica uma requisição MNI para um tenant, sem expor o material.
-  // A impl A1 lê o .pfx cifrado do cofre e assina localmente (WS-Security);
-  // a impl "nuvem" delega ao provedor (BirdID/VIDaaS/Serpro) por API.
-  Sign(ctx, tenantID, credentialRef, soapEnvelope []byte) (signed []byte, err error)
+  // Resolve a credencial MNI de consulta de um tenant (par usuário/senha institucional),
+  // decifrando do cofre atrás de credential_ref. Não assina nada — a auth de consulta
+  // é login/senha nos campos idConsultante/senhaConsultante do envelope consultarProcesso.
+  Credentials(ctx, tenantID, credentialRef) (idConsultante, senhaConsultante string, err error)
   ```
-  Isto **não trava** o fornecedor (ambiguidade nº3): A1 local e assinador em nuvem satisfazem a mesma
-  porta. Erro de credencial (expirada/revogada) é **tipado** (`apperr` `AUTH_FAILED`) e sobe até virar
-  `integration.status=AUTH_FAILED` + sinal na UI.
+  Erro de credencial (inválida/revogada pelo tribunal) é **tipado** (`apperr` `AUTH_FAILED`) e sobe até
+  virar `integration.status=AUTH_FAILED` + sinal na UI.
+  > ⚠️ **Extensão obrigatória no peticionamento.** Esta porta cobre **só a consulta**. Quando a fatia de
+  > peticionamento chegar (`entregarManifestacaoProcessual`), o `conteudo` da manifestação precisa de
+  > **assinatura digital ICP-Brasil** — capacidade que esta porta **não** tem e não deve ganhar por
+  > inchaço. Aí entra o `Signer` de `erd-pecas.md` (custodiar `.pfx` × delegar a assinador em nuvem),
+  > como porta **separada** ou extensão explícita — não force um `Sign` prematuro aqui no v0 de consulta.
 - **`DocumentSource`** (porta **já nomeada** em `erd-documentos.md §5`) — **1º adapter aqui**: dado um
   `court_record` + a resposta MNI, baixa o inteiro teor de cada documento dos autos e cria `document`
   com `origin=COURT`. Reusa `lib/storage` + o pipeline de extração/chunk existente.
 - **`Connector` MNI** (impl da porta existente `connector.go`) — `ID()="mni"`, `Version()`,
   `Capabilities()=[FETCH_BY_NUMBER]` (**não** `DISCOVER_BY_OAB` — MNI consulta por número), `Fetch` monta
-  o envelope `consultarProcesso`, chama `MNICredentialProvider.Sign`, faz o POST SOAP, devolve
+  o envelope `consultarProcesso`, obtém o par login/senha via `MNICredentialProvider.Credentials`, injeta
+  `idConsultante`/`senhaConsultante` no envelope, faz o POST SOAP, devolve
   `RawPayload{Source: SourceMNI, Body: xml}`. Registrado no `Orchestrator` (`worker-ingestao/main.go`).
 - **`Parser` MNI** (impl da porta existente) — `CanParse` casa `Source==SourceMNI`; `Parse` faz o
   unmarshal do XML MNI → `ParsedResult` (records, docket entries, **parties com `Document`**, e a lista
@@ -266,19 +296,20 @@ sequenceDiagram
   participant VLT as tenant_secret (cofre cifrado)
   participant SCH as scheduler / listener
   participant MNIC as conector MNI (lib/mni, SOAP)
-  participant CP as MNICredentialProvider (A1/nuvem)
+  participant CP as MNICredentialProvider
   participant TRIB as TJSP eproc (MNI SOAP)
   participant P as Parser MNI
   participant DS as DocumentSource → lib/storage
   participant PG as Postgres (party/document/docket)
 
-  FE->>API: configura certificado (upload .pfx / credencial nuvem)
-  API->>VLT: cifra + grava; integration(MNI).credential_ref, status=ACTIVE, credential_meta{not_after}
+  FE->>API: configura credencial MNI (idConsultante/senhaConsultante do órgão)
+  API->>VLT: cifra + grava; integration(MNI).credential_ref, status=ACTIVE
   Note over SCH: court_record elegível (§8) + integration MNI ACTIVE
   SCH->>MNIC: Fetch(FETCH_BY_NUMBER, cnj, court=TJSP)  [só se eligibleForMNI]
-  MNIC->>CP: Sign(tenant, credential_ref, envelope consultarProcesso)
-  CP->>VLT: decifra material (A1) — ou delega (nuvem)
-  CP-->>MNIC: envelope assinado
+  MNIC->>CP: Credentials(tenant, credential_ref)
+  CP->>VLT: decifra o par login/senha
+  CP-->>MNIC: idConsultante, senhaConsultante
+  MNIC->>MNIC: injeta login/senha no envelope consultarProcesso
   MNIC->>TRIB: POST SOAP consultarProcesso
   TRIB-->>MNIC: XML (partes+CPF/CNPJ, andamentos, docs)
   MNIC-->>P: RawPayload{Source=MNI, Body=xml}
@@ -286,7 +317,7 @@ sequenceDiagram
   P->>PG: upsert party.document + party.source=MNI [tx + outbox]
   P->>DS: baixa inteiro teor → document.origin=COURT → pipeline extração/chunk
   MNIC-->>SCH: falha? run FAILED categorizado (indisponível/não-encontrado/auth) — acka, não quebra
-  TRIB-->>MNIC: 401/cert inválido → integration.status=AUTH_FAILED → sinal acionável no FE
+  TRIB-->>MNIC: login/senha inválido → integration.status=AUTH_FAILED → sinal acionável no FE
 ```
 
 Escrita sempre em tx + outbox; cada etapa idempotente (`processed_event`). A **falha** de MNI vira um
@@ -295,22 +326,26 @@ re-tenta depois), **sem** burnar retries do asynq e **sem** quebrar a tela.
 
 ---
 
-## 10. Riscos de segurança (custódia de certificado ICP-Brasil)
+## 10. Riscos de segurança (custódia de credencial MNI de consulta)
 
-**Risco central:** o certificado A1 é a **identidade digital do advogado** — com ele, pode-se **assinar e
-peticionar em nome dele**. Custodiar `.pfx` é responsabilidade jurídica não-trivial: um vazamento não é
-"leak de dado", é **impersonação de um advogado perante o Judiciário**.
+**Risco central (v0 de consulta):** o segredo custodiado é um **par login/senha institucional**
+(`idConsultante`/`senhaConsultante`). Vazamento é da classe **credencial de API**: dá acesso de **leitura**
+aos processos do escritório no tribunal — sério (dado sensível, LGPD), mas **não** é impersonação/assinatura
+jurídica. É uma classe de risco **bem menor** do que a premissa original (custódia de identidade digital)
+assumia — não há `.pfx` de identidade do advogado em jogo nesta fatia.
 
 | Risco | Mitigação proposta |
 |---|---|
-| Vazamento do `.pfx` custodiado | **Preferir Opção C (assinador em nuvem)** — nunca custodiar o `.pfx`; se A1, envelope encryption (DEK/KEK, §6), KEK só em env var, nunca no dump; RLS por tenant; **jamais** em log/outbox/trace/`scope` |
-| Uso indevido além de leitura | v0 é **read-only**; a porta só assina `consultarProcesso`; qualquer escrita exige `FilingGateway` + **aprovação humana** (advisory, inegociável) |
-| Certificado expirado/revogado | `credential_meta.not_after` → aviso proativo no Cockpit **antes** de vencer; erro de auth → `AUTH_FAILED` + sinal **acionável** (edge case do PM) |
+| Vazamento do par login/senha custodiado | envelope encryption (DEK/KEK, §6), KEK só em env var, nunca no dump; RLS por tenant; **jamais** em log/outbox/trace/`scope`. Adequado para uma credencial de API dessa classe |
+| Uso indevido além de leitura | v0 é **read-only**; a credencial só autentica `consultarProcesso` (login/senha de consulta); **não** habilita peticionar — escrita exige `entregarManifestacaoProcessual` + assinatura ICP-Brasil + `FilingGateway` + **aprovação humana** (advisory, inegociável) |
+| Credencial rejeitada/descredenciada | erro de auth → `AUTH_FAILED` + sinal **acionável** no Cockpit ("credencial rejeitada, reconfigure") (edge case do PM). Login/senha não expira sozinho como certificado, mas o tribunal pode descredenciar |
 | Consentimento/escopo | o escritório **configura explicitamente** (nunca automático); registrar quando/quem configurou (auditoria) |
 | KEK única comprometida | rotação de KEK planejada; DEK por-segredo limita blast radius; migração para KMS (Opção B) é caminho de saída sem mudar `credential_ref` |
 
-**Recomendação forte ao produto:** ir de **assinador em nuvem (C)** justamente para **não** custodiar a
-identidade digital do advogado — transforma o maior risco jurídico do subsistema num problema de token.
+> ⚠️ **O risco "custódia de certificado ICP-Brasil = identidade digital" volta a valer na fatia de
+> peticionamento** — quando for preciso assinar o `conteudo` da manifestação. Aí, sim, um vazamento vira
+> impersonação perante o Judiciário, e a decisão "custodiar `.pfx` × delegar a assinador em nuvem
+> (BirdID/VIDaaS/Serpro)" reabre com toda a gravidade. **Não é um risco desta fatia de consulta.**
 
 ---
 
@@ -322,10 +357,15 @@ identidade digital do advogado — transforma o maior risco jurídico do subsist
   delta de contrato: `ParsedParty.Document` + `ParsedResult.Documents[]`.
 - ✅ Elegibilidade resolvida **localmente** por `eproc_coverage` (tabela seed) + `filed_at` ≥ migração,
   **antes** da rede — sem ruído contra eSAJ residual. Concordo com o "mapa estático" do PM, como tabela.
+- ✅ **Auth de consulta = login/senha institucional** (`idConsultante`/`senhaConsultante`), credenciado no
+  nível do órgão (CNPJ do escritório / CPF do advogado) — **não** assinatura de certificado por-chamada.
+  Sem WS-Security/XMLDSig no v0 de consulta (achado 2026-08-16, Manual Técnico MNI TJRJ, padrão CNJ 2.2.2).
 - ✅ Cofre = **coluna cifrada no Postgres (envelope encryption)**, KEK em env var; **secrets manager
   pesado adiado** (mantém o corte de `fundacao-prd:71` para a mecânica, desfaz só o produto MNI).
-- ✅ Custódia via porta `MNICredentialProvider` **agnóstica de fornecedor** (A1 local × nuvem).
-- ✅ v0 **100% leitura**; peticionamento reusa `FilingGateway`/`Signer` (`erd-pecas.md`), fora do escopo.
+- ✅ Porta `MNICredentialProvider` entrega o **par login/senha** (`Credentials(...)`), não assina; é
+  estendida/substituída (assinatura ICP-Brasil) só quando a fatia de peticionamento chegar.
+- ✅ v0 **100% leitura**; peticionamento reusa `FilingGateway`/`Signer` (`erd-pecas.md`), fora do escopo —
+  e é lá que reentram certificado ICP-Brasil e a decisão A1 × assinador em nuvem.
 
 **ASSUMPTION (assumido, a validar):**
 - Que o eproc do TJSP fala **MNI 2.2.2 (CNJ-padrão, SOAP/WSDL)** de forma consultável por advogado
@@ -343,10 +383,15 @@ identidade digital do advogado — transforma o maior risco jurídico do subsist
   ACCEPTANCE nº1** ("retorna CPF/CNPJ quando exposto"). **Não assumir otimisticamente que vem tudo
   aberto.** Precisa de validação no **schema WSDL real + resposta de sandbox/amostra** antes da fatia de
   parsing de partes. Se vier mascarado sem procuração, o valor de "partes reais" fica condicionado a ter
-  procuração cadastrada — decisão de produto a reabrir.
-- ⚠️ **Fornecedor de credencial (ambiguidade nº3 do PM):** A1 (.pfx) custodiado × assinador em nuvem
-  (BirdID/VIDaaS/Serpro) — **volta pro dono do produto**. O desenho não trava (porta), mas a decisão
-  muda drasticamente o §10.
+  procuração cadastrada — decisão de produto a reabrir. **Este achado sobre autenticação (login/senha)
+  não muda este UNKNOWN**: sigilo/mascaramento é decidido pelo **vínculo representante↔representado
+  pré-cadastrado presencialmente no tribunal** (`Consultar Avisos Pendentes` recebe `idConsultante` +
+  `idRepresentado` como campos separados; o tribunal checa se o par foi pré-cadastrado), **não** pelo tipo
+  de auth — o que só reforça que "partes reais" depende do vínculo cadastrado, não da credencial em si.
+- 📌 **Fornecedor de certificado de assinatura (A1 × assinador em nuvem BirdID/VIDaaS/Serpro):** ⚠️ **é
+  questão da fatia 7 (peticionamento, futuro), NÃO da fatia 1-4 (consulta).** A consulta autentica por
+  login/senha e **não** custodia certificado; a decisão A1 × nuvem só reabre quando o `conteudo` da
+  manifestação precisar ser assinado. Movido para fora do escopo do v0 de consulta.
 
 **FACT (evidência de código/negócio já levantada):**
 - `party.document` sempre NULL, DJEN nunca revela (`connector.go:104`, migration 0032). `document.origin=
@@ -373,8 +418,11 @@ UNKNOWN cedo** e adia o hard (cofre/custódia) para depois de provado o parsing.
    validar contra WSDL + payload real de JEC de Franca/Ribeirão (ACCEPTANCE nº5). *(Primeira fatia — é a
    que responde a pergunta que muda o critério de aceite; nada depende do cofre para isso.)*
 2. **Cofre de credencial por-tenant** (`tenant_secret` cifrado, envelope encryption) + fluxo de
-   **configuração de certificado** (`POST` no painel de Integrações) → `integration(MNI).credential_ref`,
-   `status`, `credential_meta`. Porta `MNICredentialProvider` (impl A1 primeiro).
+   **configuração da credencial MNI** — o escritório informa `idConsultante`/`senhaConsultante` no painel
+   de Integrações (`POST`) → `integration(MNI).credential_ref`, `status`, `credential_meta`. Porta
+   `MNICredentialProvider.Credentials(...)` (entrega o par login/senha; sem assinatura). *(Fatia
+   estruturalmente mais simples do que a premissa original de custódia de `.pfx` — mesma mecânica de cofre,
+   material menor.)*
 3. **Conector MNI real registrado no `Orchestrator`** + sync por evento: `Fetch` autenticado (via cofre)
    → `Parse` → upsert `party.document`/`source=MNI` em tx+outbox. Falha **categorizada** (ACCEPTANCE nº2).
    Round-trip produtor∥consumidor.
@@ -383,6 +431,6 @@ UNKNOWN cedo** e adia o hard (cofre/custódia) para depois de provado o parsing.
 5. **`DocumentSource` adapter MNI** — baixa inteiro teor → `document.origin=COURT` → pipeline de
    extração/chunk (`erd-documentos.md`).
 6. **UI no Cockpit** — indicador de **fonte do dado** (MNI × DJEN × UPLOAD) na aba Partes/Documentos +
-   sinal acionável de **certificado expirado/revogado** (`AUTH_FAILED`/`credential_meta.not_after`).
+   sinal acionável de **credencial rejeitada/descredenciada** (`AUTH_FAILED`, mensagem "reconfigure").
 7. **(Futuro, fora do v0)** peticionamento: `FilingGateway`/`Signer` (`erd-pecas.md`) reusando o cofre e a
    `MNICredentialProvider` — **sempre com aprovação humana** (advisory, inegociável).
