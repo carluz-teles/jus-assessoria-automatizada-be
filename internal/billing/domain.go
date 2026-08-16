@@ -71,6 +71,11 @@ type UseCase struct {
 	// against; it defaults to time.Now and is overridable in tests via WithClock
 	// (mirroring internal/deadline/domain.go's identical seam).
 	now func() time.Time
+	// adminLister resolves a tenant's admins for the payment_failed e-mail
+	// fan-out (WithAdminLister). Optional: nil (the zero value) makes failPayment
+	// skip the fan-out — the in-app tenant-level aviso still fires either way, so
+	// omitting it degrades gracefully rather than failing the webhook.
+	adminLister AdminLister
 }
 
 // Option configures optional UseCase collaborators. Kept variadic so the webhook
@@ -89,6 +94,13 @@ func WithCheckoutConfig(c CheckoutConfig) Option {
 // leaves the default (time.Now); tests pin it to assert deterministically.
 func WithClock(now func() time.Time) Option {
 	return func(uc *UseCase) { uc.now = now }
+}
+
+// WithAdminLister injects the port failPayment consults to fan out the
+// payment_failed e-mail to every admin of the tenant. Omitted in tests/
+// compositions that never need the fan-out (see AdminLister's doc).
+func WithAdminLister(l AdminLister) Option {
+	return func(uc *UseCase) { uc.adminLister = l }
 }
 
 // NewUseCase wires the use cases to their repository, Stripe gateway, outbox
@@ -289,8 +301,35 @@ func (uc *UseCase) failPayment(ctx context.Context, ev StripeEvent) error {
 		if _, err := uc.repo.UpdateSubscriptionStatus(ctx, tx, tenantID, StatusPastDue); err != nil {
 			return err
 		}
-		return uc.outbox.Publish(ctx, tx, newPaymentFailed(tenantID, inv.ID, inv.AmountDue))
+		if err := uc.outbox.Publish(ctx, tx, newPaymentFailed(tenantID, inv.ID, inv.AmountDue)); err != nil {
+			return err
+		}
+		return uc.notifyAdmins(ctx, tx, tenantID, inv.ID, inv.AmountDue)
 	})
+}
+
+// notifyAdmins fans the payment_failed e-mail out to every ADMIN of tenantID, in
+// the SAME tx as the past_due flip and the payment_failed event above — so the
+// fan-out is gated by the very same SeenOrMark that guards the rest of
+// failPayment (a replayed Stripe webhook re-sends nothing). A nil adminLister (no
+// composition wired one) is a no-op: the tenant-level in-app aviso (fatia 6b,
+// internal/notifications) still fires either way, so the e-mail fan-out degrades
+// gracefully instead of failing the webhook.
+func (uc *UseCase) notifyAdmins(ctx context.Context, tx database.Tx, tenantID, invoiceID string, amountDue int64) error {
+	if uc.adminLister == nil {
+		return nil
+	}
+
+	adminIDs, err := uc.adminLister.ListTenantAdminIDs(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	for _, adminID := range adminIDs {
+		if err := uc.outbox.Publish(ctx, tx, newPaymentFailedAdminNotification(tenantID, adminID, invoiceID, amountDue)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // resolveInvoiceTenant returns the tenant an invoice belongs to: the metadata
