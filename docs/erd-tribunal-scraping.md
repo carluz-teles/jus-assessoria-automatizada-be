@@ -513,3 +513,19 @@ login+parse — mesma filosofia do ERD MNI.
    (`CREDENTIAL_INVALID`) e degradação por captcha recorrente (`CAPTCHA_BLOCKED`) (ACCEPTANCE #4).
 7. **(Futuro, fora do v0)** peticionamento: `FilingGateway`/`Signer` (`erd-pecas.md`) — **sempre com
    aprovação humana** (advisory, inegociável).
+
+---
+
+## 13. Nota de escopo — outros tribunais (não bloqueante, para quando a prioridade mudar)
+
+Dado real de produção (2026-08-16, `court_record`): **TJSP é 96,4% da carteira** (6.572 de 6.818). O
+segundo colocado, **TJMG, é 2,2%** (147) — uma distância de ~44×. Todo o resto (TRF3, TRT15, TJGO, TJPR...)
+soma menos de 1% combinado. **Conclusão: nenhum outro tribunal justifica trabalho de scraping agora** —
+terminar de validar TJSP (fatias 1-6) vale mais que começar um segundo portal.
+
+**Achado que reduz o custo de expandir para TJMG no futuro:** TJMG está no mesmo movimento de migração que
+o TJSP — saindo do PJe (não do eSAJ) e indo para o **eproc**, com conclusão prevista para o 2º semestre de
+2026 (Portaria Conjunta 1.681/PR/2025, `tjmg.jus.br`). Ou seja, quando TJMG virar prioridade, o scraper
+construído para o eproc do TJSP (`lib/scraper`, fatia 1) é o ponto de partida natural — mesmo sistema por
+trás, ajuste incremental de portal/seletores em vez de um scraper novo do zero contra um portal
+desconhecido. Não é trabalho desta fatia; só um registro para não redescobrir isso depois.
