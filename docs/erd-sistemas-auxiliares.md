@@ -108,22 +108,51 @@ Revogar/remover → `organizationMembership.deleted` → desativa a membership.
 ## 6. Billing (Stripe)
 Assinatura **por tenant**; `Stripe Customer = tenant`.
 
+> ⚠️ **Atualizado (FLO-71).** A versão anterior desta seção descrevia entitlements
+> granulares por recurso (`oab_limit`, `source_limit`, `seat_limit`, `retention`).
+> Esse modelo **nunca foi implementado** — o que existe em produção (`internal/billing`)
+> é precificação **por processo**, descrita abaixo. O card que propunha os 4 limites
+> granulares (FLO-60) foi cancelado por divergir do que já estava em produção.
+
 ### 6.1 Modelo
-Plano/Preço vivem no Stripe; o BE guarda o mapeamento `price_id → plano` e os **entitlements** (limites: nº OABs,
-nº fontes, retenção, assentos). `subscription` espelha o Stripe: `status` (`trialing/active/past_due/canceled`),
-`plan`, `current_period_end`, `stripe_customer_id`, `stripe_subscription_id`.
+Stripe continua fonte de verdade do **pagamento** (cobrança, fatura, ciclo de vida da
+assinatura); o BE é fonte de verdade do **catálogo** — o que é um plano — e da
+**política de trial**. Stripe só fornece, por plano, o `price_id` do Checkout.
+
+- **`plan`** (catálogo local, migration 0037): `code`, `name`, `min_processes`,
+  `max_processes` (nil = sem teto, plano Enterprise), `price_per_process_cents`,
+  `stripe_price_id` (nil = plano ainda sem Checkout price vinculado), `active`.
+- **`subscription`** espelha o Stripe (`status`: `trialing/active/past_due/canceled`,
+  `stripe_customer_id`, `stripe_subscription_id`, `current_period_end`) **e** referencia
+  o catálogo local: `plan_id` (FK pro `plan` resolvido a partir do `price_id` — nil até o
+  próximo evento `customer.subscription.*` reprojetar, migration 0037),
+  `custom_price_per_process_cents` (override negociado pra tenant fora da tabela padrão —
+  nil = usa o preço do plano), `trial_ends_at` (fim da janela de trial, migration 0038).
+- **O único entitlement do v0** é `active_process_limit` — o teto de processos ATIVOS
+  do tenant, resolvido combinando `subscription` + `plan` via `effectiveEntitlement()`
+  (`internal/billing/domain.go`): `activeProcessLimit = plan.MaxProcesses` (ou "sem
+  limite" quando nil); o preço por processo é `subscription.CustomPricePerProcessCents`
+  quando setado, senão `plan.PricePerProcessCents`.
+- **Fail-closed por `Status`** (`internal/billing/entitlement.go`, `ActiveProcessLimit`):
+  sem assinatura (`ErrSubscriptionNotFound`), `canceled`, `past_due`, ou `trialing` com
+  `trial_ends_at` já vencido → limite **0**. Só `active` ou `trialing` dentro da janela
+  resolvem o limite real via `effectiveEntitlement`.
 
 ### 6.2 Fluxo
 1. Admin abre Billing → BE cria/reusa o Customer e abre **Checkout Session** (ou **Customer Portal**).
 2. O BE **não confia no redirect de sucesso** — confia no webhook.
 3. `internal/billing` consome (assinatura verificada, `event.id` = idempotência): `checkout.session.completed`,
-   `customer.subscription.created/updated` → atualiza `subscription`+entitlements → `billing.subscription_activated`
-   / `billing.subscription_updated`; `customer.subscription.deleted` → `billing.subscription_canceled`;
-   `invoice.payment_failed` → `billing.payment_failed` (+ notificação + estado `past_due`).
+   `customer.subscription.created/updated` → atualiza `subscription` (incl. `plan_id` resolvido do `price_id`) →
+   `billing.subscription_activated` / `billing.subscription_updated`; `customer.subscription.deleted` →
+   `billing.subscription_canceled`; `invoice.payment_failed` → grava `past_due` e emite `billing.payment_failed`
+   na mesma tx.
+4. Onboarding provisiona trial automaticamente (`identity.tenant_provisioned` → `billing` aplica a `trial_policy`,
+   migration 0038); `billing.trial_ending_soon` é agendado via outbox `process_at` e vira aviso in-app.
 
 ### 6.3 Gating
-Plano + entitlements lidos na borda para permitir/negar ações (ex.: N-ésima OAB acima do limite → erro tipado
-`FORBIDDEN`/`RATE_LIMITED`). O FE lê o plano para esconder/upsell. Fonte de verdade do entitlement é o BE.
+`active_process_limit` lido na borda (via `EntitlementAdapter`, injetado em `acquisition`) para permitir/negar
+a ativação de nova integração — acima do limite → erro tipado `FORBIDDEN`/`RATE_LIMITED`. O FE lê o plano/limite
+para esconder/upsell. Fonte de verdade do entitlement é o BE.
 
 ### 6.4 Segurança
 `/webhooks/stripe`, assinatura verificada com o signing secret (corpo raw), idempotência por `event.id`.
@@ -151,8 +180,13 @@ na mesma porta.
   `QUEUED/SENT/FAILED/BOUNCED`, `provider_message_id`, `error`). Dedup por `processed_event` no listener. Webhooks do
   Resend (bounce/complaint) atualizam a `notification_delivery`.
 - **Templates:** React Email, identidade "Ledger" (ver ERD FE).
-- **Casos v0:** prazos / novas publicações (do `acquisition`), billing (`payment_failed`, `subscription_activated`),
-  `member_joined`. **Convites continuam e-mail nativo do Clerk** (fora deste domínio).
+- **Casos v0:** prazos / novas publicações (do `acquisition`), billing (`trial_ending_soon`, `payment_failed` — hoje
+  só in-app, ver §12), `member_joined` (via e-mail, o único produtor no caminho genérico `notification.requested`
+  hoje). **Convites continuam e-mail nativo do Clerk** (fora deste domínio).
+- **Preferências (FLO-59, implementado):** `GET/PUT /v1/notifications/preferences` — o usuário liga/desliga o canal
+  EMAIL por tipo de aviso (`notification_preference.channels`); ausência de override = todos os canais habilitados
+  (default). Só o canal EMAIL é de fato verificado antes do envio hoje (`channelEnabled` em `domain.go`) — avisos
+  IN_APP não respeitam preferência ainda.
 
 > ⚠️ **Colisão de nome a resolver.** O slice `acquisition` já tem uma tabela **`notification` = intimação judicial**
 > (conceito de domínio, não "aviso ao usuário"). Recomenda-se **renomear a judicial para `intimation`** e reservar
@@ -167,9 +201,12 @@ Todas com `tenant_id` + RLS, exceto onde indicado. Enums = `text` + CHECK.
 - **`tenant` / `organization_profile`** — + `cnpj`, `legal_name` (razão social), `trade_name` (nome fantasia),
   `address` (jsonb: cep, logradouro, numero, complemento, bairro, cidade, uf), `onboarding_completed_at`.
 - **`membership`** — `tenant_id`, `app_user_id`, `role` (`ADMIN|MEMBER`), `status`, `clerk_membership_id`, timestamps.
-- **`subscription`** — `tenant_id` (unique), `stripe_customer_id`, `stripe_subscription_id`, `status`, `plan`,
-  `current_period_end`; entitlements (colunas ou tabela `entitlement`): `oab_limit`, `source_limit`, `seat_limit`,
-  `retention`.
+- **`plan`** (migration 0037) — `code`, `name`, `min_processes`, `max_processes` (nullable), `price_per_process_cents`,
+  `stripe_price_id` (nullable), `active`.
+- **`subscription`** — `tenant_id` (unique), `stripe_customer_id`, `stripe_subscription_id`, `status`, `plan_id` (FK
+  `plan`, nullable), `custom_price_per_process_cents` (nullable), `trial_ends_at` (nullable, migration 0038),
+  `current_period_end`. `active_process_limit` (o único entitlement do v0) não é coluna própria — é resolvido em
+  runtime por `effectiveEntitlement(subscription, plan)` (§6.1), nunca persistido.
 - **`notification`** (aux) — `tenant_id`, `audience`/`recipient_user_id`, `type`, `payload` (jsonb), `status`,
   `created_at`.
 - **`notification_delivery`** — `notification_id`, `channel` (`EMAIL|IN_APP|SMS|PUSH`), `status`
@@ -214,7 +251,8 @@ resolve preferências/audiência → cria `notification` + `notification_deliver
 - **Renomear a `notification` judicial → `intimation`** (§7) para liberar o nome ao domínio de avisos.
 - Canais do Notifications no v0: e-mail garantido; in-app logo a seguir (feed que o FE lê).
 - PIX/boleto (provedor BR) atrás do `BillingGateway` (§6.6).
-- Granularidade de entitlements, trial/dunning.
+- **Fan-out de e-mail do `payment_failed` por admin** (FLO-69, aberto): hoje o aviso é só in-app tenant-level —
+  `billing` não tem (e não deveria ter, por regra de dependência de slice) acesso à lista de admins do tenant.
 - Onboarding: viver em `internal/identity` ou slice próprio `internal/onboarding`? (v0: dentro de identity).
 
 ## 13. Ordem de implementação (fatias verticais)
