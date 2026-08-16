@@ -85,3 +85,70 @@ func TestTemplateComposer_UnknownAgent(t *testing.T) {
 		t.Fatal("Compose(unknown) error = nil, want invalid")
 	}
 }
+
+// The summarize_process template renders the full process context (identification +
+// andamentos + intimações + prazos + RAG chunks) and pins its version. Unknown agent
+// must stay a typed invalid.
+func TestTemplateComposer_ComposeProcess(t *testing.T) {
+	c := NewTemplateComposer()
+	out, err := c.ComposeProcess(AgentSummarizeProcess, ProcessContext{
+		CNJNumber: "0000001-23.2026.8.26.0001",
+		Court:     "TJSP",
+		Degree:    "G1",
+		Class:     "Procedimento Comum",
+		Subject:   "Contrato",
+		Lifecycle: "ACTIVE",
+		RecentMovements: []DocketEntryCtx{
+			{OccurredAt: "2026-08-01", Text: "Partes intimadas para manifestação"},
+		},
+		ActiveIntimations: []IntimationCtx{
+			{Type: "INTIMACAO", Teor: "Manifeste-se sobre a contestação", DeadlineDays: 5},
+		},
+		OpenDeadlines: []DeadlineCtx{
+			{Kind: "MANIFESTACAO", EndDate: "2026-08-04", DaysRemaining: 3, Counting: "BUSINESS"},
+		},
+		DocumentChunks: []string{"trecho do contrato"},
+	})
+	if err != nil {
+		t.Fatalf("ComposeProcess() error = %v", err)
+	}
+
+	if out.PromptVersion != "process_summary/v1" {
+		t.Errorf("PromptVersion = %q, want process_summary/v1", out.PromptVersion)
+	}
+	if strings.TrimSpace(out.System) == "" || strings.TrimSpace(out.User) == "" {
+		t.Fatalf("empty system/user: system=%q user=%q", out.System, out.User)
+	}
+	// The six output fields are instructed in the system prompt.
+	for _, want := range []string{"summary", "current_status", "key_dates_and_deadlines", "recent_movements", "risks", "recommended_actions"} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("system prompt missing %q output instruction\n---\n%s", want, out.System)
+		}
+	}
+	// Context injected.
+	for _, want := range []string{"0000001-23.2026.8.26.0001", "TJSP", "Partes intimadas para manifestação", "Manifeste-se sobre a contestação", "vence em 2026-08-04", "Trecho 1: trecho do contrato"} {
+		if !strings.Contains(out.User, want) {
+			t.Errorf("user prompt missing %q\n---\n%s", want, out.User)
+		}
+	}
+	// No playbook → the playbook SECTION (with examples/preferences) is not injected.
+	if strings.Contains(out.System, "Siga o playbook do escritório (exemplos e preferências)") {
+		t.Errorf("system injected playbook section with empty Playbook")
+	}
+}
+
+func TestTemplateComposer_ComposeProcess_UnknownAgent(t *testing.T) {
+	if _, err := NewTemplateComposer().ComposeProcess("nope", ProcessContext{}); err == nil {
+		t.Fatal("ComposeProcess(unknown) error = nil, want invalid")
+	}
+}
+
+func TestTemplateComposer_ComposeProcess_EmptyContext(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeProcess(AgentSummarizeProcess, ProcessContext{})
+	if err != nil {
+		t.Fatalf("ComposeProcess() error = %v", err)
+	}
+	if !strings.Contains(out.User, "sem contexto adicional") {
+		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
+	}
+}

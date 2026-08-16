@@ -388,6 +388,10 @@ type readRepo interface {
 	ListSyncRunsByJob(ctx context.Context, tenantID, jobID string) ([]ReconciliationRunView, error)
 	ListProcessosBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]ProcessoLineView, error)
 	ListIntimacoesBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]IntimacaoLineView, error)
+	// GetResumoContext assembles the full context for the AI process summary (last 10
+	// andamentos, active intimações, open prazos + the court_record identification and
+	// any cached ai_resume). Used by ResumoUseCase through the resumoReader port.
+	GetResumoContext(ctx context.Context, tenantID, courtRecordID string) (ProcessoResumoCtx, error)
 }
 
 // ReadUseCase serves the screen reads. It is a pagination policy over readRepo: it
@@ -624,6 +628,13 @@ func (uc *ReadUseCase) IntimacoesSummary(ctx context.Context, tenantID string) (
 // typed 404 and a non-uuid id to the typed 400.
 func (uc *ReadUseCase) Processo(ctx context.Context, tenantID, id string) (ProcessoView, error) {
 	return uc.repo.GetProcesso(ctx, tenantID, id)
+}
+
+// GetResumoContext returns the full process context for the AI summary (identification,
+// last 10 andamentos, active intimações, open prazos, cached ai_resume), tenant-scoped.
+// It satisfies the resumoReader port the ResumoUseCase drives.
+func (uc *ReadUseCase) GetResumoContext(ctx context.Context, tenantID, courtRecordID string) (ProcessoResumoCtx, error) {
+	return uc.repo.GetResumoContext(ctx, tenantID, courtRecordID)
 }
 
 // Partes returns the process's parties (behind the court_record :id), bucketed by role

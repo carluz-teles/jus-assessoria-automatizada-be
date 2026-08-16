@@ -122,6 +122,9 @@ func (r *recordingReadRepo) ListProcessosBySyncRun(context.Context, string, stri
 func (r *recordingReadRepo) ListIntimacoesBySyncRun(context.Context, string, string) ([]IntimacaoLineView, error) {
 	return nil, nil
 }
+func (r *recordingReadRepo) GetResumoContext(context.Context, string, string) (ProcessoResumoCtx, error) {
+	return ProcessoResumoCtx{}, nil
+}
 
 // The use case forwards ?search to the repo and over-fetches one row (limit+1) to
 // detect the next page without a COUNT — the extra row is trimmed off the result.

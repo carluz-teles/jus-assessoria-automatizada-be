@@ -69,24 +69,26 @@ type CourtCase struct {
 }
 
 type CourtRecord struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       uuid.UUID          `json:"case_id"`
-	CnjNumber    string             `json:"cnj_number"`
-	Degree       string             `json:"degree"`
-	Court        string             `json:"court"`
-	Class        *string            `json:"class"`
-	Subject      *string            `json:"subject"`
-	ClaimValue   pgtype.Numeric     `json:"claim_value"`
-	Secrecy      string             `json:"secrecy"`
-	Lifecycle    string             `json:"lifecycle"`
-	Completeness float32            `json:"completeness"`
-	SyncPolicy   []byte             `json:"sync_policy"`
-	NextSyncAt   pgtype.Timestamptz `json:"next_sync_at"`
-	LastSyncedAt []byte             `json:"last_synced_at"`
-	JudgingBody  *string            `json:"judging_body"`
-	FiledAt      pgtype.Date        `json:"filed_at"`
-	SyncRunID    pgtype.UUID        `json:"sync_run_id"`
+	ID                  uuid.UUID          `json:"id"`
+	TenantID            uuid.UUID          `json:"tenant_id"`
+	CaseID              uuid.UUID          `json:"case_id"`
+	CnjNumber           string             `json:"cnj_number"`
+	Degree              string             `json:"degree"`
+	Court               string             `json:"court"`
+	Class               *string            `json:"class"`
+	Subject             *string            `json:"subject"`
+	ClaimValue          pgtype.Numeric     `json:"claim_value"`
+	Secrecy             string             `json:"secrecy"`
+	Lifecycle           string             `json:"lifecycle"`
+	Completeness        float32            `json:"completeness"`
+	SyncPolicy          []byte             `json:"sync_policy"`
+	NextSyncAt          pgtype.Timestamptz `json:"next_sync_at"`
+	LastSyncedAt        []byte             `json:"last_synced_at"`
+	JudgingBody         *string            `json:"judging_body"`
+	FiledAt             pgtype.Date        `json:"filed_at"`
+	SyncRunID           pgtype.UUID        `json:"sync_run_id"`
+	AiResume            []byte             `json:"ai_resume"`
+	AiResumeGeneratedAt pgtype.Timestamptz `json:"ai_resume_generated_at"`
 }
 
 type Deadline struct {

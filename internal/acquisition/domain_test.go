@@ -302,6 +302,10 @@ func (m *mockRepo) CountIntimacoesByProcesso(_ context.Context, _, _ string) (in
 	return 0, nil
 }
 
+func (m *mockRepo) GetResumoContext(_ context.Context, _, _ string) (ProcessoResumoCtx, error) {
+	return ProcessoResumoCtx{}, nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {

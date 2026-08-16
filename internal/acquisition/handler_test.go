@@ -161,7 +161,7 @@ func newAppWithReader(uc handlerUC, rd reader, role, tenant string) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: role, tenant: tenant}))
-	NewHandler(uc, rd).RegisterV1(v1)
+	NewHandler(uc, rd, nil).RegisterV1(v1)
 	return app
 }
 
@@ -1278,5 +1278,71 @@ func TestHandler_IntimacoesSummary_OK(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %s\ngot: %s", want, body)
 		}
+	}
+}
+
+// fakeResumer is the resumer port fake for the /resume route.
+type fakeResumer struct {
+	view ProcessResumoView
+	err  error
+}
+
+func (f fakeResumer) Resume(_ context.Context, _, _ string) (ProcessResumoView, error) {
+	return f.view, f.err
+}
+
+// GET /v1/processos/:id/resume returns the AI summary view when the resumer port is
+// wired. tenant comes from the principal; the resumer is invoked with it.
+func TestHandler_Resume_OK(t *testing.T) {
+	t.Parallel()
+
+	rs := fakeResumer{view: ProcessResumoView{
+		Summary:              "Processo em fase de contestação",
+		CurrentStatus:        "Aguardando manifestação",
+		KeyDatesAndDeadlines: []KeyDate{{Kind: "MANIFESTACAO", EndDate: "2026-08-04", DaysRemaining: 3, Urgency: "DUE_SOON", Source: "deadline"}},
+		RecentMovements:      []RecentMovement{},
+		Risks:                []Risk{},
+		RecommendedActions:   []RecommendedAction{},
+		GeneratedAt:          time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+	}}
+
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
+	})
+	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: "LAWYER", tenant: "tenant-9"}))
+	NewHandler(&fakeHandlerUC{}, &recordingReader{}, rs).RegisterV1(v1)
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/rec-1/resume", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	for _, want := range []string{`"summary":"Processo em fase de contestação"`, `"current_status":"Aguardando manifestação"`, `"days_remaining":3`, `"key_dates_and_deadlines":`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+	// Slices must serialize as [] (never null) for a stable FE shape.
+	if strings.Contains(body, `"recent_movements":null`) || strings.Contains(body, `"risks":null`) {
+		t.Errorf("slices serialized as null\ngot: %s", body)
+	}
+}
+
+// GET /v1/processos/:id/resume with no resumer wired is a typed 501 — the route
+// exists but no provider is configured.
+func TestHandler_Resume_NoResumer_501(t *testing.T) {
+	t.Parallel()
+
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
+	})
+	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: "LAWYER", tenant: "tenant-9"}))
+	NewHandler(&fakeHandlerUC{}, &recordingReader{}, nil).RegisterV1(v1)
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/rec-1/resume", "", "jwt")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", status, body)
+	}
+	if !strings.Contains(body, `"kind":"SERVICE_UNAVAILABLE"`) {
+		t.Errorf("body missing kind SERVICE_UNAVAILABLE\ngot: %s", body)
 	}
 }

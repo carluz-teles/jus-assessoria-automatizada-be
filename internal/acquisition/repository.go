@@ -106,6 +106,10 @@ type Repository interface {
 	SummarizeIntimacoes(ctx context.Context, tenantID string) (IntimacoesSummaryView, error)
 	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	CountIntimacoesByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
+	// GetResumoContext assembles the full context for the AI process summary (base row
+	// + cached ai_resume + last 10 andamentos + active intimações + open prazos). Used
+	// by the resumo use case through the readRepo port.
+	GetResumoContext(ctx context.Context, tenantID, courtRecordID string) (ProcessoResumoCtx, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -1802,6 +1806,88 @@ func timestampPtr(ts pgtype.Timestamptz) *time.Time {
 	}
 	t := ts.Time
 	return &t
+}
+
+// GetResumoContext assembles the full context for the AI process summary (GET
+// /v1/processos/:id/resume): the court_record identification row plus the cached
+// ai_resume/generated_at, and the three aggregated slices (last 10 andamentos, active
+// intimações, open prazos) read as narrow queries. A non-uuid :id is client input →
+// the typed KindInvalid (→ 400); a miss — or a foreign tenant's row — is the typed
+// ErrProcessoNotFound (→ 404), never (nil, nil).
+func (r *pgRepository) GetResumoContext(ctx context.Context, tenantID, courtRecordID string) (ProcessoResumoCtx, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return ProcessoResumoCtx{}, database.WrapInfra(err)
+	}
+	rid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		return ProcessoResumoCtx{}, apperr.NewInvalid("id de processo inválido")
+	}
+
+	base, err := r.q.GetResumoContext(ctx, acquisitiondb.GetResumoContextParams{ID: rid, TenantID: tid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProcessoResumoCtx{}, ErrProcessoNotFound
+	}
+	if err != nil {
+		return ProcessoResumoCtx{}, database.WrapInfra(err)
+	}
+
+	movRows, err := r.q.GetResumoMovements(ctx, acquisitiondb.GetResumoMovementsParams{CourtRecordID: rid, TenantID: tid})
+	if err != nil {
+		return ProcessoResumoCtx{}, database.WrapInfra(err)
+	}
+	intRows, err := r.q.GetResumoActiveIntimations(ctx, acquisitiondb.GetResumoActiveIntimationsParams{CourtRecordID: rid, TenantID: tid})
+	if err != nil {
+		return ProcessoResumoCtx{}, database.WrapInfra(err)
+	}
+	dlRows, err := r.q.GetResumoOpenDeadlines(ctx, acquisitiondb.GetResumoOpenDeadlinesParams{CourtRecordID: rid, TenantID: tid})
+	if err != nil {
+		return ProcessoResumoCtx{}, database.WrapInfra(err)
+	}
+
+	ctxData := ProcessoResumoCtx{
+		ID:                  base.ID.String(),
+		CNJNumber:           base.CnjNumber,
+		Court:               base.Court,
+		Degree:              base.Degree,
+		Class:               deref(base.Class),
+		Subject:             deref(base.Subject),
+		ClaimValue:          numericStr(base.ClaimValue),
+		Lifecycle:           base.Lifecycle,
+		FiledAt:             datePtr(base.FiledAt),
+		JudgingBody:         deref(base.JudgingBody),
+		AIResume:            base.AiResume,
+		AIResumeGeneratedAt: timestampPtr(base.AiResumeGeneratedAt),
+		RecentMovements:     make([]RawDocketEntry, 0, len(movRows)),
+		ActiveIntimations:   make([]RawIntimation, 0, len(intRows)),
+		OpenDeadlines:       make([]RawDeadline, 0, len(dlRows)),
+	}
+	for _, m := range movRows {
+		ctxData.RecentMovements = append(ctxData.RecentMovements, RawDocketEntry{
+			OccurredAt: m.OccurredAt.Time,
+			Text:       m.Text,
+		})
+	}
+	for _, i := range intRows {
+		days := 0
+		if i.DeadlineDays != nil {
+			days = int(*i.DeadlineDays)
+		}
+		ctxData.ActiveIntimations = append(ctxData.ActiveIntimations, RawIntimation{
+			Type:         deref(i.Type),
+			Teor:         i.Teor,
+			DeadlineDays: days,
+		})
+	}
+	for _, d := range dlRows {
+		ctxData.OpenDeadlines = append(ctxData.OpenDeadlines, RawDeadline{
+			Kind:          deref(d.Kind),
+			EndDate:       d.EndDate.Time,
+			DaysRemaining: int(d.DaysLeft),
+			Counting:      d.Counting,
+		})
+	}
+	return ctxData, nil
 }
 
 // numericStr lifts a nullable numeric column (claim_value, the valor da causa) to a
