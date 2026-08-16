@@ -146,10 +146,11 @@ func TestNotifications_Read_PerUserReadState(t *testing.T) {
 	}
 
 	// A's full list marks n1 read, the other unread.
-	items, _, err := uc.List(ctx, readListQ(tenantID, userA, false))
+	res, err := uc.List(ctx, readListQ(tenantID, userA, false))
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
+	items := res.Items
 	if len(items) != 2 {
 		t.Fatalf("userA list = %d rows, want 2", len(items))
 	}
@@ -162,10 +163,11 @@ func TestNotifications_Read_PerUserReadState(t *testing.T) {
 	}
 
 	// ?unread=true returns only the one A has not read (not n1).
-	unreadItems, _, err := uc.List(ctx, readListQ(tenantID, userA, true))
+	unreadRes, err := uc.List(ctx, readListQ(tenantID, userA, true))
 	if err != nil {
 		t.Fatalf("List unread: %v", err)
 	}
+	unreadItems := unreadRes.Items
 	if len(unreadItems) != 1 || unreadItems[0].ID == n1 {
 		t.Fatalf("userA unread list = %+v, want the single non-n1 aviso", unreadItems)
 	}
@@ -206,10 +208,11 @@ func TestNotifications_Read_ExcludesEmailAvisos(t *testing.T) {
 	}
 
 	// The list returns only the in-app aviso, never the empty-text email one.
-	items, _, err := uc.List(ctx, readListQ(tenantID, userA, false))
+	itemsRes, err := uc.List(ctx, readListQ(tenantID, userA, false))
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
+	items := itemsRes.Items
 	if len(items) != 1 || items[0].ID != inApp {
 		t.Fatalf("list = %+v, want only the in-app aviso %s", items, inApp)
 	}
@@ -232,10 +235,11 @@ func TestNotifications_Read_KeysetPaging(t *testing.T) {
 	q := readListQ(tenantID, userA, false)
 	q.Limit = 2
 
-	page1, hasMore, err := uc.List(ctx, q)
+	res, err := uc.List(ctx, q)
 	if err != nil {
 		t.Fatalf("List page1: %v", err)
 	}
+	page1, hasMore := res.Items, res.HasMore
 	if len(page1) != 2 || !hasMore {
 		t.Fatalf("page1 = %d rows hasMore=%v, want 2/true", len(page1), hasMore)
 	}
@@ -244,10 +248,11 @@ func TestNotifications_Read_KeysetPaging(t *testing.T) {
 	q.LastCreated = last.CreatedAt.Format(time.RFC3339Nano)
 	q.LastID = last.ID
 
-	page2, hasMore, err := uc.List(ctx, q)
+	page2Res, err := uc.List(ctx, q)
 	if err != nil {
 		t.Fatalf("List page2: %v", err)
 	}
+	page2, hasMore := page2Res.Items, page2Res.HasMore
 	if len(page2) != 1 || hasMore {
 		t.Fatalf("page2 = %d rows hasMore=%v, want 1/false", len(page2), hasMore)
 	}

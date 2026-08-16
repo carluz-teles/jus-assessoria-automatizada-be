@@ -204,14 +204,17 @@ type Querier interface {
 	// Retorna o id para log/telemetria. $1..$6 são as colunas na ordem do INSERT.
 	InsertTaskSuggestion(ctx context.Context, arg InsertTaskSuggestionParams) (uuid.UUID, error)
 	// Selectable ?court values for the prazos agenda: the distinct courts of the tenant's
-	// intimated court records (the same join the list uses), ordered by name.
+	// intimated court records (the same join the list uses), ordered by name
+	// (case-insensitive). Same DISTINCT-inner / ORDER BY-outer shape as ListPrazoKinds.
 	ListPrazoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error)
 	// ── filter options (the envelope's selectable sets) ──────────────────────────
 	// Distinct-value reads that back the prazos/tasks agenda envelopes' filter chips.
 	// Each is tenant-scoped (barrier 1) and mirrors the list's own predicates, so the
 	// options reflect what the list can actually show. Empty values are skipped in Go.
 	// Selectable ?kind values for the prazos agenda: the distinct kinds of the tenant's
-	// prazos, ordered by name.
+	// prazos, ordered by name (case-insensitive). The DISTINCT lives in the inner query —
+	// a bare SELECT DISTINCT with ORDER BY on an expression not in the select list is
+	// rejected by Postgres — and the outer layer orders without re-distincting.
 	ListPrazoKinds(ctx context.Context, tenantID uuid.UUID) ([]*string, error)
 	// The global agenda (GET /v1/prazos): the tenant's prazos, soonest vencimento first,
 	// with the process context (cnj_number/court) joined in. Optional filters: @status ('' =
@@ -242,9 +245,11 @@ type Querier interface {
 	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
 	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
 	// Selectable ?assignee values for the task agenda ("meus prazos"): the distinct
-	// responsáveis of the tenant's tasks, deduped by id, ordered by name. The LEFT JOIN
-	// app_user resolves a name when the id is a known user (the column is a bare uuid with
-	// no FK); an unknown id yields an empty name — the FE labels it "ID sem nome".
+	// responsáveis of the tenant's tasks, deduped by id, ordered by name (case-insensitive).
+	// The LEFT JOIN app_user resolves a name when the id is a known user (the column is a bare
+	// uuid with no FK); an unknown id yields an empty name — the FE labels it "ID sem nome".
+	// Same DISTINCT-inner / ORDER BY-outer shape as ListPrazoKinds (Postgres rejects a bare
+	// DISTINCT with ORDER BY on an expression outside the select list).
 	ListTaskAssignees(ctx context.Context, tenantID uuid.UUID) ([]ListTaskAssigneesRow, error)
 	// One task's checklist, ordered by position (the detail view). Scoped to (task_id, tenant_id)
 	// (barrier 1). An empty checklist is 0 rows (not an error). $1 = task_id, $2 = tenant_id.

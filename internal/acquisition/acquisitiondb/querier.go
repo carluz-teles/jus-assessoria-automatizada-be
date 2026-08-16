@@ -292,7 +292,7 @@ type Querier interface {
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)
 	// Selectable ?court values for the intimações inbox: the distinct courts of the
-	// tenant's intimated court records, ordered by name.
+	// tenant's intimated court records, ordered by name (case-insensitive).
 	ListIntimacaoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error)
 	// The intimações inbox: the tenant's intimations, newest availability first, with
 	// the court record's number/court/degree joined in. Descending keyset on
@@ -319,8 +319,9 @@ type Querier interface {
 	ListPartiesByProcesso(ctx context.Context, arg ListPartiesByProcessoParams) ([]ListPartiesByProcessoRow, error)
 	// Selectable ?assignee values for the processes screen: the responsáveis of the
 	// tenant's live processes, joined at case level (court_record → court_case →
-	// app_user) exactly like the list's projection, deduped by id, ordered by name.
-	// The list filters on cc.assigned_user_id, so an unassigned case yields no option.
+	// app_user) exactly like the list's projection, deduped by id, ordered by name
+	// (case-insensitive). The list filters on cc.assigned_user_id, so an unassigned case
+	// yields no option.
 	ListProcessoAssignees(ctx context.Context, tenantID uuid.UUID) ([]ListProcessoAssigneesRow, error)
 	// ── filter options (the envelope's selectable sets) ──────────────────────────
 	// Distinct-value reads that back the list envelopes' filter chips. Each is
@@ -329,10 +330,12 @@ type Querier interface {
 	// reflect what the list can actually show. Empty values are skipped in Go (a blank
 	// chip is never selectable).
 	// Selectable ?court values for the processes screen: the distinct courts of the
-	// tenant's live (ACTIVE) records, ordered by name.
+	// tenant's live (ACTIVE) records, ordered by name (case-insensitive). The DISTINCT
+	// lives in the inner query — a bare SELECT DISTINCT with ORDER BY on an expression not
+	// in the select list is rejected by Postgres — and the outer layer orders.
 	ListProcessoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error)
 	// Selectable ?degree values for the processes screen: the distinct degrees of the
-	// tenant's live (ACTIVE) records, ordered by name.
+	// tenant's live (ACTIVE) records, ordered by name (case-insensitive).
 	ListProcessoDegrees(ctx context.Context, tenantID uuid.UUID) ([]string, error)
 	// read-model queries (acquisition slice) — the screen reads, kept OFF the write
 	// path (docs: "leitura de tela usa read model, DTO por query dedicada"). Each is

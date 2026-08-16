@@ -152,43 +152,58 @@ WHERE i.tenant_id = $1
 
 -- name: ListProcessoCourts :many
 -- Selectable ?court values for the processes screen: the distinct courts of the
--- tenant's live (ACTIVE) records, ordered by name.
-SELECT DISTINCT cr.court
-FROM court_record cr
-WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-ORDER BY LOWER(cr.court) ASC;
+-- tenant's live (ACTIVE) records, ordered by name (case-insensitive). The DISTINCT
+-- lives in the inner query — a bare SELECT DISTINCT with ORDER BY on an expression not
+-- in the select list is rejected by Postgres — and the outer layer orders.
+SELECT court
+FROM (
+  SELECT DISTINCT cr.court
+  FROM court_record cr
+  WHERE cr.tenant_id = $1
+    AND cr.lifecycle = 'ACTIVE'
+) courts
+ORDER BY LOWER(court) ASC;
 
 -- name: ListProcessoDegrees :many
 -- Selectable ?degree values for the processes screen: the distinct degrees of the
--- tenant's live (ACTIVE) records, ordered by name.
-SELECT DISTINCT cr.degree
-FROM court_record cr
-WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-ORDER BY LOWER(cr.degree) ASC;
+-- tenant's live (ACTIVE) records, ordered by name (case-insensitive).
+SELECT degree
+FROM (
+  SELECT DISTINCT cr.degree
+  FROM court_record cr
+  WHERE cr.tenant_id = $1
+    AND cr.lifecycle = 'ACTIVE'
+) degrees
+ORDER BY LOWER(degree) ASC;
 
 -- name: ListProcessoAssignees :many
 -- Selectable ?assignee values for the processes screen: the responsáveis of the
 -- tenant's live processes, joined at case level (court_record → court_case →
--- app_user) exactly like the list's projection, deduped by id, ordered by name.
--- The list filters on cc.assigned_user_id, so an unassigned case yields no option.
-SELECT DISTINCT au.id, COALESCE(au.name, '') AS name
-FROM court_record cr
-JOIN court_case cc ON cc.id = cr.case_id
-JOIN app_user au ON au.id = cc.assigned_user_id
-WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-ORDER BY LOWER(COALESCE(au.name, '')) ASC;
+-- app_user) exactly like the list's projection, deduped by id, ordered by name
+-- (case-insensitive). The list filters on cc.assigned_user_id, so an unassigned case
+-- yields no option.
+SELECT id, name
+FROM (
+  SELECT DISTINCT au.id, COALESCE(au.name, '') AS name
+  FROM court_record cr
+  JOIN court_case cc ON cc.id = cr.case_id
+  JOIN app_user au ON au.id = cc.assigned_user_id
+  WHERE cr.tenant_id = $1
+    AND cr.lifecycle = 'ACTIVE'
+) assignees
+ORDER BY LOWER(name) ASC;
 
 -- name: ListIntimacaoCourts :many
 -- Selectable ?court values for the intimações inbox: the distinct courts of the
--- tenant's intimated court records, ordered by name.
-SELECT DISTINCT cr.court
-FROM intimation i
-JOIN court_record cr ON cr.id = i.court_record_id
-WHERE i.tenant_id = $1
-ORDER BY LOWER(cr.court) ASC;
+-- tenant's intimated court records, ordered by name (case-insensitive).
+SELECT court
+FROM (
+  SELECT DISTINCT cr.court
+  FROM intimation i
+  JOIN court_record cr ON cr.id = i.court_record_id
+  WHERE i.tenant_id = $1
+) courts
+ORDER BY LOWER(court) ASC;
 
 -- name: ListAndamentosByProcesso :many
 -- The "Andamentos" tab of one process: the court record's docket entries, newest

@@ -323,31 +323,45 @@ WHERE t.tenant_id = @tenant_id::uuid;
 
 -- name: ListPrazoKinds :many
 -- Selectable ?kind values for the prazos agenda: the distinct kinds of the tenant's
--- prazos, ordered by name.
-SELECT DISTINCT d.kind
-FROM deadline d
-WHERE d.tenant_id = @tenant_id::uuid
-  AND d.kind <> ''
-ORDER BY LOWER(d.kind) ASC;
+-- prazos, ordered by name (case-insensitive). The DISTINCT lives in the inner query —
+-- a bare SELECT DISTINCT with ORDER BY on an expression not in the select list is
+-- rejected by Postgres — and the outer layer orders without re-distincting.
+SELECT kind
+FROM (
+  SELECT DISTINCT d.kind
+  FROM deadline d
+  WHERE d.tenant_id = @tenant_id::uuid
+    AND d.kind <> ''
+) kinds
+ORDER BY LOWER(kind) ASC;
 
 -- name: ListPrazoCourts :many
 -- Selectable ?court values for the prazos agenda: the distinct courts of the tenant's
--- intimated court records (the same join the list uses), ordered by name.
-SELECT DISTINCT cr.court
-FROM deadline d
-JOIN court_record cr ON cr.id = d.court_record_id
-WHERE d.tenant_id = @tenant_id::uuid
-  AND cr.court <> ''
-ORDER BY LOWER(cr.court) ASC;
+-- intimated court records (the same join the list uses), ordered by name
+-- (case-insensitive). Same DISTINCT-inner / ORDER BY-outer shape as ListPrazoKinds.
+SELECT court
+FROM (
+  SELECT DISTINCT cr.court
+  FROM deadline d
+  JOIN court_record cr ON cr.id = d.court_record_id
+  WHERE d.tenant_id = @tenant_id::uuid
+    AND cr.court <> ''
+) courts
+ORDER BY LOWER(court) ASC;
 
 -- name: ListTaskAssignees :many
 -- Selectable ?assignee values for the task agenda ("meus prazos"): the distinct
--- responsáveis of the tenant's tasks, deduped by id, ordered by name. The LEFT JOIN
--- app_user resolves a name when the id is a known user (the column is a bare uuid with
--- no FK); an unknown id yields an empty name — the FE labels it "ID sem nome".
-SELECT DISTINCT t.assignee_user_id, COALESCE(au.name, '') AS name
-FROM task t
-LEFT JOIN app_user au ON au.id = t.assignee_user_id
-WHERE t.tenant_id = @tenant_id::uuid
-  AND t.assignee_user_id IS NOT NULL
-ORDER BY LOWER(COALESCE(au.name, '')) ASC;
+-- responsáveis of the tenant's tasks, deduped by id, ordered by name (case-insensitive).
+-- The LEFT JOIN app_user resolves a name when the id is a known user (the column is a bare
+-- uuid with no FK); an unknown id yields an empty name — the FE labels it "ID sem nome".
+-- Same DISTINCT-inner / ORDER BY-outer shape as ListPrazoKinds (Postgres rejects a bare
+-- DISTINCT with ORDER BY on an expression outside the select list).
+SELECT assignee_user_id, name
+FROM (
+  SELECT DISTINCT t.assignee_user_id, COALESCE(au.name, '') AS name
+  FROM task t
+  LEFT JOIN app_user au ON au.id = t.assignee_user_id
+  WHERE t.tenant_id = @tenant_id::uuid
+    AND t.assignee_user_id IS NOT NULL
+) assignees
+ORDER BY LOWER(name) ASC;

@@ -431,15 +431,18 @@ func (q *Queries) ListAndamentosByProcesso(ctx context.Context, arg ListAndament
 }
 
 const listIntimacaoCourts = `-- name: ListIntimacaoCourts :many
-SELECT DISTINCT cr.court
-FROM intimation i
-JOIN court_record cr ON cr.id = i.court_record_id
-WHERE i.tenant_id = $1
-ORDER BY LOWER(cr.court) ASC
+SELECT court
+FROM (
+  SELECT DISTINCT cr.court
+  FROM intimation i
+  JOIN court_record cr ON cr.id = i.court_record_id
+  WHERE i.tenant_id = $1
+) courts
+ORDER BY LOWER(court) ASC
 `
 
 // Selectable ?court values for the intimações inbox: the distinct courts of the
-// tenant's intimated court records, ordered by name.
+// tenant's intimated court records, ordered by name (case-insensitive).
 func (q *Queries) ListIntimacaoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
 	rows, err := q.db.Query(ctx, listIntimacaoCourts, tenantID)
 	if err != nil {
@@ -690,13 +693,16 @@ func (q *Queries) ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoe
 }
 
 const listProcessoAssignees = `-- name: ListProcessoAssignees :many
-SELECT DISTINCT au.id, COALESCE(au.name, '') AS name
-FROM court_record cr
-JOIN court_case cc ON cc.id = cr.case_id
-JOIN app_user au ON au.id = cc.assigned_user_id
-WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-ORDER BY LOWER(COALESCE(au.name, '')) ASC
+SELECT id, name
+FROM (
+  SELECT DISTINCT au.id, COALESCE(au.name, '') AS name
+  FROM court_record cr
+  JOIN court_case cc ON cc.id = cr.case_id
+  JOIN app_user au ON au.id = cc.assigned_user_id
+  WHERE cr.tenant_id = $1
+    AND cr.lifecycle = 'ACTIVE'
+) assignees
+ORDER BY LOWER(name) ASC
 `
 
 type ListProcessoAssigneesRow struct {
@@ -706,8 +712,9 @@ type ListProcessoAssigneesRow struct {
 
 // Selectable ?assignee values for the processes screen: the responsáveis of the
 // tenant's live processes, joined at case level (court_record → court_case →
-// app_user) exactly like the list's projection, deduped by id, ordered by name.
-// The list filters on cc.assigned_user_id, so an unassigned case yields no option.
+// app_user) exactly like the list's projection, deduped by id, ordered by name
+// (case-insensitive). The list filters on cc.assigned_user_id, so an unassigned case
+// yields no option.
 func (q *Queries) ListProcessoAssignees(ctx context.Context, tenantID uuid.UUID) ([]ListProcessoAssigneesRow, error) {
 	rows, err := q.db.Query(ctx, listProcessoAssignees, tenantID)
 	if err != nil {
@@ -730,11 +737,14 @@ func (q *Queries) ListProcessoAssignees(ctx context.Context, tenantID uuid.UUID)
 
 const listProcessoCourts = `-- name: ListProcessoCourts :many
 
-SELECT DISTINCT cr.court
-FROM court_record cr
-WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-ORDER BY LOWER(cr.court) ASC
+SELECT court
+FROM (
+  SELECT DISTINCT cr.court
+  FROM court_record cr
+  WHERE cr.tenant_id = $1
+    AND cr.lifecycle = 'ACTIVE'
+) courts
+ORDER BY LOWER(court) ASC
 `
 
 // ── filter options (the envelope's selectable sets) ──────────────────────────
@@ -744,7 +754,9 @@ ORDER BY LOWER(cr.court) ASC
 // reflect what the list can actually show. Empty values are skipped in Go (a blank
 // chip is never selectable).
 // Selectable ?court values for the processes screen: the distinct courts of the
-// tenant's live (ACTIVE) records, ordered by name.
+// tenant's live (ACTIVE) records, ordered by name (case-insensitive). The DISTINCT
+// lives in the inner query — a bare SELECT DISTINCT with ORDER BY on an expression not
+// in the select list is rejected by Postgres — and the outer layer orders.
 func (q *Queries) ListProcessoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
 	rows, err := q.db.Query(ctx, listProcessoCourts, tenantID)
 	if err != nil {
@@ -766,15 +778,18 @@ func (q *Queries) ListProcessoCourts(ctx context.Context, tenantID uuid.UUID) ([
 }
 
 const listProcessoDegrees = `-- name: ListProcessoDegrees :many
-SELECT DISTINCT cr.degree
-FROM court_record cr
-WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-ORDER BY LOWER(cr.degree) ASC
+SELECT degree
+FROM (
+  SELECT DISTINCT cr.degree
+  FROM court_record cr
+  WHERE cr.tenant_id = $1
+    AND cr.lifecycle = 'ACTIVE'
+) degrees
+ORDER BY LOWER(degree) ASC
 `
 
 // Selectable ?degree values for the processes screen: the distinct degrees of the
-// tenant's live (ACTIVE) records, ordered by name.
+// tenant's live (ACTIVE) records, ordered by name (case-insensitive).
 func (q *Queries) ListProcessoDegrees(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
 	rows, err := q.db.Query(ctx, listProcessoDegrees, tenantID)
 	if err != nil {
