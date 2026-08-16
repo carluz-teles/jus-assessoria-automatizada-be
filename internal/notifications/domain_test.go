@@ -32,6 +32,9 @@ type mockRepo struct {
 	findEmail          func(ctx context.Context, tx database.Tx, tenantID, appUserID string) (string, error)
 	findByProviderID   func(ctx context.Context, providerMessageID string) (*NotificationDelivery, error)
 	hasRunningBackfill func(ctx context.Context, tx database.Tx, tenantID string) (bool, error)
+	findPrefChannels   func(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string) ([]string, error)
+	listPrefs          func(ctx context.Context, tenantID, appUserID string) ([]NotificationPreference, error)
+	upsertPref         func(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string, channels []string) (*NotificationPreference, error)
 
 	insertedNotif    []InsertNotificationParams
 	insertedDelivery []InsertDeliveryParams
@@ -63,6 +66,24 @@ func (m *mockRepo) FindDeliveryByProviderMessageID(ctx context.Context, provider
 
 func (m *mockRepo) HasRunningBackfillForTenant(ctx context.Context, tx database.Tx, tenantID string) (bool, error) {
 	return m.hasRunningBackfill(ctx, tx, tenantID)
+}
+
+// FindPreferenceChannels defaults to ErrPreferenceNotFound (no override saved) when
+// the test does not set findPrefChannels — the pre-slice default every other write
+// test relies on, so tests that never mention preferences keep behaving unchanged.
+func (m *mockRepo) FindPreferenceChannels(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string) ([]string, error) {
+	if m.findPrefChannels == nil {
+		return nil, ErrPreferenceNotFound
+	}
+	return m.findPrefChannels(ctx, tx, tenantID, appUserID, notifType)
+}
+
+func (m *mockRepo) ListPreferences(ctx context.Context, tenantID, appUserID string) ([]NotificationPreference, error) {
+	return m.listPrefs(ctx, tenantID, appUserID)
+}
+
+func (m *mockRepo) UpsertPreference(ctx context.Context, tx database.Tx, tenantID, appUserID, notifType string, channels []string) (*NotificationPreference, error) {
+	return m.upsertPref(ctx, tx, tenantID, appUserID, notifType, channels)
 }
 
 // The in-app inbox read side (slice 2a) is exercised by ReadUseCase's own tests
@@ -1018,4 +1039,128 @@ func TestWebhookUseCase_MarkDeliveryOutcome(t *testing.T) {
 			t.Fatalf("err = %v, want the lookup fault", err)
 		}
 	})
+}
+
+// AC1: a notification_preference row excluding EMAIL for the event's type makes
+// EmailChannel.Send never run — no delivery is QUEUED, the channel spy is untouched
+// — but the notification fact itself is still created (the aviso is not dropped,
+// only the e-mail send is skipped). The delivery is recorded SKIPPED, not FAILED.
+func TestNotifyUseCase_OnNotificationRequested_EmailDisabledByPreference_Skipped(t *testing.T) {
+	repo := repoHappy()
+	repo.findPrefChannels = func(_ context.Context, _ database.Tx, gotTenant, gotUser, gotType string) ([]string, error) {
+		if gotTenant != tenantID || gotUser != recipientID || gotType != "member_joined" {
+			t.Fatalf("preference lookup scope = (%q, %q, %q)", gotTenant, gotUser, gotType)
+		}
+		return []string{ChannelInApp}, nil // EMAIL explicitly excluded
+	}
+	channel := &spyChannel{id: "resend-123"}
+	uc := NewNotifyUseCase(repo, channel, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnNotificationRequested(context.Background(), requested("evt-1")); err != nil {
+		t.Fatalf("OnNotificationRequested: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 1 {
+		t.Fatalf("inserted notification count = %d, want 1 (the aviso must still be recorded)", len(repo.insertedNotif))
+	}
+	if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Status != DeliverySkipped || repo.insertedDelivery[0].Channel != ChannelEmail {
+		t.Fatalf("inserted delivery = %+v, want one SKIPPED EMAIL delivery", repo.insertedDelivery)
+	}
+	if len(channel.sent) != 0 {
+		t.Fatalf("channel.sent = %+v, want no send", channel.sent)
+	}
+	if len(repo.updatedStatus) != 0 {
+		t.Fatalf("update calls = %d, want 0 (nothing was queued to send)", len(repo.updatedStatus))
+	}
+}
+
+// AC1 (inverse): a preference row that DOES include EMAIL behaves exactly like no
+// preference at all — the send proceeds.
+func TestNotifyUseCase_OnNotificationRequested_EmailEnabledByPreference_Sends(t *testing.T) {
+	repo := repoHappy()
+	repo.findPrefChannels = func(context.Context, database.Tx, string, string, string) ([]string, error) {
+		return []string{ChannelEmail, ChannelInApp}, nil
+	}
+	channel := &spyChannel{id: "resend-123"}
+	uc := NewNotifyUseCase(repo, channel, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnNotificationRequested(context.Background(), requested("evt-1")); err != nil {
+		t.Fatalf("OnNotificationRequested: %v", err)
+	}
+	if len(channel.sent) != 1 {
+		t.Fatalf("channel.sent = %+v, want 1 send", channel.sent)
+	}
+	if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Status != DeliveryQueued {
+		t.Fatalf("inserted delivery = %+v, want QUEUED", repo.insertedDelivery)
+	}
+}
+
+// AC: an unresolvable recipient's FindPreferenceChannels error (an infra fault, not
+// ErrPreferenceNotFound) propagates and no delivery is recorded.
+func TestNotifyUseCase_OnNotificationRequested_PreferenceLookupInfraError_Propagates(t *testing.T) {
+	repo := repoHappy()
+	boom := errors.New("db unreachable")
+	repo.findPrefChannels = func(context.Context, database.Tx, string, string, string) ([]string, error) {
+		return nil, boom
+	}
+	uc := NewNotifyUseCase(repo, &spyChannel{}, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnNotificationRequested(context.Background(), requested("evt-1")); !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want %v", err, boom)
+	}
+	if len(repo.insertedDelivery) != 0 {
+		t.Fatalf("inserted delivery = %+v, want none on an infra fault", repo.insertedDelivery)
+	}
+}
+
+// --- PreferenceUseCase (GET/PUT /v1/notifications/preferences) ---------------
+
+func TestPreferenceUseCase_GetPreferences(t *testing.T) {
+	want := []NotificationPreference{{TenantID: tenantID, AppUserID: recipientID, Type: "member_joined", Channels: []string{"IN_APP"}}}
+	repo := &mockRepo{
+		listPrefs: func(_ context.Context, gotTenant, gotUser string) ([]NotificationPreference, error) {
+			if gotTenant != tenantID || gotUser != recipientID {
+				t.Fatalf("scope = (%q, %q), want (%q, %q)", gotTenant, gotUser, tenantID, recipientID)
+			}
+			return want, nil
+		},
+	}
+	uc := NewPreferenceUseCase(repo, &fakeUOW{})
+
+	got, err := uc.GetPreferences(context.Background(), tenantID, recipientID)
+	if err != nil {
+		t.Fatalf("GetPreferences: %v", err)
+	}
+	if len(got) != 1 || got[0].Type != "member_joined" {
+		t.Fatalf("GetPreferences() = %+v, want %+v", got, want)
+	}
+}
+
+func TestPreferenceUseCase_SetPreference(t *testing.T) {
+	saved := &NotificationPreference{TenantID: tenantID, AppUserID: recipientID, Type: "member_joined", Channels: []string{"IN_APP"}}
+	repo := &mockRepo{
+		upsertPref: func(_ context.Context, _ database.Tx, gotTenant, gotUser, gotType string, gotChannels []string) (*NotificationPreference, error) {
+			if gotTenant != tenantID || gotUser != recipientID || gotType != "member_joined" {
+				t.Fatalf("scope = (%q, %q, %q)", gotTenant, gotUser, gotType)
+			}
+			if len(gotChannels) != 1 || gotChannels[0] != "IN_APP" {
+				t.Fatalf("channels = %v, want [IN_APP]", gotChannels)
+			}
+			return saved, nil
+		},
+	}
+	uow := &fakeUOW{}
+	uc := NewPreferenceUseCase(repo, uow)
+
+	got, err := uc.SetPreference(context.Background(), tenantID, recipientID, "member_joined", []string{"IN_APP"})
+	if err != nil {
+		t.Fatalf("SetPreference: %v", err)
+	}
+	if got != saved {
+		t.Fatalf("SetPreference() = %+v, want %+v", got, saved)
+	}
+	// The write ran under the caller's own tenant/RLS scope.
+	if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+		t.Fatalf("uow scopes = %v, want one %q", uow.scopes, tenantID)
+	}
 }

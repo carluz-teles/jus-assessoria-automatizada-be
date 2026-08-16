@@ -60,7 +60,7 @@ func newStreamApp(sub subscriber, user, tenant string, opts ...Option) *fiber.Ap
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{user: user, tenant: tenant}))
-	NewHandler(&fakeReader{}, sub, opts...).Register(v1)
+	NewHandler(&fakeReader{}, sub, &fakePrefs{}, opts...).Register(v1)
 	return app
 }
 

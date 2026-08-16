@@ -248,6 +248,16 @@ type NotificationDelivery struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type NotificationPreference struct {
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	AppUserID uuid.UUID          `json:"app_user_id"`
+	Type      string             `json:"type"`
+	Channels  []string           `json:"channels"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type NotificationRead struct {
 	NotificationID uuid.UUID          `json:"notification_id"`
 	UserID         uuid.UUID          `json:"user_id"`

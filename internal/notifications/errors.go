@@ -25,6 +25,12 @@ var (
 	// type, so nothing can be rendered. A configuration fault, surfaced (not silently
 	// sent empty) so the missing template is fixed.
 	ErrTemplateNotFound = apperr.NewInvalid("no email template for notification type")
+
+	// ErrPreferenceNotFound — no notification_preference row for (tenant, user,
+	// type): the user never overrode this type. The routing use case reads this as
+	// "every channel enabled" (the default), never as "every channel disabled" — a
+	// missing row must never silently suppress delivery.
+	ErrPreferenceNotFound = apperr.NewNotFound("notification preference not found")
 )
 
 // noRecipientEmailReason is the delivery.error text recorded when the recipient

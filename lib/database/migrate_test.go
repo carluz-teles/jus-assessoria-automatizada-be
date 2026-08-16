@@ -183,8 +183,9 @@ func TestEmbeddedSource(t *testing.T) {
 		t.Fatalf("Next(35) = (%d, %v), want (36, nil)", next, err)
 	}
 	// The billing local-catalog slice adds 37 (plan), 38 (trial_policy) and 39
-	// (subscription's plan_id/custom_price_per_process_cents/trial_ends_at) — so
-	// 1→…→36→37→38→39 and 39 is the last — nothing follows it.
+	// (subscription's plan_id/custom_price_per_process_cents/trial_ends_at); the
+	// notifications preferences slice adds 40 (notification_preference) — so
+	// 1→…→36→37→38→39→40 and 40 is the last — nothing follows it.
 	if next, err := src.Next(36); err != nil || next != 37 {
 		t.Fatalf("Next(36) = (%d, %v), want (37, nil)", next, err)
 	}
@@ -194,8 +195,11 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(38); err != nil || next != 39 {
 		t.Fatalf("Next(38) = (%d, %v), want (39, nil)", next, err)
 	}
-	if _, err := src.Next(39); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(39) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(39); err != nil || next != 40 {
+		t.Fatalf("Next(39) = (%d, %v), want (40, nil)", next, err)
+	}
+	if _, err := src.Next(40); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(40) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

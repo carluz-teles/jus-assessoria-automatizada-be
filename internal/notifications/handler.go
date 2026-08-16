@@ -51,6 +51,13 @@ type reader interface {
 	MarkAllRead(ctx context.Context, tenantID, userID string) error
 }
 
+// prefsUC is the narrow port the Handler drives from the preference use case: the
+// caller's own saved channel overrides.
+type prefsUC interface {
+	GetPreferences(ctx context.Context, tenantID, appUserID string) ([]NotificationPreference, error)
+	SetPreference(ctx context.Context, tenantID, appUserID, notifType string, channels []string) (*NotificationPreference, error)
+}
+
 // subscriber is the narrow port the SSE stream drives: join a tenant's push channel
 // and range its raw payloads until the context ends. The slice adapter is lib/pubsub
 // over Redis — the same channel the in-app consumer publishes on (slice 2b), reused
@@ -65,6 +72,7 @@ type subscriber interface {
 type Handler struct {
 	reader    reader
 	sub       subscriber
+	prefs     prefsUC
 	heartbeat time.Duration
 }
 
@@ -78,10 +86,11 @@ func WithHeartbeat(d time.Duration) Option {
 	return func(h *Handler) { h.heartbeat = d }
 }
 
-// NewHandler wires the handler to the read use case and the pub/sub subscriber that
-// backs the SSE stream, applying any options over the defaults.
-func NewHandler(reader reader, sub subscriber, opts ...Option) *Handler {
-	h := &Handler{reader: reader, sub: sub, heartbeat: defaultHeartbeat}
+// NewHandler wires the handler to the read use case, the pub/sub subscriber that
+// backs the SSE stream, and the preference use case, applying any options over the
+// defaults.
+func NewHandler(reader reader, sub subscriber, prefs prefsUC, opts ...Option) *Handler {
+	h := &Handler{reader: reader, sub: sub, prefs: prefs, heartbeat: defaultHeartbeat}
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -101,6 +110,8 @@ func (h *Handler) Register(r fiber.Router) {
 	r.Get("/notifications/unread-count", h.unreadCount)
 	r.Post("/notifications/:id/read", h.markRead)
 	r.Post("/notifications/read-all", h.markAllRead)
+	r.Get("/notifications/preferences", h.getPreferences)
+	r.Put("/notifications/preferences", h.setPreference)
 }
 
 // list handles GET /v1/notifications: the caller's in-app inbox, newest first, keyset
@@ -174,6 +185,84 @@ func (h *Handler) markAllRead(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// preferenceView is one row of GET /v1/notifications/preferences — the caller's
+// saved override for one notification type.
+type preferenceView struct {
+	Type     string   `json:"type"`
+	Channels []string `json:"channels"`
+}
+
+// preferencesEnvelope is the {data:[...]} response for the preferences list. The
+// set of overrides a user saves is small, so it is returned whole — no cursor.
+type preferencesEnvelope struct {
+	Data []preferenceView `json:"data"`
+}
+
+// getPreferences handles GET /v1/notifications/preferences: the caller's own saved
+// channel overrides. tenant_id and app_user_id come from the verified principal,
+// never the request — a caller only ever sees its own preferences. Types never
+// touched are simply absent (the default — every channel enabled — applies
+// implicitly; the FE reconciles against its own static list of types).
+func (h *Handler) getPreferences(c *fiber.Ctx) error {
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing authenticated principal"))
+	}
+
+	prefs, err := h.prefs.GetPreferences(c.UserContext(), p.TenantID, p.UserID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newPreferencesEnvelope(prefs))
+}
+
+// setPreference handles PUT /v1/notifications/preferences: saves the caller's full
+// enabled-channel set for one notification type. tenant_id and app_user_id come
+// from the verified principal, never the body — a caller can only ever set its OWN
+// preference, never another user's.
+func (h *Handler) setPreference(c *fiber.Ctx) error {
+	var req SetPreferenceRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing authenticated principal"))
+	}
+
+	pref, err := h.prefs.SetPreference(c.UserContext(), p.TenantID, p.UserID, req.Type, req.Channels)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newPreferenceView(*pref))
+}
+
+// newPreferencesEnvelope maps the saved overrides to the {data:[...]} envelope. It
+// initializes to a non-nil slice so a caller with no overrides serializes data:[],
+// not null.
+func newPreferencesEnvelope(prefs []NotificationPreference) preferencesEnvelope {
+	views := make([]preferenceView, 0, len(prefs))
+	for _, p := range prefs {
+		views = append(views, newPreferenceView(p))
+	}
+	return preferencesEnvelope{Data: views}
+}
+
+// newPreferenceView maps a saved preference to its client view. Channels defaults
+// to a non-nil empty slice so an explicit full opt-out serializes as
+// "channels":[], not null (the two must stay visually distinct from an absent row).
+func newPreferenceView(p NotificationPreference) preferenceView {
+	channels := p.Channels
+	if channels == nil {
+		channels = []string{}
+	}
+	return preferenceView{Type: p.Type, Channels: channels}
 }
 
 // newNotificationsPage wraps the inbox read model in the cursor envelope; the next

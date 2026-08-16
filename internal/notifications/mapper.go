@@ -46,6 +46,18 @@ func deliveryToEntity(r notificationsdb.NotificationDelivery) *NotificationDeliv
 	}
 }
 
+// preferenceToEntity maps a notification_preference row to the entity.
+func preferenceToEntity(r notificationsdb.NotificationPreference) *NotificationPreference {
+	return &NotificationPreference{
+		ID:        r.ID.String(),
+		TenantID:  r.TenantID.String(),
+		AppUserID: r.AppUserID.String(),
+		Type:      r.Type,
+		Channels:  r.Channels,
+		UpdatedAt: r.UpdatedAt.Time,
+	}
+}
+
 // stringToPgUUID parses an id into a nullable pgtype.UUID: an empty string is SQL
 // NULL (a tenant-level aviso with no recipient), any other value a valid uuid. A
 // malformed non-empty id is an infra fault (the id came from a decoded event).

@@ -215,6 +215,7 @@ func run(logger *slog.Logger) error {
 	notificationsHandler := notifications.NewHandler(
 		notifications.NewReadUseCase(notificationsRepo, uow),
 		pubsub.NewRedisPubSub(pubsubClient),
+		notifications.NewPreferenceUseCase(notificationsRepo, uow),
 	)
 
 	// Lookup wiring: a stateless proxy over the BrasilAPI registry. No pool, no
