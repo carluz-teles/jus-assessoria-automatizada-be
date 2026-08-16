@@ -17,6 +17,7 @@ const (
 	consumerDeadlineDueSoon = "notifications.deadline_due_soon"
 	consumerDeadlineMissed  = "notifications.deadline_missed"
 	consumerTrialEndingSoon = "notifications.trial_ending_soon"
+	consumerPaymentFailed   = "notifications.payment_failed"
 )
 
 // txDeduper adapts lib/events' Dedup to the deduper port. events.Dedup binds its

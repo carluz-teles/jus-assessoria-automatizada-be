@@ -1019,3 +1019,80 @@ func TestWebhookUseCase_MarkDeliveryOutcome(t *testing.T) {
 		}
 	})
 }
+
+// paymentFailed builds a billing.payment_failed for the fixture tenant.
+func paymentFailed(eventID string, amountDueCents int64) PaymentFailed {
+	return PaymentFailed{
+		Base:      baseWithID(eventID),
+		TenantID:  tenantID,
+		InvoiceID: "invoice-uuid",
+		AmountDue: amountDueCents,
+	}
+}
+
+// fatia 6b: a billing.payment_failed creates one payment-failed aviso + one IN_APP
+// delivery QUEUED, tenant-level (no single recipient), in the tenant-scoped tx, and
+// pushes it once. The body names the amount due, converted from cents to reais.
+func TestInAppUseCase_OnPaymentFailed_CreatesAviso(t *testing.T) {
+	repo := repoInApp()
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, dedup, uow, pub)
+
+	if err := uc.OnPaymentFailed(context.Background(), paymentFailed("evt-pf-1", 15090)); err != nil {
+		t.Fatalf("OnPaymentFailed: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 1 {
+		t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+	}
+	notif := repo.insertedNotif[0]
+	if notif.Type != TypePaymentFailedAviso || notif.Status != StatusCreated || notif.RecipientUserID != "" {
+		t.Fatalf("notification = %+v, want payment_failed/CREATED/tenant-level", notif)
+	}
+	wantBody := "Não conseguimos cobrar sua fatura de R$ 150.90. Atualize a forma de pagamento para evitar a suspensão do acesso."
+	if notif.Title != paymentFailedTitle || notif.Body != wantBody {
+		t.Fatalf("title/body = %q / %q, want %q / %q", notif.Title, notif.Body, paymentFailedTitle, wantBody)
+	}
+	if notif.Payload["invoice_id"] != "invoice-uuid" || notif.Payload["amount_due"] != int64(15090) {
+		t.Fatalf("payload = %v, want invoice_id/amount_due", notif.Payload)
+	}
+	if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Channel != ChannelInApp || repo.insertedDelivery[0].Status != DeliveryQueued {
+		t.Fatalf("inserted delivery = %+v, want one IN_APP/QUEUED", repo.insertedDelivery)
+	}
+	if len(uow.scopes) != 1 || uow.scopes[0] != tenantID {
+		t.Fatalf("uow scopes = %v, want one %q", uow.scopes, tenantID)
+	}
+	if len(dedup.marked) != 1 || dedup.marked[0] != "evt-pf-1" || dedup.consumers[0] != consumerPaymentFailed {
+		t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-pf-1] under %q", dedup.marked, dedup.consumers, consumerPaymentFailed)
+	}
+	push := assertPushedOnce(t, pub)
+	if push["id"] != notifID || push["type"] != TypePaymentFailedAviso || push["title"] != paymentFailedTitle || push["body"] != wantBody {
+		t.Fatalf("push = %v, want the payment_failed aviso", push)
+	}
+}
+
+// fatia 6b: a replay of a billing.payment_failed (dedup already seen) is a pure
+// no-op — no aviso, no delivery, no push. This is also what makes a retried Stripe
+// webhook (billing's own at-least-once emission) safe: at most one aviso per
+// invoice failure.
+func TestInAppUseCase_OnPaymentFailed_ReplayIsNoOp(t *testing.T) {
+	repo := repoInApp()
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran on a replay")
+		return nil, nil
+	}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{}, pub)
+
+	if err := uc.OnPaymentFailed(context.Background(), paymentFailed("evt-pf-dup", 5000)); err != nil {
+		t.Fatalf("OnPaymentFailed: %v", err)
+	}
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	if len(pub.channels) != 0 {
+		t.Fatalf("replay pushed %d times, want 0", len(pub.channels))
+	}
+}
