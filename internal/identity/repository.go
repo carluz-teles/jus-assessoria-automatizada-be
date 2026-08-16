@@ -221,10 +221,15 @@ func (r *pgRepository) UpdateMembershipRole(ctx context.Context, tx database.Tx,
 }
 
 // FindActiveMemberClerkUser reads on the pool (a resolution read, no tx).
-// tenantID/appUserID are internal uuids (strings on the entity), parsed back
-// here. A missing row (REMOVED membership, or an app_user id from another
-// tenant) is the typed ErrUserNotFound — the caller distinguishes "no such
-// active member" from an infra fault by that sentinel, never by ("", nil).
+// tenantID is the internal principal's tenant (always a well-formed uuid, so a
+// parse failure there is a genuine infra fault). appUserID, by contrast, is
+// client-supplied (the DELETE :id path param) — a malformed value (a typo, a
+// probe) is not infra, so it collapses to the same typed ErrUserNotFound as an
+// unknown-but-valid id, never a 500 (mirrors NotificationVisibleTo's identical
+// malformed-id handling in the notifications slice). A missing row (REMOVED
+// membership, or an app_user id from another tenant) is that same
+// ErrUserNotFound — the caller distinguishes "no such active member" from an
+// infra fault by the sentinel, never by ("", nil).
 func (r *pgRepository) FindActiveMemberClerkUser(ctx context.Context, tenantID, appUserID string) (string, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
@@ -232,7 +237,7 @@ func (r *pgRepository) FindActiveMemberClerkUser(ctx context.Context, tenantID, 
 	}
 	uid, err := uuid.Parse(appUserID)
 	if err != nil {
-		return "", database.WrapInfra(err)
+		return "", ErrUserNotFound
 	}
 	clerkUserID, err := r.q.GetActiveMemberClerkUser(ctx, identitydb.GetActiveMemberClerkUserParams{
 		TenantID:  tid,
