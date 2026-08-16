@@ -16,4 +16,9 @@ var (
 	// user = 1 escritório in v0); a membership.created for a different org is
 	// refused rather than silently moving the user (→ 409).
 	ErrMembershipConflict = apperr.NewConflict("user already belongs to another organization")
+	// ErrCannotRemoveSelf — an admin tried to remove their own membership via
+	// DELETE /v1/organization/members/:id (→ 400). The webhook path (Clerk's own
+	// UI) already blocks removing the last admin; this guard stops the same actor
+	// from stranding themselves out of their own escritório through our API.
+	ErrCannotRemoveSelf = apperr.NewInvalid("cannot remove yourself")
 )

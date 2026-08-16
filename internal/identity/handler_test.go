@@ -55,6 +55,12 @@ type fakeHandlerUC struct {
 	members          []OrgMember
 	gotMembersTenant string
 	membersErr       error
+
+	removeErr         error
+	removeCalled      bool
+	gotRemoveTenantID string
+	gotRemoveActorID  string
+	gotRemoveTargetID string
 }
 
 func (f *fakeHandlerUC) GetMe(_ context.Context, clerkUserID string) (Me, error) {
@@ -77,6 +83,14 @@ func (f *fakeHandlerUC) UpdateOrgProfile(_ context.Context, tenantID string, pro
 func (f *fakeHandlerUC) ListOrgMembers(_ context.Context, tenantID string) ([]OrgMember, error) {
 	f.gotMembersTenant = tenantID
 	return f.members, f.membersErr
+}
+
+func (f *fakeHandlerUC) RemoveMember(_ context.Context, tenantID, actorUserID, targetAppUserID string) error {
+	f.removeCalled = true
+	f.gotRemoveTenantID = tenantID
+	f.gotRemoveActorID = actorUserID
+	f.gotRemoveTargetID = targetAppUserID
+	return f.removeErr
 }
 
 // newMeApp mounts GET /identity/me under AuthUser (tenant-less), mirroring the
@@ -536,6 +550,74 @@ func TestHandler_ListOrgMembers_NoToken_401(t *testing.T) {
 		t.Fatalf("status = %d, want 401", status)
 	}
 	if uc.gotMembersTenant != "" {
+		t.Fatal("use case ran despite a missing token")
+	}
+}
+
+// --- DELETE /v1/organization/members/:id -------------------------------------
+
+// AC1/AC4: an ADMIN removing another member → 204; the use case runs with the
+// principal's tenant/actor id and the path's target id.
+func TestHandler_RemoveMember_Admin_204(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	status, body := do(t, app, http.MethodDelete, "/v1/organization/members/target-uuid", "", "jwt")
+	if status != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", status, body)
+	}
+	if !uc.removeCalled {
+		t.Fatal("use case did not run")
+	}
+	if uc.gotRemoveTenantID != "tenant-42" || uc.gotRemoveActorID != "u-1" || uc.gotRemoveTargetID != "target-uuid" {
+		t.Fatalf("RemoveMember args = (%q, %q, %q), want (tenant-42, u-1, target-uuid)",
+			uc.gotRemoveTenantID, uc.gotRemoveActorID, uc.gotRemoveTargetID)
+	}
+}
+
+// AC2: a non-ADMIN (LAWYER) → 403; the use case never runs.
+func TestHandler_RemoveMember_Lawyer_403(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newProfileApp(uc, string(RoleLawyer), "tenant-42")
+
+	status, _ := do(t, app, http.MethodDelete, "/v1/organization/members/target-uuid", "", "jwt")
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", status)
+	}
+	if uc.removeCalled {
+		t.Fatal("use case ran despite a 403")
+	}
+}
+
+// AC3: the use case's self-removal guard surfaces as a typed 400, not a 500.
+func TestHandler_RemoveMember_Self_400(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{removeErr: ErrCannotRemoveSelf}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	status, body := do(t, app, http.MethodDelete, "/v1/organization/members/u-1", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, body)
+	}
+}
+
+// No bearer token → 401 at the Auth boundary; the handler never runs.
+func TestHandler_RemoveMember_NoToken_401(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newProfileApp(uc, string(RoleAdmin), "tenant-42")
+
+	status, _ := do(t, app, http.MethodDelete, "/v1/organization/members/target-uuid", "", "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", status)
+	}
+	if uc.removeCalled {
 		t.Fatal("use case ran despite a missing token")
 	}
 }
