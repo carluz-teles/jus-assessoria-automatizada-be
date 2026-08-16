@@ -58,13 +58,17 @@ type DeadlineMissed struct {
 	DeadlineID string `json:"deadline_id"`
 }
 
-// The billing-produced event this slice ALSO consumes (fatia 2). Same
-// consumed-event mold as the deadline events above: only the type CONST crosses
-// the boundary (TypeTrialEndingSoon = billing.…), the payload SHAPE is redefined
-// LOCALLY below, so this slice never imports billing's event struct. A contract
-// round-trip test (events_test.go) guards the shape. The import is acyclic
-// (billing does not import notifications).
+// The billing-produced events this slice ALSO consumes (fatia 2, fatia 6b).
+// TypeTrialEndingSoon follows the deadline mold below (payload shape redefined
+// locally). TypePaymentFailed instead follows the acquisition mold above (type
+// ALIAS to billing.PaymentFailed): its shape (TenantID/InvoiceID/AmountDue) is
+// exactly what the aviso needs, so redefining it locally would just be drift risk
+// with no benefit. Both imports are acyclic (billing does not import notifications).
 const TypeTrialEndingSoon = billing.TypeTrialEndingSoon
+
+type PaymentFailed = billing.PaymentFailed
+
+const TypePaymentFailed = billing.TypePaymentFailed
 
 // TrialEndingSoon is the LOCAL decode shape of billing.trial_ending_soon: a
 // tenant's trial approaching its end. TenantID scopes the aviso (barrier 1);

@@ -29,21 +29,24 @@ func (s *spyNotifyUC) OnNotificationRequested(_ context.Context, ev Notification
 // spyInAppUC records the decoded events and returns a preset error, so the two in-app
 // handlers can be asserted in isolation from the use case.
 type spyInAppUC struct {
-	backfill     BackfillFinished
-	docket       DocketEntryObserved
-	dueSoon      DeadlineDueSoon
-	missed       DeadlineMissed
-	trialEndSoon TrialEndingSoon
-	backfillN    int
-	docketN      int
-	dueSoonN     int
-	missedN      int
-	trialEndN    int
-	backfillErr  error
-	docketErr    error
-	dueSoonErr   error
-	missedErr    error
-	trialEndErr  error
+	backfill       BackfillFinished
+	docket         DocketEntryObserved
+	dueSoon        DeadlineDueSoon
+	missed         DeadlineMissed
+	trialEndSoon   TrialEndingSoon
+	paymentFail    PaymentFailed
+	backfillN      int
+	docketN        int
+	dueSoonN       int
+	missedN        int
+	trialEndN      int
+	paymentFailN   int
+	backfillErr    error
+	docketErr      error
+	dueSoonErr     error
+	missedErr      error
+	trialEndErr    error
+	paymentFailErr error
 }
 
 func (s *spyInAppUC) OnBackfillFinished(_ context.Context, ev BackfillFinished) error {
@@ -74,6 +77,12 @@ func (s *spyInAppUC) OnTrialEndingSoon(_ context.Context, ev TrialEndingSoon) er
 	s.trialEndN++
 	s.trialEndSoon = ev
 	return s.trialEndErr
+}
+
+func (s *spyInAppUC) OnPaymentFailed(_ context.Context, ev PaymentFailed) error {
+	s.paymentFailN++
+	s.paymentFail = ev
+	return s.paymentFailErr
 }
 
 // A well-formed notification.requested task is decoded and dispatched to the use case
@@ -375,5 +384,50 @@ func TestListener_HandleTrialEndingSoon_BadPayloadSkipsRetry(t *testing.T) {
 	}
 	if inApp.trialEndN != 0 {
 		t.Fatalf("use case called %d times on a decode fault, want 0", inApp.trialEndN)
+	}
+}
+
+func TestListener_HandlePaymentFailed_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := PaymentFailed{
+		Base:      events.Base{EventID: "evt-pf", Aggregate: "tenant-5"},
+		TenantID:  "tenant-5",
+		InvoiceID: "invoice-1",
+		AmountDue: 15090,
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+	if err := l.handlePaymentFailed(context.Background(), asynq.NewTask(TypePaymentFailed, payload)); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if inApp.paymentFailN != 1 {
+		t.Fatalf("use case called %d times, want 1", inApp.paymentFailN)
+	}
+	if inApp.paymentFail.TenantID != "tenant-5" || inApp.paymentFail.InvoiceID != "invoice-1" || inApp.paymentFail.AmountDue != 15090 {
+		t.Fatalf("dispatched event = %+v", inApp.paymentFail)
+	}
+}
+
+// A malformed billing.payment_failed payload wraps asynq.SkipRetry (archived), and the
+// use case is never called.
+func TestListener_HandlePaymentFailed_BadPayloadSkipsRetry(t *testing.T) {
+	t.Parallel()
+
+	inApp := &spyInAppUC{}
+	l := NewListener(&spyNotifyUC{}, inApp)
+
+	err := l.handlePaymentFailed(context.Background(), asynq.NewTask(TypePaymentFailed, []byte("{bad")))
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("err = %v, want it to wrap asynq.SkipRetry", err)
+	}
+	if inApp.paymentFailN != 0 {
+		t.Fatalf("use case called %d times on a decode fault, want 0", inApp.paymentFailN)
 	}
 }

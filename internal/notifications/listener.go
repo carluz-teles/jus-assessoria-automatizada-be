@@ -28,6 +28,7 @@ type inAppUC interface {
 	OnDeadlineDueSoon(ctx context.Context, ev DeadlineDueSoon) error
 	OnDeadlineMissed(ctx context.Context, ev DeadlineMissed) error
 	OnTrialEndingSoon(ctx context.Context, ev TrialEndingSoon) error
+	OnPaymentFailed(ctx context.Context, ev PaymentFailed) error
 }
 
 // Listener is notifications' asynq consumer. It holds no transport state; the use
@@ -55,6 +56,7 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeDeadlineDueSoon, l.handleDeadlineDueSoon)
 	mux.HandleFunc(TypeDeadlineMissed, l.handleDeadlineMissed)
 	mux.HandleFunc(TypeTrialEndingSoon, l.handleTrialEndingSoon)
+	mux.HandleFunc(TypePaymentFailed, l.handlePaymentFailed)
 }
 
 // handleNotificationRequested is the asynq.HandlerFunc for notification.requested. It
@@ -125,4 +127,15 @@ func (l *Listener) handleTrialEndingSoon(ctx context.Context, t *asynq.Task) err
 		return err
 	}
 	return l.inApp.OnTrialEndingSoon(ctx, ev)
+}
+
+// handlePaymentFailed is the asynq.HandlerFunc for billing.payment_failed (fatia
+// 6b). It decodes the payload and hands off to the in-app use case (→ a
+// payment-failed aviso). Same error contract as the other handlers.
+func (l *Listener) handlePaymentFailed(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[PaymentFailed](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnPaymentFailed(ctx, ev)
 }

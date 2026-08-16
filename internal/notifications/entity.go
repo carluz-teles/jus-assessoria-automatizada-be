@@ -86,6 +86,10 @@ const (
 	// (billing.trial_ending_soon, fatia 2). This is the aviso's `type` column,
 	// distinct from the dotted EVENT id TypeTrialEndingSoon in events.go.
 	TypeTrialEndingSoonAviso = "trial_ending_soon"
+	// TypePaymentFailedAviso — a Stripe invoice charge failed and the subscription
+	// flipped to past_due (billing.payment_failed, fatia 6b). This is the aviso's
+	// `type` column, distinct from the dotted EVENT id TypePaymentFailed in events.go.
+	TypePaymentFailedAviso = "payment_failed"
 )
 
 // Notification is the local aviso: someone (RecipientUserID, empty for a
