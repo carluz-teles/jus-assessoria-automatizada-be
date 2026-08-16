@@ -194,8 +194,13 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(38); err != nil || next != 39 {
 		t.Fatalf("Next(38) = (%d, %v), want (39, nil)", next, err)
 	}
-	if _, err := src.Next(39); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(39) error = %v, want fs.ErrNotExist", err)
+	// The process-summary slice adds 40 (court_record.ai_resume) — so 1→…→39→40 and 40
+	// is the last — nothing follows it.
+	if next, err := src.Next(39); err != nil || next != 40 {
+		t.Fatalf("Next(39) = (%d, %v), want (40, nil)", next, err)
+	}
+	if _, err := src.Next(40); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(40) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

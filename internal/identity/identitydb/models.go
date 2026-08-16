@@ -69,24 +69,26 @@ type CourtCase struct {
 }
 
 type CourtRecord struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       uuid.UUID          `json:"case_id"`
-	CnjNumber    string             `json:"cnj_number"`
-	Degree       string             `json:"degree"`
-	Court        string             `json:"court"`
-	Class        *string            `json:"class"`
-	Subject      *string            `json:"subject"`
-	ClaimValue   pgtype.Numeric     `json:"claim_value"`
-	Secrecy      string             `json:"secrecy"`
-	Lifecycle    string             `json:"lifecycle"`
-	Completeness float32            `json:"completeness"`
-	SyncPolicy   []byte             `json:"sync_policy"`
-	NextSyncAt   pgtype.Timestamptz `json:"next_sync_at"`
-	LastSyncedAt []byte             `json:"last_synced_at"`
-	JudgingBody  *string            `json:"judging_body"`
-	FiledAt      pgtype.Date        `json:"filed_at"`
-	SyncRunID    pgtype.UUID        `json:"sync_run_id"`
+	ID                  uuid.UUID          `json:"id"`
+	TenantID            uuid.UUID          `json:"tenant_id"`
+	CaseID              uuid.UUID          `json:"case_id"`
+	CnjNumber           string             `json:"cnj_number"`
+	Degree              string             `json:"degree"`
+	Court               string             `json:"court"`
+	Class               *string            `json:"class"`
+	Subject             *string            `json:"subject"`
+	ClaimValue          pgtype.Numeric     `json:"claim_value"`
+	Secrecy             string             `json:"secrecy"`
+	Lifecycle           string             `json:"lifecycle"`
+	Completeness        float32            `json:"completeness"`
+	SyncPolicy          []byte             `json:"sync_policy"`
+	NextSyncAt          pgtype.Timestamptz `json:"next_sync_at"`
+	LastSyncedAt        []byte             `json:"last_synced_at"`
+	JudgingBody         *string            `json:"judging_body"`
+	FiledAt             pgtype.Date        `json:"filed_at"`
+	SyncRunID           pgtype.UUID        `json:"sync_run_id"`
+	AiResume            []byte             `json:"ai_resume"`
+	AiResumeGeneratedAt pgtype.Timestamptz `json:"ai_resume_generated_at"`
 }
 
 type Deadline struct {
@@ -299,6 +301,19 @@ type Petition struct {
 	ObservedResult *string            `json:"observed_result"`
 }
 
+type Plan struct {
+	ID                   uuid.UUID          `json:"id"`
+	Code                 string             `json:"code"`
+	Name                 string             `json:"name"`
+	MinProcesses         int32              `json:"min_processes"`
+	MaxProcesses         *int32             `json:"max_processes"`
+	PricePerProcessCents int32              `json:"price_per_process_cents"`
+	StripePriceID        *string            `json:"stripe_price_id"`
+	Active               bool               `json:"active"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ProcessedEvent struct {
 	Consumer    string             `json:"consumer"`
 	EventID     string             `json:"event_id"`
@@ -327,16 +342,19 @@ type Review struct {
 }
 
 type Subscription struct {
-	ID                   uuid.UUID          `json:"id"`
-	TenantID             uuid.UUID          `json:"tenant_id"`
-	StripeCustomerID     *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID *string            `json:"stripe_subscription_id"`
-	Status               string             `json:"status"`
-	Plan                 *string            `json:"plan"`
-	CurrentPeriodEnd     pgtype.Timestamptz `json:"current_period_end"`
-	ActiveProcessLimit   *int32             `json:"active_process_limit"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	ID                         uuid.UUID          `json:"id"`
+	TenantID                   uuid.UUID          `json:"tenant_id"`
+	StripeCustomerID           *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID       *string            `json:"stripe_subscription_id"`
+	Status                     string             `json:"status"`
+	Plan                       *string            `json:"plan"`
+	CurrentPeriodEnd           pgtype.Timestamptz `json:"current_period_end"`
+	ActiveProcessLimit         *int32             `json:"active_process_limit"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	PlanID                     pgtype.UUID        `json:"plan_id"`
+	CustomPricePerProcessCents *int32             `json:"custom_price_per_process_cents"`
+	TrialEndsAt                pgtype.Timestamptz `json:"trial_ends_at"`
 }
 
 type SyncRun struct {
@@ -413,6 +431,16 @@ type Tenant struct {
 	OnboardingCompletedAt pgtype.Timestamptz `json:"onboarding_completed_at"`
 	Phone                 *string            `json:"phone"`
 	Email                 *string            `json:"email"`
+}
+
+type TrialPolicy struct {
+	ID                 uuid.UUID          `json:"id"`
+	Name               string             `json:"name"`
+	IsDefault          bool               `json:"is_default"`
+	TrialDays          int32              `json:"trial_days"`
+	ActiveProcessLimit int32              `json:"active_process_limit"`
+	Active             bool               `json:"active"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
 }
 
 type WatchedOab struct {

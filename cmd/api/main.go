@@ -22,6 +22,7 @@ import (
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/identity"
+	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/calendar"
@@ -134,11 +135,6 @@ func run(logger *slog.Logger) error {
 	// over-limit onboarding is refused at the edge.
 	acquisitionRepo := acquisition.NewRepository(pool)
 	acquisitionEntitlement := resolveEntitlementChecker(cfg, billing.NewRepository(pool))
-	acquisitionHandler := acquisition.NewHandler(
-		acquisition.NewUseCase(acquisitionRepo, events.NewOutbox(), uow,
-			acquisition.WithActivationEntitlementChecker(acquisitionEntitlement)),
-		acquisition.NewReadUseCase(acquisitionRepo),
-	)
 
 	// Deadline wiring: the slice's HTTP surface is the prazos screen reads (pool-backed)
 	// PLUS the F2 confirmation write (POST /prazos/confirm, §9). The confirm runs on the
@@ -166,6 +162,44 @@ func run(logger *slog.Logger) error {
 	} else {
 		logger.Warn("OPENROUTER_API_KEY unset — AI task suggestions disabled (F2 works, no pre-fill)")
 	}
+	// Process summary (AI) — GET /v1/processos/:id/resume. Same pattern as the deadline
+	// suggester: the read use case + the shared meta-prompt composer + the SAME optional LLM
+	// generator (same model — decision D of the handoff), so the api never builds a second
+	// OpenRouter client. The Voyage embedder is OPTIONAL (best-effort RAG): when
+	// VOYAGE_API_KEY is set it searches the process's document chunks to enrich the context;
+	// otherwise (or on any fault) the summary is built without chunks — never a boot failure,
+	// never a 5xx. The store write-throughs the ai_resume the FIRST time (WHERE ai_resume IS
+	// NULL), so later opens serve the cache instead of asking the LLM again.
+	var resumeEmbedder indexing.Embedder
+	if cfg.VoyageAPIKey != "" {
+		emb, err := indexing.NewVoyageEmbedder(cfg.VoyageAPIKey, cfg.VoyageModel, cfg.VoyageEmbedDim, nil)
+		if err != nil {
+			logger.Warn("voyage embedder init failed — RAG disabled for process summary", "error", err)
+		} else {
+			resumeEmbedder = emb
+		}
+	}
+	resumoUC := acquisition.NewResumoUseCase(
+		acquisition.NewReadUseCase(acquisitionRepo),
+		advisory.NewTemplateComposer(),
+		taskGenerator,
+		acquisition.NewResumoStore(uow),
+		resumeEmbedder,
+		indexing.SearchDeps{Pool: pool},
+		cfg.OpenRouterModel,
+	)
+	// Acquisition wiring: the slice owns the domain; the binary only assembles it
+	// (repo + shared outbox + unit of work → write use case; the same repo backs the
+	// read use case for the processos/intimações screen reads; the same read use case
+	// + the resumoUC above back the AI process summary). Activation is
+	// entitlement-gated (the tenant's ACTIVE-process ceiling, read from billing), so an
+	// over-limit onboarding is refused at the edge.
+	acquisitionHandler := acquisition.NewHandler(
+		acquisition.NewUseCase(acquisitionRepo, events.NewOutbox(), uow,
+			acquisition.WithActivationEntitlementChecker(acquisitionEntitlement)),
+		acquisition.NewReadUseCase(acquisitionRepo),
+		resumoUC,
+	)
 	// The suggester also captures provenance (feedback loop, camada 1): every suggestion batch
 	// is persisted (best-effort) via its own tx so the confirm can later diff it against the
 	// lawyer's confirmed tasks. The model string is recorded alongside the prompt_version. It

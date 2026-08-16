@@ -216,6 +216,27 @@ type Querier interface {
 	// One import's reconciliação header (the detail screen), same shape/aggregation as
 	// ListReconciliations but for a single backfill_job.
 	GetReconciliation(ctx context.Context, arg GetReconciliationParams) (GetReconciliationRow, error)
+	// The intimations with status = 'ACTIVE' (the DJEN cancellation lifecycle), each with
+	// the days of its derived deadline (deadline.days, via the 1:1 notification_id link;
+	// NULL when the intimação has no prazo yet). tenant-scoped.
+	GetResumoActiveIntimations(ctx context.Context, arg GetResumoActiveIntimationsParams) ([]GetResumoActiveIntimationsRow, error)
+	// resumo.sql — read-model queries for the AI process summary (GET /v1/processos/:id/resume).
+	// The context is assembled by the repository from four narrow queries (one base row +
+	// three :many reads) so sqlc types every column instead of a json_agg that would come
+	// back as an opaque interface{}. The write query persists the AI summary best-effort
+	// (WHERE ai_resume IS NULL makes it idempotent — a race between two first-opens is a
+	// safe no-op on the loser).
+	// One process's identification row plus the cached AI resume (if any). Scoped by
+	// tenant_id + court_record_id (barrier 1). A miss/foreign row → pgx.ErrNoRows →
+	// ErrProcessoNotFound (the same 404 semantics as GetProcesso).
+	GetResumoContext(ctx context.Context, arg GetResumoContextParams) (GetResumoContextRow, error)
+	// The last 10 docket entries for the process, newest first. Scoped by tenant through
+	// the court_record join (docket_entry carries no tenant_id of its own).
+	GetResumoMovements(ctx context.Context, arg GetResumoMovementsParams) ([]GetResumoMovementsRow, error)
+	// The prazos that are not closed (OPEN or PENDING — a prazo born PENDING is a rule
+	// suggestion awaiting F2 confirmation, still relevant to the summary). days_left is
+	// computed as calendar days to end_date, mirroring the prazos screen read. tenant-scoped.
+	GetResumoOpenDeadlines(ctx context.Context, arg GetResumoOpenDeadlinesParams) ([]GetResumoOpenDeadlinesRow, error)
 	// Count one failed slice; same atomic lock-and-read-back contract as
 	// IncrementBackfillSlicesOK. A job with any failed slice finalizes PARTIAL.
 	IncrementBackfillSlicesError(ctx context.Context, arg IncrementBackfillSlicesErrorParams) (IncrementBackfillSlicesErrorRow, error)
@@ -388,6 +409,10 @@ type Querier interface {
 	// Unicidade de intimation é (tenant, case_id, hash), so swapping court_record_id never
 	// breaks dedup (same case). Returns the number of rows moved.
 	RepointIntimations(ctx context.Context, arg RepointIntimationsParams) (int64, error)
+	// Best-effort persist of the AI-generated resume. The WHERE ai_resume IS NULL makes
+	// the write idempotent at the DB layer — a race between two first-opens updates 0
+	// rows on the loser, which is NOT an error (write-once by design).
+	SetCourtRecordAIResume(ctx context.Context, arg SetCourtRecordAIResumeParams) error
 	// triagem da intimação — the write path for POST /v1/intimacoes/:id/{resolve,
 	// ignore,reopen}. The user drives the intimation's workflow state (user_status,
 	// 0030), SEPARATE from the DJEN cancellation `status`. Runs inside the caller's tx

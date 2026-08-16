@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -11,6 +12,9 @@ import (
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
 )
+
+// errResumerNotWired is the cause of the typed 501 when no resumer port is wired.
+var errResumerNotWired = errors.New("resumer port not wired")
 
 // roleAdmin is the product role allowed to activate integrations. It is the
 // wire-level string the auth middleware puts on the principal (identity.Role
@@ -53,16 +57,25 @@ type reader interface {
 	SyncRunItems(ctx context.Context, tenantID, syncRunID string) (SyncRunItemsView, error)
 }
 
+// resumer is the optional AI-summary port the Handler exposes on GET
+// /v1/processos/:id/resume. It is nil when the slice isn't wired for LLM summaries
+// (same optional-port pattern as deadline's suggester).
+type resumer interface {
+	Resume(ctx context.Context, tenantID, courtRecordID string) (ProcessResumoView, error)
+}
+
 // Handler is the acquisition HTTP surface. It owns its routing; the api only
 // composes by calling RegisterV1.
 type Handler struct {
-	uc     handlerUC
-	reader reader
+	uc      handlerUC
+	reader  reader
+	resumer resumer // nil when no LLM summary port is wired
 }
 
-// NewHandler wires the handler to the acquisition write and read use cases.
-func NewHandler(uc handlerUC, reader reader) *Handler {
-	return &Handler{uc: uc, reader: reader}
+// NewHandler wires the handler to the acquisition write and read use cases. resumer
+// is optional — nil disables the /resume route surface with a typed 501.
+func NewHandler(uc handlerUC, reader reader, resumer resumer) *Handler {
+	return &Handler{uc: uc, reader: reader, resumer: resumer}
 }
 
 // RegisterV1 mounts acquisition's authenticated routes on the /v1 group. The
@@ -83,6 +96,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/processos/:id/andamentos", h.listAndamentos)
 	r.Get("/processos/:id/intimacoes", h.listIntimacoesByProcesso)
 	r.Get("/processos/:id/partes", h.listPartes)
+	r.Get("/processos/:id/resume", h.getResume)
 	r.Get("/intimacoes", h.listIntimacoes)
 	r.Get("/intimacoes/summary", h.intimacoesSummary)
 	r.Get("/intimacoes/:id", h.getIntimacao)
@@ -426,6 +440,24 @@ func (h *Handler) intimacoesSummary(c *fiber.Ctx) error {
 func (h *Handler) getProcesso(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	view, err := h.reader.Processo(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// getResume handles GET /v1/processos/:id/resume: the AI-generated process summary
+// (sync-on-first-GET, write-once, serve-from-cache thereafter — the ResumoUseCase
+// owns that policy). tenant_id comes from the principal, never the path/body: a miss
+// or a foreign tenant's id is the read's typed 404, a non-uuid id its typed 400. A nil
+// resumer (slice not wired for LLM summaries) is a typed 501 — the route exists but no
+// provider is configured, which the api composes away by always wiring the use case.
+func (h *Handler) getResume(c *fiber.Ctx) error {
+	if h.resumer == nil {
+		return httpx.WriteError(c, apperr.NewUnavailable("resumo de processo indisponível: provisor não configurado", errResumerNotWired))
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.resumer.Resume(c.UserContext(), tenantID, c.Params("id"))
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
