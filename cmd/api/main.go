@@ -232,6 +232,11 @@ func run(logger *slog.Logger) error {
 			ReturnURL:  cfg.BillingReturnURL,
 			TrialDays:  cfg.StripeTrialDays,
 		}),
+		// The payment_failed e-mail fan-out (FLO-69) reads identity's own repo —
+		// the same one already wired above for the identity use case — never
+		// identity's use case/entity, so this stays a cross-slice PORT
+		// (AdminLister), not an import of identity's domain.
+		billing.WithAdminLister(identity.NewAdminListerAdapter(repo)),
 	)
 	billingWebhook := billing.NewWebhookHandler(billingUC)
 	billingHandler := billing.NewHandler(billingUC)

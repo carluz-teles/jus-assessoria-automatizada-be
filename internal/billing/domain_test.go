@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
@@ -380,6 +381,114 @@ func TestUseCase_HandleWebhook_PaymentFailed(t *testing.T) {
 			t.Fatal("uow ran despite an unresolved tenant")
 		}
 	})
+}
+
+// fakeAdminLister is a hand-written AdminLister double: ListTenantAdminIDs
+// delegates to a func field and records the tenant it was asked about.
+type fakeAdminLister struct {
+	list      func(ctx context.Context, tenantID string) ([]string, error)
+	gotTenant string
+}
+
+func (f *fakeAdminLister) ListTenantAdminIDs(ctx context.Context, tenantID string) ([]string, error) {
+	f.gotTenant = tenantID
+	return f.list(ctx, tenantID)
+}
+
+// FLO-69: when an AdminLister is wired, invoice.payment_failed fans a
+// notification.requested out to EVERY admin of the tenant, in the same tx as the
+// past_due flip and the tenant-level payment_failed event.
+func TestUseCase_HandleWebhook_PaymentFailed_FansOutToAdmins(t *testing.T) {
+	repo := &mockRepo{
+		updateStatus: func(_ context.Context, _ database.Tx, _ string, status Status) (*Subscription, error) {
+			return &Subscription{Status: status}, nil
+		},
+	}
+	gw := &mockGateway{verify: verifyTo(StripeEvent{
+		ID: "evt_fanout", Type: EventPaymentFailed, TenantID: "tenant-uuid",
+		Invoice: &StripeInvoice{ID: "in_9", CustomerID: "cus_1", AmountDue: 15090},
+	})}
+	outbox := &recordingOutbox{}
+	admins := &fakeAdminLister{list: func(context.Context, string) ([]string, error) {
+		return []string{"admin-1", "admin-2"}, nil
+	}}
+	uc := NewUseCase(repo, gw, outbox, &fakeDedup{}, &fakeUOW{}, WithAdminLister(admins))
+
+	if err := uc.HandleWebhook(context.Background(), nil, ""); err != nil {
+		t.Fatalf("HandleWebhook: %v", err)
+	}
+
+	if admins.gotTenant != "tenant-uuid" {
+		t.Fatalf("AdminLister scope = %q, want tenant-uuid", admins.gotTenant)
+	}
+	// 1 tenant-level payment_failed + 2 per-admin notification.requested.
+	if len(outbox.published) != 3 {
+		t.Fatalf("published %d events, want 3 (1 payment_failed + 2 admin notifications)", len(outbox.published))
+	}
+	var gotRecipients []string
+	for _, ev := range outbox.published[1:] {
+		nr, ok := ev.(identity.NotificationRequested)
+		if !ok {
+			t.Fatalf("event type = %T, want identity.NotificationRequested", ev)
+		}
+		if nr.TenantID != "tenant-uuid" || nr.NotifyType != "payment_failed" {
+			t.Fatalf("notification = %+v, want tenant-uuid/payment_failed", nr)
+		}
+		if nr.Payload["invoice_id"] != "in_9" || nr.Payload["amount_due"] != int64(15090) {
+			t.Fatalf("payload = %v, want invoice_id/amount_due", nr.Payload)
+		}
+		gotRecipients = append(gotRecipients, nr.RecipientUserID)
+	}
+	if len(gotRecipients) != 2 || gotRecipients[0] != "admin-1" || gotRecipients[1] != "admin-2" {
+		t.Fatalf("recipients = %v, want [admin-1 admin-2]", gotRecipients)
+	}
+}
+
+// FLO-69: no AdminLister wired (the zero value) — failPayment behaves exactly
+// like before this fatia: only the tenant-level payment_failed event, no panic,
+// no fan-out attempted.
+func TestUseCase_HandleWebhook_PaymentFailed_NoAdminListerIsNoOp(t *testing.T) {
+	repo := &mockRepo{
+		updateStatus: func(_ context.Context, _ database.Tx, _ string, status Status) (*Subscription, error) {
+			return &Subscription{Status: status}, nil
+		},
+	}
+	gw := &mockGateway{verify: verifyTo(StripeEvent{
+		ID: "evt_noadmins", Type: EventPaymentFailed, TenantID: "tenant-uuid",
+		Invoice: &StripeInvoice{ID: "in_8", CustomerID: "cus_1", AmountDue: 100},
+	})}
+	outbox := &recordingOutbox{}
+	uc := NewUseCase(repo, gw, outbox, &fakeDedup{}, &fakeUOW{}) // no WithAdminLister
+
+	if err := uc.HandleWebhook(context.Background(), nil, ""); err != nil {
+		t.Fatalf("HandleWebhook: %v", err)
+	}
+	if len(outbox.published) != 1 {
+		t.Fatalf("published %d events, want 1 (no fan-out without an AdminLister)", len(outbox.published))
+	}
+}
+
+// FLO-69: a fan-out lookup failure propagates (the tx rolls back — a partial
+// fan-out, or a fan-out silently skipped on an infra fault, is worse than
+// retrying the whole webhook).
+func TestUseCase_HandleWebhook_PaymentFailed_AdminListerErrorPropagates(t *testing.T) {
+	repo := &mockRepo{
+		updateStatus: func(_ context.Context, _ database.Tx, _ string, status Status) (*Subscription, error) {
+			return &Subscription{Status: status}, nil
+		},
+	}
+	gw := &mockGateway{verify: verifyTo(StripeEvent{
+		ID: "evt_err", Type: EventPaymentFailed, TenantID: "tenant-uuid",
+		Invoice: &StripeInvoice{ID: "in_7", CustomerID: "cus_1", AmountDue: 100},
+	})}
+	boom := errors.New("identity unreachable")
+	admins := &fakeAdminLister{list: func(context.Context, string) ([]string, error) { return nil, boom }}
+	uc := NewUseCase(repo, gw, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithAdminLister(admins))
+
+	err := uc.HandleWebhook(context.Background(), nil, "")
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want %v", err, boom)
+	}
 }
 
 func TestUseCase_HandleWebhook_DedupReplayIsNoOp(t *testing.T) {

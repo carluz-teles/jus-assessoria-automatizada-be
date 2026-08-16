@@ -141,6 +141,34 @@ func newPaymentFailed(tenantID, invoiceID string, amountDue int64) PaymentFailed
 	}
 }
 
+// notifyTypePaymentFailed is the template selector carried in the notification's
+// payload Type — it names the notifications-side e-mail template rendered for a
+// failed charge. Matches notifications.TypePaymentFailedAviso by value (the two
+// packages don't share a const: notifications never imports billing's internals,
+// only the PaymentFailed event contract via type alias, docs §2.5).
+const notifyTypePaymentFailed = "payment_failed"
+
+// newPaymentFailedAdminNotification builds the notification.requested that fans
+// the payment_failed e-mail out to ONE admin, minting a fresh v7 event id (time-
+// ordered, distinct per admin) as the aggregate/idempotency key. Reuses
+// identity.NotificationRequested — the generic request-to-notify contract — so
+// billing turns a failed charge into an e-mail without importing the
+// notifications package (which would drag its Resend/template machinery into
+// every billing binary). Safe to import: billing already imports identity for
+// TenantProvisioned (identity never imports billing back).
+func newPaymentFailedAdminNotification(tenantID, adminID, invoiceID string, amountDue int64) identity.NotificationRequested {
+	return identity.NotificationRequested{
+		Base:            events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: tenantID},
+		TenantID:        tenantID,
+		RecipientUserID: adminID,
+		NotifyType:      notifyTypePaymentFailed,
+		Payload: map[string]any{
+			"invoice_id": invoiceID,
+			"amount_due": amountDue,
+		},
+	}
+}
+
 // derefTime collapses a nullable time to a value, the zero time standing in for
 // nil — used where an event field is a value time.Time but the entity's is
 // optional.
