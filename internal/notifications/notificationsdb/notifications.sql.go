@@ -215,14 +215,15 @@ WHERE n.tenant_id = $1
   -- out of the bell and off the unread badge.
   AND n.title IS NOT NULL
   AND (n.recipient_user_id IS NULL OR n.recipient_user_id = $3::uuid)
+  AND ($4::text = '' OR n.type = $4::text)
   AND (
-      NOT $4::boolean
+      NOT $5::boolean
       OR NOT EXISTS (
           SELECT 1 FROM notification_read r
           WHERE r.notification_id = n.id AND r.user_id = $3::uuid
       )
   )
-  AND (n.created_at, n.id) < ($5::timestamptz, $6::uuid)
+  AND (n.created_at, n.id) < ($6::timestamptz, $7::uuid)
 ORDER BY n.created_at DESC, n.id DESC
 LIMIT $2
 `
@@ -231,6 +232,7 @@ type ListNotificationsParams struct {
 	TenantID    uuid.UUID          `json:"tenant_id"`
 	Limit       int32              `json:"limit"`
 	UserID      uuid.UUID          `json:"user_id"`
+	Type        string             `json:"type"`
 	UnreadOnly  bool               `json:"unread_only"`
 	LastCreated pgtype.Timestamptz `json:"last_created"`
 	LastID      uuid.UUID          `json:"last_id"`
@@ -249,14 +251,16 @@ type ListNotificationsRow struct {
 // The in-app inbox for ONE user: the avisos visible to them — tenant-level
 // (recipient_user_id IS NULL) OR addressed to them — newest first, keyset-paginated
 // on (created_at, id) descending. `read` is per-user: EXISTS a receipt for THIS user
-// in notification_read. @unread_only filters to the ones this user has not read. The
-// caller passes the max sentinel cursor ('9999-…', max-uuid) for the first page, so
-// there is no conditional WHERE. tenant_id ($1) is barrier 1; RLS is barrier 2.
+// in notification_read. @unread_only filters to the ones this user has not read;
+// @type (” = all) filters to one closed-set type. The caller passes the max sentinel
+// cursor ('9999-…', max-uuid) for the first page, so there is no conditional WHERE.
+// tenant_id ($1) is barrier 1; RLS is barrier 2.
 func (q *Queries) ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error) {
 	rows, err := q.db.Query(ctx, listNotifications,
 		arg.TenantID,
 		arg.Limit,
 		arg.UserID,
+		arg.Type,
 		arg.UnreadOnly,
 		arg.LastCreated,
 		arg.LastID,

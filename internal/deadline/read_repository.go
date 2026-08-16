@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -134,6 +135,8 @@ func (r *pgReadRepository) ListPrazos(ctx context.Context, q PrazosQuery) ([]Age
 	rows, err := r.q.ListPrazos(ctx, deadlinedb.ListPrazosParams{
 		TenantID:  tid,
 		Status:    q.Status,
+		Kind:      q.Kind,
+		Court:     q.Court,
 		FromDate:  from,
 		ToDate:    to,
 		LastEnd:   lastEnd,
@@ -210,9 +213,10 @@ func (r *pgReadRepository) ListPrazosByIntimacao(ctx context.Context, tenantID, 
 	return out, nil
 }
 
-// CountPrazos returns the agenda's "X de Y": the filtered count (Status/window) and the
-// tenant-wide count. When no filter is active the two coincide, so a single tenant COUNT
-// fills both (mirrors the acquisition read model) — one query instead of two.
+// CountPrazos returns the agenda's "X de Y": the filtered count (Status/Kind/Court/
+// window) and the tenant-wide count. When no filter is active the two coincide, so a
+// single tenant COUNT fills both (mirrors the acquisition read model) — one query
+// instead of two.
 func (r *pgReadRepository) CountPrazos(ctx context.Context, q PrazosQuery) (int64, int64, error) {
 	tid, err := parseUUID(q.TenantID)
 	if err != nil {
@@ -224,7 +228,7 @@ func (r *pgReadRepository) CountPrazos(ctx context.Context, q PrazosQuery) (int6
 		return 0, 0, database.WrapInfra(err)
 	}
 
-	if q.Status == "" && q.From == "" && q.To == "" {
+	if q.Status == "" && q.Kind == "" && q.Court == "" && q.From == "" && q.To == "" {
 		return total, total, nil
 	}
 
@@ -239,6 +243,8 @@ func (r *pgReadRepository) CountPrazos(ctx context.Context, q PrazosQuery) (int6
 	totalCount, err := r.q.CountPrazos(ctx, deadlinedb.CountPrazosParams{
 		TenantID: tid,
 		Status:   q.Status,
+		Kind:     q.Kind,
+		Court:    q.Court,
 		FromDate: from,
 		ToDate:   to,
 	})
@@ -437,6 +443,7 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 		TenantID:   tid,
 		Status:     q.Status,
 		AssigneeID: assignee,
+		Source:     q.Source,
 		FromDate:   from,
 		ToDate:     to,
 		LastDue:    lastDue,
@@ -469,9 +476,9 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 	return out, nil
 }
 
-// CountTasks returns the task agenda's "X de Y": the filtered count (Status/Assignee/window) and
-// the tenant-wide count. When no filter is active the two coincide, so a single tenant COUNT
-// fills both (mirrors CountPrazos) — one query instead of two.
+// CountTasks returns the task agenda's "X de Y": the filtered count (Status/Assignee/
+// Source/window) and the tenant-wide count. When no filter is active the two coincide, so
+// a single tenant COUNT fills both (mirrors CountPrazos) — one query instead of two.
 func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64, int64, error) {
 	tid, err := parseUUID(q.TenantID)
 	if err != nil {
@@ -483,7 +490,7 @@ func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64,
 		return 0, 0, database.WrapInfra(err)
 	}
 
-	if q.Status == "" && q.Assignee == "" && q.From == "" && q.To == "" {
+	if q.Status == "" && q.Assignee == "" && q.Source == "" && q.From == "" && q.To == "" {
 		return total, total, nil
 	}
 
@@ -503,6 +510,7 @@ func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64,
 		TenantID:   tid,
 		Status:     q.Status,
 		AssigneeID: assignee,
+		Source:     q.Source,
 		FromDate:   from,
 		ToDate:     to,
 	})
@@ -510,6 +518,64 @@ func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64,
 		return 0, 0, database.WrapInfra(err)
 	}
 	return totalCount, total, nil
+}
+
+// ListPrazoKinds reads the distinct kinds of the tenant's prazos (the agenda's ?kind
+// options), ordered by name. Empty kinds are skipped in Go (a blank chip is never
+// selectable).
+func (r *pgReadRepository) ListPrazoKinds(ctx context.Context, tenantID string) ([]string, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.q.ListPrazoKinds(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row != nil && *row != "" {
+			out = append(out, *row)
+		}
+	}
+	return out, nil
+}
+
+// ListPrazoCourts reads the distinct courts of the tenant's prazos' court records (the
+// agenda's ?court options), ordered by name.
+func (r *pgReadRepository) ListPrazoCourts(ctx context.Context, tenantID string) ([]string, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.q.ListPrazoCourts(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return rows, nil
+}
+
+// ListTaskAssignees reads the distinct responsáveis of the tenant's tasks (the agenda's
+// ?assignee options), deduped by id and ordered by name. The LEFT JOIN app_user resolves a
+// name when the id is a known user; an unknown id yields an empty name.
+func (r *pgReadRepository) ListTaskAssignees(ctx context.Context, tenantID string) ([]AssigneeOption, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.q.ListTaskAssignees(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]AssigneeOption, 0, len(rows))
+	for _, row := range rows {
+		if !row.AssigneeUserID.Valid {
+			continue
+		}
+		id := row.AssigneeUserID.Bytes
+		out = append(out, AssigneeOption{Name: row.Name, ID: uuid.UUID(id).String()})
+	}
+	return out, nil
 }
 
 // GetTaskDetail reads one task's own fields for the detail view on the pool, filtered by

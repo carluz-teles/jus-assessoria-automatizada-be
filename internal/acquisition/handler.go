@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
@@ -102,6 +103,58 @@ const (
 	// timestamptz, unlike intimações' date column) — above every real andamento.
 	maxTimestamp = "9999-12-31T23:59:59Z"
 )
+
+// Query-param allowlists (docs/erd-backend.md §4e.3): each list route accepts only
+// its own set — a client typo or a param belonging to another route is rejected with
+// 400 instead of being silently ignored. Cursor pagination + filtering are the two
+// documented mechanisms; body/other params never read query strings.
+var (
+	processosListParams  = paramSet("limit", "cursor", "search", "court", "lifecycle", "degree", "assignee")
+	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court")
+)
+
+// paramSet builds the route allowlist used by httpx.RejectUnknownParams.
+func paramSet(params ...string) map[string]struct{} {
+	set := make(map[string]struct{}, len(params))
+	for _, p := range params {
+		set[p] = struct{}{}
+	}
+	return set
+}
+
+// isKnownLifecycle accepts only the closed lifecycle set the filter exposes — the
+// handler is the app-level CHECK on the ?lifecycle param (the DB stores text + the
+// write path's own validation, but a read filter must not smuggle a bogus value into
+// the closed-enum envelope).
+func isKnownLifecycle(v string) bool {
+	switch v {
+	case LifecycleActive, LifecycleSuspended, LifecycleArchived, LifecycleSuperseded:
+		return true
+	default:
+		return false
+	}
+}
+
+// isKnownIntimacaoType accepts only the closed intimation-type set the filter exposes.
+func isKnownIntimacaoType(v string) bool {
+	switch v {
+	case IntimationTypeIntimacao, IntimationTypeCitacao, IntimationTypeComunicacao:
+		return true
+	default:
+		return false
+	}
+}
+
+// isKnownIntimacaoUserStatus accepts only the closed intimation user-status set the
+// filter exposes.
+func isKnownIntimacaoUserStatus(v string) bool {
+	switch v {
+	case IntimationUserStatusPending, IntimationUserStatusResolved, IntimationUserStatusIgnored:
+		return true
+	default:
+		return false
+	}
+}
 
 // integrationView is the read model returned to the client — a per-endpoint DTO.
 // credential_ref is deliberately absent: it is a server-side secret pointer.
@@ -204,11 +257,28 @@ func (h *Handler) syncRunItems(c *fiber.Ctx) error {
 }
 
 // listProcessos handles GET /v1/processos: the tenant's live processes, keyset
-// paginated (?limit, ?cursor) and optionally filtered by ?search (cnj_number ILIKE).
-// tenant_id comes from the principal.
+// paginated (?limit, ?cursor) and filterable by ?search (cnj_number ILIKE), ?court /
+// ?degree (free text from the envelope's options), ?lifecycle (a closed set) and
+// ?assignee (a user id). A param outside the route's allowlist is a client error →
+// 400; an unknown lifecycle or malformed assignee is likewise 400. tenant_id comes
+// from the principal.
 func (h *Handler) listProcessos(c *fiber.Ctx) error {
+	if err := httpx.RejectUnknownParams(c, processosListParams); err != nil {
+		return httpx.WriteError(c, err)
+	}
 	tenantID := httpx.TenantFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	lifecycle := c.Query("lifecycle")
+	if lifecycle != "" && !isKnownLifecycle(lifecycle) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid lifecycle filter"))
+	}
+	assignee := c.Query("assignee")
+	if assignee != "" {
+		if _, err := uuid.Parse(assignee); err != nil {
+			return httpx.WriteError(c, apperr.NewInvalid("invalid assignee filter (want a user id)"))
+		}
+	}
 
 	lastCNJ, lastID := firstAscCNJ, zeroUUID
 	if tok := c.Query("cursor"); tok != "" {
@@ -221,7 +291,11 @@ func (h *Handler) listProcessos(c *fiber.Ctx) error {
 
 	res, err := h.reader.Processos(c.UserContext(), ProcessosQuery{
 		TenantID: tenantID, LastCNJ: lastCNJ, LastID: lastID, Limit: limit,
-		Search: c.Query("search"),
+		Search:    c.Query("search"),
+		Court:     c.Query("court"),
+		Lifecycle: lifecycle,
+		Degree:    c.Query("degree"),
+		Assignee:  assignee,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -230,11 +304,25 @@ func (h *Handler) listProcessos(c *fiber.Ctx) error {
 }
 
 // listIntimacoes handles GET /v1/intimacoes: the tenant's intimation inbox, newest
-// availability first, keyset paginated (?limit, ?cursor) and optionally filtered by
-// ?search (the court record's cnj_number ILIKE).
+// availability first, keyset paginated (?limit, ?cursor) and filterable by ?search
+// (the court record's cnj_number ILIKE), ?type / ?user_status (closed sets) and
+// ?court (free text from the envelope's options). Unknown params/lifecycle values are
+// client errors → 400.
 func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
+	if err := httpx.RejectUnknownParams(c, intimacoesListParams); err != nil {
+		return httpx.WriteError(c, err)
+	}
 	tenantID := httpx.TenantFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	typ := c.Query("type")
+	if typ != "" && !isKnownIntimacaoType(typ) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid type filter"))
+	}
+	userStatus := c.Query("user_status")
+	if userStatus != "" && !isKnownIntimacaoUserStatus(userStatus) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid user_status filter"))
+	}
 
 	lastMade, lastID := maxDate, maxUUID
 	if tok := c.Query("cursor"); tok != "" {
@@ -247,7 +335,10 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 
 	res, err := h.reader.Intimacoes(c.UserContext(), IntimacoesQuery{
 		TenantID: tenantID, LastMadeAvailable: lastMade, LastID: lastID, Limit: limit,
-		Search: c.Query("search"),
+		Search:     c.Query("search"),
+		Type:       typ,
+		UserStatus: userStatus,
+		Court:      c.Query("court"),
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -453,7 +544,7 @@ func newProcessosPage(res ProcessosResult, limit int) httpx.Page[ProcessoView] {
 		tok := httpx.EncodeCursor(httpx.Cursor{LastID: last.ID, LastSortValue: last.CNJNumber})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[ProcessoView]{Data: items, Page: meta}
+	return httpx.Page[ProcessoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
 // newIntimacoesPage wraps the intimações read model in the cursor envelope; the
@@ -472,7 +563,7 @@ func newIntimacoesPage(res IntimacoesResult, limit int) httpx.Page[IntimacaoView
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[IntimacaoView]{Data: items, Page: meta}
+	return httpx.Page[IntimacaoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
 // newAndamentosPage wraps the andamentos read model in the cursor envelope; the next
@@ -492,7 +583,7 @@ func newAndamentosPage(res AndamentosResult, limit int) httpx.Page[AndamentoView
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[AndamentoView]{Data: items, Page: meta}
+	return httpx.Page[AndamentoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
 // newIntimacoesByProcessoPage wraps the per-process intimations read model in the cursor
@@ -512,7 +603,7 @@ func newIntimacoesByProcessoPage(res IntimacoesByProcessoResult, limit int) http
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[IntimacaoView]{Data: items, Page: meta}
+	return httpx.Page[IntimacaoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
 // newListEnvelope maps entities to the client-facing envelope. The data slice is

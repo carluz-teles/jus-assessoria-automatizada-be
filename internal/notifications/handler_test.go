@@ -6,11 +6,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
 )
@@ -52,10 +54,10 @@ type fakeReader struct {
 	markedAll bool
 }
 
-func (f *fakeReader) List(_ context.Context, q ListNotificationsQuery) ([]NotificationView, bool, error) {
+func (f *fakeReader) List(_ context.Context, q ListNotificationsQuery) (NotificationsResult, error) {
 	f.gotQuery = q
 	f.gotTenant, f.gotUser = q.TenantID, q.UserID
-	return f.listResp, f.listHasMore, nil
+	return NotificationsResult{Items: f.listResp, HasMore: f.listHasMore}, nil
 }
 
 func (f *fakeReader) UnreadCount(_ context.Context, tenantID, userID string) (int, error) {
@@ -168,6 +170,61 @@ func TestHandler_List_UnreadFilterFlows(t *testing.T) {
 	}
 	if !fr.gotQuery.UnreadOnly {
 		t.Errorf("query.UnreadOnly = false, want true (?unread=true)")
+	}
+}
+
+// AC1: ?type=<closed value> flows through to the query; an out-of-set type is a
+// client error → 400 (the handler is the app-level CHECK on the type column).
+func TestHandler_List_TypeFilterFlowsAndValidates(t *testing.T) {
+	t.Parallel()
+
+	fr := &fakeReader{}
+	app := newApp(fr, "u-1", "tenant-1")
+
+	if status, body := do(t, app, http.MethodGet, "/v1/notifications?type=deadline_missed", "jwt"); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if fr.gotQuery.Type != TypeDeadlineMissedAviso {
+		t.Errorf("query.Type = %q, want %q", fr.gotQuery.Type, TypeDeadlineMissedAviso)
+	}
+
+	status, body := do(t, app, http.MethodGet, "/v1/notifications?type=alarm", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for unknown type; body=%s", status, body)
+	}
+	if !strings.Contains(body, string(apperr.KindInvalid)) {
+		t.Errorf("body missing kind %q\ngot: %s", apperr.KindInvalid, body)
+	}
+}
+
+// AC1: a param outside the inbox's allowlist is rejected with 400, never silently
+// dropped (docs/erd-backend.md §4e.3).
+func TestHandler_List_UnknownParam_400(t *testing.T) {
+	t.Parallel()
+
+	fr := &fakeReader{}
+	app := newApp(fr, "u-1", "tenant-1")
+
+	if status, body := do(t, app, http.MethodGet, "/v1/notifications?channel=email", "jwt"); status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, body)
+	}
+}
+
+// AC1: the filters block is always a JSON object, never null — a zero result must
+// serialize as {} so the FE renders an empty chip row, not a blank block. (The closed
+// type options themselves are assembled by the use case — asserted in read_test.go.)
+func TestHandler_List_EnvelopeFiltersAlwaysObject(t *testing.T) {
+	t.Parallel()
+
+	fr := &fakeReader{}
+	app := newApp(fr, "u-1", "tenant-1")
+
+	status, body := do(t, app, http.MethodGet, "/v1/notifications", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if !strings.Contains(body, `"filters":{}`) {
+		t.Errorf("envelope filters not an empty object\ngot: %s", body)
 	}
 }
 

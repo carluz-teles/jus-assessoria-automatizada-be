@@ -41,6 +41,26 @@ func TestPageMeta_MarshalsTotals(t *testing.T) {
 	}
 }
 
+// The envelope carries a filters block on every page. With no selectable options it
+// must serialize as {} (never null) — the FE always treats filters as an object.
+func TestPage_FiltersAlwaysObject(t *testing.T) {
+	t.Parallel()
+
+	page := httpx.Page[int]{
+		Data:    []int{1, 2},
+		Page:    httpx.PageMeta{Limit: 20},
+		Filters: httpx.Filters{}.NonNil(),
+	}
+
+	raw, err := json.Marshal(page)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"filters":{}`) {
+		t.Errorf("envelope must serialize filters as {} when empty\ngot: %s", raw)
+	}
+}
+
 func TestCursor_RoundTrips(t *testing.T) {
 	t.Parallel()
 

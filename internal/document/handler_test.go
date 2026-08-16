@@ -273,6 +273,9 @@ func TestListByProcesso_FirstPage(t *testing.T) {
 	if len(page.Data) != 1 || page.Page.Total != 1 || page.Page.NextCursor != nil {
 		t.Errorf("page = %+v", page)
 	}
+	if page.Filters == nil {
+		t.Error("filters is null, want an object (the aba has no filters)")
+	}
 }
 
 // TestListByProcesso_NextCursor proves a HasMore result emits a next_cursor keyed off the last

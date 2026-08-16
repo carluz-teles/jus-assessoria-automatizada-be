@@ -26,11 +26,15 @@ type PageMeta struct {
 	Total      int64   `json:"total"`
 }
 
-// Page is the cursor-paginated list envelope (§4e.2): {data, page:{...}}. It is
-// generic so every slice reuses the same shape with its own read-model DTO.
+// Page is the cursor-paginated list envelope (§4e.2): {data, page:{...}, filters}.
+// It is generic so every slice reuses the same shape with its own read-model DTO.
+// Filters is the selectable-options block for the list's filter chips: always present,
+// {} (never null) when the list has no filters. The page builders set it from the
+// Result's Filters (NonNil), so an empty envelope still serializes an object.
 type Page[T any] struct {
-	Data []T      `json:"data"`
-	Page PageMeta `json:"page"`
+	Data    []T      `json:"data"`
+	Page    PageMeta `json:"page"`
+	Filters Filters  `json:"filters"`
 }
 
 // Cursor is the opaque, stateless pagination cursor. It carries the last row's

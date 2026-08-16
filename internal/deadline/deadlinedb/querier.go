@@ -25,8 +25,9 @@ type Querier interface {
 	// tenant_id, then the confirmed fields.
 	ConfirmDeadline(ctx context.Context, arg ConfirmDeadlineParams) (ConfirmDeadlineRow, error)
 	// The filtered "X" of the agenda's "X de Y" counter: how many prazos match the active
-	// @status / end_date window. Called only when a filter is present; the unfiltered "Y"
-	// reuses CountPrazosByTenant.
+	// @status / @kind / @court / end_date window. Called only when a filter is present; the
+	// unfiltered "Y" reuses CountPrazosByTenant. The court filter needs the same court_record
+	// join as the list, so it never multiplies rows (the join key is the record id).
 	CountPrazos(ctx context.Context, arg CountPrazosParams) (int64, error)
 	// The "X de Y" total for the Prazos tab: how many prazos the process holds. Same
 	// tenant + court_record scoping as the list.
@@ -35,8 +36,8 @@ type Querier interface {
 	// of any filter.
 	CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
-	// @status / @assignee_id / window. Called only when a filter is present; the unfiltered "Y"
-	// reuses CountTasksByTenant.
+	// @status / @assignee_id / @source / window. Called only when a filter is present; the
+	// unfiltered "Y" reuses CountTasksByTenant.
 	CountTasks(ctx context.Context, arg CountTasksParams) (int64, error)
 	// The "X de Y" total for the Tasks tab: how many tasks the process holds. Same tenant +
 	// court_record scoping as the list.
@@ -202,11 +203,21 @@ type Querier interface {
 	// (suggested jsonb: [{title, kind}, …]). É best-effort — uma falha aqui não quebra o F2.
 	// Retorna o id para log/telemetria. $1..$6 são as colunas na ordem do INSERT.
 	InsertTaskSuggestion(ctx context.Context, arg InsertTaskSuggestionParams) (uuid.UUID, error)
+	// Selectable ?court values for the prazos agenda: the distinct courts of the tenant's
+	// intimated court records (the same join the list uses), ordered by name.
+	ListPrazoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error)
+	// ── filter options (the envelope's selectable sets) ──────────────────────────
+	// Distinct-value reads that back the prazos/tasks agenda envelopes' filter chips.
+	// Each is tenant-scoped (barrier 1) and mirrors the list's own predicates, so the
+	// options reflect what the list can actually show. Empty values are skipped in Go.
+	// Selectable ?kind values for the prazos agenda: the distinct kinds of the tenant's
+	// prazos, ordered by name.
+	ListPrazoKinds(ctx context.Context, tenantID uuid.UUID) ([]*string, error)
 	// The global agenda (GET /v1/prazos): the tenant's prazos, soonest vencimento first,
 	// with the process context (cnj_number/court) joined in. Optional filters: @status ('' =
-	// all) and an end_date window [@from_date, @to_date] (NULL = open bound). Ascending
-	// keyset on (end_date, id); the first page passes the min sentinel ('0001-01-01',
-	// zero-uuid).
+	// all), @kind ('' = all), @court ('' = all), and an end_date window [@from_date, @to_date]
+	// (NULL = open bound). Ascending keyset on (end_date, id); the first page passes the min
+	// sentinel ('0001-01-01', zero-uuid).
 	ListPrazos(ctx context.Context, arg ListPrazosParams) ([]ListPrazosRow, error)
 	// The prazo of ONE intimação (GET /v1/prazos?intimation_id=...): the F2 screen opens
 	// from an intimação and needs its derived prazo. The deadline is 1:1 with the intimação
@@ -230,6 +241,11 @@ type Querier interface {
 	// historic column name, migration 0006) — the read model exposes it as intimation_id.
 	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
 	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
+	// Selectable ?assignee values for the task agenda ("meus prazos"): the distinct
+	// responsáveis of the tenant's tasks, deduped by id, ordered by name. The LEFT JOIN
+	// app_user resolves a name when the id is a known user (the column is a bare uuid with
+	// no FK); an unknown id yields an empty name — the FE labels it "ID sem nome".
+	ListTaskAssignees(ctx context.Context, tenantID uuid.UUID) ([]ListTaskAssigneesRow, error)
 	// One task's checklist, ordered by position (the detail view). Scoped to (task_id, tenant_id)
 	// (barrier 1). An empty checklist is 0 rows (not an error). $1 = task_id, $2 = tenant_id.
 	ListTaskItems(ctx context.Context, arg ListTaskItemsParams) ([]ListTaskItemsRow, error)
@@ -244,10 +260,11 @@ type Querier interface {
 	ListTaskTitlesByDeadline(ctx context.Context, arg ListTaskTitlesByDeadlineParams) ([]string, error)
 	// The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 	// first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
-	// assignees; = principal.UserID for "meus"), and a due_date window [@from_date, @to_date]
-	// (NULL = open bound). The window filters on the REAL due_date, so it naturally EXCLUDES
-	// undated tasks (NULL >= date is NULL) — a dated-window query wants dated items. Ascending
-	// (sort_due, id) keyset; the first page passes the min sentinel ('0001-01-01', zero-uuid).
+	// assignees; = principal.UserID for "meus"), @source ('' = all), and a due_date window
+	// [@from_date, @to_date] (NULL = open bound). The window filters on the REAL due_date, so it
+	// naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window query wants dated
+	// items. Ascending (sort_due, id) keyset; the first page passes the min sentinel
+	// ('0001-01-01', zero-uuid).
 	ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error)
 	// ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
 	// The task agenda reads soonest-due first, but due_date is NULLABLE (an undated backlog

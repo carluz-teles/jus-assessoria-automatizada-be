@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/httpx"
 )
 
 // read.go is the slice's read side: the in-app inbox screen reads (list, unread
@@ -28,16 +29,27 @@ type NotificationView struct {
 }
 
 // ListNotificationsQuery carries the tenant+user scope, the keyset cursor (the last
-// row's created_at and id), the unread-only filter and the page size. The handler
-// fills the max sentinel (LastCreated/LastID) for the first page; the repo turns
-// them into the descending keyset predicate.
+// row's created_at and id), the unread-only filter, the optional type filter (a closed
+// set, "" = all) and the page size. The handler fills the max sentinel
+// (LastCreated/LastID) for the first page; the repo turns them into the descending
+// keyset predicate.
 type ListNotificationsQuery struct {
 	TenantID    string
 	UserID      string
 	LastCreated string // RFC3339Nano sort value; max sentinel for the first page
 	LastID      string
 	UnreadOnly  bool
+	Type        string // ?type: closed set (Type* consts); "" = all
 	Limit       int
+}
+
+// NotificationsResult is a page of the inbox plus whether a further page exists. It
+// wraps the raw items because the inbox's filter options (the closed type set) travel
+// with the page for the envelope's chips block.
+type NotificationsResult struct {
+	Items   []NotificationView
+	HasMore bool
+	Filters httpx.Filters
 }
 
 // readRepo is the narrow read/receipt port the ReadUseCase drives. The list and the
@@ -69,18 +81,23 @@ func NewReadUseCase(repo readRepo, uow database.UnitOfWork) *ReadUseCase {
 
 // List returns up to q.Limit avisos visible to the user (newest first) and whether a
 // further page exists. It over-fetches one row so the handler learns hasMore without
-// a separate COUNT.
-func (uc *ReadUseCase) List(ctx context.Context, q ListNotificationsQuery) (items []NotificationView, hasMore bool, err error) {
+// a separate COUNT. The envelope's filter options — the closed type set from the
+// entity constants — are assembled alongside so the FE renders the chips without a
+// second request.
+func (uc *ReadUseCase) List(ctx context.Context, q ListNotificationsQuery) (NotificationsResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
 	rows, err := uc.repo.ListNotifications(ctx, q)
 	if err != nil {
-		return nil, false, err
+		return NotificationsResult{}, err
 	}
+	hasMore := false
 	if len(rows) > limit {
-		return rows[:limit], true, nil
+		rows, hasMore = rows[:limit], true
 	}
-	return rows, false, nil
+	f := httpx.Filters{}
+	f.SetEnum("type", TypeImportFinished, TypeNewAndamento, TypeDeadlineDueSoonAviso, TypeDeadlineMissedAviso, TypeTrialEndingSoonAviso)
+	return NotificationsResult{Items: rows, HasMore: hasMore, Filters: f}, nil
 }
 
 // UnreadCount returns the number of avisos visible to the user that they have not

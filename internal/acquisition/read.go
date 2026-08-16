@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/jusassessoria/platform/lib/httpx"
 )
 
 // read.go is the slice's read side: the screen reads that bypass the write
@@ -144,13 +146,26 @@ type PartyRow struct {
 
 // ProcessosQuery / IntimacoesQuery carry the keyset cursor (the last row's sort key
 // and id) and the page size. The handler fills the sentinel for a first page; the
-// repo turns them into the query's keyset predicate.
+// repo turns them into the query's keyset predicate. The filter fields mirror the
+// envelope's selectable options: Court/kind-like free text (any well-formed value),
+// Lifecycle/Type/UserStatus closed sets (validated at the handler), Assignee a user
+// id ("me" resolved by the handler). An empty filter matches everything.
 type ProcessosQuery struct {
-	TenantID string
-	LastCNJ  string
-	LastID   string
-	Limit    int
-	Search   string // ?search: ILIKE on cnj_number; "" means no filter
+	TenantID  string
+	LastCNJ   string
+	LastID    string
+	Limit     int
+	Search    string // ?search: ILIKE on cnj_number; "" means no filter
+	Court     string // ?court: exact match on the record's court (from ListProcessoCourts)
+	Lifecycle string // ?lifecycle: closed set (Lifecycle* consts); "" = default ACTIVE
+	Degree    string // ?degree: exact match (from ListProcessoDegrees)
+	Assignee  string // ?assignee: the case-level responsável's user id; "" = any
+}
+
+// Filtered reports whether any list filter (search included) is active — the repo
+// uses it to decide when the "X de Y" counter needs the filtered COUNT.
+func (q ProcessosQuery) Filtered() bool {
+	return q.Search != "" || q.Court != "" || q.Lifecycle != "" || q.Degree != "" || q.Assignee != ""
 }
 
 type IntimacoesQuery struct {
@@ -159,6 +174,14 @@ type IntimacoesQuery struct {
 	LastID            string
 	Limit             int
 	Search            string // ?search: ILIKE on the court record's cnj_number; "" means no filter
+	Type              string // ?type: closed set (IntimationType* consts); "" = all
+	UserStatus        string // ?user_status: closed set (IntimationUserStatus* consts); "" = all
+	Court             string // ?court: exact match (from ListIntimacaoCourts); "" = all
+}
+
+// Filtered reports whether any list filter (search included) is active.
+func (q IntimacoesQuery) Filtered() bool {
+	return q.Search != "" || q.Type != "" || q.UserStatus != "" || q.Court != ""
 }
 
 // AndamentosQuery carries the descending keyset cursor (the last row's occurred_at
@@ -187,12 +210,14 @@ type IntimacoesByProcessoQuery struct {
 
 // ProcessosResult / IntimacoesResult are the paginated read plus the two totals for
 // the "X de Y" counter: TotalCount is the current context (filtered by Search when
-// set), Total the tenant-wide count. HasMore drives the next cursor.
+// set), Total the tenant-wide count. HasMore drives the next cursor. Filters is the
+// selectable-options block the envelope renders as chips (assembled by the use case).
 type ProcessosResult struct {
 	Items      []ProcessoView
 	HasMore    bool
 	TotalCount int64
 	Total      int64
+	Filters    httpx.Filters
 }
 
 type IntimacoesResult struct {
@@ -200,24 +225,35 @@ type IntimacoesResult struct {
 	HasMore    bool
 	TotalCount int64
 	Total      int64
+	Filters    httpx.Filters
+}
+
+// AssigneeOption is one selectable ?assignee: the responsável's name (the chip label)
+// and user id (the query-param value). Read-model DTO, off the write path.
+type AssigneeOption struct {
+	Name string
+	ID   string
 }
 
 // AndamentosResult is a page of a process's andamentos plus its total for the "X de
 // Y" counter. There is no search on this tab, so the two totals coincide; the read
-// use case carries one Total. HasMore drives the next cursor.
+// use case carries one Total. HasMore drives the next cursor. Filters is always
+// empty on the tab (no filter chips).
 type AndamentosResult struct {
 	Items   []AndamentoView
 	HasMore bool
 	Total   int64
+	Filters httpx.Filters
 }
 
 // IntimacoesByProcessoResult is a page of a process's intimations plus its total for
 // the "X de Y" counter. Like AndamentosResult (no search on this tab), it carries a
-// single Total; HasMore drives the next cursor.
+// single Total; HasMore drives the next cursor. Filters is always empty (no chips).
 type IntimacoesByProcessoResult struct {
 	Items   []IntimacaoView
 	HasMore bool
 	Total   int64
+	Filters httpx.Filters
 }
 
 // ImportStatusView is the onboarding backfill state for the FE banner ("importando
@@ -333,8 +369,14 @@ type readRepo interface {
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
 	ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error)
-	CountProcessos(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
-	CountIntimacoes(ctx context.Context, tenantID, search string) (totalCount, total int64, err error)
+	CountProcessos(ctx context.Context, q ProcessosQuery) (totalCount, total int64, err error)
+	CountIntimacoes(ctx context.Context, q IntimacoesQuery) (totalCount, total int64, err error)
+	// Filter options for the list envelopes — the distinct-value reads that back the
+	// chips. Each is tenant-scoped and matches the list's own context predicate.
+	ListProcessoCourts(ctx context.Context, tenantID string) ([]string, error)
+	ListProcessoDegrees(ctx context.Context, tenantID string) ([]string, error)
+	ListProcessoAssignees(ctx context.Context, tenantID string) ([]AssigneeOption, error)
+	ListIntimacaoCourts(ctx context.Context, tenantID string) ([]string, error)
 	SummarizeProcessos(ctx context.Context, tenantID string) (ProcessosSummaryView, error)
 	SummarizeIntimacoes(ctx context.Context, tenantID string) (IntimacoesSummaryView, error)
 	CountAndamentosByProcesso(ctx context.Context, tenantID, courtRecordID string) (int64, error)
@@ -361,10 +403,12 @@ func NewReadUseCase(repo readRepo) *ReadUseCase {
 }
 
 // Processos returns up to q.Limit processes, whether a further page exists, and the
-// "X de Y" totals (filtered by q.Search, plus the tenant-wide total). The keyset read
-// over-fetches one row for hasMore; the totals are separate COUNTs (one when no
-// search, two when filtered) — a small skew vs the page under concurrent inserts is
-// tolerable (read model, not aggregate).
+// "X de Y" totals (filtered by the active filters, plus the tenant-wide total). The
+// keyset read over-fetches one row for hasMore; the totals are separate COUNTs (one
+// when no filter, two when filtered) — a small skew vs the page under concurrent
+// inserts is tolerable (read model, not aggregate). The envelope's filter options are
+// assembled alongside (the distinct-value reads) so the FE renders the chips without
+// a second request.
 func (uc *ReadUseCase) Processos(ctx context.Context, q ProcessosQuery) (ProcessosResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
@@ -376,17 +420,59 @@ func (uc *ReadUseCase) Processos(ctx context.Context, q ProcessosQuery) (Process
 	if len(rows) > limit {
 		rows, hasMore = rows[:limit], true
 	}
-	totalCount, total, err := uc.repo.CountProcessos(ctx, q.TenantID, q.Search)
+	totalCount, total, err := uc.repo.CountProcessos(ctx, q)
 	if err != nil {
 		return ProcessosResult{}, err
 	}
-	return ProcessosResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+	filters, err := uc.processosFilters(ctx, q.TenantID)
+	if err != nil {
+		return ProcessosResult{}, err
+	}
+	return ProcessosResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total, Filters: filters}, nil
+}
+
+// processosFilters assembles the processes screen's selectable options: the closed
+// lifecycle set from the entity constants and the free-text court/degree/assignee
+// options from the distinct-value reads. Each key is omitted when it has no options.
+func (uc *ReadUseCase) processosFilters(ctx context.Context, tenantID string) (httpx.Filters, error) {
+	courts, err := uc.repo.ListProcessoCourts(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	degrees, err := uc.repo.ListProcessoDegrees(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	assignees, err := uc.repo.ListProcessoAssignees(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	f := httpx.Filters{}
+	f.Set("court", httpx.OptionsFromStrings(courts)...)
+	f.Set("degree", httpx.OptionsFromStrings(degrees)...)
+	f.SetEnum("lifecycle", LifecycleActive, LifecycleSuspended, LifecycleArchived, LifecycleSuperseded)
+	f.Set("assignee", assigneeOptions(assignees)...)
+	return f, nil
+}
+
+// assigneeOptions maps the repo's {name, id} options to the envelope's label==name /
+// value==id filter options, skipping an empty id (never selectable).
+func assigneeOptions(assignees []AssigneeOption) []httpx.FilterOption {
+	opts := make([]httpx.FilterOption, 0, len(assignees))
+	for _, a := range assignees {
+		if a.ID == "" {
+			continue
+		}
+		opts = append(opts, httpx.FilterOption{Label: a.Name, Value: a.ID})
+	}
+	return opts
 }
 
 // Andamentos returns up to q.Limit of a process's docket entries (newest first),
 // whether a further page exists, and the tab's total. Same over-fetch policy as
 // Processos: the keyset read over-fetches one row for hasMore, the total is a
-// separate COUNT — a small skew under concurrent inserts is fine (read model).
+// separate COUNT — a small skew under concurrent inserts is fine (read model). The
+// tab has no filter chips, so Filters is the empty object.
 func (uc *ReadUseCase) Andamentos(ctx context.Context, q AndamentosQuery) (AndamentosResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
@@ -402,14 +488,14 @@ func (uc *ReadUseCase) Andamentos(ctx context.Context, q AndamentosQuery) (Andam
 	if err != nil {
 		return AndamentosResult{}, err
 	}
-	return AndamentosResult{Items: rows, HasMore: hasMore, Total: total}, nil
+	return AndamentosResult{Items: rows, HasMore: hasMore, Total: total, Filters: httpx.Filters{}}, nil
 }
 
 // IntimacoesByProcesso returns up to q.Limit of a process's intimations (newest
 // availability first), whether a further page exists, and the tab's total. Same
 // over-fetch policy as Andamentos: the keyset read over-fetches one row for hasMore,
 // the total is a separate COUNT — a small skew under concurrent inserts is fine (read
-// model).
+// model). The tab has no filter chips, so Filters is the empty object.
 func (uc *ReadUseCase) IntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
@@ -425,7 +511,7 @@ func (uc *ReadUseCase) IntimacoesByProcesso(ctx context.Context, q IntimacoesByP
 	if err != nil {
 		return IntimacoesByProcessoResult{}, err
 	}
-	return IntimacoesByProcessoResult{Items: rows, HasMore: hasMore, Total: total}, nil
+	return IntimacoesByProcessoResult{Items: rows, HasMore: hasMore, Total: total, Filters: httpx.Filters{}}, nil
 }
 
 // ImportStatus returns the tenant's latest backfill state — the FE banner reads it
@@ -483,8 +569,9 @@ func (uc *ReadUseCase) SyncRunItems(ctx context.Context, tenantID, syncRunID str
 }
 
 // Intimacoes returns up to q.Limit intimations (newest availability first), whether a
-// further page exists, and the "X de Y" totals (filtered by q.Search plus the
-// tenant-wide total). Same shape as Processos.
+// further page exists, and the "X de Y" totals (filtered by the active filters plus
+// the tenant-wide total). Same shape as Processos; the envelope's filter options are
+// assembled alongside.
 func (uc *ReadUseCase) Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error) {
 	limit := q.Limit
 	q.Limit = limit + 1
@@ -496,11 +583,19 @@ func (uc *ReadUseCase) Intimacoes(ctx context.Context, q IntimacoesQuery) (Intim
 	if len(rows) > limit {
 		rows, hasMore = rows[:limit], true
 	}
-	totalCount, total, err := uc.repo.CountIntimacoes(ctx, q.TenantID, q.Search)
+	totalCount, total, err := uc.repo.CountIntimacoes(ctx, q)
 	if err != nil {
 		return IntimacoesResult{}, err
 	}
-	return IntimacoesResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total}, nil
+	courts, err := uc.repo.ListIntimacaoCourts(ctx, q.TenantID)
+	if err != nil {
+		return IntimacoesResult{}, err
+	}
+	f := httpx.Filters{}
+	f.Set("court", httpx.OptionsFromStrings(courts)...)
+	f.SetEnum("type", IntimationTypeIntimacao, IntimationTypeCitacao, IntimationTypeComunicacao)
+	f.SetEnum("user_status", IntimationUserStatusPending, IntimationUserStatusResolved, IntimationUserStatusIgnored)
+	return IntimacoesResult{Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total, Filters: f}, nil
 }
 
 // Intimacao returns one intimation by id for the FE deep-link (open the detail of an

@@ -33,6 +33,25 @@ func (q *Queries) CountAndamentosByProcesso(ctx context.Context, arg CountAndame
 	return count, err
 }
 
+const countCourtRecordsByLifecycle = `-- name: CountCourtRecordsByLifecycle :one
+SELECT count(*) FROM court_record WHERE tenant_id = $1 AND lifecycle = $2
+`
+
+type CountCourtRecordsByLifecycleParams struct {
+	TenantID  uuid.UUID `json:"tenant_id"`
+	Lifecycle string    `json:"lifecycle"`
+}
+
+// The "Y" of the counter when the user filters ?lifecycle: how many records the tenant
+// holds in that lifecycle, so "X de Y" stays meaningful (X ⊆ that lifecycle). ACTIVE —
+// the screen's default context — keeps the cheaper CountActiveCourtRecordsByTenant.
+func (q *Queries) CountCourtRecordsByLifecycle(ctx context.Context, arg CountCourtRecordsByLifecycleParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countCourtRecordsByLifecycle, arg.TenantID, arg.Lifecycle)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countIntimacoesByProcesso = `-- name: CountIntimacoesByProcesso :one
 SELECT count(*) FROM intimation i
 WHERE i.court_record_id = $1::uuid
@@ -54,23 +73,36 @@ func (q *Queries) CountIntimacoesByProcesso(ctx context.Context, arg CountIntima
 	return count, err
 }
 
-const countIntimacoesMatchingSearch = `-- name: CountIntimacoesMatchingSearch :one
+const countIntimacoesFiltered = `-- name: CountIntimacoesFiltered :one
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
-  AND cr.cnj_number ILIKE '%' || $2::text || '%' ESCAPE '\'
+  AND ($2::text = '' OR cr.cnj_number ILIKE '%' || $2 || '%' ESCAPE '\')
+  AND ($3::text = '' OR i.type = $3::text)
+  AND ($4::text = '' OR i.user_status = $4::text)
+  AND ($5::text = '' OR cr.court = $5::text)
 `
 
-type CountIntimacoesMatchingSearchParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	Search   string    `json:"search"`
+type CountIntimacoesFilteredParams struct {
+	TenantID   uuid.UUID `json:"tenant_id"`
+	Search     string    `json:"search"`
+	Type       string    `json:"type"`
+	UserStatus string    `json:"user_status"`
+	Court      string    `json:"court"`
 }
 
 // The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
-// whose court record's cnj_number matches the search term. Called only when ?search
-// is present; the unfiltered "Y" reuses CountIntimationsByTenant.
-func (q *Queries) CountIntimacoesMatchingSearch(ctx context.Context, arg CountIntimacoesMatchingSearchParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countIntimacoesMatchingSearch, arg.TenantID, arg.Search)
+// match the active filters (search on the court record's cnj_number, type, user_status,
+// court). Called only when a filter is present; the unfiltered "Y" reuses
+// CountIntimationsByTenant. SAME predicates as ListIntimacoes (minus the keyset).
+func (q *Queries) CountIntimacoesFiltered(ctx context.Context, arg CountIntimacoesFilteredParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countIntimacoesFiltered,
+		arg.TenantID,
+		arg.Search,
+		arg.Type,
+		arg.UserStatus,
+		arg.Court,
+	)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -89,23 +121,43 @@ func (q *Queries) CountIntimationsByTenant(ctx context.Context, tenantID uuid.UU
 	return count, err
 }
 
-const countProcessosMatchingSearch = `-- name: CountProcessosMatchingSearch :one
+const countProcessosFiltered = `-- name: CountProcessosFiltered :one
 SELECT count(*) FROM court_record cr
+LEFT JOIN court_case cc ON cc.id = cr.case_id
 WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
-  AND cr.cnj_number ILIKE '%' || $2::text || '%' ESCAPE '\'
+  AND ($2::text = '' OR cr.cnj_number ILIKE '%' || $2 || '%' ESCAPE '\')
+  AND ($3::text = '' OR cr.court = $3::text)
+  AND ($4::text = '' OR cr.degree = $4::text)
+  AND ($5::text = '' OR cr.lifecycle = $5::text)
+  AND ($5::text <> '' OR cr.lifecycle = 'ACTIVE')
+  AND ($6::uuid IS NULL OR cc.assigned_user_id = $6::uuid)
 `
 
-type CountProcessosMatchingSearchParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	Search   string    `json:"search"`
+type CountProcessosFilteredParams struct {
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	Search     string      `json:"search"`
+	Court      string      `json:"court"`
+	Degree     string      `json:"degree"`
+	Lifecycle  string      `json:"lifecycle"`
+	AssigneeID pgtype.UUID `json:"assignee_id"`
 }
 
-// The filtered "X" of the processes screen's "X de Y" counter: how many ACTIVE court
-// records match the search term (cnj_number ILIKE, trigram-indexed). Called only when
-// ?search is present; the unfiltered "Y" reuses CountActiveCourtRecordsByTenant.
-func (q *Queries) CountProcessosMatchingSearch(ctx context.Context, arg CountProcessosMatchingSearchParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countProcessosMatchingSearch, arg.TenantID, arg.Search)
+// The filtered "X" of the processes screen's "X de Y" counter: how many court records
+// match the active filters (search on cnj_number ILIKE, court, degree, lifecycle, and
+// the case-level responsável). Called only when any filter is present; the unfiltered
+// "Y" is CountActiveCourtRecordsByTenant (or CountCourtRecordsByLifecycle when
+// ?lifecycle is set). The SAME predicates as ListProcessos (minus the keyset), so the
+// counter agrees with the page. The LEFT JOIN court_case is needed for the assignee
+// predicate; the case id is the join key, so it never multiplies rows.
+func (q *Queries) CountProcessosFiltered(ctx context.Context, arg CountProcessosFilteredParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countProcessosFiltered,
+		arg.TenantID,
+		arg.Search,
+		arg.Court,
+		arg.Degree,
+		arg.Lifecycle,
+		arg.AssigneeID,
+	)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -378,6 +430,36 @@ func (q *Queries) ListAndamentosByProcesso(ctx context.Context, arg ListAndament
 	return items, nil
 }
 
+const listIntimacaoCourts = `-- name: ListIntimacaoCourts :many
+SELECT DISTINCT cr.court
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.tenant_id = $1
+ORDER BY LOWER(cr.court) ASC
+`
+
+// Selectable ?court values for the intimações inbox: the distinct courts of the
+// tenant's intimated court records, ordered by name.
+func (q *Queries) ListIntimacaoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listIntimacaoCourts, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var court string
+		if err := rows.Scan(&court); err != nil {
+			return nil, err
+		}
+		items = append(items, court)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listIntimacoes = `-- name: ListIntimacoes :many
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
@@ -386,7 +468,10 @@ FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.tenant_id = $1
   AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%' ESCAPE '\')
-  AND (i.made_available_at, i.id) < ($4::date, $5::uuid)
+  AND ($4::text = '' OR i.type = $4::text)
+  AND ($5::text = '' OR i.user_status = $5::text)
+  AND ($6::text = '' OR cr.court = $6::text)
+  AND (i.made_available_at, i.id) < ($7::date, $8::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2
 `
@@ -395,6 +480,9 @@ type ListIntimacoesParams struct {
 	TenantID          uuid.UUID   `json:"tenant_id"`
 	Limit             int32       `json:"limit"`
 	Search            string      `json:"search"`
+	Type              string      `json:"type"`
+	UserStatus        string      `json:"user_status"`
+	Court             string      `json:"court"`
 	LastMadeAvailable pgtype.Date `json:"last_made_available"`
 	LastID            uuid.UUID   `json:"last_id"`
 }
@@ -418,12 +506,16 @@ type ListIntimacoesRow struct {
 // The intimações inbox: the tenant's intimations, newest availability first, with
 // the court record's number/court/degree joined in. Descending keyset on
 // (made_available_at, id); the first page passes the max sentinel
-// ('9999-12-31', max-uuid).
+// ('9999-12-31', max-uuid). Optional filters — @court (free text from the DISTINCT
+// options), @type / @user_status (closed sets) — are additive ANDs.
 func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error) {
 	rows, err := q.db.Query(ctx, listIntimacoes,
 		arg.TenantID,
 		arg.Limit,
 		arg.Search,
+		arg.Type,
+		arg.UserStatus,
+		arg.Court,
 		arg.LastMadeAvailable,
 		arg.LastID,
 	)
@@ -597,6 +689,112 @@ func (q *Queries) ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoe
 	return items, nil
 }
 
+const listProcessoAssignees = `-- name: ListProcessoAssignees :many
+SELECT DISTINCT au.id, COALESCE(au.name, '') AS name
+FROM court_record cr
+JOIN court_case cc ON cc.id = cr.case_id
+JOIN app_user au ON au.id = cc.assigned_user_id
+WHERE cr.tenant_id = $1
+  AND cr.lifecycle = 'ACTIVE'
+ORDER BY LOWER(COALESCE(au.name, '')) ASC
+`
+
+type ListProcessoAssigneesRow struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+}
+
+// Selectable ?assignee values for the processes screen: the responsáveis of the
+// tenant's live processes, joined at case level (court_record → court_case →
+// app_user) exactly like the list's projection, deduped by id, ordered by name.
+// The list filters on cc.assigned_user_id, so an unassigned case yields no option.
+func (q *Queries) ListProcessoAssignees(ctx context.Context, tenantID uuid.UUID) ([]ListProcessoAssigneesRow, error) {
+	rows, err := q.db.Query(ctx, listProcessoAssignees, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListProcessoAssigneesRow
+	for rows.Next() {
+		var i ListProcessoAssigneesRow
+		if err := rows.Scan(&i.ID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProcessoCourts = `-- name: ListProcessoCourts :many
+
+SELECT DISTINCT cr.court
+FROM court_record cr
+WHERE cr.tenant_id = $1
+  AND cr.lifecycle = 'ACTIVE'
+ORDER BY LOWER(cr.court) ASC
+`
+
+// ── filter options (the envelope's selectable sets) ──────────────────────────
+// Distinct-value reads that back the list envelopes' filter chips. Each is
+// tenant-scoped (barrier 1) and matches the list's OWN context predicate (the
+// processos options restrict to the default ACTIVE lifecycle), so the options
+// reflect what the list can actually show. Empty values are skipped in Go (a blank
+// chip is never selectable).
+// Selectable ?court values for the processes screen: the distinct courts of the
+// tenant's live (ACTIVE) records, ordered by name.
+func (q *Queries) ListProcessoCourts(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listProcessoCourts, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var court string
+		if err := rows.Scan(&court); err != nil {
+			return nil, err
+		}
+		items = append(items, court)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProcessoDegrees = `-- name: ListProcessoDegrees :many
+SELECT DISTINCT cr.degree
+FROM court_record cr
+WHERE cr.tenant_id = $1
+  AND cr.lifecycle = 'ACTIVE'
+ORDER BY LOWER(cr.degree) ASC
+`
+
+// Selectable ?degree values for the processes screen: the distinct degrees of the
+// tenant's live (ACTIVE) records, ordered by name.
+func (q *Queries) ListProcessoDegrees(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listProcessoDegrees, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var degree string
+		if err := rows.Scan(&degree); err != nil {
+			return nil, err
+		}
+		items = append(items, degree)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listProcessos = `-- name: ListProcessos :many
 
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
@@ -618,19 +816,27 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) m ON true
 WHERE cr.tenant_id = $1
-  AND cr.lifecycle = 'ACTIVE'
   AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%' ESCAPE '\')
-  AND (cr.cnj_number, cr.id) > ($4::text, $5::uuid)
+  AND ($4::text = '' OR cr.court = $4::text)
+  AND ($5::text = '' OR cr.degree = $5::text)
+  AND ($6::text = '' OR cr.lifecycle = $6::text)
+  AND ($6::text <> '' OR cr.lifecycle = 'ACTIVE')
+  AND ($7::uuid IS NULL OR cc.assigned_user_id = $7::uuid)
+  AND (cr.cnj_number, cr.id) > ($8::text, $9::uuid)
 ORDER BY cr.cnj_number, cr.id
 LIMIT $2
 `
 
 type ListProcessosParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	Limit    int32     `json:"limit"`
-	Search   string    `json:"search"`
-	LastCnj  string    `json:"last_cnj"`
-	LastID   uuid.UUID `json:"last_id"`
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	Limit      int32       `json:"limit"`
+	Search     string      `json:"search"`
+	Court      string      `json:"court"`
+	Degree     string      `json:"degree"`
+	Lifecycle  string      `json:"lifecycle"`
+	AssigneeID pgtype.UUID `json:"assignee_id"`
+	LastCnj    string      `json:"last_cnj"`
+	LastID     uuid.UUID   `json:"last_id"`
 }
 
 type ListProcessosRow struct {
@@ -661,12 +867,19 @@ type ListProcessosRow struct {
 // The consolidated processes screen: the tenant's live court records (SUPERSEDED
 // placeholders drop out), each with its most recent andamento for the "last
 // movement" column. Ordered by cnj_number then id (ascending keyset): the first
-// page passes (”, zero-uuid).
+// page passes (”, zero-uuid). Optional filters — @court / @degree (free text from
+// the DISTINCT options), @lifecycle (a closed set; ” keeps the default ACTIVE
+// context), @assignee_id (NULL = any; the case-level responsável) — are additive
+// ANDs, so an absent filter matches everything.
 func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([]ListProcessosRow, error) {
 	rows, err := q.db.Query(ctx, listProcessos,
 		arg.TenantID,
 		arg.Limit,
 		arg.Search,
+		arg.Court,
+		arg.Degree,
+		arg.Lifecycle,
+		arg.AssigneeID,
 		arg.LastCnj,
 		arg.LastID,
 	)

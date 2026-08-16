@@ -113,6 +113,33 @@ const (
 	zeroUUID = "00000000-0000-0000-0000-000000000000"
 )
 
+// Query-param allowlists (docs/erd-backend.md §4e.3): each list route accepts only its
+// own set — a client typo or a param belonging to another route is rejected with 400
+// instead of being silently ignored. The prazos/tasks routes also accept ?intimation_id
+// / ?assignee respectively as their documented special cases.
+var (
+	prazosListParams = map[string]struct{}{
+		"status": {}, "kind": {}, "court": {}, "from": {}, "to": {},
+		"limit": {}, "cursor": {}, "intimation_id": {},
+	}
+	tasksListParams = map[string]struct{}{
+		"status": {}, "assignee": {}, "source": {}, "from": {}, "to": {},
+		"limit": {}, "cursor": {},
+	}
+)
+
+// isKnownTaskSource accepts only the closed task-source set the filter exposes — the
+// handler is the app-level CHECK on the ?source param (task.source is a plain text
+// column; the closed set lives in the entity constants).
+func isKnownTaskSource(v string) bool {
+	switch v {
+	case string(SourceAI), string(SourceRule), string(SourceManual):
+		return true
+	default:
+		return false
+	}
+}
+
 // listPrazosByProcesso handles GET /v1/processos/:id/prazos: one process's Prazos tab —
 // its prazos ordered by end_date (soonest first), keyset paginated (?limit, ?cursor).
 // The :id is the court_record id (the same id /processos returns); tenant_id comes from
@@ -142,11 +169,15 @@ func (h *Handler) listPrazosByProcesso(c *fiber.Ctx) error {
 
 // listPrazos handles GET /v1/prazos: the tenant's agenda — every prazo ordered by
 // end_date (soonest first), keyset paginated (?limit, ?cursor), optionally filtered by
-// ?status (a closed set) and an end_date window ?from/?to (wire date 2006-01-02). A bad
-// status or malformed date is a client error → 400. As a special case, ?intimation_id
-// (a uuid) narrows to the single prazo of that intimação — the F2 lookup — returning the
-// same envelope with 0 or 1 item (a malformed id is a 400).
+// ?status (a closed set), ?kind / ?court (free text from the envelope's options) and an
+// end_date window ?from/?to (wire date 2006-01-02). A bad status or malformed date is a
+// client error → 400; a param outside the route's allowlist is likewise 400. As a
+// special case, ?intimation_id (a uuid) narrows to the single prazo of that intimação —
+// the F2 lookup — returning the same envelope with 0 or 1 item (a malformed id is a 400).
 func (h *Handler) listPrazos(c *fiber.Ctx) error {
+	if err := httpx.RejectUnknownParams(c, prazosListParams); err != nil {
+		return httpx.WriteError(c, err)
+	}
 	tenantID := httpx.TenantFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
 
@@ -184,8 +215,8 @@ func (h *Handler) listPrazos(c *fiber.Ctx) error {
 	}
 
 	res, err := h.reader.Prazos(c.UserContext(), PrazosQuery{
-		TenantID: tenantID, Status: status, From: from, To: to,
-		LastEnd: lastEnd, LastID: lastID, Limit: limit,
+		TenantID: tenantID, Status: status, Kind: c.Query("kind"), Court: c.Query("court"),
+		From: from, To: to, LastEnd: lastEnd, LastID: lastID, Limit: limit,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -355,9 +386,13 @@ func (h *Handler) listTasksByProcesso(c *fiber.Ctx) error {
 
 // listTasks handles GET /v1/tasks: the tenant's task agenda ("meus prazos") — every task ordered
 // by due_date (soonest first, undated last), keyset paginated, optionally filtered by ?status (a
-// closed set), ?assignee (a user id, or the sentinel "me" → the principal's own id) and a
-// due_date window ?from/?to. A bad status/date/assignee is a client error → 400.
+// closed set), ?assignee (a user id, or the sentinel "me" → the principal's own id), ?source (a
+// closed set) and a due_date window ?from/?to. A bad status/date/assignee is a client error → 400;
+// a param outside the route's allowlist is likewise 400.
 func (h *Handler) listTasks(c *fiber.Ctx) error {
+	if err := httpx.RejectUnknownParams(c, tasksListParams); err != nil {
+		return httpx.WriteError(c, err)
+	}
 	tenantID := httpx.TenantFromCtx(c)
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
 
@@ -373,6 +408,10 @@ func (h *Handler) listTasks(c *fiber.Ctx) error {
 	assignee, err := resolveAssignee(c.Query("assignee"), p.UserID)
 	if err != nil {
 		return httpx.WriteError(c, err)
+	}
+	source := c.Query("source")
+	if source != "" && !isKnownTaskSource(source) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid source filter"))
 	}
 	from, err := validateOptionalDate(c.Query("from"))
 	if err != nil {
@@ -393,7 +432,7 @@ func (h *Handler) listTasks(c *fiber.Ctx) error {
 	}
 
 	res, err := h.reader.Tasks(c.UserContext(), TasksQuery{
-		TenantID: tenantID, Status: status, Assignee: assignee, From: from, To: to,
+		TenantID: tenantID, Status: status, Assignee: assignee, Source: source, From: from, To: to,
 		LastDue: lastDue, LastID: lastID, Limit: limit,
 	})
 	if err != nil {
@@ -755,7 +794,7 @@ func newTasksByProcessoPage(res TasksByProcessoResult, limit int) httpx.Page[Tas
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[TaskView]{Data: items, Page: meta}
+	return httpx.Page[TaskView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
 // newTasksPage wraps the task agenda read model in the cursor envelope; the next cursor keys off
@@ -774,7 +813,7 @@ func newTasksPage(res TasksResult, limit int) httpx.Page[TaskView] {
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[TaskView]{Data: items, Page: meta}
+	return httpx.Page[TaskView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
 // formatDates renders the holidays audit as wire dates (2006-01-02), always a non-nil
@@ -804,7 +843,7 @@ func newPrazosByProcessoPage(res PrazosByProcessoResult, limit int) httpx.Page[P
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[PrazoView]{Data: items, Page: meta}
+	return httpx.Page[PrazoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
 // newPrazosPage wraps the agenda read model in the cursor envelope; the next cursor keys
@@ -824,5 +863,5 @@ func newPrazosPage(res PrazosResult, limit int) httpx.Page[AgendaPrazoView] {
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[AgendaPrazoView]{Data: items, Page: meta}
+	return httpx.Page[AgendaPrazoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }

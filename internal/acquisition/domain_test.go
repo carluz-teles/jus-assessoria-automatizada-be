@@ -254,12 +254,28 @@ func (m *mockRepo) SetIntimationUserStatus(_ context.Context, _ database.Tx, _, 
 	return m.setUserStatusErr
 }
 
-func (m *mockRepo) CountProcessos(_ context.Context, _, _ string) (int64, int64, error) {
+func (m *mockRepo) CountProcessos(_ context.Context, _ ProcessosQuery) (int64, int64, error) {
 	return 0, 0, nil
 }
 
-func (m *mockRepo) CountIntimacoes(_ context.Context, _, _ string) (int64, int64, error) {
+func (m *mockRepo) CountIntimacoes(_ context.Context, _ IntimacoesQuery) (int64, int64, error) {
 	return 0, 0, nil
+}
+
+func (m *mockRepo) ListProcessoCourts(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) ListProcessoDegrees(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) ListProcessoAssignees(_ context.Context, _ string) ([]AssigneeOption, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) ListIntimacaoCourts(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
 }
 
 func (m *mockRepo) SummarizeProcessos(_ context.Context, _ string) (ProcessosSummaryView, error) {

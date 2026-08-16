@@ -16,6 +16,11 @@ type recordingReadRepo struct {
 	procTotal      int64
 	lastProcQuery  ProcessosQuery
 	procSearchSeen string
+	// Filter-option reads — canned distinct values the use case turns into chips.
+	procCourts    []string
+	procDegrees   []string
+	procAssignees []AssigneeOption
+	intiCourts    []string
 	// GetProcesso deep-link — capture the forwarded (tenant, id) and return a canned view.
 	procOneRes    ProcessoView
 	gotProcOneTID string
@@ -45,8 +50,9 @@ func (r *recordingReadRepo) GetProcesso(_ context.Context, tenantID, id string) 
 	return r.procOneRes, nil
 }
 
-func (r *recordingReadRepo) CountProcessos(_ context.Context, _, search string) (int64, int64, error) {
-	r.procSearchSeen = search
+func (r *recordingReadRepo) CountProcessos(_ context.Context, q ProcessosQuery) (int64, int64, error) {
+	r.lastProcQuery = q
+	r.procSearchSeen = q.Search
 	return r.procTotalCount, r.procTotal, nil
 }
 
@@ -56,8 +62,20 @@ func (r *recordingReadRepo) ListIntimacoes(context.Context, IntimacoesQuery) ([]
 func (r *recordingReadRepo) GetIntimacao(context.Context, string, string) (IntimacaoDetailView, error) {
 	return IntimacaoDetailView{}, nil
 }
-func (r *recordingReadRepo) CountIntimacoes(context.Context, string, string) (int64, int64, error) {
+func (r *recordingReadRepo) CountIntimacoes(context.Context, IntimacoesQuery) (int64, int64, error) {
 	return 0, 0, nil
+}
+func (r *recordingReadRepo) ListProcessoCourts(context.Context, string) ([]string, error) {
+	return r.procCourts, nil
+}
+func (r *recordingReadRepo) ListProcessoDegrees(context.Context, string) ([]string, error) {
+	return r.procDegrees, nil
+}
+func (r *recordingReadRepo) ListProcessoAssignees(context.Context, string) ([]AssigneeOption, error) {
+	return r.procAssignees, nil
+}
+func (r *recordingReadRepo) ListIntimacaoCourts(context.Context, string) ([]string, error) {
+	return r.intiCourts, nil
 }
 func (r *recordingReadRepo) SummarizeProcessos(context.Context, string) (ProcessosSummaryView, error) {
 	return r.procSummary, nil
@@ -149,6 +167,77 @@ func TestReadUseCase_Processos_WiresTotals(t *testing.T) {
 	}
 	if res.TotalCount != 32 || res.Total != 1247 {
 		t.Errorf("totals = (%d, %d), want (32, 1247)", res.TotalCount, res.Total)
+	}
+}
+
+// The processes envelope's filter options are assembled from the distinct-value reads:
+// court/degree are label==value strings, lifecycle is the closed enum set (canonical
+// order), assignee is label==name/value==id. A key with no options is omitted; an
+// assignee without an id is never selectable.
+func TestReadUseCase_Processos_AssemblesFilters(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{
+		procCourts:    []string{"TJSP", "TRT3"},
+		procDegrees:   []string{"PRIMEIRO_GRAU"},
+		procAssignees: []AssigneeOption{{Name: "Ana", ID: "u-1"}, {Name: "Sem Id", ID: ""}},
+	}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Processos(context.Background(), ProcessosQuery{TenantID: "t-1", Limit: 20})
+	if err != nil {
+		t.Fatalf("Processos: %v", err)
+	}
+
+	courts := res.Filters["court"]
+	if len(courts) != 2 || courts[0].Label != "TJSP" || courts[0].Value != "TJSP" || courts[1].Value != "TRT3" {
+		t.Errorf("court options = %+v, want label==value TJSP,TRT3", courts)
+	}
+	degrees := res.Filters["degree"]
+	if len(degrees) != 1 || degrees[0].Label != "PRIMEIRO_GRAU" || degrees[0].Value != "PRIMEIRO_GRAU" {
+		t.Errorf("degree options = %+v", degrees)
+	}
+	lifecycle := res.Filters["lifecycle"]
+	wantLifecycle := []string{LifecycleActive, LifecycleSuspended, LifecycleArchived, LifecycleSuperseded}
+	if len(lifecycle) != len(wantLifecycle) {
+		t.Fatalf("lifecycle options = %+v, want %v", lifecycle, wantLifecycle)
+	}
+	for i, want := range wantLifecycle {
+		if lifecycle[i].Label != want || lifecycle[i].Value != want {
+			t.Errorf("lifecycle[%d] = %+v, want label==value %q", i, lifecycle[i], want)
+		}
+	}
+	assignees := res.Filters["assignee"]
+	if len(assignees) != 1 || assignees[0].Label != "Ana" || assignees[0].Value != "u-1" {
+		t.Errorf("assignee options = %+v, want only the id-bearing Ana", assignees)
+	}
+}
+
+// A ProcessosQuery is "filtered" when any of search/court/lifecycle/degree/assignee is
+// set — the counter then needs the filtered COUNT; all-empty is the default context.
+func TestProcessosQuery_Filtered(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		q    ProcessosQuery
+		want bool
+	}{
+		{"none", ProcessosQuery{}, false},
+		{"search", ProcessosQuery{Search: "x"}, true},
+		{"court", ProcessosQuery{Court: "TJSP"}, true},
+		{"lifecycle", ProcessosQuery{Lifecycle: LifecycleArchived}, true},
+		{"degree", ProcessosQuery{Degree: "PRIMEIRO_GRAU"}, true},
+		{"assignee", ProcessosQuery{Assignee: "u-1"}, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tc.q.Filtered(); got != tc.want {
+				t.Errorf("Filtered() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

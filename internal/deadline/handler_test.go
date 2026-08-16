@@ -474,6 +474,53 @@ func TestHandler_ListPrazos_EnvelopeHasTotalsAndContext(t *testing.T) {
 	}
 }
 
+// ?kind/?court (the envelope's free-text options) flow into the PrazosQuery the handler
+// sends to the read port.
+func TestHandler_ListPrazos_ForwardsKindAndCourt(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newApp(rd, "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet,
+		"/v1/prazos?kind=Aguardando%20resposta&court=TJSP", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotAgendaQ.Kind != "Aguardando resposta" {
+		t.Errorf("Kind = %q, want Aguardando resposta", rd.gotAgendaQ.Kind)
+	}
+	if rd.gotAgendaQ.Court != "TJSP" {
+		t.Errorf("Court = %q, want TJSP", rd.gotAgendaQ.Court)
+	}
+}
+
+// A param outside the prazos route's allowlist is a client error → 400, never silently
+// ignored (docs/erd-backend.md §4e.3).
+func TestHandler_ListPrazos_UnknownParam_400(t *testing.T) {
+	t.Parallel()
+
+	app := newApp(&recordingReader{}, "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/prazos?assignee=u-1", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a foreign param", status)
+	}
+}
+
+// The prazos envelope's filters block is always present and never null.
+func TestHandler_ListPrazos_EnvelopeFiltersAlwaysObject(t *testing.T) {
+	t.Parallel()
+
+	app := newApp(&recordingReader{}, "tenant-9")
+	status, body := do(t, app, http.MethodGet, "/v1/prazos", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if !strings.Contains(body, `"filters":{}`) {
+		t.Errorf("envelope filters not an empty object\ngot: %s", body)
+	}
+}
+
 // Cursor round-trip across two pages: when the read reports a further page, the envelope
 // carries a next_cursor keyed off the last row's (end_date, id); echoing it back resumes
 // the keyset exactly there.
@@ -1082,6 +1129,7 @@ func TestHandler_ListTasks_BadFilters_400(t *testing.T) {
 		{"bad status", "/v1/tasks?status=BOGUS"},
 		{"bad assignee", "/v1/tasks?assignee=not-a-uuid"},
 		{"bad date", "/v1/tasks?from=03-2024"},
+		{"bad source", "/v1/tasks?source=LLM"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1092,6 +1140,48 @@ func TestHandler_ListTasks_BadFilters_400(t *testing.T) {
 				t.Fatalf("status = %d, want 400 (body: %s)", status, body)
 			}
 		})
+	}
+}
+
+// ?source (a closed set) flows into the TasksQuery the handler sends to the read port.
+func TestHandler_ListTasks_ForwardsSource(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newApp(rd, "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/tasks?source=AI", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotTasksQ.Source != "AI" {
+		t.Errorf("Source = %q, want AI", rd.gotTasksQ.Source)
+	}
+}
+
+// A param outside the tasks route's allowlist is a client error → 400, never silently
+// ignored.
+func TestHandler_ListTasks_UnknownParam_400(t *testing.T) {
+	t.Parallel()
+
+	app := newApp(&recordingReader{}, "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/tasks?court=TJSP", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a foreign param", status)
+	}
+}
+
+// The tasks envelope's filters block is always present and never null.
+func TestHandler_ListTasks_EnvelopeFiltersAlwaysObject(t *testing.T) {
+	t.Parallel()
+
+	app := newApp(&recordingReader{}, "tenant-9")
+	status, body := do(t, app, http.MethodGet, "/v1/tasks", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if !strings.Contains(body, `"filters":{}`) {
+		t.Errorf("envelope filters not an empty object\ngot: %s", body)
 	}
 }
 

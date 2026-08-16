@@ -60,9 +60,10 @@ SELECT EXISTS (
 -- The in-app inbox for ONE user: the avisos visible to them — tenant-level
 -- (recipient_user_id IS NULL) OR addressed to them — newest first, keyset-paginated
 -- on (created_at, id) descending. `read` is per-user: EXISTS a receipt for THIS user
--- in notification_read. @unread_only filters to the ones this user has not read. The
--- caller passes the max sentinel cursor ('9999-…', max-uuid) for the first page, so
--- there is no conditional WHERE. tenant_id ($1) is barrier 1; RLS is barrier 2.
+-- in notification_read. @unread_only filters to the ones this user has not read;
+-- @type ('' = all) filters to one closed-set type. The caller passes the max sentinel
+-- cursor ('9999-…', max-uuid) for the first page, so there is no conditional WHERE.
+-- tenant_id ($1) is barrier 1; RLS is barrier 2.
 SELECT n.id, n.type, n.title, n.body, n.payload, n.created_at,
        EXISTS (
            SELECT 1 FROM notification_read r
@@ -75,6 +76,7 @@ WHERE n.tenant_id = $1
   -- out of the bell and off the unread badge.
   AND n.title IS NOT NULL
   AND (n.recipient_user_id IS NULL OR n.recipient_user_id = @user_id::uuid)
+  AND (@type::text = '' OR n.type = @type::text)
   AND (
       NOT @unread_only::boolean
       OR NOT EXISTS (
