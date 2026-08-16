@@ -22,9 +22,20 @@ type SetPreferenceRequest struct {
 // preference. A failure here is a 400 at the edge (KindInvalid → 400).
 func (r SetPreferenceRequest) Validate() error {
 	return validation.ValidateStruct(&r,
-		validation.Field(&r.Type, validation.Required),
+		validation.Field(&r.Type, validation.Required, validation.By(validNotificationType)),
 		validation.Field(&r.Channels, validation.Each(validation.By(validDeliveryChannel))),
 	)
+}
+
+// validNotificationType is the ozzo rule: the value must be a known aviso type
+// (ValidNotificationType) — an unrecognized type is a 400, not a silently-saved
+// preference that will never match a real notification.
+func validNotificationType(value any) error {
+	t, _ := value.(string)
+	if !ValidNotificationType(t) {
+		return fmt.Errorf("unknown notification type: %s", t)
+	}
+	return nil
 }
 
 // validDeliveryChannel is the ozzo rule: the value must be a known delivery

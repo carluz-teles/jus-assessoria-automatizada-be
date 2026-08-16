@@ -468,6 +468,24 @@ func TestHandler_SetPreference_InvalidChannel_400(t *testing.T) {
 	}
 }
 
+// AC (FLO-70): an unrecognized type → 400; the use case never runs. A typo'd
+// type must not silently save a preference that will never match a real aviso.
+func TestHandler_SetPreference_UnknownType_400(t *testing.T) {
+	t.Parallel()
+
+	fp := &fakePrefs{}
+	app := newAppWithPrefs(&fakeReader{}, fp, "u-1", "tenant-1")
+
+	body := `{"type":"totally_made_up","channels":["EMAIL"]}`
+	status, resp := doBody(t, app, http.MethodPut, "/v1/notifications/preferences", body, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, resp)
+	}
+	if fp.gotType != "" {
+		t.Fatal("use case ran on an unknown type")
+	}
+}
+
 // AC2: a missing type → 400; the use case never runs.
 func TestHandler_SetPreference_MissingType_400(t *testing.T) {
 	t.Parallel()
