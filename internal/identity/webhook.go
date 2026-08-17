@@ -16,6 +16,8 @@ import (
 // Clerk webhook event types this slice provisions from (docs §4d.3, via 2).
 const (
 	eventOrganizationCreated = "organization.created"
+	eventOrganizationUpdated = "organization.updated"
+	eventOrganizationDeleted = "organization.deleted"
 	eventMembershipCreated   = "organizationMembership.created"
 	eventMembershipDeleted   = "organizationMembership.deleted"
 	eventMembershipUpdated   = "organizationMembership.updated"
@@ -137,6 +139,27 @@ func (h *WebhookHandler) dispatch(ctx context.Context, ev clerkEvent) error {
 		}
 		_, err := h.uc.ProvisionTenant(ctx, d.ID, d.Name)
 		return err
+
+	case eventOrganizationUpdated:
+		// Reuses ProvisionTenant — UpsertTenant is ON CONFLICT (clerk_org_id) DO
+		// UPDATE, so a rename in Clerk reprojects tenant.name the same way a
+		// replayed .created would. TenantProvisioned republishes with its STABLE
+		// event id (derived from tenant id alone, see newTenantProvisioned's doc),
+		// so a downstream SeenOrMark dedup treats this as the replay it already
+		// knows how to collapse — no new event fatigue from renames.
+		var d orgData
+		if err := json.Unmarshal(ev.Data, &d); err != nil {
+			return apperr.NewInvalid("malformed organization payload")
+		}
+		_, err := h.uc.ProvisionTenant(ctx, d.ID, d.Name)
+		return err
+
+	case eventOrganizationDeleted:
+		var d orgData
+		if err := json.Unmarshal(ev.Data, &d); err != nil {
+			return apperr.NewInvalid("malformed organization payload")
+		}
+		return h.uc.OnOrganizationDeleted(ctx, d.ID)
 
 	case eventMembershipCreated:
 		var d membershipData
