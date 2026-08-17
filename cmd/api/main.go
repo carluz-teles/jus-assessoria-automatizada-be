@@ -25,7 +25,6 @@ import (
 	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
-	"github.com/jusassessoria/platform/internal/portalcredential"
 	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
@@ -36,7 +35,6 @@ import (
 	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/storage"
 	"github.com/jusassessoria/platform/lib/telemetry"
-	"github.com/jusassessoria/platform/lib/vault"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
 
@@ -296,29 +294,6 @@ func run(logger *slog.Logger) error {
 		)
 	}
 
-	// portalcredential wiring: only mounted when VAULT_KEK_BASE64 is configured
-	// — the same optional-adapter convention S3/document follows above. Without
-	// it the slice stays unmounted (nil → the router nil-guard skips it) rather
-	// than booting with a vault that can never seal/open a secret.
-	var portalCredentialHandler *portalcredential.Handler
-	if cfg.VaultKEK != "" {
-		v, err := vault.New(cfg.VaultKEK)
-		if err != nil {
-			return fmt.Errorf("init vault: %w", err)
-		}
-		logger.Info("vault configured")
-
-		portalCredentialUC := portalcredential.NewUseCase(
-			portalcredential.NewRepository(),
-			portalcredential.NewTJSPEprocChecker(),
-			v,
-			uow,
-		)
-		portalCredentialHandler = portalcredential.NewHandler(portalCredentialUC)
-	} else {
-		logger.Warn("VAULT_KEK_BASE64 unset — /v1/scraping/portal-credential disabled")
-	}
-
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,
@@ -335,7 +310,6 @@ func run(logger *slog.Logger) error {
 		deadline:             deadlineHandler,
 		document:             documentHandler,
 		lookup:               lookupHandler,
-		portalCredential:     portalCredentialHandler,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext

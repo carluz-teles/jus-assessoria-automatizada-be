@@ -198,17 +198,6 @@ type Config struct {
 	// remover a flag, se ela deixar de fazer sentido) quando a precificação for
 	// definida.
 	BillingGateEnabled bool `env:"BILLING_GATE_ENABLED" envDefault:"false"`
-
-	// VaultKEK is the base64-encoded 32-byte Key Encryption Key lib/vault uses to
-	// wrap every secret's per-row DEK (docs/erd-tribunal-scraping.md §6 — the
-	// portal_credential password is the first secret it protects). Optional in
-	// the aggregate for the same reason S3/Resend/Stripe are: only the api (where
-	// PUT /v1/scraping/portal-credential lives) needs it, and keeping it optional
-	// here preserves the boot of every binary that doesn't touch the vault. The
-	// slice's own wiring in cmd/api validates presence at the point of use
-	// (vault.New returns vault.ErrInvalidKEK) and fails fast there, not
-	// mid-request — same convention as storage.New/S3Enabled.
-	VaultKEK string `env:"VAULT_KEK_BASE64"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do
