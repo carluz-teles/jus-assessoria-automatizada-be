@@ -232,6 +232,49 @@ func TestUseCase_ProvisionTenant(t *testing.T) {
 	})
 }
 
+func TestUseCase_OnOrganizationDeleted(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("known tenant — logs, touches nothing", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(_ context.Context, clerkOrgID string) (*Tenant, error) {
+				if clerkOrgID != "org_abc" {
+					t.Fatalf("lookup clerk org = %q, want org_abc", clerkOrgID)
+				}
+				return &Tenant{ID: "tenant-uuid", ClerkOrgID: "org_abc"}, nil
+			},
+		}
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{})
+
+		if err := uc.OnOrganizationDeleted(ctx, "org_abc"); err != nil {
+			t.Fatalf("OnOrganizationDeleted() error = %v", err)
+		}
+	})
+
+	t.Run("unknown clerk org — silent no-op, not an error", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+		}
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{})
+
+		if err := uc.OnOrganizationDeleted(ctx, "org_never_seen"); err != nil {
+			t.Fatalf("OnOrganizationDeleted() error = %v, want nil (unknown org is a no-op)", err)
+		}
+	})
+
+	t.Run("a lookup infra fault propagates unchanged", func(t *testing.T) {
+		boom := errors.New("db unreachable")
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, boom },
+		}
+		uc := NewUseCase(repo, noopOutbox{}, &fakeUOW{})
+
+		if err := uc.OnOrganizationDeleted(ctx, "org_abc"); !errors.Is(err, boom) {
+			t.Fatalf("error = %v, want %v", err, boom)
+		}
+	})
+}
+
 func TestUseCase_SyncUser(t *testing.T) {
 	ctx := context.Background()
 	existing := &AppUser{ID: "u-1", ClerkUserID: "user_xyz", TenantID: "tenant-uuid", Role: RoleAdmin}

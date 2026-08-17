@@ -3,6 +3,7 @@ package identity
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/google/uuid"
 
@@ -67,6 +68,29 @@ func (uc *UseCase) ProvisionTenant(ctx context.Context, clerkOrgID, name string)
 		return nil, err
 	}
 	return tenant, nil
+}
+
+// OnOrganizationDeleted handles a Clerk organization.deleted webhook. Deleting a
+// tenant (and everything FK'd to it — memberships, subscriptions, processos) is a
+// product decision with no safe automatic default, so this deliberately does NOT
+// delete or deactivate anything: it logs a structured warning an operator can act
+// on. An unknown clerk org id (no local tenant was ever provisioned for it) is a
+// silent no-op — nothing to warn about. Idempotent by construction: replaying the
+// same webhook just logs again, no state to double-apply.
+func (uc *UseCase) OnOrganizationDeleted(ctx context.Context, clerkOrgID string) error {
+	tenant, err := uc.repo.FindTenantByClerkOrg(ctx, clerkOrgID)
+	if errors.Is(err, ErrTenantNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	slog.WarnContext(ctx, "identity: Clerk organization deleted — local tenant data retained, no automatic cleanup",
+		"tenant_id", tenant.ID,
+		"clerk_org_id", clerkOrgID,
+	)
+	return nil
 }
 
 // resolveOrProvisionTenant returns the tenant behind clerkOrgID, provisioning it

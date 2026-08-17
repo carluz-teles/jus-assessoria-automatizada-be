@@ -248,11 +248,11 @@ resolve preferências/audiência → cria `notification` + `notification_deliver
 - `tenant_id` sempre do contexto verificado; RLS por tx; segredos por env. Lookups CNPJ/CEP via proxy do BE (cache).
 
 ## 12. Decisões em aberto
-- **Renomear a `notification` judicial → `intimation`** (§7) para liberar o nome ao domínio de avisos.
-- Canais do Notifications no v0: e-mail garantido; in-app logo a seguir (feed que o FE lê).
-- PIX/boleto (provedor BR) atrás do `BillingGateway` (§6.6).
-- **Fan-out de e-mail do `payment_failed` por admin** (FLO-69, aberto): hoje o aviso é só in-app tenant-level —
-  `billing` não tem (e não deveria ter, por regra de dependência de slice) acesso à lista de admins do tenant.
+> Resolvidas (não repetir): renomear `notification` judicial → `intimation` (§7, migration 0006); canais
+> in-app do Notifications (implementado, fatias 1a/2a); fan-out de e-mail do `payment_failed` por admin
+> (FLO-69, via port `AdminLister`/`AdminListerAdapter`); `organization.updated/deleted` do Clerk (FLO-72).
+
+- PIX/boleto (provedor BR) atrás do `BillingGateway` (§6.6). Fora do v0.
 - Onboarding: viver em `internal/identity` ou slice próprio `internal/onboarding`? (v0: dentro de identity).
 
 ## 13. Ordem de implementação (fatias verticais)
