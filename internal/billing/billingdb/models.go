@@ -165,14 +165,18 @@ type Document struct {
 }
 
 type Draft struct {
-	ID         uuid.UUID          `json:"id"`
-	TenantID   uuid.UUID          `json:"tenant_id"`
-	CaseID     pgtype.UUID        `json:"case_id"`
-	PieceType  string             `json:"piece_type"`
-	Status     string             `json:"status"`
-	SagaState  string             `json:"saga_state"`
-	StorageKey string             `json:"storage_key"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CaseID       pgtype.UUID        `json:"case_id"`
+	PieceType    string             `json:"piece_type"`
+	Status       string             `json:"status"`
+	SagaState    string             `json:"saga_state"`
+	StorageKey   *string            `json:"storage_key"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	IntimationID pgtype.UUID        `json:"intimation_id"`
+	Title        string             `json:"title"`
+	Content      *string            `json:"content"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Holiday struct {
