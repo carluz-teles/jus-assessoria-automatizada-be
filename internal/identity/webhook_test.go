@@ -262,6 +262,59 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		}
 	})
 
+	t.Run("organization.updated reprojects the tenant name", func(t *testing.T) {
+		var got struct{ clerkOrgID, name string }
+		repo := &mockRepo{
+			upsertTenant: func(_ context.Context, _ database.Tx, clerkOrgID, name string) (*Tenant, error) {
+				got.clerkOrgID, got.name = clerkOrgID, name
+				return &Tenant{ID: "t-1", ClerkOrgID: clerkOrgID, Name: name}, nil
+			},
+		}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
+
+		body := []byte(`{"type":"organization.updated","data":{"id":"org_abc","name":"Escritório Renomeado"}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if got.clerkOrgID != "org_abc" || got.name != "Escritório Renomeado" {
+			t.Fatalf("UpsertTenant args = %+v", got)
+		}
+	})
+
+	t.Run("organization.deleted acks without deleting local data", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) {
+				return &Tenant{ID: "t-1", ClerkOrgID: "org_abc"}, nil
+			},
+			// Any write call would nil-panic — proving OnOrganizationDeleted never
+			// touches the tenant row (it only logs).
+		}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
+
+		body := []byte(`{"type":"organization.deleted","data":{"id":"org_abc"}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	})
+
+	t.Run("organization.deleted for an unknown clerk org is a silent no-op", func(t *testing.T) {
+		repo := &mockRepo{
+			findTenant: func(context.Context, string) (*Tenant, error) { return nil, ErrTenantNotFound },
+		}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
+
+		body := []byte(`{"type":"organization.deleted","data":{"id":"org_never_seen"}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	})
+
 	t.Run("unknown event type is acknowledged and ignored", func(t *testing.T) {
 		repo := &mockRepo{} // any repo call would nil-panic — proving none happens
 		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
