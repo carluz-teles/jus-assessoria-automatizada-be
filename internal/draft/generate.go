@@ -357,14 +357,27 @@ func buildQueryText(d *Draft, i *IntimationContext) string {
 }
 
 // buildDraftContext converts the loaded domain objects to the advisory DraftContext.
+// When i is nil (blank/processo draft) the intimation fields remain empty strings —
+// the prompt's add() helper drops empty labels, so the LLM still gets a clean prompt.
 func buildDraftContext(d *Draft, i *IntimationContext, chunks []string) advisory.DraftContext {
 	dc := advisory.DraftContext{
 		PieceType: d.PieceType,
 		Chunks:    chunks,
 	}
-	if i != nil {
-		dc.IntimationType = i.Type
+	if i == nil {
+		return dc
 	}
+	dc.IntimationType = i.Type
+	// The DJEN intimation teor is stored as HTML — strip it to plain text so the LLM
+	// gets clean signal (parties, order, dates) without markup noise wasting tokens.
+	dc.IntimationText = stripHTML(i.Content)
+	dc.Court = i.Court
+	dc.Degree = i.Degree
+	dc.Class = i.Class
+	dc.Subject = i.Subject
+	dc.CNJNumber = i.CNJNumber
+	dc.JudgingBody = i.JudgingBody
+	dc.DeadlineDate = i.DeadlineEndDate
 	return dc
 }
 

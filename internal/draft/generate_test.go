@@ -565,6 +565,82 @@ func TestGenerateUseCase_WithoutIntimation_WholeTenantSearch(t *testing.T) {
 	}
 }
 
+// TestBuildDraftContext_WithIntimation verifies that buildDraftContext populates ALL
+// fields from a fully-loaded IntimationContext. This is the regression guard for the
+// root cause: previously only IntimationType was populated; Court/Degree/Class/Subject/
+// CNJNumber/JudgingBody/DeadlineDate/IntimationText were silently dropped.
+func TestBuildDraftContext_WithIntimation(t *testing.T) {
+	d := &Draft{PieceType: PieceTypeDefense}
+	i := &IntimationContext{
+		Type:            "CITACAO",
+		Content:         "Fica o réu citado para contestar em 15 dias.",
+		Court:           "TJSP",
+		Degree:          "G1",
+		Class:           "Procedimento Comum",
+		Subject:         "Contrato",
+		CNJNumber:       "0000001-23.2026.8.26.0001",
+		JudgingBody:     "3ª Vara Cível",
+		DeadlineEndDate: "2026-09-01",
+	}
+	chunks := []string{"trecho 1", "trecho 2"}
+
+	dc := buildDraftContext(d, i, chunks)
+
+	tests := []struct {
+		field string
+		got   string
+		want  string
+	}{
+		{"PieceType", dc.PieceType, PieceTypeDefense},
+		{"IntimationType", dc.IntimationType, "CITACAO"},
+		{"IntimationText", dc.IntimationText, i.Content},
+		{"Court", dc.Court, "TJSP"},
+		{"Degree", dc.Degree, "G1"},
+		{"Class", dc.Class, "Procedimento Comum"},
+		{"Subject", dc.Subject, "Contrato"},
+		{"CNJNumber", dc.CNJNumber, "0000001-23.2026.8.26.0001"},
+		{"JudgingBody", dc.JudgingBody, "3ª Vara Cível"},
+		{"DeadlineDate", dc.DeadlineDate, "2026-09-01"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("buildDraftContext.%s = %q, want %q", tt.field, tt.got, tt.want)
+			}
+		})
+	}
+	if len(dc.Chunks) != 2 {
+		t.Errorf("len(Chunks) = %d, want 2", len(dc.Chunks))
+	}
+}
+
+// TestBuildDraftContext_NilIntimation verifies that buildDraftContext with a nil
+// IntimationContext leaves the intimation fields empty (blank/processo draft path).
+func TestBuildDraftContext_NilIntimation(t *testing.T) {
+	d := &Draft{PieceType: PieceTypeMotion}
+	dc := buildDraftContext(d, nil, nil)
+
+	if dc.PieceType != PieceTypeMotion {
+		t.Errorf("PieceType = %q, want MOTION", dc.PieceType)
+	}
+	// All intimation-derived fields must be empty.
+	for _, f := range []struct{ name, val string }{
+		{"IntimationType", dc.IntimationType},
+		{"IntimationText", dc.IntimationText},
+		{"Court", dc.Court},
+		{"Degree", dc.Degree},
+		{"Class", dc.Class},
+		{"Subject", dc.Subject},
+		{"CNJNumber", dc.CNJNumber},
+		{"JudgingBody", dc.JudgingBody},
+		{"DeadlineDate", dc.DeadlineDate},
+	} {
+		if f.val != "" {
+			t.Errorf("nil intimation: %s = %q, want empty", f.name, f.val)
+		}
+	}
+}
+
 // TestBuildFindings_DocumentsCited verifies that documents cited in Argumento
 // suggestions appear in the coverage.documents_cited list.
 func TestBuildFindings_DocumentsCited(t *testing.T) {

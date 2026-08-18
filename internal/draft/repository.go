@@ -198,11 +198,24 @@ func (r *pgRepository) GetIntimationForDraft(ctx context.Context, tx database.Tx
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
+	// Format deadline end_date as DateOnly string; empty when NULL (no deadline yet).
+	deadlineDate := ""
+	if row.DeadlineEndDate.Valid {
+		deadlineDate = row.DeadlineEndDate.Time.Format("2006-01-02")
+	}
 	return &IntimationContext{
-		IntimationID:  row.IntimationID.String(),
-		CaseID:        row.CaseID.String(),
-		CourtRecordID: row.CourtRecordID.String(),
-		Type:          derefString(row.IntimationType),
+		IntimationID:    row.IntimationID.String(),
+		CaseID:          row.CaseID.String(),
+		CourtRecordID:   row.CourtRecordID.String(),
+		Type:            derefString(row.IntimationType),
+		Content:         row.IntimationContent,
+		CNJNumber:       row.CnjNumber,
+		Court:           row.Court,
+		Degree:          row.Degree,
+		Class:           derefString(row.Class),
+		Subject:         derefString(row.Subject),
+		JudgingBody:     derefString(row.JudgingBody),
+		DeadlineEndDate: deadlineDate,
 	}, nil
 }
 

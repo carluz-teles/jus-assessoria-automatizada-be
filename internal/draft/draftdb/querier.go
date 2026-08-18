@@ -19,6 +19,9 @@ type Querier interface {
 	// Remove all review rows for a draft. Called by Gerar before persisting DRAFTED so
 	// that subsequent Revisar calls always operate on a clean slate (no stale suggestions
 	// from a prior generation attempt are mixed with a new minuta).
+	// tenant isolation: review has no tenant_id (child of draft); the caller guards the
+	// tenant via GetDraftByID(tenantID, draftID) earlier in the same tx. Do NOT "fix"
+	// this with a JOIN — the app-layer barrier is intentional (see 0044_review_status).
 	DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error
 	// Load an attachment for update/delete guard: resolves (id, draft_id, tenant_id) to
 	// confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
@@ -55,8 +58,10 @@ type Querier interface {
 	// without importing the acquisition slice (decisão: read the table directly).
 	GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) (GetDraftDetailRow, error)
 	// Load the intimation context needed to build a draft from source=intimation:
-	// the case_id (via court_record), the court_record_id, and the type (for piece_type
-	// inference). Filtered by intimation.id and tenant_id (barrier 1 via court_record).
+	// the case_id (via court_record), the court_record_id, the type (for piece_type
+	// inference), and the rich context fields (content, process metadata, deadline)
+	// used to compose the AI generation prompt. Filtered by intimation.id and
+	// tenant_id (barrier 1 via court_record).
 	// A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 	GetIntimationForDraft(ctx context.Context, arg GetIntimationForDraftParams) (GetIntimationForDraftRow, error)
 	// Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.

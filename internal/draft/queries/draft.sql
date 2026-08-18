@@ -182,16 +182,27 @@ WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL;
 
 -- name: GetIntimationForDraft :one
 -- Load the intimation context needed to build a draft from source=intimation:
--- the case_id (via court_record), the court_record_id, and the type (for piece_type
--- inference). Filtered by intimation.id and tenant_id (barrier 1 via court_record).
+-- the case_id (via court_record), the court_record_id, the type (for piece_type
+-- inference), and the rich context fields (content, process metadata, deadline)
+-- used to compose the AI generation prompt. Filtered by intimation.id and
+-- tenant_id (barrier 1 via court_record).
 -- A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 SELECT
-    i.id            AS intimation_id,
-    cr.case_id      AS case_id,
-    cr.id           AS court_record_id,
-    i.type          AS intimation_type
+    i.id                AS intimation_id,
+    cr.case_id          AS case_id,
+    cr.id               AS court_record_id,
+    i.type              AS intimation_type,
+    i.content           AS intimation_content,
+    cr.cnj_number       AS cnj_number,
+    cr.court            AS court,
+    cr.degree           AS degree,
+    cr.class            AS class,
+    cr.subject          AS subject,
+    cr.judging_body     AS judging_body,
+    dl.end_date         AS deadline_end_date
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN deadline dl ON dl.notification_id = i.id
 WHERE i.id = $1 AND cr.tenant_id = $2;
 
 -- ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────

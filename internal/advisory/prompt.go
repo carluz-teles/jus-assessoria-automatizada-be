@@ -110,6 +110,12 @@ type DraftContext struct {
 	Degree         string
 	Class          string
 	Subject        string
+	// CNJNumber is the process number in CNJ format (e.g. 0000001-23.2026.8.26.0001).
+	CNJNumber string
+	// JudgingBody is the órgão julgador / vara (e.g. "3ª Vara Cível da Comarca de São Paulo").
+	JudgingBody string
+	// DeadlineDate is the prazo end date formatted as "2006-01-02", or empty when unknown.
+	DeadlineDate string
 	// Chunks are the RAG top-K hits (text only). Empty → grounded=false (degraded).
 	Chunks   []string
 	Playbook string // always empty in v0
@@ -183,9 +189,10 @@ const summarizeProcessVersion = "process_summary/v1"
 
 // draftMinutaVersion is the pinned version of the draft_minuta template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
-// Bumped to v2: Gerar agora produz APENAS a minuta limpa (sem sugestões). As sugestões são produzidas
-// pelo Revisar (review_minuta/v1). Removida a instrução de gerar suggestions do system prompt.
-const draftMinutaVersion = "draft_minuta/v2"
+// Bumped to v3: injeta dados reais (nº do processo, vara, tribunal, classe, assunto, prazo, teor da
+// intimação). O LLM agora tem contexto completo para preencher todos os campos da minuta sem
+// placeholders. Adicionada estrutura canônica por tipo de peça e instrução de usar os dados fornecidos.
+const draftMinutaVersion = "draft_minuta/v3"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -259,43 +266,96 @@ func (*TemplateComposer) ComposeReview(agent string, c ReviewContext) (Composed,
 	}
 }
 
-// composeDraftMinuta renders the draft_minuta instruction-set (v2). The system message describes
-// the legal writing role; the user message carries the intimation context + RAG chunks (when
-// available). Gerar now produces ONLY draft_content — suggestions are a separate Revisar step
-// (review_minuta agent). The output schema lives with the caller (use case).
+// composeDraftMinuta renders the draft_minuta instruction-set (v3). The system message describes
+// the legal writing role with the canonical structure and the gold rule (use real data, no
+// placeholders for provided fields). The user message carries the fully injected process context —
+// nº do processo, vara/órgão julgador, tribunal, classe, assunto, prazo, teor da intimação e
+// trechos RAG — so the LLM has everything it needs to produce a complete, non-generic minuta.
+// Gerar produces ONLY draft_content — suggestions are a separate Revisar step (review_minuta agent).
+// The output schema lives with the caller (use case).
 func composeDraftMinuta(c DraftContext) Composed {
 	var sys strings.Builder
 	sys.WriteString(
-		"Você é um assistente jurídico brasileiro especializado em redação de peças processuais. " +
-			"A partir do contexto da intimação e dos autos (quando disponível), escreva a melhor " +
-			"minuta possível para a peça processual indicada. Produza SOMENTE o campo `draft_content`: " +
-			"o texto completo da minuta em formato jurídico brasileiro, pronto para revisão do advogado.\n\n" +
-			"REGRAS OBRIGATÓRIAS:\n" +
-			"- NÃO invente fatos; fundamente-se nos autos quando possível.\n" +
-			"- Se não houver trechos dos autos, redija a minuta sem referências específicas (modo degradado).\n" +
-			"- Produza APENAS `draft_content` — nenhuma sugestão, crítica ou comentário.",
+		"Você é um assistente jurídico brasileiro que redige a MINUTA COMPLETA de uma peça processual, " +
+			"pronta para revisão do advogado. Produza SOMENTE o campo `draft_content`: o texto integral " +
+			"da minuta em formato jurídico brasileiro.\n\n" +
+
+			"REGRA DE OURO (a mais importante): USE OS DADOS REAIS fornecidos no contexto. NUNCA deixe " +
+			"placeholder (___, [assim], \"NOME DA PARTE\") para um dado que foi fornecido. Só use " +
+			"marcador [entre colchetes] quando o dado for genuinamente DESCONHECIDO (não fornecido no " +
+			"contexto). Se o tribunal, a vara (órgão julgador), o número do processo, a classe e o " +
+			"assunto foram dados, escreva-os. Extraia os NOMES DAS PARTES do teor da intimação quando " +
+			"presentes. O nome do advogado e o número da OAB NUNCA são fornecidos no contexto — use SEMPRE " +
+			"os marcadores literais [Nome do Advogado] e OAB/[UF] nº [número]; JAMAIS invente, preencha ou " +
+			"deduza um número de OAB.\n\n" +
+
+			"ESTRUTURA CANÔNICA (nesta ordem, blocos separados por linha em branco):\n" +
+			"1) ENDEREÇAMENTO em CAIXA ALTA, adaptado ao foro: Vara Cível comum → " +
+			"\"EXCELENTÍSSIMO SENHOR DOUTOR JUIZ DE DIREITO DA [vara] DA COMARCA DE [comarca]/[UF]\"; " +
+			"Juizado Especial (degree=JE ou órgão contém \"JUIZADO ESPECIAL\") → " +
+			"\"EXCELENTÍSSIMO SENHOR JUIZ DE DIREITO DO JUIZADO ESPECIAL CÍVEL DA COMARCA DE [comarca]/[UF]\" " +
+			"(tom simples, SEM \"Doutor\"); 2ª instância → Tribunal/Desembargador. " +
+			"Derive a comarca do órgão julgador quando possível.\n" +
+			"2) Referência: \"Processo nº [CNJ]\" + classe/assunto.\n" +
+			"3) Identificação/qualificação: em autos em curso basta \"[PARTE], já qualificado(a) nos autos " +
+			"em epígrafe, por seu advogado infra-assinado,\"; em petição inicial, qualificar as partes.\n" +
+			"4) EXÓRDIO com base legal: \"vem, respeitosamente, à presença de Vossa Excelência, com " +
+			"fundamento no [artigo], apresentar [TIPO DA PEÇA EM CAIXA ALTA]\" pelos fatos e fundamentos " +
+			"a seguir expostos.\n" +
+			"5) \"I – DOS FATOS\" (CAIXA ALTA), parágrafos em arábico, narrativa objetiva ancorada no " +
+			"TEOR DA INTIMAÇÃO e nos trechos dos autos fornecidos.\n" +
+			"6) \"II – DO DIREITO\" (CAIXA ALTA), fundamentação com artigos de lei no formato " +
+			"\"art. XXX, inciso, da Lei nº .../CPC\"; em defesa, impugnação especificada (art. 341 CPC) " +
+			"e todas as teses (art. 336); adapte ao tipo de peça.\n" +
+			"7) \"III – DOS PEDIDOS\" (CAIXA ALTA): \"Ante o exposto, requer a Vossa Excelência:\" + " +
+			"alíneas a), b), c) (pedido certo e determinado, art. 322/324 CPC; inclua produção de provas " +
+			"e sucumbência quando cabível).\n" +
+			"8) FECHO: \"Nestes termos,\\nPede deferimento.\" + \"[Comarca]/[UF], [data].\" + " +
+			"\"[Nome do Advogado]\\nOAB/[UF] nº [número]\". A COMARCA você preenche do contexto, mas a DATA " +
+			"do fecho é SEMPRE o marcador literal [data] — a data de protocolo é definida pelo advogado ao " +
+			"assinar; NUNCA infira, calcule ou copie uma data do teor/prazo para o fecho. O prazo final, " +
+			"quando fornecido, é contexto (mencione nos fatos se relevante), não a data do fecho.\n\n" +
+
+			"REQUISITOS LEGAIS POR TIPO DE PEÇA:\n" +
+			"- PETIÇÃO INICIAL (COMPLAINT): art. 319 CPC (juízo, partes, causa de pedir, pedido, valor " +
+			"da causa, provas).\n" +
+			"- CONTESTAÇÃO/DEFESA (DEFENSE): arts. 336 (eventualidade) e 341 (impugnação especificada); " +
+			"preliminares antes do mérito (art. 337). Em execução de título extrajudicial no JE (ex.: nota " +
+			"promissória), a defesa pode ser EMBARGOS À EXECUÇÃO (art. 917 CPC — excesso de execução " +
+			"§2º com valor correto + cálculo; e prescrição: nota promissória = 3 anos, art. 70 da " +
+			"LUG/Dec. 57.663/66).\n" +
+			"- RECURSO (APPEAL): síntese do decidido + razões de reforma + pedido de provimento. No JE, " +
+			"recurso inominado (art. 41 Lei 9.099/95).\n\n" +
+
+			"FORMATAÇÃO: títulos de seção em CAIXA ALTA com romanos; parágrafos em arábico; pedidos em " +
+			"alíneas; negrito com **markdown** para ênfase pontual (nome da peça, valores, nº do processo). " +
+			"Se faltar dado essencial, escreva a melhor minuta possível com marcador claro no que faltar — " +
+			"NUNCA invente fatos, valores, súmulas, datas ou nºs de processo que não constem do contexto.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
 		sys.WriteString(pb)
 	}
 
-	lines := make([]string, 0, 10)
+	lines := make([]string, 0, 12)
 	add := func(label, value string) {
 		if v := strings.TrimSpace(value); v != "" {
 			lines = append(lines, label+": "+v)
 		}
 	}
-	add("Tipo de peça", c.PieceType)
-	add("Tipo de intimação", c.IntimationType)
+	add("Tipo da peça", c.PieceType)
 	add("Tribunal", c.Court)
-	add("Grau", c.Degree)
+	add("Órgão julgador/Vara", c.JudgingBody)
+	add("Nº do processo", c.CNJNumber)
 	add("Classe/rito", c.Class)
 	add("Assunto", c.Subject)
-	add("Teor da intimação", c.IntimationText)
+	add("Grau", c.Degree)
+	add("Tipo de intimação", c.IntimationType)
+	add("Prazo final", c.DeadlineDate)
+	add("TEOR DA INTIMAÇÃO", c.IntimationText)
 
 	if len(c.Chunks) > 0 {
-		lines = append(lines, "Trechos dos autos (RAG):")
+		lines = append(lines, "Trechos relevantes dos autos:")
 		for i, chunk := range c.Chunks {
 			if i >= 8 {
 				break
@@ -305,13 +365,12 @@ func composeDraftMinuta(c DraftContext) Composed {
 	}
 
 	var usr strings.Builder
-	usr.WriteString("Contexto do caso:\n")
 	if len(lines) == 0 {
-		usr.WriteString("(sem contexto adicional)")
+		usr.WriteString("(sem contexto adicional — modo degradado)")
 	} else {
 		usr.WriteString(strings.Join(lines, "\n"))
 	}
-	usr.WriteString("\n\nGere a minuta da peça processual.")
+	usr.WriteString("\n\nRedija a minuta completa da peça seguindo as instruções.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftMinutaVersion}
 }
