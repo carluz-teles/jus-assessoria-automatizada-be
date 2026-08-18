@@ -95,6 +95,7 @@ type GenerateUseCase struct {
 	emb      embedder               // nil → degraded (no grounding)
 	search   indexing.SearchDeps    // Pool may be nil → degraded
 	composer advisory.PromptComposer
+	model    string // OpenRouter model slug (from config); falls back to generationModel
 	now      func() time.Time
 }
 
@@ -110,6 +111,7 @@ type GenerateUseCaseParams struct {
 	Emb      embedder
 	Search   indexing.SearchDeps
 	Composer advisory.PromptComposer
+	Model    string           // OpenRouter model slug; empty → generationModel fallback
 	Now      func() time.Time // defaults to time.Now
 }
 
@@ -118,6 +120,9 @@ type GenerateUseCaseParams struct {
 func NewGenerateUseCase(p GenerateUseCaseParams) *GenerateUseCase {
 	if p.Now == nil {
 		p.Now = time.Now
+	}
+	if p.Model == "" {
+		p.Model = generationModel
 	}
 	return &GenerateUseCase{
 		uow:      p.UoW,
@@ -129,6 +134,7 @@ func NewGenerateUseCase(p GenerateUseCaseParams) *GenerateUseCase {
 		emb:      p.Emb,
 		search:   p.Search,
 		composer: p.Composer,
+		model:    p.Model,
 		now:      p.Now,
 	}
 }
@@ -174,17 +180,17 @@ var generateSchema = json.RawMessage(`{
           "problem":     { "type": "string" },
           "description": { "type": "string" },
           "citation": {
-            "type": "object",
+            "type": ["object", "null"],
             "properties": {
               "document_id": { "type": "string" },
-              "page":        { "type": "integer" },
+              "page":        { "type": ["integer", "null"] },
               "quote":       { "type": "string" }
             },
             "required": ["document_id", "page", "quote"],
             "additionalProperties": false
           }
         },
-        "required": ["category", "original", "replacement", "problem", "description"],
+        "required": ["category", "original", "replacement", "problem", "description", "citation"],
         "additionalProperties": false
       }
     }
@@ -270,7 +276,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		User:       composed.User,
 		Schema:     generateSchema,
 		SchemaName: "draft_minuta",
-		Model:      generationModel,
+		Model:      uc.model,
 		MaxTokens:  4096,
 	})
 	if err3 != nil {
@@ -307,7 +313,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			DraftID:      ev.DraftID,
 			Findings:     findings,
 			Coverage:     coverage,
-			ModelVersion: generationModel,
+			ModelVersion: uc.model,
 			RulesVersion: composed.PromptVersion,
 			Status:       ReviewStatusCompleted,
 			GeneratedAt:  uc.now(),

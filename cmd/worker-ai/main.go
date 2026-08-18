@@ -141,6 +141,7 @@ func run(logger *slog.Logger) error {
 			Emb:      emb,
 			Search:   searchDeps,
 			Composer: advisory.NewTemplateComposer(),
+			Model:    cfg.OpenRouterModel,
 		})
 
 		listener := draft.NewListener(generateUC)
