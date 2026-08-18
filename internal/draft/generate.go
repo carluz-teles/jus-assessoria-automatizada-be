@@ -91,9 +91,9 @@ type GenerateUseCase struct {
 	writer   generationWriter
 	outbox   outboxPublisher
 	dedup    generateDeduper
-	gen      llm.Generator          // nil → FAILED "IA não configurada"
-	emb      embedder               // nil → degraded (no grounding)
-	search   indexing.SearchDeps    // Pool may be nil → degraded
+	gen      llm.Generator       // nil → FAILED "IA não configurada"
+	emb      embedder            // nil → degraded (no grounding)
+	search   indexing.SearchDeps // Pool may be nil → degraded
 	composer advisory.PromptComposer
 	model    string // OpenRouter model slug (from config); falls back to generationModel
 	now      func() time.Time

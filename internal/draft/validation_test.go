@@ -25,8 +25,8 @@ func TestCreateRequest_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "source=intimation requires intimation_id",
-			req:  CreateRequest{Source: SourceIntimation},
+			name:    "source=intimation requires intimation_id",
+			req:     CreateRequest{Source: SourceIntimation},
 			wantErr: true,
 		},
 		{

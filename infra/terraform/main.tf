@@ -78,8 +78,16 @@ locals {
       BACKFILL_WINDOW_DAYS = "30"
       INGESTION_ENABLED    = "false"
     })
-    # Skeletons por ora — só a base (config.Load exige os 5 required).
-    "worker-ai" = local.base_vars
+    # worker-ai: geração assíncrona da minuta + review (Fatia 3 do peticionamento).
+    # Consome draft.generation_requested → chama o LLM (OpenRouter) com structured
+    # output. Precisa da OPENROUTER_API_KEY (sem ela o binário sobe mas marca todo draft
+    # FAILED "IA não configurada"). Modelo/base_url ficam no default do código
+    # (openai/gpt-4o-mini) — mesmo que o api usa. VOYAGE_API_KEY fica de fora por ora:
+    # sem ela a geração roda ungrounded (grounded=false, sem citação dos autos) — RAG
+    # em prod é follow-up (exige os chunks indexados no pgvector).
+    "worker-ai" = merge(local.base_vars, {
+      OPENROUTER_API_KEY = var.openrouter_api_key
+    })
     # worker-documents: pipeline de documentos (extração/OCR + chunk/embedding). Precisa de
     # storage (lê o PDF, grava o texto extraído, baixa) + a chave Voyage (embeddings). O
     # ANTHROPIC_API_KEY (OCR via Claude vision) já vem na base. Sem VOYAGE_API_KEY o binário

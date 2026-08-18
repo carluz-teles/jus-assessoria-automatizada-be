@@ -111,7 +111,7 @@ type DraftContext struct {
 	Class          string
 	Subject        string
 	// Chunks are the RAG top-K hits (text only). Empty → grounded=false (degraded).
-	Chunks  []string
+	Chunks   []string
 	Playbook string // always empty in v0
 }
 
