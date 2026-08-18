@@ -50,6 +50,12 @@ func (txGenerateDeduper) SeenOrMark(ctx context.Context, tx database.Tx, consume
 // Dedup is per-consumer (docs §4c.3), so it is slice+job-specific.
 const generationConsumer = "draft_ai"
 
+// generationModel is the single source of truth for the Claude model used in the
+// generation pipeline. Referenced in the llm.Request (prompt call) and stamped on
+// the review row (model_version) so findings are always attributable to the model
+// that produced them. Bump here when the model changes — one place, not two.
+const generationModel = "claude-opus-4-8"
+
 // generationDepsReader is the narrow read port the generation use case needs to load
 // case context for composing the advisory prompt. Satisfied by the read Repository
 // (GetDraftByID + optionally GetIntimationForDraft), but kept as a port so the unit
@@ -207,21 +213,13 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, "IA não configurada")
 	}
 
-	// ── 2. Dedup: if already processed, no-op ─────────────────────────────────
-	// The dedup mark commits with the effect tx below (same tx = atomic). We do a
-	// pre-check in a short read tx first; if the event is already seen we return
-	// before touching anything. This mirrors the deadline domain pattern.
-	var seen bool
-	if err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
-		var e error
-		seen, e = uc.dedup.SeenOrMark(ctx, tx, generationConsumer, ev.EventID)
-		return e
-	}); err != nil {
-		return fmt.Errorf("draft generate: dedup check: %w", err)
-	}
-	if seen {
-		return nil
-	}
+	// ── 2. Dedup happens in the effect tx (step 7 / persistFailure), NOT here ──
+	// The mark MUST commit atomically with the writes it guards (at-least-once
+	// contract, erd-backend §4c.3): a separate dedup tx would leave the draft
+	// stuck in EXTRACTING forever if the process crashed between the dedup commit
+	// and the effect commit. The saga==EXTRACTING guard (step 3) already short-
+	// circuits redeliveries that arrive after a terminal state, so the LLM call
+	// is only wasted on a genuine concurrent in-flight duplicate (rare).
 
 	// ── 3. Read draft + guard saga_state == EXTRACTING ────────────────────────
 	var draft *Draft
@@ -264,7 +262,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	draftCtx := buildDraftContext(draft, intimation, chunks)
 	composed, err2 := uc.composer.ComposeDraft(advisory.AgentDraftMinuta, draftCtx)
 	if err2 != nil {
-		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, "", fmt.Sprintf("compose prompt: %v", err2))
+		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("compose prompt: %v", err2))
 	}
 
 	rawBytes, err3 := uc.gen.GenerateJSON(ctx, llm.Request{
@@ -272,20 +270,20 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		User:       composed.User,
 		Schema:     generateSchema,
 		SchemaName: "draft_minuta",
-		Model:      "claude-opus-4-8",
+		Model:      generationModel,
 		MaxTokens:  4096,
 	})
 	if err3 != nil {
 		// Transient LLM errors stay retryable; terminal (bad key / parse) become FAILED.
 		if isTerminalGenErr(err3) {
-			return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, "", fmt.Sprintf("llm: %v", err3))
+			return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("llm: %v", err3))
 		}
 		return fmt.Errorf("draft generate: llm call: %w", err3)
 	}
 
 	var out generatedOutput
 	if err4 := json.Unmarshal(rawBytes, &out); err4 != nil {
-		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, "", fmt.Sprintf("parse llm output: %v", err4))
+		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("parse llm output: %v", err4))
 	}
 
 	// ── 6. Validate and filter suggestions ────────────────────────────────────
@@ -294,6 +292,13 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	// ── 7. Persist success in ONE tx ──────────────────────────────────────────
 	var reviewID string
 	if err5 := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		// Dedup in the SAME tx as the effect: a concurrent delivery that already
+		// marked this event skips the writes (only one review is persisted).
+		if seen, e := uc.dedup.SeenOrMark(ctx, tx, generationConsumer, ev.EventID); e != nil {
+			return e
+		} else if seen {
+			return nil
+		}
 		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateReviewed, true, out.DraftContent); e != nil {
 			return fmt.Errorf("update saga state: %w", e)
 		}
@@ -302,7 +307,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			DraftID:      ev.DraftID,
 			Findings:     findings,
 			Coverage:     coverage,
-			ModelVersion: "claude-opus-4-8",
+			ModelVersion: generationModel,
 			RulesVersion: composed.PromptVersion,
 			Status:       ReviewStatusCompleted,
 			GeneratedAt:  uc.now(),
@@ -335,6 +340,14 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 // It returns a SkipRetry-wrapped error so the listener archives the task.
 func (uc *GenerateUseCase) persistFailure(ctx context.Context, tenantID, draftID, eventID, reason string) error {
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		// Dedup in the same tx as the FAILED effect (skip if already processed).
+		if eventID != "" {
+			if seen, e := uc.dedup.SeenOrMark(ctx, tx, generationConsumer, eventID); e != nil {
+				return e
+			} else if seen {
+				return nil
+			}
+		}
 		if _, e := uc.writer.UpdateSagaState(ctx, tx, draftID, tenantID, SagaStateFailed, false, ""); e != nil {
 			return e
 		}
@@ -427,24 +440,20 @@ func buildDraftContext(d *Draft, i *IntimationContext, chunks []string) advisory
 // Returns the validated Finding slice and the Coverage summary.
 func buildFindings(out generatedOutput, grounded bool, chunksUsed int) ([]Finding, Coverage) {
 	total := len(out.Suggestions)
-	dropped := 0
 	documentsCited := map[string]bool{}
 
 	findings := make([]Finding, 0, min(total, 10))
 	for _, s := range out.Suggestions {
 		if len(findings) >= 10 {
-			dropped += total - len(out.Suggestions) // count remainder
-			break
+			break // top-10 cap; the remainder is counted as dropped below
 		}
 		// Substring validation: original must appear in draft_content.
 		if !strings.Contains(out.DraftContent, s.Original) {
-			dropped++
 			continue
 		}
 		// Citation requirement for Argumento and Coerência.
 		if citationRequired(s.Category) {
 			if s.Citation == nil || s.Citation.DocumentID == "" {
-				dropped++
 				continue
 			}
 		}
@@ -467,16 +476,9 @@ func buildFindings(out generatedOutput, grounded bool, chunksUsed int) ([]Findin
 		}
 		findings = append(findings, f)
 	}
-	// Count any remaining suggestions beyond 10 as dropped.
-	if len(findings) == 10 {
-		for i := range out.Suggestions {
-			if i >= 10 {
-				if strings.Contains(out.DraftContent, out.Suggestions[i].Original) {
-					dropped++
-				}
-			}
-		}
-	}
+	// Everything not kept (substring/citation failures + top-10 cap overflow) is
+	// a drop — total minus the validated findings.
+	dropped := total - len(findings)
 
 	cited := make([]string, 0, len(documentsCited))
 	for id := range documentsCited {
