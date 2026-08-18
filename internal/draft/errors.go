@@ -6,6 +6,13 @@ import "github.com/jusassessoria/platform/lib/apperr"
 // repository, never (nil, nil). The Kind drives the HTTP status at the edge
 // (lib/httpx.statusByKind).
 var (
+	// errGenerationInProgress is returned when POST /v1/pecas/:id/generate is called
+	// while the draft is already in EXTRACTING state (generation is already running).
+	// CONFLICT (→ 409). Internal sentinel; exported as ErrGenerationInProgress via the
+	// generate_trigger.go alias for package-external code that needs to errors.Is it.
+	errGenerationInProgress = apperr.NewConflict("generation is already in progress for this draft")
+
+
 	// ErrAttachmentAlreadyLinked — a POST /v1/pecas/:id/anexos tried to link a
 	// document that is already attached to this draft. The UNIQUE (draft_id, document_id)
 	// constraint fires. CONFLICT (→ 409).

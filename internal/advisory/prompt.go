@@ -97,6 +97,24 @@ type Composed struct {
 	PromptVersion string
 }
 
+// DraftContext is the per-draft signal the draft_minuta composer specializes the
+// instruction-set with. It carries the intimation that triggered the draft (the richest
+// context signal), the process metadata (court/class/subject, for legal register), and
+// any RAG chunks retrieved from the case corpus (empty when the embedder is unconfigured
+// or the corpus has no documents — the degraded path).
+type DraftContext struct {
+	PieceType      string // DEFENSE|COMPLAINT|APPEAL|MOTION|OTHER
+	IntimationType string // CITACAO|INTIMACAO|COMUNICACAO…
+	IntimationText string // teor da intimação — o contexto mais rico
+	Court          string
+	Degree         string
+	Class          string
+	Subject        string
+	// Chunks are the RAG top-K hits (text only). Empty → grounded=false (degraded).
+	Chunks  []string
+	Playbook string // always empty in v0
+}
+
 // PromptComposer composes the instruction-set for a named advisory agent from a case context.
 // It is a first-class, versioned artifact (§3): the agent name + version identify exactly which
 // template ran. Behind an interface so the deterministic v0 (TemplateComposer) can later be
@@ -104,6 +122,7 @@ type Composed struct {
 type PromptComposer interface {
 	Compose(agent string, c CaseContext) (Composed, error)
 	ComposeProcess(agent string, c ProcessContext) (Composed, error)
+	ComposeDraft(agent string, c DraftContext) (Composed, error)
 }
 
 // Agent identifiers — one per specialized advisory task (erd-ai-advisory.md §4). Each maps to a
@@ -111,6 +130,7 @@ type PromptComposer interface {
 const (
 	AgentSuggestTasks     = "suggest_tasks"
 	AgentSummarizeProcess = "summarize_process"
+	AgentDraftMinuta      = "draft_minuta"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
@@ -122,6 +142,10 @@ const suggestTasksVersion = "suggest_tasks/v2"
 // whenever the template text changes so the feedback delta of the OLD prompt stays attributable
 // to the OLD version.
 const summarizeProcessVersion = "process_summary/v1"
+
+// draftMinutaVersion is the pinned version of the draft_minuta template. BUMP IT whenever the
+// template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
+const draftMinutaVersion = "draft_minuta/v1"
 
 // TemplateComposer is the deterministic v0 composer: templates + context injection, no LLM. It is
 // stateless.
@@ -152,6 +176,81 @@ func (*TemplateComposer) ComposeProcess(agent string, c ProcessContext) (Compose
 	default:
 		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
 	}
+}
+
+// ComposeDraft builds the (system, user, version) for the draft_minuta agent from the draft
+// context. An unknown agent is a programmer error surfaced as a typed invalid.
+func (*TemplateComposer) ComposeDraft(agent string, c DraftContext) (Composed, error) {
+	switch agent {
+	case AgentDraftMinuta:
+		return composeDraftMinuta(c), nil
+	default:
+		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
+	}
+}
+
+// composeDraftMinuta renders the draft_minuta instruction-set. The system message describes
+// the legal writing role; the user message carries the intimation context + RAG chunks (when
+// available). The output schema (draft_content + suggestions array) lives with the caller (use
+// case), so the prompt stays about WHAT to produce, not the JSON shape.
+func composeDraftMinuta(c DraftContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um assistente jurídico brasileiro especializado em redação de peças processuais. " +
+			"A partir do contexto da intimação e dos autos (quando disponível), gere:\n" +
+			"1. `draft_content`: o texto completo da minuta da peça processual em formato jurídico " +
+			"brasileiro, pronto para revisão do advogado.\n" +
+			"2. `suggestions`: lista de sugestões de melhoria mapeadas a trechos EXATOS do draft_content. " +
+			"Cada sugestão tem: `category` (um de: Clareza, Argumento, Coerência, Estilo), `original` " +
+			"(trecho EXATO do draft_content), `replacement` (versão melhorada), `problem` (descrição " +
+			"curta do problema), `description` (explicação acionável). Para categorias Argumento e " +
+			"Coerência, inclua obrigatoriamente `citation` com `document_id`, `page` e `quote` " +
+			"extraídos dos trechos dos autos fornecidos. Para Clareza e Estilo, `citation` é opcional.\n\n" +
+			"REGRAS OBRIGATÓRIAS:\n" +
+			"- `original` DEVE ser um trecho que aparece literalmente no `draft_content`.\n" +
+			"- Máximo 10 sugestões após filtragem.\n" +
+			"- NÃO invente fatos; fundamente-se nos autos quando possível.\n" +
+			"- Se não houver trechos dos autos, gere a minuta sem citações (modo degradado).",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório:\n")
+		sys.WriteString(pb)
+	}
+
+	lines := make([]string, 0, 10)
+	add := func(label, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			lines = append(lines, label+": "+v)
+		}
+	}
+	add("Tipo de peça", c.PieceType)
+	add("Tipo de intimação", c.IntimationType)
+	add("Tribunal", c.Court)
+	add("Grau", c.Degree)
+	add("Classe/rito", c.Class)
+	add("Assunto", c.Subject)
+	add("Teor da intimação", c.IntimationText)
+
+	if len(c.Chunks) > 0 {
+		lines = append(lines, "Trechos dos autos (RAG):")
+		for i, chunk := range c.Chunks {
+			if i >= 8 {
+				break
+			}
+			lines = append(lines, strconv.Itoa(i+1)+". "+chunk)
+		}
+	}
+
+	var usr strings.Builder
+	usr.WriteString("Contexto do caso:\n")
+	if len(lines) == 0 {
+		usr.WriteString("(sem contexto adicional)")
+	} else {
+		usr.WriteString(strings.Join(lines, "\n"))
+	}
+	usr.WriteString("\n\nGere a minuta e as sugestões de melhoria.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftMinutaVersion}
 }
 
 // composeSuggestTasks renders the suggest_tasks instruction-set. The system message is the stable

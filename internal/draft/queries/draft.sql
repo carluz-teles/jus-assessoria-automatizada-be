@@ -193,3 +193,41 @@ SELECT
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 WHERE i.id = $1 AND cr.tenant_id = $2;
+
+-- ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+-- These are the three new queries the async generation saga needs.
+
+-- name: UpdateSagaState :one
+-- Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
+-- on success, FAILED on LLM error). Also updates content when the generator returns new
+-- text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
+-- which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
+-- A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+UPDATE draft
+SET saga_state = $3,
+    content    = CASE WHEN $4::boolean THEN $5 ELSE content END,
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at;
+
+-- name: InsertReview :one
+-- Persist one AI review (findings + coverage as jsonb, model_version, rules_version,
+-- status, generated_at). No tenant_id — isolation is via JOIN on draft.tenant_id (the
+-- caller already tenant-guarded the draft before calling this). ON CONFLICT is absent
+-- (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
+INSERT INTO review (draft_id, findings, coverage, model_version, rules_version, status, generated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, draft_id, findings, coverage, model_version, rules_version, status, generated_at, created_at;
+
+-- name: GetLatestReview :one
+-- Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.
+-- Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.
+-- A draft with no reviews → pgx.ErrNoRows (the read model maps this to nil, not an error).
+SELECT id, draft_id, findings, coverage, model_version, rules_version, status, generated_at, created_at
+FROM review
+WHERE draft_id = $1
+ORDER BY generated_at DESC
+LIMIT 1;

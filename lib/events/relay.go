@@ -257,6 +257,18 @@ func queueFor(typ string) string {
 	if typ == "identity.tenant_provisioned" || typ == "billing.trial_ending_soon_check" || typ == "billing.trial_ending_soon" {
 		return "notifications"
 	}
+	// draft.generation_requested (Fatia 3) → "ai": consumed by worker-ai's
+	// draft.Listener. String literal avoids an import cycle with internal/draft.
+	if typ == "draft.generation_requested" {
+		return "ai"
+	}
+	// review.completed has no active consumer today. Route to "ingestao" (archived as
+	// handler-not-found — the worker drains that queue) rather than "default" (which no
+	// worker drains — silently building up in Redis). Mirrors the orphan deadline.*
+	// pattern above. When a consumer is added, move this routing to its queue.
+	if typ == "review.completed" {
+		return "ingestao"
+	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":
 		// The acquisition slice's events (integration_activated, sync_requested,

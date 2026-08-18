@@ -418,6 +418,46 @@ func (q *Queries) GetIntimationForDraft(ctx context.Context, arg GetIntimationFo
 	return i, err
 }
 
+const getLatestReview = `-- name: GetLatestReview :one
+SELECT id, draft_id, findings, coverage, model_version, rules_version, status, generated_at, created_at
+FROM review
+WHERE draft_id = $1
+ORDER BY generated_at DESC
+LIMIT 1
+`
+
+type GetLatestReviewRow struct {
+	ID           uuid.UUID          `json:"id"`
+	DraftID      uuid.UUID          `json:"draft_id"`
+	Findings     []byte             `json:"findings"`
+	Coverage     []byte             `json:"coverage"`
+	ModelVersion string             `json:"model_version"`
+	RulesVersion string             `json:"rules_version"`
+	Status       string             `json:"status"`
+	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.
+// Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.
+// A draft with no reviews → pgx.ErrNoRows (the read model maps this to nil, not an error).
+func (q *Queries) GetLatestReview(ctx context.Context, draftID uuid.UUID) (GetLatestReviewRow, error) {
+	row := q.db.QueryRow(ctx, getLatestReview, draftID)
+	var i GetLatestReviewRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Findings,
+		&i.Coverage,
+		&i.ModelVersion,
+		&i.RulesVersion,
+		&i.Status,
+		&i.GeneratedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const insertDraft = `-- name: InsertDraft :one
 
 INSERT INTO draft (
@@ -545,6 +585,63 @@ func (q *Queries) InsertDraftAttachment(ctx context.Context, arg InsertDraftAtta
 	return i, err
 }
 
+const insertReview = `-- name: InsertReview :one
+INSERT INTO review (draft_id, findings, coverage, model_version, rules_version, status, generated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, draft_id, findings, coverage, model_version, rules_version, status, generated_at, created_at
+`
+
+type InsertReviewParams struct {
+	DraftID      uuid.UUID          `json:"draft_id"`
+	Findings     []byte             `json:"findings"`
+	Coverage     []byte             `json:"coverage"`
+	ModelVersion string             `json:"model_version"`
+	RulesVersion string             `json:"rules_version"`
+	Status       string             `json:"status"`
+	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
+}
+
+type InsertReviewRow struct {
+	ID           uuid.UUID          `json:"id"`
+	DraftID      uuid.UUID          `json:"draft_id"`
+	Findings     []byte             `json:"findings"`
+	Coverage     []byte             `json:"coverage"`
+	ModelVersion string             `json:"model_version"`
+	RulesVersion string             `json:"rules_version"`
+	Status       string             `json:"status"`
+	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// Persist one AI review (findings + coverage as jsonb, model_version, rules_version,
+// status, generated_at). No tenant_id — isolation is via JOIN on draft.tenant_id (the
+// caller already tenant-guarded the draft before calling this). ON CONFLICT is absent
+// (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
+func (q *Queries) InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error) {
+	row := q.db.QueryRow(ctx, insertReview,
+		arg.DraftID,
+		arg.Findings,
+		arg.Coverage,
+		arg.ModelVersion,
+		arg.RulesVersion,
+		arg.Status,
+		arg.GeneratedAt,
+	)
+	var i InsertReviewRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Findings,
+		&i.Coverage,
+		&i.ModelVersion,
+		&i.RulesVersion,
+		&i.Status,
+		&i.GeneratedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const updateAttachmentCategory = `-- name: UpdateAttachmentCategory :one
 UPDATE draft_attachment
 SET category = $4
@@ -618,5 +715,72 @@ func (q *Queries) UpdateDraftContent(ctx context.Context, arg UpdateDraftContent
 	)
 	var i UpdateDraftContentRow
 	err := row.Scan(&i.ID, &i.Title, &i.UpdatedAt)
+	return i, err
+}
+
+const updateSagaState = `-- name: UpdateSagaState :one
+
+UPDATE draft
+SET saga_state = $3,
+    content    = CASE WHEN $4::boolean THEN $5 ELSE content END,
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at
+`
+
+type UpdateSagaStateParams struct {
+	ID        uuid.UUID `json:"id"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	SagaState string    `json:"saga_state"`
+	Column4   bool      `json:"column_4"`
+	Content   *string   `json:"content"`
+}
+
+type UpdateSagaStateRow struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CaseID       pgtype.UUID        `json:"case_id"`
+	IntimationID pgtype.UUID        `json:"intimation_id"`
+	PieceType    string             `json:"piece_type"`
+	Title        string             `json:"title"`
+	Content      *string            `json:"content"`
+	Status       string             `json:"status"`
+	SagaState    string             `json:"saga_state"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+// These are the three new queries the async generation saga needs.
+// Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
+// on success, FAILED on LLM error). Also updates content when the generator returns new
+// text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
+// which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
+// A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+func (q *Queries) UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams) (UpdateSagaStateRow, error) {
+	row := q.db.QueryRow(ctx, updateSagaState,
+		arg.ID,
+		arg.TenantID,
+		arg.SagaState,
+		arg.Column4,
+		arg.Content,
+	)
+	var i UpdateSagaStateRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CaseID,
+		&i.IntimationID,
+		&i.PieceType,
+		&i.Title,
+		&i.Content,
+		&i.Status,
+		&i.SagaState,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
 	return i, err
 }

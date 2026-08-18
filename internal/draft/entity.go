@@ -131,6 +131,85 @@ const (
 	documentOriginUpload   = "UPLOAD"
 )
 
+// ── Saga state constants (Fatia 3) ───────────────────────────────────────────
+
+// The saga_state column on draft tracks the AI generation lifecycle. No DB CHECK is
+// added (the init migration has no CHECK on saga_state), so the enforcement is in the
+// application layer (use case guard + handler guard).
+const (
+	SagaStateCreated    = "CREATED"
+	SagaStateExtracting = "EXTRACTING"
+	SagaStateReviewed   = "REVIEWED"
+	SagaStateFailed     = "FAILED"
+)
+
+// ── Review (AI parecer) ────────────────────────────────────────────────────
+
+// Review is one AI-generated review for a draft. Multiple reviews may exist (one per
+// generation attempt). The read model exposes only the LATEST (by generated_at DESC).
+type Review struct {
+	ID           string
+	DraftID      string
+	Findings     []Finding
+	Coverage     Coverage
+	ModelVersion string
+	RulesVersion string
+	Status       string // COMPLETED | FAILED
+	GeneratedAt  time.Time
+	CreatedAt    time.Time
+}
+
+// ReviewStatus closed set.
+const (
+	ReviewStatusCompleted = "COMPLETED"
+	ReviewStatusFailed    = "FAILED"
+)
+
+// Finding is one AI suggestion mapped to an exact substring of draft.content.
+// category drives citation requirements (Argumento/Coerência → citation required).
+type Finding struct {
+	N           int      `json:"n"`
+	Category    string   `json:"category"`
+	Original    string   `json:"original"`
+	Replacement string   `json:"replacement"`
+	Problem     string   `json:"problem"`
+	Description string   `json:"description"`
+	Citation    *Citation `json:"citation,omitempty"`
+}
+
+// Citation anchors a finding to a specific chunk from the case corpus.
+type Citation struct {
+	DocumentID string `json:"document_id"`
+	Page       int    `json:"page"`
+	Quote      string `json:"quote"`
+}
+
+// Coverage summarizes the grounding and filtering results of one generation run.
+type Coverage struct {
+	Grounded           bool     `json:"grounded"`
+	ChunksUsed         int      `json:"chunks_used"`
+	SuggestionsTotal   int      `json:"suggestions_total"`
+	SuggestionsDropped int      `json:"suggestions_dropped"`
+	DocumentsCited     []string `json:"documents_cited"`
+	// Error is non-empty only for FAILED reviews — the human-readable reason.
+	Error string `json:"error,omitempty"`
+}
+
+// FindingCategory is the closed set of suggestion categories.
+const (
+	CategoryClareza   = "Clareza"
+	CategoryArgumento = "Argumento"
+	CategoryCoerencia = "Coerência"
+	CategoryEstilo    = "Estilo"
+)
+
+// citationRequired reports whether a finding of the given category must include a citation
+// (true for Argumento and Coerência — the factual categories that require grounding in the
+// case corpus). Clareza and Estilo are stylistic; citation is optional.
+func citationRequired(category string) bool {
+	return category == CategoryArgumento || category == CategoryCoerencia
+}
+
 // inferPieceType maps an intimation type (DJEN tipoComunicacao) to a PieceType
 // when the client omits piece_type. This is the SINGLE source of truth for the
 // inference — referenced by the domain use case and tested directly.

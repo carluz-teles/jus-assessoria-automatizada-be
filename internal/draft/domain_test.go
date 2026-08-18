@@ -123,6 +123,23 @@ func (r *fakeRepo) GetDraftAttachments(_ context.Context, _ database.Tx, _, _ st
 	return r.getDraftAttachResult, r.getDraftAttachErr
 }
 
+// ── Fatia 3 stubs (GetLatestReview, UpdateSagaState, InsertReview) ──────────
+// The domain_test.go tests only cover the Fatia 1–2 use cases; these stubs just
+// satisfy the interface so the existing tests continue to compile.
+
+func (r *fakeRepo) GetLatestReview(_ context.Context, _ database.Tx, _ string) (*Review, error) {
+	return nil, nil // no review by default
+}
+
+func (r *fakeRepo) UpdateSagaState(_ context.Context, _ database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error) {
+	return r.getByIDResult, nil
+}
+
+func (r *fakeRepo) InsertReview(_ context.Context, _ database.Tx, rev *Review) (*Review, error) {
+	rev.ID = "stub-review-id"
+	return rev, nil
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 func newTenantID() string { return uuid.New().String() }

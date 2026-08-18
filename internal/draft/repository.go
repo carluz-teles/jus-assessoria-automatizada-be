@@ -58,6 +58,22 @@ type Repository interface {
 	// UPLOADED documents, ordered position ASC, created_at ASC). An empty draft
 	// returns an empty slice, never nil.
 	GetDraftAttachments(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]Attachment, error)
+
+	// ── AI generation methods (Fatia 3) ──────────────────────────────────────
+
+	// UpdateSagaState transitions the draft's saga_state column and optionally
+	// overwrites content (when updateContent=true). Scoped to (draftID, tenantID).
+	// A miss is ErrDraftNotFound.
+	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error)
+
+	// InsertReview persists one AI review row. No tenant guard here — the caller
+	// already tenant-guarded the draft before entering the tx. Returns the persisted
+	// Review entity.
+	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
+
+	// GetLatestReview returns the most recent review for a draft (generated_at DESC).
+	// A draft with no reviews returns (nil, nil) — not an error.
+	GetLatestReview(ctx context.Context, tx database.Tx, draftID string) (*Review, error)
 }
 
 // ErrDraftAlreadyExists is a sentinel the repository returns when InsertDraft hits
@@ -378,4 +394,83 @@ func (r *pgRepository) GetDraftAttachments(ctx context.Context, tx database.Tx, 
 		return nil, database.WrapInfra(err)
 	}
 	return attachmentsFromRows(rows), nil
+}
+
+// ── AI generation repository methods (Fatia 3) ───────────────────────────────
+
+func (r *pgRepository) UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	var contentPtr *string
+	if updateContent {
+		contentPtr = &content
+	}
+
+	row, err := draftdb.New(tx).UpdateSagaState(ctx, draftdb.UpdateSagaStateParams{
+		ID:        did,
+		TenantID:  tid,
+		SagaState: sagaState,
+		Column4:   updateContent,
+		Content:   contentPtr,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDraftNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return draftFromUpdateSagaStateRow(row), nil
+}
+
+func (r *pgRepository) InsertReview(ctx context.Context, tx database.Tx, rev *Review) (*Review, error) {
+	did, err := parseUUID(rev.DraftID)
+	if err != nil {
+		return nil, err
+	}
+
+	findingsJSON, err := marshalJSON(rev.Findings)
+	if err != nil {
+		return nil, err
+	}
+	coverageJSON, err := marshalJSON(rev.Coverage)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).InsertReview(ctx, draftdb.InsertReviewParams{
+		DraftID:      did,
+		Findings:     findingsJSON,
+		Coverage:     coverageJSON,
+		ModelVersion: rev.ModelVersion,
+		RulesVersion: rev.RulesVersion,
+		Status:       rev.Status,
+		GeneratedAt:  timeToTimestamptz(rev.GeneratedAt),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return reviewFromInsertRow(row), nil
+}
+
+func (r *pgRepository) GetLatestReview(ctx context.Context, tx database.Tx, draftID string) (*Review, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).GetLatestReview(ctx, did)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil // no review yet — not an error
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return reviewFromGetLatestRow(row), nil
 }
