@@ -140,6 +140,10 @@ func (r *fakeRepo) InsertReview(_ context.Context, _ database.Tx, rev *Review) (
 	return rev, nil
 }
 
+func (r *fakeRepo) DeleteReviewsForDraft(_ context.Context, _ database.Tx, _ string) error {
+	return nil // no-op stub — domain_test.go covers Fatia 1–2 use cases
+}
+
 // ── Fatia 3b stubs (InsertChatMessage, GetChatThread) ────────────────────────
 // These stubs satisfy the Repository interface for existing tests that do not
 // exercise the chat use case.

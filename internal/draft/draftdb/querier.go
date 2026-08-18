@@ -16,6 +16,10 @@ type Querier interface {
 	// ignored (the caller checks rows-affected via the :exec tag; our mapper maps 0 to
 	// ErrAttachmentNotFound).
 	DeleteDraftAttachment(ctx context.Context, arg DeleteDraftAttachmentParams) error
+	// Remove all review rows for a draft. Called by Gerar before persisting DRAFTED so
+	// that subsequent Revisar calls always operate on a clean slate (no stale suggestions
+	// from a prior generation attempt are mixed with a new minuta).
+	DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error
 	// Load an attachment for update/delete guard: resolves (id, draft_id, tenant_id) to
 	// confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).

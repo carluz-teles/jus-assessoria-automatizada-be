@@ -139,8 +139,11 @@ const (
 const (
 	SagaStateCreated    = "CREATED"
 	SagaStateExtracting = "EXTRACTING"
-	SagaStateReviewed   = "REVIEWED"
-	SagaStateFailed     = "FAILED"
+	// SagaStateDrafted is set after Gerar completes: the draft has content but no
+	// AI review yet. The advogado can then trigger Revisar to produce suggestions.
+	SagaStateDrafted  = "DRAFTED"
+	SagaStateReviewed = "REVIEWED"
+	SagaStateFailed   = "FAILED"
 )
 
 // ── Review (AI parecer) ────────────────────────────────────────────────────

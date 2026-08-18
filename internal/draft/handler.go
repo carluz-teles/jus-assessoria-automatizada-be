@@ -39,12 +39,19 @@ type chatter interface {
 	GetThread(ctx context.Context, tenantID, draftID string) ([]ChatMessage, *Draft, error)
 }
 
+// reviewer is the narrow port for POST /v1/pecas/:id/review (Revisar síncrono).
+// Composed independently from the generator and the chat use case.
+type reviewer interface {
+	ReviewDraft(ctx context.Context, cmd ReviewDraftCommand) (*ReviewResult, error)
+}
+
 // Handler is the draft HTTP surface. It owns its routing; cmd/api composes via
 // RegisterV1.
 type Handler struct {
-	uc   writer
-	gen  generator // nil when the generation use case is not wired (no AI key)
-	chat chatter   // nil when the chat use case is not wired
+	uc     writer
+	gen    generator // nil when the generation use case is not wired (no AI key)
+	chat   chatter   // nil when the chat use case is not wired
+	review reviewer  // nil when the review use case is not wired
 }
 
 // NewHandler wires the handler to the use case.
@@ -66,6 +73,13 @@ func (h *Handler) WithChat(chat chatter) *Handler {
 	return h
 }
 
+// WithReviewer attaches the review use case to the handler. Called by cmd/api composition
+// when the review use case is available (requires AI config).
+func (h *Handler) WithReviewer(rev reviewer) *Handler {
+	h.review = rev
+	return h
+}
+
 // RegisterV1 mounts the peças routes on the /v1 group. The static-vs-param ordering
 // matters: /pecas/:id/anexos must be declared before /pecas/:id so Fiber routes them
 // correctly. Fiber's router is declaration-order-sensitive for sub-resources under a
@@ -77,6 +91,9 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 	// AI generation trigger (Fatia 3).
 	r.Post("/pecas/:id/generate", h.generatePeca)
+
+	// AI review trigger (Fatia 3 — Revisar síncrono).
+	r.Post("/pecas/:id/review", h.reviewPeca)
 
 	// Grounded chat (Fatia 3b).
 	r.Post("/pecas/:id/chat", h.postChat)
@@ -402,6 +419,34 @@ func (h *Handler) generatePeca(c *fiber.Ctx) error {
 		"data": fiber.Map{
 			"id":         draft.ID,
 			"saga_state": draft.SagaState,
+		},
+	})
+}
+
+// ─── POST /v1/pecas/:id/review ────────────────────────────────────────────────
+
+// reviewPeca handles POST /v1/pecas/:id/review (Revisar síncrono). Guards reviewer nil,
+// tenant, and draftID. Body is intentionally empty (no input needed — the minuta lives in
+// the draft row). Returns 200 {data:{review, saga_state:"REVIEWED"}}.
+func (h *Handler) reviewPeca(c *fiber.Ctx) error {
+	if h.review == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	result, err := h.review.ReviewDraft(c.UserContext(), ReviewDraftCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"data": fiber.Map{
+			"review":     reviewToResponse(result.Review),
+			"saga_state": result.SagaState,
 		},
 	})
 }

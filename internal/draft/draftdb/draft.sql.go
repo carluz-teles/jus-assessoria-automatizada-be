@@ -32,6 +32,18 @@ func (q *Queries) DeleteDraftAttachment(ctx context.Context, arg DeleteDraftAtta
 	return err
 }
 
+const deleteReviewsForDraft = `-- name: DeleteReviewsForDraft :exec
+DELETE FROM review WHERE draft_id = $1
+`
+
+// Remove all review rows for a draft. Called by Gerar before persisting DRAFTED so
+// that subsequent Revisar calls always operate on a clean slate (no stale suggestions
+// from a prior generation attempt are mixed with a new minuta).
+func (q *Queries) DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteReviewsForDraft, draftID)
+	return err
+}
+
 const getAttachmentForUpdate = `-- name: GetAttachmentForUpdate :one
 SELECT id, tenant_id, draft_id, document_id, category, position, created_at
 FROM draft_attachment
