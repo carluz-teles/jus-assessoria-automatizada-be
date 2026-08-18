@@ -22,6 +22,7 @@ import (
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/identity"
+	"github.com/jusassessoria/platform/internal/draft"
 	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -294,6 +295,12 @@ func run(logger *slog.Logger) error {
 		)
 	}
 
+	// Draft (Peticionamento Fatia 1): the peça create/read/autosave surface.
+	// Pool-backed read (GetDetail) + transactional writes via the shared UoW.
+	// No storage required (content lives in the DB column, not S3).
+	draftUC := draft.NewUseCase(uow, draft.NewRepository())
+	draftHandler := draft.NewHandler(draftUC)
+
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,
@@ -309,6 +316,7 @@ func run(logger *slog.Logger) error {
 		acquisition:          acquisitionHandler,
 		deadline:             deadlineHandler,
 		document:             documentHandler,
+		draft:                draftHandler,
 		lookup:               lookupHandler,
 	})
 

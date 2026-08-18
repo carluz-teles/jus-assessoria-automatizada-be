@@ -10,6 +10,7 @@ import (
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
+	"github.com/jusassessoria/platform/internal/draft"
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -45,6 +46,7 @@ type routerDeps struct {
 	acquisition          *acquisition.Handler
 	deadline             *deadline.Handler
 	document             *document.Handler
+	draft                *draft.Handler
 	lookup               *lookup.Handler
 }
 
@@ -161,6 +163,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	// and so a boot without S3 configured (no write use case) leaves the slice unmounted.
 	if deps.document != nil {
 		deps.document.RegisterV1(v1)
+	}
+
+	// draft owns its /v1/pecas routes (create, read, autosave) and mounts them via
+	// RegisterV1 — the api only composes. Nil-guarded so the router test fixture builds
+	// without a use case, like the other slices.
+	if deps.draft != nil {
+		deps.draft.RegisterV1(v1)
 	}
 
 	// notifications owns its authenticated /v1 in-app inbox routes (list/badge/
