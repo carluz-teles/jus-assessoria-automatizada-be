@@ -32,11 +32,19 @@ type generator interface {
 	TriggerGeneration(ctx context.Context, cmd TriggerGenerationCommand) (*Draft, error)
 }
 
+// chatter is the narrow port for the chat endpoints (POST + GET /v1/pecas/:id/chat).
+// Composed independently (different dep set: no outbox, synchronous LLM call).
+type chatter interface {
+	AnswerQuestion(ctx context.Context, cmd AnswerQuestionCommand) (*ChatMessage, error)
+	GetThread(ctx context.Context, tenantID, draftID string) ([]ChatMessage, *Draft, error)
+}
+
 // Handler is the draft HTTP surface. It owns its routing; cmd/api composes via
 // RegisterV1.
 type Handler struct {
-	uc  writer
-	gen generator // nil when the generation use case is not wired (no AI key)
+	uc   writer
+	gen  generator // nil when the generation use case is not wired (no AI key)
+	chat chatter   // nil when the chat use case is not wired
 }
 
 // NewHandler wires the handler to the use case.
@@ -51,6 +59,13 @@ func (h *Handler) WithGenerator(gen generator) *Handler {
 	return h
 }
 
+// WithChat attaches the chat use case to the handler. Called by cmd/api composition
+// when the chat use case is available (requires AI config).
+func (h *Handler) WithChat(chat chatter) *Handler {
+	h.chat = chat
+	return h
+}
+
 // RegisterV1 mounts the peças routes on the /v1 group. The static-vs-param ordering
 // matters: /pecas/:id/anexos must be declared before /pecas/:id so Fiber routes them
 // correctly. Fiber's router is declaration-order-sensitive for sub-resources under a
@@ -62,6 +77,10 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 	// AI generation trigger (Fatia 3).
 	r.Post("/pecas/:id/generate", h.generatePeca)
+
+	// Grounded chat (Fatia 3b).
+	r.Post("/pecas/:id/chat", h.postChat)
+	r.Get("/pecas/:id/chat", h.getChat)
 
 	// Attachment sub-resource (Fatia 2).
 	r.Post("/pecas/:id/anexos", h.attachDocument)
@@ -385,6 +404,120 @@ func (h *Handler) generatePeca(c *fiber.Ctx) error {
 			"saga_state": draft.SagaState,
 		},
 	})
+}
+
+// ── Chat handlers (Fatia 3b) ──────────────────────────────────────────────────
+
+// postChat handles POST /v1/pecas/:id/chat {question}.
+// Returns 200 {data: message} with the assistant's turn. When the chat use case is
+// not wired (no AI config), returns 422 to match ErrIANotConfigured.
+func (h *Handler) postChat(c *fiber.Ctx) error {
+	if h.chat == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	var req ChatRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	msg, err := h.chat.AnswerQuestion(c.UserContext(), AnswerQuestionCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+		Question: req.Question,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": chatMessageToResponse(msg)})
+}
+
+// getChat handles GET /v1/pecas/:id/chat.
+// Returns 200 {data: {messages: [...], grounded_capable: bool}}.
+// grounded_capable is true when the draft has a court_record_id (i.e. it has case context
+// that can be searched via RAG). Determined from draft.CaseID being non-empty.
+func (h *Handler) getChat(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	// If the chat use case is not wired, we still return the thread (empty), just
+	// grounded_capable=false (no AI). If the use case is nil, fall back to the
+	// main writer's GetDetail for the draft guard, but simpler: return empty thread.
+	if h.chat == nil {
+		// Need to tenant-guard the draft; use the main use case's GetDetail.
+		if _, err := h.uc.GetDetail(c.UserContext(), tenantID, draftID); err != nil {
+			return httpx.WriteError(c, err)
+		}
+		return c.JSON(fiber.Map{
+			"data": fiber.Map{
+				"messages":         []chatMessageResponse{},
+				"grounded_capable": false,
+			},
+		})
+	}
+
+	messages, draft, err := h.chat.GetThread(c.UserContext(), tenantID, draftID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	// grounded_capable = the draft has a case_id (implying a court_record exists
+	// and the embedder can search the corpus). This tells the FE whether to show
+	// the "Ancorado nos autos" indicator in the chat UI.
+	groundedCapable := draft.CaseID != ""
+
+	msgResponses := make([]chatMessageResponse, 0, len(messages))
+	for i := range messages {
+		msgResponses = append(msgResponses, chatMessageToResponse(&messages[i]))
+	}
+
+	return c.JSON(fiber.Map{
+		"data": fiber.Map{
+			"messages":         msgResponses,
+			"grounded_capable": groundedCapable,
+		},
+	})
+}
+
+// ── Chat response shapes ──────────────────────────────────────────────────────
+
+// chatMessageResponse is the JSON shape for one chat turn.
+type chatMessageResponse struct {
+	ID           string             `json:"id"`
+	DraftID      string             `json:"draft_id"`
+	Role         string             `json:"role"`
+	Content      string             `json:"content"`
+	Citations    []citationResponse `json:"citations"`
+	Grounded     bool               `json:"grounded"`
+	ModelVersion string             `json:"model_version,omitempty"`
+	CreatedAt    string             `json:"created_at"`
+}
+
+func chatMessageToResponse(m *ChatMessage) chatMessageResponse {
+	cits := make([]citationResponse, 0, len(m.Citations))
+	for _, c := range m.Citations {
+		cits = append(cits, citationResponse{
+			DocumentID: c.DocumentID,
+			Page:       c.Page,
+			Quote:      c.Quote,
+		})
+	}
+	return chatMessageResponse{
+		ID:           m.ID,
+		DraftID:      m.DraftID,
+		Role:         m.Role,
+		Content:      m.Content,
+		Citations:    cits,
+		Grounded:     m.Grounded,
+		ModelVersion: m.ModelVersion,
+		CreatedAt:    m.CreatedAt.Format(time.RFC3339),
+	}
 }
 
 // ── Attachment response shape ─────────────────────────────────────────────────

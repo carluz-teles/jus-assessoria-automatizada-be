@@ -74,6 +74,18 @@ type Repository interface {
 	// GetLatestReview returns the most recent review for a draft (generated_at DESC).
 	// A draft with no reviews returns (nil, nil) — not an error.
 	GetLatestReview(ctx context.Context, tx database.Tx, draftID string) (*Review, error)
+
+	// ── Chat methods (Fatia 3b) ───────────────────────────────────────────────
+
+	// InsertChatMessage appends one turn to the thread. No tenant guard in the query —
+	// the caller must have already tenant-guarded the draft (barrier 1). Returns the
+	// persisted ChatMessage entity.
+	InsertChatMessage(ctx context.Context, tx database.Tx, m *ChatMessage) (*ChatMessage, error)
+
+	// GetChatThread returns the last 50 messages for a draft ordered chronologically
+	// (oldest first). No tenant guard in the query — the caller tenant-guards via the
+	// draft load. An empty thread returns an empty slice, never nil.
+	GetChatThread(ctx context.Context, tx database.Tx, draftID string) ([]ChatMessage, error)
 }
 
 // ErrDraftAlreadyExists is a sentinel the repository returns when InsertDraft hits
@@ -473,4 +485,49 @@ func (r *pgRepository) GetLatestReview(ctx context.Context, tx database.Tx, draf
 		return nil, database.WrapInfra(err)
 	}
 	return reviewFromGetLatestRow(row), nil
+}
+
+// ── Chat repository methods (Fatia 3b) ───────────────────────────────────────
+
+func (r *pgRepository) InsertChatMessage(ctx context.Context, tx database.Tx, m *ChatMessage) (*ChatMessage, error) {
+	did, err := parseUUID(m.DraftID)
+	if err != nil {
+		return nil, err
+	}
+
+	citationsJSON, err := marshalJSON(m.Citations)
+	if err != nil {
+		return nil, err
+	}
+
+	var modelVersion *string
+	if m.ModelVersion != "" {
+		modelVersion = &m.ModelVersion
+	}
+
+	row, err := draftdb.New(tx).InsertChatMessage(ctx, draftdb.InsertChatMessageParams{
+		DraftID:      did,
+		Role:         m.Role,
+		Content:      m.Content,
+		Citations:    citationsJSON,
+		Grounded:     m.Grounded,
+		ModelVersion: modelVersion,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return chatMessageFromRow(row), nil
+}
+
+func (r *pgRepository) GetChatThread(ctx context.Context, tx database.Tx, draftID string) ([]ChatMessage, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := draftdb.New(tx).GetChatThread(ctx, did)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return chatMessagesFromRows(rows), nil
 }

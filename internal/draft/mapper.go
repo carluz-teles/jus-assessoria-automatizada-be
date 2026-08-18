@@ -279,3 +279,46 @@ func timeToTimestamptz(t time.Time) pgtype.Timestamptz {
 	}
 	return pgtype.Timestamptz{Time: t, Valid: true}
 }
+
+// ── Chat mappers (Fatia 3b) ──────────────────────────────────────────────────
+
+// chatMessageFromRow maps a draftdb.ChatMessage row to a *ChatMessage entity.
+// citations jsonb is unmarshalled from []byte; a decode fault returns an empty slice
+// (best-effort — a corrupt row should not crash the read model).
+func chatMessageFromRow(r draftdb.ChatMessage) *ChatMessage {
+	return &ChatMessage{
+		ID:           r.ID.String(),
+		DraftID:      r.DraftID.String(),
+		Role:         r.Role,
+		Content:      r.Content,
+		Citations:    unmarshalCitations(r.Citations),
+		Grounded:     r.Grounded,
+		ModelVersion: derefString(r.ModelVersion),
+		CreatedAt:    timestamptzToTime(r.CreatedAt),
+	}
+}
+
+// chatMessagesFromRows maps a slice of draftdb.ChatMessage rows to []ChatMessage.
+func chatMessagesFromRows(rows []draftdb.ChatMessage) []ChatMessage {
+	out := make([]ChatMessage, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, *chatMessageFromRow(r))
+	}
+	return out
+}
+
+// unmarshalCitations decodes jsonb bytes into []Citation. A decode fault or empty
+// input returns an empty slice (never nil — serializes as [] in JSON, not null).
+func unmarshalCitations(b []byte) []Citation {
+	if len(b) == 0 {
+		return []Citation{}
+	}
+	var out []Citation
+	if err := json.Unmarshal(b, &out); err != nil {
+		return []Citation{}
+	}
+	if out == nil {
+		return []Citation{}
+	}
+	return out
+}
