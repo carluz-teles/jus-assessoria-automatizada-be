@@ -36,6 +36,7 @@ import (
 	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/storage"
 	"github.com/jusassessoria/platform/lib/telemetry"
+	"github.com/jusassessoria/platform/lib/vault"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
 
@@ -343,6 +344,22 @@ func run(logger *slog.Logger) error {
 	})
 	draftHandler = draftHandler.WithReviewer(reviewUC)
 
+	// Vault is optional: only instantiated when VAULT_KEK_BASE64 is present. When
+	// absent the court-credential slice stays unmounted (S2) — same optional-adapter
+	// convention as document/S3. vault.New validates the KEK eagerly so a malformed
+	// key fails at boot, not mid-request.
+	var vlt *vault.Vault
+	if cfg.VaultKEK != "" {
+		v, err := vault.New(cfg.VaultKEK)
+		if err != nil {
+			return fmt.Errorf("init vault: %w", err)
+		}
+		vlt = v
+		logger.Info("vault configured")
+	} else {
+		logger.Warn("VAULT_KEK_BASE64 unset — court credential endpoints will be disabled")
+	}
+
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,
@@ -360,6 +377,7 @@ func run(logger *slog.Logger) error {
 		document:             documentHandler,
 		draft:                draftHandler,
 		lookup:               lookupHandler,
+		vault:                vlt,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext
