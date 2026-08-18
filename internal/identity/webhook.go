@@ -22,6 +22,11 @@ const (
 	eventMembershipDeleted   = "organizationMembership.deleted"
 	eventMembershipUpdated   = "organizationMembership.updated"
 	eventUserUpdated         = "user.updated"
+	// eventInvitationAccepted fires alongside eventMembershipCreated when an
+	// invitee accepts (Clerk sends both webhooks for the same acceptance) — see
+	// its dispatch case for why this slice deliberately ack-and-ignores it rather
+	// than falling through the generic default (docs §3).
+	eventInvitationAccepted = "organizationInvitation.accepted"
 )
 
 // WebhookHandler provisions the local projection of Clerk Organizations and Users
@@ -160,6 +165,17 @@ func (h *WebhookHandler) dispatch(ctx context.Context, ev clerkEvent) error {
 			return apperr.NewInvalid("malformed organization payload")
 		}
 		return h.uc.OnOrganizationDeleted(ctx, d.ID)
+
+	case eventInvitationAccepted:
+		// Deliberate ack, not an unmodeled-event fallthrough: Clerk fires
+		// organizationMembership.created for the SAME acceptance, and that handler
+		// already upserts app_user + membership and emits identity.member_joined
+		// (docs §5). Processing this one too would just replay the identical
+		// upsert under a different clerk id with no new information — so this
+		// case exists to make that skip an explicit, documented decision (ERD §3)
+		// rather than a silent catch-all no-op indistinguishable from an event we
+		// simply haven't modeled yet.
+		return nil
 
 	case eventMembershipCreated:
 		var d membershipData
