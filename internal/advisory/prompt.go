@@ -115,6 +115,24 @@ type DraftContext struct {
 	Playbook string // always empty in v0
 }
 
+// ChatTurn is one message in the conversation history passed to ComposeChat.
+type ChatTurn struct {
+	Role    string // "user" | "assistant"
+	Content string
+}
+
+// ChatContext is the per-question signal the chat_grounding composer uses. It carries the
+// draft's current content (so the assistant can refer to the peça), the RAG chunks retrieved
+// for the question (empty → ungrounded path), the conversation history (up to 50 turns), and
+// the current question being answered.
+type ChatContext struct {
+	DraftContent string     // current content of the draft/peça (may be empty before first save)
+	Chunks       []string   // RAG top-K hits (text only). Empty → grounded=false (degraded).
+	History      []ChatTurn // last N turns of the conversation (oldest first)
+	Question     string     // the user's current question
+	Playbook     string     // always empty in v0
+}
+
 // PromptComposer composes the instruction-set for a named advisory agent from a case context.
 // It is a first-class, versioned artifact (§3): the agent name + version identify exactly which
 // template ran. Behind an interface so the deterministic v0 (TemplateComposer) can later be
@@ -123,6 +141,7 @@ type PromptComposer interface {
 	Compose(agent string, c CaseContext) (Composed, error)
 	ComposeProcess(agent string, c ProcessContext) (Composed, error)
 	ComposeDraft(agent string, c DraftContext) (Composed, error)
+	ComposeChat(agent string, c ChatContext) (Composed, error)
 }
 
 // Agent identifiers — one per specialized advisory task (erd-ai-advisory.md §4). Each maps to a
@@ -131,6 +150,7 @@ const (
 	AgentSuggestTasks     = "suggest_tasks"
 	AgentSummarizeProcess = "summarize_process"
 	AgentDraftMinuta      = "draft_minuta"
+	AgentChatGrounding    = "chat_grounding"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
@@ -146,6 +166,10 @@ const summarizeProcessVersion = "process_summary/v1"
 // draftMinutaVersion is the pinned version of the draft_minuta template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
 const draftMinutaVersion = "draft_minuta/v1"
+
+// chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
+// template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
+const chatGroundingVersion = "chat_grounding/v1"
 
 // TemplateComposer is the deterministic v0 composer: templates + context injection, no LLM. It is
 // stateless.
@@ -184,6 +208,17 @@ func (*TemplateComposer) ComposeDraft(agent string, c DraftContext) (Composed, e
 	switch agent {
 	case AgentDraftMinuta:
 		return composeDraftMinuta(c), nil
+	default:
+		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
+	}
+}
+
+// ComposeChat builds the (system, user, version) for the chat_grounding agent from the chat
+// context. An unknown agent is a programmer error surfaced as a typed invalid.
+func (*TemplateComposer) ComposeChat(agent string, c ChatContext) (Composed, error) {
+	switch agent {
+	case AgentChatGrounding:
+		return composeChatGrounding(c), nil
 	default:
 		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
 	}
@@ -308,6 +343,76 @@ func composeSuggestTasks(c CaseContext) Composed {
 	usr.WriteString("\n\nProduza o resumo, a recomendação e as tarefas sugeridas.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: suggestTasksVersion}
+}
+
+// composeChatGrounding renders the chat_grounding instruction-set. The assistant answers
+// the lawyer's question using ONLY the retrieved chunks from the case corpus as context.
+// When no chunks are available it still answers, but grounded=false (no citations). The
+// multi-turn history is injected in the user message so the model can follow the conversation.
+func composeChatGrounding(c ChatContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um assistente jurídico brasileiro especializado em análise de autos processuais. " +
+			"Responda à pergunta do advogado com base EXCLUSIVAMENTE nos trechos dos autos fornecidos " +
+			"como contexto. Para cada afirmação factual, cite o trecho correspondente usando " +
+			"document_id, page e quote. Se não houver trechos dos autos ou se a informação " +
+			"necessária não estiver nos trechos, responda honestamente que não encontrou essa " +
+			"informação nos documentos disponíveis — nunca invente fatos. " +
+			"Quando citar, use apenas document_ids que apareçam exatamente nos trechos fornecidos.\n\n" +
+			"REGRAS OBRIGATÓRIAS:\n" +
+			"- Responda SOMENTE com base nos trechos fornecidos; se não houver trechos suficientes, " +
+			"diga que não encontrou a informação nos autos disponíveis.\n" +
+			"- `citations` deve conter APENAS citações de trechos que aparecem literalmente no contexto.\n" +
+			"- `citations` pode ser vazio [] quando não houver contexto suficiente — nunca invente document_ids.\n" +
+			"- Mantenha o tom jurídico formal brasileiro.",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório:\n")
+		sys.WriteString(pb)
+	}
+
+	var usr strings.Builder
+
+	// Inject the draft content for reference (may be empty before first save).
+	if draft := strings.TrimSpace(c.DraftContent); draft != "" {
+		usr.WriteString("Conteúdo atual da minuta:\n")
+		usr.WriteString(draft)
+		usr.WriteString("\n\n")
+	}
+
+	// Inject the retrieved RAG chunks.
+	if len(c.Chunks) > 0 {
+		usr.WriteString("Trechos dos autos disponíveis (RAG):\n")
+		for i, chunk := range c.Chunks {
+			if i >= 8 {
+				break
+			}
+			usr.WriteString(strconv.Itoa(i+1) + ". " + chunk + "\n")
+		}
+		usr.WriteString("\n")
+	} else {
+		usr.WriteString("(Nenhum trecho dos autos disponível para esta pergunta.)\n\n")
+	}
+
+	// Inject the conversation history (multi-turn context).
+	if len(c.History) > 0 {
+		usr.WriteString("Histórico da conversa:\n")
+		for _, turn := range c.History {
+			role := "Advogado"
+			if turn.Role == "assistant" {
+				role = "Assistente"
+			}
+			usr.WriteString(role + ": " + turn.Content + "\n")
+		}
+		usr.WriteString("\n")
+	}
+
+	// The current question.
+	usr.WriteString("Pergunta atual do advogado: ")
+	usr.WriteString(c.Question)
+	usr.WriteString("\n\nResponda à pergunta citando os trechos dos autos relevantes.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: chatGroundingVersion}
 }
 
 // composeSummarizeProcess renders the summarize_process instruction-set. The system message is

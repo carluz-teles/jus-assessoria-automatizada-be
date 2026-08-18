@@ -210,6 +210,30 @@ func citationRequired(category string) bool {
 	return category == CategoryArgumento || category == CategoryCoerencia
 }
 
+// ── Chat (Fatia 3b) ───────────────────────────────────────────────────────────
+
+// ChatMessage is one turn in the multi-turn grounded chat thread for a draft. Each
+// call to AnswerQuestion appends two rows: one role='user' and one role='assistant'.
+// The thread is scoped to a draft; isolation is via JOIN draft.tenant_id (same
+// pattern as review — no tenant_id column, no RLS on this table; barrier-1 is the
+// enforced guard).
+type ChatMessage struct {
+	ID           string
+	DraftID      string
+	Role         string // "user" | "assistant"
+	Content      string
+	Citations    []Citation
+	Grounded     bool
+	ModelVersion string // non-empty only for role="assistant"
+	CreatedAt    time.Time
+}
+
+// ChatRole closed set.
+const (
+	ChatRoleUser      = "user"
+	ChatRoleAssistant = "assistant"
+)
+
 // inferPieceType maps an intimation type (DJEN tipoComunicacao) to a PieceType
 // when the client omits piece_type. This is the SINGLE source of truth for the
 // inference — referenced by the domain use case and tested directly.

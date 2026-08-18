@@ -62,6 +62,51 @@ func (q *Queries) GetAttachmentForUpdate(ctx context.Context, arg GetAttachmentF
 	return i, err
 }
 
+const getChatThread = `-- name: GetChatThread :many
+SELECT id, draft_id, role, content, citations, grounded, model_version, created_at
+FROM (
+    SELECT id, draft_id, role, content, citations, grounded, model_version, created_at
+    FROM chat_message
+    WHERE draft_id = $1
+    ORDER BY created_at DESC
+    LIMIT 50
+) sub
+ORDER BY created_at ASC
+`
+
+// Load the last 50 messages for a draft, ordered chronologically (oldest first).
+// Returns at most 50 rows (LIMIT 50 on a subquery ordered DESC so the result is
+// the most-recent 50 turned back into ASC order for display).
+// No tenant guard here — the caller must have verified draft ownership.
+func (q *Queries) GetChatThread(ctx context.Context, draftID uuid.UUID) ([]ChatMessage, error) {
+	rows, err := q.db.Query(ctx, getChatThread, draftID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ChatMessage
+	for rows.Next() {
+		var i ChatMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.DraftID,
+			&i.Role,
+			&i.Content,
+			&i.Citations,
+			&i.Grounded,
+			&i.ModelVersion,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getDocumentForAttachment = `-- name: GetDocumentForAttachment :one
 SELECT id, tenant_id, status, origin
 FROM document
@@ -453,6 +498,51 @@ func (q *Queries) GetLatestReview(ctx context.Context, draftID uuid.UUID) (GetLa
 		&i.RulesVersion,
 		&i.Status,
 		&i.GeneratedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertChatMessage = `-- name: InsertChatMessage :one
+
+INSERT INTO chat_message (draft_id, role, content, citations, grounded, model_version)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, draft_id, role, content, citations, grounded, model_version, created_at
+`
+
+type InsertChatMessageParams struct {
+	DraftID      uuid.UUID `json:"draft_id"`
+	Role         string    `json:"role"`
+	Content      string    `json:"content"`
+	Citations    []byte    `json:"citations"`
+	Grounded     bool      `json:"grounded"`
+	ModelVersion *string   `json:"model_version"`
+}
+
+// ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
+// Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
+// first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).
+// Append one turn (user or assistant) to the thread. No tenant guard here — the caller
+// must have already verified tenant ownership of draft_id before calling this.
+// citations is a jsonb array of {document_id, page, quote}; empty [] for user turns.
+func (q *Queries) InsertChatMessage(ctx context.Context, arg InsertChatMessageParams) (ChatMessage, error) {
+	row := q.db.QueryRow(ctx, insertChatMessage,
+		arg.DraftID,
+		arg.Role,
+		arg.Content,
+		arg.Citations,
+		arg.Grounded,
+		arg.ModelVersion,
+	)
+	var i ChatMessage
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Role,
+		&i.Content,
+		&i.Citations,
+		&i.Grounded,
+		&i.ModelVersion,
 		&i.CreatedAt,
 	)
 	return i, err

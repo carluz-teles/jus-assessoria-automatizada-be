@@ -20,6 +20,11 @@ type Querier interface {
 	// confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).
 	GetAttachmentForUpdate(ctx context.Context, arg GetAttachmentForUpdateParams) (DraftAttachment, error)
+	// Load the last 50 messages for a draft, ordered chronologically (oldest first).
+	// Returns at most 50 rows (LIMIT 50 on a subquery ordered DESC so the result is
+	// the most-recent 50 turned back into ASC order for display).
+	// No tenant guard here — the caller must have verified draft ownership.
+	GetChatThread(ctx context.Context, draftID uuid.UUID) ([]ChatMessage, error)
 	// Load the minimal document fields the POST /v1/pecas/:id/anexos use case needs to
 	// validate before linking: status (must be UPLOADED) and origin (must be UPLOAD, never
 	// COURT). Scoped to (id, tenant_id) — a foreign or missing document → pgx.ErrNoRows →
@@ -54,6 +59,13 @@ type Querier interface {
 	// Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.
 	// A draft with no reviews → pgx.ErrNoRows (the read model maps this to nil, not an error).
 	GetLatestReview(ctx context.Context, draftID uuid.UUID) (GetLatestReviewRow, error)
+	// ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
+	// Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
+	// first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).
+	// Append one turn (user or assistant) to the thread. No tenant guard here — the caller
+	// must have already verified tenant ownership of draft_id before calling this.
+	// citations is a jsonb array of {document_id, page, quote}; empty [] for user turns.
+	InsertChatMessage(ctx context.Context, arg InsertChatMessageParams) (ChatMessage, error)
 	// draft slice queries (peticionamento Fatia 1). Every write runs inside the use
 	// case's transaction so RLS scopes it to the principal's tenant (barrier 2) on top
 	// of the explicit tenant filter (barrier 1). Absence is a typed error at the mapper,

@@ -47,6 +47,17 @@ type CaseLink struct {
 	ConfirmedAt       pgtype.Timestamptz `json:"confirmed_at"`
 }
 
+type ChatMessage struct {
+	ID           uuid.UUID          `json:"id"`
+	DraftID      uuid.UUID          `json:"draft_id"`
+	Role         string             `json:"role"`
+	Content      string             `json:"content"`
+	Citations    []byte             `json:"citations"`
+	Grounded     bool               `json:"grounded"`
+	ModelVersion *string            `json:"model_version"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type Chunk struct {
 	ID             uuid.UUID        `json:"id"`
 	DocumentID     uuid.UUID        `json:"document_id"`

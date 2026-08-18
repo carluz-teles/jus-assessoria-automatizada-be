@@ -140,6 +140,19 @@ func (r *fakeRepo) InsertReview(_ context.Context, _ database.Tx, rev *Review) (
 	return rev, nil
 }
 
+// ── Fatia 3b stubs (InsertChatMessage, GetChatThread) ────────────────────────
+// These stubs satisfy the Repository interface for existing tests that do not
+// exercise the chat use case.
+
+func (r *fakeRepo) InsertChatMessage(_ context.Context, _ database.Tx, m *ChatMessage) (*ChatMessage, error) {
+	m.ID = "stub-chat-id"
+	return m, nil
+}
+
+func (r *fakeRepo) GetChatThread(_ context.Context, _ database.Tx, _ string) ([]ChatMessage, error) {
+	return []ChatMessage{}, nil
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 func newTenantID() string { return uuid.New().String() }

@@ -2,6 +2,7 @@ package draft
 
 import (
 	"errors"
+	"strings"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/google/uuid"
@@ -105,6 +106,26 @@ func (r UpdateAttachmentCategoryRequest) Validate() error {
 		validation.Field(&r.Category,
 			validation.Required,
 			validation.By(isAttachmentCategory)),
+	)
+}
+
+// ── Chat request types (Fatia 3b) ─────────────────────────────────────────────
+
+// ChatRequest is the POST /v1/pecas/:id/chat body.
+type ChatRequest struct {
+	Question string `json:"question"`
+}
+
+// Validate enforces edge rules: question is required, must be non-empty after trim,
+// and must be at most 2000 rune characters. The Question field is trimmed in-place
+// so the handler receives the sanitised value (no leading/trailing whitespace).
+func (r *ChatRequest) Validate() error {
+	r.Question = strings.TrimSpace(r.Question)
+	return validation.ValidateStruct(r,
+		validation.Field(&r.Question,
+			validation.Required,
+			validation.RuneLength(1, 2000),
+		),
 	)
 }
 

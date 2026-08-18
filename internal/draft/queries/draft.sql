@@ -231,3 +231,30 @@ FROM review
 WHERE draft_id = $1
 ORDER BY generated_at DESC
 LIMIT 1;
+
+-- ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
+-- Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
+-- first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).
+
+-- name: InsertChatMessage :one
+-- Append one turn (user or assistant) to the thread. No tenant guard here — the caller
+-- must have already verified tenant ownership of draft_id before calling this.
+-- citations is a jsonb array of {document_id, page, quote}; empty [] for user turns.
+INSERT INTO chat_message (draft_id, role, content, citations, grounded, model_version)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, draft_id, role, content, citations, grounded, model_version, created_at;
+
+-- name: GetChatThread :many
+-- Load the last 50 messages for a draft, ordered chronologically (oldest first).
+-- Returns at most 50 rows (LIMIT 50 on a subquery ordered DESC so the result is
+-- the most-recent 50 turned back into ASC order for display).
+-- No tenant guard here — the caller must have verified draft ownership.
+SELECT id, draft_id, role, content, citations, grounded, model_version, created_at
+FROM (
+    SELECT id, draft_id, role, content, citations, grounded, model_version, created_at
+    FROM chat_message
+    WHERE draft_id = $1
+    ORDER BY created_at DESC
+    LIMIT 50
+) sub
+ORDER BY created_at ASC;

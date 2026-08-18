@@ -295,15 +295,37 @@ func run(logger *slog.Logger) error {
 		)
 	}
 
-	// Draft (Peticionamento Fatias 1–3): the peça create/read/autosave surface +
-	// the AI generation trigger. Pool-backed read (GetDetail) + transactional writes
-	// via the shared UoW. No storage required (content lives in the DB column, not S3).
+	// Draft (Peticionamento Fatias 1–3b): the peça create/read/autosave surface +
+	// the AI generation trigger (Fatia 3) + grounded chat (Fatia 3b). Pool-backed
+	// read (GetDetail) + transactional writes via the shared UoW. No storage required
+	// (content lives in the DB column, not S3).
 	// The trigger use case (Fatia 3) flips saga→EXTRACTING and publishes
 	// draft.generation_requested into the outbox; worker-ai does the async generation.
+	// The chat use case (Fatia 3b) is synchronous in-process (same request/response
+	// cycle) — no outbox needed. It reuses the SAME taskGenerator + resumeEmbedder
+	// already wired above (same OpenRouter model slug, same Voyage embedder).
 	draftRepo := draft.NewRepository()
 	draftUC := draft.NewUseCase(uow, draftRepo)
 	draftTrigger := draft.NewTriggerUseCase(uow, draftRepo, events.NewOutbox())
 	draftHandler := draft.NewHandler(draftUC).WithGenerator(draftTrigger)
+
+	// Chat use case (Fatia 3b): reuses taskGenerator + resumeEmbedder + advisory
+	// composer already instantiated above. nil generator / nil embedder → degraded
+	// (ErrIANotConfigured / grounded=false) — never a boot failure.
+	var chatEmbedder draft.VoyageEmbedder
+	if resumeEmbedder != nil {
+		chatEmbedder = resumeEmbedder
+	}
+	chatUC := draft.NewChatUseCase(draft.ChatUseCaseParams{
+		UoW:      uow,
+		Repo:     draftRepo,
+		Gen:      taskGenerator,
+		Emb:      chatEmbedder,
+		Search:   indexing.SearchDeps{Pool: pool},
+		Composer: advisory.NewTemplateComposer(),
+		Model:    cfg.OpenRouterModel,
+	})
+	draftHandler = draftHandler.WithChat(chatUC)
 
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
