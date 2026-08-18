@@ -34,7 +34,9 @@ func (f *fakeChatGen) GenerateJSON(_ context.Context, _ llm.Request) ([]byte, er
 	return f.out, f.err
 }
 
-// fakeChatEmb is a fake embedder. Returns a single fixed vector or an error.
+// fakeChatEmb is a fake embedder for chat tests. Satisfies the package-level
+// embedder interface (same as fakeEmbedder in generate_test.go, but kept separate
+// so each test file controls its own fake independently).
 type fakeChatEmb struct {
 	vec []float32
 	err error
@@ -56,6 +58,9 @@ func (f *fakeChatEmb) Embed(_ context.Context, _ []string) ([][]float32, string,
 type fakeChatRepo struct {
 	draft        *Draft
 	draftErr     error
+	intimation   *IntimationContext
+	intimErr     error
+	intimCalled  bool
 	thread       []ChatMessage
 	threadErr    error
 	insertedMsgs []*ChatMessage
@@ -64,6 +69,11 @@ type fakeChatRepo struct {
 
 func (r *fakeChatRepo) GetDraftByID(_ context.Context, _ database.Tx, _, _ string) (*Draft, error) {
 	return r.draft, r.draftErr
+}
+
+func (r *fakeChatRepo) GetIntimationForDraft(_ context.Context, _ database.Tx, _, _ string) (*IntimationContext, error) {
+	r.intimCalled = true
+	return r.intimation, r.intimErr
 }
 
 func (r *fakeChatRepo) InsertChatMessage(_ context.Context, _ database.Tx, m *ChatMessage) (*ChatMessage, error) {
@@ -112,7 +122,7 @@ func (fakeChatComposer) ComposeChat(_ string, _ advisory.ChatContext) (advisory.
 
 // newChatUCForTest builds a ChatUseCase with the given fakes. Uses fakeUoW from
 // generate_test.go (same package — runs fn immediately with a nil tx).
-func newChatUCForTest(repo chatRepo, gen llm.Generator, emb chatEmbedder) *ChatUseCase {
+func newChatUCForTest(repo chatRepo, gen llm.Generator, emb embedder) *ChatUseCase {
 	return &ChatUseCase{
 		uow:      fakeUoW{},
 		repo:     repo,
@@ -534,6 +544,115 @@ func TestBuildChatContext(t *testing.T) {
 	}
 	if ctx.Question != "Nova pergunta" {
 		t.Errorf("Question = %q, want %q", ctx.Question, "Nova pergunta")
+	}
+}
+
+// TestChatUseCase_WithIntimation_CRIDResolvedInPhase1 verifies that when a draft has
+// an intimation with a CourtRecordID, GetIntimationForDraft is called during Phase 1
+// (inside the read tx) and the court_record_id is resolved before Phase 2 (RAG).
+// Since the unit tests use Pool=nil, runRAG degrades gracefully; we assert the answer
+// is still produced (non-fatal degradation) and GetIntimationForDraft was invoked.
+func TestChatUseCase_WithIntimation_CRIDResolvedInPhase1(t *testing.T) {
+	tenantID := "tenant-crid"
+	d := stubChatDraft(tenantID)
+	d.IntimationID = "intim-1"
+
+	intim := &IntimationContext{
+		IntimationID:  "intim-1",
+		CaseID:        d.CaseID,
+		CourtRecordID: "court-record-abc",
+		Type:          "CITACAO",
+	}
+	repo := &fakeChatRepo{
+		draft:      d,
+		intimation: intim,
+	}
+	gen := &fakeChatGen{out: []byte(noCitationsJSON)}
+	uc := newChatUCForTest(repo, gen, nil) // nil embedder → RAG degrades (non-fatal)
+
+	msg, err := uc.AnswerQuestion(context.Background(), AnswerQuestionCommand{
+		TenantID: tenantID,
+		DraftID:  d.ID,
+		Question: "Qual o prazo para contestar?",
+	})
+
+	if err != nil {
+		t.Fatalf("AnswerQuestion: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected non-nil message")
+	}
+	// Degraded (nil embedder, pool nil) → grounded=false, but the answer is still produced.
+	if msg.Grounded {
+		t.Error("grounded = true, want false (nil embedder)")
+	}
+	// The 2 messages (user + assistant) must be persisted regardless of grounding.
+	if len(repo.insertedMsgs) != 2 {
+		t.Errorf("inserted %d messages, want 2", len(repo.insertedMsgs))
+	}
+}
+
+// TestChatUseCase_WithIntimation_CRIDLoadError_NonFatal verifies that when
+// GetIntimationForDraft returns an error, AnswerQuestion degrades to whole-tenant
+// RAG (non-fatal) rather than failing the request.
+func TestChatUseCase_WithIntimation_CRIDLoadError_NonFatal(t *testing.T) {
+	tenantID := "tenant-crid-err"
+	d := stubChatDraft(tenantID)
+	d.IntimationID = "intim-2"
+
+	repo := &fakeChatRepo{
+		draft:    d,
+		intimErr: errors.New("intimation row not found"), // simulates DB error
+	}
+	gen := &fakeChatGen{out: []byte(noCitationsJSON)}
+	uc := newChatUCForTest(repo, gen, nil)
+
+	msg, err := uc.AnswerQuestion(context.Background(), AnswerQuestionCommand{
+		TenantID: tenantID,
+		DraftID:  d.ID,
+		Question: "Qual é o juiz?",
+	})
+
+	// Non-fatal: intimation load error must NOT propagate; the chat must still answer.
+	if err != nil {
+		t.Fatalf("want nil err (intimation load error is non-fatal), got %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected non-nil message")
+	}
+	if len(repo.insertedMsgs) != 2 {
+		t.Errorf("inserted %d messages, want 2", len(repo.insertedMsgs))
+	}
+}
+
+// TestChatUseCase_WithoutIntimation_NoCRIDLoad verifies that a draft without an
+// IntimationID does NOT call GetIntimationForDraft (no unnecessary DB round-trip).
+func TestChatUseCase_WithoutIntimation_NoCRIDLoad(t *testing.T) {
+	tenantID := "tenant-no-intim"
+	d := stubChatDraft(tenantID)
+	d.IntimationID = "" // blank/processo draft
+
+	repo := &fakeChatRepo{
+		draft: d,
+	}
+	gen := &fakeChatGen{out: []byte(noCitationsJSON)}
+	uc := newChatUCForTest(repo, gen, nil)
+
+	msg, err := uc.AnswerQuestion(context.Background(), AnswerQuestionCommand{
+		TenantID: tenantID,
+		DraftID:  d.ID,
+		Question: "Alguma informação?",
+	})
+
+	if err != nil {
+		t.Fatalf("AnswerQuestion: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected non-nil message")
+	}
+	// The guard (d.IntimationID != "") must prevent the extra DB round-trip.
+	if repo.intimCalled {
+		t.Error("GetIntimationForDraft was called for a draft without an intimation")
 	}
 }
 

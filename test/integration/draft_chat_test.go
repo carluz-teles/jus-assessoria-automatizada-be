@@ -326,6 +326,115 @@ func TestDraftChat_TenantIsolation(t *testing.T) {
 	}
 }
 
+// ── AC5b: RAG scoping — SearchChunks with court_record_id isolation ──────────
+
+// seedChunkForDocument inserts a chunk row with a fixed embedding vector (all-zeros
+// 1024-dim) linked to the given documentID. Schema: 0001_init (id, document_id, page,
+// text, embedding) + 0034_chunk_embedding_deltas (embedding_model, dim, chunk_hash).
+// The exact vector value is irrelevant for scoping tests; cosine distance still orders
+// by similarity and any non-null vector produces hits.
+func seedChunkForDocument(t *testing.T, pool *pgxpool.Pool, documentID string, page int, text string) {
+	t.Helper()
+	// Use a CTE to capture $3 once so sha256 sees bytea while the INSERT sees text.
+	if _, err := pool.Exec(context.Background(),
+		`WITH v AS (SELECT $3::text AS t)
+		 INSERT INTO chunk (document_id, page, text, chunk_hash, embedding, embedding_model, dim)
+		 SELECT $1, $2, v.t,
+		        encode(sha256(v.t::bytea), 'hex'),
+		        (array_fill(0, ARRAY[1024])::vector(1024)),
+		        'voyage-4-lite', 1024
+		 FROM v`,
+		documentID, page, text); err != nil {
+		t.Fatalf("seedChunkForDocument(%s, %d): %v", documentID, page, err)
+	}
+}
+
+// TestSearchChunks_ScopedByCourtRecordID proves that SearchChunks with a non-nil
+// courtRecordID returns ONLY chunks whose document has that court_record_id.
+// Two documents are seeded: one with court_record_id=A and one with court_record_id=B.
+// A query scoped to A must return only the chunk from document A.
+//
+// This is the load-bearing integration assertion for the intimation-scoped grounding
+// feature: we prove that the SQL isolation (document.court_record_id = $3) actually
+// works against a real Postgres, not just in the pgxmock unit tests.
+func TestSearchChunks_ScopedByCourtRecordID(t *testing.T) {
+	pool := newPool(t)
+	ctx := context.Background()
+
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-rag-scope", 0)
+
+	// Seed two court_record rows (auto-generated IDs) — represent two different processos.
+	cridA, _ := seedCourtRecordCNJ(t, pool, tenantID, "0000001-01.2024.8.26.0001")
+	cridB, _ := seedCourtRecordCNJ(t, pool, tenantID, "0000002-02.2024.8.26.0001")
+
+	// One document per court_record.
+	docA := seedUploadedDocument(t, pool, tenantID, cridA)
+	docB := seedUploadedDocument(t, pool, tenantID, cridB)
+
+	// One chunk per document.
+	seedChunkForDocument(t, pool, docA, 1, "texto do processo A — prazo de 15 dias")
+	seedChunkForDocument(t, pool, docB, 1, "texto do processo B — recurso cabível")
+
+	// All-zeros query vector (1024-dim) — used for the SearchChunks call. The actual
+	// score is irrelevant; we just need hits to be returned (any similarity > -1).
+	queryVec := make([]float32, 1024)
+
+	// Scope to court_record A → must return ONLY the chunk from docA.
+	hitsA, err := indexing.SearchChunks(ctx,
+		indexing.SearchDeps{Pool: pool},
+		tenantID,
+		&cridA,
+		queryVec,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("SearchChunks(cridA): %v", err)
+	}
+	if len(hitsA) != 1 {
+		t.Fatalf("hits with cridA = %d, want 1 (only docA's chunk)", len(hitsA))
+	}
+	if hitsA[0].DocumentID != docA {
+		t.Errorf("hit document_id = %q, want docA %q", hitsA[0].DocumentID, docA)
+	}
+	if hitsA[0].Text != "texto do processo A — prazo de 15 dias" {
+		t.Errorf("hit text = %q, want docA text", hitsA[0].Text)
+	}
+
+	// Scope to court_record B → must return ONLY the chunk from docB.
+	hitsB, err := indexing.SearchChunks(ctx,
+		indexing.SearchDeps{Pool: pool},
+		tenantID,
+		&cridB,
+		queryVec,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("SearchChunks(cridB): %v", err)
+	}
+	if len(hitsB) != 1 {
+		t.Fatalf("hits with cridB = %d, want 1 (only docB's chunk)", len(hitsB))
+	}
+	if hitsB[0].DocumentID != docB {
+		t.Errorf("hit document_id = %q, want docB %q", hitsB[0].DocumentID, docB)
+	}
+
+	// Whole-tenant (nil crid) → both chunks returned.
+	hitsAll, err := indexing.SearchChunks(ctx,
+		indexing.SearchDeps{Pool: pool},
+		tenantID,
+		nil,
+		queryVec,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("SearchChunks(nil): %v", err)
+	}
+	if len(hitsAll) != 2 {
+		t.Errorf("hits whole-tenant = %d, want 2 (docA + docB)", len(hitsAll))
+	}
+}
+
 // ── AC5: Ungrounded — grounded=false when no embedder ─────────────────────────
 
 // TestDraftChat_Ungrounded_GroundedFalse proves that when the embedder is nil,
