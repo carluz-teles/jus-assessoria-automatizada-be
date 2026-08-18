@@ -292,9 +292,9 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 // ── AC3: Consumer happy path — review persisted + outbox in one tx ────────────
 
 // TestDraftGenerate_Consumer_HappyPath proves OnGenerationRequested:
-//   1. Updates draft.content and saga_state=REVIEWED in the DB.
-//   2. Inserts a review row with status=COMPLETED, non-empty findings, and coverage.
-//   3. Publishes review.completed in the outbox — SAME tx as review insert.
+//  1. Updates draft.content and saga_state=REVIEWED in the DB.
+//  2. Inserts a review row with status=COMPLETED, non-empty findings, and coverage.
+//  3. Publishes review.completed in the outbox — SAME tx as review insert.
 //
 // The fake generator returns cannedGenerationJSON; embedder is nil (degraded).
 func TestDraftGenerate_Consumer_HappyPath(t *testing.T) {

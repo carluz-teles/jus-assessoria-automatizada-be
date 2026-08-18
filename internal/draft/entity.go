@@ -72,17 +72,17 @@ var validPieceTypes = map[string]bool{
 // one exhibit the advogado has attached to the peça. The document itself lives in
 // the document slice; this entity owns only the link metadata (category, position).
 type Attachment struct {
-	ID               string
-	TenantID         string
-	DraftID          string
-	DocumentID       string
-	Name             string // document.title, falling back to original_filename
-	Category         AttachmentCategory
-	MimeType         string
-	SizeBytes        int64
-	Status           string // mirrors document.status (always UPLOADED in the read model)
-	Position         int
-	CreatedAt        time.Time
+	ID         string
+	TenantID   string
+	DraftID    string
+	DocumentID string
+	Name       string // document.title, falling back to original_filename
+	Category   AttachmentCategory
+	MimeType   string
+	SizeBytes  int64
+	Status     string // mirrors document.status (always UPLOADED in the read model)
+	Position   int
+	CreatedAt  time.Time
 }
 
 // AttachmentCategory is the closed set of labels the advogado can assign to an
@@ -90,22 +90,22 @@ type Attachment struct {
 type AttachmentCategory string
 
 const (
-	CategoryProcuracao              AttachmentCategory = "Procuração"
-	CategoryComprovante             AttachmentCategory = "Comprovante de endereço"
-	CategoryContrato                AttachmentCategory = "Contrato"
-	CategoryProvasDocumentais       AttachmentCategory = "Provas documentais"
+	CategoryProcuracao                 AttachmentCategory = "Procuração"
+	CategoryComprovante                AttachmentCategory = "Comprovante de endereço"
+	CategoryContrato                   AttachmentCategory = "Contrato"
+	CategoryProvasDocumentais          AttachmentCategory = "Provas documentais"
 	CategoryDeclaracaoHipossuficiencia AttachmentCategory = "Declaração de hipossuficiência"
-	CategoryOutro                   AttachmentCategory = "Outro"
+	CategoryOutro                      AttachmentCategory = "Outro"
 )
 
 // validAttachmentCategories is the lookup for validation (mirrors the DB CHECK).
 var validAttachmentCategories = map[AttachmentCategory]bool{
-	CategoryProcuracao:              true,
-	CategoryComprovante:             true,
-	CategoryContrato:                true,
-	CategoryProvasDocumentais:       true,
+	CategoryProcuracao:                 true,
+	CategoryComprovante:                true,
+	CategoryContrato:                   true,
+	CategoryProvasDocumentais:          true,
 	CategoryDeclaracaoHipossuficiencia: true,
-	CategoryOutro:                   true,
+	CategoryOutro:                      true,
 }
 
 // IsValidCategory reports whether cat is a member of the closed set.
@@ -168,12 +168,12 @@ const (
 // Finding is one AI suggestion mapped to an exact substring of draft.content.
 // category drives citation requirements (Argumento/Coerência → citation required).
 type Finding struct {
-	N           int      `json:"n"`
-	Category    string   `json:"category"`
-	Original    string   `json:"original"`
-	Replacement string   `json:"replacement"`
-	Problem     string   `json:"problem"`
-	Description string   `json:"description"`
+	N           int       `json:"n"`
+	Category    string    `json:"category"`
+	Original    string    `json:"original"`
+	Replacement string    `json:"replacement"`
+	Problem     string    `json:"problem"`
+	Description string    `json:"description"`
 	Citation    *Citation `json:"citation,omitempty"`
 }
 

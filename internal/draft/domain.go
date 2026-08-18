@@ -57,7 +57,7 @@ type CreateCommand struct {
 // draft, plus a flag indicating whether this was a first creation (201) or idempotent
 // (200).
 type CreateResult struct {
-	Draft     *Draft
+	Draft      *Draft
 	IsNewDraft bool
 }
 

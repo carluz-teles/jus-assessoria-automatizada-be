@@ -220,9 +220,9 @@ type detailResponse struct {
 
 // reviewResponse is the nested review shape in GET /v1/pecas/:id.
 type reviewResponse struct {
-	Status      string           `json:"status"`
-	GeneratedAt string           `json:"generated_at"`
-	Grounded    bool             `json:"grounded"`
+	Status      string            `json:"status"`
+	GeneratedAt string            `json:"generated_at"`
+	Grounded    bool              `json:"grounded"`
 	Suggestions []findingResponse `json:"suggestions"`
 }
 

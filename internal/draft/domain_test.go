@@ -166,13 +166,13 @@ func TestUseCase_Create(t *testing.T) {
 	caseID := uuid.New().String()
 
 	tests := []struct {
-		name        string
-		cmd         CreateCommand
-		repo        *fakeRepo
-		wantNew     bool
-		wantErr     bool
-		errTarget   error
-		wantPiece   string
+		name      string
+		cmd       CreateCommand
+		repo      *fakeRepo
+		wantNew   bool
+		wantErr   bool
+		errTarget error
+		wantPiece string
 	}{
 		{
 			name: "source=intimation creates draft with inferred DEFENSE piece_type",
@@ -735,4 +735,3 @@ func TestUseCase_RemoveAttachment(t *testing.T) {
 		})
 	}
 }
-
