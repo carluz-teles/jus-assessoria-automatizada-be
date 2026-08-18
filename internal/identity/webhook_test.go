@@ -315,6 +315,22 @@ func TestWebhookHandler_Handle(t *testing.T) {
 		}
 	})
 
+	// FLO-74: organizationInvitation.accepted is a deliberate ack — Clerk fires
+	// organizationMembership.created for the same acceptance, which already does
+	// the real work. Any repo call here would nil-panic, proving this case never
+	// reaches the use case.
+	t.Run("organizationInvitation.accepted is acknowledged without touching the repo", func(t *testing.T) {
+		repo := &mockRepo{}
+		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))
+
+		body := []byte(`{"type":"organizationInvitation.accepted","data":{"id":"orginv_1"}}`)
+		resp := doWebhook(t, h, signedRequest(t, testWebhookSecret, body))
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	})
+
 	t.Run("unknown event type is acknowledged and ignored", func(t *testing.T) {
 		repo := &mockRepo{} // any repo call would nil-panic — proving none happens
 		h := NewWebhookHandler(testWebhookSecret, NewUseCase(repo, noopOutbox{}, &fakeUOW{}))

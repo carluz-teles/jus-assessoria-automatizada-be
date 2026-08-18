@@ -185,8 +185,14 @@ na mesma porta.
   hoje). **Convites continuam e-mail nativo do Clerk** (fora deste domínio).
 - **Preferências (FLO-59, implementado):** `GET/PUT /v1/notifications/preferences` — o usuário liga/desliga o canal
   EMAIL por tipo de aviso (`notification_preference.channels`); ausência de override = todos os canais habilitados
-  (default). Só o canal EMAIL é de fato verificado antes do envio hoje (`channelEnabled` em `domain.go`) — avisos
-  IN_APP não respeitam preferência ainda.
+  (default). Só o canal EMAIL é de fato verificado antes do envio hoje (`channelEnabled` em `domain.go`).
+- **IN_APP é broadcast, não endereçável (decisão FLO-75, v0).** `notification_preference` é escopado por
+  `(tenant_id, app_user_id, type)`, mas TODO aviso IN_APP hoje (`OnBackfillFinished`, `OnDocketEntryObserved`,
+  `OnDeadlineDueSoon`, `OnDeadlineMissed`, `OnTrialEndingSoon`, `OnPaymentFailed`) é **tenant-level** — sem
+  `recipient_user_id`, então não há usuário individual contra o qual checar a preferência. "Respeitar preferência
+  por usuário" simplesmente não se aplica a nenhum caso real ainda: o sino é broadcast pra todo mundo do tenant, por
+  design, no v0. Isso só mudaria se um produtor endereçado a um usuário específico (o caminho
+  `notification.requested`/`NotifyUseCase`, hoje só EMAIL) passasse a também criar delivery IN_APP.
 
 > ⚠️ **Colisão de nome a resolver.** O slice `acquisition` já tem uma tabela **`notification` = intimação judicial**
 > (conceito de domínio, não "aviso ao usuário"). Recomenda-se **renomear a judicial para `intimation`** e reservar
