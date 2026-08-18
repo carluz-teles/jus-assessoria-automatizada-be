@@ -363,6 +363,8 @@ type Review struct {
 	ModelVersion string             `json:"model_version"`
 	RulesVersion string             `json:"rules_version"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	Status       string             `json:"status"`
+	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
 }
 
 type Subscription struct {

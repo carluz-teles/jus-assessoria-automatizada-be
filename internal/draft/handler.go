@@ -25,15 +25,30 @@ type writer interface {
 	RemoveAttachment(ctx context.Context, cmd RemoveAttachmentCommand) error
 }
 
+// generator is the narrow port for the POST /v1/pecas/:id/generate trigger. It is a
+// separate interface (not embedded in writer) because the generate use case is composed
+// independently (different dependencies: outbox, UoW).
+type generator interface {
+	TriggerGeneration(ctx context.Context, cmd TriggerGenerationCommand) (*Draft, error)
+}
+
 // Handler is the draft HTTP surface. It owns its routing; cmd/api composes via
 // RegisterV1.
 type Handler struct {
-	uc writer
+	uc  writer
+	gen generator // nil when the generation use case is not wired (no AI key)
 }
 
 // NewHandler wires the handler to the use case.
 func NewHandler(uc writer) *Handler {
 	return &Handler{uc: uc}
+}
+
+// WithGenerator attaches the generation trigger use case to the handler. Called by
+// cmd/api composition when the generation use case is available.
+func (h *Handler) WithGenerator(gen generator) *Handler {
+	h.gen = gen
+	return h
 }
 
 // RegisterV1 mounts the peças routes on the /v1 group. The static-vs-param ordering
@@ -44,6 +59,9 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/pecas", h.createPeca)
 	r.Get("/pecas/:id", h.getPeca)
 	r.Patch("/pecas/:id", h.patchPeca)
+
+	// AI generation trigger (Fatia 3).
+	r.Post("/pecas/:id/generate", h.generatePeca)
 
 	// Attachment sub-resource (Fatia 2).
 	r.Post("/pecas/:id/anexos", h.attachDocument)
@@ -195,6 +213,35 @@ type detailResponse struct {
 	Process     *processResponse     `json:"process,omitempty"`
 	Deadline    *deadlineResponse    `json:"deadline,omitempty"`
 	Attachments []attachmentResponse `json:"attachments"`
+
+	// Review is the latest AI review, or null when no generation has been run.
+	Review *reviewResponse `json:"review"`
+}
+
+// reviewResponse is the nested review shape in GET /v1/pecas/:id.
+type reviewResponse struct {
+	Status      string           `json:"status"`
+	GeneratedAt string           `json:"generated_at"`
+	Grounded    bool             `json:"grounded"`
+	Suggestions []findingResponse `json:"suggestions"`
+}
+
+// findingResponse is one suggestion in the review response.
+type findingResponse struct {
+	N           int               `json:"n"`
+	Category    string            `json:"category"`
+	Original    string            `json:"original"`
+	Replacement string            `json:"replacement"`
+	Problem     string            `json:"problem"`
+	Description string            `json:"description"`
+	Citation    *citationResponse `json:"citation,omitempty"`
+}
+
+// citationResponse is a grounding citation in a finding.
+type citationResponse struct {
+	DocumentID string `json:"document_id"`
+	Page       int    `json:"page"`
+	Quote      string `json:"quote"`
 }
 
 type intimationResponse struct {
@@ -271,7 +318,73 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 	// Attachments: always an array (empty when none), never omitted.
 	resp.Attachments = attachmentsToResponse(v.Attachments)
 
+	// Review: nil when no generation has run yet, otherwise the latest review.
+	if v.Review != nil {
+		resp.Review = reviewToResponse(v.Review)
+	}
+
 	return resp
+}
+
+// reviewToResponse maps a *Review entity to the nested response shape.
+func reviewToResponse(r *Review) *reviewResponse {
+	suggestions := make([]findingResponse, 0, len(r.Findings))
+	for _, f := range r.Findings {
+		fr := findingResponse{
+			N:           f.N,
+			Category:    f.Category,
+			Original:    f.Original,
+			Replacement: f.Replacement,
+			Problem:     f.Problem,
+			Description: f.Description,
+		}
+		if f.Citation != nil {
+			fr.Citation = &citationResponse{
+				DocumentID: f.Citation.DocumentID,
+				Page:       f.Citation.Page,
+				Quote:      f.Citation.Quote,
+			}
+		}
+		suggestions = append(suggestions, fr)
+	}
+	return &reviewResponse{
+		Status:      r.Status,
+		GeneratedAt: r.GeneratedAt.Format(time.RFC3339),
+		Grounded:    r.Coverage.Grounded,
+		Suggestions: suggestions,
+	}
+}
+
+// ─── POST /v1/pecas/:id/generate ──────────────────────────────────────────────
+
+// generatePeca handles POST /v1/pecas/:id/generate (Fatia 3). Guards saga_state,
+// flips to EXTRACTING, publishes draft.generation_requested in the same tx.
+// Returns 202 with {data:{id, saga_state:"EXTRACTING"}}.
+func (h *Handler) generatePeca(c *fiber.Ctx) error {
+	if h.gen == nil {
+		// The generation use case was not wired (no AI config). Return 202 with FAILED
+		// immediately to match the "generator nil → FAILED" behaviour visible to the FE.
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"data": fiber.Map{"saga_state": SagaStateFailed, "message": "IA não configurada"},
+		})
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	draft, err := h.gen.TriggerGeneration(c.UserContext(), TriggerGenerationCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"data": fiber.Map{
+			"id":         draft.ID,
+			"saga_state": draft.SagaState,
+		},
+	})
 }
 
 // ── Attachment response shape ─────────────────────────────────────────────────

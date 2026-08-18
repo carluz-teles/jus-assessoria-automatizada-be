@@ -8,14 +8,20 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/hibiken/asynq"
 
+	"github.com/jusassessoria/platform/internal/advisory"
+	"github.com/jusassessoria/platform/internal/draft"
+	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
+	"github.com/jusassessoria/platform/lib/llm"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
@@ -72,12 +78,75 @@ func run(logger *slog.Logger) error {
 		LogLevel:    asynq.ErrorLevel,
 	})
 
-	// Feature slices register their listeners on this mux, e.g.
-	//   mux.HandleFunc("ai.summary.requested", listener.Handle)
-	// Observe wraps EVERY handler (consumer span + failure log) — a future ai
-	// listener inherits the instrumentation for free.
+	// Observe wraps EVERY handler (consumer span + failure log) — all ai listeners
+	// inherit the instrumentation for free.
 	mux := asynq.NewServeMux()
 	mux.Use(events.Observe(logger))
+
+	// ── Draft AI generation listener (Fatia 3) ────────────────────────────────
+	// Compose the generation use case with the real dependencies. The LLM generator
+	// is optional: when OPENROUTER_API_KEY is not configured, gen is nil and the use
+	// case marks every draft FAILED "IA não configurada" (the degraded path). The
+	// Voyage embedder is also optional: when absent, the use case degrades to
+	// ungrounded generation (no RAG, no citations). Both are soft failures — the
+	// worker still boots and the listener is always registered (it handles the
+	// "generator nil → FAILED" case itself, per the Architect's design).
+	{
+		uow := database.NewUnitOfWork(pool)
+		outbox := events.NewOutbox()
+		repo := draft.NewRepository()
+		dedup := draft.NewGenerateDeduper()
+
+		// LLM generator (OpenRouter). nil when the key is absent.
+		var gen llm.Generator
+		if cfg.OpenRouterAPIKey != "" {
+			httpClient := &http.Client{Timeout: 2 * time.Minute}
+			g, err := llm.NewOpenRouterGenerator(
+				cfg.OpenRouterAPIKey,
+				cfg.OpenRouterBaseURL,
+				cfg.OpenRouterModel,
+				httpClient,
+			)
+			if err != nil {
+				return fmt.Errorf("init openrouter generator: %w", err)
+			}
+			gen = g
+			logger.Info("AI generation: OpenRouter generator configured", "model", cfg.OpenRouterModel)
+		} else {
+			logger.Warn("OPENROUTER_API_KEY unset — AI generation will mark drafts FAILED")
+		}
+
+		// Voyage embedder for RAG. nil when the key is absent.
+		var emb draft.VoyageEmbedder
+		searchDeps := indexing.SearchDeps{Pool: pool}
+		if cfg.VoyageAPIKey != "" {
+			httpClient := &http.Client{Timeout: 30 * time.Second}
+			e, err := indexing.NewVoyageEmbedder(cfg.VoyageAPIKey, cfg.VoyageModel, cfg.VoyageEmbedDim, httpClient)
+			if err != nil {
+				return fmt.Errorf("init voyage embedder for ai: %w", err)
+			}
+			emb = e
+			logger.Info("AI generation: RAG embedder configured", "model", cfg.VoyageModel)
+		} else {
+			logger.Warn("VOYAGE_API_KEY unset — AI generation will run without RAG grounding")
+		}
+
+		generateUC := draft.NewGenerateUseCase(draft.GenerateUseCaseParams{
+			UoW:      uow,
+			Reader:   repo,
+			Writer:   repo,
+			Outbox:   outbox,
+			Dedup:    dedup,
+			Gen:      gen,
+			Emb:      emb,
+			Search:   searchDeps,
+			Composer: advisory.NewTemplateComposer(),
+		})
+
+		listener := draft.NewListener(generateUC)
+		listener.Register(mux)
+		logger.Info("draft generation listener registered")
+	}
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)

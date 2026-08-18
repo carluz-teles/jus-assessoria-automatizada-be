@@ -29,6 +29,11 @@ type DraftDetailView struct {
 	// Attachments is the ordered list of uploaded documents linked to this draft.
 	// Empty slice (never nil) when no attachments exist.
 	Attachments []Attachment
+
+	// Review is the latest AI-generated review for this draft, or nil when no
+	// generation has been run yet (saga_state == CREATED or EXTRACTING with no
+	// prior attempt).
+	Review *Review
 }
 
 // IntimationView is the context the editor shows alongside the draft text.

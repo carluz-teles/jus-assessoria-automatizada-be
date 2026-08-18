@@ -179,6 +179,14 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 			return err
 		}
 		v.Attachments = attachments
+
+		// Latest AI review (nil when no generation has been run).
+		rev, err := uc.rw.GetLatestReview(ctx, tx, v.ID)
+		if err != nil {
+			return err
+		}
+		v.Review = rev
+
 		view = v
 		return nil
 	})

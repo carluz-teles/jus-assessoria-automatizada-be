@@ -1,6 +1,7 @@
 package draft
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/jusassessoria/platform/internal/draft/draftdb"
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/database"
 )
 
 // mapper.go is the boundary where driver types die (docs §4b.3): uuid.UUID,
@@ -178,4 +180,102 @@ func draftFromGetByIntimationRow(r draftdb.GetDraftByIntimationIDRow) *Draft {
 		CreatedAt:    timestamptzToTime(r.CreatedAt),
 		UpdatedAt:    timestamptzToTime(r.UpdatedAt),
 	}
+}
+
+// ── AI generation mappers (Fatia 3) ──────────────────────────────────────────
+
+// draftFromUpdateSagaStateRow maps the UpdateSagaState RETURNING row to a *Draft.
+func draftFromUpdateSagaStateRow(r draftdb.UpdateSagaStateRow) *Draft {
+	return &Draft{
+		ID:           r.ID.String(),
+		TenantID:     r.TenantID.String(),
+		CaseID:       pgUUIDToString(r.CaseID),
+		IntimationID: pgUUIDToString(r.IntimationID),
+		PieceType:    r.PieceType,
+		Title:        r.Title,
+		Content:      derefString(r.Content),
+		Status:       r.Status,
+		SagaState:    r.SagaState,
+		CreatedAt:    timestamptzToTime(r.CreatedAt),
+		UpdatedAt:    timestamptzToTime(r.UpdatedAt),
+	}
+}
+
+// reviewFromInsertRow maps an InsertReview RETURNING row to a *Review entity.
+func reviewFromInsertRow(r draftdb.InsertReviewRow) *Review {
+	return &Review{
+		ID:           r.ID.String(),
+		DraftID:      r.DraftID.String(),
+		Findings:     unmarshalFindings(r.Findings),
+		Coverage:     unmarshalCoverage(r.Coverage),
+		ModelVersion: r.ModelVersion,
+		RulesVersion: r.RulesVersion,
+		Status:       r.Status,
+		GeneratedAt:  timestamptzToTime(r.GeneratedAt),
+		CreatedAt:    timestamptzToTime(r.CreatedAt),
+	}
+}
+
+// reviewFromGetLatestRow maps a GetLatestReview row to a *Review entity.
+func reviewFromGetLatestRow(r draftdb.GetLatestReviewRow) *Review {
+	return &Review{
+		ID:           r.ID.String(),
+		DraftID:      r.DraftID.String(),
+		Findings:     unmarshalFindings(r.Findings),
+		Coverage:     unmarshalCoverage(r.Coverage),
+		ModelVersion: r.ModelVersion,
+		RulesVersion: r.RulesVersion,
+		Status:       r.Status,
+		GeneratedAt:  timestamptzToTime(r.GeneratedAt),
+		CreatedAt:    timestamptzToTime(r.CreatedAt),
+	}
+}
+
+// marshalJSON serializes a value to []byte (jsonb). An encoding error is an infra
+// fault — it indicates a programmer mistake (a non-serializable type), not a user
+// error.
+func marshalJSON(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return b, nil
+}
+
+// unmarshalFindings decodes jsonb bytes into []Finding. A decode fault returns an
+// empty slice (best-effort — a corrupt review row should not crash the read model).
+func unmarshalFindings(b []byte) []Finding {
+	var out []Finding
+	if len(b) == 0 {
+		return []Finding{}
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return []Finding{}
+	}
+	if out == nil {
+		return []Finding{}
+	}
+	return out
+}
+
+// unmarshalCoverage decodes jsonb bytes into a Coverage struct. A decode fault
+// returns a zero-value Coverage (best-effort — same rationale as unmarshalFindings).
+func unmarshalCoverage(b []byte) Coverage {
+	var out Coverage
+	if len(b) == 0 {
+		return Coverage{DocumentsCited: []string{}}
+	}
+	_ = json.Unmarshal(b, &out)
+	if out.DocumentsCited == nil {
+		out.DocumentsCited = []string{}
+	}
+	return out
+}
+
+// timeToTimestamptz converts a time.Time to a pgtype.Timestamptz.
+func timeToTimestamptz(t time.Time) pgtype.Timestamptz {
+	if t.IsZero() {
+		return pgtype.Timestamptz{Valid: false}
+	}
+	return pgtype.Timestamptz{Time: t, Valid: true}
 }

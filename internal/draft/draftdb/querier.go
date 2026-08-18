@@ -6,6 +6,8 @@ package draftdb
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 type Querier interface {
@@ -48,6 +50,10 @@ type Querier interface {
 	// inference). Filtered by intimation.id and tenant_id (barrier 1 via court_record).
 	// A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 	GetIntimationForDraft(ctx context.Context, arg GetIntimationForDraftParams) (GetIntimationForDraftRow, error)
+	// Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.
+	// Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.
+	// A draft with no reviews → pgx.ErrNoRows (the read model maps this to nil, not an error).
+	GetLatestReview(ctx context.Context, draftID uuid.UUID) (GetLatestReviewRow, error)
 	// draft slice queries (peticionamento Fatia 1). Every write runs inside the use
 	// case's transaction so RLS scopes it to the principal's tenant (barrier 2) on top
 	// of the explicit tenant filter (barrier 1). Absence is a typed error at the mapper,
@@ -71,6 +77,11 @@ type Querier interface {
 	// NOTHING maps it to pgx.ErrNoRows so the repo can return ErrAttachmentAlreadyLinked
 	// without a 23505 transaction abort.
 	InsertDraftAttachment(ctx context.Context, arg InsertDraftAttachmentParams) (DraftAttachment, error)
+	// Persist one AI review (findings + coverage as jsonb, model_version, rules_version,
+	// status, generated_at). No tenant_id — isolation is via JOIN on draft.tenant_id (the
+	// caller already tenant-guarded the draft before calling this). ON CONFLICT is absent
+	// (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
+	InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error)
 	// Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
 	// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).
@@ -79,6 +90,14 @@ type Querier interface {
 	// (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
 	// or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
 	UpdateDraftContent(ctx context.Context, arg UpdateDraftContentParams) (UpdateDraftContentRow, error)
+	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+	// These are the three new queries the async generation saga needs.
+	// Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
+	// on success, FAILED on LLM error). Also updates content when the generator returns new
+	// text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
+	// which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
+	// A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+	UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams) (UpdateSagaStateRow, error)
 }
 
 var _ Querier = (*Queries)(nil)
