@@ -58,8 +58,19 @@ type fakeRepo struct {
 	detailResult *DraftDetailView
 	detailErr    error
 
+	// Attachment stubs.
+	getDocForAttachResult *documentForAttachment
+	getDocForAttachErr    error
+	insertAttachResult    *Attachment
+	insertAttachErr       error
+	updateCategoryResult  *Attachment
+	updateCategoryErr     error
+	deleteAttachErr       error
+	getDraftAttachResult  []Attachment
+	getDraftAttachErr     error
+
 	// Recorded calls.
-	insertCalls      int
+	insertCalls       int
 	lastInsertedDraft *Draft
 }
 
@@ -87,6 +98,29 @@ func (r *fakeRepo) UpdateDraftContent(_ context.Context, _ database.Tx, _, _, _ 
 
 func (r *fakeRepo) GetDraftDetail(_ context.Context, _ database.Tx, _, _ string) (*DraftDetailView, error) {
 	return r.detailResult, r.detailErr
+}
+
+func (r *fakeRepo) GetDocumentForAttachment(_ context.Context, _ database.Tx, _, _ string) (*documentForAttachment, error) {
+	return r.getDocForAttachResult, r.getDocForAttachErr
+}
+
+func (r *fakeRepo) InsertAttachment(_ context.Context, _ database.Tx, _ *Attachment) (*Attachment, error) {
+	return r.insertAttachResult, r.insertAttachErr
+}
+
+func (r *fakeRepo) UpdateAttachmentCategory(_ context.Context, _ database.Tx, _, _, _ string, _ AttachmentCategory) (*Attachment, error) {
+	return r.updateCategoryResult, r.updateCategoryErr
+}
+
+func (r *fakeRepo) DeleteAttachment(_ context.Context, _ database.Tx, _, _, _ string) error {
+	return r.deleteAttachErr
+}
+
+func (r *fakeRepo) GetDraftAttachments(_ context.Context, _ database.Tx, _, _ string) ([]Attachment, error) {
+	if r.getDraftAttachResult == nil {
+		return []Attachment{}, r.getDraftAttachErr
+	}
+	return r.getDraftAttachResult, r.getDraftAttachErr
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -400,6 +434,286 @@ func TestUseCase_GetDetail(t *testing.T) {
 			}
 			if view == nil {
 				t.Fatal("GetDetail() view is nil")
+			}
+		})
+	}
+}
+
+// ── AttachDocument tests ──────────────────────────────────────────────────────
+
+func TestUseCase_AttachDocument(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+	docID := uuid.New().String()
+
+	stubAtt := func() *Attachment {
+		return &Attachment{
+			ID:         uuid.New().String(),
+			TenantID:   tenantID,
+			DraftID:    draftID,
+			DocumentID: docID,
+			Category:   CategoryOutro,
+			Position:   0,
+		}
+	}
+	uploadedDoc := &documentForAttachment{
+		ID:       docID,
+		TenantID: tenantID,
+		Status:   documentStatusUploaded,
+		Origin:   documentOriginUpload,
+	}
+
+	tests := []struct {
+		name      string
+		cmd       AttachDocumentCommand
+		repo      *fakeRepo
+		wantErr   bool
+		errTarget error
+	}{
+		{
+			name: "links UPLOAD/UPLOADED document → 201",
+			cmd: AttachDocumentCommand{
+				TenantID:   tenantID,
+				DraftID:    draftID,
+				DocumentID: docID,
+				Category:   CategoryProcuracao,
+			},
+			repo: &fakeRepo{
+				getByIDResult:         stubDraft(tenantID, ""),
+				getDocForAttachResult: uploadedDoc,
+				insertAttachResult:    stubAtt(),
+			},
+		},
+		{
+			name: "default category is Outro when empty",
+			cmd: AttachDocumentCommand{
+				TenantID:   tenantID,
+				DraftID:    draftID,
+				DocumentID: docID,
+			},
+			repo: &fakeRepo{
+				getByIDResult:         stubDraft(tenantID, ""),
+				getDocForAttachResult: uploadedDoc,
+				insertAttachResult:    stubAtt(),
+			},
+		},
+		{
+			name: "draft not found → ErrDraftNotFound",
+			cmd: AttachDocumentCommand{
+				TenantID:   tenantID,
+				DraftID:    draftID,
+				DocumentID: docID,
+			},
+			repo:      &fakeRepo{getByIDErr: ErrDraftNotFound},
+			wantErr:   true,
+			errTarget: ErrDraftNotFound,
+		},
+		{
+			name: "document not found → ErrDocumentNotFound",
+			cmd: AttachDocumentCommand{
+				TenantID:   tenantID,
+				DraftID:    draftID,
+				DocumentID: docID,
+			},
+			repo: &fakeRepo{
+				getByIDResult:      stubDraft(tenantID, ""),
+				getDocForAttachErr: ErrDocumentNotFound,
+			},
+			wantErr:   true,
+			errTarget: ErrDocumentNotFound,
+		},
+		{
+			name: "PENDING document → ErrDocumentNotAttachable",
+			cmd: AttachDocumentCommand{
+				TenantID:   tenantID,
+				DraftID:    draftID,
+				DocumentID: docID,
+			},
+			repo: &fakeRepo{
+				getByIDResult: stubDraft(tenantID, ""),
+				getDocForAttachResult: &documentForAttachment{
+					ID: docID, TenantID: tenantID,
+					Status: "PENDING", Origin: documentOriginUpload,
+				},
+			},
+			wantErr:   true,
+			errTarget: ErrDocumentNotAttachable,
+		},
+		{
+			name: "COURT document → ErrDocumentNotAttachable",
+			cmd: AttachDocumentCommand{
+				TenantID:   tenantID,
+				DraftID:    draftID,
+				DocumentID: docID,
+			},
+			repo: &fakeRepo{
+				getByIDResult: stubDraft(tenantID, ""),
+				getDocForAttachResult: &documentForAttachment{
+					ID: docID, TenantID: tenantID,
+					Status: documentStatusUploaded, Origin: "COURT",
+				},
+			},
+			wantErr:   true,
+			errTarget: ErrDocumentNotAttachable,
+		},
+		{
+			name: "duplicate link → ErrAttachmentAlreadyLinked",
+			cmd: AttachDocumentCommand{
+				TenantID:   tenantID,
+				DraftID:    draftID,
+				DocumentID: docID,
+			},
+			repo: &fakeRepo{
+				getByIDResult:         stubDraft(tenantID, ""),
+				getDocForAttachResult: uploadedDoc,
+				insertAttachErr:       ErrAttachmentAlreadyLinked,
+			},
+			wantErr:   true,
+			errTarget: ErrAttachmentAlreadyLinked,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			att, err := uc.AttachDocument(context.Background(), tt.cmd)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("AttachDocument() error = nil, want non-nil")
+				}
+				if tt.errTarget != nil && !errors.Is(err, tt.errTarget) {
+					t.Errorf("AttachDocument() error = %v, want %v", err, tt.errTarget)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AttachDocument() unexpected error: %v", err)
+			}
+			if att == nil {
+				t.Fatal("AttachDocument() returned nil attachment")
+			}
+		})
+	}
+}
+
+// ── UpdateAttachmentCategory tests ───────────────────────────────────────────
+
+func TestUseCase_UpdateAttachmentCategory(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+	attID := uuid.New().String()
+
+	tests := []struct {
+		name      string
+		cmd       UpdateAttachmentCategoryCommand
+		repo      *fakeRepo
+		wantErr   bool
+		errTarget error
+	}{
+		{
+			name: "updates category successfully",
+			cmd: UpdateAttachmentCategoryCommand{
+				TenantID:     tenantID,
+				DraftID:      draftID,
+				AttachmentID: attID,
+				Category:     CategoryContrato,
+			},
+			repo: &fakeRepo{
+				updateCategoryResult: &Attachment{
+					ID:       attID,
+					Category: CategoryContrato,
+				},
+			},
+		},
+		{
+			name: "attachment not found → ErrAttachmentNotFound",
+			cmd: UpdateAttachmentCategoryCommand{
+				TenantID:     tenantID,
+				DraftID:      draftID,
+				AttachmentID: attID,
+				Category:     CategoryOutro,
+			},
+			repo:      &fakeRepo{updateCategoryErr: ErrAttachmentNotFound},
+			wantErr:   true,
+			errTarget: ErrAttachmentNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			att, err := uc.UpdateAttachmentCategory(context.Background(), tt.cmd)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("UpdateAttachmentCategory() error = nil, want non-nil")
+				}
+				if tt.errTarget != nil && !errors.Is(err, tt.errTarget) {
+					t.Errorf("UpdateAttachmentCategory() error = %v, want %v", err, tt.errTarget)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("UpdateAttachmentCategory() unexpected error: %v", err)
+			}
+			if att == nil {
+				t.Fatal("UpdateAttachmentCategory() returned nil")
+			}
+		})
+	}
+}
+
+// ── RemoveAttachment tests ────────────────────────────────────────────────────
+
+func TestUseCase_RemoveAttachment(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+	attID := uuid.New().String()
+
+	tests := []struct {
+		name      string
+		cmd       RemoveAttachmentCommand
+		repo      *fakeRepo
+		wantErr   bool
+		errTarget error
+	}{
+		{
+			name: "removes attachment successfully",
+			cmd:  RemoveAttachmentCommand{TenantID: tenantID, DraftID: draftID, AttachmentID: attID},
+			repo: &fakeRepo{deleteAttachErr: nil},
+		},
+		{
+			name:      "attachment not found → ErrAttachmentNotFound",
+			cmd:       RemoveAttachmentCommand{TenantID: tenantID, DraftID: draftID, AttachmentID: attID},
+			repo:      &fakeRepo{deleteAttachErr: ErrAttachmentNotFound},
+			wantErr:   true,
+			errTarget: ErrAttachmentNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			err := uc.RemoveAttachment(context.Background(), tt.cmd)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("RemoveAttachment() error = nil, want non-nil")
+				}
+				if tt.errTarget != nil && !errors.Is(err, tt.errTarget) {
+					t.Errorf("RemoveAttachment() error = %v, want %v", err, tt.errTarget)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RemoveAttachment() unexpected error: %v", err)
 			}
 		})
 	}

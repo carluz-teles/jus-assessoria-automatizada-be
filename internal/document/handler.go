@@ -199,15 +199,22 @@ type startUploadRequest struct {
 	SizeBytes        int64  `json:"size_bytes"`
 }
 
+// maxUploadBytes is the 50 MB limit on a single document upload (§4e.4 Fatia 2).
+const maxUploadBytes = int64(52428800)
+
 // Validate enforces the edge rules: document_type/original_filename/mime_type non-empty, a
-// positive size, and (when present) a well-formed court_record_id uuid. A failure is a 400 at
-// the edge (KindInvalid) via httpx.WriteValidationError.
+// positive size ≤ 50 MB, and (when present) a well-formed court_record_id uuid. A failure is a
+// 422 at the edge (KindInvalid) via httpx.WriteValidationError.
 func (r startUploadRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.DocumentType, validation.Required),
 		validation.Field(&r.OriginalFilename, validation.Required),
 		validation.Field(&r.MimeType, validation.Required),
-		validation.Field(&r.SizeBytes, validation.Required, validation.Min(int64(1))),
+		validation.Field(&r.SizeBytes,
+			validation.Required,
+			validation.Min(int64(1)),
+			validation.Max(maxUploadBytes),
+		),
 		validation.Field(&r.CourtRecordID, validation.By(uuidIfPresent)),
 	)
 }

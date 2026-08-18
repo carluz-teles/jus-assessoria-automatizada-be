@@ -26,6 +26,9 @@ type DraftDetailView struct {
 	Process *ProcessView
 	// Deadline is nil when no deadline has been derived for the intimation yet.
 	Deadline *DeadlineView
+	// Attachments is the ordered list of uploaded documents linked to this draft.
+	// Empty slice (never nil) when no attachments exist.
+	Attachments []Attachment
 }
 
 // IntimationView is the context the editor shows alongside the draft text.
@@ -63,14 +66,15 @@ type DeadlineView struct {
 // yield NULLs for a blank/processo draft).
 func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 	view := &DraftDetailView{
-		ID:        r.ID.String(),
-		PieceType: r.PieceType,
-		Title:     r.Title,
-		Content:   derefString(r.Content),
-		Status:    r.Status,
-		SagaState: r.SagaState,
-		CreatedAt: timestamptzToTime(r.CreatedAt),
-		UpdatedAt: timestamptzToTime(r.UpdatedAt),
+		ID:          r.ID.String(),
+		PieceType:   r.PieceType,
+		Title:       r.Title,
+		Content:     derefString(r.Content),
+		Status:      r.Status,
+		SagaState:   r.SagaState,
+		CreatedAt:   timestamptzToTime(r.CreatedAt),
+		UpdatedAt:   timestamptzToTime(r.UpdatedAt),
+		Attachments: []Attachment{}, // never nil — serializes as [] not null
 	}
 
 	// Intimation — only when the draft has an intimation_id (LEFT JOIN yields a

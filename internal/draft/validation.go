@@ -73,6 +73,50 @@ type PatchRequest struct {
 // called uniformly at the edge.
 func (r PatchRequest) Validate() error { return nil }
 
+// ── Attachment request types (Fatia 2) ───────────────────────────────────────
+
+// AttachDocumentRequest is the POST /v1/pecas/:id/anexos body.
+type AttachDocumentRequest struct {
+	DocumentID string `json:"document_id"`
+	Category   string `json:"category"`
+}
+
+// Validate enforces edge rules: document_id is required and must be a valid UUID;
+// category, when present, must be in the closed set. An absent category defaults to
+// "Outro" in the use case.
+func (r AttachDocumentRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.DocumentID, validation.Required, validation.By(isUUID)),
+		validation.Field(&r.Category,
+			validation.When(r.Category != "",
+				validation.By(isAttachmentCategory)),
+		),
+	)
+}
+
+// UpdateAttachmentCategoryRequest is the PATCH /v1/pecas/:id/anexos/:attachmentId body.
+type UpdateAttachmentCategoryRequest struct {
+	Category string `json:"category"`
+}
+
+// Validate enforces edge rules: category is required and must be in the closed set.
+func (r UpdateAttachmentCategoryRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Category,
+			validation.Required,
+			validation.By(isAttachmentCategory)),
+	)
+}
+
+// isAttachmentCategory rejects a string that is not a valid AttachmentCategory.
+func isAttachmentCategory(value any) error {
+	s, _ := value.(string)
+	if !IsValidCategory(AttachmentCategory(s)) {
+		return errors.New("must be a valid attachment category")
+	}
+	return nil
+}
+
 // isUUID is an ozzo custom rule that rejects non-UUID strings.
 func isUUID(value any) error {
 	s, _ := value.(string)

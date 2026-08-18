@@ -107,6 +107,79 @@ LEFT JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline    dl  ON dl.notification_id = i.id
 WHERE d.id = $1 AND d.tenant_id = $2;
 
+-- ── draft_attachment queries (Peticionamento Fatia 2) ────────────────────────
+-- All writes run inside the use case's transaction (RLS barrier 2 + explicit
+-- tenant filter barrier 1). Absence is a typed error at the mapper, never (nil,nil).
+
+-- name: InsertDraftAttachment :one
+-- Link a document (origin=UPLOAD, status=UPLOADED) to a draft. The UNIQUE constraint
+-- (draft_id, document_id) guards against duplicates at the DB level; ON CONFLICT DO
+-- NOTHING maps it to pgx.ErrNoRows so the repo can return ErrAttachmentAlreadyLinked
+-- without a 23505 transaction abort.
+INSERT INTO draft_attachment (tenant_id, draft_id, document_id, category, position)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (draft_id, document_id) DO NOTHING
+RETURNING id, tenant_id, draft_id, document_id, category, position, created_at;
+
+-- name: UpdateAttachmentCategory :one
+-- Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
+-- A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
+-- ErrAttachmentNotFound (→ 404).
+UPDATE draft_attachment
+SET category = $4
+WHERE id = $1 AND draft_id = $2 AND tenant_id = $3
+RETURNING id, tenant_id, draft_id, document_id, category, position, created_at;
+
+-- name: DeleteDraftAttachment :exec
+-- Hard-delete the join row. The document itself is NOT touched (ON DELETE RESTRICT
+-- enforces that in the FK). Scoped to (id, draft_id, tenant_id) — a miss is silently
+-- ignored (the caller checks rows-affected via the :exec tag; our mapper maps 0 to
+-- ErrAttachmentNotFound).
+DELETE FROM draft_attachment
+WHERE id = $1 AND draft_id = $2 AND tenant_id = $3;
+
+-- name: GetDraftAttachments :many
+-- Read model for the attachments list embedded in GET /v1/pecas/:id. Returns only
+-- documents with status='UPLOADED' (a PENDING attachment is invisible — its bytes
+-- have not landed yet). Ordered by (position ASC, created_at ASC) for stable display.
+-- Scoped to (draft_id, tenant_id) — barrier 1; RLS on draft_attachment is barrier 2.
+SELECT
+    da.id,
+    da.document_id,
+    d.title         AS name,
+    d.original_filename,
+    da.category,
+    d.mime_type,
+    d.size_bytes,
+    d.status,
+    da.position,
+    da.created_at
+FROM draft_attachment da
+JOIN document d ON d.id = da.document_id
+WHERE da.draft_id = $1
+  AND da.tenant_id = $2
+  AND d.status = 'UPLOADED'
+  AND d.deleted_at IS NULL
+ORDER BY da.position ASC, da.created_at ASC;
+
+-- name: GetAttachmentForUpdate :one
+-- Load an attachment for update/delete guard: resolves (id, draft_id, tenant_id) to
+-- confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
+-- ErrAttachmentNotFound (→ 404).
+SELECT id, tenant_id, draft_id, document_id, category, position, created_at
+FROM draft_attachment
+WHERE id = $1 AND draft_id = $2 AND tenant_id = $3;
+
+-- name: GetDocumentForAttachment :one
+-- Load the minimal document fields the POST /v1/pecas/:id/anexos use case needs to
+-- validate before linking: status (must be UPLOADED) and origin (must be UPLOAD, never
+-- COURT). Scoped to (id, tenant_id) — a foreign or missing document → pgx.ErrNoRows →
+-- ErrDocumentNotFound (→ 404). Filters deleted_at IS NULL (a soft-deleted document
+-- cannot be attached).
+SELECT id, tenant_id, status, origin
+FROM document
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL;
+
 -- name: GetIntimationForDraft :one
 -- Load the intimation context needed to build a draft from source=intimation:
 -- the case_id (via court_record), the court_record_id, and the type (for piece_type

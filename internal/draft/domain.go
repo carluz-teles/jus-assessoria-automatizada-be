@@ -163,7 +163,9 @@ func (uc *UseCase) Patch(ctx context.Context, cmd PatchCommand) (*PatchResult, e
 
 // GetDetail implements GET /v1/pecas/:id. Runs in a read-only tenant-scoped tx
 // (the pool-backed Do — same RLS barrier as the writes). A missing or foreign-tenant
-// draft is ErrDraftNotFound (→ 404).
+// draft is ErrDraftNotFound (→ 404). The attachments list is loaded by a separate
+// dedicated query (2 queries per the Architect's decision — no JOIN monstrosity on
+// GetDraftDetail).
 func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*DraftDetailView, error) {
 	var view *DraftDetailView
 
@@ -172,6 +174,11 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 		if err != nil {
 			return err
 		}
+		attachments, err := uc.rw.GetDraftAttachments(ctx, tx, tenantID, draftID)
+		if err != nil {
+			return err
+		}
+		v.Attachments = attachments
 		view = v
 		return nil
 	})
@@ -179,4 +186,112 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 		return nil, err
 	}
 	return view, nil
+}
+
+// ── Attachment use cases (Fatia 2) ────────────────────────────────────────────
+
+// AttachDocumentCommand is the input for POST /v1/pecas/:id/anexos.
+type AttachDocumentCommand struct {
+	TenantID   string
+	DraftID    string
+	DocumentID string
+	Category   AttachmentCategory
+}
+
+// AttachDocument implements POST /v1/pecas/:id/anexos. In ONE tenant-scoped tx it:
+//  1. Verifies the draft exists in the tenant (ErrDraftNotFound → 404).
+//  2. Loads the document (ErrDocumentNotFound → 404 if unknown/foreign/soft-deleted).
+//  3. Guards: origin must be UPLOAD (not COURT) and status must be UPLOADED (not PENDING).
+//     Either violation → ErrDocumentNotAttachable → 422.
+//  4. Inserts the join row. A UNIQUE conflict → ErrAttachmentAlreadyLinked → 409.
+//
+// tenant_id comes from the principal, never the body or path.
+func (uc *UseCase) AttachDocument(ctx context.Context, cmd AttachDocumentCommand) (*Attachment, error) {
+	category := cmd.Category
+	if category == "" {
+		category = CategoryOutro
+	}
+
+	var result *Attachment
+	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		// 1. Confirm draft belongs to tenant.
+		if _, err := uc.rw.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID); err != nil {
+			return err
+		}
+
+		// 2. Load document (guards tenant scope, deleted_at IS NULL).
+		doc, err := uc.rw.GetDocumentForAttachment(ctx, tx, cmd.TenantID, cmd.DocumentID)
+		if err != nil {
+			return err
+		}
+
+		// 3. Guard: origin=UPLOAD and status=UPLOADED.
+		isUpload := doc.Origin == documentOriginUpload
+		isUploaded := doc.Status == documentStatusUploaded
+		if !isUpload || !isUploaded {
+			return ErrDocumentNotAttachable
+		}
+
+		// 4. Insert (UNIQUE conflict → ErrAttachmentAlreadyLinked).
+		att, err := uc.rw.InsertAttachment(ctx, tx, &Attachment{
+			TenantID:   cmd.TenantID,
+			DraftID:    cmd.DraftID,
+			DocumentID: cmd.DocumentID,
+			Category:   category,
+			Position:   0,
+		})
+		if err != nil {
+			return err
+		}
+		result = att
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// UpdateAttachmentCategoryCommand is the input for PATCH /v1/pecas/:id/anexos/:attachmentId.
+type UpdateAttachmentCategoryCommand struct {
+	TenantID     string
+	DraftID      string
+	AttachmentID string
+	Category     AttachmentCategory
+}
+
+// UpdateAttachmentCategory implements PATCH /v1/pecas/:id/anexos/:attachmentId. In ONE
+// tenant-scoped tx it validates the category and updates the row. A miss (wrong id, draft,
+// or tenant) is ErrAttachmentNotFound → 404. An invalid category is ErrDocumentNotAttachable
+// returned before the tx — actually we use a validation error, see validation.go.
+func (uc *UseCase) UpdateAttachmentCategory(ctx context.Context, cmd UpdateAttachmentCategoryCommand) (*Attachment, error) {
+	var result *Attachment
+	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		att, err := uc.rw.UpdateAttachmentCategory(ctx, tx, cmd.TenantID, cmd.DraftID, cmd.AttachmentID, cmd.Category)
+		if err != nil {
+			return err
+		}
+		result = att
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RemoveAttachmentCommand is the input for DELETE /v1/pecas/:id/anexos/:attachmentId.
+type RemoveAttachmentCommand struct {
+	TenantID     string
+	DraftID      string
+	AttachmentID string
+}
+
+// RemoveAttachment implements DELETE /v1/pecas/:id/anexos/:attachmentId (hard-delete of
+// the join row). The document subjacente is NEVER deleted. A miss is ErrAttachmentNotFound
+// → 404.
+func (uc *UseCase) RemoveAttachment(ctx context.Context, cmd RemoveAttachmentCommand) error {
+	return uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		return uc.rw.DeleteAttachment(ctx, tx, cmd.TenantID, cmd.DraftID, cmd.AttachmentID)
+	})
 }

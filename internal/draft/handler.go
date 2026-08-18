@@ -20,6 +20,9 @@ type writer interface {
 	Create(ctx context.Context, cmd CreateCommand) (CreateResult, error)
 	Patch(ctx context.Context, cmd PatchCommand) (*PatchResult, error)
 	GetDetail(ctx context.Context, tenantID, draftID string) (*DraftDetailView, error)
+	AttachDocument(ctx context.Context, cmd AttachDocumentCommand) (*Attachment, error)
+	UpdateAttachmentCategory(ctx context.Context, cmd UpdateAttachmentCategoryCommand) (*Attachment, error)
+	RemoveAttachment(ctx context.Context, cmd RemoveAttachmentCommand) error
 }
 
 // Handler is the draft HTTP surface. It owns its routing; cmd/api composes via
@@ -33,11 +36,19 @@ func NewHandler(uc writer) *Handler {
 	return &Handler{uc: uc}
 }
 
-// RegisterV1 mounts the peças routes on the /v1 group.
+// RegisterV1 mounts the peças routes on the /v1 group. The static-vs-param ordering
+// matters: /pecas/:id/anexos must be declared before /pecas/:id so Fiber routes them
+// correctly. Fiber's router is declaration-order-sensitive for sub-resources under a
+// param segment.
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/pecas", h.createPeca)
 	r.Get("/pecas/:id", h.getPeca)
 	r.Patch("/pecas/:id", h.patchPeca)
+
+	// Attachment sub-resource (Fatia 2).
+	r.Post("/pecas/:id/anexos", h.attachDocument)
+	r.Patch("/pecas/:id/anexos/:attachmentId", h.updateAttachmentCategory)
+	r.Delete("/pecas/:id/anexos/:attachmentId", h.removeAttachment)
 }
 
 // ─── POST /v1/pecas ──────────────────────────────────────────────────────────
@@ -180,9 +191,10 @@ type detailResponse struct {
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 
-	Intimation *intimationResponse `json:"intimation,omitempty"`
-	Process    *processResponse    `json:"process,omitempty"`
-	Deadline   *deadlineResponse   `json:"deadline,omitempty"`
+	Intimation  *intimationResponse  `json:"intimation,omitempty"`
+	Process     *processResponse     `json:"process,omitempty"`
+	Deadline    *deadlineResponse    `json:"deadline,omitempty"`
+	Attachments []attachmentResponse `json:"attachments"`
 }
 
 type intimationResponse struct {
@@ -256,7 +268,127 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 		}
 	}
 
+	// Attachments: always an array (empty when none), never omitted.
+	resp.Attachments = attachmentsToResponse(v.Attachments)
+
 	return resp
+}
+
+// ── Attachment response shape ─────────────────────────────────────────────────
+
+// attachmentResponse is the per-item shape inside the attachments array in
+// GET /v1/pecas/:id and the standalone body for POST / PATCH /v1/pecas/:id/anexos.
+type attachmentResponse struct {
+	ID         string `json:"id"`
+	DocumentID string `json:"document_id"`
+	Name       string `json:"name"`
+	Category   string `json:"category"`
+	MimeType   string `json:"mime_type"`
+	SizeBytes  int64  `json:"size_bytes"`
+	Status     string `json:"status"`
+	Position   int    `json:"position"`
+	CreatedAt  string `json:"created_at"`
+}
+
+func attachmentToResponse(a *Attachment) attachmentResponse {
+	return attachmentResponse{
+		ID:         a.ID,
+		DocumentID: a.DocumentID,
+		Name:       a.Name,
+		Category:   string(a.Category),
+		MimeType:   a.MimeType,
+		SizeBytes:  a.SizeBytes,
+		Status:     a.Status,
+		Position:   a.Position,
+		CreatedAt:  a.CreatedAt.Format(time.RFC3339),
+	}
+}
+
+func attachmentsToResponse(atts []Attachment) []attachmentResponse {
+	out := make([]attachmentResponse, 0, len(atts))
+	for i := range atts {
+		out = append(out, attachmentResponse{
+			ID:         atts[i].ID,
+			DocumentID: atts[i].DocumentID,
+			Name:       atts[i].Name,
+			Category:   string(atts[i].Category),
+			MimeType:   atts[i].MimeType,
+			SizeBytes:  atts[i].SizeBytes,
+			Status:     atts[i].Status,
+			Position:   atts[i].Position,
+			CreatedAt:  atts[i].CreatedAt.Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+// ── Attachment handlers ───────────────────────────────────────────────────────
+
+// attachDocument handles POST /v1/pecas/:id/anexos.
+func (h *Handler) attachDocument(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	var req AttachDocumentRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	att, err := h.uc.AttachDocument(c.UserContext(), AttachDocumentCommand{
+		TenantID:   tenantID,
+		DraftID:    draftID,
+		DocumentID: req.DocumentID,
+		Category:   AttachmentCategory(req.Category),
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"data": attachmentToResponse(att)})
+}
+
+// updateAttachmentCategory handles PATCH /v1/pecas/:id/anexos/:attachmentId.
+func (h *Handler) updateAttachmentCategory(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	attachmentID := c.Params("attachmentId")
+
+	var req UpdateAttachmentCategoryRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	att, err := h.uc.UpdateAttachmentCategory(c.UserContext(), UpdateAttachmentCategoryCommand{
+		TenantID:     tenantID,
+		DraftID:      draftID,
+		AttachmentID: attachmentID,
+		Category:     AttachmentCategory(req.Category),
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": attachmentToResponse(att)})
+}
+
+// removeAttachment handles DELETE /v1/pecas/:id/anexos/:attachmentId.
+func (h *Handler) removeAttachment(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	attachmentID := c.Params("attachmentId")
+
+	if err := h.uc.RemoveAttachment(c.UserContext(), RemoveAttachmentCommand{
+		TenantID:     tenantID,
+		DraftID:      draftID,
+		AttachmentID: attachmentID,
+	}); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // daysLeftFromNow computes calendar days remaining until endDate (from today). A

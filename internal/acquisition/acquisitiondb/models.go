@@ -179,6 +179,16 @@ type Draft struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
+type DraftAttachment struct {
+	ID         uuid.UUID          `json:"id"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	DraftID    uuid.UUID          `json:"draft_id"`
+	DocumentID uuid.UUID          `json:"document_id"`
+	Category   string             `json:"category"`
+	Position   int32              `json:"position"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
 type Holiday struct {
 	ID      uuid.UUID   `json:"id"`
 	Scope   string      `json:"scope"`

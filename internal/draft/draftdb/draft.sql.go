@@ -12,6 +12,165 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteDraftAttachment = `-- name: DeleteDraftAttachment :exec
+DELETE FROM draft_attachment
+WHERE id = $1 AND draft_id = $2 AND tenant_id = $3
+`
+
+type DeleteDraftAttachmentParams struct {
+	ID       uuid.UUID `json:"id"`
+	DraftID  uuid.UUID `json:"draft_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Hard-delete the join row. The document itself is NOT touched (ON DELETE RESTRICT
+// enforces that in the FK). Scoped to (id, draft_id, tenant_id) — a miss is silently
+// ignored (the caller checks rows-affected via the :exec tag; our mapper maps 0 to
+// ErrAttachmentNotFound).
+func (q *Queries) DeleteDraftAttachment(ctx context.Context, arg DeleteDraftAttachmentParams) error {
+	_, err := q.db.Exec(ctx, deleteDraftAttachment, arg.ID, arg.DraftID, arg.TenantID)
+	return err
+}
+
+const getAttachmentForUpdate = `-- name: GetAttachmentForUpdate :one
+SELECT id, tenant_id, draft_id, document_id, category, position, created_at
+FROM draft_attachment
+WHERE id = $1 AND draft_id = $2 AND tenant_id = $3
+`
+
+type GetAttachmentForUpdateParams struct {
+	ID       uuid.UUID `json:"id"`
+	DraftID  uuid.UUID `json:"draft_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Load an attachment for update/delete guard: resolves (id, draft_id, tenant_id) to
+// confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
+// ErrAttachmentNotFound (→ 404).
+func (q *Queries) GetAttachmentForUpdate(ctx context.Context, arg GetAttachmentForUpdateParams) (DraftAttachment, error) {
+	row := q.db.QueryRow(ctx, getAttachmentForUpdate, arg.ID, arg.DraftID, arg.TenantID)
+	var i DraftAttachment
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.DraftID,
+		&i.DocumentID,
+		&i.Category,
+		&i.Position,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getDocumentForAttachment = `-- name: GetDocumentForAttachment :one
+SELECT id, tenant_id, status, origin
+FROM document
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+`
+
+type GetDocumentForAttachmentParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetDocumentForAttachmentRow struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Status   string    `json:"status"`
+	Origin   string    `json:"origin"`
+}
+
+// Load the minimal document fields the POST /v1/pecas/:id/anexos use case needs to
+// validate before linking: status (must be UPLOADED) and origin (must be UPLOAD, never
+// COURT). Scoped to (id, tenant_id) — a foreign or missing document → pgx.ErrNoRows →
+// ErrDocumentNotFound (→ 404). Filters deleted_at IS NULL (a soft-deleted document
+// cannot be attached).
+func (q *Queries) GetDocumentForAttachment(ctx context.Context, arg GetDocumentForAttachmentParams) (GetDocumentForAttachmentRow, error) {
+	row := q.db.QueryRow(ctx, getDocumentForAttachment, arg.ID, arg.TenantID)
+	var i GetDocumentForAttachmentRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Status,
+		&i.Origin,
+	)
+	return i, err
+}
+
+const getDraftAttachments = `-- name: GetDraftAttachments :many
+SELECT
+    da.id,
+    da.document_id,
+    d.title         AS name,
+    d.original_filename,
+    da.category,
+    d.mime_type,
+    d.size_bytes,
+    d.status,
+    da.position,
+    da.created_at
+FROM draft_attachment da
+JOIN document d ON d.id = da.document_id
+WHERE da.draft_id = $1
+  AND da.tenant_id = $2
+  AND d.status = 'UPLOADED'
+  AND d.deleted_at IS NULL
+ORDER BY da.position ASC, da.created_at ASC
+`
+
+type GetDraftAttachmentsParams struct {
+	DraftID  uuid.UUID `json:"draft_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetDraftAttachmentsRow struct {
+	ID               uuid.UUID          `json:"id"`
+	DocumentID       uuid.UUID          `json:"document_id"`
+	Name             *string            `json:"name"`
+	OriginalFilename *string            `json:"original_filename"`
+	Category         string             `json:"category"`
+	MimeType         *string            `json:"mime_type"`
+	SizeBytes        *int64             `json:"size_bytes"`
+	Status           string             `json:"status"`
+	Position         int32              `json:"position"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+// Read model for the attachments list embedded in GET /v1/pecas/:id. Returns only
+// documents with status='UPLOADED' (a PENDING attachment is invisible — its bytes
+// have not landed yet). Ordered by (position ASC, created_at ASC) for stable display.
+// Scoped to (draft_id, tenant_id) — barrier 1; RLS on draft_attachment is barrier 2.
+func (q *Queries) GetDraftAttachments(ctx context.Context, arg GetDraftAttachmentsParams) ([]GetDraftAttachmentsRow, error) {
+	rows, err := q.db.Query(ctx, getDraftAttachments, arg.DraftID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetDraftAttachmentsRow
+	for rows.Next() {
+		var i GetDraftAttachmentsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.DocumentID,
+			&i.Name,
+			&i.OriginalFilename,
+			&i.Category,
+			&i.MimeType,
+			&i.SizeBytes,
+			&i.Status,
+			&i.Position,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getDraftByID = `-- name: GetDraftByID :one
 SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
@@ -308,11 +467,14 @@ type InsertDraftRow struct {
 // never (nil, nil).
 // Persist a new peça (DRAFT status, CREATED saga_state). Returns all columns so the
 // handler renders the 201 response without a follow-up read. storage_key is NULL for
-// Fatia 1 (content lives in the column, not in S3). ON CONFLICT DO NOTHING targets
-// the partial unique index (tenant_id, intimation_id WHERE intimation_id IS NOT NULL):
-// when a row already exists, RETURNING yields no rows (pgx.ErrNoRows) — the
-// repository maps that to ErrDraftAlreadyExists and the use case fetches the existing
-// row for a 200 idempotent response, all within the same unaborted transaction.
+// Fatia 1 (content lives in the column, not in S3).
+//
+// ON CONFLICT DO NOTHING targets the partial unique index
+// (tenant_id, intimation_id WHERE intimation_id IS NOT NULL). When the row already
+// exists the RETURNING clause yields zero rows (pgx.ErrNoRows), which the repository
+// maps to ErrDraftAlreadyExists so the use case can fetch the existing row for 200.
+// This avoids a 23505 error that would abort the current transaction (25P02), making
+// subsequent queries in the same tx impossible without a SAVEPOINT.
 func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (InsertDraftRow, error) {
 	row := q.db.QueryRow(ctx, insertDraft,
 		arg.TenantID,
@@ -335,6 +497,87 @@ func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (Inser
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const insertDraftAttachment = `-- name: InsertDraftAttachment :one
+
+INSERT INTO draft_attachment (tenant_id, draft_id, document_id, category, position)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (draft_id, document_id) DO NOTHING
+RETURNING id, tenant_id, draft_id, document_id, category, position, created_at
+`
+
+type InsertDraftAttachmentParams struct {
+	TenantID   uuid.UUID `json:"tenant_id"`
+	DraftID    uuid.UUID `json:"draft_id"`
+	DocumentID uuid.UUID `json:"document_id"`
+	Category   string    `json:"category"`
+	Position   int32     `json:"position"`
+}
+
+// ── draft_attachment queries (Peticionamento Fatia 2) ────────────────────────
+// All writes run inside the use case's transaction (RLS barrier 2 + explicit
+// tenant filter barrier 1). Absence is a typed error at the mapper, never (nil,nil).
+// Link a document (origin=UPLOAD, status=UPLOADED) to a draft. The UNIQUE constraint
+// (draft_id, document_id) guards against duplicates at the DB level; ON CONFLICT DO
+// NOTHING maps it to pgx.ErrNoRows so the repo can return ErrAttachmentAlreadyLinked
+// without a 23505 transaction abort.
+func (q *Queries) InsertDraftAttachment(ctx context.Context, arg InsertDraftAttachmentParams) (DraftAttachment, error) {
+	row := q.db.QueryRow(ctx, insertDraftAttachment,
+		arg.TenantID,
+		arg.DraftID,
+		arg.DocumentID,
+		arg.Category,
+		arg.Position,
+	)
+	var i DraftAttachment
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.DraftID,
+		&i.DocumentID,
+		&i.Category,
+		&i.Position,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const updateAttachmentCategory = `-- name: UpdateAttachmentCategory :one
+UPDATE draft_attachment
+SET category = $4
+WHERE id = $1 AND draft_id = $2 AND tenant_id = $3
+RETURNING id, tenant_id, draft_id, document_id, category, position, created_at
+`
+
+type UpdateAttachmentCategoryParams struct {
+	ID       uuid.UUID `json:"id"`
+	DraftID  uuid.UUID `json:"draft_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Category string    `json:"category"`
+}
+
+// Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
+// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
+// ErrAttachmentNotFound (→ 404).
+func (q *Queries) UpdateAttachmentCategory(ctx context.Context, arg UpdateAttachmentCategoryParams) (DraftAttachment, error) {
+	row := q.db.QueryRow(ctx, updateAttachmentCategory,
+		arg.ID,
+		arg.DraftID,
+		arg.TenantID,
+		arg.Category,
+	)
+	var i DraftAttachment
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.DraftID,
+		&i.DocumentID,
+		&i.Category,
+		&i.Position,
+		&i.CreatedAt,
 	)
 	return i, err
 }

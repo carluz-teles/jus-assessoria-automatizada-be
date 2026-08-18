@@ -9,6 +9,26 @@ import (
 )
 
 type Querier interface {
+	// Hard-delete the join row. The document itself is NOT touched (ON DELETE RESTRICT
+	// enforces that in the FK). Scoped to (id, draft_id, tenant_id) — a miss is silently
+	// ignored (the caller checks rows-affected via the :exec tag; our mapper maps 0 to
+	// ErrAttachmentNotFound).
+	DeleteDraftAttachment(ctx context.Context, arg DeleteDraftAttachmentParams) error
+	// Load an attachment for update/delete guard: resolves (id, draft_id, tenant_id) to
+	// confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
+	// ErrAttachmentNotFound (→ 404).
+	GetAttachmentForUpdate(ctx context.Context, arg GetAttachmentForUpdateParams) (DraftAttachment, error)
+	// Load the minimal document fields the POST /v1/pecas/:id/anexos use case needs to
+	// validate before linking: status (must be UPLOADED) and origin (must be UPLOAD, never
+	// COURT). Scoped to (id, tenant_id) — a foreign or missing document → pgx.ErrNoRows →
+	// ErrDocumentNotFound (→ 404). Filters deleted_at IS NULL (a soft-deleted document
+	// cannot be attached).
+	GetDocumentForAttachment(ctx context.Context, arg GetDocumentForAttachmentParams) (GetDocumentForAttachmentRow, error)
+	// Read model for the attachments list embedded in GET /v1/pecas/:id. Returns only
+	// documents with status='UPLOADED' (a PENDING attachment is invisible — its bytes
+	// have not landed yet). Ordered by (position ASC, created_at ASC) for stable display.
+	// Scoped to (draft_id, tenant_id) — barrier 1; RLS on draft_attachment is barrier 2.
+	GetDraftAttachments(ctx context.Context, arg GetDraftAttachmentsParams) ([]GetDraftAttachmentsRow, error)
 	// Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
 	// foreign-tenant id yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
 	GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (GetDraftByIDRow, error)
@@ -34,11 +54,27 @@ type Querier interface {
 	// never (nil, nil).
 	// Persist a new peça (DRAFT status, CREATED saga_state). Returns all columns so the
 	// handler renders the 201 response without a follow-up read. storage_key is NULL for
-	// Fatia 1 (content lives in the column, not in S3). ON CONFLICT on the partial unique
-	// index (tenant_id, intimation_id WHERE intimation_id IS NOT NULL) is handled by the
-	// use case via the pgconn 23505 code: the INSERT returns an error, the use case
-	// fetches the existing row and returns 200 (idempotent).
+	// Fatia 1 (content lives in the column, not in S3).
+	//
+	// ON CONFLICT DO NOTHING targets the partial unique index
+	// (tenant_id, intimation_id WHERE intimation_id IS NOT NULL). When the row already
+	// exists the RETURNING clause yields zero rows (pgx.ErrNoRows), which the repository
+	// maps to ErrDraftAlreadyExists so the use case can fetch the existing row for 200.
+	// This avoids a 23505 error that would abort the current transaction (25P02), making
+	// subsequent queries in the same tx impossible without a SAVEPOINT.
 	InsertDraft(ctx context.Context, arg InsertDraftParams) (InsertDraftRow, error)
+	// ── draft_attachment queries (Peticionamento Fatia 2) ────────────────────────
+	// All writes run inside the use case's transaction (RLS barrier 2 + explicit
+	// tenant filter barrier 1). Absence is a typed error at the mapper, never (nil,nil).
+	// Link a document (origin=UPLOAD, status=UPLOADED) to a draft. The UNIQUE constraint
+	// (draft_id, document_id) guards against duplicates at the DB level; ON CONFLICT DO
+	// NOTHING maps it to pgx.ErrNoRows so the repo can return ErrAttachmentAlreadyLinked
+	// without a 23505 transaction abort.
+	InsertDraftAttachment(ctx context.Context, arg InsertDraftAttachmentParams) (DraftAttachment, error)
+	// Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
+	// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
+	// ErrAttachmentNotFound (→ 404).
+	UpdateAttachmentCategory(ctx context.Context, arg UpdateAttachmentCategoryParams) (DraftAttachment, error)
 	// Autosave: update content (and optionally title) + bump updated_at, scoped to
 	// (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
 	// or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
