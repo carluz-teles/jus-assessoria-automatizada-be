@@ -113,6 +113,56 @@ func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
 	}
 }
 
+// ── Attachment mappers (Fatia 2) ─────────────────────────────────────────────
+
+// attachmentFromRow maps a DraftAttachment db row to an *Attachment entity. The
+// name and document metadata are NOT on the DraftAttachment model (they live on
+// the document table) — this function is only for write results (INSERT/UPDATE).
+// Read model rows (GetDraftAttachmentsRow) are mapped by attachmentFromReadRow.
+func attachmentFromRow(r draftdb.DraftAttachment) *Attachment {
+	return &Attachment{
+		ID:         r.ID.String(),
+		TenantID:   r.TenantID.String(),
+		DraftID:    r.DraftID.String(),
+		DocumentID: r.DocumentID.String(),
+		Category:   AttachmentCategory(r.Category),
+		Position:   int(r.Position),
+		CreatedAt:  timestamptzToTime(r.CreatedAt),
+	}
+}
+
+// attachmentsFromRows maps a slice of GetDraftAttachmentsRow (the read-model query
+// that JOINs document to carry name/mime_type/size_bytes) to []Attachment.
+func attachmentsFromRows(rows []draftdb.GetDraftAttachmentsRow) []Attachment {
+	out := make([]Attachment, 0, len(rows))
+	for _, r := range rows {
+		name := derefString(r.Name)
+		if name == "" {
+			name = derefString(r.OriginalFilename)
+		}
+		out = append(out, Attachment{
+			ID:         r.ID.String(),
+			DocumentID: r.DocumentID.String(),
+			Name:       name,
+			Category:   AttachmentCategory(r.Category),
+			MimeType:   derefString(r.MimeType),
+			SizeBytes:  derefInt64(r.SizeBytes),
+			Status:     r.Status,
+			Position:   int(r.Position),
+			CreatedAt:  timestamptzToTime(r.CreatedAt),
+		})
+	}
+	return out
+}
+
+// derefInt64 collapses a nullable int8 column (*int64) to a plain int64.
+func derefInt64(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
 // draftFromGetByIntimationRow maps the GetDraftByIntimationID row to a *Draft entity.
 func draftFromGetByIntimationRow(r draftdb.GetDraftByIntimationIDRow) *Draft {
 	return &Draft{

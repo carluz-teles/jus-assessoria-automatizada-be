@@ -35,6 +35,29 @@ type Repository interface {
 	// GetDraftDetail runs the JOIN read model for GET /v1/pecas/:id. A miss is
 	// ErrDraftNotFound.
 	GetDraftDetail(ctx context.Context, tx database.Tx, tenantID, draftID string) (*DraftDetailView, error)
+
+	// ── Attachment methods (Fatia 2) ─────────────────────────────────────────
+
+	// GetDocumentForAttachment loads the minimal document fields (id, tenant_id,
+	// status, origin) to validate before linking. A miss (unknown, foreign, or
+	// soft-deleted) is ErrDocumentNotFound (→ 404).
+	GetDocumentForAttachment(ctx context.Context, tx database.Tx, tenantID, documentID string) (*documentForAttachment, error)
+
+	// InsertAttachment inserts the join row. On a UNIQUE (draft_id, document_id)
+	// conflict it returns ErrAttachmentAlreadyLinked (→ 409) — never a 23505 abort.
+	InsertAttachment(ctx context.Context, tx database.Tx, a *Attachment) (*Attachment, error)
+
+	// UpdateAttachmentCategory changes the category of an existing attachment. A miss
+	// (wrong id, draft, or tenant) is ErrAttachmentNotFound (→ 404).
+	UpdateAttachmentCategory(ctx context.Context, tx database.Tx, tenantID, draftID, attachmentID string, category AttachmentCategory) (*Attachment, error)
+
+	// DeleteAttachment hard-deletes the join row. A miss is ErrAttachmentNotFound (→ 404).
+	DeleteAttachment(ctx context.Context, tx database.Tx, tenantID, draftID, attachmentID string) error
+
+	// GetDraftAttachments returns the ordered attachment list for a draft (only
+	// UPLOADED documents, ordered position ASC, created_at ASC). An empty draft
+	// returns an empty slice, never nil.
+	GetDraftAttachments(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]Attachment, error)
 }
 
 // ErrDraftAlreadyExists is a sentinel the repository returns when InsertDraft hits
@@ -207,4 +230,152 @@ func (r *pgRepository) GetDraftDetail(ctx context.Context, tx database.Tx, tenan
 		return nil, database.WrapInfra(err)
 	}
 	return detailViewFromRow(row), nil
+}
+
+// ── Attachment repository methods (Fatia 2) ──────────────────────────────────
+
+func (r *pgRepository) GetDocumentForAttachment(ctx context.Context, tx database.Tx, tenantID, documentID string) (*documentForAttachment, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(documentID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).GetDocumentForAttachment(ctx, draftdb.GetDocumentForAttachmentParams{
+		ID:       did,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDocumentNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return &documentForAttachment{
+		ID:       row.ID.String(),
+		TenantID: row.TenantID.String(),
+		Status:   row.Status,
+		Origin:   row.Origin,
+	}, nil
+}
+
+func (r *pgRepository) InsertAttachment(ctx context.Context, tx database.Tx, a *Attachment) (*Attachment, error) {
+	tid, err := parseUUID(a.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(a.DraftID)
+	if err != nil {
+		return nil, err
+	}
+	docID, err := parseUUID(a.DocumentID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).InsertDraftAttachment(ctx, draftdb.InsertDraftAttachmentParams{
+		TenantID:   tid,
+		DraftID:    did,
+		DocumentID: docID,
+		Category:   string(a.Category),
+		Position:   int32(a.Position),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrAttachmentAlreadyLinked
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return attachmentFromRow(row), nil
+}
+
+func (r *pgRepository) UpdateAttachmentCategory(ctx context.Context, tx database.Tx, tenantID, draftID, attachmentID string, category AttachmentCategory) (*Attachment, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	aid, err := parseUUID(attachmentID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).UpdateAttachmentCategory(ctx, draftdb.UpdateAttachmentCategoryParams{
+		ID:       aid,
+		DraftID:  did,
+		TenantID: tid,
+		Category: string(category),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrAttachmentNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return attachmentFromRow(row), nil
+}
+
+func (r *pgRepository) DeleteAttachment(ctx context.Context, tx database.Tx, tenantID, draftID, attachmentID string) error {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	aid, err := parseUUID(attachmentID)
+	if err != nil {
+		return err
+	}
+
+	// Confirm existence before deleting so a miss is always a typed ErrAttachmentNotFound
+	// (the :exec query returns only error, with no RowsAffected). A separate SELECT +
+	// DELETE in the same tx is safe under RLS — the policy prevents cross-tenant rows.
+	_, err = draftdb.New(tx).GetAttachmentForUpdate(ctx, draftdb.GetAttachmentForUpdateParams{
+		ID:       aid,
+		DraftID:  did,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAttachmentNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+
+	if err := draftdb.New(tx).DeleteDraftAttachment(ctx, draftdb.DeleteDraftAttachmentParams{
+		ID:       aid,
+		DraftID:  did,
+		TenantID: tid,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func (r *pgRepository) GetDraftAttachments(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]Attachment, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := draftdb.New(tx).GetDraftAttachments(ctx, draftdb.GetDraftAttachmentsParams{
+		DraftID:  did,
+		TenantID: tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return attachmentsFromRows(rows), nil
 }

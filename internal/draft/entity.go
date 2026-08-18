@@ -66,6 +66,71 @@ var validPieceTypes = map[string]bool{
 	PieceTypeOther:     true,
 }
 
+// ── Attachment (Fatia 2) ──────────────────────────────────────────────────────
+
+// Attachment is the join between a draft and an uploaded document. It represents
+// one exhibit the advogado has attached to the peça. The document itself lives in
+// the document slice; this entity owns only the link metadata (category, position).
+type Attachment struct {
+	ID               string
+	TenantID         string
+	DraftID          string
+	DocumentID       string
+	Name             string // document.title, falling back to original_filename
+	Category         AttachmentCategory
+	MimeType         string
+	SizeBytes        int64
+	Status           string // mirrors document.status (always UPLOADED in the read model)
+	Position         int
+	CreatedAt        time.Time
+}
+
+// AttachmentCategory is the closed set of labels the advogado can assign to an
+// attachment. The same set is enforced by the DB CHECK constraint.
+type AttachmentCategory string
+
+const (
+	CategoryProcuracao              AttachmentCategory = "Procuração"
+	CategoryComprovante             AttachmentCategory = "Comprovante de endereço"
+	CategoryContrato                AttachmentCategory = "Contrato"
+	CategoryProvasDocumentais       AttachmentCategory = "Provas documentais"
+	CategoryDeclaracaoHipossuficiencia AttachmentCategory = "Declaração de hipossuficiência"
+	CategoryOutro                   AttachmentCategory = "Outro"
+)
+
+// validAttachmentCategories is the lookup for validation (mirrors the DB CHECK).
+var validAttachmentCategories = map[AttachmentCategory]bool{
+	CategoryProcuracao:              true,
+	CategoryComprovante:             true,
+	CategoryContrato:                true,
+	CategoryProvasDocumentais:       true,
+	CategoryDeclaracaoHipossuficiencia: true,
+	CategoryOutro:                   true,
+}
+
+// IsValidCategory reports whether cat is a member of the closed set.
+func IsValidCategory(cat AttachmentCategory) bool {
+	return validAttachmentCategories[cat]
+}
+
+// documentForAttachment is the minimal document state the attachment use case loads
+// before linking. It carries only the fields needed for the guard checks; the full
+// document entity lives in the document slice (imported by the read query via JOIN,
+// never via Go import). This is an internal type — not exported.
+type documentForAttachment struct {
+	ID       string
+	TenantID string
+	Status   string
+	Origin   string
+}
+
+// documentStatus mirrors the document status constants used in validation —
+// kept as local constants so the draft slice never imports the document slice.
+const (
+	documentStatusUploaded = "UPLOADED"
+	documentOriginUpload   = "UPLOAD"
+)
+
 // inferPieceType maps an intimation type (DJEN tipoComunicacao) to a PieceType
 // when the client omits piece_type. This is the SINGLE source of truth for the
 // inference — referenced by the domain use case and tested directly.
