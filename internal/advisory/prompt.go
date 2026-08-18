@@ -115,6 +115,22 @@ type DraftContext struct {
 	Playbook string // always empty in v0
 }
 
+// ReviewContext is the per-draft signal the review_minuta composer uses. It carries the
+// draft's current content (the text the advogado has in the editor — the target for review),
+// the RAG chunks retrieved from the case corpus (for grounded citations), and the process
+// metadata (court/class/subject, for legal register). Unlike DraftContext it has Content
+// (the already-written minuta) instead of IntimationText.
+type ReviewContext struct {
+	Content   string   // current content of the draft (non-empty — caller guards)
+	PieceType string   // DEFENSE|COMPLAINT|APPEAL|MOTION|OTHER
+	Court     string   // sigla do tribunal (TJSP, TRT2, STJ…)
+	Degree    string   // G1|G2|JE|SUPERIOR…
+	Class     string   // classe/rito processual
+	Subject   string   // assunto
+	Chunks    []string // RAG top-K hits (text only). Empty → grounded=false (degraded).
+	Playbook  string   // always empty in v0
+}
+
 // ChatTurn is one message in the conversation history passed to ComposeChat.
 type ChatTurn struct {
 	Role    string // "user" | "assistant"
@@ -142,6 +158,7 @@ type PromptComposer interface {
 	ComposeProcess(agent string, c ProcessContext) (Composed, error)
 	ComposeDraft(agent string, c DraftContext) (Composed, error)
 	ComposeChat(agent string, c ChatContext) (Composed, error)
+	ComposeReview(agent string, c ReviewContext) (Composed, error)
 }
 
 // Agent identifiers — one per specialized advisory task (erd-ai-advisory.md §4). Each maps to a
@@ -151,6 +168,7 @@ const (
 	AgentSummarizeProcess = "summarize_process"
 	AgentDraftMinuta      = "draft_minuta"
 	AgentChatGrounding    = "chat_grounding"
+	AgentReviewMinuta     = "review_minuta"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
@@ -165,11 +183,17 @@ const summarizeProcessVersion = "process_summary/v1"
 
 // draftMinutaVersion is the pinned version of the draft_minuta template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
-const draftMinutaVersion = "draft_minuta/v1"
+// Bumped to v2: Gerar agora produz APENAS a minuta limpa (sem sugestões). As sugestões são produzidas
+// pelo Revisar (review_minuta/v1). Removida a instrução de gerar suggestions do system prompt.
+const draftMinutaVersion = "draft_minuta/v2"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
 const chatGroundingVersion = "chat_grounding/v1"
+
+// reviewMinutaVersion is the pinned version of the review_minuta template. BUMP IT whenever the
+// template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
+const reviewMinutaVersion = "review_minuta/v1"
 
 // TemplateComposer is the deterministic v0 composer: templates + context injection, no LLM. It is
 // stateless.
@@ -224,28 +248,32 @@ func (*TemplateComposer) ComposeChat(agent string, c ChatContext) (Composed, err
 	}
 }
 
-// composeDraftMinuta renders the draft_minuta instruction-set. The system message describes
+// ComposeReview builds the (system, user, version) for the review_minuta agent from the review
+// context. An unknown agent is a programmer error surfaced as a typed invalid.
+func (*TemplateComposer) ComposeReview(agent string, c ReviewContext) (Composed, error) {
+	switch agent {
+	case AgentReviewMinuta:
+		return composeReviewMinuta(c), nil
+	default:
+		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
+	}
+}
+
+// composeDraftMinuta renders the draft_minuta instruction-set (v2). The system message describes
 // the legal writing role; the user message carries the intimation context + RAG chunks (when
-// available). The output schema (draft_content + suggestions array) lives with the caller (use
-// case), so the prompt stays about WHAT to produce, not the JSON shape.
+// available). Gerar now produces ONLY draft_content — suggestions are a separate Revisar step
+// (review_minuta agent). The output schema lives with the caller (use case).
 func composeDraftMinuta(c DraftContext) Composed {
 	var sys strings.Builder
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro especializado em redação de peças processuais. " +
-			"A partir do contexto da intimação e dos autos (quando disponível), gere:\n" +
-			"1. `draft_content`: o texto completo da minuta da peça processual em formato jurídico " +
-			"brasileiro, pronto para revisão do advogado.\n" +
-			"2. `suggestions`: lista de sugestões de melhoria mapeadas a trechos EXATOS do draft_content. " +
-			"Cada sugestão tem: `category` (um de: Clareza, Argumento, Coerência, Estilo), `original` " +
-			"(trecho EXATO do draft_content), `replacement` (versão melhorada), `problem` (descrição " +
-			"curta do problema), `description` (explicação acionável). Para categorias Argumento e " +
-			"Coerência, inclua obrigatoriamente `citation` com `document_id`, `page` e `quote` " +
-			"extraídos dos trechos dos autos fornecidos. Para Clareza e Estilo, `citation` é opcional.\n\n" +
+			"A partir do contexto da intimação e dos autos (quando disponível), escreva a melhor " +
+			"minuta possível para a peça processual indicada. Produza SOMENTE o campo `draft_content`: " +
+			"o texto completo da minuta em formato jurídico brasileiro, pronto para revisão do advogado.\n\n" +
 			"REGRAS OBRIGATÓRIAS:\n" +
-			"- `original` DEVE ser um trecho que aparece literalmente no `draft_content`.\n" +
-			"- Máximo 10 sugestões após filtragem.\n" +
 			"- NÃO invente fatos; fundamente-se nos autos quando possível.\n" +
-			"- Se não houver trechos dos autos, gere a minuta sem citações (modo degradado).",
+			"- Se não houver trechos dos autos, redija a minuta sem referências específicas (modo degradado).\n" +
+			"- Produza APENAS `draft_content` — nenhuma sugestão, crítica ou comentário.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
@@ -283,7 +311,7 @@ func composeDraftMinuta(c DraftContext) Composed {
 	} else {
 		usr.WriteString(strings.Join(lines, "\n"))
 	}
-	usr.WriteString("\n\nGere a minuta e as sugestões de melhoria.")
+	usr.WriteString("\n\nGere a minuta da peça processual.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftMinutaVersion}
 }
@@ -413,6 +441,68 @@ func composeChatGrounding(c ChatContext) Composed {
 	usr.WriteString("\n\nResponda à pergunta citando os trechos dos autos relevantes.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: chatGroundingVersion}
+}
+
+// composeReviewMinuta renders the review_minuta instruction-set. The system message instructs
+// the model to act as a critical reviewer of an already-written minuta, not as the author.
+// The output schema (suggestions array) lives with the caller (ReviewUseCase in review.go).
+// Categories and citation rules are identical to composeDraftMinuta (same closed set).
+func composeReviewMinuta(c ReviewContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um revisor jurídico brasileiro especializado em peças processuais. " +
+			"Revise esta minuta JÁ redigida e aponte melhorias pontuais mapeadas a trechos EXATOS do texto. " +
+			"Para cada melhoria, indique: `category` (um de: Clareza, Argumento, Coerência, Estilo), " +
+			"`original` (trecho EXATO que aparece literalmente na minuta), `replacement` (versão melhorada), " +
+			"`problem` (descrição curta do problema), `description` (explicação acionável). " +
+			"Para categorias Argumento e Coerência, inclua obrigatoriamente `citation` com `document_id`, " +
+			"`page` e `quote` extraídos dos trechos dos autos fornecidos — sem trechos dos autos, omita " +
+			"sugestões dessas categorias. Para Clareza e Estilo, `citation` é opcional.\n\n" +
+			"REGRAS OBRIGATÓRIAS:\n" +
+			"- `original` DEVE ser um trecho que aparece literalmente na minuta fornecida.\n" +
+			"- Máximo 10 sugestões após filtragem.\n" +
+			"- NÃO reescreva a minuta inteira — apenas aponte melhorias cirúrgicas.\n" +
+			"- NÃO invente fatos ou document_ids ausentes dos trechos dos autos fornecidos.\n" +
+			"- Cite os autos quando aplicável para Argumento e Coerência.",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório:\n")
+		sys.WriteString(pb)
+	}
+
+	lines := make([]string, 0, 8)
+	add := func(label, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			lines = append(lines, label+": "+v)
+		}
+	}
+	add("Tipo de peça", c.PieceType)
+	add("Tribunal", c.Court)
+	add("Grau", c.Degree)
+	add("Classe/rito", c.Class)
+	add("Assunto", c.Subject)
+
+	if len(c.Chunks) > 0 {
+		lines = append(lines, "Trechos dos autos (RAG):")
+		for i, chunk := range c.Chunks {
+			if i >= 8 {
+				break
+			}
+			lines = append(lines, strconv.Itoa(i+1)+". "+chunk)
+		}
+	}
+
+	var usr strings.Builder
+	if len(lines) > 0 {
+		usr.WriteString("Contexto do caso:\n")
+		usr.WriteString(strings.Join(lines, "\n"))
+		usr.WriteString("\n\n")
+	}
+	usr.WriteString("Minuta para revisão:\n")
+	usr.WriteString(c.Content)
+	usr.WriteString("\n\nRevise a minuta e produza as sugestões de melhoria.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: reviewMinutaVersion}
 }
 
 // composeSummarizeProcess renders the summarize_process instruction-set. The system message is

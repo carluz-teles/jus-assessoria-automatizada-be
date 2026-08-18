@@ -222,6 +222,15 @@ INSERT INTO review (draft_id, findings, coverage, model_version, rules_version, 
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING id, draft_id, findings, coverage, model_version, rules_version, status, generated_at, created_at;
 
+-- name: DeleteReviewsForDraft :exec
+-- Remove all review rows for a draft. Called by Gerar before persisting DRAFTED so
+-- that subsequent Revisar calls always operate on a clean slate (no stale suggestions
+-- from a prior generation attempt are mixed with a new minuta).
+-- tenant isolation: review has no tenant_id (child of draft); the caller guards the
+-- tenant via GetDraftByID(tenantID, draftID) earlier in the same tx. Do NOT "fix"
+-- this with a JOIN — the app-layer barrier is intentional (see 0044_review_status).
+DELETE FROM review WHERE draft_id = $1;
+
 -- name: GetLatestReview :one
 -- Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.
 -- Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.

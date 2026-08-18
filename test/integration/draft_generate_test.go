@@ -1,20 +1,19 @@
 //go:build integration
 
 // draft_generate integration tests — prove the Fatia 3 async AI generation
-// round-trip (trigger → outbox → consumer → review) against a REAL Postgres with
+// round-trip (trigger → outbox → consumer) against a REAL Postgres with
 // migrations applied through 0044_review_status.
 //
-// What the 13 unit tests with mocked repos CANNOT prove:
+// What the unit tests with mocked repos CANNOT prove:
 //   - TriggerGeneration writes BOTH the outbox row AND saga_state=EXTRACTING in
 //     the SAME committed transaction (unit of work atomicity).
 //   - The relay correctly routes "draft.generation_requested" → queue "ai" and
 //     "review.completed" does NOT route to "default".
-//   - OnGenerationRequested updates draft.content, sets saga_state=REVIEWED, inserts
-//     a review row (status=COMPLETED, findings, coverage), and publishes
-//     review.completed — all in the same tx, against a real schema.
+//   - OnGenerationRequested updates draft.content and sets saga_state=DRAFTED
+//     (Gerar no longer inserts a review row — that is Revisar's job).
 //   - saga_state=FAILED + review(status=FAILED) persists on terminal generator error.
-//   - processed_event dedup: a duplicate event_id is a no-op (no second review row).
-//   - Tenant isolation: GetLatestReview for a foreign tenant never leaks data
+//   - processed_event dedup: a duplicate event_id is a no-op (idempotent).
+//   - Tenant isolation: GetDetail for a foreign tenant never leaks data
 //     (barrier 1 via JOIN draft.tenant_id — review has no RLS, documented in 0044).
 //
 // Helpers reused from the existing test suite:
@@ -63,10 +62,16 @@ func (f *integrationFakeGen) GenerateJSON(_ context.Context, _ llm.Request) ([]b
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 // cannedGenerationJSON is the JSON returned by the fake generator.
-// draft_content contains all `original` substrings; the Argumento suggestion has
-// a citation so it is not dropped by the citation-required filter.
+// Gerar (OnGenerationRequested) only produces draft_content now — suggestions are
+// the responsibility of Revisar (ReviewDraft). No "suggestions" field here.
 const cannedGenerationJSON = `{
-  "draft_content": "Excelentíssimo Senhor Juiz, vem o réu apresentar contestação. Argumento jurídico claro.",
+  "draft_content": "Excelentíssimo Senhor Juiz, vem o réu apresentar contestação. Argumento jurídico claro."
+}`
+
+// cannedReviewJSON is the JSON returned by the fake generator for Revisar
+// (ReviewDraft). The Argumento suggestion has a citation so it passes the
+// citation-required filter; all `original` substrings appear in cannedGenerationJSON.
+const cannedReviewJSON = `{
   "suggestions": [
     {
       "category": "Clareza",
@@ -289,14 +294,15 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 	}
 }
 
-// ── AC3: Consumer happy path — review persisted + outbox in one tx ────────────
+// ── AC3: Consumer happy path — DRAFTED + content set, no review row ──────────
 
-// TestDraftGenerate_Consumer_HappyPath proves OnGenerationRequested:
-//  1. Updates draft.content and saga_state=REVIEWED in the DB.
-//  2. Inserts a review row with status=COMPLETED, non-empty findings, and coverage.
-//  3. Publishes review.completed in the outbox — SAME tx as review insert.
+// TestDraftGenerate_Consumer_HappyPath proves OnGenerationRequested (Gerar):
+//  1. Updates draft.content and sets saga_state=DRAFTED in the DB.
+//  2. Does NOT insert a review row (that is Revisar's job).
+//  3. Does NOT publish review.completed (no outbox row for that type).
 //
-// The fake generator returns cannedGenerationJSON; embedder is nil (degraded).
+// The fake generator returns cannedGenerationJSON (only draft_content);
+// embedder is nil (degraded — no RAG).
 func TestDraftGenerate_Consumer_HappyPath(t *testing.T) {
 	pool := newPool(t)
 	ctx := context.Background()
@@ -342,9 +348,9 @@ func TestDraftGenerate_Consumer_HappyPath(t *testing.T) {
 		t.Fatalf("OnGenerationRequested: %v", err)
 	}
 
-	// ── saga_state must be REVIEWED in the DB ────────────────────────────────
-	if got := readDraftSagaState(t, pool, draftID); got != draft.SagaStateReviewed {
-		t.Errorf("saga_state = %q, want REVIEWED", got)
+	// ── saga_state must be DRAFTED (not REVIEWED — review is Revisar's job) ──
+	if got := readDraftSagaState(t, pool, draftID); got != draft.SagaStateDrafted {
+		t.Errorf("saga_state = %q, want DRAFTED", got)
 	}
 
 	// ── draft.content must be set to the generated text ──────────────────────
@@ -356,29 +362,14 @@ func TestDraftGenerate_Consumer_HappyPath(t *testing.T) {
 		t.Error("draft.content is empty after generation — UpdateSagaState did not set content")
 	}
 
-	// ── review row: status=COMPLETED, findings non-empty, coverage ────────────
-	if n := countReviews(t, pool, draftID); n != 1 {
-		t.Fatalf("review count = %d, want 1", n)
-	}
-	rev := readLatestReviewRaw(t, pool, draftID)
-	if rev.Status != draft.ReviewStatusCompleted {
-		t.Errorf("review.status = %q, want COMPLETED", rev.Status)
-	}
-	if len(rev.Findings) == 0 {
-		t.Error("review.findings is empty — buildFindings produced no valid suggestions")
-	}
-	// The canned JSON has 2 valid suggestions (Clareza + Argumento with citation).
-	if len(rev.Findings) != 2 {
-		t.Errorf("review.findings count = %d, want 2 (Clareza + Argumento)", len(rev.Findings))
-	}
-	// Confirm grounded=false (embedder nil → degraded path).
-	if rev.Coverage.Grounded {
-		t.Error("coverage.grounded = true, want false (embedder nil → degraded)")
+	// ── no review row — Gerar no longer inserts reviews ──────────────────────
+	if n := countReviews(t, pool, draftID); n != 0 {
+		t.Errorf("review count = %d, want 0 (Gerar no longer inserts reviews)", n)
 	}
 
-	// ── review.completed published in the outbox (same tx as review insert) ───
-	if n := countOutboxRows(t, pool, draft.TypeReviewCompleted, draftID); n != 1 {
-		t.Errorf("outbox rows for review.completed = %d, want 1", n)
+	// ── no review.completed outbox row ────────────────────────────────────────
+	if n := countOutboxRows(t, pool, draft.TypeReviewCompleted, draftID); n != 0 {
+		t.Errorf("outbox rows for review.completed = %d, want 0", n)
 	}
 
 	// ── processed_event dedup mark written under consumer "draft_ai" ─────────
@@ -386,12 +377,9 @@ func TestDraftGenerate_Consumer_HappyPath(t *testing.T) {
 		t.Errorf("processed_event rows = %d, want 1 (dedup mark for draft_ai)", n)
 	}
 
-	// ── GetDetail exposes the review via the read model ───────────────────────
-	if view.Review == nil {
-		t.Fatal("view.Review is nil — GetLatestReview JOIN not returning the review")
-	}
-	if view.Review.Status != draft.ReviewStatusCompleted {
-		t.Errorf("view.Review.Status = %q, want COMPLETED", view.Review.Status)
+	// ── GetDetail view.Review is nil (no review exists yet) ──────────────────
+	if view.Review != nil {
+		t.Errorf("view.Review = %+v, want nil (Gerar does not insert reviews)", view.Review)
 	}
 }
 
@@ -450,8 +438,8 @@ func TestDraftGenerate_Consumer_TerminalError(t *testing.T) {
 // ── AC5: Idempotency — duplicate event_id processed only once ────────────────
 
 // TestDraftGenerate_Consumer_Idempotency proves that delivering the SAME event
-// twice (same event_id) is a no-op on the second delivery: only 1 review row is
-// created and the second call returns nil (dedup guard fires → seen=true).
+// twice (same event_id) is a no-op on the second delivery: saga_state remains
+// DRAFTED and the second call returns nil (dedup guard fires → seen=true).
 func TestDraftGenerate_Consumer_Idempotency(t *testing.T) {
 	pool := newPool(t)
 	ctx := context.Background()
@@ -478,20 +466,19 @@ func TestDraftGenerate_Consumer_Idempotency(t *testing.T) {
 	gen := &integrationFakeGen{out: []byte(cannedGenerationJSON)}
 	generateUC := newGenerateUC(pool, gen)
 
-	// First delivery — creates the review.
+	// First delivery — sets saga_state=DRAFTED, content is populated.
 	if err := generateUC.OnGenerationRequested(ctx, ev); err != nil {
 		t.Fatalf("first OnGenerationRequested: %v", err)
 	}
-	if n := countReviews(t, pool, draftID); n != 1 {
-		t.Fatalf("review count after first delivery = %d, want 1", n)
+	if got := readDraftSagaState(t, pool, draftID); got != draft.SagaStateDrafted {
+		t.Fatalf("saga_state after first delivery = %q, want DRAFTED", got)
 	}
 
 	// Second delivery with the SAME event_id — dedup must absorb it.
-	// The dedup mark lives in the EFFECT tx (atomic with the writes), so after
-	// the first delivery saga_state is REVIEWED. To exercise the dedup path (not
-	// the saga guard), re-trigger to put the draft back into EXTRACTING, then
-	// re-deliver the SAME event_id: the saga guard passes, but the dedup
-	// SeenOrMark inside the effect tx returns seen=true → no second review.
+	// DRAFTED allows re-triggering (generate_trigger.go only blocks EXTRACTING).
+	// Re-trigger to put the draft back into EXTRACTING, then re-deliver the SAME
+	// event_id: the saga guard passes, but the dedup SeenOrMark inside the effect
+	// tx returns seen=true → no second state change.
 	if _, err := triggerUC.TriggerGeneration(ctx, draft.TriggerGenerationCommand{
 		TenantID: tenantID,
 		DraftID:  draftID,
@@ -502,10 +489,6 @@ func TestDraftGenerate_Consumer_Idempotency(t *testing.T) {
 		t.Fatalf("second OnGenerationRequested (same event_id): %v", err)
 	}
 
-	// Still exactly 1 review — the dedup guard (effect tx) prevented a second insert.
-	if n := countReviews(t, pool, draftID); n != 1 {
-		t.Errorf("review count after duplicate delivery = %d, want 1 (dedup no-op)", n)
-	}
 	// processed_event mark exists exactly once.
 	if n := countDraftProcessedEvent(t, pool, "draft_ai", eventID); n != 1 {
 		t.Errorf("processed_event rows = %d, want 1 (idempotent mark)", n)
@@ -550,9 +533,12 @@ func TestDraftGenerate_TenantIsolation_ReviewNotLeaked(t *testing.T) {
 		t.Fatalf("owner OnGenerationRequested: %v", err)
 	}
 
-	// Confirm the review row exists in the DB for the owner.
-	if n := countReviews(t, pool, ownerDraftID); n != 1 {
-		t.Fatalf("owner review count = %d, want 1", n)
+	// Confirm saga_state=DRAFTED and no review row (Gerar does not insert reviews).
+	if got := readDraftSagaState(t, pool, ownerDraftID); got != draft.SagaStateDrafted {
+		t.Fatalf("owner saga_state = %q, want DRAFTED", got)
+	}
+	if n := countReviews(t, pool, ownerDraftID); n != 0 {
+		t.Fatalf("owner review count = %d, want 0 (Gerar does not insert reviews)", n)
 	}
 
 	// Foreign tenant: seed a separate tenant (no draft, no review).

@@ -71,6 +71,11 @@ type Repository interface {
 	// Review entity.
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
 
+	// DeleteReviewsForDraft removes all review rows for a draft. Called by Gerar
+	// before persisting DRAFTED state so that Revisar always operates on a clean
+	// slate (no stale suggestions from a prior generation attempt).
+	DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error
+
 	// GetLatestReview returns the most recent review for a draft (generated_at DESC).
 	// A draft with no reviews returns (nil, nil) — not an error.
 	GetLatestReview(ctx context.Context, tx database.Tx, draftID string) (*Review, error)
@@ -469,6 +474,17 @@ func (r *pgRepository) InsertReview(ctx context.Context, tx database.Tx, rev *Re
 		return nil, database.WrapInfra(err)
 	}
 	return reviewFromInsertRow(row), nil
+}
+
+func (r *pgRepository) DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).DeleteReviewsForDraft(ctx, did); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 func (r *pgRepository) GetLatestReview(ctx context.Context, tx database.Tx, draftID string) (*Review, error) {

@@ -38,12 +38,13 @@ func NewTriggerUseCase(uow database.UnitOfWork, rw Repository, outbox *events.Ou
 
 // TriggerGeneration implements POST /v1/pecas/:id/generate. In ONE tenant-scoped tx:
 //  1. GetDraftByID (tenant guard → 404 if not found).
-//  2. Guard saga_state ∈ {CREATED, REVIEWED, FAILED}; if EXTRACTING → 409.
+//  2. Guard: if EXTRACTING → 409 (generation already running).
+//     Any other state (CREATED, DRAFTED, REVIEWED, FAILED) → allowed (regeneration is valid).
 //  3. UpdateSagaState → EXTRACTING (content unchanged).
 //  4. outbox.Publish(draft.generation_requested) — same tx as the state flip.
 //  5. Commit → returns the updated draft (saga_state=EXTRACTING).
 //
-// Regenerating from REVIEWED or FAILED is valid (same route, same logic).
+// Regenerating from DRAFTED, REVIEWED, or FAILED is valid (same route, same logic).
 func (uc *TriggerUseCase) TriggerGeneration(ctx context.Context, cmd TriggerGenerationCommand) (*Draft, error) {
 	var updated *Draft
 
@@ -53,6 +54,7 @@ func (uc *TriggerUseCase) TriggerGeneration(ctx context.Context, cmd TriggerGene
 			return err
 		}
 
+		// Only block if generation is already in flight — all other states allow re-triggering.
 		if d.SagaState == SagaStateExtracting {
 			return ErrGenerationInProgress
 		}

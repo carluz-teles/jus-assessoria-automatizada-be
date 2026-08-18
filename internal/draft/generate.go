@@ -70,6 +70,7 @@ type generationDepsReader interface {
 type generationWriter interface {
 	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error)
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
+	DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error
 }
 
 // embedder is the narrow embedding port for RAG. Satisfied by *indexing.VoyageEmbedder
@@ -140,9 +141,9 @@ func NewGenerateUseCase(p GenerateUseCaseParams) *GenerateUseCase {
 }
 
 // generatedOutput is the LLM's structured response for one generation call.
+// Gerar now produces ONLY draft_content — suggestions are produced by Revisar.
 type generatedOutput struct {
-	DraftContent string          `json:"draft_content"`
-	Suggestions  []rawSuggestion `json:"suggestions"`
+	DraftContent string `json:"draft_content"`
 }
 
 // rawSuggestion is one LLM-suggested improvement before validation.
@@ -163,39 +164,14 @@ type rawCitation struct {
 }
 
 // generateSchema is the JSON Schema constraining the LLM's output via
-// structured output (strict). draft_content + suggestions array; citation is optional
-// per suggestion. The schema lives here (the caller) per the design decision.
+// structured output (strict). Gerar now produces ONLY draft_content — suggestions
+// are a separate concern handled by Revisar (review.go).
 var generateSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "draft_content": { "type": "string" },
-    "suggestions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "category":    { "type": "string" },
-          "original":    { "type": "string" },
-          "replacement": { "type": "string" },
-          "problem":     { "type": "string" },
-          "description": { "type": "string" },
-          "citation": {
-            "type": ["object", "null"],
-            "properties": {
-              "document_id": { "type": "string" },
-              "page":        { "type": ["integer", "null"] },
-              "quote":       { "type": "string" }
-            },
-            "required": ["document_id", "page", "quote"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["category", "original", "replacement", "problem", "description", "citation"],
-        "additionalProperties": false
-      }
-    }
+    "draft_content": { "type": "string" }
   },
-  "required": ["draft_content", "suggestions"],
+  "required": ["draft_content"],
   "additionalProperties": false
 }`)
 
@@ -300,40 +276,25 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("parse llm output: %v", err4))
 	}
 
-	// ── 6. Validate and filter suggestions ────────────────────────────────────
-	findings, coverage := buildFindings(out, grounded, len(chunks))
-
-	// ── 7. Persist success in ONE tx ──────────────────────────────────────────
-	var reviewID string
+	// ── 6. Persist success in ONE tx ──────────────────────────────────────────
+	// Gerar now produces ONLY draft_content (DRAFTED state). Any previous reviews
+	// (from prior generation attempts) are deleted so Revisar always operates on a
+	// clean slate. The advogado triggers Revisar explicitly as a separate action.
 	if err5 := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		// Dedup in the SAME tx as the effect: a concurrent delivery that already
-		// marked this event skips the writes (only one review is persisted).
+		// marked this event skips the writes.
 		if seen, e := uc.dedup.SeenOrMark(ctx, tx, generationConsumer, ev.EventID); e != nil {
 			return e
 		} else if seen {
 			return nil
 		}
-		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateReviewed, true, out.DraftContent); e != nil {
+		// Delete any reviews from prior generation attempts so the draft starts
+		// clean for the next Revisar call.
+		if e := uc.writer.DeleteReviewsForDraft(ctx, tx, ev.DraftID); e != nil {
+			return fmt.Errorf("delete prior reviews: %w", e)
+		}
+		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, out.DraftContent); e != nil {
 			return fmt.Errorf("update saga state: %w", e)
-		}
-
-		rev, e := uc.writer.InsertReview(ctx, tx, &Review{
-			DraftID:      ev.DraftID,
-			Findings:     findings,
-			Coverage:     coverage,
-			ModelVersion: uc.model,
-			RulesVersion: composed.PromptVersion,
-			Status:       ReviewStatusCompleted,
-			GeneratedAt:  uc.now(),
-		})
-		if e != nil {
-			return fmt.Errorf("insert review: %w", e)
-		}
-		reviewID = rev.ID
-
-		ev2 := newReviewCompleted(ev.DraftID, rev.ID, ReviewStatusCompleted)
-		if e := uc.outbox.Publish(ctx, tx, ev2); e != nil {
-			return fmt.Errorf("publish review.completed: %w", e)
 		}
 		return nil
 	}); err5 != nil {
@@ -342,8 +303,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 
 	slog.InfoContext(ctx, "draft generation completed",
 		slog.String("draft_id", ev.DraftID),
-		slog.String("review_id", reviewID),
-		slog.Int("findings", len(findings)),
+		slog.String("saga_state", SagaStateDrafted),
 		slog.Bool("grounded", grounded),
 	)
 	return nil
@@ -409,22 +369,26 @@ func buildDraftContext(d *Draft, i *IntimationContext, chunks []string) advisory
 }
 
 // buildFindings validates and filters the LLM's raw suggestions:
-//   - original must appear as a substring in draft_content → drop if not
+//   - original must appear as a substring in contentForValidation → drop if not
 //   - Argumento/Coerência must have a non-empty citation → drop if absent
 //   - cap at 10 after filtering
 //
+// contentForValidation is the current draft text to validate `original` substrings
+// against. For Revisar this is the draft's current editor content; Gerar no longer
+// calls buildFindings directly.
+//
 // Returns the validated Finding slice and the Coverage summary.
-func buildFindings(out generatedOutput, grounded bool, chunksUsed int) ([]Finding, Coverage) {
-	total := len(out.Suggestions)
+func buildFindings(suggestions []rawSuggestion, grounded bool, chunksUsed int, contentForValidation string) ([]Finding, Coverage) {
+	total := len(suggestions)
 	documentsCited := map[string]bool{}
 
 	findings := make([]Finding, 0, min(total, 10))
-	for _, s := range out.Suggestions {
+	for _, s := range suggestions {
 		if len(findings) >= 10 {
 			break // top-10 cap; the remainder is counted as dropped below
 		}
-		// Substring validation: original must appear in draft_content.
-		if !strings.Contains(out.DraftContent, s.Original) {
+		// Substring validation: original must appear in the current draft content.
+		if !strings.Contains(contentForValidation, s.Original) {
 			continue
 		}
 		// Citation requirement for Argumento and Coerência.

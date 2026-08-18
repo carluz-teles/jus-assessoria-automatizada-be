@@ -327,6 +327,22 @@ func run(logger *slog.Logger) error {
 	})
 	draftHandler = draftHandler.WithChat(chatUC)
 
+	// Review use case (Fatia 3 — Revisar síncrono): same deps as ChatUseCase (shared
+	// generator, embedder, search, composer, model). Revisar produces AI suggestions
+	// (findings) over the advogado's current minuta, grounded in the case corpus.
+	// nil generator → ErrIANotConfigured (422) — never a boot failure.
+	reviewUC := draft.NewReviewUseCase(draft.ReviewUseCaseParams{
+		UoW:      uow,
+		Reader:   draftRepo,
+		Writer:   draftRepo,
+		Gen:      taskGenerator,
+		Emb:      chatEmbedder,
+		Search:   indexing.SearchDeps{Pool: pool},
+		Composer: advisory.NewTemplateComposer(),
+		Model:    cfg.OpenRouterModel,
+	})
+	draftHandler = draftHandler.WithReviewer(reviewUC)
+
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,

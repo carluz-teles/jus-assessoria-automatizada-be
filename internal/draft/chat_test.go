@@ -120,6 +120,10 @@ func (fakeChatComposer) ComposeChat(_ string, _ advisory.ChatContext) (advisory.
 	}, nil
 }
 
+func (fakeChatComposer) ComposeReview(_ string, _ advisory.ReviewContext) (advisory.Composed, error) {
+	panic("unexpected ComposeReview call in chat test")
+}
+
 // newChatUCForTest builds a ChatUseCase with the given fakes. Uses fakeUoW from
 // generate_test.go (same package — runs fn immediately with a nil tx).
 func newChatUCForTest(repo chatRepo, gen llm.Generator, emb embedder) *ChatUseCase {
@@ -448,6 +452,9 @@ func (c *capturingChatComposer) ComposeDraft(_ string, _ advisory.DraftContext) 
 func (c *capturingChatComposer) ComposeChat(_ string, ctx advisory.ChatContext) (advisory.Composed, error) {
 	*c.captured = ctx
 	return advisory.Composed{System: "s", User: "u", PromptVersion: "v"}, nil
+}
+func (c *capturingChatComposer) ComposeReview(_ string, _ advisory.ReviewContext) (advisory.Composed, error) {
+	panic("unexpected ComposeReview in chat test")
 }
 
 // ── validateChatCitations unit tests ─────────────────────────────────────────
