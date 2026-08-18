@@ -40,14 +40,9 @@ type AnswerQuestionCommand struct {
 // full Repository; kept as a separate interface so tests can inject minimal fakes.
 type chatRepo interface {
 	GetDraftByID(ctx context.Context, tx database.Tx, tenantID, draftID string) (*Draft, error)
+	GetIntimationForDraft(ctx context.Context, tx database.Tx, tenantID, intimationID string) (*IntimationContext, error)
 	InsertChatMessage(ctx context.Context, tx database.Tx, m *ChatMessage) (*ChatMessage, error)
 	GetChatThread(ctx context.Context, tx database.Tx, draftID string) ([]ChatMessage, error)
-}
-
-// chatEmbedder is the narrow embedding port for chat RAG. Satisfied by
-// *indexing.VoyageEmbedder or a test fake. nil → degraded path (no grounding).
-type chatEmbedder interface {
-	Embed(ctx context.Context, texts []string) ([][]float32, string, error)
 }
 
 // chatOutput is the LLM's structured response for one chat turn.
@@ -93,7 +88,7 @@ type ChatUseCase struct {
 	uow      database.UnitOfWork
 	repo     chatRepo
 	gen      llm.Generator // nil → typed error "IA não configurada"
-	emb      chatEmbedder  // nil → degraded (no RAG grounding)
+	emb      embedder      // nil → degraded (no RAG grounding)
 	search   indexing.SearchDeps
 	composer advisory.PromptComposer
 	model    string
@@ -104,7 +99,7 @@ type ChatUseCaseParams struct {
 	UoW      database.UnitOfWork
 	Repo     chatRepo
 	Gen      llm.Generator
-	Emb      chatEmbedder
+	Emb      embedder
 	Search   indexing.SearchDeps
 	Composer advisory.PromptComposer
 	Model    string // OpenRouter model slug; empty → chatModel fallback
@@ -131,8 +126,8 @@ func NewChatUseCase(p ChatUseCaseParams) *ChatUseCase {
 // Structured in 3 phases to avoid holding a pgx connection open during the LLM call
 // (which can take 2–30 s and would exhaust the pool under concurrency):
 //
-//	Phase 1 (READ, short tx): load draft (tenant guard) + load history.
-//	Phase 2 (LLM, NO tx):    embed → SearchChunks → ComposeChat → GenerateJSON → validate citations.
+//	Phase 1 (READ, short tx): load draft (tenant guard) + load history + resolve courtRecordID.
+//	Phase 2 (LLM, NO tx):    embed → SearchChunks (scoped to intimation) → ComposeChat → GenerateJSON → validate citations.
 //	Phase 3 (WRITE, short tx): insert role='user' + role='assistant' atomically.
 //
 // The FK chat_message.draft_id ON DELETE CASCADE ensures a clean insert failure
@@ -149,12 +144,27 @@ func (uc *ChatUseCase) AnswerQuestion(ctx context.Context, cmd AnswerQuestionCom
 	// ── Phase 1: READ (short tx) ──────────────────────────────────────────────
 	var d *Draft
 	var history []ChatMessage
+	var crid *string // court_record_id resolved from the intimation (nil → whole-tenant)
 	if err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
 		loaded, err := uc.repo.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
 		if err != nil {
 			return err
 		}
 		d = loaded
+
+		// Resolve the court_record_id for RAG scoping. Non-fatal: if the intimation
+		// load fails, grounding degrades to tenant-wide (same policy as generate.go).
+		if d.IntimationID != "" {
+			intimation, e := uc.repo.GetIntimationForDraft(ctx, tx, cmd.TenantID, d.IntimationID)
+			if e != nil {
+				slog.WarnContext(ctx, "chat: intimation load failed — falling back to tenant-wide RAG",
+					slog.String("draft_id", cmd.DraftID),
+					slog.Any("error", e),
+				)
+			} else if intimation.CourtRecordID != "" {
+				crid = &intimation.CourtRecordID
+			}
+		}
 
 		msgs, err := uc.repo.GetChatThread(ctx, tx, cmd.DraftID)
 		if err != nil {
@@ -168,8 +178,8 @@ func (uc *ChatUseCase) AnswerQuestion(ctx context.Context, cmd AnswerQuestionCom
 
 	// ── Phase 2: LLM (NO tx — connection released) ───────────────────────────
 
-	// 2a. RAG: embed question → search chunks.
-	chunks, chunkHits := uc.runChatRAG(ctx, cmd.TenantID, d, cmd.Question)
+	// 2a. RAG: embed question → search chunks (scoped to intimation's court_record when available).
+	chunks, chunkHits, _ := runRAG(ctx, uc.emb, uc.search, cmd.TenantID, crid, cmd.Question, 8)
 
 	// 2b. Compose prompt.
 	chatCtx := buildChatContext(d, history, chunks, cmd.Question)
@@ -278,44 +288,6 @@ func (uc *ChatUseCase) GetThread(ctx context.Context, tenantID, draftID string) 
 		messages = []ChatMessage{}
 	}
 	return messages, draft, nil
-}
-
-// runChatRAG embeds the question and searches for top-8 chunks. Returns the raw
-// chunk texts (for prompt injection) and the ChunkHit slice (for citation validation).
-// Degrades gracefully when the embedder is nil, the search pool is nil, or no hits.
-func (uc *ChatUseCase) runChatRAG(ctx context.Context, tenantID string, d *Draft, question string) (chunks []string, hits []indexing.ChunkHit) {
-	if uc.emb == nil || uc.search.Pool == nil {
-		return []string{}, nil
-	}
-	vecs, _, err := uc.emb.Embed(ctx, []string{question})
-	if err != nil || len(vecs) == 0 {
-		slog.WarnContext(ctx, "chat: embed failed",
-			slog.String("draft_id", d.ID), slog.Any("error", err))
-		return []string{}, nil
-	}
-
-	var crid *string
-	if d.CaseID != "" {
-		// scope would go here when court_record_id is resolvable from case_id;
-		// for now, search tenant-wide (same behaviour as generate.go).
-		_ = crid
-	}
-
-	h, err := indexing.SearchChunks(ctx, uc.search, tenantID, nil, vecs[0], 8)
-	if err != nil {
-		slog.WarnContext(ctx, "chat: search chunks failed",
-			slog.String("draft_id", d.ID), slog.Any("error", err))
-		return []string{}, nil
-	}
-	if len(h) == 0 {
-		return []string{}, nil
-	}
-
-	texts := make([]string, len(h))
-	for i, hit := range h {
-		texts[i] = hit.Text
-	}
-	return texts, h
 }
 
 // buildChatContext converts the domain objects to an advisory.ChatContext for prompt composition.

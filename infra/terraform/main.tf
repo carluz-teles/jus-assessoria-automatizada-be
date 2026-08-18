@@ -41,6 +41,7 @@ locals {
   # fatia à parte; por ora a base fica em todos.)
   service_vars = {
     # api: HTTP server — Clerk (webhook/issuer), Stripe, Billing URLs, Resend webhook, S3, Port.
+    # Também faz RAG síncrono (chat grounded): precisa de VOYAGE_* para embebedar a query.
     "api" = merge(local.base_vars, {
       PORT                    = "8080"
       CLERK_ISSUER            = var.clerk_issuer
@@ -59,6 +60,13 @@ locals {
       APP_BILLING_RETURN_URL  = var.billing_return_url
       # OpenRouter (geração LLM): o endpoint de sugestão de tarefas é síncrono no api.
       OPENROUTER_API_KEY = var.openrouter_api_key
+      # Voyage (RAG — chat grounded). Valores explícitos = contrato de infra: o modelo
+      # que indexou os chunks (worker-documents) DEVE ser o mesmo que embeda a query
+      # aqui; drift silencioso entre serviços causaria busca cross-model e degradaria
+      # a qualidade do grounding sem sinalização de erro.
+      VOYAGE_API_KEY   = var.voyage_api_key
+      VOYAGE_MODEL     = "voyage-4-lite"
+      VOYAGE_EMBED_DIM = "1024"
     })
     # worker-ingestao: roda o listener de notifications (e-mail via Resend) e o
     # backfill/sync DJEN por-OAB (on-demand no onboarding). Todo egress DJEN sai pelo
@@ -78,27 +86,34 @@ locals {
       BACKFILL_WINDOW_DAYS = "30"
       INGESTION_ENABLED    = "false"
     })
-    # worker-ai: geração assíncrona da minuta + review (Fatia 3 do peticionamento).
-    # Consome draft.generation_requested → chama o LLM (OpenRouter) com structured
-    # output. Precisa da OPENROUTER_API_KEY (sem ela o binário sobe mas marca todo draft
-    # FAILED "IA não configurada"). Modelo/base_url ficam no default do código
-    # (openai/gpt-4o-mini) — mesmo que o api usa. VOYAGE_API_KEY fica de fora por ora:
-    # sem ela a geração roda ungrounded (grounded=false, sem citação dos autos) — RAG
-    # em prod é follow-up (exige os chunks indexados no pgvector).
+    # worker-ai: geração assíncrona da minuta + review (Fatia 3 do peticionamento)
+    # E RAG assíncrono (intimation-scoped grounding). Consome draft.generation_requested
+    # → chama o LLM (OpenRouter) + embeda a query com Voyage para SearchChunks. Precisa
+    # de OPENROUTER_API_KEY (sem ela marca FAILED) e VOYAGE_API_KEY (sem ela roda
+    # ungrounded). VOYAGE_MODEL/VOYAGE_EMBED_DIM: mesmo contrato que o api — qualquer
+    # drift entre o modelo que indexou (worker-documents) e o que busca (worker-ai) causa
+    # grounding cruzado e degradação silenciosa da qualidade.
     "worker-ai" = merge(local.base_vars, {
       OPENROUTER_API_KEY = var.openrouter_api_key
+      VOYAGE_API_KEY     = var.voyage_api_key
+      VOYAGE_MODEL       = "voyage-4-lite"
+      VOYAGE_EMBED_DIM   = "1024"
     })
     # worker-documents: pipeline de documentos (extração/OCR + chunk/embedding). Precisa de
     # storage (lê o PDF, grava o texto extraído, baixa) + a chave Voyage (embeddings). O
     # ANTHROPIC_API_KEY (OCR via Claude vision) já vem na base. Sem VOYAGE_API_KEY o binário
     # sobe e só a indexação fica de fora (a extração roda) — ver cmd/worker-documents/main.go.
+    # VOYAGE_MODEL/VOYAGE_EMBED_DIM: fonte de verdade do modelo que GRAVA os vetores no DB.
+    # Deve ser idêntico ao usado em api e worker-ai (que leem os vetores via SearchChunks).
     "worker-documents" = merge(local.base_vars, {
-      S3_ENDPOINT    = var.s3_endpoint
-      S3_REGION      = var.s3_region
-      S3_BUCKET      = var.s3_bucket
-      S3_ACCESS_KEY  = var.s3_access_key
-      S3_SECRET_KEY  = var.s3_secret_key
-      VOYAGE_API_KEY = var.voyage_api_key
+      S3_ENDPOINT      = var.s3_endpoint
+      S3_REGION        = var.s3_region
+      S3_BUCKET        = var.s3_bucket
+      S3_ACCESS_KEY    = var.s3_access_key
+      S3_SECRET_KEY    = var.s3_secret_key
+      VOYAGE_API_KEY   = var.voyage_api_key
+      VOYAGE_MODEL     = "voyage-4-lite"
+      VOYAGE_EMBED_DIM = "1024"
     })
     "worker-outbox-relay" = local.base_vars
     # scheduler: re-poll dos court_records due (enrichment DATAJUD). A ingestão nacional

@@ -261,8 +261,16 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	}
 
 	// ── 4. RAG: embed + search chunks ─────────────────────────────────────────
+	// Resolve the court_record_id from the already-loaded intimation context so
+	// SearchChunks scopes to this process's documents (intimation-scoped grounding).
+	// When there is no intimation (blank/processo draft), crid stays nil and the
+	// search spans the whole tenant corpus (the existing behaviour, preserved).
+	var crid *string
+	if intimation != nil && intimation.CourtRecordID != "" {
+		crid = &intimation.CourtRecordID
+	}
 	queryText := buildQueryText(draft, intimation)
-	chunks, grounded := uc.runRAG(ctx, ev.TenantID, draft, queryText)
+	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, ev.TenantID, crid, queryText, 8)
 
 	// ── 5. Compose prompt and call LLM ────────────────────────────────────────
 	draftCtx := buildDraftContext(draft, intimation, chunks)
@@ -374,44 +382,6 @@ func (uc *GenerateUseCase) persistFailure(ctx context.Context, tenantID, draftID
 			slog.String("draft_id", draftID), slog.Any("error", err))
 	}
 	return fmt.Errorf("draft generation failed: %s: %w", reason, errSkipRetry)
-}
-
-// runRAG embeds the query text and searches for the top-8 chunks. Returns the
-// chunk texts and whether grounding was achieved. Degrades gracefully when the
-// embedder is nil, the search pool is nil, or the search returns nothing.
-func (uc *GenerateUseCase) runRAG(ctx context.Context, tenantID string, d *Draft, queryText string) (chunks []string, grounded bool) {
-	if uc.emb == nil || uc.search.Pool == nil {
-		return []string{}, false
-	}
-	vecs, _, err := uc.emb.Embed(ctx, []string{queryText})
-	if err != nil || len(vecs) == 0 {
-		slog.WarnContext(ctx, "draft generate: embed failed",
-			slog.String("draft_id", d.ID), slog.Any("error", err))
-		return []string{}, false
-	}
-
-	var crid *string
-	if d.CaseID != "" {
-		// scope to this case's court record documents — requires the court_record_id.
-		// The draft entity only carries case_id; we pass nil to search tenant-wide.
-		// A future improvement: join court_record to resolve the id here.
-	}
-
-	hits, err := indexing.SearchChunks(ctx, uc.search, tenantID, crid, vecs[0], 8)
-	if err != nil {
-		slog.WarnContext(ctx, "draft generate: search chunks failed",
-			slog.String("draft_id", d.ID), slog.Any("error", err))
-		return []string{}, false
-	}
-	if len(hits) == 0 {
-		return []string{}, false
-	}
-
-	out := make([]string, len(hits))
-	for i, h := range hits {
-		out[i] = h.Text
-	}
-	return out, true
 }
 
 // buildQueryText builds the RAG query string from the draft and intimation context.
