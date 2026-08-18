@@ -6,10 +6,14 @@
 -- name: InsertDraft :one
 -- Persist a new peça (DRAFT status, CREATED saga_state). Returns all columns so the
 -- handler renders the 201 response without a follow-up read. storage_key is NULL for
--- Fatia 1 (content lives in the column, not in S3). ON CONFLICT on the partial unique
--- index (tenant_id, intimation_id WHERE intimation_id IS NOT NULL) is handled by the
--- use case via the pgconn 23505 code: the INSERT returns an error, the use case
--- fetches the existing row and returns 200 (idempotent).
+-- Fatia 1 (content lives in the column, not in S3).
+--
+-- ON CONFLICT DO NOTHING targets the partial unique index
+-- (tenant_id, intimation_id WHERE intimation_id IS NOT NULL). When the row already
+-- exists the RETURNING clause yields zero rows (pgx.ErrNoRows), which the repository
+-- maps to ErrDraftAlreadyExists so the use case can fetch the existing row for 200.
+-- This avoids a 23505 error that would abort the current transaction (25P02), making
+-- subsequent queries in the same tx impossible without a SAVEPOINT.
 INSERT INTO draft (
     tenant_id, case_id, intimation_id,
     piece_type, title, content,
@@ -21,6 +25,7 @@ INSERT INTO draft (
     'DRAFT', 'CREATED',
     now(), now()
 )
+ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHING
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,

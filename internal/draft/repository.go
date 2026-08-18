@@ -5,7 +5,6 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/jusassessoria/platform/internal/draft/draftdb"
 	"github.com/jusassessoria/platform/lib/database"
@@ -16,9 +15,9 @@ import (
 // unit of work; RLS scopes the reads/writes to the principal's tenant.
 type Repository interface {
 	// InsertDraft persists a new peça. On success it returns the full *Draft so the
-	// handler renders the 201 response without a follow-up read. On a unique
-	// violation (23505 — the partial index draft_intimation_id_uidx), it returns
-	// ErrDraftAlreadyExists so the use case can fetch the existing row for 200.
+	// handler renders the 201 response without a follow-up read. When the partial
+	// unique index draft_intimation_id_uidx fires (ON CONFLICT DO NOTHING), it
+	// returns ErrDraftAlreadyExists so the use case can fetch the existing row for 200.
 	InsertDraft(ctx context.Context, tx database.Tx, d *Draft) (*Draft, error)
 	// GetDraftByIntimationID returns the existing draft for the (tenant, intimation)
 	// pair — the idempotent path after a 23505. A miss is ErrDraftNotFound.
@@ -53,15 +52,16 @@ var _ Repository = (*pgRepository)(nil)
 // NewRepository returns the stateless Repository.
 func NewRepository() Repository { return &pgRepository{} }
 
-// uniqueViolationCode is the PostgreSQL error code for unique_violation (§23505).
-const uniqueViolationCode = "23505"
-
 func (r *pgRepository) InsertDraft(ctx context.Context, tx database.Tx, d *Draft) (*Draft, error) {
 	tenantID, err := parseUUID(d.TenantID)
 	if err != nil {
 		return nil, err
 	}
 
+	// ON CONFLICT DO NOTHING: when the partial unique index fires (same tenant +
+	// intimation_id), the INSERT is silently skipped and RETURNING yields no rows
+	// (pgx.ErrNoRows). We map that to ErrDraftAlreadyExists so the use case can
+	// fetch the existing row — the transaction stays healthy (no 23505 abort).
 	row, err := draftdb.New(tx).InsertDraft(ctx, draftdb.InsertDraftParams{
 		TenantID:     tenantID,
 		CaseID:       optUUID(d.CaseID),
@@ -70,11 +70,10 @@ func (r *pgRepository) InsertDraft(ctx context.Context, tx database.Tx, d *Draft
 		Title:        d.Title,
 		Content:      textToNull(d.Content),
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDraftAlreadyExists
+	}
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolationCode {
-			return nil, ErrDraftAlreadyExists
-		}
 		return nil, database.WrapInfra(err)
 	}
 	return draftFromInsertRow(row), nil

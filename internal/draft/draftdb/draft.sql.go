@@ -272,6 +272,7 @@ INSERT INTO draft (
     'DRAFT', 'CREATED',
     now(), now()
 )
+ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHING
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
@@ -307,10 +308,11 @@ type InsertDraftRow struct {
 // never (nil, nil).
 // Persist a new peça (DRAFT status, CREATED saga_state). Returns all columns so the
 // handler renders the 201 response without a follow-up read. storage_key is NULL for
-// Fatia 1 (content lives in the column, not in S3). ON CONFLICT on the partial unique
-// index (tenant_id, intimation_id WHERE intimation_id IS NOT NULL) is handled by the
-// use case via the pgconn 23505 code: the INSERT returns an error, the use case
-// fetches the existing row and returns 200 (idempotent).
+// Fatia 1 (content lives in the column, not in S3). ON CONFLICT DO NOTHING targets
+// the partial unique index (tenant_id, intimation_id WHERE intimation_id IS NOT NULL):
+// when a row already exists, RETURNING yields no rows (pgx.ErrNoRows) — the
+// repository maps that to ErrDraftAlreadyExists and the use case fetches the existing
+// row for a 200 idempotent response, all within the same unaborted transaction.
 func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (InsertDraftRow, error) {
 	row := q.db.QueryRow(ctx, insertDraft,
 		arg.TenantID,
