@@ -557,7 +557,7 @@ SELECT p.id, p.role, p.name,
                    ORDER BY pc.name
                  )
           FROM party_counsel pc
-          WHERE pc.party_id = p.id),
+          WHERE pc.party_id = p.id AND pc.tenant_id = p.tenant_id),
          '[]'::jsonb
        )::text AS counsels
 FROM party p

@@ -304,7 +304,8 @@ const (
 //   - APPEAL  — a decision was rendered and a recursal window opened
 //   - DEFENSE — cited to defend, or embargos/impugnação (execução/cumprimento)
 //   - MOTION  — ordered to manifest/say/indicate (manifestação incidental)
-//   - OTHER   — no strong signal
+//   - DEFENSE — fallback: an INTIMACAO with no content signal (historical default)
+//   - OTHER   — no signal and not an INTIMACAO/CITACAO
 //
 // Note: the class "Execução" alone does NOT imply DEFENSE — the recipient may be the
 // exequente ordered to indicate assets (→ MOTION). Only the content disambiguates.
@@ -326,6 +327,11 @@ func inferPieceType(it *IntimationContext) string {
 	case containsAny(blob, "manifeste-se", "manifestar-se", "manifestação", "diga sobre",
 		"indique bens", "indicar bens", "requeira o que"):
 		return PieceTypeMotion
+	case it.Type == "INTIMACAO":
+		// Fallback: an INTIMACAO with no recognized content signal defaults to DEFENSE
+		// (the historical default) — better a sane hint than OTHER when the teor is
+		// thin/empty (scraping gap). Content signals above still win (APPEAL/MOTION).
+		return PieceTypeDefense
 	default:
 		return PieceTypeOther
 	}

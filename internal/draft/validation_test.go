@@ -169,6 +169,7 @@ func TestInferPieceType(t *testing.T) {
 			&IntimationContext{Type: "INTIMACAO", Content: "Manifeste-se a parte autora sobre a petição."},
 			PieceTypeMotion,
 		},
+		{"INTIMACAO sem sinal → DEFENSE (fallback histórico)", &IntimationContext{Type: "INTIMACAO", Content: ""}, PieceTypeDefense},
 		{"sem sinal → OTHER", &IntimationContext{Type: "COMUNICACAO", Content: "Comunicação de ato ordinatório."}, PieceTypeOther},
 		{"vazio → OTHER", &IntimationContext{}, PieceTypeOther},
 	}
