@@ -25,10 +25,17 @@ type Repository interface {
 	// GetDraftByID returns the full draft by id, scoped to tenantID. A miss or
 	// foreign-tenant id is ErrDraftNotFound (→ 404).
 	GetDraftByID(ctx context.Context, tx database.Tx, tenantID, draftID string) (*Draft, error)
-	// GetIntimationForDraft loads the minimal intimation context (case_id,
-	// court_record_id, type) needed by the POST path when source=intimation. A miss
-	// or foreign id is ErrIntimationNotFound (→ 404).
+	// GetIntimationForDraft loads the intimation context (case_id, court_record_id,
+	// type, process metadata, deadline, and recipients jsonb for signing-lawyer
+	// resolution) needed by the generation pipeline. A miss or foreign id is
+	// ErrIntimationNotFound (→ 404).
 	GetIntimationForDraft(ctx context.Context, tx database.Tx, tenantID, intimationID string) (*IntimationContext, error)
+
+	// GetPartiesForDraft loads the parties (PLAINTIFF/DEFENDANT/THIRD_PARTY) and
+	// their aggregated counsels for a given case, tenant-scoped (barrier 1). Used
+	// by the generation pipeline to inject structured party data into the AI prompt.
+	// An empty case or one with no parties returns an empty slice, never nil.
+	GetPartiesForDraft(ctx context.Context, tx database.Tx, tenantID, caseID string) ([]PartyInfo, error)
 	// UpdateDraftContent patches content (+optional title) and bumps updated_at. A
 	// no-match (wrong id or foreign tenant) is ErrDraftNotFound.
 	UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string) (*PatchResult, error)
@@ -209,6 +216,7 @@ func (r *pgRepository) GetIntimationForDraft(ctx context.Context, tx database.Tx
 		CourtRecordID:   row.CourtRecordID.String(),
 		Type:            derefString(row.IntimationType),
 		Content:         row.IntimationContent,
+		Recipients:      row.Recipients,
 		CNJNumber:       row.CnjNumber,
 		Court:           row.Court,
 		Degree:          row.Degree,
@@ -217,6 +225,26 @@ func (r *pgRepository) GetIntimationForDraft(ctx context.Context, tx database.Tx
 		JudgingBody:     derefString(row.JudgingBody),
 		DeadlineEndDate: deadlineDate,
 	}, nil
+}
+
+func (r *pgRepository) GetPartiesForDraft(ctx context.Context, tx database.Tx, tenantID, caseID string) ([]PartyInfo, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	cid, err := parseUUID(caseID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := draftdb.New(tx).GetPartiesForDraft(ctx, draftdb.GetPartiesForDraftParams{
+		TenantID: tid,
+		CaseID:   cid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return partiesFromRows(rows), nil
 }
 
 func (r *pgRepository) UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string) (*PatchResult, error) {

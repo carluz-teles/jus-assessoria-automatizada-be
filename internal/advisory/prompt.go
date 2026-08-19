@@ -97,11 +97,22 @@ type Composed struct {
 	PromptVersion string
 }
 
+// PartyCtx is one party of the process for the draft_minuta prompt.
+// Role is the raw DB value (PLAINTIFF, DEFENDANT, THIRD_PARTY).
+// Counsel is a short human-readable label for the first advogado, or "" when absent.
+type PartyCtx struct {
+	Role    string
+	Name    string
+	Counsel string
+}
+
 // DraftContext is the per-draft signal the draft_minuta composer specializes the
 // instruction-set with. It carries the intimation that triggered the draft (the richest
-// context signal), the process metadata (court/class/subject, for legal register), and
-// any RAG chunks retrieved from the case corpus (empty when the embedder is unconfigured
-// or the corpus has no documents — the degraded path).
+// context signal), the process metadata (court/class/subject, for legal register),
+// the structured parties (PLAINTIFF/DEFENDANT) for qualificação, the signing lawyer
+// resolved from the matched OAB recipient, and any RAG chunks retrieved from the case
+// corpus (empty when the embedder is unconfigured or the corpus has no documents — the
+// degraded path).
 type DraftContext struct {
 	PieceType      string // DEFENSE|COMPLAINT|APPEAL|MOTION|OTHER
 	IntimationType string // CITACAO|INTIMACAO|COMUNICACAO…
@@ -116,6 +127,18 @@ type DraftContext struct {
 	JudgingBody string
 	// DeadlineDate is the prazo end date formatted as "2006-01-02", or empty when unknown.
 	DeadlineDate string
+
+	// Parties is the structured list of process parties loaded from the party table.
+	// Empty when case_id is unavailable or when the process has no seeded parties.
+	Parties []PartyCtx
+
+	// SigningLawyerName / SigningLawyerOAB / SigningLawyerUF are resolved from the
+	// first matched=true recipient in intimation.recipients. All empty when the
+	// intimation has no OAB-matched recipient (blank/processo draft or DJEN parse gap).
+	SigningLawyerName string
+	SigningLawyerOAB  string
+	SigningLawyerUF   string
+
 	// Chunks are the RAG top-K hits (text only). Empty → grounded=false (degraded).
 	Chunks   []string
 	Playbook string // always empty in v0
@@ -189,10 +212,11 @@ const summarizeProcessVersion = "process_summary/v1"
 
 // draftMinutaVersion is the pinned version of the draft_minuta template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
-// Bumped to v3: injeta dados reais (nº do processo, vara, tribunal, classe, assunto, prazo, teor da
-// intimação). O LLM agora tem contexto completo para preencher todos os campos da minuta sem
-// placeholders. Adicionada estrutura canônica por tipo de peça e instrução de usar os dados fornecidos.
-const draftMinutaVersion = "draft_minuta/v3"
+// Bumped to v4: injeta as PARTES estruturadas (party table) e o ADVOGADO SIGNATÁRIO (matched OAB
+// recipient) no prompt, eliminando os placeholders [Nome do Advogado]/OAB nº [número] e os nomes
+// de parte adivinhados do teor. Quando fornecidos, devem ser usados diretamente; marcadores só
+// quando genuinamente ausentes.
+const draftMinutaVersion = "draft_minuta/v4"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -266,10 +290,11 @@ func (*TemplateComposer) ComposeReview(agent string, c ReviewContext) (Composed,
 	}
 }
 
-// composeDraftMinuta renders the draft_minuta instruction-set (v3). The system message describes
+// composeDraftMinuta renders the draft_minuta instruction-set (v4). The system message describes
 // the legal writing role with the canonical structure and the gold rule (use real data, no
-// placeholders for provided fields). The user message carries the fully injected process context —
-// nº do processo, vara/órgão julgador, tribunal, classe, assunto, prazo, teor da intimação e
+// placeholders for provided fields, including structured parties and signing-lawyer OAB). The user
+// message carries the fully injected process context — nº do processo, vara/órgão julgador,
+// tribunal, classe, assunto, prazo, teor da intimação, partes estruturadas, advogado signatário e
 // trechos RAG — so the LLM has everything it needs to produce a complete, non-generic minuta.
 // Gerar produces ONLY draft_content — suggestions are a separate Revisar step (review_minuta agent).
 // The output schema lives with the caller (use case).
@@ -284,10 +309,13 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"placeholder (___, [assim], \"NOME DA PARTE\") para um dado que foi fornecido. Só use " +
 			"marcador [entre colchetes] quando o dado for genuinamente DESCONHECIDO (não fornecido no " +
 			"contexto). Se o tribunal, a vara (órgão julgador), o número do processo, a classe e o " +
-			"assunto foram dados, escreva-os. Extraia os NOMES DAS PARTES do teor da intimação quando " +
-			"presentes. O nome do advogado e o número da OAB NUNCA são fornecidos no contexto — use SEMPRE " +
-			"os marcadores literais [Nome do Advogado] e OAB/[UF] nº [número]; JAMAIS invente, preencha ou " +
-			"deduza um número de OAB.\n\n" +
+			"assunto foram dados, escreva-os.\n" +
+			"As PARTES do processo (autor/réu) e o ADVOGADO SIGNATÁRIO são fornecidos ESTRUTURADOS no " +
+			"contexto — USE-OS: os nomes das partes na qualificação/endereçamento conforme o papel " +
+			"(PLAINTIFF = autor/exequente/requerente; DEFENDANT = réu/executado/requerido); o advogado " +
+			"signatário (nome + OAB/UF fornecidos) no FECHO, substituindo os marcadores " +
+			"[Nome do Advogado]/[número]. Só use os marcadores se o advogado NÃO for fornecido. " +
+			"Prefira SEMPRE a parte estruturada ao que você extrairia do teor da intimação.\n\n" +
 
 			"ESTRUTURA CANÔNICA (nesta ordem, blocos separados por linha em branco):\n" +
 			"1) ENDEREÇAMENTO em CAIXA ALTA, adaptado ao foro: Vara Cível comum → " +
@@ -310,11 +338,13 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"7) \"III – DOS PEDIDOS\" (CAIXA ALTA): \"Ante o exposto, requer a Vossa Excelência:\" + " +
 			"alíneas a), b), c) (pedido certo e determinado, art. 322/324 CPC; inclua produção de provas " +
 			"e sucumbência quando cabível).\n" +
-			"8) FECHO: \"Nestes termos,\\nPede deferimento.\" + \"[Comarca]/[UF], [data].\" + " +
-			"\"[Nome do Advogado]\\nOAB/[UF] nº [número]\". A COMARCA você preenche do contexto, mas a DATA " +
-			"do fecho é SEMPRE o marcador literal [data] — a data de protocolo é definida pelo advogado ao " +
-			"assinar; NUNCA infira, calcule ou copie uma data do teor/prazo para o fecho. O prazo final, " +
-			"quando fornecido, é contexto (mencione nos fatos se relevante), não a data do fecho.\n\n" +
+			"8) FECHO: \"Nestes termos,\\nPede deferimento.\" + \"[Comarca]/[UF], [data].\" + assinatura " +
+			"do advogado. Quando o advogado signatário for fornecido no contexto, use exatamente: " +
+			"\"<Nome>\\nOAB/<UF> nº <oab>\". Quando não fornecido, use os marcadores literais " +
+			"\"[Nome do Advogado]\\nOAB/[UF] nº [número]\". JAMAIS invente, preencha ou deduza um número " +
+			"de OAB ausente. A COMARCA você preenche do contexto, mas a DATA do fecho é SEMPRE o marcador " +
+			"literal [data] — a data de protocolo é definida pelo advogado ao assinar; NUNCA infira, " +
+			"calcule ou copie uma data do teor/prazo para o fecho.\n\n" +
 
 			"REQUISITOS LEGAIS POR TIPO DE PEÇA:\n" +
 			"- PETIÇÃO INICIAL (COMPLAINT): art. 319 CPC (juízo, partes, causa de pedir, pedido, valor " +
@@ -337,7 +367,7 @@ func composeDraftMinuta(c DraftContext) Composed {
 		sys.WriteString(pb)
 	}
 
-	lines := make([]string, 0, 12)
+	lines := make([]string, 0, 16)
 	add := func(label, value string) {
 		if v := strings.TrimSpace(value); v != "" {
 			lines = append(lines, label+": "+v)
@@ -352,6 +382,26 @@ func composeDraftMinuta(c DraftContext) Composed {
 	add("Grau", c.Degree)
 	add("Tipo de intimação", c.IntimationType)
 	add("Prazo final", c.DeadlineDate)
+
+	// Inject structured parties (PLAINTIFF/DEFENDANT/THIRD_PARTY).
+	for _, p := range c.Parties {
+		label := roleLabel(p.Role)
+		value := p.Name
+		if p.Counsel != "" {
+			value += " (adv. " + p.Counsel + ")"
+		}
+		add(label, value)
+	}
+
+	// Inject signing lawyer when resolved from the matched OAB recipient.
+	if name := strings.TrimSpace(c.SigningLawyerName); name != "" || strings.TrimSpace(c.SigningLawyerOAB) != "" {
+		uf := c.SigningLawyerUF
+		if uf == "" {
+			uf = "??"
+		}
+		lines = append(lines, "Advogado signatário: "+c.SigningLawyerName+", OAB/"+uf+" nº "+c.SigningLawyerOAB)
+	}
+
 	add("TEOR DA INTIMAÇÃO", c.IntimationText)
 
 	if len(c.Chunks) > 0 {
@@ -373,6 +423,18 @@ func composeDraftMinuta(c DraftContext) Composed {
 	usr.WriteString("\n\nRedija a minuta completa da peça seguindo as instruções.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftMinutaVersion}
+}
+
+// roleLabel converts the DB party role to a Portuguese label for the prompt.
+func roleLabel(role string) string {
+	switch role {
+	case "PLAINTIFF":
+		return "Autor/Exequente/Requerente"
+	case "DEFENDANT":
+		return "Réu/Executado/Requerido"
+	default:
+		return "Terceiro"
+	}
 }
 
 // composeSuggestTasks renders the suggest_tasks instruction-set. The system message is the stable

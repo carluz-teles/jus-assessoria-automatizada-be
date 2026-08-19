@@ -2,6 +2,7 @@ package draft
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -278,6 +279,85 @@ func timeToTimestamptz(t time.Time) pgtype.Timestamptz {
 		return pgtype.Timestamptz{Valid: false}
 	}
 	return pgtype.Timestamptz{Time: t, Valid: true}
+}
+
+// ── Parties + signing-lawyer mappers ─────────────────────────────────────────
+
+// djenRecipientRaw is the JSON shape of one element in intimation.recipients.
+// It mirrors the djenRecipient struct in the acquisition slice without importing it
+// (same principle as reading court_record directly — slice independence).
+type djenRecipientRaw struct {
+	Name    string `json:"name"`
+	OAB     string `json:"oab"`
+	UF      string `json:"uf"`
+	Matched bool   `json:"matched"`
+}
+
+// signingLawyerFromRecipients parses intimation.recipients jsonb and returns the
+// first recipient with matched=true (our OAB, the signing lawyer). Returns a
+// zero-value SigningLawyer when recipients is empty, nil, or has no matched entry.
+func signingLawyerFromRecipients(raw []byte) SigningLawyer {
+	if len(raw) == 0 {
+		return SigningLawyer{}
+	}
+	var recs []djenRecipientRaw
+	if err := json.Unmarshal(raw, &recs); err != nil {
+		return SigningLawyer{}
+	}
+	for _, r := range recs {
+		if r.Matched {
+			return SigningLawyer{Name: r.Name, OAB: r.OAB, UF: r.UF}
+		}
+	}
+	return SigningLawyer{}
+}
+
+// counselInfoRaw is the JSON shape of one element in the counsels jsonb_agg text.
+type counselInfoRaw struct {
+	Name string `json:"name"`
+	OAB  string `json:"oab"`
+	UF   string `json:"uf"`
+}
+
+// partiesFromRows maps GetPartiesForDraft rows to []PartyInfo. The counsels column
+// is a jsonb_agg encoded as text; a decode failure returns an empty counsel string
+// (best-effort — a corrupt row should not crash the generation pipeline).
+func partiesFromRows(rows []draftdb.GetPartiesForDraftRow) []PartyInfo {
+	out := make([]PartyInfo, 0, len(rows))
+	for _, r := range rows {
+		counsel := firstCounselLabel(r.Counsels)
+		out = append(out, PartyInfo{
+			Role:    r.Role,
+			Name:    r.Name,
+			Counsel: counsel,
+		})
+	}
+	return out
+}
+
+// firstCounselLabel returns a short label for the first (alphabetically) advogado
+// aggregated under a party, formatted as "Name (OAB/UF nº oab)". Returns "" when
+// the counsels array is empty or cannot be decoded.
+func firstCounselLabel(counselsText string) string {
+	if counselsText == "" || counselsText == "[]" {
+		return ""
+	}
+	var recs []counselInfoRaw
+	if err := json.Unmarshal([]byte(counselsText), &recs); err != nil || len(recs) == 0 {
+		return ""
+	}
+	c := recs[0]
+	if c.Name == "" && c.OAB == "" {
+		return ""
+	}
+	if c.OAB == "" {
+		return c.Name
+	}
+	uf := c.UF
+	if uf == "" {
+		uf = "??"
+	}
+	return fmt.Sprintf("%s (OAB/%s nº %s)", c.Name, uf, c.OAB)
 }
 
 // ── Chat mappers (Fatia 3b) ──────────────────────────────────────────────────

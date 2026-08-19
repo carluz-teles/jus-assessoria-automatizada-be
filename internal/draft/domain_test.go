@@ -144,6 +144,12 @@ func (r *fakeRepo) DeleteReviewsForDraft(_ context.Context, _ database.Tx, _ str
 	return nil // no-op stub — domain_test.go covers Fatia 1–2 use cases
 }
 
+// GetPartiesForDraft stub — domain_test.go covers Fatia 1–2 use cases only;
+// parties are loaded by the generation pipeline (generate.go), not the Fatia 1 UseCase.
+func (r *fakeRepo) GetPartiesForDraft(_ context.Context, _ database.Tx, _, _ string) ([]PartyInfo, error) {
+	return []PartyInfo{}, nil
+}
+
 // ── Fatia 3b stubs (InsertChatMessage, GetChatThread) ────────────────────────
 // These stubs satisfy the Repository interface for existing tests that do not
 // exercise the chat use case.

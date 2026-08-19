@@ -59,15 +59,24 @@ type Querier interface {
 	GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) (GetDraftDetailRow, error)
 	// Load the intimation context needed to build a draft from source=intimation:
 	// the case_id (via court_record), the court_record_id, the type (for piece_type
-	// inference), and the rich context fields (content, process metadata, deadline)
-	// used to compose the AI generation prompt. Filtered by intimation.id and
-	// tenant_id (barrier 1 via court_record).
+	// inference), the rich context fields (content, process metadata, deadline)
+	// used to compose the AI generation prompt, and the recipients jsonb (for
+	// signing-lawyer resolution — matched=true recipient is our advogado). Filtered
+	// by intimation.id and tenant_id (barrier 1 via court_record).
 	// A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 	GetIntimationForDraft(ctx context.Context, arg GetIntimationForDraftParams) (GetIntimationForDraftRow, error)
 	// Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.
 	// Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.
 	// A draft with no reviews → pgx.ErrNoRows (the read model maps this to nil, not an error).
 	GetLatestReview(ctx context.Context, draftID uuid.UUID) (GetLatestReviewRow, error)
+	// Load the parties (autor/réu/terceiro) and their advogados for a given case,
+	// tenant-scoped (barrier 1). Used by the draft generation pipeline to inject
+	// structured party names and counsel info into the AI prompt — the draft slice
+	// reads party/party_counsel directly without importing the acquisition slice
+	// (same pattern as GetDraftDetail for court_record). counsels defaults to an
+	// empty jsonb array (never NULL) when a party has no advogado. Ordered by
+	// role then name for deterministic iteration.
+	GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraftParams) ([]GetPartiesForDraftRow, error)
 	// ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
 	// Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
 	// first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).

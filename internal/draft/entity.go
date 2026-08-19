@@ -73,6 +73,34 @@ type IntimationContext struct {
 	// DeadlineEndDate is the prazo end date formatted as "2006-01-02" (DateOnly),
 	// or empty string when no deadline has been derived for this intimation yet.
 	DeadlineEndDate string
+	// Recipients is the raw jsonb from intimation.recipients ([]djenRecipient shape).
+	// Parsed by the mapper to resolve the signing lawyer (matched=true recipient).
+	Recipients []byte
+}
+
+// PartyCounselInfo is one advogado aggregated under a party. OAB and UF are the
+// stable identity (as stored by the DJEN parser); Name may be empty when absent.
+type PartyCounselInfo struct {
+	Name string
+	OAB  string
+	UF   string
+}
+
+// PartyInfo is one party of the process with its aggregated counsels.
+// Role is the raw DB value (PLAINTIFF, DEFENDANT, THIRD_PARTY).
+type PartyInfo struct {
+	Role    string
+	Name    string
+	Counsel string // first counsel formatted as "Name (OAB/UF nº oab)", or "" when absent
+}
+
+// SigningLawyer is the OAB-matched advogado from intimation.recipients — the first
+// recipient flagged matched=true (our OAB, the signing lawyer for the peça).
+// All fields are empty strings when no matched recipient exists.
+type SigningLawyer struct {
+	Name string
+	OAB  string
+	UF   string
 }
 
 // PieceType closed set — the only values the edge accepts and the DB stores.

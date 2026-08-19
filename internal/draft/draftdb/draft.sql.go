@@ -446,6 +446,7 @@ SELECT
     cr.id               AS court_record_id,
     i.type              AS intimation_type,
     i.content           AS intimation_content,
+    i.recipients        AS recipients,
     cr.cnj_number       AS cnj_number,
     cr.court            AS court,
     cr.degree           AS degree,
@@ -470,6 +471,7 @@ type GetIntimationForDraftRow struct {
 	CourtRecordID     uuid.UUID   `json:"court_record_id"`
 	IntimationType    *string     `json:"intimation_type"`
 	IntimationContent string      `json:"intimation_content"`
+	Recipients        []byte      `json:"recipients"`
 	CnjNumber         string      `json:"cnj_number"`
 	Court             string      `json:"court"`
 	Degree            string      `json:"degree"`
@@ -481,9 +483,10 @@ type GetIntimationForDraftRow struct {
 
 // Load the intimation context needed to build a draft from source=intimation:
 // the case_id (via court_record), the court_record_id, the type (for piece_type
-// inference), and the rich context fields (content, process metadata, deadline)
-// used to compose the AI generation prompt. Filtered by intimation.id and
-// tenant_id (barrier 1 via court_record).
+// inference), the rich context fields (content, process metadata, deadline)
+// used to compose the AI generation prompt, and the recipients jsonb (for
+// signing-lawyer resolution — matched=true recipient is our advogado). Filtered
+// by intimation.id and tenant_id (barrier 1 via court_record).
 // A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 func (q *Queries) GetIntimationForDraft(ctx context.Context, arg GetIntimationForDraftParams) (GetIntimationForDraftRow, error) {
 	row := q.db.QueryRow(ctx, getIntimationForDraft, arg.ID, arg.TenantID)
@@ -494,6 +497,7 @@ func (q *Queries) GetIntimationForDraft(ctx context.Context, arg GetIntimationFo
 		&i.CourtRecordID,
 		&i.IntimationType,
 		&i.IntimationContent,
+		&i.Recipients,
 		&i.CnjNumber,
 		&i.Court,
 		&i.Degree,
@@ -543,6 +547,66 @@ func (q *Queries) GetLatestReview(ctx context.Context, draftID uuid.UUID) (GetLa
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const getPartiesForDraft = `-- name: GetPartiesForDraft :many
+SELECT p.id, p.role, p.name,
+       COALESCE(
+         (SELECT jsonb_agg(
+                   jsonb_build_object('name', pc.name, 'oab', pc.oab, 'uf', pc.uf)
+                   ORDER BY pc.name
+                 )
+          FROM party_counsel pc
+          WHERE pc.party_id = p.id),
+         '[]'::jsonb
+       )::text AS counsels
+FROM party p
+WHERE p.tenant_id = $1 AND p.case_id = $2
+ORDER BY p.role, p.name
+`
+
+type GetPartiesForDraftParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	CaseID   uuid.UUID `json:"case_id"`
+}
+
+type GetPartiesForDraftRow struct {
+	ID       uuid.UUID `json:"id"`
+	Role     string    `json:"role"`
+	Name     string    `json:"name"`
+	Counsels string    `json:"counsels"`
+}
+
+// Load the parties (autor/réu/terceiro) and their advogados for a given case,
+// tenant-scoped (barrier 1). Used by the draft generation pipeline to inject
+// structured party names and counsel info into the AI prompt — the draft slice
+// reads party/party_counsel directly without importing the acquisition slice
+// (same pattern as GetDraftDetail for court_record). counsels defaults to an
+// empty jsonb array (never NULL) when a party has no advogado. Ordered by
+// role then name for deterministic iteration.
+func (q *Queries) GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraftParams) ([]GetPartiesForDraftRow, error) {
+	rows, err := q.db.Query(ctx, getPartiesForDraft, arg.TenantID, arg.CaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetPartiesForDraftRow
+	for rows.Next() {
+		var i GetPartiesForDraftRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Role,
+			&i.Name,
+			&i.Counsels,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const insertChatMessage = `-- name: InsertChatMessage :one
