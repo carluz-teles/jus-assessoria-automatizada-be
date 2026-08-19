@@ -56,6 +56,31 @@ type IntimationCancelled struct {
 	Reason       string `json:"reason"`
 }
 
+// TypeDocketEntryObserved is the THIRD dotted id this slice CONSUMES: one newly landed
+// andamento (docket_entry). It drives the reconcile — a prazo histórico nasce MISSED apesar
+// de já haver petição/manifestação nos autos, so when a movimento de resposta lands we
+// resurrect the MISSED/OPEN prazo to MET. As with the intimation types, ONLY the const
+// crosses the boundary from acquisition; the payload SHAPE is redefined LOCALLY as
+// DocketEntryObserved below (this slice never imports the producer's struct). A round-trip
+// test (deadline_events_test.go) guards the shape. NOTE: this event has TWO consumers on two
+// asynq servers (notifications' aviso + this reconcile), so the relay FANS IT OUT to both the
+// "ingestao" and "deadline" queues (lib/events queuesFor) — a change made outside this slice.
+const TypeDocketEntryObserved = acquisition.TypeDocketEntryObserved
+
+// DocketEntryObserved is the LOCAL decode shape of acquisition.docket_entry_observed: the
+// exact subset the reconcile reads. It deliberately carries ONLY TenantID (RLS scope + dedup)
+// and CourtRecordID (the record whose MISSED/OPEN prazos we re-check) — NOT the producer's
+// DocketEntryID/Hash/SyncRunID nor the movimento's tpu_code/occurred_at. The reconcile does
+// NOT key off the single entry the event announces; it re-checks EVERY reconcilable prazo of
+// the court_record against ALL its response movements (read directly from docket_entry),
+// because the event does not carry the movimento's fields (decisão travada: não enriquecer o
+// payload — é contrato compartilhado com notifications). Base yields the event id for dedup.
+type DocketEntryObserved struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	CourtRecordID string `json:"court_record_id"`
+}
+
 // TypeDeadlineOpened is the dotted id this slice PRODUCES when a prazo is derived. Its
 // "deadline" prefix routes it to the ingestao/default work at the relay; downstream
 // slices (read models, reminders) consume it.

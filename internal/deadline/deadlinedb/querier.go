@@ -178,6 +178,16 @@ type Querier interface {
 	// display_status): concluidas = DONE; atrasadas = OPEN with due_date < today; em_execucao = OPEN,
 	// not yet due, with at least one done item; abertas = OPEN, not yet due, no done item. $1 = tenant_id.
 	GetTasksSummary(ctx context.Context, tenantID uuid.UUID) (GetTasksSummaryRow, error)
+	// Does the court_record hold an andamento de RESPOSTA on/after the prazo's start_date?
+	// The predicate the reconcile hangs on (docs): a movimento é resposta quando seu tpu_code
+	// está no conjunto de códigos de peça de resposta (@tpu_codes), OU — sem código TPU — quando
+	// o texto casa o regex de tipos de peça (petiç|manifest|contestaç|impugnaç|recurso|embargos|
+	// defesa). docket_entry has NO tenant_id of its own, so it is scoped by JOIN court_record +
+	// the explicit tenant filter (barrier 1) on top of RLS (barrier 2) — a movimento can never
+	// leak across tenants. occurred_at >= start_date anchors it to the contagem: a peça anterior
+	// ao início do prazo não o cumpre. Returns a bool (EXISTS), never (nil, nil). $1 =
+	// court_record_id, $2 = tenant_id, $3 = start_date, $4 = tpu_codes (int[]).
+	HasResponseMovement(ctx context.Context, arg HasResponseMovementParams) (bool, error)
 	// Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
 	// notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO row on a re-derivation, so
 	// the mapper reads pgx.ErrNoRows as "already exists" (ErrDeadlineExists) instead of
@@ -244,6 +254,17 @@ type Querier interface {
 	// historic column name, migration 0006) — the read model exposes it as intimation_id.
 	// confirmed collapses confirmed_by IS NOT NULL to a bool (was the prazo human-approved).
 	ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProcessoParams) ([]ListPrazosByProcessoRow, error)
+	// List the prazos of a court_record that are candidates for reconciliation by an
+	// andamento de resposta (docs: prazo histórico nascido MISSED apesar de já haver
+	// petição/manifestação nos autos). Scoped to (court_record_id, tenant_id) (barrier 1,
+	// on top of RLS barrier 2). ONLY status IN ('MISSED','OPEN') qualify — the reconcile
+	// resurrects a prazo dado por perdido/aberto, never a PENDING (unconfirmed suggestion),
+	// a MET (already done) nor a CANCELLED (revoked). Each row carries the id (to flip) and
+	// the fixed start_date the response-movement predicate compares occurred_at against — a
+	// movimento só cumpre o prazo se ocorreu em/depois do início da contagem. No rows → an
+	// empty slice (a record with no reconcilable prazo), never an error. $1 = court_record_id,
+	// $2 = tenant_id, both from the trusted event payload.
+	ListReconcilableDeadlines(ctx context.Context, arg ListReconcilableDeadlinesParams) ([]ListReconcilableDeadlinesRow, error)
 	// Selectable ?assignee values for the task agenda ("meus prazos"): the distinct
 	// responsáveis of the tenant's tasks, deduped by id, ordered by name (case-insensitive).
 	// The LEFT JOIN app_user resolves a name when the id is a known user (the column is a bare
@@ -293,6 +314,14 @@ type Querier interface {
 	// racing flip — a no-match (already transitioned) → pgx.ErrNoRows → typed not-found at the
 	// mapper. On a hit it returns the id so deadline.met/deadline.missed commits in the SAME tx.
 	MarkDeadlineStatus(ctx context.Context, arg MarkDeadlineStatusParams) (uuid.UUID, error)
+	// Reconcile a prazo MISSED/OPEN → MET, keyed by id and scoped to tenant_id (barrier 1). The
+	// `status IN ('MISSED','OPEN')` guard makes the flip SAFE and IDEMPOTENT (docs: só ressuscita
+	// um prazo dado por perdido/aberto): a redelivery, an already-MET/CANCELLED prazo, or a
+	// PENDING one updates NO row → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper, the
+	// use case's no-op (never a phantom deadline.met). On a hit it returns the id so deadline.met
+	// commits in the SAME tx. It mirrors MarkMissed's guarded-UPDATE shape, widened to the two
+	// reconcilable statuses. $1 = id, $2 = tenant_id, both from the trusted event payload.
+	MarkMet(ctx context.Context, arg MarkMetParams) (uuid.UUID, error)
 	// Auto-mark a prazo MISSED at the D+1 carência (deadline.missed_check fire path). Scoped to
 	// tenant_id (barrier 1). The `status = 'OPEN' AND end_date < CURRENT_DATE` guard makes the
 	// flip SAFE and IDEMPOTENT (decisão travada: MISSED auto D+1 SÓ em OPEN — nunca perder um

@@ -38,6 +38,25 @@ type mockRepo struct {
 	markMissedID  string
 	markMissedErr error
 
+	// docket-entry reconcile path
+	reconcilable       []ReconcilableDeadline
+	reconcilableErr    error
+	hasResponse        bool
+	hasResponseErr     error
+	hasResponseByStart map[string]bool  // keyed by start_date (time.DateOnly) → per-prazo override
+	markMetID          string           // returned id when no per-id override; defaults to the input id
+	markMetErr         error            // blanket MarkMet error
+	markMetErrByID     map[string]error // per-deadline-id MarkMet error (e.g. racing flip → ErrDeadlineNotFound)
+	gotReconcileRecord string
+	gotReconcileTenant string
+	reconcilableCalls  int
+	gotHasRespRecord   string
+	gotHasRespTenant   string
+	gotHasRespCodes    []int32
+	hasResponseCalls   int
+	markMetIDs         []string
+	markMetTenantIDs   []string
+
 	// confirm path
 	confirmAnchor    *DeadlineForConfirm
 	confirmAnchorErr error
@@ -217,6 +236,53 @@ func (m *mockRepo) MarkMissed(_ context.Context, _ database.Tx, deadlineID, tena
 	m.gotMissedID = deadlineID
 	m.gotMissedTenantID = tenantID
 	return m.markMissedID, m.markMissedErr
+}
+
+// ListReconcilableDeadlines returns the configured MISSED/OPEN prazos and records the (record,
+// tenant) scoping so a reconcile test can assert the 2-barrier key.
+func (m *mockRepo) ListReconcilableDeadlines(_ context.Context, _ database.Tx, courtRecordID, tenantID string) ([]ReconcilableDeadline, error) {
+	m.reconcilableCalls++
+	m.gotReconcileRecord = courtRecordID
+	m.gotReconcileTenant = tenantID
+	return m.reconcilable, m.reconcilableErr
+}
+
+// HasResponseMovement returns the configured predicate result — a per-prazo override keyed by
+// start_date when set, else the blanket hasResponse — and records the (record, tenant, tpuCodes)
+// it was asked, so a test can assert the predicate scoping and the tpu code set.
+func (m *mockRepo) HasResponseMovement(_ context.Context, _ database.Tx, courtRecordID, tenantID string, startDate time.Time, tpuCodes []int32) (bool, error) {
+	m.hasResponseCalls++
+	m.gotHasRespRecord = courtRecordID
+	m.gotHasRespTenant = tenantID
+	m.gotHasRespCodes = tpuCodes
+	if m.hasResponseErr != nil {
+		return false, m.hasResponseErr
+	}
+	if m.hasResponseByStart != nil {
+		if v, ok := m.hasResponseByStart[startDate.Format(time.DateOnly)]; ok {
+			return v, nil
+		}
+	}
+	return m.hasResponse, nil
+}
+
+// MarkMet echoes the reconciled id (or a per-id/blanket error) and records every (id, tenant)
+// it flipped, so a test can assert the guarded MET flip ran per matching prazo.
+func (m *mockRepo) MarkMet(_ context.Context, _ database.Tx, deadlineID, tenantID string) (string, error) {
+	m.markMetIDs = append(m.markMetIDs, deadlineID)
+	m.markMetTenantIDs = append(m.markMetTenantIDs, tenantID)
+	if m.markMetErrByID != nil {
+		if err, ok := m.markMetErrByID[deadlineID]; ok {
+			return "", err
+		}
+	}
+	if m.markMetErr != nil {
+		return "", m.markMetErr
+	}
+	if m.markMetID != "" {
+		return m.markMetID, nil
+	}
+	return deadlineID, nil
 }
 
 func (m *mockRepo) GetDeadlineForConfirm(_ context.Context, _ database.Tx, intimationID, tenantID string) (*DeadlineForConfirm, error) {
@@ -1114,6 +1180,290 @@ func TestOnIntimationCancelled_InfraErrorPropagates(t *testing.T) {
 	}
 	if len(outbox.published) != 0 {
 		t.Errorf("published events = %d, want 0 on error", len(outbox.published))
+	}
+}
+
+// docketFixture builds a well-formed docket_entry_observed for the reconcile path; tests
+// override the fields they exercise.
+func docketFixture() DocketEntryObserved {
+	return DocketEntryObserved{
+		Base:          events.Base{EventID: uuid.NewString(), Aggregate: uuid.NewString()},
+		TenantID:      uuid.NewString(),
+		CourtRecordID: uuid.NewString(),
+	}
+}
+
+// TestOnDocketEntryObserved_MissedReconciledToMet is case (a): a MISSED prazo whose
+// court_record holds a response movement after its start_date is flipped to MET and emits
+// exactly one deadline.met (aggregate = the reconciled deadline id). The predicate got the
+// event's record/tenant + the response TPU code set.
+func TestOnDocketEntryObserved_MissedReconciledToMet(t *testing.T) {
+	ev := docketFixture()
+	deadlineID := uuid.NewString()
+	start := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{
+		reconcilable: []ReconcilableDeadline{{ID: deadlineID, StartDate: start}},
+		hasResponse:  true,
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnDocketEntryObserved() error = %v", err)
+	}
+
+	// The list + predicate ran scoped to the event's record/tenant (barrier 1).
+	if repo.gotReconcileRecord != ev.CourtRecordID || repo.gotReconcileTenant != ev.TenantID {
+		t.Errorf("list scope record/tenant = %q/%q, want %q/%q",
+			repo.gotReconcileRecord, repo.gotReconcileTenant, ev.CourtRecordID, ev.TenantID)
+	}
+	if repo.gotHasRespRecord != ev.CourtRecordID || repo.gotHasRespTenant != ev.TenantID {
+		t.Errorf("predicate scope record/tenant = %q/%q", repo.gotHasRespRecord, repo.gotHasRespTenant)
+	}
+	// The predicate carries the fixed response TPU code set.
+	if len(repo.gotHasRespCodes) != len(responseTPUCodes) {
+		t.Errorf("tpu codes = %v, want %v", repo.gotHasRespCodes, responseTPUCodes)
+	}
+	// The prazo was flipped MET.
+	if len(repo.markMetIDs) != 1 || repo.markMetIDs[0] != deadlineID {
+		t.Errorf("MarkMet ids = %v, want [%q]", repo.markMetIDs, deadlineID)
+	}
+	if repo.markMetTenantIDs[0] != ev.TenantID {
+		t.Errorf("MarkMet tenant = %q, want %q", repo.markMetTenantIDs[0], ev.TenantID)
+	}
+
+	// Exactly one deadline.met, aggregate = the reconciled deadline id (a uuid).
+	mets := publishedOfType[DeadlineMet](outbox)
+	if len(mets) != 1 {
+		t.Fatalf("deadline.met events = %d, want 1", len(mets))
+	}
+	met := mets[0]
+	if met.Type() != TypeDeadlineMet || met.AggregateType() != aggregateTypeDeadline {
+		t.Errorf("event type/aggregate = %q/%q", met.Type(), met.AggregateType())
+	}
+	if met.DeadlineID != deadlineID || met.TenantID != ev.TenantID {
+		t.Errorf("met deadline/tenant = %q/%q, want %q/%q", met.DeadlineID, met.TenantID, deadlineID, ev.TenantID)
+	}
+	if _, err := uuid.Parse(met.AggregateID()); err != nil {
+		t.Errorf("aggregate id is not a uuid: %v", err)
+	}
+}
+
+// TestOnDocketEntryObserved_OpenReconciledToMet is case (b): an OPEN prazo (not just MISSED)
+// with a response movement is likewise flipped to MET + emits deadline.met — the reconcile
+// resurrects both reconcilable statuses.
+func TestOnDocketEntryObserved_OpenReconciledToMet(t *testing.T) {
+	ev := docketFixture()
+	deadlineID := uuid.NewString()
+
+	// The mock does not model status (the guarded MarkMet does), but the caller only lists
+	// MISSED/OPEN — so an OPEN prazo reaching MarkMet is exactly this case.
+	repo := &mockRepo{
+		reconcilable: []ReconcilableDeadline{{ID: deadlineID, StartDate: time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)}},
+		hasResponse:  true,
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnDocketEntryObserved() error = %v", err)
+	}
+	if len(repo.markMetIDs) != 1 || repo.markMetIDs[0] != deadlineID {
+		t.Errorf("MarkMet ids = %v, want [%q]", repo.markMetIDs, deadlineID)
+	}
+	if got := len(publishedOfType[DeadlineMet](outbox)); got != 1 {
+		t.Errorf("deadline.met events = %d, want 1", got)
+	}
+}
+
+// TestOnDocketEntryObserved_NoResponseNoOp is case (c): a reconcilable prazo with NO response
+// movement is left untouched — no MarkMet, no deadline.met.
+func TestOnDocketEntryObserved_NoResponseNoOp(t *testing.T) {
+	ev := docketFixture()
+	repo := &mockRepo{
+		reconcilable: []ReconcilableDeadline{{ID: uuid.NewString(), StartDate: time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)}},
+		hasResponse:  false,
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnDocketEntryObserved() error = %v", err)
+	}
+	if repo.hasResponseCalls != 1 {
+		t.Errorf("HasResponseMovement calls = %d, want 1", repo.hasResponseCalls)
+	}
+	if len(repo.markMetIDs) != 0 {
+		t.Errorf("MarkMet calls = %v, want none (no response)", repo.markMetIDs)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 (no response)", len(outbox.published))
+	}
+}
+
+// TestOnDocketEntryObserved_MarkMetGuardNoOp is case (d): the guarded MarkMet touches no row
+// (a racing flip already moved the prazo out of MISSED/OPEN → ErrDeadlineNotFound). The
+// reconcile treats it as a per-prazo no-op: no deadline.met, no error, keeps going.
+func TestOnDocketEntryObserved_MarkMetGuardNoOp(t *testing.T) {
+	ev := docketFixture()
+	racedID := uuid.NewString()
+	repo := &mockRepo{
+		reconcilable:   []ReconcilableDeadline{{ID: racedID, StartDate: time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)}},
+		hasResponse:    true,
+		markMetErrByID: map[string]error{racedID: ErrDeadlineNotFound},
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnDocketEntryObserved() error = %v, want nil (guarded no-op)", err)
+	}
+	if len(repo.markMetIDs) != 1 {
+		t.Errorf("MarkMet calls = %d, want 1 (attempted the flip)", len(repo.markMetIDs))
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 (0 rows flipped)", len(outbox.published))
+	}
+}
+
+// TestOnDocketEntryObserved_NoReconcilableNoOp is case (e): a court_record with NO MISSED/OPEN
+// prazo (all PENDING/MET/CANCELLED) reconciles nothing — the predicate is never even asked.
+// The MISSED/OPEN-only filter lives in the query (ListReconcilableDeadlines), so a PENDING or
+// CANCELLED prazo simply never appears in the reconcilable set the use case iterates.
+func TestOnDocketEntryObserved_NoReconcilableNoOp(t *testing.T) {
+	ev := docketFixture()
+	repo := &mockRepo{reconcilable: nil} // no MISSED/OPEN prazo for the record
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnDocketEntryObserved() error = %v", err)
+	}
+	if repo.reconcilableCalls != 1 {
+		t.Errorf("ListReconcilableDeadlines calls = %d, want 1", repo.reconcilableCalls)
+	}
+	if repo.hasResponseCalls != 0 {
+		t.Errorf("HasResponseMovement calls = %d, want 0 (nothing to reconcile)", repo.hasResponseCalls)
+	}
+	if len(repo.markMetIDs) != 0 || len(outbox.published) != 0 {
+		t.Errorf("MarkMet/published = %v/%d, want none", repo.markMetIDs, len(outbox.published))
+	}
+}
+
+// TestOnDocketEntryObserved_Idempotent is case (f): a replay (dedup reports seen) is a pure
+// no-op — no list, no predicate, no flip, no event. It dedups under the SEPARATE
+// consumerReconcile name (NOT consumerDeadline), so the reconcile has its own
+// processed_event floor independent of the creation/revocation consumer.
+func TestOnDocketEntryObserved_Idempotent(t *testing.T) {
+	ev := docketFixture()
+	repo := &mockRepo{
+		reconcilable: []ReconcilableDeadline{{ID: uuid.NewString(), StartDate: time.Now()}},
+		hasResponse:  true,
+	}
+	outbox := &fakeOutbox{}
+	dedup := &fakeDedup{seen: true}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, dedup, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnDocketEntryObserved() error = %v", err)
+	}
+	if repo.reconcilableCalls != 0 {
+		t.Errorf("ListReconcilableDeadlines calls = %d, want 0 on a replay", repo.reconcilableCalls)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on a replay", len(outbox.published))
+	}
+	// It dedups under the reconcile-specific consumer name, NOT the deadline creation one.
+	if len(dedup.consumers) != 1 || dedup.consumers[0] != consumerReconcile {
+		t.Errorf("dedup consumer = %v, want [%q]", dedup.consumers, consumerReconcile)
+	}
+	if consumerReconcile == consumerDeadline {
+		t.Error("reconcile must dedup under a DISTINCT consumer name from the creation path")
+	}
+}
+
+// TestOnDocketEntryObserved_MultiplePrazos proves the reconcile re-checks EVERY MISSED/OPEN
+// prazo of the court_record (not just one): given two reconcilable prazos where only one has a
+// response movement (per-start_date predicate override), exactly that one is flipped to MET and
+// emits deadline.met — the other is left untouched.
+func TestOnDocketEntryObserved_MultiplePrazos(t *testing.T) {
+	ev := docketFixture()
+	metID := uuid.NewString()
+	keepID := uuid.NewString()
+	metStart := time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)
+	keepStart := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{
+		reconcilable: []ReconcilableDeadline{
+			{ID: metID, StartDate: metStart},
+			{ID: keepID, StartDate: keepStart},
+		},
+		// Only the earlier prazo has a response movement on/after its start_date.
+		hasResponseByStart: map[string]bool{
+			metStart.Format(time.DateOnly):  true,
+			keepStart.Format(time.DateOnly): false,
+		},
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnDocketEntryObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnDocketEntryObserved() error = %v", err)
+	}
+	if repo.hasResponseCalls != 2 {
+		t.Errorf("HasResponseMovement calls = %d, want 2 (both prazos re-checked)", repo.hasResponseCalls)
+	}
+	if len(repo.markMetIDs) != 1 || repo.markMetIDs[0] != metID {
+		t.Errorf("MarkMet ids = %v, want only [%q]", repo.markMetIDs, metID)
+	}
+	mets := publishedOfType[DeadlineMet](outbox)
+	if len(mets) != 1 || mets[0].DeadlineID != metID {
+		t.Errorf("deadline.met = %v, want one for %q", mets, metID)
+	}
+}
+
+// TestOnDocketEntryObserved_InfraErrorPropagates proves an infra fault (from the list or the
+// predicate) aborts the tx (retryable) and emits nothing — only ErrDeadlineNotFound from
+// MarkMet is a per-prazo no-op.
+func TestOnDocketEntryObserved_InfraErrorPropagates(t *testing.T) {
+	infra := apperr.NewInfra("db down", errors.New("boom"))
+	tests := []struct {
+		name   string
+		mutate func(r *mockRepo)
+	}{
+		{
+			name:   "list fails → propagate",
+			mutate: func(r *mockRepo) { r.reconcilableErr = infra },
+		},
+		{
+			name: "predicate fails → propagate",
+			mutate: func(r *mockRepo) {
+				r.reconcilable = []ReconcilableDeadline{{ID: uuid.NewString(), StartDate: time.Now()}}
+				r.hasResponseErr = infra
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := docketFixture()
+			repo := &mockRepo{}
+			tt.mutate(repo)
+			outbox := &fakeOutbox{}
+			uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+			err := uc.OnDocketEntryObserved(context.Background(), ev)
+			if err == nil {
+				t.Fatal("expected an error to propagate")
+			}
+			ae, ok := apperr.From(err)
+			if !ok || ae.Kind != apperr.KindInfra {
+				t.Errorf("error kind = %v, want KindInfra", err)
+			}
+			if len(outbox.published) != 0 {
+				t.Errorf("published events = %d, want 0 on error", len(outbox.published))
+			}
+		})
 	}
 }
 
