@@ -47,6 +47,11 @@ type GradeParams struct {
 	Secrecy       string
 	Completeness  float32
 	NextSyncAt    time.Time
+	// Lifecycle is the process-liveness state derived from DATAJUD movimentos by
+	// lifecycleFromMovimentos. The SQL UPDATE uses CASE to ensure an already-SUPERSEDED
+	// row is never downgraded to ACTIVE/ARCHIVED/SUSPENDED: superseding is a structural
+	// merge operation, not a lifecycle transition, and must be preserved.
+	Lifecycle string
 }
 
 // enrichRepo is the narrow persistence port the enrichment use case drives: grading
@@ -208,6 +213,9 @@ func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecord
 			// Seeds the re-poll schedule when the row has none yet (COALESCE keeps an
 			// existing schedule, so the scheduler's claim owns re-scheduling afterward).
 			NextSyncAt: uc.now().Add(defaultSyncInterval),
+			// Lifecycle derived from movimentos; the SQL guards SUPERSEDED (never
+			// downgrades it). Falls back to ACTIVE when graded.Lifecycle is empty.
+			Lifecycle: graded.Lifecycle,
 		})
 		if err != nil {
 			return err

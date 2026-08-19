@@ -158,3 +158,101 @@ func TestSecrecyFromNivel(t *testing.T) {
 		}
 	}
 }
+
+// TestLifecycleFromMovimentos verifies the conservative lifecycle derivation from
+// DATAJUD movimentos: terminal code (22) → ARCHIVED, suspension code (25) as
+// the latest → SUSPENDED, no signal → ACTIVE, and an empty list → ACTIVE.
+// The SUPERSEDED guard (never-downgrade) is tested in enrichment_test.go because it
+// lives in the SQL layer, not in this function.
+func TestLifecycleFromMovimentos(t *testing.T) {
+	t.Parallel()
+
+	mov := func(codigo int, dataHora string) datajudMovimento {
+		return datajudMovimento{Codigo: codigo, Nome: "test", DataHora: dataHora}
+	}
+
+	tests := []struct {
+		name string
+		movs []datajudMovimento
+		want string
+	}{
+		{
+			name: "empty list → ACTIVE (safe default)",
+			movs: nil,
+			want: LifecycleActive,
+		},
+		{
+			name: "only unknown codes → ACTIVE",
+			movs: []datajudMovimento{
+				mov(123, "2026-01-10T00:00:00Z"),
+				mov(456, "2026-01-09T00:00:00Z"),
+			},
+			want: LifecycleActive,
+		},
+		{
+			name: "terminal code 22 as the only movement → ARCHIVED",
+			movs: []datajudMovimento{
+				mov(22, "2026-03-01T00:00:00Z"),
+			},
+			want: LifecycleArchived,
+		},
+		{
+			name: "terminal code 22 present but not most recent → ARCHIVED (terminal wins)",
+			movs: []datajudMovimento{
+				mov(123, "2026-05-01T00:00:00Z"), // more recent procedural step
+				mov(22, "2026-01-01T00:00:00Z"),  // terminal
+			},
+			want: LifecycleArchived,
+		},
+		{
+			name: "suspension code 25 is the most recent movement → SUSPENDED",
+			movs: []datajudMovimento{
+				mov(25, "2026-04-01T00:00:00Z"), // suspension — most recent
+				mov(123, "2026-01-01T00:00:00Z"),
+			},
+			want: LifecycleSuspended,
+		},
+		{
+			name: "suspension code 25 not the most recent movement → ACTIVE (process resumed)",
+			movs: []datajudMovimento{
+				mov(123, "2026-05-01T00:00:00Z"), // later procedural step = process resumed
+				mov(25, "2026-01-01T00:00:00Z"),  // suspension — but older
+			},
+			want: LifecycleActive,
+		},
+		{
+			name: "terminal code beats suspension (terminal wins the walk)",
+			movs: []datajudMovimento{
+				mov(25, "2026-05-01T00:00:00Z"), // suspension — most recent
+				mov(22, "2026-01-01T00:00:00Z"), // terminal — older
+			},
+			want: LifecycleArchived,
+		},
+		{
+			name: "unparseable dataHora is skipped; remaining signal respected",
+			movs: []datajudMovimento{
+				mov(22, "not-a-date"),            // skipped
+				mov(123, "2026-01-01T00:00:00Z"), // only parseable: ACTIVE
+			},
+			want: LifecycleActive,
+		},
+		{
+			name: "all unparseable dataHora → ACTIVE (empty valid list)",
+			movs: []datajudMovimento{
+				mov(22, "bad"),
+				mov(25, "also-bad"),
+			},
+			want: LifecycleActive,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := lifecycleFromMovimentos(tt.movs)
+			if got != tt.want {
+				t.Errorf("lifecycleFromMovimentos(...) = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

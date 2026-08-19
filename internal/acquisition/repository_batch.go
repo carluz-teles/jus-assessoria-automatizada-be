@@ -54,6 +54,11 @@ type markSyncedRowJSON struct {
 	Completeness float32   `json:"completeness"`
 	NextSyncAt   time.Time `json:"next_sync_at"`
 	JudgingBody  *string   `json:"judging_body"`
+	// Class and Subject propagate tribunal corrections on re-sync. Empty string is
+	// intentional when the source omits them: the SQL NULLIF('', cr.class) falls
+	// back to the existing value, so a non-disclosure never clobbers a real value.
+	Class   string `json:"class"`
+	Subject string `json:"subject"`
 }
 
 // BatchUpsertCourtRecords resolves-or-creates every record of a window in a handful of
@@ -161,6 +166,8 @@ func (r *pgRepository) BatchUpsertCourtRecords(ctx context.Context, tx database.
 				Completeness: p.Completeness,
 				NextSyncAt:   p.NextSyncAt,
 				JudgingBody:  strPtrOrNil(p.JudgingBody),
+				Class:        p.Class,
+				Subject:      p.Subject,
 			})
 			resolved[k] = newCourtRecordEntity(idByKey[k], caseByKey[k], p)
 		}

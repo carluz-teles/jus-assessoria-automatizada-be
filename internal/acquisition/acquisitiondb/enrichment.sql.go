@@ -66,8 +66,12 @@ UPDATE court_record SET
     filed_at = $6,
     secrecy = $7,
     completeness = $8,
-    next_sync_at = COALESCE(next_sync_at, $9)
-WHERE id = $10 AND tenant_id = $11
+    next_sync_at = COALESCE(next_sync_at, $9),
+    lifecycle = CASE
+        WHEN lifecycle = 'SUPERSEDED' THEN lifecycle
+        ELSE COALESCE(NULLIF($10, ''), lifecycle)
+    END
+WHERE id = $11 AND tenant_id = $12
 RETURNING id, case_id
 `
 
@@ -81,6 +85,7 @@ type UpdateCourtRecordGradeParams struct {
 	Secrecy       string             `json:"secrecy"`
 	Completeness  float32            `json:"completeness"`
 	NextSyncAt    pgtype.Timestamptz `json:"next_sync_at"`
+	Lifecycle     string             `json:"lifecycle"`
 	CourtRecordID uuid.UUID          `json:"court_record_id"`
 	TenantID      uuid.UUID          `json:"tenant_id"`
 }
@@ -126,6 +131,7 @@ func (q *Queries) UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRec
 		arg.Secrecy,
 		arg.Completeness,
 		arg.NextSyncAt,
+		arg.Lifecycle,
 		arg.CourtRecordID,
 		arg.TenantID,
 	)

@@ -336,3 +336,68 @@ func TestParsePartiesCounselOnlyPlaceholder(t *testing.T) {
 // TestUFFromTribunal moved to pkg/tribunal (TestUF) with the registry relocation —
 // UF derivation is reference data shared by acquisition and deadline, so it lives in
 // /pkg now (Regra nº1: one source of truth, two consumers).
+
+// TestDJENTypeRobustness verifies the improved djenType matching:
+//   - "REINTIMAÇÃO" (Contains("INTIMA")) → INTIMACAO
+//   - prefix-based "CITA" match avoids false positives from mid-string occurrence
+func TestDJENTypeRobustness(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		// Contains("INTIMA") covers re-notifications correctly.
+		{"Reintimação", IntimationTypeIntimacao},
+		{"REINTIMACAO", IntimationTypeIntimacao},
+		{"Intimação Eletrônica", IntimationTypeIntimacao},
+		// HasPrefix("CITA") avoids the mid-string false-positive.
+		{"Citação Eletrônica", IntimationTypeCitacao},
+		// A type with "CITA" mid-string must NOT classify as citação.
+		{"Notificação de Citação", IntimationTypeComunicacao},
+		// Generic fallback.
+		{"Edital", IntimationTypeComunicacao},
+		{"Comunicação", IntimationTypeComunicacao},
+		{"AlgoDesconhecido", IntimationTypeComunicacao},
+		// Empty string → COMUNICACAO (no warn emitted).
+		{"", IntimationTypeComunicacao},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			t.Parallel()
+			if got := djenType(tt.in); got != tt.want {
+				t.Errorf("djenType(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPartyRoleFromPoloUnknown verifies that an unrecognized polo returns THIRD_PARTY
+// (the safe fallback) even when the polo is non-empty. The slog.Warn is a side effect
+// that cannot be asserted in unit tests without a custom handler, but the behavior
+// (return value) is the observable contract.
+func TestPartyRoleFromPoloUnknown(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		polo string
+		want string
+	}{
+		{"A", PartyRolePlaintiff},
+		{"a", PartyRolePlaintiff}, // case-insensitive
+		{"P", PartyRoleDefendant},
+		{"p", PartyRoleDefendant},
+		{"", PartyRoleThirdParty},   // empty → THIRD_PARTY (no warn)
+		{"X", PartyRoleThirdParty},  // unknown → THIRD_PARTY (warn emitted)
+		{"T", PartyRoleThirdParty},  // unknown
+		{"AB", PartyRoleThirdParty}, // unknown multi-char
+	}
+	for _, tt := range tests {
+		t.Run(tt.polo, func(t *testing.T) {
+			t.Parallel()
+			if got := partyRoleFromPolo(tt.polo); got != tt.want {
+				t.Errorf("partyRoleFromPolo(%q) = %q, want %q", tt.polo, got, tt.want)
+			}
+		})
+	}
+}

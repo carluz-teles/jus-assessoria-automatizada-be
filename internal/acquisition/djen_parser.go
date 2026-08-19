@@ -261,13 +261,25 @@ func parsedCounsels(advs []djenAdvogadoLink) []ParsedCounsel {
 
 // partyRoleFromPolo maps a DJEN destinatário polo to the party role enum: "A" (ativo =
 // autor) → PLAINTIFF, "P" (passivo = réu) → DEFENDANT, anything else → THIRD_PARTY.
+// An unexpected polo value is logged at Warn level so DJEN schema changes (new polo
+// codes, typos) surface in logs and can be added to the switch rather than silently
+// creating phantom THIRD_PARTY entries. The THIRD_PARTY fallback is preserved so the
+// party is never dropped.
 func partyRoleFromPolo(polo string) string {
-	switch strings.ToUpper(strings.TrimSpace(polo)) {
+	normalized := strings.ToUpper(strings.TrimSpace(polo))
+	switch normalized {
 	case "A":
 		return PartyRolePlaintiff
 	case "P":
 		return PartyRoleDefendant
 	default:
+		if normalized != "" {
+			// A non-empty, unrecognized polo is a data quality signal: the DJEN may have
+			// introduced a new polo code or there is a typo in the payload. Log it so it
+			// can be added to the switch above.
+			slog.Warn("djen: unrecognized polo value; defaulting to THIRD_PARTY",
+				"polo", polo)
+		}
 		return PartyRoleThirdParty
 	}
 }
@@ -420,14 +432,31 @@ func djenRecipients(advs []djenAdvogadoLink, watched map[string]bool) json.RawMe
 // "Edital", "Comunicação") to the intimation type enum. Anything that is not an
 // intimação or citação (Edital included) counts as a generic COMUNICACAO, so the
 // deadline slice's counting rule sees only the three kinds it knows.
+//
+// Matching strategy (conservative):
+//   - Contains("INTIMA"): catches "Intimação", "REINTIMAÇÃO", "Intimação Eletrônica".
+//     Contains is appropriate here because "INTIMA" is a distinctive root that does
+//     not appear as a substring of unrelated types.
+//   - HasPrefix("CITA"): catches "Citação", "Citação Eletrônica" but NOT a future
+//     type like "NOTIFICAÇÃO DE CITAÇÃO" that contains "CITA" only mid-string.
+//     HasPrefix is safer than Contains for this root.
+//
+// An unrecognized tipo is logged at Warn so new DJEN communication types surface
+// in observability and can be explicitly mapped. Behavior is unchanged: COMUNICACAO.
 func djenType(tipo string) string {
 	t := strings.ToUpper(strings.TrimSpace(tipo))
 	switch {
 	case strings.Contains(t, "INTIMA"):
 		return IntimationTypeIntimacao
-	case strings.Contains(t, "CITA"):
+	case strings.HasPrefix(t, "CITA"):
 		return IntimationTypeCitacao
 	default:
+		if tipo != "" {
+			// An unrecognized tipo defaults to COMUNICACAO (the safe generic bucket).
+			// Log it so new DJEN communication types can be mapped explicitly.
+			slog.Warn("djen: unrecognized tipoComunicacao; defaulting to COMUNICACAO",
+				"tipo_comunicacao", tipo)
+		}
 		return IntimationTypeComunicacao
 	}
 }
