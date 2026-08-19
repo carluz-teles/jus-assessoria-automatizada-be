@@ -444,6 +444,52 @@ func (q *Queries) GetTaskItemForUpdate(ctx context.Context, arg GetTaskItemForUp
 	return i, err
 }
 
+const hasResponseMovement = `-- name: HasResponseMovement :one
+SELECT EXISTS (
+    SELECT 1
+    FROM docket_entry de
+    JOIN court_record cr ON cr.id = de.court_record_id
+    WHERE cr.id = $1
+      AND cr.tenant_id = $2
+      AND de.occurred_at >= $3
+      AND (
+        de.tpu_code = ANY($4::int[])
+        OR (
+          de.tpu_code IS NULL
+          AND de.text ~* 'petiç|manifest|contestaç|impugnaç|recurso|embargos|defesa'
+        )
+      )
+) AS has_response
+`
+
+type HasResponseMovementParams struct {
+	ID         uuid.UUID          `json:"id"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+	TpuCodes   []int32            `json:"tpu_codes"`
+}
+
+// Does the court_record hold an andamento de RESPOSTA on/after the prazo's start_date?
+// The predicate the reconcile hangs on (docs): a movimento é resposta quando seu tpu_code
+// está no conjunto de códigos de peça de resposta (@tpu_codes), OU — sem código TPU — quando
+// o texto casa o regex de tipos de peça (petiç|manifest|contestaç|impugnaç|recurso|embargos|
+// defesa). docket_entry has NO tenant_id of its own, so it is scoped by JOIN court_record +
+// the explicit tenant filter (barrier 1) on top of RLS (barrier 2) — a movimento can never
+// leak across tenants. occurred_at >= start_date anchors it to the contagem: a peça anterior
+// ao início do prazo não o cumpre. Returns a bool (EXISTS), never (nil, nil). $1 =
+// court_record_id, $2 = tenant_id, $3 = start_date, $4 = tpu_codes (int[]).
+func (q *Queries) HasResponseMovement(ctx context.Context, arg HasResponseMovementParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasResponseMovement,
+		arg.ID,
+		arg.TenantID,
+		arg.OccurredAt,
+		arg.TpuCodes,
+	)
+	var has_response bool
+	err := row.Scan(&has_response)
+	return has_response, err
+}
+
 const insertDeadline = `-- name: InsertDeadline :one
 INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
@@ -639,6 +685,54 @@ func (q *Queries) InsertTaskSuggestion(ctx context.Context, arg InsertTaskSugges
 	return id, err
 }
 
+const listReconcilableDeadlines = `-- name: ListReconcilableDeadlines :many
+SELECT id, start_date
+FROM deadline
+WHERE court_record_id = $1
+  AND tenant_id = $2
+  AND status IN ('MISSED', 'OPEN')
+`
+
+type ListReconcilableDeadlinesParams struct {
+	CourtRecordID uuid.UUID `json:"court_record_id"`
+	TenantID      uuid.UUID `json:"tenant_id"`
+}
+
+type ListReconcilableDeadlinesRow struct {
+	ID        uuid.UUID   `json:"id"`
+	StartDate pgtype.Date `json:"start_date"`
+}
+
+// List the prazos of a court_record that are candidates for reconciliation by an
+// andamento de resposta (docs: prazo histórico nascido MISSED apesar de já haver
+// petição/manifestação nos autos). Scoped to (court_record_id, tenant_id) (barrier 1,
+// on top of RLS barrier 2). ONLY status IN ('MISSED','OPEN') qualify — the reconcile
+// resurrects a prazo dado por perdido/aberto, never a PENDING (unconfirmed suggestion),
+// a MET (already done) nor a CANCELLED (revoked). Each row carries the id (to flip) and
+// the fixed start_date the response-movement predicate compares occurred_at against — a
+// movimento só cumpre o prazo se ocorreu em/depois do início da contagem. No rows → an
+// empty slice (a record with no reconcilable prazo), never an error. $1 = court_record_id,
+// $2 = tenant_id, both from the trusted event payload.
+func (q *Queries) ListReconcilableDeadlines(ctx context.Context, arg ListReconcilableDeadlinesParams) ([]ListReconcilableDeadlinesRow, error) {
+	rows, err := q.db.Query(ctx, listReconcilableDeadlines, arg.CourtRecordID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListReconcilableDeadlinesRow
+	for rows.Next() {
+		var i ListReconcilableDeadlinesRow
+		if err := rows.Scan(&i.ID, &i.StartDate); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTaskTitlesByDeadline = `-- name: ListTaskTitlesByDeadline :many
 SELECT title
 FROM task
@@ -707,6 +801,32 @@ func (q *Queries) MarkDeadlineStatus(ctx context.Context, arg MarkDeadlineStatus
 		arg.TenantID,
 		arg.CurrentStatus,
 	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const markMet = `-- name: MarkMet :one
+UPDATE deadline
+SET status = 'MET'
+WHERE id = $1 AND tenant_id = $2 AND status IN ('MISSED', 'OPEN')
+RETURNING id
+`
+
+type MarkMetParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Reconcile a prazo MISSED/OPEN → MET, keyed by id and scoped to tenant_id (barrier 1). The
+// `status IN ('MISSED','OPEN')` guard makes the flip SAFE and IDEMPOTENT (docs: só ressuscita
+// um prazo dado por perdido/aberto): a redelivery, an already-MET/CANCELLED prazo, or a
+// PENDING one updates NO row → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper, the
+// use case's no-op (never a phantom deadline.met). On a hit it returns the id so deadline.met
+// commits in the SAME tx. It mirrors MarkMissed's guarded-UPDATE shape, widened to the two
+// reconcilable statuses. $1 = id, $2 = tenant_id, both from the trusted event payload.
+func (q *Queries) MarkMet(ctx context.Context, arg MarkMetParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, markMet, arg.ID, arg.TenantID)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err

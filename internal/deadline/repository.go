@@ -855,6 +855,93 @@ func (r *pgRepository) MarkMissed(ctx context.Context, tx database.Tx, deadlineI
 	return missed.String(), nil
 }
 
+// ListReconcilableDeadlines loads the MISSED/OPEN prazos of a court_record inside the caller's
+// tx, filtered by tenantID (barrier 1). It reads the deadline table directly for the docket-
+// entry reconcile. No reconcilable prazo yields an empty slice (a :many never returns
+// pgx.ErrNoRows), never an error; the mapper absorbs the driver types (uuid.UUID, pgtype.Date).
+func (r *pgRepository) ListReconcilableDeadlines(ctx context.Context, tx database.Tx, courtRecordID, tenantID string) ([]ReconcilableDeadline, error) {
+	recordID, err := parseUUID(courtRecordID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := deadlinedb.New(tx).ListReconcilableDeadlines(ctx, deadlinedb.ListReconcilableDeadlinesParams{
+		CourtRecordID: recordID,
+		TenantID:      tenant,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]ReconcilableDeadline, len(rows))
+	for i, row := range rows {
+		out[i] = ReconcilableDeadline{
+			ID:        row.ID.String(),
+			StartDate: row.StartDate.Time,
+		}
+	}
+	return out, nil
+}
+
+// HasResponseMovement reports whether the court_record holds an andamento de resposta on/after
+// startDate inside the caller's tx, filtered by tenantID (barrier 1) via the JOIN — the ONE
+// cross-table read the reconcile needs (decisão P1: read docket_entry directly, never import
+// acquisition). start_date (a civil date) is lifted to a timestamptz so it compares against the
+// occurred_at column. It returns a plain bool (an EXISTS), so absence is false, not an error.
+func (r *pgRepository) HasResponseMovement(ctx context.Context, tx database.Tx, courtRecordID, tenantID string, startDate time.Time, tpuCodes []int32) (bool, error) {
+	recordID, err := parseUUID(courtRecordID)
+	if err != nil {
+		return false, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return false, err
+	}
+
+	has, err := deadlinedb.New(tx).HasResponseMovement(ctx, deadlinedb.HasResponseMovementParams{
+		ID:         recordID,
+		TenantID:   tenant,
+		OccurredAt: pgTimestamptz(startDate),
+		TpuCodes:   tpuCodes,
+	})
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	return has, nil
+}
+
+// MarkMet reconciles the prazo MISSED/OPEN → MET inside the caller's tx, filtered by tenantID
+// (barrier 1). The query's status IN ('MISSED','OPEN') guard means a redelivery — or an
+// already-MET/CANCELLED/PENDING prazo — updates no row: sqlc returns pgx.ErrNoRows, mapped to
+// the typed ErrDeadlineNotFound so the use case no-ops instead of emitting a phantom met. On a
+// hit it returns the reconciled prazo's id. It mirrors MarkMissed's shape.
+func (r *pgRepository) MarkMet(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	met, err := deadlinedb.New(tx).MarkMet(ctx, deadlinedb.MarkMetParams{
+		ID:       id,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrDeadlineNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return met.String(), nil
+}
+
 // RevokeDeadlineByIntimation cancels the prazo derived from the intimação inside the
 // caller's tx, filtered by tenantID (barrier 1). The query's status <> 'CANCELLED' guard
 // means a redelivery — or a cancel that arrives before (or without) any prazo — updates no

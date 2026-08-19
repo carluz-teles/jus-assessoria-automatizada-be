@@ -148,17 +148,29 @@ func readPending(ctx context.Context, tx database.Tx) ([]pendingEvent, error) {
 	return batch, nil
 }
 
-// publish enqueues one event and marks its outbox row published. The traceparent
-// travels as an asynq task header so the worker continues the producer's trace;
-// TaskID gives asynq best-effort enqueue dedup, MaxRetry and Queue route by type.
+// publish enqueues one event — once PER destination queue (fan-out) — and marks its
+// outbox row published. The traceparent travels as an asynq task header so the worker
+// continues the producer's trace; TaskID gives asynq best-effort enqueue dedup, MaxRetry
+// and Queue route by type.
 //
-// ErrTaskIDConflict is not a failure: asynq already holds a task with this id, so
-// the event IS enqueued — mark it published so the row does not spin every Tick.
-// Any other enqueue error propagates, rolling the batch back for a later retry.
+// A single-consumer event (the common case) fans out to exactly ONE queue, so this is a
+// straight enqueue, unchanged. A multi-consumer event (docket_entry_observed) fans out to
+// several queues; asynq's TaskID uniqueness is GLOBAL (one task per id across the whole
+// instance, per the asynq Unique-Tasks docs), so the same event id enqueued to two queues
+// would collide and the 2nd copy would be dropped as ErrTaskIDConflict. The TaskID is
+// therefore SUFFIXED by the queue ("<eventID>:<queue>") so each fan-out copy is a distinct
+// asynq task — one per consuming server — while the payload event id (the consumer dedup
+// key in processed_event) stays identical, so each consumer still dedups its own copy.
+//
+// ErrTaskIDConflict is not a failure: asynq already holds a task with this id, so that copy
+// IS enqueued — treat it as delivered. The row is marked published only after ALL its copies
+// are enqueued; any other enqueue error propagates, rolling the batch back for a later retry.
 func (r *Relay) publish(ctx context.Context, tx database.Tx, ev pendingEvent) error {
 	// Carry the event identity on the task so the consumer middleware can attribute
 	// its span/log without decoding the payload; traceparent joins the consumer span
-	// to the producer's (empty when the producer ran with no active span).
+	// to the producer's (empty when the producer ran with no active span). The event id
+	// on the header stays the UNSUFFIXED id (the consumer's dedup key), regardless of the
+	// per-queue TaskID suffix below.
 	headers := map[string]string{
 		eventIDHeader:     ev.idempotencyKey,
 		aggregateIDHeader: ev.aggregateID,
@@ -166,25 +178,28 @@ func (r *Relay) publish(ctx context.Context, tx database.Tx, ev pendingEvent) er
 	if ev.traceContext != "" {
 		headers[traceparentKey] = ev.traceContext
 	}
-	task := asynq.NewTaskWithHeaders(ev.typ, ev.payload, headers)
 
-	opts := []asynq.Option{
-		asynq.Queue(queueFor(ev.typ)),
-		asynq.MaxRetry(maxRetryFor(ev.typ)),
-	}
-	if ev.idempotencyKey != "" {
-		opts = append(opts, asynq.TaskID(ev.idempotencyKey))
-	}
-	// An opted-in ETA becomes an asynq.ProcessAt option, so the task lands SCHEDULED
-	// and the consumer only sees it once the time arrives. A nil processAt (the common
-	// case) leaves opts untouched — the task is pending immediately, exactly as before.
-	if ev.processAt != nil {
-		opts = append(opts, asynq.ProcessAt(*ev.processAt))
-	}
+	for _, queue := range queuesFor(ev.typ) {
+		task := asynq.NewTaskWithHeaders(ev.typ, ev.payload, headers)
 
-	if _, err := r.enq.EnqueueContext(ctx, task, opts...); err != nil {
-		if !errors.Is(err, asynq.ErrTaskIDConflict) {
-			return database.WrapInfra(err)
+		opts := []asynq.Option{
+			asynq.Queue(queue),
+			asynq.MaxRetry(maxRetryFor(ev.typ)),
+		}
+		if ev.idempotencyKey != "" {
+			opts = append(opts, asynq.TaskID(taskIDForQueue(ev.idempotencyKey, queue)))
+		}
+		// An opted-in ETA becomes an asynq.ProcessAt option, so the task lands SCHEDULED
+		// and the consumer only sees it once the time arrives. A nil processAt (the common
+		// case) leaves opts untouched — the task is pending immediately, exactly as before.
+		if ev.processAt != nil {
+			opts = append(opts, asynq.ProcessAt(*ev.processAt))
+		}
+
+		if _, err := r.enq.EnqueueContext(ctx, task, opts...); err != nil {
+			if !errors.Is(err, asynq.ErrTaskIDConflict) {
+				return database.WrapInfra(err)
+			}
 		}
 	}
 
@@ -192,6 +207,15 @@ func (r *Relay) publish(ctx context.Context, tx database.Tx, ev pendingEvent) er
 		return database.WrapInfra(err)
 	}
 	return nil
+}
+
+// taskIDForQueue makes the asynq TaskID unique PER destination queue so a fan-out event
+// enqueued to N queues yields N distinct tasks instead of one + (N-1) ErrTaskIDConflicts
+// (asynq TaskID uniqueness is global across the instance). A single-consumer event keeps a
+// stable "<eventID>:<queue>" id — still unique per event, so the enqueue-dedup guarantee is
+// preserved: a redelivered outbox row for the same event+queue still conflicts and is a no-op.
+func taskIDForQueue(eventID, queue string) string {
+	return eventID + ":" + queue
 }
 
 // ExtractTrace returns a ctx carrying the producer's span context, read from the
@@ -300,6 +324,24 @@ func queueFor(typ string) string {
 	default:
 		return "default"
 	}
+}
+
+// queuesFor is the FAN-OUT resolver: which asynq queues one event must be delivered to.
+// Almost every event has a single consumer, so it returns queueFor(typ) as a 1-element
+// slice — identical behavior, zero blast radius. The ONE exception is
+// acquisition.docket_entry_observed, which has TWO independent consumers on two DIFFERENT
+// asynq servers/muxes: notifications (main server, "ingestao"/"notifications" queues →
+// new-andamento aviso) AND deadline (dedicated "deadline" server → reconcile a MISSED/OPEN
+// prazo when a movimento de resposta lands). One outbox row → one asynq task → one queue →
+// one mux → one handler, so a single delivery cannot reach both muxes; the relay instead
+// enqueues ONE task per queue here. The current consumer ("ingestao") stays FIRST so the
+// perceived priority is unchanged. Each consumer dedups under its OWN processed_event key
+// (notifications' vs deadline.reconcile's), so at-least-once per consumer is expected and safe.
+func queuesFor(typ string) []string {
+	if typ == "acquisition.docket_entry_observed" {
+		return []string{"ingestao", "deadline"}
+	}
+	return []string{queueFor(typ)}
 }
 
 // maxRetryFor sets the retry budget per work kind: sync tolerates flaky courts and

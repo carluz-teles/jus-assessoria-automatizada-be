@@ -25,6 +25,7 @@ type useCase interface {
 	OnIntimationCancelled(ctx context.Context, ev IntimationCancelled) error
 	OnReminderCheck(ctx context.Context, ev DeadlineReminderCheck) error
 	OnMissedCheck(ctx context.Context, ev DeadlineMissedCheck) error
+	OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error
 }
 
 // Listener is the deadline slice's asynq consumer. It holds no transport state; the use
@@ -39,14 +40,19 @@ func NewListener(uc useCase) *Listener {
 }
 
 // Register mounts the slice's task handlers on the asynq mux — the async analog of a
-// Handler.Register. Both intimation.observed and intimation.cancelled route to the
-// "ingestao" queue (acquisition prefix), so they mount on the worker's main mux. Adding a
-// consumed event = one HandleFunc here plus one Register call in the worker's composition.
+// Handler.Register. This mux is the DEDICATED deadline server's (deadlineSrv, draining the
+// "deadline" queue): the intimation events, the scheduled self-messages AND the docket-entry
+// reconcile all route there (lib/events queuesFor), so all four mount here. docket_entry_observed
+// is FANNED OUT by the relay to two queues — "ingestao" (the notifications aviso, on the MAIN
+// server's mux) and "deadline" (this reconcile) — so the two consumers live on DIFFERENT muxes
+// and never collide (asynq panics only on a duplicate pattern within ONE mux). Adding a consumed
+// event = one HandleFunc here plus one Register call in the worker's composition.
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntimationObserved, l.handleIntimationObserved)
 	mux.HandleFunc(TypeIntimationCancelled, l.handleIntimationCancelled)
 	mux.HandleFunc(TypeDeadlineReminderCheck, l.handleReminderCheck)
 	mux.HandleFunc(TypeDeadlineMissedCheck, l.handleMissedCheck)
+	mux.HandleFunc(TypeDocketEntryObserved, l.handleDocketEntryObserved)
 }
 
 // handleIntimationObserved is the asynq.HandlerFunc for acquisition.intimation.observed.
@@ -121,6 +127,31 @@ func (l *Listener) handleMissedCheck(ctx context.Context, t *asynq.Task) error {
 		return err
 	}
 	if err := l.uc.OnMissedCheck(ctx, ev); err != nil {
+		if isTerminal(err) {
+			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
+		}
+		return err
+	}
+	return nil
+}
+
+// handleDocketEntryObserved is the asynq.HandlerFunc for acquisition.docket_entry_observed,
+// the reconcile trigger. It decodes the LOCAL shape and delegates to OnDocketEntryObserved,
+// mapping the outcome to asynq's retry decision the same way as the other handlers. The
+// reconcile treats a racing flip (ErrDeadlineNotFound from MarkMet) as an in-use-case per-prazo
+// no-op and returns nil, so a terminal domain error never surfaces from that path. What CAN
+// reach isTerminal here is classified by Kind: a malformed JSON payload is archived at decode
+// (SkipRetry); a well-formed payload from the trusted producer whose ids fail parseUUID surfaces
+// as KindInfra (retryable, not terminal — the producer always mints valid uuids, so a parse
+// fault is a transient/data anomaly worth a retry, never an archive). This handler runs on the
+// DEDICATED deadline server's mux; the notifications consumer of the same event runs on the MAIN
+// server's mux (the relay fans the event out to both queues).
+func (l *Listener) handleDocketEntryObserved(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DocketEntryObserved](t)
+	if err != nil {
+		return err
+	}
+	if err := l.uc.OnDocketEntryObserved(ctx, ev); err != nil {
 		if isTerminal(err) {
 			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 		}

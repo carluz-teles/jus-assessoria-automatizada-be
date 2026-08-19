@@ -157,8 +157,10 @@ func (CourtRecordObserved) AggregateType() string { return aggregateTypeCourtRec
 
 // DocketEntryObserved announces one NEWLY inserted andamento (deduped entries do
 // not emit it, so a re-sync of the same window is silent). It carries the entry
-// and record ids and the source hash; the deadline/documents slices consume it.
-// Aggregate id is the docket_entry id.
+// and record ids and the source hash. TWO slices consume it, on two different asynq
+// servers, so the relay FANS IT OUT (lib/events queuesFor): notifications (main server →
+// new-andamento aviso) and deadline (dedicated server → reconcile a MISSED/OPEN prazo
+// when a movimento de resposta lands). Aggregate id is the docket_entry id.
 type DocketEntryObserved struct {
 	events.Base
 	TenantID      string `json:"tenant_id"`

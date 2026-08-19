@@ -253,6 +253,16 @@ type RevokedDeadline struct {
 	CourtRecordID string
 }
 
+// ReconcilableDeadline is the thin read the docket-entry reconcile loads for each MISSED/OPEN
+// prazo of a court_record (ListReconcilableDeadlines): the id it may flip to MET and the fixed
+// StartDate the response-movement predicate compares occurred_at against (a movimento só
+// cumpre o prazo se ocorreu em/depois do início da contagem). It is a read value object — the
+// reconcile flips through the guarded MarkMet UPDATE, never through this struct.
+type ReconcilableDeadline struct {
+	ID        string
+	StartDate time.Time
+}
+
 // DeadlineForCheck is the thin re-read of a prazo at a scheduled mark's fire time
 // (reminder_check / missed_check): the current Status the handler branches on, the EndDate
 // and the context (Kind, Counting, CourtRecordID) a lembrete or MISSED fact may carry. It

@@ -17,6 +17,21 @@ import (
 // another consumer of the same intimation.observed event.
 const consumerDeadline = "deadline"
 
+// consumerReconcile is the SEPARATE processed_event consumer name the docket-entry reconcile
+// dedups under. Dedup is per-consumer (docs §4c.3), so the reconcile MUST NOT reuse
+// consumerDeadline: docket_entry_observed and intimation.observed are different events, but
+// keeping distinct consumer names also means a future second deadline consumer of the same
+// event never collides with this one on the (consumer, event_id) key.
+const consumerReconcile = "deadline.reconcile"
+
+// responseTPUcodes are the CNJ/TPU movement codes that mark a peça de RESPOSTA já nos autos
+// (petição, contestação, manifestação, impugnação, recurso). A docket_entry carrying one of
+// these — on/after the prazo's start_date — means the prazo foi cumprido, so a prazo histórico
+// nascido MISSED (backfill) is reconciled to MET. It is the positive half of the predicate;
+// the negative half (a movimento sem tpu_code) falls back to the text regex in the query.
+// int32 to match the docket_entry.tpu_code column (deadlinedb.DocketEntry.TpuCode *int32).
+var responseTPUCodes = []int32{85, 118, 383, 433, 235}
+
 // rulesVersion pins which seeded deadline_rule set this slice resolves against. The
 // derived prazo records it (rules_version) so "por que 15 dias?" is answerable and the
 // rule set can evolve without touching this code (docs §8).
@@ -125,6 +140,24 @@ type Repository interface {
 	// terminal one, or one not yet overdue touches no row and returns ErrDeadlineNotFound.
 	// On a hit it returns the missed prazo's id so deadline.missed commits in the same tx.
 	MarkMissed(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
+	// ListReconcilableDeadlines loads the prazos of a court_record the reconcile may resurrect
+	// — status IN ('MISSED','OPEN') — scoped to tenantID (barrier 1). Each carries its id (to
+	// flip) and the fixed start_date the response-movement predicate compares against. A record
+	// with no reconcilable prazo yields an empty slice (a :many never returns pgx.ErrNoRows),
+	// never an error.
+	ListReconcilableDeadlines(ctx context.Context, tx database.Tx, courtRecordID, tenantID string) ([]ReconcilableDeadline, error)
+	// HasResponseMovement reports whether the court_record holds an andamento de RESPOSTA on/
+	// after startDate: a docket_entry whose tpu_code is one of tpuCodes, OR (no tpu_code) whose
+	// text matches the peça-de-resposta regex. docket_entry has no tenant_id of its own, so the
+	// read JOINs court_record and filters tenantID (barrier 1) — a cross-table read the reconcile
+	// needs (decisão P1: read the table, never import acquisition). Returns a bool.
+	HasResponseMovement(ctx context.Context, tx database.Tx, courtRecordID, tenantID string, startDate time.Time, tpuCodes []int32) (bool, error)
+	// MarkMet reconciles a prazo MISSED/OPEN → MET, keyed by its id and scoped to tenantID
+	// (barrier 1). The `status IN ('MISSED','OPEN')` guard makes the flip SAFE and IDEMPOTENT:
+	// a redelivery, an already-MET/CANCELLED, or a PENDING prazo touches no row and returns
+	// ErrDeadlineNotFound (the reconcile's no-op). On a hit it returns the id so deadline.met
+	// commits in the same tx. It mirrors MarkMissed, widened to the two reconcilable statuses.
+	MarkMet(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
 	// EnsureTaskInTenant guards the checklist writes: it confirms the parent task exists in the
 	// tenant (POST /v1/tasks/:id/items) before any item write, scoped to tenantID (barrier 1). A
 	// missing/foreign task id is ErrTaskItemNotFound (→ 404), so an item can never be grafted onto
@@ -466,6 +499,74 @@ func (uc *UseCase) OnIntimationCancelled(ctx context.Context, ev IntimationCance
 		}
 
 		return uc.outbox.Publish(ctx, tx, newDeadlineRevoked(revoked.ID, ev.IntimationID, ev.Reason))
+	})
+}
+
+// OnDocketEntryObserved is the RECONCILE path (docs: prazo histórico nasce MISSED apesar de
+// já haver petição/manifestação nos autos). From one acquisition.docket_entry_observed it
+// re-checks EVERY reconcilable (MISSED/OPEN) prazo of the event's court_record: if the record
+// holds an andamento de RESPOSTA on/after that prazo's start_date, the prazo foi cumprido, so
+// it is flipped to MET and deadline.met is emitted — all in one tenant-scoped tx so the dedup
+// mark, the status flips and the outbox rows commit together.
+//
+// The event announces ONE new andamento but carries none of its fields (no tpu_code/
+// occurred_at — decisão travada: não enriquecer o payload, contrato compartilhado com
+// notifications); so the reconcile does not key off that single entry. It re-evaluates the
+// court_record's whole reconcilable set against ALL its response movements — a court_record
+// may hold several MISSED/OPEN prazos, and any newly landed movimento may cumprir more than
+// one. Silencioso no backfill em massa não se aplica aqui (isto é o caminho LIVE de um
+// andamento novo): each real cumprimento legitimately emits deadline.met.
+//
+// Steps:
+//  1. dedup under consumerReconcile — a replay marks nothing new and returns before any write;
+//  2. load the MISSED/OPEN prazos of the court_record (each with its start_date);
+//  3. for each: HasResponseMovement(start_date, responseTPUCodes)? no → skip;
+//  4. MarkMet (guarded MISSED/OPEN→MET) — a racing flip touches no row (ErrDeadlineNotFound),
+//     a safe per-prazo no-op that emits nothing;
+//  5. on a hit, emit deadline.met in the SAME tx.
+//
+// tenantID comes from the trusted event payload (no Clerk token on the worker) and scopes the
+// transaction's RLS.
+func (uc *UseCase) OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerReconcile, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		prazos, err := uc.repo.ListReconcilableDeadlines(ctx, tx, ev.CourtRecordID, ev.TenantID)
+		if err != nil {
+			return err
+		}
+
+		for _, p := range prazos {
+			hasResponse, err := uc.repo.HasResponseMovement(ctx, tx, ev.CourtRecordID, ev.TenantID, p.StartDate, responseTPUCodes)
+			if err != nil {
+				return err
+			}
+			if !hasResponse {
+				continue
+			}
+
+			metID, err := uc.repo.MarkMet(ctx, tx, p.ID, ev.TenantID)
+			if errors.Is(err, ErrDeadlineNotFound) {
+				// A racing flip already moved this prazo out of MISSED/OPEN (met/cancelled by
+				// another path between the list and the guarded UPDATE): touch no row, emit
+				// nothing, keep reconciling the rest. The dedup mark still commits.
+				continue
+			}
+			if err != nil {
+				return err
+			}
+
+			if err := uc.outbox.Publish(ctx, tx, newDeadlineMet(ev.TenantID, metID)); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

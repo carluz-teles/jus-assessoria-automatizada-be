@@ -120,6 +120,49 @@ func TestIntimationCancelled_ContractRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDocketEntryObserved_ContractRoundTrip is the reconcile counterpart of the observed/
+// cancelled round-trip guards (memória parallel-producer-consumer-roundtrip): it MARSHALS the
+// producer's acquisition.DocketEntryObserved and UNMARSHALS it into this slice's LOCAL decode
+// struct, asserting the two fields the reconcile reads (TenantID, CourtRecordID) survive the
+// wire. The producer carries more (DocketEntryID/Hash/SyncRunID) that this slice deliberately
+// ignores — the reconcile re-reads docket_entry directly, keyed by the court_record — so the
+// local shape is a strict subset. Without this test a rename of either shared field would drift
+// silently and the reconcile would scope off zero values. It also pins the shared dotted id.
+func TestDocketEntryObserved_ContractRoundTrip(t *testing.T) {
+	if TypeDocketEntryObserved != acquisition.TypeDocketEntryObserved {
+		t.Fatalf("consumed type %q != producer type %q", TypeDocketEntryObserved, acquisition.TypeDocketEntryObserved)
+	}
+
+	producer := acquisition.DocketEntryObserved{
+		Base:          events.Base{EventID: uuid.NewString(), Aggregate: uuid.NewString()},
+		TenantID:      uuid.NewString(),
+		SyncRunID:     uuid.NewString(),
+		CourtRecordID: uuid.NewString(),
+		DocketEntryID: uuid.NewString(),
+		Hash:          "abc123",
+	}
+
+	raw, err := json.Marshal(producer)
+	if err != nil {
+		t.Fatalf("marshal producer: %v", err)
+	}
+
+	var got DocketEntryObserved
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal into local shape: %v", err)
+	}
+
+	if got.EventID != producer.EventID {
+		t.Errorf("EventID = %q, want %q", got.EventID, producer.EventID)
+	}
+	if got.TenantID != producer.TenantID {
+		t.Errorf("TenantID = %q, want %q", got.TenantID, producer.TenantID)
+	}
+	if got.CourtRecordID != producer.CourtRecordID {
+		t.Errorf("CourtRecordID = %q, want %q", got.CourtRecordID, producer.CourtRecordID)
+	}
+}
+
 // TestDeadlineReminderCheck_ScheduledContract pins the D-N mark's scheduled contract: it
 // implements events.ScheduledEvent, its ETA is start-of-day(end_date) − days_left calendar
 // days, and its idempotency key is the stable per-mark id the relay uses as the asynq

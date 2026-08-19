@@ -22,6 +22,8 @@ type stubUC struct {
 	reminderCalls  int
 	missedErr      error
 	missedCalls    int
+	docketErr      error
+	docketCalls    int
 }
 
 func (s *stubUC) OnIntimationObserved(context.Context, IntimationObserved) error {
@@ -42,6 +44,11 @@ func (s *stubUC) OnReminderCheck(context.Context, DeadlineReminderCheck) error {
 func (s *stubUC) OnMissedCheck(context.Context, DeadlineMissedCheck) error {
 	s.missedCalls++
 	return s.missedErr
+}
+
+func (s *stubUC) OnDocketEntryObserved(context.Context, DocketEntryObserved) error {
+	s.docketCalls++
+	return s.docketErr
 }
 
 // TestListener_handleIntimationObserved covers the listener's contract: a terminal
@@ -280,6 +287,66 @@ func TestListener_handleMissedCheck_decodeFault(t *testing.T) {
 
 	if stub.missedCalls != 0 {
 		t.Errorf("use case called on decode fault (calls = %d)", stub.missedCalls)
+	}
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Errorf("decode fault not archived: %v", err)
+	}
+}
+
+// TestListener_handleDocketEntryObserved covers the reconcile handler's contract: a success
+// acks; an infra/unknown error stays retryable while the original stays in the chain (single
+// handling rule). The reconcile's own no-ops (ErrDeadlineNotFound per prazo) are absorbed
+// upstream and surface as nil, so the terminal branch is never exercised on the live path —
+// but isTerminal is shared, so a KindNotFound that did surface would archive.
+func TestListener_handleDocketEntryObserved(t *testing.T) {
+	task := asynq.NewTask(TypeDocketEntryObserved, []byte(`{}`))
+
+	tests := []struct {
+		name     string
+		ucErr    error
+		wantSkip bool
+	}{
+		{name: "success acks", ucErr: nil, wantSkip: false},
+		{name: "infra error stays retryable", ucErr: apperr.NewInfra("db down", errors.New("boom")), wantSkip: false},
+		{name: "unknown error stays retryable", ucErr: errors.New("opaque"), wantSkip: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubUC{docketErr: tt.ucErr}
+			l := NewListener(stub)
+
+			err := l.handleDocketEntryObserved(context.Background(), task)
+
+			if stub.docketCalls != 1 {
+				t.Fatalf("use case calls = %d, want 1", stub.docketCalls)
+			}
+			if tt.ucErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.ucErr) {
+				t.Errorf("original error dropped from chain: %v", err)
+			}
+			if got := errors.Is(err, asynq.SkipRetry); got != tt.wantSkip {
+				t.Errorf("SkipRetry = %v, want %v (err = %v)", got, tt.wantSkip, err)
+			}
+		})
+	}
+}
+
+// TestListener_handleDocketEntryObserved_decodeFault proves a malformed reconcile payload is
+// archived (SkipRetry) at decode, before the use case is ever invoked.
+func TestListener_handleDocketEntryObserved_decodeFault(t *testing.T) {
+	stub := &stubUC{}
+	l := NewListener(stub)
+
+	err := l.handleDocketEntryObserved(context.Background(), asynq.NewTask(TypeDocketEntryObserved, []byte(`{`)))
+
+	if stub.docketCalls != 0 {
+		t.Errorf("use case called on decode fault (calls = %d)", stub.docketCalls)
 	}
 	if !errors.Is(err, asynq.SkipRetry) {
 		t.Errorf("decode fault not archived: %v", err)
