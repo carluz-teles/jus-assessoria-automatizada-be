@@ -118,6 +118,11 @@ func TestEnrichment_GraduatesInPlace(t *testing.T) {
 		t.Errorf("grade update = %d calls, id %q degree %q; want 1 call on unknown-1 → G1",
 			repo.updateCalls, repo.updateParams.CourtRecordID, repo.updateParams.Degree)
 	}
+	// Lifecycle is derived from the fixture's movimentos (no code 22/25) → ACTIVE, and
+	// is passed through to the update params (the SQL CASE then guards SUPERSEDED).
+	if repo.updateParams.Lifecycle != LifecycleActive {
+		t.Errorf("grade update lifecycle = %q; want ACTIVE (fixture has no terminal/suspension code)", repo.updateParams.Lifecycle)
+	}
 	if repo.repointCalls != 0 || repo.supersedeCall != 0 {
 		t.Errorf("common grade must not re-point/supersede: repoint=%d supersede=%d", repo.repointCalls, repo.supersedeCall)
 	}

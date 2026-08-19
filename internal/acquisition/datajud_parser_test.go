@@ -162,8 +162,9 @@ func TestSecrecyFromNivel(t *testing.T) {
 // TestLifecycleFromMovimentos verifies the conservative lifecycle derivation from
 // DATAJUD movimentos: terminal code (22) → ARCHIVED, suspension code (25) as
 // the latest → SUSPENDED, no signal → ACTIVE, and an empty list → ACTIVE.
-// The SUPERSEDED guard (never-downgrade) is tested in enrichment_test.go because it
-// lives in the SQL layer, not in this function.
+// The SUPERSEDED guard (never-downgrade) lives in the SQL layer (UpdateCourtRecordGrade
+// CASE) and is NOT covered by a unit test — known-limitation, needs an integration test
+// against real Postgres. This function's output (the Lifecycle value) is validated here.
 func TestLifecycleFromMovimentos(t *testing.T) {
 	t.Parallel()
 
