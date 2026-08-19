@@ -355,6 +355,8 @@ func TestDJENTypeRobustness(t *testing.T) {
 		{"Citação Eletrônica", IntimationTypeCitacao},
 		// A type with "CITA" mid-string must NOT classify as citação.
 		{"Notificação de Citação", IntimationTypeComunicacao},
+		// Recognized non-actionable notice → COMUNICACAO without the unknown-type warn.
+		{"Lista de distribuição", IntimationTypeComunicacao},
 		// Generic fallback.
 		{"Edital", IntimationTypeComunicacao},
 		{"Comunicação", IntimationTypeComunicacao},

@@ -450,6 +450,11 @@ func djenType(tipo string) string {
 		return IntimationTypeIntimacao
 	case strings.HasPrefix(t, "CITA"):
 		return IntimationTypeCitacao
+	case strings.Contains(t, "DISTRIBUI"), strings.Contains(t, "COMUNICA"):
+		// Known non-actionable notices ("Lista de distribuição", "Comunicação"):
+		// legitimately a generic COMUNICACAO — recognized here so they do NOT trip
+		// the "unrecognized type" Warn below (they carry no deadline).
+		return IntimationTypeComunicacao
 	default:
 		if tipo != "" {
 			// An unrecognized tipo defaults to COMUNICACAO (the safe generic bucket).

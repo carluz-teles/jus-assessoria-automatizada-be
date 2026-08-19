@@ -222,12 +222,43 @@ func TestLifecycleFromMovimentos(t *testing.T) {
 			want: LifecycleActive,
 		},
 		{
-			name: "terminal code beats suspension (terminal wins the walk)",
+			name: "terminal code beats suspension (terminal is sticky)",
 			movs: []datajudMovimento{
 				mov(25, "2026-05-01T00:00:00Z"), // suspension — most recent
-				mov(22, "2026-01-01T00:00:00Z"), // terminal — older
+				mov(22, "2026-01-01T00:00:00Z"), // terminal — older but sticky
 			},
 			want: LifecycleArchived,
+		},
+		{
+			name: "terminal code 196 (extinção da execução) → ARCHIVED",
+			movs: []datajudMovimento{
+				mov(196, "2026-03-01T00:00:00Z"),
+			},
+			want: LifecycleArchived,
+		},
+		{
+			name: "suspension code 12065 as most recent → SUSPENDED",
+			movs: []datajudMovimento{
+				mov(12065, "2026-05-01T00:00:00Z"),
+				mov(123, "2026-01-01T00:00:00Z"),
+			},
+			want: LifecycleSuspended,
+		},
+		{
+			name: "desarquivamento (893) after baixa (22) → ACTIVE (reopened)",
+			movs: []datajudMovimento{
+				mov(893, "2026-06-01T00:00:00Z"), // reactivation — most recent
+				mov(22, "2026-01-01T00:00:00Z"),  // terminal — older, reversed
+			},
+			want: LifecycleActive,
+		},
+		{
+			name: "levantamento da suspensão (12066) after suspensão (25) → ACTIVE",
+			movs: []datajudMovimento{
+				mov(12066, "2026-06-01T00:00:00Z"), // reactivation — most recent
+				mov(25, "2026-01-01T00:00:00Z"),    // suspension — older, lifted
+			},
+			want: LifecycleActive,
 		},
 		{
 			name: "unparseable dataHora is skipped; remaining signal respected",

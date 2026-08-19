@@ -182,8 +182,8 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
 
-	if out.PromptVersion != "draft_minuta/v4" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v4", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v5" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v5", out.PromptVersion)
 	}
 
 	// System must contain the gold rule (v4: parties + signing lawyer instruction).
@@ -269,7 +269,7 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
 	if !strings.Contains(out.User, "sem contexto adicional") {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
-	if out.PromptVersion != "draft_minuta/v4" {
+	if out.PromptVersion != "draft_minuta/v5" {
 		t.Errorf("PromptVersion = %q, want draft_minuta/v3", out.PromptVersion)
 	}
 }
