@@ -47,7 +47,16 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntimationCancelled, l.handleIntimationCancelled)
 	mux.HandleFunc(TypeDeadlineReminderCheck, l.handleReminderCheck)
 	mux.HandleFunc(TypeDeadlineMissedCheck, l.handleMissedCheck)
+	// deadline.opened has no functional consumer (read models JOIN the deadline table),
+	// but it IS produced per prazo (high-volume: a backfill mints thousands). Without a
+	// handler it fails "handler not found", retries, and — routed to the deadline queue by
+	// queueFor — would clog it. A no-op ACK drains it cheaply. Register a real consumer here
+	// if a downstream ever needs to react to a prazo being opened.
+	mux.HandleFunc(TypeDeadlineOpened, l.handleOpenedNoop)
 }
+
+// handleOpenedNoop acknowledges deadline.opened without work. See Register.
+func (l *Listener) handleOpenedNoop(_ context.Context, _ *asynq.Task) error { return nil }
 
 // handleIntimationObserved is the asynq.HandlerFunc for acquisition.intimation.observed.
 // It decodes the payload into the LOCAL shape and hands off to the use case, then maps

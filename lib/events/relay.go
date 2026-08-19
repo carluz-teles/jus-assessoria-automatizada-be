@@ -236,7 +236,13 @@ func queueFor(typ string) string {
 	// literals, not the slice's consts: queueFor cannot import internal/deadline (import
 	// cycle). Must match worker-ingestao's deadlineQueue and the dedicated server's Queues.
 	if typ == "acquisition.intimation.observed" || typ == "acquisition.intimation.cancelled" ||
-		typ == "deadline.reminder_check" || typ == "deadline.missed_check" {
+		typ == "deadline.reminder_check" || typ == "deadline.missed_check" ||
+		typ == "deadline.opened" {
+		// deadline.opened is HIGH-VOLUME (one per prazo — a backfill mints thousands) and has
+		// no functional consumer, but it MUST NOT ride "ingestao" (the orphan default in the
+		// switch below): there it fails handler-not-found, retries, and STARVES the DATAJUD
+		// enrichment sharing that queue. Route it to the deadline server, which acks it with a
+		// no-op handler (deadline.Listener) — cheap, no retry, no queue clog.
 		return "deadline"
 	}
 	// deadline.due_soon/missed are NOT consumed by the deadline server — they are consumed by
@@ -278,12 +284,13 @@ func queueFor(typ string) string {
 		// discovery/enrichment chain silently stalls.
 		return "ingestao"
 	case "deadline":
-		// The deadline slice's CONSUMED events (reminder_check/missed_check → "deadline",
-		// due_soon/missed → "notifications") are special-cased above. What reaches here is the
-		// REST of the domain — deadline.opened/revoked/updated/met and task.* — which has NO
-		// async consumer today. Keep it on "ingestao" (the current behavior: archived as
+		// The deadline slice's CONSUMED events (reminder_check/missed_check + high-volume
+		// deadline.opened → "deadline"; due_soon/missed → "notifications") are special-cased
+		// above. What reaches here is the LOW-VOLUME rest — deadline.revoked/updated/met and
+		// task.* — with no async consumer today. Keep it on "ingestao" (archived as
 		// handler-not-found), NOT "default", so the rows don't pile up in a Redis queue no
-		// worker drains.
+		// worker drains. If any of these ever goes high-volume, give it a no-op handler and
+		// route it to "deadline" too (see deadline.opened).
 		return "ingestao"
 	case "documents", "document":
 		// The document slice PRODUCES document.* (singular prefix: document.uploaded,

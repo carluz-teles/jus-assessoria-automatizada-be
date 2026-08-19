@@ -262,9 +262,10 @@ func TestQueueFor(t *testing.T) {
 		// deadline server — route them to the queue that listener serves.
 		{"deadline.due_soon", "notifications"},
 		{"deadline.missed", "notifications"},
-		// The rest of the deadline domain has no async consumer — stays on "ingestao"
-		// (archived as handler-not-found), not "default".
-		{"deadline.opened", "ingestao"},
+		// deadline.opened is high-volume (one per prazo) and gets a no-op handler on the
+		// deadline server, so it routes to "deadline" — NOT "ingestao" (where it would clog
+		// the enrichment). The low-volume rest stays on "ingestao" (archived, no consumer).
+		{"deadline.opened", "deadline"},
 		{"deadline.revoked", "ingestao"},
 		{"deadline.task.created", "ingestao"},
 		{"documents.file.extracted", "documents"},
