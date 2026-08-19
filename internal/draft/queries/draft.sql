@@ -182,17 +182,52 @@ WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL;
 
 -- name: GetIntimationForDraft :one
 -- Load the intimation context needed to build a draft from source=intimation:
--- the case_id (via court_record), the court_record_id, and the type (for piece_type
--- inference). Filtered by intimation.id and tenant_id (barrier 1 via court_record).
+-- the case_id (via court_record), the court_record_id, the type (for piece_type
+-- inference), the rich context fields (content, process metadata, deadline)
+-- used to compose the AI generation prompt, and the recipients jsonb (for
+-- signing-lawyer resolution — matched=true recipient is our advogado). Filtered
+-- by intimation.id and tenant_id (barrier 1 via court_record).
 -- A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 SELECT
-    i.id            AS intimation_id,
-    cr.case_id      AS case_id,
-    cr.id           AS court_record_id,
-    i.type          AS intimation_type
+    i.id                AS intimation_id,
+    cr.case_id          AS case_id,
+    cr.id               AS court_record_id,
+    i.type              AS intimation_type,
+    i.content           AS intimation_content,
+    i.recipients        AS recipients,
+    cr.cnj_number       AS cnj_number,
+    cr.court            AS court,
+    cr.degree           AS degree,
+    cr.class            AS class,
+    cr.subject          AS subject,
+    cr.judging_body     AS judging_body,
+    dl.end_date         AS deadline_end_date
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN deadline dl ON dl.notification_id = i.id
 WHERE i.id = $1 AND cr.tenant_id = $2;
+
+-- name: GetPartiesForDraft :many
+-- Load the parties (autor/réu/terceiro) and their advogados for a given case,
+-- tenant-scoped (barrier 1). Used by the draft generation pipeline to inject
+-- structured party names and counsel info into the AI prompt — the draft slice
+-- reads party/party_counsel directly without importing the acquisition slice
+-- (same pattern as GetDraftDetail for court_record). counsels defaults to an
+-- empty jsonb array (never NULL) when a party has no advogado. Ordered by
+-- role then name for deterministic iteration.
+SELECT p.id, p.role, p.name,
+       COALESCE(
+         (SELECT jsonb_agg(
+                   jsonb_build_object('name', pc.name, 'oab', pc.oab, 'uf', pc.uf)
+                   ORDER BY pc.name
+                 )
+          FROM party_counsel pc
+          WHERE pc.party_id = p.id AND pc.tenant_id = p.tenant_id),
+         '[]'::jsonb
+       )::text AS counsels
+FROM party p
+WHERE p.tenant_id = $1 AND p.case_id = $2
+ORDER BY p.role, p.name;
 
 -- ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
 -- These are the three new queries the async generation saga needs.

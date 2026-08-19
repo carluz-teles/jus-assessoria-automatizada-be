@@ -33,12 +33,14 @@ func (f fakeUoW) DoSystem(_ context.Context, fn func(database.Tx) error) error {
 	return fn(nil)
 }
 
-// fakeReader returns a preset draft and intimation.
+// fakeReader returns a preset draft, intimation, and parties.
 type fakeReader struct {
 	draft      *Draft
 	intimation *IntimationContext
+	parties    []PartyInfo
 	draftErr   error
 	intimErr   error
+	partiesErr error
 }
 
 func (f fakeReader) GetDraftByID(_ context.Context, _ database.Tx, _, _ string) (*Draft, error) {
@@ -46,6 +48,9 @@ func (f fakeReader) GetDraftByID(_ context.Context, _ database.Tx, _, _ string) 
 }
 func (f fakeReader) GetIntimationForDraft(_ context.Context, _ database.Tx, _, _ string) (*IntimationContext, error) {
 	return f.intimation, f.intimErr
+}
+func (f fakeReader) GetPartiesForDraft(_ context.Context, _ database.Tx, _, _ string) ([]PartyInfo, error) {
+	return f.parties, f.partiesErr
 }
 
 // fakeWriter captures UpdateSagaState, InsertReview, and DeleteReviewsForDraft calls.
@@ -562,6 +567,101 @@ func TestGenerateUseCase_WithoutIntimation_WholeTenantSearch(t *testing.T) {
 	}
 	if w.insertedReview != nil {
 		t.Errorf("insertedReview non-nil, want nil (Gerar must not insert reviews)")
+	}
+}
+
+// TestBuildDraftContext_WithIntimation verifies that buildDraftContext populates ALL
+// fields from a fully-loaded IntimationContext, including parties and signing lawyer.
+func TestBuildDraftContext_WithIntimation(t *testing.T) {
+	d := &Draft{PieceType: PieceTypeDefense}
+	// Recipients: one matched recipient (our advogado).
+	recipientsJSON := []byte(`[{"name":"Dr. João Silva","oab":"12345","uf":"SP","matched":true},{"name":"Dr. Maria","oab":"99999","uf":"SP","matched":false}]`)
+	i := &IntimationContext{
+		Type:            "CITACAO",
+		Content:         "Fica o réu citado para contestar em 15 dias.",
+		Court:           "TJSP",
+		Degree:          "G1",
+		Class:           "Procedimento Comum",
+		Subject:         "Contrato",
+		CNJNumber:       "0000001-23.2026.8.26.0001",
+		JudgingBody:     "3ª Vara Cível",
+		DeadlineEndDate: "2026-09-01",
+		Recipients:      recipientsJSON,
+	}
+	parties := []PartyInfo{
+		{Role: "PLAINTIFF", Name: "AUTOR LTDA", Counsel: "Pedro (OAB/RS nº 119938)"},
+		{Role: "DEFENDANT", Name: "RÉU SA"},
+	}
+	chunks := []string{"trecho 1", "trecho 2"}
+
+	dc := buildDraftContext(d, i, parties, chunks)
+
+	tests := []struct {
+		field string
+		got   string
+		want  string
+	}{
+		{"PieceType", dc.PieceType, PieceTypeDefense},
+		{"IntimationType", dc.IntimationType, "CITACAO"},
+		{"IntimationText", dc.IntimationText, i.Content},
+		{"Court", dc.Court, "TJSP"},
+		{"Degree", dc.Degree, "G1"},
+		{"Class", dc.Class, "Procedimento Comum"},
+		{"Subject", dc.Subject, "Contrato"},
+		{"CNJNumber", dc.CNJNumber, "0000001-23.2026.8.26.0001"},
+		{"JudgingBody", dc.JudgingBody, "3ª Vara Cível"},
+		{"DeadlineDate", dc.DeadlineDate, "2026-09-01"},
+		// Signing lawyer from matched recipient.
+		{"SigningLawyerName", dc.SigningLawyerName, "Dr. João Silva"},
+		{"SigningLawyerOAB", dc.SigningLawyerOAB, "12345"},
+		{"SigningLawyerUF", dc.SigningLawyerUF, "SP"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("buildDraftContext.%s = %q, want %q", tt.field, tt.got, tt.want)
+			}
+		})
+	}
+	if len(dc.Chunks) != 2 {
+		t.Errorf("len(Chunks) = %d, want 2", len(dc.Chunks))
+	}
+	// Parties must be propagated.
+	if len(dc.Parties) != 2 {
+		t.Fatalf("len(Parties) = %d, want 2", len(dc.Parties))
+	}
+	if dc.Parties[0].Role != "PLAINTIFF" || dc.Parties[0].Name != "AUTOR LTDA" {
+		t.Errorf("Parties[0] = %+v, want PLAINTIFF AUTOR LTDA", dc.Parties[0])
+	}
+	if dc.Parties[1].Role != "DEFENDANT" || dc.Parties[1].Name != "RÉU SA" {
+		t.Errorf("Parties[1] = %+v, want DEFENDANT RÉU SA", dc.Parties[1])
+	}
+}
+
+// TestBuildDraftContext_NilIntimation verifies that buildDraftContext with a nil
+// IntimationContext leaves the intimation fields empty (blank/processo draft path).
+func TestBuildDraftContext_NilIntimation(t *testing.T) {
+	d := &Draft{PieceType: PieceTypeMotion}
+	dc := buildDraftContext(d, nil, nil, nil)
+
+	if dc.PieceType != PieceTypeMotion {
+		t.Errorf("PieceType = %q, want MOTION", dc.PieceType)
+	}
+	// All intimation-derived fields must be empty.
+	for _, f := range []struct{ name, val string }{
+		{"IntimationType", dc.IntimationType},
+		{"IntimationText", dc.IntimationText},
+		{"Court", dc.Court},
+		{"Degree", dc.Degree},
+		{"Class", dc.Class},
+		{"Subject", dc.Subject},
+		{"CNJNumber", dc.CNJNumber},
+		{"JudgingBody", dc.JudgingBody},
+		{"DeadlineDate", dc.DeadlineDate},
+	} {
+		if f.val != "" {
+			t.Errorf("nil intimation: %s = %q, want empty", f.name, f.val)
+		}
 	}
 }
 

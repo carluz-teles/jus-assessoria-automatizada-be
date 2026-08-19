@@ -138,21 +138,47 @@ func TestChatRequest_Validate(t *testing.T) {
 
 func TestInferPieceType(t *testing.T) {
 	tests := []struct {
-		intimationType string
-		want           string
+		name string
+		it   *IntimationContext
+		want string
 	}{
-		{"CITACAO", PieceTypeDefense},
-		{"INTIMACAO", PieceTypeDefense},
-		{"COMUNICACAO", PieceTypeOther},
-		{"", PieceTypeOther},
-		{"UNKNOWN", PieceTypeOther},
+		{"nil → OTHER", nil, PieceTypeOther},
+		{"CITACAO → DEFENSE (cited to defend)", &IntimationContext{Type: "CITACAO"}, PieceTypeDefense},
+		{
+			"content 'conteste' → DEFENSE",
+			&IntimationContext{Type: "INTIMACAO", Content: "Fica intimado para contestar / apresentar defesa no prazo legal."},
+			PieceTypeDefense,
+		},
+		{
+			"embargos à execução → DEFENSE",
+			&IntimationContext{Type: "INTIMACAO", Class: "Execução de Título Extrajudicial", Content: "para oferecer embargos à execução"},
+			PieceTypeDefense,
+		},
+		{
+			"sentença + recurso → APPEAL",
+			&IntimationContext{Type: "INTIMACAO", Content: "Publicada a sentença, fica intimado do prazo recursal para recorrer."},
+			PieceTypeAppeal,
+		},
+		{
+			"exequente intimada a indicar bens → MOTION (não DEFENSE)",
+			&IntimationContext{Type: "INTIMACAO", Class: "Execução de Título Extrajudicial", Content: "<p>Fica a exequente intimada a indicar bens à penhora, no prazo de 5 dias.</p>"},
+			PieceTypeMotion,
+		},
+		{
+			"manifeste-se → MOTION",
+			&IntimationContext{Type: "INTIMACAO", Content: "Manifeste-se a parte autora sobre a petição."},
+			PieceTypeMotion,
+		},
+		{"INTIMACAO sem sinal → DEFENSE (fallback histórico)", &IntimationContext{Type: "INTIMACAO", Content: ""}, PieceTypeDefense},
+		{"sem sinal → OTHER", &IntimationContext{Type: "COMUNICACAO", Content: "Comunicação de ato ordinatório."}, PieceTypeOther},
+		{"vazio → OTHER", &IntimationContext{}, PieceTypeOther},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.intimationType, func(t *testing.T) {
-			got := inferPieceType(tt.intimationType)
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferPieceType(tt.it)
 			if got != tt.want {
-				t.Errorf("inferPieceType(%q) = %q, want %q", tt.intimationType, got, tt.want)
+				t.Errorf("inferPieceType() = %q, want %q", got, tt.want)
 			}
 		})
 	}

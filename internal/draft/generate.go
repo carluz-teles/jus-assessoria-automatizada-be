@@ -58,11 +58,12 @@ const generationModel = "claude-opus-4-8"
 
 // generationDepsReader is the narrow read port the generation use case needs to load
 // case context for composing the advisory prompt. Satisfied by the read Repository
-// (GetDraftByID + optionally GetIntimationForDraft), but kept as a port so the unit
-// tests can inject a fake without a full repo mock.
+// (GetDraftByID + optionally GetIntimationForDraft + GetPartiesForDraft), but kept as
+// a port so the unit tests can inject a fake without a full repo mock.
 type generationDepsReader interface {
 	GetDraftByID(ctx context.Context, tx database.Tx, tenantID, draftID string) (*Draft, error)
 	GetIntimationForDraft(ctx context.Context, tx database.Tx, tenantID, intimationID string) (*IntimationContext, error)
+	GetPartiesForDraft(ctx context.Context, tx database.Tx, tenantID, caseID string) ([]PartyInfo, error)
 }
 
 // generationWriter is the narrow write port the generation use case needs. A separate
@@ -206,6 +207,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	// ── 3. Read draft + guard saga_state == EXTRACTING ────────────────────────
 	var draft *Draft
 	var intimation *IntimationContext
+	var parties []PartyInfo
 	if err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		d, e := uc.reader.GetDraftByID(ctx, tx, ev.TenantID, ev.DraftID)
 		if e != nil {
@@ -226,6 +228,18 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 					slog.String("draft_id", ev.DraftID), slog.Any("error", e2))
 			} else {
 				intimation = i
+			}
+		}
+		// Load structured parties from the party table (non-fatal: an empty case or
+		// a process with no seeded parties degrades gracefully — the LLM uses the
+		// teor da intimação as a fallback for party names, as in previous versions).
+		if d.CaseID != "" {
+			pp, e3 := uc.reader.GetPartiesForDraft(ctx, tx, ev.TenantID, d.CaseID)
+			if e3 != nil {
+				slog.WarnContext(ctx, "draft generate: parties load failed",
+					slog.String("draft_id", ev.DraftID), slog.Any("error", e3))
+			} else {
+				parties = pp
 			}
 		}
 		return nil
@@ -249,7 +263,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, ev.TenantID, crid, queryText, 8)
 
 	// ── 5. Compose prompt and call LLM ────────────────────────────────────────
-	draftCtx := buildDraftContext(draft, intimation, chunks)
+	draftCtx := buildDraftContext(draft, intimation, parties, chunks)
 	composed, err2 := uc.composer.ComposeDraft(advisory.AgentDraftMinuta, draftCtx)
 	if err2 != nil {
 		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("compose prompt: %v", err2))
@@ -357,14 +371,46 @@ func buildQueryText(d *Draft, i *IntimationContext) string {
 }
 
 // buildDraftContext converts the loaded domain objects to the advisory DraftContext.
-func buildDraftContext(d *Draft, i *IntimationContext, chunks []string) advisory.DraftContext {
+// When i is nil (blank/processo draft) the intimation fields remain empty strings —
+// the prompt's add() helper drops empty labels, so the LLM still gets a clean prompt.
+// parties may be nil/empty (non-fatal degraded path); the signing lawyer is resolved
+// from the matched recipient in intimation.recipients (nil recipients → zero-value).
+func buildDraftContext(d *Draft, i *IntimationContext, parties []PartyInfo, chunks []string) advisory.DraftContext {
 	dc := advisory.DraftContext{
 		PieceType: d.PieceType,
 		Chunks:    chunks,
 	}
-	if i != nil {
-		dc.IntimationType = i.Type
+	// Populate structured parties (PLAINTIFF/DEFENDANT/THIRD_PARTY).
+	if len(parties) > 0 {
+		partiesCtx := make([]advisory.PartyCtx, 0, len(parties))
+		for _, p := range parties {
+			partiesCtx = append(partiesCtx, advisory.PartyCtx{
+				Role:    p.Role,
+				Name:    p.Name,
+				Counsel: p.Counsel,
+			})
+		}
+		dc.Parties = partiesCtx
 	}
+	if i == nil {
+		return dc
+	}
+	dc.IntimationType = i.Type
+	// The DJEN intimation teor is stored as HTML — strip it to plain text so the LLM
+	// gets clean signal (parties, order, dates) without markup noise wasting tokens.
+	dc.IntimationText = stripHTML(i.Content)
+	dc.Court = i.Court
+	dc.Degree = i.Degree
+	dc.Class = i.Class
+	dc.Subject = i.Subject
+	dc.CNJNumber = i.CNJNumber
+	dc.JudgingBody = i.JudgingBody
+	dc.DeadlineDate = i.DeadlineEndDate
+	// Resolve signing lawyer from the matched OAB recipient (our advogado).
+	sl := signingLawyerFromRecipients(i.Recipients)
+	dc.SigningLawyerName = sl.Name
+	dc.SigningLawyerOAB = sl.OAB
+	dc.SigningLawyerUF = sl.UF
 	return dc
 }
 

@@ -11,6 +11,8 @@
 // handler, or lib (the slice's inward dependency rule).
 package draft
 
+import "strings"
+
 import "time"
 
 // Draft is a peça (minuta) in its DRAFT lifecycle state. It is 1:1 with an intimação
@@ -39,13 +41,66 @@ type PatchResult struct {
 }
 
 // IntimationContext is the data the use case reads from the intimation row when
-// source=intimation, to infer piece_type and resolve case_id/court_record_id.
+// source=intimation, to infer piece_type, resolve case_id/court_record_id, and
+// compose the AI generation prompt with real process metadata.
 type IntimationContext struct {
 	IntimationID  string
 	CaseID        string
 	CourtRecordID string
 	// Type is the raw DJEN type: CITACAO, INTIMACAO, COMUNICACAO, etc.
 	Type string
+
+	// Fields below are used by the AI generation prompt (buildDraftContext).
+	// They mirror the columns available via GetDraftDetail's JOIN on court_record
+	// and deadline — reusing the same sources, loading them together for the
+	// generation path so no second query is needed.
+
+	// Content is the full text of the intimation (teor) — the richest context
+	// signal for the AI prompt.
+	Content string
+	// CNJNumber is the process number in CNJ format (e.g. 0000001-23.2026.8.26.0001).
+	CNJNumber string
+	// Court is the tribunal sigla (e.g. TJSP, TRT2).
+	Court string
+	// Degree is the grau (G1, G2, JE, SUPERIOR…).
+	Degree string
+	// Class is the classe/rito processual.
+	Class string
+	// Subject is the assunto.
+	Subject string
+	// JudgingBody is the órgão julgador / vara.
+	JudgingBody string
+	// DeadlineEndDate is the prazo end date formatted as "2006-01-02" (DateOnly),
+	// or empty string when no deadline has been derived for this intimation yet.
+	DeadlineEndDate string
+	// Recipients is the raw jsonb from intimation.recipients ([]djenRecipient shape).
+	// Parsed by the mapper to resolve the signing lawyer (matched=true recipient).
+	Recipients []byte
+}
+
+// PartyCounselInfo is one advogado aggregated under a party. OAB and UF are the
+// stable identity (as stored by the DJEN parser); Name may be empty when absent.
+type PartyCounselInfo struct {
+	Name string
+	OAB  string
+	UF   string
+}
+
+// PartyInfo is one party of the process with its aggregated counsels.
+// Role is the raw DB value (PLAINTIFF, DEFENDANT, THIRD_PARTY).
+type PartyInfo struct {
+	Role    string
+	Name    string
+	Counsel string // first counsel formatted as "Name (OAB/UF nº oab)", or "" when absent
+}
+
+// SigningLawyer is the OAB-matched advogado from intimation.recipients — the first
+// recipient flagged matched=true (our OAB, the signing lawyer for the peça).
+// All fields are empty strings when no matched recipient exists.
+type SigningLawyer struct {
+	Name string
+	OAB  string
+	UF   string
 }
 
 // PieceType closed set — the only values the edge accepts and the DB stores.
@@ -237,19 +292,57 @@ const (
 	ChatRoleAssistant = "assistant"
 )
 
-// inferPieceType maps an intimation type (DJEN tipoComunicacao) to a PieceType
-// when the client omits piece_type. This is the SINGLE source of truth for the
-// inference — referenced by the domain use case and tested directly.
+// inferPieceType classifies the peça type when the client omits piece_type. It is
+// the SINGLE source of truth for creation-time inference and is CONTENT-FIRST: the
+// real signal lives in the teor da intimação (the DJEN type alone is ambiguous — the
+// same "INTIMACAO" covers a defense, a manifestation, or a recursal window). It uses
+// the type + class + subject + the HTML-stripped teor, is high-precision (conservative
+// keyword match), and falls back to OTHER rather than mislabel. The generation LLM
+// still adapts the actual peça to the teor; this drives the UI label and prompt hint.
 //
-// Inference rules (docs/erd-backend.md peticionamento §4):
-//   - CITACAO  → DEFENSE
-//   - INTIMACAO → DEFENSE
-//   - anything else (COMUNICACAO, unknown) → OTHER
-func inferPieceType(intimationType string) string {
-	switch intimationType {
-	case "CITACAO", "INTIMACAO":
+// Precedence (most specific first):
+//   - APPEAL  — a decision was rendered and a recursal window opened
+//   - DEFENSE — cited to defend, or embargos/impugnação (execução/cumprimento)
+//   - MOTION  — ordered to manifest/say/indicate (manifestação incidental)
+//   - DEFENSE — fallback: an INTIMACAO with no content signal (historical default)
+//   - OTHER   — no signal and not an INTIMACAO/CITACAO
+//
+// Note: the class "Execução" alone does NOT imply DEFENSE — the recipient may be the
+// exequente ordered to indicate assets (→ MOTION). Only the content disambiguates.
+func inferPieceType(it *IntimationContext) string {
+	if it == nil {
+		return PieceTypeOther
+	}
+	blob := strings.ToLower(strings.Join(
+		[]string{it.Type, it.Class, it.Subject, stripHTML(it.Content)}, " "))
+
+	switch {
+	case containsAny(blob, "sentença", "acórdão", "recurso inominado", "prazo recursal",
+		"para recorrer", "interpor recurso", "apelaç", "julgo procedente", "julgo improcedente"):
+		return PieceTypeAppeal
+	case it.Type == "CITACAO",
+		containsAny(blob, "conteste", "contestação", "apresentar defesa", "oferecer defesa",
+			"embargos à execução", "embargos do executado", "impugnação ao cumprimento"):
+		return PieceTypeDefense
+	case containsAny(blob, "manifeste-se", "manifestar-se", "manifestação", "diga sobre",
+		"indique bens", "indicar bens", "requeira o que"):
+		return PieceTypeMotion
+	case it.Type == "INTIMACAO":
+		// Fallback: an INTIMACAO with no recognized content signal defaults to DEFENSE
+		// (the historical default) — better a sane hint than OTHER when the teor is
+		// thin/empty (scraping gap). Content signals above still win (APPEAL/MOTION).
 		return PieceTypeDefense
 	default:
 		return PieceTypeOther
 	}
+}
+
+// containsAny reports whether s contains any of subs (all expected pre-lowercased).
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }

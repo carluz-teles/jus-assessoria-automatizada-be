@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/draft"
+	"github.com/jusassessoria/platform/lib/database"
 )
 
 // seedParty inserts one party under the case and returns its id (owner insert, RLS
@@ -86,6 +88,83 @@ func TestListPartesByProcesso_BucketsAndCounsels(t *testing.T) {
 	}
 	if len(byRole["THIRD_PARTY"]) != 1 {
 		t.Errorf("terceiros = %+v, want one MP", byRole["THIRD_PARTY"])
+	}
+}
+
+// TestGetPartiesForDraft proves the draft slice's own GetPartiesForDraft query (used during
+// generation to inject structured parties into the prompt) against a real Postgres:
+// - counsels are aggregated correctly in the jsonb_agg subquery
+// - parties are tenant-scoped (cross-tenant reads return empty)
+// - a party without counsels returns an empty-string Counsel field (not a crash)
+func TestGetPartiesForDraft(t *testing.T) {
+	pool := newPool(t)
+	repo := draft.NewRepository()
+	uow := database.NewUnitOfWork(pool)
+
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-draft-parties", 0)
+	_, caseID := seedCourtRecordCNJ(t, pool, tenantID, "0000021-11.2024.8.26.0200")
+
+	// Seed parties: one plaintiff with one counsel, one defendant without.
+	autorID := seedParty(t, pool, tenantID, caseID, "PLAINTIFF", "AUTOR DRAFT")
+	seedCounsel(t, pool, tenantID, autorID, "Ana Lima", "55123", "SP")
+	seedParty(t, pool, tenantID, caseID, "DEFENDANT", "REU DRAFT")
+
+	ctx := context.Background()
+
+	var parties []draft.PartyInfo
+	var foreignParties []draft.PartyInfo
+
+	// Use the UoW to run inside a real tenant-scoped tx (same path as generate.go).
+	if err := uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		var err error
+		parties, err = repo.GetPartiesForDraft(ctx, tx, tenantID, caseID)
+		return err
+	}); err != nil {
+		t.Fatalf("GetPartiesForDraft: %v", err)
+	}
+
+	if len(parties) != 2 {
+		t.Fatalf("got %d parties, want 2", len(parties))
+	}
+
+	byRole := map[string]draft.PartyInfo{}
+	for _, p := range parties {
+		byRole[p.Role] = p
+	}
+
+	plaintiff, ok := byRole["PLAINTIFF"]
+	if !ok {
+		t.Fatal("PLAINTIFF missing from result")
+	}
+	if plaintiff.Name != "AUTOR DRAFT" {
+		t.Errorf("plaintiff.Name = %q, want AUTOR DRAFT", plaintiff.Name)
+	}
+	// Counsel must be formatted as "Ana Lima (OAB/SP nº 55123)".
+	if plaintiff.Counsel == "" {
+		t.Error("PLAINTIFF with a counsel must have non-empty Counsel field")
+	}
+
+	defendant, ok := byRole["DEFENDANT"]
+	if !ok {
+		t.Fatal("DEFENDANT missing from result")
+	}
+	if defendant.Counsel != "" {
+		t.Errorf("DEFENDANT has no counsel; Counsel must be empty, got %q", defendant.Counsel)
+	}
+
+	// Cross-tenant: a different tenant sees no parties for the same case_id.
+	tenantB := uuid.NewString()
+	seedTenant(t, pool, tenantB, "org-draft-parties-b", 0)
+	if err := uow.Do(ctx, tenantB, func(tx database.Tx) error {
+		var err error
+		foreignParties, err = repo.GetPartiesForDraft(ctx, tx, tenantB, caseID)
+		return err
+	}); err != nil {
+		t.Fatalf("GetPartiesForDraft (cross-tenant): %v", err)
+	}
+	if len(foreignParties) != 0 {
+		t.Fatalf("cross-tenant read returned %d parties, want 0", len(foreignParties))
 	}
 }
 

@@ -39,6 +39,9 @@ DELETE FROM review WHERE draft_id = $1
 // Remove all review rows for a draft. Called by Gerar before persisting DRAFTED so
 // that subsequent Revisar calls always operate on a clean slate (no stale suggestions
 // from a prior generation attempt are mixed with a new minuta).
+// tenant isolation: review has no tenant_id (child of draft); the caller guards the
+// tenant via GetDraftByID(tenantID, draftID) earlier in the same tx. Do NOT "fix"
+// this with a JOIN — the app-layer barrier is intentional (see 0044_review_status).
 func (q *Queries) DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteReviewsForDraft, draftID)
 	return err
@@ -438,12 +441,22 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 
 const getIntimationForDraft = `-- name: GetIntimationForDraft :one
 SELECT
-    i.id            AS intimation_id,
-    cr.case_id      AS case_id,
-    cr.id           AS court_record_id,
-    i.type          AS intimation_type
+    i.id                AS intimation_id,
+    cr.case_id          AS case_id,
+    cr.id               AS court_record_id,
+    i.type              AS intimation_type,
+    i.content           AS intimation_content,
+    i.recipients        AS recipients,
+    cr.cnj_number       AS cnj_number,
+    cr.court            AS court,
+    cr.degree           AS degree,
+    cr.class            AS class,
+    cr.subject          AS subject,
+    cr.judging_body     AS judging_body,
+    dl.end_date         AS deadline_end_date
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN deadline dl ON dl.notification_id = i.id
 WHERE i.id = $1 AND cr.tenant_id = $2
 `
 
@@ -453,15 +466,27 @@ type GetIntimationForDraftParams struct {
 }
 
 type GetIntimationForDraftRow struct {
-	IntimationID   uuid.UUID `json:"intimation_id"`
-	CaseID         uuid.UUID `json:"case_id"`
-	CourtRecordID  uuid.UUID `json:"court_record_id"`
-	IntimationType *string   `json:"intimation_type"`
+	IntimationID      uuid.UUID   `json:"intimation_id"`
+	CaseID            uuid.UUID   `json:"case_id"`
+	CourtRecordID     uuid.UUID   `json:"court_record_id"`
+	IntimationType    *string     `json:"intimation_type"`
+	IntimationContent string      `json:"intimation_content"`
+	Recipients        []byte      `json:"recipients"`
+	CnjNumber         string      `json:"cnj_number"`
+	Court             string      `json:"court"`
+	Degree            string      `json:"degree"`
+	Class             *string     `json:"class"`
+	Subject           *string     `json:"subject"`
+	JudgingBody       *string     `json:"judging_body"`
+	DeadlineEndDate   pgtype.Date `json:"deadline_end_date"`
 }
 
 // Load the intimation context needed to build a draft from source=intimation:
-// the case_id (via court_record), the court_record_id, and the type (for piece_type
-// inference). Filtered by intimation.id and tenant_id (barrier 1 via court_record).
+// the case_id (via court_record), the court_record_id, the type (for piece_type
+// inference), the rich context fields (content, process metadata, deadline)
+// used to compose the AI generation prompt, and the recipients jsonb (for
+// signing-lawyer resolution — matched=true recipient is our advogado). Filtered
+// by intimation.id and tenant_id (barrier 1 via court_record).
 // A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 func (q *Queries) GetIntimationForDraft(ctx context.Context, arg GetIntimationForDraftParams) (GetIntimationForDraftRow, error) {
 	row := q.db.QueryRow(ctx, getIntimationForDraft, arg.ID, arg.TenantID)
@@ -471,6 +496,15 @@ func (q *Queries) GetIntimationForDraft(ctx context.Context, arg GetIntimationFo
 		&i.CaseID,
 		&i.CourtRecordID,
 		&i.IntimationType,
+		&i.IntimationContent,
+		&i.Recipients,
+		&i.CnjNumber,
+		&i.Court,
+		&i.Degree,
+		&i.Class,
+		&i.Subject,
+		&i.JudgingBody,
+		&i.DeadlineEndDate,
 	)
 	return i, err
 }
@@ -513,6 +547,66 @@ func (q *Queries) GetLatestReview(ctx context.Context, draftID uuid.UUID) (GetLa
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const getPartiesForDraft = `-- name: GetPartiesForDraft :many
+SELECT p.id, p.role, p.name,
+       COALESCE(
+         (SELECT jsonb_agg(
+                   jsonb_build_object('name', pc.name, 'oab', pc.oab, 'uf', pc.uf)
+                   ORDER BY pc.name
+                 )
+          FROM party_counsel pc
+          WHERE pc.party_id = p.id AND pc.tenant_id = p.tenant_id),
+         '[]'::jsonb
+       )::text AS counsels
+FROM party p
+WHERE p.tenant_id = $1 AND p.case_id = $2
+ORDER BY p.role, p.name
+`
+
+type GetPartiesForDraftParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	CaseID   uuid.UUID `json:"case_id"`
+}
+
+type GetPartiesForDraftRow struct {
+	ID       uuid.UUID `json:"id"`
+	Role     string    `json:"role"`
+	Name     string    `json:"name"`
+	Counsels string    `json:"counsels"`
+}
+
+// Load the parties (autor/réu/terceiro) and their advogados for a given case,
+// tenant-scoped (barrier 1). Used by the draft generation pipeline to inject
+// structured party names and counsel info into the AI prompt — the draft slice
+// reads party/party_counsel directly without importing the acquisition slice
+// (same pattern as GetDraftDetail for court_record). counsels defaults to an
+// empty jsonb array (never NULL) when a party has no advogado. Ordered by
+// role then name for deterministic iteration.
+func (q *Queries) GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraftParams) ([]GetPartiesForDraftRow, error) {
+	rows, err := q.db.Query(ctx, getPartiesForDraft, arg.TenantID, arg.CaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetPartiesForDraftRow
+	for rows.Next() {
+		var i GetPartiesForDraftRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Role,
+			&i.Name,
+			&i.Counsels,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const insertChatMessage = `-- name: InsertChatMessage :one

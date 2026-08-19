@@ -152,3 +152,185 @@ func TestTemplateComposer_ComposeProcess_EmptyContext(t *testing.T) {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
 }
+
+// TestTemplateComposer_ComposeDraft_v4_FullContext verifies that v4 injects all real
+// data fields into the user message — including parties and signing lawyer — and that
+// the system prompt contains the canonical structure instructions and v4 gold rule.
+func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
+	c := NewTemplateComposer()
+	out, err := c.ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType:      "DEFENSE",
+		IntimationType: "CITACAO",
+		IntimationText: "Fica o réu citado a contestar em 15 dias úteis.",
+		Court:          "TJSP",
+		Degree:         "G1",
+		Class:          "Procedimento Comum",
+		Subject:        "Contrato",
+		CNJNumber:      "0000001-23.2026.8.26.0001",
+		JudgingBody:    "3ª Vara Cível da Comarca de São Paulo",
+		DeadlineDate:   "2026-09-01",
+		Parties: []PartyCtx{
+			{Role: "PLAINTIFF", Name: "AUTOR LTDA", Counsel: "Pedro (OAB/RS nº 119938)"},
+			{Role: "DEFENDANT", Name: "RÉU SA"},
+		},
+		SigningLawyerName: "Dr. João Silva",
+		SigningLawyerOAB:  "12345",
+		SigningLawyerUF:   "SP",
+		Chunks:            []string{"trecho 1", "trecho 2"},
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+
+	if out.PromptVersion != "draft_minuta/v4" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v4", out.PromptVersion)
+	}
+
+	// System must contain the gold rule (v4: parties + signing lawyer instruction).
+	for _, want := range []string{
+		"REGRA DE OURO",
+		"NUNCA deixe",
+		"placeholder",
+		"PARTES do processo",
+		"ADVOGADO SIGNATÁRIO",
+		"PLAINTIFF",
+		"DEFENDANT",
+		"ESTRUTURA CANÔNICA",
+		"ENDEREÇAMENTO",
+		"DOS FATOS",
+		"DO DIREITO",
+		"DOS PEDIDOS",
+		"REQUISITOS LEGAIS",
+		"DEFENSE",
+		"COMPLAINT",
+		"APPEAL",
+	} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("system prompt missing %q\n---\n%s", want, out.System)
+		}
+	}
+
+	// User message must contain all injected real fields including parties + lawyer.
+	for _, want := range []string{
+		"0000001-23.2026.8.26.0001",
+		"3ª Vara Cível da Comarca de São Paulo",
+		"TJSP",
+		"G1",
+		"Procedimento Comum",
+		"Contrato",
+		"CITACAO",
+		"2026-09-01",
+		"Fica o réu citado a contestar",
+		"AUTOR LTDA",
+		"RÉU SA",
+		"Dr. João Silva",
+		"OAB/SP nº 12345",
+		"Trechos relevantes dos autos:",
+		"trecho 1",
+	} {
+		if !strings.Contains(out.User, want) {
+			t.Errorf("user prompt missing %q\n---\n%s", want, out.User)
+		}
+	}
+
+	// User must NOT start with "Contexto do caso:\n" header (dropped in v3+).
+	if strings.HasPrefix(out.User, "Contexto do caso:") {
+		t.Errorf("v4 user prompt should not start with 'Contexto do caso:' header")
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v4_NoSigningLawyer verifies that when no signing
+// lawyer is provided the system instructs using the literal marker [Nome do Advogado].
+func TestTemplateComposer_ComposeDraft_v4_NoSigningLawyer(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType: "DEFENSE",
+		// SigningLawyer fields all empty — should NOT appear in user message.
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	// User must NOT inject a signing-lawyer line when fields are empty.
+	if strings.Contains(out.User, "Advogado signatário:") {
+		t.Errorf("user prompt should omit 'Advogado signatário:' when fields empty\n---\n%s", out.User)
+	}
+	// System must still instruct fallback to markers.
+	if !strings.Contains(out.System, "[Nome do Advogado]") {
+		t.Errorf("system must mention fallback marker [Nome do Advogado] when lawyer absent\n---\n%s", out.System)
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v4_EmptyContext verifies that an empty DraftContext
+// renders the degraded-mode message (no placeholders injected).
+func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	if !strings.Contains(out.User, "sem contexto adicional") {
+		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
+	}
+	if out.PromptVersion != "draft_minuta/v4" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v3", out.PromptVersion)
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v4_EmptyFieldsDropped verifies that empty
+// fields are not rendered as dangling labels (regression from v2 pattern).
+func TestTemplateComposer_ComposeDraft_v4_EmptyFieldsDropped(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType: "MOTION",
+		// All other fields empty — should not appear in user message.
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	for _, absent := range []string{
+		"Tribunal:", "Grau:", "Classe/rito:", "Assunto:", "Nº do processo:",
+		"Órgão julgador/Vara:", "Prazo final:", "TEOR DA INTIMAÇÃO:",
+	} {
+		if strings.Contains(out.User, absent) {
+			t.Errorf("user prompt should omit empty field label %q\n---\n%s", absent, out.User)
+		}
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v4_UnknownAgent verifies that an unknown agent
+// returns a typed invalid error (programmer safety net).
+func TestTemplateComposer_ComposeDraft_v4_UnknownAgent(t *testing.T) {
+	if _, err := NewTemplateComposer().ComposeDraft("nope", DraftContext{}); err == nil {
+		t.Fatal("ComposeDraft(unknown) error = nil, want invalid")
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v4_PlaybookInjected verifies that a non-empty
+// Playbook is injected into the system prompt.
+func TestTemplateComposer_ComposeDraft_v4_PlaybookInjected(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType: "DEFENSE",
+		Playbook:  "Sempre incluir citação ao CPC.",
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	if !strings.Contains(out.System, "playbook do escritório") ||
+		!strings.Contains(out.System, "Sempre incluir citação ao CPC.") {
+		t.Errorf("playbook not injected into system:\n%s", out.System)
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v4_ChunksInjected verifies that RAG chunks
+// are injected with numbered labels in the user message.
+func TestTemplateComposer_ComposeDraft_v4_ChunksInjected(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType: "DEFENSE",
+		Chunks:    []string{"chunk A", "chunk B", "chunk C"},
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	for _, want := range []string{"Trechos relevantes dos autos:", "1. chunk A", "2. chunk B", "3. chunk C"} {
+		if !strings.Contains(out.User, want) {
+			t.Errorf("user prompt missing %q\n---\n%s", want, out.User)
+		}
+	}
+}

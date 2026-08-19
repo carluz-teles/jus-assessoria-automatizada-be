@@ -86,9 +86,9 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 			}
 			d.IntimationID = intimation.IntimationID
 			d.CaseID = intimation.CaseID
-			// Infer piece_type from intimation type when not supplied by the client.
+			// Infer piece_type from the intimation (content-first) when not supplied.
 			if d.PieceType == "" {
-				d.PieceType = inferPieceType(intimation.Type)
+				d.PieceType = inferPieceType(intimation)
 			}
 
 		case SourceProcesso:
