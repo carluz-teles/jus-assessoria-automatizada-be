@@ -159,7 +159,7 @@ func (q *Queries) BatchInsertDocketEntries(ctx context.Context, entries []byte) 
 
 const batchMarkCourtRecordsSynced = `-- name: BatchMarkCourtRecordsSynced :exec
 UPDATE court_record cr
-SET completeness  = u.completeness,
+SET completeness  = GREATEST(u.completeness, cr.completeness),
     next_sync_at  = u.next_sync_at,
     judging_body  = COALESCE(u.judging_body, cr.judging_body),
     class         = COALESCE(NULLIF(u.class, ''), cr.class),
@@ -172,8 +172,13 @@ WHERE cr.id = u.id
 
 // Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
 // completeness/next_sync_at and COALESCE judging_body/class/subject (a sync that
-// omits them keeps the prior value; a non-empty value overwrites via NULLIF/COALESCE)
-// for MANY records in one round-trip, from a jsonb array of rows.
+// omits them keeps the prior value; a sync that supplies them overwrites — COALESCE on
+// NULLIF(”, prior) so an empty string from the source does not clobber a real value).
+// class and subject are included so a tribunal correction in DJEN/DATAJUD propagates
+// on the next re-sync instead of being frozen at the first-seen value.
+// completeness uses GREATEST (never DOWNGRADE): a DJEN re-observation (0.3) must NOT
+// clobber a prior DATAJUD enrichment (0.9). Without this the churn of a backfill
+// re-discovering the same process across windows/OABs erases every enrichment.
 func (q *Queries) BatchMarkCourtRecordsSynced(ctx context.Context, updates []byte) error {
 	_, err := q.db.Exec(ctx, batchMarkCourtRecordsSynced, updates)
 	return err

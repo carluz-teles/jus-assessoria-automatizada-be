@@ -197,8 +197,11 @@ RETURNING id, cnj_number, degree;
 -- NULLIF('', prior) so an empty string from the source does not clobber a real value).
 -- class and subject are included so a tribunal correction in DJEN/DATAJUD propagates
 -- on the next re-sync instead of being frozen at the first-seen value.
+-- completeness uses GREATEST (never DOWNGRADE): a DJEN re-observation (0.3) must NOT
+-- clobber a prior DATAJUD enrichment (0.9). Without this the churn of a backfill
+-- re-discovering the same process across windows/OABs erases every enrichment.
 UPDATE court_record cr
-SET completeness  = u.completeness,
+SET completeness  = GREATEST(u.completeness, cr.completeness),
     next_sync_at  = u.next_sync_at,
     judging_body  = COALESCE(u.judging_body, cr.judging_body),
     class         = COALESCE(NULLIF(u.class, ''), cr.class),
