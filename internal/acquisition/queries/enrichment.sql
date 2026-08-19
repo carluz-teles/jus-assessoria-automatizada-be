@@ -25,6 +25,11 @@
 -- re-poll cadence. case_id is never touched (the record keeps its Pasta). RETURNING
 -- carries id + case_id for the caller. The (tenant, cnj, degree) UNIQUE requires the
 -- caller to ensure no OTHER record already holds @degree (the merge path handles that).
+-- lifecycle is derived from DATAJUD movimentos (lifecycleFromMovimentos in the parser):
+-- CASE guards that an already-SUPERSEDED row is never downgraded — superseding is a
+-- structural merge operation and must survive a scheduler re-poll. When @lifecycle is
+-- empty (source does not carry movimentos) the existing lifecycle is preserved via the
+-- NULLIF/COALESCE: NULLIF('', lifecycle) = NULL → COALESCE falls back to lifecycle.
 UPDATE court_record SET
     degree = @degree,
     court = @court,
@@ -34,7 +39,11 @@ UPDATE court_record SET
     filed_at = @filed_at,
     secrecy = @secrecy,
     completeness = @completeness,
-    next_sync_at = COALESCE(next_sync_at, @next_sync_at)
+    next_sync_at = COALESCE(next_sync_at, @next_sync_at),
+    lifecycle = CASE
+        WHEN lifecycle = 'SUPERSEDED' THEN lifecycle
+        ELSE COALESCE(NULLIF(@lifecycle, ''), lifecycle)
+    END
 WHERE id = @court_record_id AND tenant_id = @tenant_id
 RETURNING id, case_id;
 

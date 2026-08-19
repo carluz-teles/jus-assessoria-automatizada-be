@@ -138,6 +138,12 @@ type ParsedCourtRecord struct {
 	// the source (DJEN discovery) does not carry them.
 	FiledAt time.Time
 	Secrecy string
+	// Lifecycle is derived from the DATAJUD movimentos by lifecycleFromMovimentos
+	// (datajud_parser.go). Empty when the source does not carry movimentos (DJEN
+	// discovery never sets it — the enrichment path always owns this field). The
+	// enrichment use case writes it to court_record, but NEVER downgrades an
+	// already-SUPERSEDED row.
+	Lifecycle string
 }
 
 // ParsedDocketEntry is one andamento. Hash is the source-computed dedup key

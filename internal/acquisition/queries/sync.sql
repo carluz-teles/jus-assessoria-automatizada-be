@@ -192,14 +192,19 @@ RETURNING id, cnj_number, degree;
 
 -- name: BatchMarkCourtRecordsSynced :exec
 -- Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
--- completeness/next_sync_at and COALESCE judging_body (a sync that omits it keeps the
--- prior value) for MANY records in one round-trip, from a jsonb array of rows.
+-- completeness/next_sync_at and COALESCE judging_body/class/subject (a sync that
+-- omits them keeps the prior value; a sync that supplies them overwrites — COALESCE on
+-- NULLIF('', prior) so an empty string from the source does not clobber a real value).
+-- class and subject are included so a tribunal correction in DJEN/DATAJUD propagates
+-- on the next re-sync instead of being frozen at the first-seen value.
 UPDATE court_record cr
-SET completeness = u.completeness,
-    next_sync_at = u.next_sync_at,
-    judging_body = COALESCE(u.judging_body, cr.judging_body)
+SET completeness  = u.completeness,
+    next_sync_at  = u.next_sync_at,
+    judging_body  = COALESCE(u.judging_body, cr.judging_body),
+    class         = COALESCE(NULLIF(u.class, ''), cr.class),
+    subject       = COALESCE(NULLIF(u.subject, ''), cr.subject)
 FROM jsonb_to_recordset(@updates::jsonb) AS u(
-    id uuid, completeness real, next_sync_at timestamptz, judging_body text
+    id uuid, completeness real, next_sync_at timestamptz, judging_body text, class text, subject text
 )
 WHERE cr.id = u.id;
 

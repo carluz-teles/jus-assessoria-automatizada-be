@@ -159,18 +159,21 @@ func (q *Queries) BatchInsertDocketEntries(ctx context.Context, entries []byte) 
 
 const batchMarkCourtRecordsSynced = `-- name: BatchMarkCourtRecordsSynced :exec
 UPDATE court_record cr
-SET completeness = u.completeness,
-    next_sync_at = u.next_sync_at,
-    judging_body = COALESCE(u.judging_body, cr.judging_body)
+SET completeness  = u.completeness,
+    next_sync_at  = u.next_sync_at,
+    judging_body  = COALESCE(u.judging_body, cr.judging_body),
+    class         = COALESCE(NULLIF(u.class, ''), cr.class),
+    subject       = COALESCE(NULLIF(u.subject, ''), cr.subject)
 FROM jsonb_to_recordset($1::jsonb) AS u(
-    id uuid, completeness real, next_sync_at timestamptz, judging_body text
+    id uuid, completeness real, next_sync_at timestamptz, judging_body text, class text, subject text
 )
 WHERE cr.id = u.id
 `
 
 // Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
-// completeness/next_sync_at and COALESCE judging_body (a sync that omits it keeps the
-// prior value) for MANY records in one round-trip, from a jsonb array of rows.
+// completeness/next_sync_at and COALESCE judging_body/class/subject (a sync that
+// omits them keeps the prior value; a non-empty value overwrites via NULLIF/COALESCE)
+// for MANY records in one round-trip, from a jsonb array of rows.
 func (q *Queries) BatchMarkCourtRecordsSynced(ctx context.Context, updates []byte) error {
 	_, err := q.db.Exec(ctx, batchMarkCourtRecordsSynced, updates)
 	return err

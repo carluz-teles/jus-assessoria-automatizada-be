@@ -941,6 +941,9 @@ func (r *pgRepository) UpdateCourtRecordGrade(ctx context.Context, tx database.T
 		Secrecy:       params.Secrecy,
 		Completeness:  params.Completeness,
 		NextSyncAt:    pgtype.Timestamptz{Time: params.NextSyncAt, Valid: !params.NextSyncAt.IsZero()},
+		// Empty string when graded.Lifecycle is unset: the SQL NULLIF('')→NULL and
+		// COALESCE falls back to the existing lifecycle column value (preserves SUPERSEDED).
+		Lifecycle: params.Lifecycle,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrCourtRecordNotFound
