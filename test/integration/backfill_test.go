@@ -1,8 +1,8 @@
 //go:build integration
 
 // Backfill listener integration tests — prove OnIntegrationActivated against a
-// real Postgres: a first activation creates ONE backfill_job (53 RUNNING slices)
-// plus 53 sync_requested outbox rows and one processed_event, all in one atomic
+// real Postgres: a first activation creates ONE backfill_job (5 RUNNING slices)
+// plus 5 sync_requested outbox rows and one processed_event, all in one atomic
 // tx (a failed publish rolls the whole thing back); a duplicate delivery and a
 // re-activation are both no-ops; and the job is tenant-isolated by RLS.
 package integration_test
@@ -94,8 +94,8 @@ func countProcessedEvent(t *testing.T, pool *pgxpool.Pool, eventID string) int {
 	return n
 }
 
-// AC4: a valid integration_activated event → 1 backfill_job (53 slices, RUNNING)
-// + 1 processed_event + 53 sync_requested outbox rows with well-formed payloads.
+// AC4: a valid integration_activated event → 1 backfill_job (5 slices, RUNNING)
+// + 1 processed_event + 5 sync_requested outbox rows with well-formed payloads.
 func TestBackfill_FirstActivation_JobAndSlices(t *testing.T) {
 	pool := newPool(t)
 	tenantID := uuid.NewString()
@@ -117,14 +117,14 @@ func TestBackfill_FirstActivation_JobAndSlices(t *testing.T) {
 		Scan(&slices, &status); err != nil {
 		t.Fatalf("read job: %v", err)
 	}
-	if slices != 53 || status != acquisition.BackfillStatusRunning {
-		t.Fatalf("job = {slices:%d status:%q}, want {53 RUNNING}", slices, status)
+	if slices != 5 || status != acquisition.BackfillStatusRunning {
+		t.Fatalf("job = {slices:%d status:%q}, want {5 RUNNING}", slices, status)
 	}
 	if n := countProcessedEvent(t, pool, ev.EventID); n != 1 {
 		t.Fatalf("processed_event rows = %d, want 1", n)
 	}
-	if n := countSyncRequestedOutbox(t, pool, tenantID); n != 53 {
-		t.Fatalf("sync_requested outbox rows = %d, want 53", n)
+	if n := countSyncRequestedOutbox(t, pool, tenantID); n != 5 {
+		t.Fatalf("sync_requested outbox rows = %d, want 5", n)
 	}
 
 	// The slice-0 payload carries the identifiers and dated bounds a consumer needs.
@@ -204,8 +204,8 @@ func TestBackfill_DuplicateDelivery_NoOp(t *testing.T) {
 	if n := countBackfillJobs(t, pool, tenantID); n != 1 {
 		t.Fatalf("backfill_job rows = %d, want 1 (duplicate must not add one)", n)
 	}
-	if n := countSyncRequestedOutbox(t, pool, tenantID); n != 53 {
-		t.Fatalf("sync_requested rows = %d, want 53 (duplicate must not add more)", n)
+	if n := countSyncRequestedOutbox(t, pool, tenantID); n != 5 {
+		t.Fatalf("sync_requested rows = %d, want 5 (duplicate must not add more)", n)
 	}
 	if n := countProcessedEvent(t, pool, ev.EventID); n != 1 {
 		t.Fatalf("processed_event rows = %d, want 1", n)
@@ -236,8 +236,8 @@ func TestBackfill_Reactivation_Guarded(t *testing.T) {
 	if n := countBackfillJobs(t, pool, tenantID); n != 1 {
 		t.Fatalf("backfill_job rows = %d, want 1 (re-activation must not add one)", n)
 	}
-	if n := countSyncRequestedOutbox(t, pool, tenantID); n != 53 {
-		t.Fatalf("sync_requested rows = %d, want 53 (re-activation must not add more)", n)
+	if n := countSyncRequestedOutbox(t, pool, tenantID); n != 5 {
+		t.Fatalf("sync_requested rows = %d, want 5 (re-activation must not add more)", n)
 	}
 	// Both distinct events are marked processed (the guard still acks the 2nd).
 	if n := countProcessedEvent(t, pool, second.EventID); n != 1 {

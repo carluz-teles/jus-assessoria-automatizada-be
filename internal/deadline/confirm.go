@@ -126,6 +126,14 @@ type ConfirmResult struct {
 // TenantID scopes the tx's RLS and every read/write (barrier 1 + 2); it comes from the
 // verified principal, never the body.
 func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResult, error) {
+	// Defense-in-depth: o anchor_event persistido tem de estar no conjunto válido
+	// (CHECK deadline_anchor_event_check). O handler já faz "" → DEADLINE_START ao
+	// montar o command; reforçamos aqui pra qualquer caller direto do domínio — o
+	// invariante de dado safety-critical é do domínio, não só da borda HTTP.
+	if cmd.AnchorEvent == "" {
+		cmd.AnchorEvent = AnchorDeadlineStart
+	}
+
 	var result ConfirmResult
 	err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
 		anchor, err := uc.repo.GetDeadlineForConfirm(ctx, tx, cmd.IntimationID, cmd.TenantID)

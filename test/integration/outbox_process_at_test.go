@@ -104,7 +104,9 @@ func TestRelay_ProcessAt(t *testing.T) {
 	}
 
 	// The scheduled event is a SCHEDULED task whose next process time is ~process_at.
-	schedInfo, err := inspector.GetTaskInfo("default", schedID)
+	// O relay dá ao asynq um TaskID por-fila "<eventID>:<queue>" (fan-out multi-fila);
+	// tudo aqui roteia pra "default", então o id da task é "<eventID>:default".
+	schedInfo, err := inspector.GetTaskInfo("default", schedID+":default")
 	if err != nil {
 		t.Fatalf("get scheduled task info: %v", err)
 	}
@@ -116,7 +118,7 @@ func TestRelay_ProcessAt(t *testing.T) {
 	}
 
 	// The plain event is a PENDING task, deliverable now — the NULL process_at path.
-	immInfo, err := inspector.GetTaskInfo("default", immID)
+	immInfo, err := inspector.GetTaskInfo("default", immID+":default")
 	if err != nil {
 		t.Fatalf("get immediate task info: %v", err)
 	}
