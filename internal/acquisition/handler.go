@@ -47,6 +47,9 @@ type handlerUC interface {
 	// AssignIntimacaoResponsaveis sets/clears the conductor and reviewer on one intimação in
 	// one tx. The handler re-reads the detail view afterwards so the FE reidrates the aside.
 	AssignIntimacaoResponsaveis(ctx context.Context, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error
+	// BulkAssignConductor atribui o condutor a várias intimações (por ids ou toda a faixa
+	// via All+filtros). Devolve a contagem afetada.
+	BulkAssignConductor(ctx context.Context, tenantID string, all bool, q IntimacoesQuery, ids []string, conductorUserID *string) (int64, error)
 }
 
 // reader is the narrow port the Handler uses from the read use case — the
@@ -146,6 +149,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/intimacoes/:id/providencias/:idx/aprovar", h.aprovarProvidencia)
 	r.Post("/intimacoes/:id/providencias/:idx/descartar", h.descartarProvidencia)
 	r.Put("/intimacoes/:id/responsaveis", h.assignIntimacaoResponsaveis)
+	r.Post("/intimacoes/bulk/responsaveis", h.bulkAssignIntimacaoResponsaveis)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending processos scan
@@ -167,7 +171,7 @@ const (
 // documented mechanisms; body/other params never read query strings.
 var (
 	processosListParams  = paramSet("limit", "cursor", "search", "court", "lifecycle", "degree", "assignee")
-	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia")
+	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia", "assignee")
 )
 
 // paramSet builds the route allowlist used by httpx.RejectUnknownParams.
@@ -213,11 +217,34 @@ func isKnownIntimacaoUserStatus(v string) bool {
 	}
 }
 
+// resolveIntimacaoAssignee turns the ?assignee filter into the value ListIntimacoes/
+// CountIntimacoesFiltered filter on: "" is no filter, the sentinel "me" resolves to
+// the principal's own id (the "Minhas" toggle), and any other value must be a
+// well-formed uuid (a client error → 400 otherwise). Mirrors deadline's
+// resolveAssignee (internal/deadline/handler.go:714) — kept as a local copy since
+// slices only communicate by event, never by importing each other's code; the name
+// is distinct from acquisition's own resolveAssignee (analise.go), which resolves an
+// AI-suggested assignee against the firm's member list, a different concern.
+func resolveIntimacaoAssignee(assignee, principalUserID string) (string, error) {
+	switch assignee {
+	case "":
+		return "", nil
+	case "me":
+		return principalUserID, nil
+	default:
+		if _, err := uuid.Parse(assignee); err != nil {
+			return "", apperr.NewInvalid("invalid assignee filter (want a user id or \"me\")")
+		}
+		return assignee, nil
+	}
+}
+
 // isKnownUrgencia accepts only the closed urgência set the filter exposes — the
 // handler is the app-level CHECK on the ?urgencia param.
 func isKnownUrgencia(v string) bool {
 	switch v {
-	case UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado:
+	case UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana, UrgenciaMaisAdiante,
+		UrgenciaNaoConfirmado, UrgenciaSemProvidencia:
 		return true
 	default:
 		return false
@@ -477,6 +504,14 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	if urgencia != "" && !isKnownUrgencia(urgencia) {
 		return httpx.WriteError(c, apperr.NewInvalid("invalid urgencia filter"))
 	}
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	assignee, err := resolveIntimacaoAssignee(c.Query("assignee"), p.UserID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
 
 	lastMade, lastID := maxDate, maxUUID
 	if tok := c.Query("cursor"); tok != "" {
@@ -494,6 +529,7 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 		UserStatus: userStatus,
 		Court:      c.Query("court"),
 		Urgencia:   urgencia,
+		Assignee:   assignee,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -574,6 +610,48 @@ func (h *Handler) assignIntimacaoResponsaveis(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// bulkAssignIntimacaoResponsaveis handles POST /v1/intimacoes/bulk/responsaveis: atribui
+// o condutor a várias intimações. All=true aplica a TODA a faixa/filtro atual (inclui os
+// não paginados) reusando os filtros do GET /intimacoes; senão aplica aos ids. Só toca o
+// condutor (preserva o revisor). tenant_id vem do principal, nunca do body.
+func (h *Handler) bulkAssignIntimacaoResponsaveis(c *fiber.Ctx) error {
+	var req BulkAssignResponsaveisRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+	if req.All && req.Urgencia != "" && !isKnownUrgencia(req.Urgencia) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid urgencia filter"))
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	assignee, err := resolveIntimacaoAssignee(req.Assignee, p.UserID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	q := IntimacoesQuery{
+		TenantID:   tenantID,
+		Search:     req.Search,
+		Type:       req.Type,
+		UserStatus: req.UserStatus,
+		Court:      req.Court,
+		Urgencia:   req.Urgencia,
+		Assignee:   assignee,
+	}
+	n, err := h.uc.BulkAssignConductor(c.UserContext(), tenantID, req.All, q, req.IDs, req.ConductorUserID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"affected": n})
 }
 
 // processosSummary handles GET /v1/processos/summary: the processes list KPI counts

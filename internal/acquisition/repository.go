@@ -114,6 +114,12 @@ type Repository interface {
 	// Tx-taking (the use case owns the tx+RLS boundary).
 	AssignIntimacaoResponsaveis(ctx context.Context, tx database.Tx, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error
 
+	// Bulk: atribui o condutor (só conductor_user_id — preserva o revisor) a várias
+	// intimações de uma vez. ByIDs = lista explícita; ByFilter = TODA a faixa/filtro
+	// atual (modo "todos" da UI, inclui não-paginados). Devolvem a contagem afetada.
+	BulkAssignConductorByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, conductorUserID *string) (int64, error)
+	BulkAssignConductorByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, conductorUserID *string) (int64, error)
+
 	// Screen reads — the keyset-paginated read models (off the write path). The read
 	// use case depends on the narrow readRepo view of these.
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
@@ -1712,6 +1718,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		Type:              q.Type,
 		UserStatus:        q.UserStatus,
 		Court:             q.Court,
+		AssigneeID:        nullUUID(q.Assignee),
 		Urgencia:          q.Urgencia,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
@@ -1722,22 +1729,27 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, IntimacaoView{
-			ID:              row.ID.String(),
-			CNJNumber:       row.CnjNumber,
-			Class:           deref(row.Class),
-			CourtRecordID:   row.CourtRecordID.String(),
-			Court:           row.Court,
-			Degree:          row.Degree,
-			Type:            deref(row.Type),
-			Status:          row.Status,
-			UserStatus:      row.UserStatus,
-			Source:          row.Source,
-			SourceURL:       deref(row.SourceUrl),
-			MadeAvailableAt: row.MadeAvailableAt.Time,
-			PublishedAt:     row.PublishedAt.Time,
-			DeadlineStartAt: row.DeadlineStartAt.Time,
-			ContentPreview:  contentPreview(row.Content),
-			Prazo:           mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			ID:                row.ID.String(),
+			CNJNumber:         row.CnjNumber,
+			Class:             deref(row.Class),
+			Subject:           deref(row.Subject),
+			CourtRecordID:     row.CourtRecordID.String(),
+			Court:             row.Court,
+			Degree:            row.Degree,
+			Type:              deref(row.Type),
+			Status:            row.Status,
+			UserStatus:        row.UserStatus,
+			Source:            row.Source,
+			SourceURL:         deref(row.SourceUrl),
+			MadeAvailableAt:   row.MadeAvailableAt.Time,
+			PublishedAt:       row.PublishedAt.Time,
+			DeadlineStartAt:   row.DeadlineStartAt.Time,
+			ContentPreview:    contentPreview(row.Content),
+			Prazo:             mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			AIAnalyzedAt:      timestampPtr(row.AiAnalyzedAt),
+			ConductorUserID:   uuidPtrFromPgtype(row.ConductorUserID),
+			ConductorUserName: row.ConductorUserName,
+			ReviewerUserID:    uuidPtrFromPgtype(row.ReviewerUserID),
 		})
 	}
 	return out, nil
@@ -1773,6 +1785,7 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			ID:              row.ID.String(),
 			CNJNumber:       row.CnjNumber,
 			Class:           deref(row.Class),
+			Subject:         deref(row.Subject),
 			CourtRecordID:   row.CourtRecordID.String(),
 			Court:           row.Court,
 			Degree:          row.Degree,
@@ -2165,6 +2178,7 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, q IntimacoesQuery) (
 		Type:       q.Type,
 		UserStatus: q.UserStatus,
 		Court:      q.Court,
+		AssigneeID: nullUUID(q.Assignee),
 		Urgencia:   q.Urgencia,
 	})
 	if err != nil {
@@ -2194,11 +2208,13 @@ func (r *pgRepository) BucketIntimacoes(ctx context.Context, q IntimacoesQuery) 
 		return IntimacaoBucketsView{}, database.WrapInfra(err)
 	}
 	return IntimacaoBucketsView{
-		Atraso:      row.Atraso,
-		Hoje:        row.Hoje,
-		EstaSemana:  row.EstaSemana,
-		MaisAdiante: row.MaisAdiante,
-		SemPrazo:    row.SemPrazo,
+		Atraso:           row.Atraso,
+		Hoje:             row.Hoje,
+		ProximosDoisDias: row.ProximosDoisDias,
+		EstaSemana:       row.EstaSemana,
+		SemProvidencia:   row.SemProvidencia,
+		MaisAdiante:      row.MaisAdiante,
+		NaoConfirmado:    row.NaoConfirmado,
 	}, nil
 }
 
@@ -2381,6 +2397,71 @@ func (r *pgRepository) AssignIntimacaoResponsaveis(ctx context.Context, tx datab
 		return database.WrapInfra(err)
 	}
 	return nil
+}
+
+// conductorPtrToUUID converte *string (id do condutor; nil = desatribuir) em pgtype.UUID.
+func conductorPtrToUUID(s *string) (pgtype.UUID, error) {
+	if s == nil {
+		return pgtype.UUID{}, nil
+	}
+	u, err := uuid.Parse(*s)
+	if err != nil {
+		return pgtype.UUID{}, apperr.NewInvalid("id de usuário inválido")
+	}
+	return pgtype.UUID{Bytes: u, Valid: true}, nil
+}
+
+func (r *pgRepository) BulkAssignConductorByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, conductorUserID *string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	uuids := make([]uuid.UUID, 0, len(ids))
+	for _, id := range ids {
+		u, perr := uuid.Parse(id)
+		if perr != nil {
+			return 0, apperr.NewInvalid("id de intimação inválido")
+		}
+		uuids = append(uuids, u)
+	}
+	conductor, err := conductorPtrToUUID(conductorUserID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := acquisitiondb.New(tx).BulkAssignConductorByIDs(ctx, acquisitiondb.BulkAssignConductorByIDsParams{
+		TenantID:        tid,
+		Ids:             uuids,
+		ConductorUserID: conductor,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return n, nil
+}
+
+func (r *pgRepository) BulkAssignConductorByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, conductorUserID *string) (int64, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	conductor, err := conductorPtrToUUID(conductorUserID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := acquisitiondb.New(tx).BulkAssignConductorByFilter(ctx, acquisitiondb.BulkAssignConductorByFilterParams{
+		TenantID:        tid,
+		ConductorUserID: conductor,
+		Search:          escapeLike(q.Search),
+		Type:            q.Type,
+		UserStatus:      q.UserStatus,
+		Court:           q.Court,
+		AssigneeID:      nullUUID(q.Assignee),
+		Urgencia:        q.Urgencia,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return n, nil
 }
 
 // newCourtRecordEntity assembles the CourtRecord the use case works with from the

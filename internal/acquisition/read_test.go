@@ -927,11 +927,13 @@ func TestReadUseCase_Intimacoes_BucketCountsForwarded(t *testing.T) {
 	t.Parallel()
 
 	want := IntimacaoBucketsView{
-		Atraso:      3,
-		Hoje:        1,
-		EstaSemana:  5,
-		MaisAdiante: 12,
-		SemPrazo:    7,
+		Atraso:           3,
+		Hoje:             1,
+		ProximosDoisDias: 2,
+		EstaSemana:       5,
+		SemProvidencia:   7,
+		MaisAdiante:      12,
+		NaoConfirmado:    4,
 	}
 	repo := newBucketsRepo(want)
 	uc := NewReadUseCase(repo)
@@ -987,8 +989,8 @@ func TestReadUseCase_Intimacoes_BucketCountsZeroWhenNoDeadlines(t *testing.T) {
 	}
 }
 
-// The urgência filter options include mais_adiante (the new bucket) alongside the
-// existing ones — proved via the assembled Filters block.
+// The urgência filter options include proximos_dois_dias and sem_providencia (the
+// new buckets) alongside the existing ones — proved via the assembled Filters block.
 func TestReadUseCase_Intimacoes_UrgenciaFilterIncludesMaisAdiante(t *testing.T) {
 	t.Parallel()
 
@@ -1002,7 +1004,10 @@ func TestReadUseCase_Intimacoes_UrgenciaFilterIncludesMaisAdiante(t *testing.T) 
 		t.Fatalf("Intimacoes: %v", err)
 	}
 	opts := res.Filters["urgencia"]
-	want := []string{UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado}
+	want := []string{
+		UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana,
+		UrgenciaMaisAdiante, UrgenciaNaoConfirmado, UrgenciaSemProvidencia,
+	}
 	if len(opts) != len(want) {
 		t.Fatalf("urgencia filter options = %d, want %d: %+v", len(opts), len(want), opts)
 	}

@@ -182,6 +182,41 @@ func (uc *UseCase) AssignIntimacaoResponsaveis(
 	})
 }
 
+// BulkAssignConductor atribui o condutor a várias intimações de uma vez. Dois modos
+// (mutuamente exclusivos): All=true aplica a TODA a faixa/filtro atual (q — mesmos
+// filtros do ListIntimacoes; inclui os não paginados); senão aplica à lista ids.
+// Valida a pertinência do condutor (quando não-nil) antes do write, numa única tx
+// (UoW + RLS). Devolve quantas linhas foram afetadas.
+func (uc *UseCase) BulkAssignConductor(
+	ctx context.Context,
+	tenantID string,
+	all bool,
+	q IntimacoesQuery,
+	ids []string,
+	conductorUserID *string,
+) (int64, error) {
+	var n int64
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		if conductorUserID != nil {
+			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *conductorUserID)
+			if err != nil {
+				return err
+			}
+			if !member {
+				return ErrResponsibleNotMember
+			}
+		}
+		var err error
+		if all {
+			n, err = uc.repo.BulkAssignConductorByFilter(ctx, tx, q, conductorUserID)
+		} else {
+			n, err = uc.repo.BulkAssignConductorByIDs(ctx, tx, tenantID, ids, conductorUserID)
+		}
+		return err
+	})
+	return n, err
+}
+
 // ResolveIntimacao / IgnoreIntimacao / ReopenIntimacao are the triagem actions the user
 // drives from the inbox: they move ONE intimation's user_status to RESOLVED / IGNORED /
 // PENDING, in a single tx (UoW → SET LOCAL app.tenant_id, RLS as a second barrier under

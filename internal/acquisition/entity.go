@@ -164,11 +164,15 @@ const (
 // intimações inbox (?urgencia query param). The handler validates against this set;
 // the SQL predicate maps each value to a deadline subquery.
 const (
-	UrgenciaAtraso        = "atraso"         // prazo vencido (days_left < 0, status PENDING|OPEN)
-	UrgenciaHoje          = "hoje"           // vence hoje (days_left = 0, status PENDING|OPEN)
-	UrgenciaSemana        = "semana"         // vence nos próximos 7 dias (days_left 1-7, status PENDING|OPEN)
-	UrgenciaMaisAdiante   = "mais_adiante"   // vence em mais de 7 dias (days_left > 7, status PENDING|OPEN)
-	UrgenciaNaoConfirmado = "nao_confirmado" // sugerido, ainda não confirmado (status = PENDING)
+	UrgenciaAtraso           = "atraso"             // prazo vencido (days_left < 0, status PENDING|OPEN)
+	UrgenciaHoje             = "hoje"               // vence hoje (days_left = 0, status PENDING|OPEN)
+	UrgenciaProximosDoisDias = "proximos_dois_dias" // vence em 1-2 dias (status PENDING|OPEN)
+	UrgenciaSemana           = "semana"             // vence em 3-7 dias (status PENDING|OPEN)
+	UrgenciaMaisAdiante      = "mais_adiante"       // vence em mais de 7 dias (days_left > 7, status PENDING|OPEN)
+	UrgenciaNaoConfirmado    = "nao_confirmado"     // sugerido, ainda não confirmado (status = PENDING)
+	// UrgenciaSemProvidencia backs the "sem providência" tab of the master-detail inbox: not
+	// yet AI-analyzed and still actionable, independent of whether a deadline was derived.
+	UrgenciaSemProvidencia = "sem_providencia"
 )
 
 // Party role constants — a party's polo in the process (CHECK-on-app enum). The

@@ -97,6 +97,10 @@ func (f *fakeHandlerUC) AssignIntimacaoResponsaveis(_ context.Context, _, _ stri
 	return nil
 }
 
+func (f *fakeHandlerUC) BulkAssignConductor(_ context.Context, _ string, _ bool, _ IntimacoesQuery, ids []string, _ *string) (int64, error) {
+	return int64(len(ids)), nil
+}
+
 // fakeReader is a no-op read port for the write-path handler tests (the read
 // routes have their own coverage).
 type fakeReader struct{}
@@ -643,9 +647,11 @@ func TestHandler_ListIntimacoes_ValidUrgencia_ForwardedToReader(t *testing.T) {
 	}{
 		{name: "atraso", urgencia: UrgenciaAtraso},
 		{name: "hoje", urgencia: UrgenciaHoje},
+		{name: "proximos_dois_dias", urgencia: UrgenciaProximosDoisDias},
 		{name: "semana", urgencia: UrgenciaSemana},
 		{name: "mais_adiante", urgencia: UrgenciaMaisAdiante},
 		{name: "nao_confirmado", urgencia: UrgenciaNaoConfirmado},
+		{name: "sem_providencia", urgencia: UrgenciaSemProvidencia},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -720,6 +726,52 @@ func TestHandler_ListIntimacoes_EnvelopeFiltersIncludesUrgencia(t *testing.T) {
 		if opts[i].Value != w {
 			t.Errorf("filters.urgencia[%d].value = %q, want %q", i, opts[i].Value, w)
 		}
+	}
+}
+
+// ?assignee=me resolves to the authenticated principal's own user id (stubResolver
+// always yields "u-1") and is forwarded to the read port — the "Minhas" toggle.
+func TestHandler_ListIntimacoes_AssigneeMe_ResolvesToPrincipal(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes?assignee=me", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if rd.gotIntiListQ.Assignee != "u-1" {
+		t.Errorf("forwarded Assignee = %q, want the principal's own id %q", rd.gotIntiListQ.Assignee, "u-1")
+	}
+}
+
+// ?assignee=<uuid> is forwarded verbatim (no "me" resolution) to the read port.
+func TestHandler_ListIntimacoes_AssigneeUUID_ForwardedVerbatim(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	const uid = "018f0000-0000-7000-8000-000000000abc"
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes?assignee="+uid, "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if rd.gotIntiListQ.Assignee != uid {
+		t.Errorf("forwarded Assignee = %q, want %q", rd.gotIntiListQ.Assignee, uid)
+	}
+}
+
+// ?assignee with a value that is neither "" nor "me" nor a well-formed uuid is a
+// client error → 400.
+func TestHandler_ListIntimacoes_InvalidAssignee_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/intimacoes?assignee=not-a-uuid", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a malformed assignee", status)
 	}
 }
 
@@ -1553,16 +1605,18 @@ func TestHandler_Resume_NoResumer_501(t *testing.T) {
 }
 
 // GET /v1/intimacoes: the envelope must carry a `buckets` object with the five
-// urgência section counts (atraso, hoje, esta_semana, mais_adiante, sem_prazo).
+// section counts (atraso, hoje, proximos_dois_dias, esta_semana, sem_providencia).
 func TestHandler_ListIntimacoes_EnvelopeCarriesBuckets(t *testing.T) {
 	t.Parallel()
 
 	buckets := IntimacaoBucketsView{
-		Atraso:      3,
-		Hoje:        1,
-		EstaSemana:  5,
-		MaisAdiante: 12,
-		SemPrazo:    7,
+		Atraso:           3,
+		Hoje:             1,
+		ProximosDoisDias: 2,
+		EstaSemana:       5,
+		SemProvidencia:   7,
+		MaisAdiante:      12,
+		NaoConfirmado:    4,
 	}
 	rd := &recordingReader{intiListRes: IntimacoesResult{Buckets: buckets}}
 	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")

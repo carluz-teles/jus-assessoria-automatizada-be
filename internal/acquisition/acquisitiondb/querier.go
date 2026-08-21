@@ -111,6 +111,14 @@ type Querier interface {
 	// neither duplicates nor errors. source is DJEN. The name is refreshed only on insert
 	// (a DO NOTHING leaves the existing row) — an advogado's OAB is the stable identity.
 	BatchUpsertPartyCounsels(ctx context.Context, arg BatchUpsertPartyCounselsParams) error
+	// Atribuição em massa do condutor para TODA a faixa/filtro atual (modo "todos" da UI —
+	// inclui as linhas ainda não paginadas). Reusa EXATAMENTE a cláusula de filtro do
+	// ListIntimacoes (search/type/user_status/court/assignee/urgencia) via subquery. SÓ toca
+	// conductor_user_id (preserva o revisor). tenant-scoped (barrier 1, RLS barrier 2).
+	BulkAssignConductorByFilter(ctx context.Context, arg BulkAssignConductorByFilterParams) (int64, error)
+	// Atribuição em massa do condutor (SÓ conductor_user_id — preserva o revisor) para
+	// uma lista explícita de ids, tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
+	BulkAssignConductorByIDs(ctx context.Context, arg BulkAssignConductorByIDsParams) (int64, error)
 	// Push a record's next_sync_at forward as its re-poll is enqueued, so the next tick
 	// does not re-enqueue it; if the resync never lands, it falls due again after the
 	// interval (at-least-once).
@@ -150,22 +158,26 @@ type Querier interface {
 	// Bucket counts for the list envelope's `buckets` object, derived in the same
 	// request as ListIntimacoes (no N+1). Mirrors the urgência buckets of the list's
 	// WHERE clause but expressed as FILTER aggregates over the SAME non-urgencia
-	// filters (type, user_status, court, search) — so the header badges agree with
-	// what the list would show when the user picks that bucket. `sem_prazo` counts
-	// intimations with no derived deadline AND not yet resolved/ignored (user still
-	// needs to triage them but there is no urgency signal from a deadline). All four
-	// deadline buckets restrict to status IN (PENDING, OPEN): MISSED/MET deadlines
-	// belong to closed intimations and are not counted as actionable.
+	// filters (type, user_status, court, search — assignee is deliberately NOT
+	// applied here, mirroring how the processes screen's other chips don't gate its
+	// own filter options) — so the header badges agree with what the list would show
+	// when the user picks that bucket. `sem_providencia` counts intimações not yet
+	// AI-analyzed AND not yet resolved/ignored (user still needs to act, independent
+	// of whether a deadline was derived). The four deadline buckets restrict to
+	// status IN (PENDING, OPEN): MISSED/MET deadlines belong to closed intimations
+	// and are not counted as actionable. `mais_adiante`/`nao_confirmado` stay in the
+	// projection (not removed) though the FE renders only the five tabs above.
 	CountIntimacoesBuckets(ctx context.Context, arg CountIntimacoesBucketsParams) (CountIntimacoesBucketsRow, error)
 	// The "X de Y" total for the Intimações tab: how many intimations the process holds.
 	// Scoped by the same court_record_id + tenant_id as the list; no court_record join is
 	// needed (intimation carries tenant_id), unlike the andamentos count.
 	CountIntimacoesByProcesso(ctx context.Context, arg CountIntimacoesByProcessoParams) (int64, error)
 	// The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
-	// match the active filters (search on the court record's cnj_number, type, user_status,
-	// court, urgencia). Called only when a filter is present; the unfiltered "Y" reuses
-	// CountIntimationsByTenant. SAME predicates as ListIntimacoes (minus the keyset). The
-	// LEFT JOIN deadline mirrors ListIntimacoes so the urgencia filter agrees with the page.
+	// match the active filters (search on the court record's cnj_number/class/judging_body,
+	// type, user_status, court, urgencia, assignee). Called only when a filter is present;
+	// the unfiltered "Y" reuses CountIntimationsByTenant. SAME predicates as ListIntimacoes
+	// (minus the keyset). The LEFT JOIN deadline mirrors ListIntimacoes so the urgencia
+	// filter agrees with the page.
 	CountIntimacoesFiltered(ctx context.Context, arg CountIntimacoesFilteredParams) (int64, error)
 	// The reconciliations totals: how many intimations the tenant holds (paired with
 	// CountActiveCourtRecordsByTenant for the processes side).
@@ -469,9 +481,13 @@ type Querier interface {
 	// the court record's number/court/degree joined in. Descending keyset on
 	// (made_available_at, id); the first page passes the max sentinel
 	// ('9999-12-31', max-uuid). Optional filters — @court (free text from the DISTINCT
-	// options), @type / @user_status (closed sets), @urgencia (deadline-proximity
-	// bucket, closed set) — are additive ANDs. The LEFT JOIN deadline exposes the
-	// derived prazo (1:1 per notification_id, UNIQUE); NULL when no prazo exists yet.
+	// options), @type / @user_status (closed sets), @urgencia (deadline-proximity /
+	// providência bucket, closed set), @search (cnj_number/class/judging_body ILIKE),
+	// @assignee_id (condutor OR revisor, the "Minhas" toggle) — are additive ANDs. The
+	// LEFT JOIN deadline exposes the derived prazo (1:1 per notification_id, UNIQUE);
+	// NULL when no prazo exists yet. ai_analyzed_at + conductor_user_id/name mirror
+	// GetIntimacao's projection (same LEFT JOIN app_user pattern) so the inbox row can
+	// render the "não analisada" badge and the condutor label without a deep-link.
 	ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error)
 	// The "Intimações" tab of one process: the intimations filed on this court record,
 	// newest availability first, with the record's number/court/degree joined in (same

@@ -45,6 +45,98 @@ func (q *Queries) AssignIntimationResponsaveis(ctx context.Context, arg AssignIn
 	return id, err
 }
 
+const bulkAssignConductorByFilter = `-- name: BulkAssignConductorByFilter :execrows
+UPDATE intimation
+   SET conductor_user_id = $1::uuid
+ WHERE tenant_id = $2::uuid
+   AND id IN (
+     SELECT i.id
+     FROM intimation i
+     JOIN court_record cr ON cr.id = i.court_record_id
+     LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+     WHERE i.tenant_id = $2::uuid
+       AND (
+         $3::text = ''
+         OR cr.cnj_number ILIKE '%' || $3 || '%' ESCAPE '\'
+         OR cr.class ILIKE '%' || $3 || '%'
+         OR cr.judging_body ILIKE '%' || $3 || '%'
+       )
+       AND ($4::text = '' OR i.type = $4::text)
+       AND ($5::text = '' OR i.user_status = $5::text)
+       AND ($6::text = '' OR cr.court = $6::text)
+       AND (
+         $7::uuid IS NULL
+         OR i.conductor_user_id = $7::uuid
+         OR i.reviewer_user_id = $7::uuid
+       )
+       AND (
+         $8::text = ''
+         OR ($8::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
+         OR ($8::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
+         OR ($8::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
+         OR ($8::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
+         OR ($8::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
+         OR ($8::text = 'nao_confirmado'     AND d.status = 'PENDING')
+         OR ($8::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+       )
+   )
+`
+
+type BulkAssignConductorByFilterParams struct {
+	ConductorUserID pgtype.UUID `json:"conductor_user_id"`
+	TenantID        uuid.UUID   `json:"tenant_id"`
+	Search          string      `json:"search"`
+	Type            string      `json:"type"`
+	UserStatus      string      `json:"user_status"`
+	Court           string      `json:"court"`
+	AssigneeID      pgtype.UUID `json:"assignee_id"`
+	Urgencia        string      `json:"urgencia"`
+}
+
+// Atribuição em massa do condutor para TODA a faixa/filtro atual (modo "todos" da UI —
+// inclui as linhas ainda não paginadas). Reusa EXATAMENTE a cláusula de filtro do
+// ListIntimacoes (search/type/user_status/court/assignee/urgencia) via subquery. SÓ toca
+// conductor_user_id (preserva o revisor). tenant-scoped (barrier 1, RLS barrier 2).
+func (q *Queries) BulkAssignConductorByFilter(ctx context.Context, arg BulkAssignConductorByFilterParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bulkAssignConductorByFilter,
+		arg.ConductorUserID,
+		arg.TenantID,
+		arg.Search,
+		arg.Type,
+		arg.UserStatus,
+		arg.Court,
+		arg.AssigneeID,
+		arg.Urgencia,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const bulkAssignConductorByIDs = `-- name: BulkAssignConductorByIDs :execrows
+UPDATE intimation
+   SET conductor_user_id = $1::uuid
+ WHERE tenant_id = $2::uuid
+   AND id = ANY($3::uuid[])
+`
+
+type BulkAssignConductorByIDsParams struct {
+	ConductorUserID pgtype.UUID `json:"conductor_user_id"`
+	TenantID        uuid.UUID   `json:"tenant_id"`
+	Ids             []uuid.UUID `json:"ids"`
+}
+
+// Atribuição em massa do condutor (SÓ conductor_user_id — preserva o revisor) para
+// uma lista explícita de ids, tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
+func (q *Queries) BulkAssignConductorByIDs(ctx context.Context, arg BulkAssignConductorByIDsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bulkAssignConductorByIDs, arg.ConductorUserID, arg.TenantID, arg.Ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setIntimationUserStatus = `-- name: SetIntimationUserStatus :one
 
 UPDATE intimation

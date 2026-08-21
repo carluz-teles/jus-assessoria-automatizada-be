@@ -73,6 +73,35 @@ func (r AssignIntimacaoResponsaveisRequest) Validate() error {
 	)
 }
 
+// BulkAssignResponsaveisRequest é o corpo de POST /v1/intimacoes/bulk/responsaveis:
+// atribui o condutor a várias intimações. Dois modos: All=true aplica a TODA a
+// faixa/filtro atual (os campos de filtro espelham o GET /intimacoes; inclui os itens
+// ainda não paginados); senão aplica aos IDs. ConductorUserID nil desatribui.
+type BulkAssignResponsaveisRequest struct {
+	ConductorUserID *string  `json:"conductor_user_id"`
+	All             bool     `json:"all"`
+	IDs             []string `json:"ids"`
+	// filtros (usados só quando All=true) — espelham o GET /intimacoes.
+	Urgencia   string `json:"urgencia"`
+	Search     string `json:"search"`
+	Type       string `json:"type"`
+	UserStatus string `json:"user_status"`
+	Court      string `json:"court"`
+	Assignee   string `json:"assignee"`
+}
+
+// Validate: conductor (quando presente) uuid; no modo por-ids, ao menos um id, cada
+// um uuid. A pertinência do condutor ao tenant é checada no caso de uso (sob a tx).
+func (r BulkAssignResponsaveisRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.ConductorUserID, is.UUID),
+		validation.Field(&r.IDs,
+			validation.When(!r.All, validation.Required),
+			validation.Each(is.UUID),
+		),
+	)
+}
+
 // Validate enforces the scope rules: at least one OAB, each a well-formed
 // registration. tax ids are optional and unconstrained in v0. Declaring Validate
 // on Scope lets ozzo validate it automatically when it is a request field.

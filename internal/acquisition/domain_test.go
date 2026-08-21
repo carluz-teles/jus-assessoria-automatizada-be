@@ -316,6 +316,14 @@ func (m *mockRepo) AssignIntimacaoResponsaveis(_ context.Context, _ database.Tx,
 	return nil
 }
 
+func (m *mockRepo) BulkAssignConductorByIDs(_ context.Context, _ database.Tx, _ string, ids []string, _ *string) (int64, error) {
+	return int64(len(ids)), nil
+}
+
+func (m *mockRepo) BulkAssignConductorByFilter(_ context.Context, _ database.Tx, _ IntimacoesQuery, _ *string) (int64, error) {
+	return 0, nil
+}
+
 func (m *mockRepo) CountProcessos(_ context.Context, _ ProcessosQuery) (int64, int64, error) {
 	return 0, 0, nil
 }

@@ -75,6 +75,7 @@ type IntimacaoView struct {
 	ID              string              `json:"id"`
 	CNJNumber       string              `json:"cnj_number"`
 	Class           string              `json:"class"`           // court_record.class (classe processual)
+	Subject         string              `json:"subject"`         // court_record.subject (assunto; pode vir vazio)
 	CourtRecordID   string              `json:"court_record_id"` // court_record.id (deep-link ao processo)
 	Court           string              `json:"court"`
 	Degree          string              `json:"degree"`
@@ -88,6 +89,16 @@ type IntimacaoView struct {
 	DeadlineStartAt time.Time           `json:"deadline_start_at"`
 	ContentPreview  string              `json:"content_preview"`
 	Prazo           *IntimacaoPrazoView `json:"prazo"` // nil (JSON null) when no prazo derived yet
+	// Análise IA (0051) + condutor do prazo (0050), surfaced on the list row (not just the
+	// detail) for the master-detail inbox: AIAnalyzedAt nil = "não analisada" badge; non-nil =
+	// already analyzed. ConductorUserID/Name back the "Minhas" toggle and the row's condutor
+	// label, joined the same way as GetIntimacao (LEFT JOIN app_user) — nil = não atribuído.
+	AIAnalyzedAt      *time.Time `json:"ai_analyzed_at"`
+	ConductorUserID   *string    `json:"conductor_user_id"`
+	ConductorUserName *string    `json:"conductor_user_name"`
+	// ReviewerUserID: surfaced on the list row so a row-level "atribuir condutor"
+	// (PUT /responsaveis, full replace) can preserve the reviewer instead of clearing it.
+	ReviewerUserID *string `json:"reviewer_user_id"`
 }
 
 // IntimacaoHistoryEntry is one event in the intimation's derived timeline (Histórico
@@ -265,12 +276,13 @@ type IntimacoesQuery struct {
 	Type              string // ?type: closed set (IntimationType* consts); "" = all
 	UserStatus        string // ?user_status: closed set (IntimationUserStatus* consts); "" = all
 	Court             string // ?court: exact match (from ListIntimacaoCourts); "" = all
-	Urgencia          string // ?urgencia: closed set (atraso|hoje|semana|mais_adiante|nao_confirmado); "" = all
+	Urgencia          string // ?urgencia: closed set (atraso|hoje|proximos_dois_dias|semana|mais_adiante|nao_confirmado|sem_providencia); "" = all
+	Assignee          string // ?assignee: a user id ("me" resolved by the handler); matches condutor OR revisor; "" = any
 }
 
 // Filtered reports whether any list filter (search included) is active.
 func (q IntimacoesQuery) Filtered() bool {
-	return q.Search != "" || q.Type != "" || q.UserStatus != "" || q.Court != "" || q.Urgencia != ""
+	return q.Search != "" || q.Type != "" || q.UserStatus != "" || q.Court != "" || q.Urgencia != "" || q.Assignee != ""
 }
 
 // AndamentosQuery carries the descending keyset cursor (the last row's occurred_at
@@ -314,14 +326,21 @@ type ProcessosResult struct {
 // when the user selects that urgência filter — computed over the same non-urgência
 // filters (type, user_status, court, search) in a single aggregate query, so the
 // header badges agree with the list without an N+1 round-trip.
-// SemPrazo counts actionable intimations (not yet resolved/ignored) that have no
-// derived deadline; they are not urgência-bucketed but are shown as a fifth group.
+// Atraso/Hoje/ProximosDoisDias/EstaSemana/SemProvidencia are the five tabs the
+// master-detail inbox renders (in that order). SemProvidencia counts actionable
+// intimações (not yet resolved/ignored) that have not been AI-analyzed yet
+// (ai_analyzed_at IS NULL) — the "sem providência" tab, unrelated to whether a
+// deadline was derived. MaisAdiante/NaoConfirmado are kept in the struct (not
+// removed — other reads/tests still reference them) but are NOT one of the five
+// tabs; the FE does not render them as a section.
 type IntimacaoBucketsView struct {
-	Atraso      int64 `json:"atraso"`
-	Hoje        int64 `json:"hoje"`
-	EstaSemana  int64 `json:"esta_semana"`
-	MaisAdiante int64 `json:"mais_adiante"`
-	SemPrazo    int64 `json:"sem_prazo"`
+	Atraso           int64 `json:"atraso"`
+	Hoje             int64 `json:"hoje"`
+	ProximosDoisDias int64 `json:"proximos_dois_dias"`
+	EstaSemana       int64 `json:"esta_semana"`
+	SemProvidencia   int64 `json:"sem_providencia"`
+	MaisAdiante      int64 `json:"mais_adiante"`
+	NaoConfirmado    int64 `json:"nao_confirmado"`
 }
 
 type IntimacoesResult struct {
@@ -991,7 +1010,7 @@ func (uc *ReadUseCase) Intimacoes(ctx context.Context, q IntimacoesQuery) (Intim
 	f.Set("court", httpx.OptionsFromStrings(courts)...)
 	f.SetEnum("type", IntimationTypeIntimacao, IntimationTypeCitacao, IntimationTypeComunicacao)
 	f.SetEnum("user_status", IntimationUserStatusPending, IntimationUserStatusResolved, IntimationUserStatusIgnored)
-	f.SetEnum("urgencia", UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado)
+	f.SetEnum("urgencia", UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado, UrgenciaSemProvidencia)
 	return IntimacoesResult{
 		Items: rows, HasMore: hasMore, TotalCount: totalCount, Total: total,
 		Filters: f, Buckets: buckets,
