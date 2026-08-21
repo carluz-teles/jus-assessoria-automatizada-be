@@ -63,6 +63,17 @@ const (
 	// within a queue), which in prod starved prazos to ~16/min. Same starvation fix as
 	// syncStatusQueue. Must match lib/events.queueFor's routing of these events.
 	deadlineQueue = "deadline"
+	// enrichmentQueue carries the batch DATAJUD enrichment job (enrichment_batch_requested).
+	// It is drained by a SEPARATE low-concurrency server: the batch is serialized by the
+	// DATAJUD connector's own rate limiter (a handful of _search requests per import), so it
+	// must not compete on the "ingestao" pool with the sync work. Must match
+	// lib/events.queueFor's routing of the event.
+	enrichmentQueue = "enrichment"
+	// enrichmentConcurrency is fixed at 2: the DATAJUD limiter (shared connector) already
+	// serializes the requests, so a couple of slots cover the self-re-enqueue overlap
+	// between one import's tribunals without hammering the API. Not env-tunable — the true
+	// throttle is the limiter, not the slot count.
+	enrichmentConcurrency = 2
 	// deadlineConcurrency is fixed at 8: deriving a prazo is a short DB+outbox transaction
 	// (no slow external fetch, unlike the enrichment), so a handful of slots clears the
 	// intimation backlog quickly; on its own queue those 8 workers never compete with the
@@ -75,8 +86,10 @@ const (
 	// by the AcquireTenantWriteLock advisory lock, so there is no 40P01 deadlock.
 	defaultConcurrency = 8
 	// onboardingHistoryDays is how far back a new tenant is caught up from the stored
-	// firehose on the cutover — matched to the publication store's ~90d retention.
-	onboardingHistoryDays = 90
+	// firehose on the cutover. Aligned to the lean-ingestion 30-day horizon (the same
+	// window the per-OAB backfill now reaches): without this, the cutover would still
+	// sweep a full year of the firehose even though the backfill only spans 30 days.
+	onboardingHistoryDays = 30
 )
 
 func main() {
@@ -181,7 +194,12 @@ func run(logger *slog.Logger) error {
 	// the scheduler in the event-driven ingestion redesign).
 	djenConnector := acquisition.NewDJENConnector(djenOpts...)
 	orchestrator.Register(acquisition.SourceDJEN, djenConnector)
-	orchestrator.Register(acquisition.SourceDATAJUD, acquisition.NewDATAJUDConnector())
+	// One DATAJUD connector instance backs BOTH the per-record enrichment (via the
+	// orchestrator, FETCH_BY_NUMBER) and the batch enrichment job (FETCH_BATCH, injected
+	// directly below), so they share one egress + one rate limiter — the limiter is what
+	// keeps the batch under the DATAJUD request-per-minute ceiling.
+	datajudConnector := acquisition.NewDATAJUDConnector()
+	orchestrator.Register(acquisition.SourceDATAJUD, datajudConnector)
 
 	// Parsers are resolved by CanParse: the DJEN parser claims DJEN payloads and
 	// derives the CPC-224 publication/deadline dates through the judicial calendar
@@ -233,10 +251,19 @@ func run(logger *slog.Logger) error {
 	// the placeholder+merge. It shares the orchestrator and the ParserSet.
 	enrichment := acquisition.NewEnrichmentUseCase(repo, outbox, uow, orchestrator, parser)
 
+	// The batch enrichment job reacts to enrichment_batch_requested (emitted per tribunal on
+	// backfill discovery): it scans a tribunal's due records, pulls them in ONE DATAJUD
+	// _search (terms), grades all, and OWNS the import's ENRICHMENT capture row (opens →
+	// progresses → closes deterministically when the scan drains). It reuses the enrichment
+	// use case's shared grade core (gradeInTx) and the DATAJUD connector/parser's batch
+	// methods (FetchBatch/ParseBatch). It runs on the dedicated "enrichment" server below.
+	enrichmentBatch := acquisition.NewEnrichmentBatchUseCase(repo, enrichment, datajudConnector, acquisition.NewDATAJUDParser(), outbox, uow)
+
 	// The listener mounts the shared enrichment/sync/backfill handlers on the MAIN mux.
-	// diario_requested is NOT among them — it runs on the dedicated server below. Register
-	// never dereferences the ingestion dep, so a nil (pivot off) is harmless here.
-	listener := acquisition.NewListener(backfill, sync, enrichment, ingestion)
+	// diario_requested and enrichment_batch_requested are NOT among them — they run on the
+	// dedicated servers below. Register never dereferences the ingestion dep, so a nil (pivot
+	// off) is harmless here.
+	listener := acquisition.NewListener(backfill, sync, enrichment, enrichmentBatch, ingestion)
 	listener.Register(mux)
 
 	// notifications: consume notification.requested and deliver by e-mail (Resend).
@@ -334,6 +361,26 @@ func run(logger *slog.Logger) error {
 	logger.Info("deadline server started (dedicated)",
 		"service", serviceName, "queue", deadlineQueue, "concurrency", deadlineConcurrency)
 
+	// The DEDICATED enrichment server: its own "enrichment" queue, so the batch DATAJUD job
+	// (serialized by the connector's rate limiter) is isolated from the sync work on
+	// "ingestao" — it neither starves nor is starved by it. Built ALWAYS: every backfill's
+	// 2nd phase (enrichment) must be able to run and close its capture row. enrichment is
+	// deliberately NOT in the main srv's Queues, or it would compete on that pool again.
+	enrichmentSrv := asynq.NewServer(redisOpt, asynq.Config{
+		Concurrency: enrichmentConcurrency,
+		Queues:      map[string]int{enrichmentQueue: enrichmentConcurrency},
+		Logger:      events.NewAsynqLogger(logger),
+		LogLevel:    asynq.ErrorLevel,
+	})
+	enrichmentMux := asynq.NewServeMux()
+	enrichmentMux.Use(events.Observe(logger))
+	listener.RegisterEnrichment(enrichmentMux)
+	if err := enrichmentSrv.Start(enrichmentMux); err != nil {
+		return fmt.Errorf("start enrichment asynq server: %w", err)
+	}
+	logger.Info("enrichment server started (dedicated)",
+		"service", serviceName, "queue", enrichmentQueue, "concurrency", enrichmentConcurrency)
+
 	// The DEDICATED national-ingestion server: one worker, its own "diario" queue, so the
 	// slow globally-rate-limited DJEN diário fetch runs serialized (never 3-way hammering
 	// the cumulative cap) and stays off the enrichment/sync queue. Built only when the
@@ -369,6 +416,7 @@ func run(logger *slog.Logger) error {
 			srv.Shutdown() // drains in-flight tasks before returning
 			syncStatusSrv.Shutdown()
 			deadlineSrv.Shutdown()
+			enrichmentSrv.Shutdown()
 			if diarioSrv != nil {
 				diarioSrv.Shutdown()
 			}

@@ -129,6 +129,17 @@ func (p *DJENParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult, e
 			return ParsedResult{}, fmt.Errorf("djen: decode item: %w", err)
 		}
 
+		// Lean-ingestion gate: a generic COMUNICACAO (Edital and anything that is not
+		// an INTIMACAO/CITACAO) opens no prazo and is dropped at the source — no
+		// intimation AND no court record (the record is appended below only for a kept
+		// item, so a COMUNICACAO-only processo yields zero court_records, not a phantom
+		// one). This covers backfill, sync and the national match: all three write
+		// through parser.Parse. A defensive no-op in deadline.OnIntimationObserved is
+		// the belt-and-suspenders guard against a future producer.
+		if djenType(item.TipoComunicacao) == IntimationTypeComunicacao {
+			continue
+		}
+
 		intim, ok := p.parseIntimation(ctx, item, watched)
 		if !ok {
 			continue

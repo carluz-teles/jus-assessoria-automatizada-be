@@ -285,6 +285,9 @@ func TestQueueFor(t *testing.T) {
 		// enrichment flood on "ingestao".
 		{"acquisition.sync_completed", "sync_status"},
 		{"acquisition.sync_failed", "sync_status"},
+		// The batch enrichment job gets its OWN dedicated queue (serialized by the DATAJUD
+		// limiter), routed ahead of the acquisition→ingestao prefix.
+		{"acquisition.enrichment_batch_requested", "enrichment"},
 		// The prazo flow gets its OWN dedicated queue so creating a prazo is never starved by
 		// the enrichment flood on "ingestao". The two intimation events carry the "acquisition"
 		// prefix, so they must be special-cased ahead of the prefix switch.

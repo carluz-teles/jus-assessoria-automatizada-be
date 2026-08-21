@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -66,6 +67,137 @@ func TestDATAJUDParserParse(t *testing.T) {
 		if de.OccurredAt.IsZero() || de.Text == "" || de.TPUCode == 0 {
 			t.Errorf("docket %q under-populated: occurred=%s text=%q tpu=%d", de.Hash, de.OccurredAt, de.Text, de.TPUCode)
 		}
+	}
+}
+
+// TestDATAJUDParserParseBatch maps a MULTI-hit, MULTI-page batch payload into a
+// numeroProcesso→process map: every graded hit is keyed by its number; a hit with an empty
+// grau is skipped (nothing to grade); a number never returned is simply absent.
+func TestDATAJUDParserParseBatch(t *testing.T) {
+	t.Parallel()
+
+	observed := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	parser := newTestDATAJUDParser(observed)
+
+	page1 := RawPayload{Source: SourceDATAJUD, Body: []byte(`{"hits":{"hits":[
+		{"_source":{"numeroProcesso":"111","grau":"G1","tribunal":"TJSP","movimentos":[{"codigo":26,"nome":"Ato","dataHora":"2024-01-10T12:00:00.000Z"}]}},
+		{"_source":{"numeroProcesso":"222","grau":"","tribunal":"TJSP"}}
+	]}}`)}
+	page2 := RawPayload{Source: SourceDATAJUD, Body: []byte(`{"hits":{"hits":[
+		{"_source":{"numeroProcesso":"333","grau":"G2","tribunal":"TJSP"}}
+	]}}`)}
+
+	byNumber, skipped, err := parser.ParseBatch(context.Background(), []RawPayload{page1, page2})
+	if err != nil {
+		t.Fatalf("ParseBatch: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Errorf("skipped (real parse errors) = %v, want none (222 empty grau is benign, not a skip)", skipped)
+	}
+	if len(byNumber) != 2 {
+		t.Fatalf("map size = %d, want 2 (111 graded, 333 graded; 222 skipped for empty grau)", len(byNumber))
+	}
+	if _, ok := byNumber["222"]; ok {
+		t.Error("222 has an empty grau and must be absent from the map")
+	}
+	p111 := byNumber["111"]
+	if p111.Record.Degree != "G1" || len(p111.Movimentos) != 1 {
+		t.Errorf("111 = degree %q, %d movimentos; want G1, 1", p111.Record.Degree, len(p111.Movimentos))
+	}
+	if p111.Movimentos[0].ObservedAt != observed {
+		t.Errorf("111 movimento observed_at = %s, want the parser clock %s", p111.Movimentos[0].ObservedAt, observed)
+	}
+	if byNumber["333"].Record.Degree != "G2" {
+		t.Errorf("333 degree = %q, want G2", byNumber["333"].Record.Degree)
+	}
+}
+
+// TestDATAJUDParserParseBatch_NestedAssuntosDoesNotBreakPage proves the QA-found bug is
+// fixed: a real DATAJUD page where ONE hit carries a nested-array `assuntos`
+// (00012991920158260153, TJSP) no longer fails the whole page. ParseBatch returns NO error;
+// the malformed hit is TOLERATED (its nested assuntos flattened) and the other 3 hits parse.
+func TestDATAJUDParserParseBatch_NestedAssuntosDoesNotBreakPage(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile("testdata/datajud_batch_nested_assuntos.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	byNumber, skipped, err := newTestDATAJUDParser(time.Now()).ParseBatch(
+		context.Background(), []RawPayload{{Source: SourceDATAJUD, Body: body}})
+	if err != nil {
+		t.Fatalf("ParseBatch must not error on a page with one nested-assuntos hit: %v", err)
+	}
+	// The nested assuntos is FLATTENED (not skipped), so there are ZERO real parse errors →
+	// the fecho of an import like this must be OK, not PARTIAL.
+	if len(skipped) != 0 {
+		t.Errorf("skipped (real parse errors) = %v, want none (nested assuntos is flattened, not a skip)", skipped)
+	}
+
+	// The three normal hits must be present, and the nested-assuntos process must NOT have
+	// taken the page down with it.
+	want := []string{"00001974620238260196", "00002084120248260196", "00003631020258260196"}
+	for _, num := range want {
+		if _, ok := byNumber[num]; !ok {
+			t.Errorf("normal hit %s missing from ParseBatch result", num)
+		}
+	}
+	// The nested-assuntos process is tolerated and PARSED (its nested assuntos flattened).
+	if proc, ok := byNumber["00012991920158260153"]; ok {
+		if proc.Record.Degree == "" {
+			t.Errorf("nested-assuntos hit parsed but degree empty")
+		}
+	}
+	if len(byNumber) < 3 {
+		t.Errorf("ParseBatch returned %d processes, want at least the 3 normal hits", len(byNumber))
+	}
+}
+
+// TestDATAJUDParser_NestedAssuntosFlattened proves the lenient assuntos unmarshaler flattens
+// a nested array and ignores non-object elements, exposing the first valid subject.
+func TestDATAJUDParser_NestedAssuntosFlattened(t *testing.T) {
+	t.Parallel()
+
+	// Mixed shape: an object, then a NESTED ARRAY of objects, then a bare string (ignored).
+	src := []byte(`{"assuntos":[{"codigo":1,"nome":"Primeiro"},[{"codigo":2,"nome":"Aninhado"}],"lixo"]}`)
+	var got datajudSource
+	if err := json.Unmarshal(src, &got); err != nil {
+		t.Fatalf("mixed-shape assuntos must not fail unmarshal: %v", err)
+	}
+	if len(got.Assuntos) != 2 {
+		t.Fatalf("assuntos = %d, want 2 (object + flattened nested; bare string ignored)", len(got.Assuntos))
+	}
+	if firstAssunto(got.Assuntos) != "Primeiro" {
+		t.Errorf("firstAssunto = %q, want Primeiro", firstAssunto(got.Assuntos))
+	}
+}
+
+// TestDATAJUDParser_PerHitResilience proves a page with one hit whose _source is structurally
+// bad (a type clash on a scalar field) skips that hit, REPORTS it in `skipped` (a real parse
+// error), and still returns the good ones with no fatal error.
+func TestDATAJUDParser_PerHitResilience(t *testing.T) {
+	t.Parallel()
+
+	// hit 1 valid; hit 2 has nivelSigilo as an object (type clash) → parseHit fails → skip.
+	body := []byte(`{"hits":{"hits":[
+		{"_source":{"numeroProcesso":"good","grau":"G1","tribunal":"TJSP"}},
+		{"_source":{"numeroProcesso":"bad","grau":"G1","nivelSigilo":{"x":1}}}
+	]}}`)
+	byNumber, skipped, err := newTestDATAJUDParser(time.Now()).ParseBatch(
+		context.Background(), []RawPayload{{Source: SourceDATAJUD, Body: body}})
+	if err != nil {
+		t.Fatalf("one bad hit must not fail the page: %v", err)
+	}
+	if _, ok := byNumber["good"]; !ok {
+		t.Error("good hit missing")
+	}
+	if _, ok := byNumber["bad"]; ok {
+		t.Error("structurally-bad hit must be skipped, not included")
+	}
+	// The bad hit is a REAL parse error → reported in skipped (drives the fecho to PARTIAL).
+	if len(skipped) != 1 || skipped[0] != "bad" {
+		t.Errorf("skipped = %v, want exactly [bad] (the unparseable hit)", skipped)
 	}
 }
 

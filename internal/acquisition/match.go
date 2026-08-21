@@ -23,6 +23,7 @@ type matchRepo interface {
 	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
 	BatchUpsertCourtRecords(ctx context.Context, tx database.Tx, tenantID string, activeLimit int, params []FindOrCreateCourtRecordParams) (outcomes []CourtRecordOutcome, newCount int, err error)
 	UpsertIntimations(ctx context.Context, tx database.Tx, params []IntimationParams) (newRows, cancelledRows []IntimationChange, err error)
+	WriteDailyCaptureRun(ctx context.Context, tx database.Tx, params DailyCaptureParams) error
 }
 
 // MatchUseCase turns a day's national publications into per-tenant intimações: it
@@ -68,7 +69,7 @@ func (uc *MatchUseCase) MatchDay(ctx context.Context, day time.Time) (err error)
 	recordMatch(ctx, matched)
 
 	for tenantID, b := range groupMatches(matches) {
-		if err = uc.writeForTenant(ctx, tenantID, b.keys, b.items); err != nil {
+		if err = uc.writeForTenant(ctx, tenantID, day, b.keys, b.items); err != nil {
 			return err
 		}
 	}
@@ -92,7 +93,11 @@ func (uc *MatchUseCase) MatchTenantSince(ctx context.Context, tenantID string, s
 	if b == nil {
 		return nil // nothing in the store matches this tenant's OABs yet
 	}
-	return uc.writeForTenant(ctx, tenantID, b.keys, b.items)
+	// The catch-up write lands NOW, so the capture is stamped on today's window (the
+	// day the tenant actually sees "+N proc" from the bootstrap history). `since` bounds
+	// which stored publications were folded in, not when the effect happened — using it
+	// as the window would key the capture on a past day the fan-out never ran on.
+	return uc.writeForTenant(ctx, tenantID, uc.now(), b.keys, b.items)
 }
 
 type tenantMatches struct {
@@ -125,7 +130,7 @@ func groupMatches(matches []PublicationMatch) map[string]*tenantMatches {
 // records + intimações in its tx, reusing the sync helpers. The advisory lock keeps
 // concurrent tenant writes deadlock-free; the match is not entitlement-gated (like the
 // backfill) and carries no sync_run.
-func (uc *MatchUseCase) writeForTenant(ctx context.Context, tenantID string, keys map[string]bool, items []json.RawMessage) error {
+func (uc *MatchUseCase) writeForTenant(ctx context.Context, tenantID string, window time.Time, keys map[string]bool, items []json.RawMessage) error {
 	body, err := json.Marshal(djenPayload{OABs: oabEntriesFromKeys(keys), Items: items})
 	if err != nil {
 		return apperr.NewInfra("match: marshal payload", err)
@@ -136,6 +141,7 @@ func (uc *MatchUseCase) writeForTenant(ctx context.Context, tenantID string, key
 	}
 
 	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		startedAt := uc.now()
 		if err := uc.repo.AcquireTenantWriteLock(ctx, tx, tenantID); err != nil {
 			return err
 		}
@@ -157,7 +163,7 @@ func (uc *MatchUseCase) writeForTenant(ctx context.Context, tenantID string, key
 		}
 		// One set-based resolve-or-create; bulk match is ungated (math.MaxInt), like the
 		// backfill, so nothing comes back Blocked.
-		outcomes, _, err := uc.repo.BatchUpsertCourtRecords(ctx, tx, tenantID, math.MaxInt, crParams)
+		outcomes, newCount, err := uc.repo.BatchUpsertCourtRecords(ctx, tx, tenantID, math.MaxInt, crParams)
 		if err != nil {
 			return err
 		}
@@ -172,11 +178,42 @@ func (uc *MatchUseCase) writeForTenant(ctx context.Context, tenantID string, key
 		}
 		// National bulk match is a separate producer; it does not emit the
 		// intimation.observed/cancelled events the sync slice does (a future slice may),
-		// so the change slices are intentionally discarded here.
-		if _, _, err := uc.repo.UpsertIntimations(ctx, tx, intimParams); err != nil {
+		// so the cancelled slice is discarded — but the NEW slice count is the honest
+		// intimations_new for the capture audit row below.
+		newIntim, _, err := uc.repo.UpsertIntimations(ctx, tx, intimParams)
+		if err != nil {
 			return err
 		}
-		return nil
+		// MatchDay re-ticks hourly over the same day (at-least-once + lookback window):
+		// a bare re-observation re-resolves every record but lands NO new intimation. So
+		// skip the audit write when nothing is net-new — otherwise the ON CONFLICT sum
+		// inflates the counters and drags finished_at across the whole day (duration lie).
+		if newCount == 0 && len(newIntim) == 0 {
+			return nil
+		}
+		// "Processos atualizados" is the honest, re-tick-safe quantity: DISTINCT already-
+		// known records that got a NEW intimation this tick (new intimations only land
+		// once, so a re-tick contributes 0). New records are court_records_new, not
+		// updated — subtract them out (clamped, since a new record's only intimation may
+		// have deduped). len(outcomes) would recount every re-observed record → inflation.
+		touched := make(map[string]struct{}, len(newIntim))
+		for _, in := range newIntim {
+			touched[in.CourtRecordID] = struct{}{}
+		}
+		updated := len(touched) - newCount
+		if updated < 0 {
+			updated = 0
+		}
+		// Audit this fan-out's per-tenant effect in the SAME tx.
+		return uc.repo.WriteDailyCaptureRun(ctx, tx, DailyCaptureParams{
+			TenantID:            tenantID,
+			Window:              window,
+			StartedAt:           startedAt,
+			FinishedAt:          uc.now(),
+			CourtRecordsNew:     newCount,
+			CourtRecordsUpdated: updated,
+			IntimationsNew:      len(newIntim),
+		})
 	})
 }
 

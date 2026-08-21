@@ -249,6 +249,16 @@ func queueFor(typ string) string {
 	if typ == "acquisition.sync_completed" || typ == "acquisition.sync_failed" {
 		return "sync_status"
 	}
+	// enrichment_batch_requested (the self-re-enqueuing DATAJUD batch job) gets its OWN
+	// queue, drained by a dedicated low-concurrency server: the batch is serialized by its
+	// own DATAJUD rate limiter (a handful of _search requests), so it must not sit behind —
+	// or compete on the same pool with — the sync work on "ingestao". It carries the
+	// "acquisition" prefix, so it must be routed HERE, before the prefix switch sends
+	// "acquisition" to "ingestao". String literal, not the slice's const (queueFor cannot
+	// import internal/acquisition). Must match worker-ingestao's enrichmentQueue.
+	if typ == "acquisition.enrichment_batch_requested" {
+		return "enrichment"
+	}
 	// The deadline slice's async listener (intimation.observed/cancelled + the scheduled
 	// reminder_check/missed_check self-messages) gets its OWN queue, drained by a dedicated
 	// server on worker-ingestao: creating a prazo is fast (DB + outbox), but on "ingestao" it

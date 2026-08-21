@@ -5,6 +5,8 @@ import (
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/go-ozzo/ozzo-validation/v4/is"
+
+	"github.com/jusassessoria/platform/lib/apperr"
 )
 
 // oabRegex matches an OAB registration: a two-letter uppercase UF followed by 1–6
@@ -13,26 +15,20 @@ import (
 var oabRegex = regexp.MustCompile(`^[A-Z]{2}\d{1,6}$`)
 
 // ActivateIntegrationRequest is the POST /v1/acquisition/integrations body: the
-// set of sources to activate and the scope they all share. tenant_id is NOT here
-// — it comes from the verified principal. credential_ref is NOT here either — it
-// is never accepted from the client (v0 leaves it NULL).
+// scope to watch. tenant_id is NOT here — it comes from the verified principal.
+// credential_ref is NOT here either — it is never accepted from the client (v0
+// leaves it NULL). There is no source selector: DJEN is the only activatable
+// source (the sole one that DISCOVERS a process nationally, by OAB) and every
+// activation targets it — DATAJUD only ENRICHES an already-discovered process
+// (by number), triggered by court_record_observed, never by this endpoint.
 type ActivateIntegrationRequest struct {
-	Sources []string `json:"sources"`
-	Scope   Scope    `json:"scope"`
+	Scope Scope `json:"scope"`
 }
 
-// Validate enforces the boundary rules via ozzo (method-based, not struct tags):
-// sources must be non-empty and a subset of the activatable sources, and the scope
-// must be valid. Only DJEN is activatable: it is the sole source that DISCOVERS a
-// process (nationally, by OAB). DATAJUD only ENRICHES an already-discovered process
-// (by number), triggered by court_record_observed — never activated — so it is
-// rejected here alongside UPLOAD/MNI. A failure is a 400 at the edge (KindInvalid).
+// Validate enforces the boundary rule via ozzo (method-based, not struct tags):
+// the scope must be valid. A failure is a 400 at the edge (KindInvalid).
 func (r ActivateIntegrationRequest) Validate() error {
 	return validation.ValidateStruct(&r,
-		validation.Field(&r.Sources,
-			validation.Required,
-			validation.Each(validation.In(SourceDJEN)),
-		),
 		validation.Field(&r.Scope),
 	)
 }
@@ -56,6 +52,56 @@ func (r AssignResponsibleRequest) Validate() error {
 	)
 }
 
+// AssignIntimacaoResponsaveisRequest is the PUT /v1/intimacoes/:id/responsaveis body:
+// the two optional roles — condutor do prazo (ConductorUserID) and revisor/assinador
+// (ReviewerUserID). Each is a *string so the caller can send an explicit null to
+// desatribuir that specific role. Both null = remove all assignments. tenant_id comes
+// from the verified principal, never the body.
+type AssignIntimacaoResponsaveisRequest struct {
+	ConductorUserID *string `json:"conductor_user_id"`
+	ReviewerUserID  *string `json:"reviewer_user_id"`
+}
+
+// Validate enforces the boundary rules via ozzo: when either ID is present it must be
+// a well-formed uuid (bad shape → 400 at the edge, before any DB hop). A nil is valid
+// (desatribuir). Whether a uuid names a real member of the tenant is a domain concern
+// the use case checks under the tx (ErrResponsibleNotMember), not a shape rule here.
+func (r AssignIntimacaoResponsaveisRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.ConductorUserID, is.UUID),
+		validation.Field(&r.ReviewerUserID, is.UUID),
+	)
+}
+
+// BulkAssignResponsaveisRequest é o corpo de POST /v1/intimacoes/bulk/responsaveis:
+// atribui o condutor a várias intimações. Dois modos: All=true aplica a TODA a
+// faixa/filtro atual (os campos de filtro espelham o GET /intimacoes; inclui os itens
+// ainda não paginados); senão aplica aos IDs. ConductorUserID nil desatribui.
+type BulkAssignResponsaveisRequest struct {
+	ConductorUserID *string  `json:"conductor_user_id"`
+	All             bool     `json:"all"`
+	IDs             []string `json:"ids"`
+	// filtros (usados só quando All=true) — espelham o GET /intimacoes.
+	Urgencia   string `json:"urgencia"`
+	Search     string `json:"search"`
+	Type       string `json:"type"`
+	UserStatus string `json:"user_status"`
+	Court      string `json:"court"`
+	Assignee   string `json:"assignee"`
+}
+
+// Validate: conductor (quando presente) uuid; no modo por-ids, ao menos um id, cada
+// um uuid. A pertinência do condutor ao tenant é checada no caso de uso (sob a tx).
+func (r BulkAssignResponsaveisRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.ConductorUserID, is.UUID),
+		validation.Field(&r.IDs,
+			validation.When(!r.All, validation.Required),
+			validation.Each(is.UUID),
+		),
+	)
+}
+
 // Validate enforces the scope rules: at least one OAB, each a well-formed
 // registration. tax ids are optional and unconstrained in v0. Declaring Validate
 // on Scope lets ozzo validate it automatically when it is a request field.
@@ -66,4 +112,15 @@ func (s Scope) Validate() error {
 			validation.Each(validation.Match(oabRegex)),
 		),
 	)
+}
+
+// parseOAB validates a combined "UFNÚMERO" registration (e.g. "SP123456") and
+// splits it into the OABEntry the DJEN connector queries by. A bad format is a
+// typed Invalid error (→ 400) raised before any network call — same shape as
+// normalizeCNPJ/normalizeCEP in the lookup slice.
+func parseOAB(raw string) (OABEntry, error) {
+	if !oabRegex.MatchString(raw) {
+		return OABEntry{}, apperr.NewInvalid("oab must be UF (2 letters) + 1-6 digits, e.g. SP123456")
+	}
+	return OABEntry{UF: raw[:2], Number: raw[2:]}, nil
 }

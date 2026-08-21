@@ -86,7 +86,7 @@ func TestListener_HandleIntegrationActivated_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil, nil, nil)
+	l := NewListener(spy, nil, nil, nil, nil)
 	task := asynq.NewTask(TypeIntegrationActivated, payload)
 
 	if err := l.handleIntegrationActivated(context.Background(), task); err != nil {
@@ -106,7 +106,7 @@ func TestListener_HandleIntegrationActivated_BadPayloadSkipsRetry(t *testing.T) 
 	t.Parallel()
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil, nil, nil)
+	l := NewListener(spy, nil, nil, nil, nil)
 	task := asynq.NewTask(TypeIntegrationActivated, []byte("{not json"))
 
 	err := l.handleIntegrationActivated(context.Background(), task)
@@ -141,7 +141,7 @@ func TestListener_HandleSyncRequested_Dispatches(t *testing.T) {
 	}
 
 	spy := &spySyncUC{}
-	l := NewListener(nil, spy, nil, nil)
+	l := NewListener(nil, spy, nil, nil, nil)
 	task := asynq.NewTask(TypeSyncRequested, payload)
 
 	if err := l.handleSyncRequested(context.Background(), task); err != nil {
@@ -161,7 +161,7 @@ func TestListener_HandleSyncRequested_BadPayloadSkipsRetry(t *testing.T) {
 	t.Parallel()
 
 	spy := &spySyncUC{}
-	l := NewListener(nil, spy, nil, nil)
+	l := NewListener(nil, spy, nil, nil, nil)
 	task := asynq.NewTask(TypeSyncRequested, []byte("{not json"))
 
 	err := l.handleSyncRequested(context.Background(), task)
@@ -195,7 +195,7 @@ func TestListener_HandleSyncCompleted_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil, nil, nil)
+	l := NewListener(spy, nil, nil, nil, nil)
 	task := asynq.NewTask(TypeSyncCompleted, payload)
 
 	if err := l.handleSyncCompleted(context.Background(), task); err != nil {
@@ -228,7 +228,7 @@ func TestListener_HandleSyncFailed_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil, nil, nil)
+	l := NewListener(spy, nil, nil, nil, nil)
 	task := asynq.NewTask(TypeSyncFailed, payload)
 
 	if err := l.handleSyncFailed(context.Background(), task); err != nil {
@@ -248,7 +248,7 @@ func TestListener_HandleSyncCompleted_BadPayloadSkipsRetry(t *testing.T) {
 	t.Parallel()
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil, nil, nil)
+	l := NewListener(spy, nil, nil, nil, nil)
 	task := asynq.NewTask(TypeSyncCompleted, []byte("{not json"))
 
 	err := l.handleSyncCompleted(context.Background(), task)
@@ -268,7 +268,7 @@ func TestListener_HandleSyncFailed_BadPayloadSkipsRetry(t *testing.T) {
 	t.Parallel()
 
 	spy := &spyListenerUC{}
-	l := NewListener(spy, nil, nil, nil)
+	l := NewListener(spy, nil, nil, nil, nil)
 	task := asynq.NewTask(TypeSyncFailed, []byte("{not json"))
 
 	err := l.handleSyncFailed(context.Background(), task)
@@ -299,7 +299,7 @@ func TestListener_HandleDiarioRequested_Dispatches(t *testing.T) {
 	}
 
 	spy := &spyIngestionUC{}
-	l := NewListener(nil, nil, nil, spy)
+	l := NewListener(nil, nil, nil, nil, spy)
 	task := asynq.NewTask(TypeDiarioRequested, payload)
 
 	if err := l.handleDiarioRequested(context.Background(), task); err != nil {
@@ -319,7 +319,7 @@ func TestListener_HandleDiarioRequested_BadPayloadSkipsRetry(t *testing.T) {
 	t.Parallel()
 
 	spy := &spyIngestionUC{}
-	l := NewListener(nil, nil, nil, spy)
+	l := NewListener(nil, nil, nil, nil, spy)
 	task := asynq.NewTask(TypeDiarioRequested, []byte("{not json"))
 
 	err := l.handleDiarioRequested(context.Background(), task)
@@ -345,13 +345,13 @@ func TestListener_DiarioRequestedOnlyViaRegisterIngestion(t *testing.T) {
 	// asynq's ServeMux.Handler returns an empty pattern (and a NotFoundHandler) when no
 	// route matches; the registered pattern otherwise.
 	mainMux := asynq.NewServeMux()
-	NewListener(&spyListenerUC{}, &spySyncUC{}, nil, &spyIngestionUC{}).Register(mainMux)
+	NewListener(&spyListenerUC{}, &spySyncUC{}, nil, nil, &spyIngestionUC{}).Register(mainMux)
 	if _, pattern := mainMux.Handler(task); pattern != "" {
 		t.Errorf("diario_requested on the main mux (pattern %q), want it only on the dedicated server", pattern)
 	}
 
 	diarioMux := asynq.NewServeMux()
-	NewListener(nil, nil, nil, &spyIngestionUC{}).RegisterIngestion(diarioMux)
+	NewListener(nil, nil, nil, nil, &spyIngestionUC{}).RegisterIngestion(diarioMux)
 	if _, pattern := diarioMux.Handler(task); pattern != TypeDiarioRequested {
 		t.Errorf("RegisterIngestion pattern = %q, want %q", pattern, TypeDiarioRequested)
 	}

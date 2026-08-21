@@ -40,10 +40,11 @@ func (r stubResolver) Resolve(context.Context, string, string) (httpx.Principal,
 
 // fakeHandlerUC records what the handler passed and returns canned results.
 type fakeHandlerUC struct {
-	activateResp []*Integration
-	listResp     []*Integration
-	gotTenantID  string
-	gotSources   []string
+	activateResp   *Integration
+	listResp       []*Integration
+	gotTenantID    string
+	gotScope       Scope
+	activateCalled bool
 	// Responsável write path (AssignResponsible): what the handler forwarded, and an
 	// optional canned error to drive the failure branches.
 	gotAssignTenant string
@@ -58,9 +59,10 @@ type fakeHandlerUC struct {
 	triageErr       error
 }
 
-func (f *fakeHandlerUC) ActivateIntegration(_ context.Context, tenantID string, sources []string, _ Scope) ([]*Integration, error) {
+func (f *fakeHandlerUC) ActivateIntegration(_ context.Context, tenantID string, scope Scope) (*Integration, error) {
 	f.gotTenantID = tenantID
-	f.gotSources = sources
+	f.gotScope = scope
+	f.activateCalled = true
 	return f.activateResp, nil
 }
 
@@ -89,6 +91,14 @@ func (f *fakeHandlerUC) IgnoreIntimacao(_ context.Context, tenantID, intimationI
 func (f *fakeHandlerUC) ReopenIntimacao(_ context.Context, tenantID, intimationID string) error {
 	f.gotTriageTenant, f.gotTriageID, f.gotTriageVerb = tenantID, intimationID, "reopen"
 	return f.triageErr
+}
+
+func (f *fakeHandlerUC) AssignIntimacaoResponsaveis(_ context.Context, _, _ string, _, _ *string) error {
+	return nil
+}
+
+func (f *fakeHandlerUC) BulkAssignConductor(_ context.Context, _ string, _ bool, _ IntimacoesQuery, ids []string, _ *string) (int64, error) {
+	return int64(len(ids)), nil
 }
 
 // fakeReader is a no-op read port for the write-path handler tests (the read
@@ -147,6 +157,18 @@ func (fakeReader) SyncRunItems(context.Context, string, string) (SyncRunItemsVie
 	return SyncRunItemsView{}, nil
 }
 
+func (fakeReader) Captures(context.Context, string) (CapturesView, error) {
+	return CapturesView{}, nil
+}
+
+func (fakeReader) CaptureDetail(context.Context, string, string) (CaptureRunView, error) {
+	return CaptureRunView{}, nil
+}
+
+func (fakeReader) WatchedOABs(context.Context, string) ([]WatchedOABView, error) {
+	return nil, nil
+}
+
 // newApp builds an app whose /v1 group mirrors production: Auth resolves a
 // principal with the given role/tenant, then the acquisition routes mount under
 // it. An empty role/tenant still yields a valid principal (used by role tests).
@@ -161,7 +183,7 @@ func newAppWithReader(uc handlerUC, rd reader, role, tenant string) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: role, tenant: tenant}))
-	NewHandler(uc, rd, nil).RegisterV1(v1)
+	NewHandler(uc, rd, nil, nil, nil, nil).RegisterV1(v1)
 	return app
 }
 
@@ -190,7 +212,7 @@ func do(t *testing.T, app *fiber.App, method, path, body, bearer string) (int, s
 	return resp.StatusCode, string(raw)
 }
 
-const validBody = `{"sources":["DJEN"],"scope":{"oab":["SP123456"]}}`
+const validBody = `{"scope":{"oab":["SP123456"]}}`
 
 // --- tests -------------------------------------------------------------------
 
@@ -221,8 +243,8 @@ func TestHandler_Activate_Lawyer_403(t *testing.T) {
 func TestHandler_Activate_Admin_201(t *testing.T) {
 	t.Parallel()
 
-	uc := &fakeHandlerUC{activateResp: []*Integration{
-		{ID: "i1", Source: SourceDJEN, Scope: Scope{OAB: []string{"SP123456"}}, Status: StatusActive},
+	uc := &fakeHandlerUC{activateResp: &Integration{
+		ID: "i1", Source: SourceDJEN, Scope: Scope{OAB: []string{"SP123456"}}, Status: StatusActive,
 	}}
 	app := newApp(uc, roleAdmin, "tenant-42")
 
@@ -233,8 +255,8 @@ func TestHandler_Activate_Admin_201(t *testing.T) {
 	if uc.gotTenantID != "tenant-42" {
 		t.Fatalf("tenant passed to uc = %q, want tenant-42 (from principal)", uc.gotTenantID)
 	}
-	if len(uc.gotSources) != 1 || uc.gotSources[0] != SourceDJEN {
-		t.Fatalf("sources passed = %v, want [DJEN]", uc.gotSources)
+	if len(uc.gotScope.OAB) != 1 || uc.gotScope.OAB[0] != "SP123456" {
+		t.Fatalf("scope passed = %+v, want oab [SP123456]", uc.gotScope)
 	}
 	// AC10: credential_ref must never surface in the response.
 	if strings.Contains(body, "credential_ref") {
@@ -251,10 +273,8 @@ func TestHandler_Activate_InvalidBody_400(t *testing.T) {
 		name string
 		body string
 	}{
-		{name: "AC4 empty sources", body: `{"sources":[],"scope":{"oab":["SP123456"]}}`},
-		{name: "AC4 unsupported source", body: `{"sources":["UPLOAD"],"scope":{"oab":["SP123456"]}}`},
-		{name: "AC2 empty oab", body: `{"sources":["DJEN"],"scope":{"oab":[]}}`},
-		{name: "AC3 malformed oab", body: `{"sources":["DJEN"],"scope":{"oab":["bad"]}}`},
+		{name: "AC2 empty oab", body: `{"scope":{"oab":[]}}`},
+		{name: "AC3 malformed oab", body: `{"scope":{"oab":["bad"]}}`},
 	}
 
 	for _, tt := range tests {
@@ -267,8 +287,8 @@ func TestHandler_Activate_InvalidBody_400(t *testing.T) {
 			if status != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400; body=%s", status, body)
 			}
-			if uc.gotSources != nil {
-				t.Fatalf("use case was called on invalid input (sources=%v)", uc.gotSources)
+			if uc.activateCalled {
+				t.Fatalf("use case was called on invalid input (scope=%+v)", uc.gotScope)
 			}
 		})
 	}
@@ -295,6 +315,95 @@ func TestHandler_List_ScopedToTenant(t *testing.T) {
 	}
 	if strings.Contains(body, "credential_ref") {
 		t.Fatalf("response leaked credential_ref: %s", body)
+	}
+}
+
+// --- oab-lookup route ---------------------------------------------------------
+
+// fakeLawyerLookup is a controllable LawyerLookup double for the handler tests.
+type fakeLawyerLookup struct {
+	name      string
+	err       error
+	gotOAB    OABEntry
+	wasCalled bool
+}
+
+func (f *fakeLawyerLookup) LookupOABName(_ context.Context, oab OABEntry) (string, error) {
+	f.wasCalled = true
+	f.gotOAB = oab
+	return f.name, f.err
+}
+
+// newAppWithLawyers is newApp with an explicit LawyerLookup port wired.
+func newAppWithLawyers(lawyers LawyerLookup, role, tenant string) *fiber.App {
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
+	})
+	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: role, tenant: tenant}))
+	NewHandler(&fakeHandlerUC{}, fakeReader{}, nil, nil, nil, lawyers).RegisterV1(v1)
+	return app
+}
+
+// GET /v1/acquisition/oab-lookup with a well-formed, matched OAB → 200 with the
+// name. Any authenticated role may call it (no tenant/role gate, unlike activate).
+func TestHandler_OABLookup_Found_200(t *testing.T) {
+	t.Parallel()
+
+	lawyers := &fakeLawyerLookup{name: "LUAN GOMES"}
+	app := newAppWithLawyers(lawyers, "LAWYER", "tenant-1")
+
+	status, body := do(t, app, http.MethodGet, "/v1/acquisition/oab-lookup?oab=SP347019", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if !strings.Contains(body, "LUAN GOMES") {
+		t.Fatalf("body missing looked-up name: %s", body)
+	}
+	if !lawyers.wasCalled || lawyers.gotOAB != (OABEntry{UF: "SP", Number: "347019"}) {
+		t.Fatalf("port called with %+v, want SP/347019", lawyers.gotOAB)
+	}
+}
+
+// A malformed oab query param never reaches the port — 400 before any call.
+func TestHandler_OABLookup_BadFormat_400(t *testing.T) {
+	t.Parallel()
+
+	lawyers := &fakeLawyerLookup{name: "unreachable"}
+	app := newAppWithLawyers(lawyers, "LAWYER", "tenant-1")
+
+	status, body := do(t, app, http.MethodGet, "/v1/acquisition/oab-lookup?oab=not-an-oab", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", status, body)
+	}
+	if lawyers.wasCalled {
+		t.Fatal("port was called on invalid input")
+	}
+}
+
+// No recent DJEN communication names the OAB → the typed ErrOABNotFound renders
+// 404 — a normal, expected outcome for the wizard, not a fault.
+func TestHandler_OABLookup_NotFound_404(t *testing.T) {
+	t.Parallel()
+
+	lawyers := &fakeLawyerLookup{err: ErrOABNotFound}
+	app := newAppWithLawyers(lawyers, "LAWYER", "tenant-1")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/acquisition/oab-lookup?oab=SP347019", "", "jwt")
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", status)
+	}
+}
+
+// No LawyerLookup wired (e.g. local dev without the DJEN connector configured) →
+// a typed 503, same optional-port pattern as /resume with no resumer.
+func TestHandler_OABLookup_NotWired_503(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithLawyers(nil, "LAWYER", "tenant-1")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/acquisition/oab-lookup?oab=SP347019", "", "jwt")
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
 	}
 }
 
@@ -344,7 +453,8 @@ func (r *recordingReader) Processo(_ context.Context, tenantID, id string) (Proc
 	r.gotProcOneTID, r.gotProcOneID = tenantID, id
 	return r.procOneRes, r.procOneErr
 }
-func (r *recordingReader) Intimacoes(context.Context, IntimacoesQuery) (IntimacoesResult, error) {
+func (r *recordingReader) Intimacoes(_ context.Context, q IntimacoesQuery) (IntimacoesResult, error) {
+	r.gotIntiListQ = q
 	return r.intiListRes, nil
 }
 func (r *recordingReader) Intimacao(_ context.Context, tenantID, id string) (IntimacaoDetailView, error) {
@@ -380,6 +490,15 @@ func (r *recordingReader) ReconciliationDetail(context.Context, string, string) 
 }
 func (r *recordingReader) SyncRunItems(context.Context, string, string) (SyncRunItemsView, error) {
 	return SyncRunItemsView{}, nil
+}
+func (r *recordingReader) Captures(context.Context, string) (CapturesView, error) {
+	return CapturesView{}, nil
+}
+func (r *recordingReader) CaptureDetail(context.Context, string, string) (CaptureRunView, error) {
+	return CaptureRunView{}, nil
+}
+func (r *recordingReader) WatchedOABs(context.Context, string) ([]WatchedOABView, error) {
+	return nil, nil
 }
 
 // GET /v1/processos forwards ?search and the decoded ?cursor to the read port, and the
@@ -515,6 +634,144 @@ func TestHandler_ListIntimacoes_EnvelopeFiltersWithOptions(t *testing.T) {
 	}
 	if got := len(env.Filters["court"]); got != 1 || env.Filters["court"][0].Value != "TJSP" {
 		t.Errorf("filters.court = %+v, want the TJSP option", env.Filters["court"])
+	}
+}
+
+// ?urgencia is a closed set: valid values are forwarded to the read port.
+func TestHandler_ListIntimacoes_ValidUrgencia_ForwardedToReader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		urgencia string
+	}{
+		{name: "atraso", urgencia: UrgenciaAtraso},
+		{name: "hoje", urgencia: UrgenciaHoje},
+		{name: "proximos_dois_dias", urgencia: UrgenciaProximosDoisDias},
+		{name: "semana", urgencia: UrgenciaSemana},
+		{name: "mais_adiante", urgencia: UrgenciaMaisAdiante},
+		{name: "nao_confirmado", urgencia: UrgenciaNaoConfirmado},
+		{name: "sem_providencia", urgencia: UrgenciaSemProvidencia},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rd := &recordingReader{}
+			app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+			status, body := do(t, app, http.MethodGet,
+				"/v1/intimacoes?urgencia="+tt.urgencia, "", "jwt")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", status, body)
+			}
+			if rd.gotIntiListQ.Urgencia != tt.urgencia {
+				t.Errorf("forwarded Urgencia = %q, want %q", rd.gotIntiListQ.Urgencia, tt.urgencia)
+			}
+		})
+	}
+}
+
+// ?urgencia with a value outside the closed set is a client error → 400.
+func TestHandler_ListIntimacoes_InvalidUrgencia_400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		urgencia string
+	}{
+		{name: "typo", urgencia: "urgente"},
+		{name: "uppercase", urgencia: "ATRASO"},
+		{name: "arbitrary", urgencia: "this_week"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+			status, _ := do(t, app, http.MethodGet,
+				"/v1/intimacoes?urgencia="+tt.urgencia, "", "jwt")
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for unknown urgencia %q", status, tt.urgencia)
+			}
+		})
+	}
+}
+
+// The envelope's filters block includes the urgencia options so the FE can render
+// the chip set without hard-coding the closed set.
+func TestHandler_ListIntimacoes_EnvelopeFiltersIncludesUrgencia(t *testing.T) {
+	t.Parallel()
+
+	f := httpx.Filters{}
+	f.SetEnum("urgencia", UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado)
+	rd := &recordingReader{intiListRes: IntimacoesResult{Filters: f}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	var env intimacoesEnvelope
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatalf("decode envelope: %v; body=%s", err, body)
+	}
+	opts, ok := env.Filters["urgencia"]
+	if !ok || len(opts) != 5 {
+		t.Fatalf("filters.urgencia = %v (len=%d), want 5 options", opts, len(opts))
+	}
+	// Verify the five canonical values are all present in order.
+	want := []string{UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado}
+	for i, w := range want {
+		if opts[i].Value != w {
+			t.Errorf("filters.urgencia[%d].value = %q, want %q", i, opts[i].Value, w)
+		}
+	}
+}
+
+// ?assignee=me resolves to the authenticated principal's own user id (stubResolver
+// always yields "u-1") and is forwarded to the read port — the "Minhas" toggle.
+func TestHandler_ListIntimacoes_AssigneeMe_ResolvesToPrincipal(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes?assignee=me", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if rd.gotIntiListQ.Assignee != "u-1" {
+		t.Errorf("forwarded Assignee = %q, want the principal's own id %q", rd.gotIntiListQ.Assignee, "u-1")
+	}
+}
+
+// ?assignee=<uuid> is forwarded verbatim (no "me" resolution) to the read port.
+func TestHandler_ListIntimacoes_AssigneeUUID_ForwardedVerbatim(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	const uid = "018f0000-0000-7000-8000-000000000abc"
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes?assignee="+uid, "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if rd.gotIntiListQ.Assignee != uid {
+		t.Errorf("forwarded Assignee = %q, want %q", rd.gotIntiListQ.Assignee, uid)
+	}
+}
+
+// ?assignee with a value that is neither "" nor "me" nor a well-formed uuid is a
+// client error → 400.
+func TestHandler_ListIntimacoes_InvalidAssignee_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, _ := do(t, app, http.MethodGet, "/v1/intimacoes?assignee=not-a-uuid", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a malformed assignee", status)
 	}
 }
 
@@ -1310,7 +1567,7 @@ func TestHandler_Resume_OK(t *testing.T) {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: "LAWYER", tenant: "tenant-9"}))
-	NewHandler(&fakeHandlerUC{}, &recordingReader{}, rs).RegisterV1(v1)
+	NewHandler(&fakeHandlerUC{}, &recordingReader{}, rs, nil, nil, nil).RegisterV1(v1)
 
 	status, body := do(t, app, http.MethodGet, "/v1/processos/rec-1/resume", "", "jwt")
 	if status != http.StatusOK {
@@ -1336,7 +1593,7 @@ func TestHandler_Resume_NoResumer_501(t *testing.T) {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: "LAWYER", tenant: "tenant-9"}))
-	NewHandler(&fakeHandlerUC{}, &recordingReader{}, nil).RegisterV1(v1)
+	NewHandler(&fakeHandlerUC{}, &recordingReader{}, nil, nil, nil, nil).RegisterV1(v1)
 
 	status, body := do(t, app, http.MethodGet, "/v1/processos/rec-1/resume", "", "jwt")
 	if status != http.StatusServiceUnavailable {
@@ -1344,5 +1601,53 @@ func TestHandler_Resume_NoResumer_501(t *testing.T) {
 	}
 	if !strings.Contains(body, `"kind":"SERVICE_UNAVAILABLE"`) {
 		t.Errorf("body missing kind SERVICE_UNAVAILABLE\ngot: %s", body)
+	}
+}
+
+// GET /v1/intimacoes: the envelope must carry a `buckets` object with the five
+// section counts (atraso, hoje, proximos_dois_dias, esta_semana, sem_providencia).
+func TestHandler_ListIntimacoes_EnvelopeCarriesBuckets(t *testing.T) {
+	t.Parallel()
+
+	buckets := IntimacaoBucketsView{
+		Atraso:           3,
+		Hoje:             1,
+		ProximosDoisDias: 2,
+		EstaSemana:       5,
+		SemProvidencia:   7,
+		MaisAdiante:      12,
+		NaoConfirmado:    4,
+	}
+	rd := &recordingReader{intiListRes: IntimacoesResult{Buckets: buckets}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+
+	var env intimacoesEnvelope
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatalf("decode envelope: %v; body=%s", err, body)
+	}
+	if env.Buckets != buckets {
+		t.Errorf("buckets = %+v, want %+v", env.Buckets, buckets)
+	}
+}
+
+// ?urgencia=mais_adiante is accepted as a valid value (closed-set) and forwarded
+// to the read port; the handler returns 200.
+func TestHandler_ListIntimacoes_MaisAdiante_AcceptedAndForwarded(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/intimacoes?urgencia=mais_adiante", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if rd.gotIntiListQ.Urgencia != UrgenciaMaisAdiante {
+		t.Errorf("forwarded Urgencia = %q, want %q", rd.gotIntiListQ.Urgencia, UrgenciaMaisAdiante)
 	}
 }

@@ -123,6 +123,12 @@ type recordingWriter struct {
 	adjustRes    AdjustedDeadline
 	adjustErr    error
 
+	// preview
+	gotPreviewCmd PreviewCommand
+	previewCalls  int
+	previewRes    PreviewResult
+	previewErr    error
+
 	// met / missed
 	gotMetTenant, gotMetID       string
 	metCalls                     int
@@ -132,6 +138,16 @@ type recordingWriter struct {
 	missedCalls                  int
 	missedRes                    MarkedDeadline
 	missedErr                    error
+
+	// no-deadline / reopen
+	gotNoDeadlineTenant, gotNoDeadlineUser, gotNoDeadlineID string
+	noDeadlineCalls                                         int
+	noDeadlineRes                                           MarkedDeadline
+	noDeadlineErr                                           error
+	gotReopenTenant, gotReopenID                            string
+	reopenCalls                                             int
+	reopenRes                                               MarkedDeadline
+	reopenErr                                               error
 
 	// task writes
 	gotCreateTaskCmd               CreateTaskCommand
@@ -175,6 +191,24 @@ func (w *recordingWriter) Adjust(_ context.Context, cmd AdjustCommand) (Adjusted
 	w.adjustCalls++
 	w.gotAdjustCmd = cmd
 	return w.adjustRes, w.adjustErr
+}
+
+func (w *recordingWriter) Preview(_ context.Context, cmd PreviewCommand) (PreviewResult, error) {
+	w.previewCalls++
+	w.gotPreviewCmd = cmd
+	return w.previewRes, w.previewErr
+}
+
+func (w *recordingWriter) NoDeadline(_ context.Context, tenantID, userID, deadlineID string) (MarkedDeadline, error) {
+	w.noDeadlineCalls++
+	w.gotNoDeadlineTenant, w.gotNoDeadlineUser, w.gotNoDeadlineID = tenantID, userID, deadlineID
+	return w.noDeadlineRes, w.noDeadlineErr
+}
+
+func (w *recordingWriter) Reopen(_ context.Context, tenantID, deadlineID string) (MarkedDeadline, error) {
+	w.reopenCalls++
+	w.gotReopenTenant, w.gotReopenID = tenantID, deadlineID
+	return w.reopenRes, w.reopenErr
 }
 
 func (w *recordingWriter) MarkMet(_ context.Context, tenantID, deadlineID string) (MarkedDeadline, error) {
@@ -1236,6 +1270,70 @@ func TestHandler_ListTasks_CursorRoundTrip_UndatedSentinel(t *testing.T) {
 	}
 }
 
+// --- GET /v1/tasks?intimation_id=... -----------------------------------------
+
+// With a valid ?intimation_id the handler forwards it to the read port via TasksQuery and
+// returns 200 — the tasks of that specific intimação without triggering an allowlist 400.
+func TestHandler_ListTasks_IntimationID_ForwardsToRepo(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{tasksRes: TasksResult{
+		Items: []TaskView{{
+			ID: "t-1", Title: "Contestar", Status: "OPEN", Source: "MANUAL",
+			IntimationID: "018f0000-0000-7000-8000-000000000abc",
+		}},
+		TotalCount: 1,
+		Total:      1,
+	}}
+	app := newApp(rd, "tenant-9")
+
+	status, body := do(t, app, http.MethodGet,
+		"/v1/tasks?intimation_id=018f0000-0000-7000-8000-000000000abc", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+	}
+	if rd.gotTasksQ.IntimationID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("IntimationID forwarded = %q, want the query id", rd.gotTasksQ.IntimationID)
+	}
+	if rd.gotTasksQ.TenantID != "tenant-9" {
+		t.Errorf("TenantID = %q, want tenant-9 (from principal)", rd.gotTasksQ.TenantID)
+	}
+}
+
+// A malformed ?intimation_id (not a uuid) is a client error → 400, and the read port is
+// never called (mirrors the ?intimation_id validation on the prazos route).
+func TestHandler_ListTasks_IntimationID_BadID_400(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newApp(rd, "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/tasks?intimation_id=not-a-uuid", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if rd.gotTasksQ.TenantID != "" {
+		t.Errorf("read port called (query %+v), want no call on a bad intimation_id", rd.gotTasksQ)
+	}
+}
+
+// Without ?intimation_id the handler takes the normal agenda path: IntimationID is empty
+// in the forwarded query and the read port is called normally.
+func TestHandler_ListTasks_NoIntimationID_NormalPath(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newApp(rd, "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/tasks?status=OPEN", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotTasksQ.IntimationID != "" {
+		t.Errorf("IntimationID = %q, want empty (no filter)", rd.gotTasksQ.IntimationID)
+	}
+}
+
 // --- POST /v1/tasks ----------------------------------------------------------
 
 // The create handler takes tenant_id/created_by from the PRINCIPAL (never the body), forwards the
@@ -1673,5 +1771,170 @@ func TestHandler_DeleteTaskItem_NotFound_404(t *testing.T) {
 	status, body := doJSON(t, app, http.MethodDelete, "/v1/tasks/t-1/items/missing", "jwt", "")
 	if status != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (body: %s)", status, body)
+	}
+}
+
+// --- confirmation panel endpoints (0049) ------------------------------------
+
+// TestHandler_Preview_ForwardsAndRenders proves POST /v1/prazos/preview forwards the mapped
+// command (tenant from the principal) and renders the recomputed dates + pt-BR weekday.
+func TestHandler_Preview_ForwardsAndRenders(t *testing.T) {
+	t.Parallel()
+
+	end := time.Date(2024, 2, 12, 0, 0, 0, 0, time.UTC)
+	wr := &recordingWriter{previewRes: PreviewResult{
+		StartDate: time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC),
+		EndDate:   end,
+		Weekday:   "segunda",
+		DaysLeft:  23,
+	}}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	body := `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","anchor_event":"PUBLISHED",
+		"kind":"CONTESTACAO","days":15,"counting":"BUSINESS","manual_extra_days":2}`
+	status, resBody := doJSON(t, app, http.MethodPost, "/v1/prazos/preview", "jwt", body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
+	}
+	if wr.previewCalls != 1 {
+		t.Fatalf("preview calls = %d, want 1", wr.previewCalls)
+	}
+	cmd := wr.gotPreviewCmd
+	if cmd.TenantID != "tenant-9" {
+		t.Errorf("tenant = %q, want tenant-9 (from principal)", cmd.TenantID)
+	}
+	if cmd.AnchorEvent != AnchorPublished || cmd.ManualExtraDays != 2 || cmd.Days != 15 {
+		t.Errorf("cmd anchor/extra/days = %q/%d/%d", cmd.AnchorEvent, cmd.ManualExtraDays, cmd.Days)
+	}
+	for _, want := range []string{`"weekday":"segunda"`, `"days_left":23`, `"holidays_applied":[]`} {
+		if !strings.Contains(resBody, want) {
+			t.Errorf("body missing %s\ngot: %s", want, resBody)
+		}
+	}
+}
+
+// TestHandler_Preview_RejectsBothSources proves the body validation (intimation_id XOR start_date)
+// is a 400 at the edge and never reaches the writer.
+func TestHandler_Preview_RejectsBothSources(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	body := `{"intimation_id":"018f0000-0000-7000-8000-000000000abc","start_date":"2024-01-16","days":15,"counting":"BUSINESS"}`
+	status, _ := doJSON(t, app, http.MethodPost, "/v1/prazos/preview", "jwt", body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	if wr.previewCalls != 0 {
+		t.Errorf("preview calls = %d, want 0 (rejected at edge)", wr.previewCalls)
+	}
+}
+
+// TestHandler_NoDeadline_ForwardsFromPrincipal proves POST /v1/prazos/:id/no-deadline forwards
+// tenant/user from the principal + id from the path, and renders {deadline_id, status}.
+func TestHandler_NoDeadline_ForwardsFromPrincipal(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{noDeadlineRes: MarkedDeadline{ID: "d-7", Status: StatusNoDeadline}}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	status, resBody := do(t, app, http.MethodPost, "/v1/prazos/d-7/no-deadline", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
+	}
+	if wr.noDeadlineCalls != 1 || wr.gotNoDeadlineTenant != "tenant-9" || wr.gotNoDeadlineUser != "u-1" || wr.gotNoDeadlineID != "d-7" {
+		t.Errorf("no-deadline calls/tenant/user/id = %d/%q/%q/%q", wr.noDeadlineCalls, wr.gotNoDeadlineTenant, wr.gotNoDeadlineUser, wr.gotNoDeadlineID)
+	}
+	for _, want := range []string{`"deadline_id":"d-7"`, `"status":"NO_DEADLINE"`} {
+		if !strings.Contains(resBody, want) {
+			t.Errorf("body missing %s\ngot: %s", want, resBody)
+		}
+	}
+}
+
+// TestHandler_NoDeadline_TerminalConflict proves a terminal prazo surfaces the use case's 409.
+func TestHandler_NoDeadline_TerminalConflict(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{noDeadlineErr: ErrDeadlineNotOpen}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	status, _ := do(t, app, http.MethodPost, "/v1/prazos/d-7/no-deadline", "jwt")
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", status)
+	}
+}
+
+// TestHandler_Reopen_ForwardsFromPrincipal proves POST /v1/prazos/:id/reopen forwards tenant/id
+// and renders the PENDING transition.
+func TestHandler_Reopen_ForwardsFromPrincipal(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{reopenRes: MarkedDeadline{ID: "d-7", Status: StatusPending}}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	status, resBody := do(t, app, http.MethodPost, "/v1/prazos/d-7/reopen", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
+	}
+	if wr.reopenCalls != 1 || wr.gotReopenTenant != "tenant-9" || wr.gotReopenID != "d-7" {
+		t.Errorf("reopen calls/tenant/id = %d/%q/%q", wr.reopenCalls, wr.gotReopenTenant, wr.gotReopenID)
+	}
+	for _, want := range []string{`"deadline_id":"d-7"`, `"status":"PENDING"`} {
+		if !strings.Contains(resBody, want) {
+			t.Errorf("body missing %s\ngot: %s", want, resBody)
+		}
+	}
+}
+
+// TestHandler_Reopen_NonNoDeadlineConflict proves a non-NO_DEADLINE reopen surfaces the 409.
+func TestHandler_Reopen_NonNoDeadlineConflict(t *testing.T) {
+	t.Parallel()
+
+	wr := &recordingWriter{reopenErr: ErrDeadlineNotReopenable}
+	app := newAppWithWriter(&recordingReader{}, wr, "tenant-9")
+
+	status, _ := do(t, app, http.MethodPost, "/v1/prazos/d-7/reopen", "jwt")
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", status)
+	}
+}
+
+// TestHandler_GetPrazo_RendersAuditFields proves GET /v1/prazos/:id renders the new panel/audit
+// fields (anchor_event, legal_citation, manual_extra_days, confirmed_by_id/name, confirmed_at).
+func TestHandler_GetPrazo_RendersAuditFields(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2024, 1, 17, 9, 30, 0, 0, time.UTC)
+	rd := &recordingReader{detailView: PrazoDetailView{
+		ID:              "d-1",
+		AnchorEvent:     "PUBLISHED",
+		LegalCitation:   "art. 335, CPC",
+		ManualExtraDays: 3,
+		ConfirmedByID:   "u-42",
+		ConfirmedByName: "Dra. Ana",
+		ConfirmedAt:     &at,
+	}}
+	app := newApp(rd, "tenant-9")
+
+	status, resBody := do(t, app, http.MethodGet, "/v1/prazos/d-1", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resBody)
+	}
+	for _, want := range []string{
+		`"anchor_event":"PUBLISHED"`,
+		`"legal_citation":"art. 335, CPC"`,
+		`"manual_extra_days":3`,
+		`"confirmed_by_id":"u-42"`,
+		`"confirmed_by_name":"Dra. Ana"`,
+	} {
+		if !strings.Contains(resBody, want) {
+			t.Errorf("body missing %s\ngot: %s", want, resBody)
+		}
+	}
+	// low_confidence is DEFERRED — omitempty keeps it off the wire (always false).
+	if strings.Contains(resBody, "low_confidence") {
+		t.Errorf("low_confidence should be omitted (deferred): %s", resBody)
 	}
 }

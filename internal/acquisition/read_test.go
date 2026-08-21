@@ -3,9 +3,22 @@ package acquisition
 import (
 	"context"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // --- use-case unit tests (recording readRepo) -------------------------------
+
+// pgDate builds a pgtype.Date for test assertions (year/month/day in UTC).
+func pgDate(year int, month time.Month, day int) pgtype.Date {
+	return pgtype.Date{Time: time.Date(year, month, day, 0, 0, 0, 0, time.UTC), Valid: true}
+}
+
+// pgDateInvalid returns an invalid pgtype.Date, simulating a LEFT JOIN miss.
+func pgDateInvalid() pgtype.Date {
+	return pgtype.Date{}
+}
 
 // recordingReadRepo implements readRepo, capturing the queries the ReadUseCase
 // forwards and returning canned rows/totals. Only the processos/intimacoes paths
@@ -38,6 +51,19 @@ type recordingReadRepo struct {
 	// Summary reads — canned views the ReadUseCase forwards verbatim.
 	procSummary ProcessosSummaryView
 	intiSummary IntimacoesSummaryView
+	// Captures reads — canned rows/summary/detail + the derivation counts, and the
+	// captured (tenant, id) forwarded to the repo.
+	captureRows      []CaptureRunRow
+	captureSummary   CaptureSummaryRow
+	captureOne       CaptureRunRow
+	captureOneErr    error
+	deadlinesBetween int
+	tasksBetween     int
+	deadlinesToday   int
+	oabCount         int
+	gotCapturesTID   string
+	gotCaptureTID    string
+	gotCaptureID     string
 }
 
 func (r *recordingReadRepo) ListProcessos(_ context.Context, q ProcessosQuery) ([]ProcessoView, error) {
@@ -64,6 +90,9 @@ func (r *recordingReadRepo) GetIntimacao(context.Context, string, string) (Intim
 }
 func (r *recordingReadRepo) CountIntimacoes(context.Context, IntimacoesQuery) (int64, int64, error) {
 	return 0, 0, nil
+}
+func (r *recordingReadRepo) BucketIntimacoes(context.Context, IntimacoesQuery) (IntimacaoBucketsView, error) {
+	return IntimacaoBucketsView{}, nil
 }
 func (r *recordingReadRepo) ListProcessoCourts(context.Context, string) ([]string, error) {
 	return r.procCourts, nil
@@ -124,6 +153,39 @@ func (r *recordingReadRepo) ListIntimacoesBySyncRun(context.Context, string, str
 }
 func (r *recordingReadRepo) GetResumoContext(context.Context, string, string) (ProcessoResumoCtx, error) {
 	return ProcessoResumoCtx{}, nil
+}
+
+func (r *recordingReadRepo) GetIntimacaoAnaliseContext(context.Context, string, string) (IntimacaoAnaliseCtx, error) {
+	return IntimacaoAnaliseCtx{}, nil
+}
+
+// Captures reads — canned values the Captures/CaptureDetail use case folds together.
+// Count* return per-field canned counts; the capture rows/summary/detail are canned.
+func (r *recordingReadRepo) ListCaptureRuns(_ context.Context, tenantID string, _ int) ([]CaptureRunRow, error) {
+	r.gotCapturesTID = tenantID
+	return r.captureRows, nil
+}
+func (r *recordingReadRepo) GetCaptureRun(_ context.Context, tenantID, id string) (CaptureRunRow, error) {
+	r.gotCaptureTID, r.gotCaptureID = tenantID, id
+	return r.captureOne, r.captureOneErr
+}
+func (r *recordingReadRepo) GetCaptureSummary(context.Context, string) (CaptureSummaryRow, error) {
+	return r.captureSummary, nil
+}
+func (r *recordingReadRepo) CountDeadlinesCreatedBetween(context.Context, string, time.Time, time.Time) (int, error) {
+	return r.deadlinesBetween, nil
+}
+func (r *recordingReadRepo) CountTasksCreatedBetween(context.Context, string, time.Time, time.Time) (int, error) {
+	return r.tasksBetween, nil
+}
+func (r *recordingReadRepo) CountDeadlinesCreatedToday(context.Context, string) (int, error) {
+	return r.deadlinesToday, nil
+}
+func (r *recordingReadRepo) CountWatchedOABsForDJEN(context.Context, string) (int, error) {
+	return r.oabCount, nil
+}
+func (r *recordingReadRepo) ListWatchedOABsWithName(context.Context, string) ([]WatchedOABView, error) {
+	return nil, nil
 }
 
 // The use case forwards ?search to the repo and over-fetches one row (limit+1) to
@@ -270,6 +332,139 @@ func TestReadUseCase_Processo_ForwardsAndReturnsView(t *testing.T) {
 	}
 	if view.ClaimValue == nil || *view.ClaimValue != "150000.00" {
 		t.Errorf("claim_value = %v, want 150000.00", view.ClaimValue)
+	}
+}
+
+// --- next_deadline (Entrega 1) -------------------------------------------------
+
+// Processo (the deep-link) propagates the NextDeadline block verbatim from the repo
+// when the process has an OPEN/PENDING prazo — the use case is a thin delegation with
+// no transformation of the next_deadline field.
+func TestReadUseCase_Processo_NextDeadline_Present(t *testing.T) {
+	t.Parallel()
+
+	endDate := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	repo := &recordingReadRepo{procOneRes: ProcessoView{
+		ID:           "cr-99",
+		NextDeadline: &NextDeadlineView{EndDate: endDate, DaysLeft: 12, Kind: "CONTESTACAO"},
+	}}
+	uc := NewReadUseCase(repo)
+
+	view, err := uc.Processo(context.Background(), "t-1", "cr-99")
+	if err != nil {
+		t.Fatalf("Processo: %v", err)
+	}
+	if view.NextDeadline == nil {
+		t.Fatal("NextDeadline should be non-nil when process has an open prazo")
+	}
+	if view.NextDeadline.Kind != "CONTESTACAO" {
+		t.Errorf("Kind = %q, want CONTESTACAO", view.NextDeadline.Kind)
+	}
+	if view.NextDeadline.DaysLeft != 12 {
+		t.Errorf("DaysLeft = %d, want 12", view.NextDeadline.DaysLeft)
+	}
+	if !view.NextDeadline.EndDate.Equal(endDate) {
+		t.Errorf("EndDate = %v, want %v", view.NextDeadline.EndDate, endDate)
+	}
+}
+
+// Processo propagates NextDeadline as nil when the process has no open/pending prazo.
+func TestReadUseCase_Processo_NextDeadline_Nil(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{procOneRes: ProcessoView{ID: "cr-1", NextDeadline: nil}}
+	uc := NewReadUseCase(repo)
+
+	view, err := uc.Processo(context.Background(), "t-1", "cr-1")
+	if err != nil {
+		t.Fatalf("Processo: %v", err)
+	}
+	if view.NextDeadline != nil {
+		t.Errorf("NextDeadline should be nil when no prazo exists, got %+v", view.NextDeadline)
+	}
+}
+
+// Processos (the list) includes the NextDeadline block from each row as returned by
+// the repo — the use case applies the over-fetch/trim policy without touching the field.
+func TestReadUseCase_Processos_NextDeadline_CarriedThrough(t *testing.T) {
+	t.Parallel()
+
+	endDate := time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC)
+	repo := &recordingReadRepo{
+		procRows: []ProcessoView{
+			{ID: "cr-1", NextDeadline: &NextDeadlineView{EndDate: endDate, DaysLeft: 3, Kind: "RECURSO"}},
+			{ID: "cr-2", NextDeadline: nil},
+		},
+	}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Processos(context.Background(), ProcessosQuery{TenantID: "t-1", Limit: 10})
+	if err != nil {
+		t.Fatalf("Processos: %v", err)
+	}
+	if len(res.Items) != 2 {
+		t.Fatalf("len(Items) = %d, want 2", len(res.Items))
+	}
+	if res.Items[0].NextDeadline == nil {
+		t.Fatal("Items[0].NextDeadline should be non-nil")
+	}
+	if res.Items[0].NextDeadline.Kind != "RECURSO" {
+		t.Errorf("Items[0].NextDeadline.Kind = %q, want RECURSO", res.Items[0].NextDeadline.Kind)
+	}
+	if res.Items[0].NextDeadline.DaysLeft != 3 {
+		t.Errorf("Items[0].NextDeadline.DaysLeft = %d, want 3", res.Items[0].NextDeadline.DaysLeft)
+	}
+	if res.Items[1].NextDeadline != nil {
+		t.Errorf("Items[1].NextDeadline should be nil (no prazo), got %+v", res.Items[1].NextDeadline)
+	}
+}
+
+// mapNextDeadline — unit tests for the repository helper (white-box: lives in the
+// same package). The CASE WHEN expression sqlc emits returns interface{} from pgx;
+// these tests prove the int64/int32 type-switch handles both scan targets.
+func TestMapNextDeadline_WithPrazo(t *testing.T) {
+	t.Parallel()
+
+	endDate := pgDate(2026, 9, 15)
+	kind := "DEFESA"
+	v := mapNextDeadline(endDate, int64(7), &kind)
+
+	if v == nil {
+		t.Fatal("expected non-nil NextDeadlineView")
+	}
+	if v.DaysLeft != 7 {
+		t.Errorf("DaysLeft = %d, want 7", v.DaysLeft)
+	}
+	if v.Kind != "DEFESA" {
+		t.Errorf("Kind = %q, want DEFESA", v.Kind)
+	}
+	want := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+	if !v.EndDate.Equal(want) {
+		t.Errorf("EndDate = %v, want %v", v.EndDate, want)
+	}
+}
+
+func TestMapNextDeadline_NilWhenNoRow(t *testing.T) {
+	t.Parallel()
+
+	// An invalid pgtype.Date means the LEFT JOIN LATERAL returned no row.
+	v := mapNextDeadline(pgDateInvalid(), nil, nil)
+	if v != nil {
+		t.Errorf("mapNextDeadline with invalid date should return nil, got %+v", v)
+	}
+}
+
+func TestMapNextDeadline_Int32DaysLeft(t *testing.T) {
+	t.Parallel()
+
+	endDate := pgDate(2026, 10, 1)
+	kind := "RECURSO"
+	v := mapNextDeadline(endDate, int32(14), &kind)
+	if v == nil {
+		t.Fatal("expected non-nil NextDeadlineView")
+	}
+	if v.DaysLeft != 14 {
+		t.Errorf("DaysLeft = %d, want 14 (int32 branch)", v.DaysLeft)
 	}
 }
 
@@ -504,12 +699,65 @@ func TestReadUseCase_ProcessosSummary_PassesThrough(t *testing.T) {
 	}
 }
 
-// IntimacoesSummary passes the repo's triagem-bucketed counts through verbatim.
+// WatchedOABs passes the repo rows through to the caller. A nil Name (no counsel
+// yet) must be preserved as nil in the result; a non-empty name passes through.
+func TestReadUseCase_WatchedOABs_PassesThrough(t *testing.T) {
+	t.Parallel()
+
+	nameStr := "LUAN GOMES"
+	rows := []WatchedOABView{
+		{OAB: "SP347019", Name: &nameStr},
+		{OAB: "SP100001", Name: nil},
+	}
+	called := false
+	uc := NewReadUseCase(&watchedOABsRecordingRepo{
+		recordingReadRepo: &recordingReadRepo{},
+		oabRows:           rows,
+		onCall:            func() { called = true },
+	})
+
+	got, err := uc.WatchedOABs(context.Background(), "tenant-oabs")
+	if err != nil {
+		t.Fatalf("WatchedOABs: %v", err)
+	}
+	if !called {
+		t.Error("repo.ListWatchedOABsWithName was not called")
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+	if got[0].OAB != "SP347019" || got[0].Name == nil || *got[0].Name != "LUAN GOMES" {
+		t.Errorf("got[0] = %+v, want {OAB:SP347019 Name:&LUAN GOMES}", got[0])
+	}
+	if got[1].OAB != "SP100001" || got[1].Name != nil {
+		t.Errorf("got[1] = %+v, want {OAB:SP100001 Name:nil}", got[1])
+	}
+}
+
+// watchedOABsRecordingRepo embeds recordingReadRepo and overrides only
+// ListWatchedOABsWithName so the WatchedOABs use-case test can verify the repo
+// was called and the result passes through unchanged.
+type watchedOABsRecordingRepo struct {
+	*recordingReadRepo
+	oabRows []WatchedOABView
+	onCall  func()
+}
+
+func (r *watchedOABsRecordingRepo) ListWatchedOABsWithName(_ context.Context, _ string) ([]WatchedOABView, error) {
+	if r.onCall != nil {
+		r.onCall()
+	}
+	return r.oabRows, nil
+}
+
+// IntimacoesSummary passes the repo's triagem-bucketed counts through verbatim,
+// including the new urgência KPIs (em_atraso, vencem_hoje, nao_confirmado).
 func TestReadUseCase_IntimacoesSummary_PassesThrough(t *testing.T) {
 	t.Parallel()
 
 	repo := &recordingReadRepo{intiSummary: IntimacoesSummaryView{
 		Total: 20, Pendentes: 12, EmAnalise: 0, Resolvidas: 6, Ignoradas: 2, Criticas: 0,
+		EmAtraso: 3, VencemHoje: 1, NaoConfirmado: 5,
 	}}
 	uc := NewReadUseCase(repo)
 
@@ -517,7 +765,255 @@ func TestReadUseCase_IntimacoesSummary_PassesThrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IntimacoesSummary: %v", err)
 	}
-	if got != (IntimacoesSummaryView{Total: 20, Pendentes: 12, Resolvidas: 6, Ignoradas: 2}) {
-		t.Errorf("summary = %+v, want the repo's counts verbatim", got)
+	want := IntimacoesSummaryView{
+		Total: 20, Pendentes: 12, Resolvidas: 6, Ignoradas: 2,
+		EmAtraso: 3, VencemHoje: 1, NaoConfirmado: 5,
+	}
+	if got != want {
+		t.Errorf("summary = %+v, want %+v", got, want)
+	}
+}
+
+// IntimacoesSummary passes the urgência KPIs as zeroes when there are no prazos —
+// the summary is still valid (the counts are just 0).
+func TestReadUseCase_IntimacoesSummary_ZeroUrgenciaWhenNoDeadlines(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{intiSummary: IntimacoesSummaryView{
+		Total: 5, Pendentes: 5,
+	}}
+	uc := NewReadUseCase(repo)
+
+	got, err := uc.IntimacoesSummary(context.Background(), "tenant-10")
+	if err != nil {
+		t.Fatalf("IntimacoesSummary: %v", err)
+	}
+	if got.EmAtraso != 0 || got.VencemHoje != 0 || got.NaoConfirmado != 0 {
+		t.Errorf("urgência KPIs should be 0 when no deadlines: em_atraso=%d vencem_hoje=%d nao_confirmado=%d",
+			got.EmAtraso, got.VencemHoje, got.NaoConfirmado)
+	}
+}
+
+// Intimacoes use case forwards Urgencia to the repo query when set.
+func TestReadUseCase_Intimacoes_ForwardsUrgencia(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		urgencia string
+	}{
+		{name: "atraso", urgencia: UrgenciaAtraso},
+		{name: "hoje", urgencia: UrgenciaHoje},
+		{name: "semana", urgencia: UrgenciaSemana},
+		{name: "mais_adiante", urgencia: UrgenciaMaisAdiante},
+		{name: "nao_confirmado", urgencia: UrgenciaNaoConfirmado},
+		{name: "empty passes through", urgencia: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var got IntimacoesQuery
+			repo := &recordingIntimacoesRepo{onList: func(q IntimacoesQuery) { got = q }}
+			uc := NewReadUseCase(repo)
+
+			_, err := uc.Intimacoes(context.Background(), IntimacoesQuery{
+				TenantID: "t-1", LastMadeAvailable: "9999-12-31", LastID: maxUUID, Limit: 10,
+				Urgencia: tt.urgencia,
+			})
+			if err != nil {
+				t.Fatalf("Intimacoes: %v", err)
+			}
+			if got.Urgencia != tt.urgencia {
+				t.Errorf("forwarded urgencia = %q, want %q", got.Urgencia, tt.urgencia)
+			}
+		})
+	}
+}
+
+// recordingIntimacoesRepo extends recordingReadRepo and captures the forwarded
+// IntimacoesQuery so Urgencia-forwarding tests can inspect it.
+type recordingIntimacoesRepo struct {
+	*recordingReadRepo
+	onList func(IntimacoesQuery)
+}
+
+func newRecordingIntimacoesRepo(onList func(IntimacoesQuery)) *recordingIntimacoesRepo {
+	return &recordingIntimacoesRepo{
+		recordingReadRepo: &recordingReadRepo{},
+		onList:            onList,
+	}
+}
+
+func (r *recordingIntimacoesRepo) ListIntimacoes(_ context.Context, q IntimacoesQuery) ([]IntimacaoView, error) {
+	if r.onList != nil {
+		r.onList(q)
+	}
+	return nil, nil
+}
+
+func (r *recordingIntimacoesRepo) CountIntimacoes(context.Context, IntimacoesQuery) (int64, int64, error) {
+	return 0, 0, nil
+}
+
+func (r *recordingIntimacoesRepo) ListIntimacaoCourts(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+// IntimacaoView carries a nil Prazo when the intimation has no derived deadline.
+func TestIntimacaoView_NilPrazoWhenNoDeadline(t *testing.T) {
+	t.Parallel()
+
+	view := IntimacaoView{ID: "abc", Prazo: nil}
+	if view.Prazo != nil {
+		t.Errorf("Prazo should be nil when no deadline derived, got %+v", view.Prazo)
+	}
+}
+
+// IntimacaoView carries a populated Prazo when a deadline exists.
+func TestIntimacaoView_PrazoPresent(t *testing.T) {
+	t.Parallel()
+
+	deadlineID := "018f0000-0000-7000-8000-000000000001"
+	endDate := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	view := IntimacaoView{
+		ID: "abc",
+		Prazo: &IntimacaoPrazoView{
+			DeadlineID: deadlineID,
+			EndDate:    endDate,
+			DaysLeft:   5,
+			Status:     "OPEN",
+			Confirmed:  false,
+		},
+	}
+	if view.Prazo == nil {
+		t.Fatal("Prazo should be non-nil when deadline exists")
+	}
+	if view.Prazo.DeadlineID != deadlineID {
+		t.Errorf("DeadlineID = %q, want %q", view.Prazo.DeadlineID, deadlineID)
+	}
+	if view.Prazo.DaysLeft != 5 {
+		t.Errorf("DaysLeft = %d, want 5", view.Prazo.DaysLeft)
+	}
+	if view.Prazo.Status != "OPEN" {
+		t.Errorf("Status = %q, want OPEN", view.Prazo.Status)
+	}
+}
+
+// --- bucket counts (Entrega 3) -----------------------------------------------
+
+// bucketsRecordingRepo extends recordingIntimacoesRepo and captures the BucketIntimacoes
+// call so bucket-forwarding tests can verify the query and the returned counts.
+type bucketsRecordingRepo struct {
+	*recordingIntimacoesRepo
+	buckets     IntimacaoBucketsView
+	bucketQuery IntimacoesQuery
+}
+
+func newBucketsRepo(buckets IntimacaoBucketsView) *bucketsRecordingRepo {
+	return &bucketsRecordingRepo{
+		recordingIntimacoesRepo: newRecordingIntimacoesRepo(nil),
+		buckets:                 buckets,
+	}
+}
+
+func (r *bucketsRecordingRepo) BucketIntimacoes(_ context.Context, q IntimacoesQuery) (IntimacaoBucketsView, error) {
+	r.bucketQuery = q
+	return r.buckets, nil
+}
+
+// Intimacoes use case forwards the non-urgência filters to BucketIntimacoes
+// and carries the returned counts in IntimacoesResult.Buckets.
+func TestReadUseCase_Intimacoes_BucketCountsForwarded(t *testing.T) {
+	t.Parallel()
+
+	want := IntimacaoBucketsView{
+		Atraso:           3,
+		Hoje:             1,
+		ProximosDoisDias: 2,
+		EstaSemana:       5,
+		SemProvidencia:   7,
+		MaisAdiante:      12,
+		NaoConfirmado:    4,
+	}
+	repo := newBucketsRepo(want)
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Intimacoes(context.Background(), IntimacoesQuery{
+		TenantID:          "t-1",
+		LastMadeAvailable: "9999-12-31",
+		LastID:            maxUUID,
+		Limit:             10,
+		Type:              IntimationTypeIntimacao,
+		UserStatus:        IntimationUserStatusPending,
+		Court:             "TJSP",
+		Search:            "cnj",
+		Urgencia:          UrgenciaAtraso, // urgência filter must NOT be forwarded to buckets
+	})
+	if err != nil {
+		t.Fatalf("Intimacoes: %v", err)
+	}
+	if res.Buckets != want {
+		t.Errorf("Buckets = %+v, want %+v", res.Buckets, want)
+	}
+	// Non-urgência filters must be forwarded; urgência must NOT be forwarded to bucket query.
+	if repo.bucketQuery.Type != IntimationTypeIntimacao {
+		t.Errorf("bucket query Type = %q, want %q", repo.bucketQuery.Type, IntimationTypeIntimacao)
+	}
+	if repo.bucketQuery.UserStatus != IntimationUserStatusPending {
+		t.Errorf("bucket query UserStatus = %q, want %q", repo.bucketQuery.UserStatus, IntimationUserStatusPending)
+	}
+	if repo.bucketQuery.Court != "TJSP" {
+		t.Errorf("bucket query Court = %q, want %q", repo.bucketQuery.Court, "TJSP")
+	}
+	if repo.bucketQuery.Search != "cnj" {
+		t.Errorf("bucket query Search = %q, want %q", repo.bucketQuery.Search, "cnj")
+	}
+}
+
+// Intimacoes result carries zero buckets when no intimations have active deadlines.
+func TestReadUseCase_Intimacoes_BucketCountsZeroWhenNoDeadlines(t *testing.T) {
+	t.Parallel()
+
+	repo := newBucketsRepo(IntimacaoBucketsView{})
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Intimacoes(context.Background(), IntimacoesQuery{
+		TenantID: "t-1", LastMadeAvailable: "9999-12-31", LastID: maxUUID, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("Intimacoes: %v", err)
+	}
+	zero := IntimacaoBucketsView{}
+	if res.Buckets != zero {
+		t.Errorf("Buckets should be zero when no deadlines, got %+v", res.Buckets)
+	}
+}
+
+// The urgência filter options include proximos_dois_dias and sem_providencia (the
+// new buckets) alongside the existing ones — proved via the assembled Filters block.
+func TestReadUseCase_Intimacoes_UrgenciaFilterIncludesMaisAdiante(t *testing.T) {
+	t.Parallel()
+
+	repo := newBucketsRepo(IntimacaoBucketsView{})
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.Intimacoes(context.Background(), IntimacoesQuery{
+		TenantID: "t-1", LastMadeAvailable: "9999-12-31", LastID: maxUUID, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("Intimacoes: %v", err)
+	}
+	opts := res.Filters["urgencia"]
+	want := []string{
+		UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana,
+		UrgenciaMaisAdiante, UrgenciaNaoConfirmado, UrgenciaSemProvidencia,
+	}
+	if len(opts) != len(want) {
+		t.Fatalf("urgencia filter options = %d, want %d: %+v", len(opts), len(want), opts)
+	}
+	for i, w := range want {
+		if opts[i].Value != w {
+			t.Errorf("urgencia filter[%d].value = %q, want %q", i, opts[i].Value, w)
+		}
 	}
 }

@@ -38,6 +38,14 @@ type Deadline struct {
 	Status          Status
 	Source          Source
 	RulesVersion    string
+	// AnchorEvent is which observed intimação date the start_date was anchored on. The creation
+	// path is born on the derived deadline_start_at (AnchorDeadlineStart); the confirmation panel
+	// may re-anchor it later.
+	AnchorEvent AnchorEvent
+	// LegalCitation is the frozen citation snapshot (e.g. "art. 218, §1º, CPC") copied from the
+	// resolved deadline_rule at derivation — distinct from DoubledReason. "" when the rule has no
+	// citation (the catch-all / generic rules).
+	LegalCitation string
 }
 
 // Counting is how the days are counted. Cível/CPC counts in dias úteis (art. 219);
@@ -61,7 +69,61 @@ const (
 	StatusMet       Status = "MET"
 	StatusMissed    Status = "MISSED"
 	StatusCancelled Status = "CANCELLED"
+	// StatusNoDeadline is "mera ciência": the lawyer declared the intimação carries no prazo
+	// to cumprir. It is DISTINCT from CANCELLED (revocation by a retificação event): a human
+	// PENDING|OPEN → NO_DEADLINE decision, reversible via reopen (→ PENDING). A NO_DEADLINE
+	// prazo sits OUTSIDE the MarkMissed (status='OPEN') and reconcile (MISSED,OPEN) guards, so
+	// it never auto-flips to MISSED nor gets resurrected.
+	StatusNoDeadline Status = "NO_DEADLINE"
 )
+
+// AnchorEvent is which observed date of the intimação anchors the prazo's start_date (a closed
+// set the DB CHECK also enforces). DEADLINE_START is the legacy default (the derived
+// deadline_start_at); MADE_AVAILABLE / PUBLISHED re-anchor on the intimação's real dates. The
+// confirmation panel lets the lawyer re-count from a different termo inicial.
+type AnchorEvent string
+
+const (
+	AnchorMadeAvailable AnchorEvent = "MADE_AVAILABLE"
+	AnchorPublished     AnchorEvent = "PUBLISHED"
+	AnchorDeadlineStart AnchorEvent = "DEADLINE_START"
+)
+
+// validAnchorEvent reports whether a is a member of the closed anchor set (the same set the DB
+// CHECK enforces). The empty string is NOT accepted here — the edge defaults an absent
+// anchor_event to DEADLINE_START before it reaches the domain.
+func validAnchorEvent(a AnchorEvent) bool {
+	switch a {
+	case AnchorMadeAvailable, AnchorPublished, AnchorDeadlineStart:
+		return true
+	}
+	return false
+}
+
+// IntimationAnchors are the three observed dates of an intimação the confirmation panel can
+// re-anchor a prazo on (GetIntimationAnchors). All three are NOT NULL date columns on the
+// intimation row, so a present intimação always yields three real dates; the use case maps the
+// chosen AnchorEvent to one of them for the recompute. A missing intimação for the tenant is
+// ErrDeadlineNotFound (the prazo it anchors could not be found), never a zero value.
+type IntimationAnchors struct {
+	MadeAvailableAt time.Time
+	PublishedAt     time.Time
+	DeadlineStartAt time.Time
+}
+
+// startFor maps an AnchorEvent to the matching observed date. DEADLINE_START (the default and
+// any unrecognized value, defensively) yields the derived deadline_start_at — the legacy anchor
+// the prazo was born on.
+func (a IntimationAnchors) startFor(anchor AnchorEvent) time.Time {
+	switch anchor {
+	case AnchorMadeAvailable:
+		return a.MadeAvailableAt
+	case AnchorPublished:
+		return a.PublishedAt
+	default:
+		return a.DeadlineStartAt
+	}
+}
 
 // Source records where the {days, counting} came from. The creation path derives from
 // the conservative rules layer (RULE); the F2 confirmation creates its tasks MANUAL.
@@ -214,6 +276,9 @@ type DeadlineForConfirm struct {
 	ID            string
 	CourtRecordID string
 	StartDate     time.Time
+	// LegalCitation is the snapshot copied at derivation; the confirm carries it forward so a
+	// re-confirm never drops the fundamento the panel shows.
+	LegalCitation string
 }
 
 // DeadlineForAdjust is the FULL adjustable state the F2 ajuste manual loads BEFORE the
@@ -226,13 +291,19 @@ type DeadlineForConfirm struct {
 type DeadlineForAdjust struct {
 	ID            string
 	CourtRecordID string
-	StartDate     time.Time
-	Status        Status
-	Kind          string
-	Days          int
-	Counting      Counting
-	Doubled       bool
-	DoubledReason string
+	// IntimationID keys the anchor read (GetIntimationAnchors): when the ajuste re-anchors
+	// (anchor_event present), the recompute re-counts from the chosen intimação date, not the
+	// stored start_date.
+	IntimationID    string
+	StartDate       time.Time
+	Status          Status
+	Kind            string
+	Days            int
+	Counting        Counting
+	Doubled         bool
+	DoubledReason   string
+	AnchorEvent     AnchorEvent
+	ManualExtraDays int
 }
 
 // Kind constants — the legible prazo kinds the v0 rules layer emits (docs/erd-prazos.md
@@ -287,4 +358,7 @@ type DeadlineRule struct {
 	Days         int
 	Counting     Counting
 	Doubled      bool
+	// LegalCitation is the rule's legal fundamento (deadline_rule.legal_citation, migration 0049),
+	// snapshotted onto the derived prazo. "" when the rule has none (the '*' catch-all / generic).
+	LegalCitation string
 }

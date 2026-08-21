@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
@@ -30,6 +31,9 @@ type fakeEnrichRepo struct {
 	supersedeCall int
 
 	docketParams []DocketEntryParams
+
+	enrichRunCalls      int
+	enrichRunBackfillID string
 }
 
 func (r *fakeEnrichRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, _ string) error {
@@ -67,6 +71,12 @@ func (r *fakeEnrichRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, p
 		out = append(out, DocketEntry{ID: "de-" + p.Hash, CourtRecordID: p.CourtRecordID, Hash: p.Hash})
 	}
 	return out, nil
+}
+
+func (r *fakeEnrichRepo) IncrementImportEnrichmentRun(_ context.Context, _ database.Tx, _, backfillJobID string, _ time.Time) error {
+	r.enrichRunCalls++
+	r.enrichRunBackfillID = backfillJobID
+	return nil
 }
 
 func datajudFixtureBytes(t *testing.T) []byte {
@@ -137,38 +147,35 @@ func TestEnrichment_GraduatesInPlace(t *testing.T) {
 	if got := countByType(outbox.published)[TypeDocketEntryObserved]; got != len(repo.docketParams) {
 		t.Errorf("docket_entry_observed events = %d, want %d", got, len(repo.docketParams))
 	}
+	// A live enrichment (no BackfillJobID) has no import to attribute to → the import's
+	// ENRICHMENT capture row is NOT bumped (the batch job owns that counter now).
+	if repo.enrichRunCalls != 0 {
+		t.Errorf("IncrementImportEnrichmentRun calls = %d, want 0 (single path never bumps the counter)", repo.enrichRunCalls)
+	}
 }
 
-// TestEnrichment_BackfillSuppressesDocketEvents proves the outbox-flood fix: when the
-// observed record came from an onboarding backfill (BackfillJobID set), the enrichment
-// still GRADES the record and PERSISTS the movimentos as docket entries, but emits NO
-// docket_entry_observed — the per-andamento aviso is silenced during onboarding anyway,
-// so the events would only flood the relay and starve the backfill's own sync_completed.
-func TestEnrichment_BackfillSuppressesDocketEvents(t *testing.T) {
+// TestEnrichment_BackfillIsNoOp proves the anti-double guard: a record discovered by an
+// onboarding backfill (BackfillJobID set) is enriched by the BATCH job (one _search per
+// tribunal), so the per-record consumer early-returns — no fetch, no grade, no docket.
+// This is what prevents double-enrichment (the same process pulled twice).
+func TestEnrichment_BackfillIsNoOp(t *testing.T) {
 	t.Parallel()
 
 	repo := &fakeEnrichRepo{}
-	outbox := &fakeOutbox{}
-	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
-	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
+	conn := &stubConnector{id: "datajud", payload: RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}}
+	orch := NewOrchestrator()
+	orch.Register(SourceDATAJUD, conn)
+	uc := NewEnrichmentUseCase(repo, &fakeOutbox{}, &stubBackfillUoW{tx: stubTx{rows: 1}}, orch, NewDATAJUDParser())
 
 	ev := placeholderObserved()
-	ev.BackfillJobID = "backfill-1" // discovered by an onboarding backfill
+	ev.BackfillJobID = "backfill-9" // discovered by an onboarding backfill → batch owns it
 
-	if err := enrichmentUnderTest(repo, outbox, uow, payload).OnCourtRecordObserved(context.Background(), ev); err != nil {
+	if err := uc.OnCourtRecordObserved(context.Background(), ev); err != nil {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
-
-	// The record is still graded and the movimentos still land as docket entries…
-	if repo.updateCalls != 1 {
-		t.Errorf("grade update = %d calls; want 1 (grading happens regardless of backfill)", repo.updateCalls)
-	}
-	if len(repo.docketParams) == 0 {
-		t.Fatal("movimentos must still be persisted as docket entries during a backfill")
-	}
-	// …but NO docket_entry_observed is emitted for a backfill-originated record.
-	if got := countByType(outbox.published)[TypeDocketEntryObserved]; got != 0 {
-		t.Errorf("docket_entry_observed events = %d, want 0 (suppressed for backfill)", got)
+	if conn.fetchCalls != 0 || repo.updateCalls != 0 {
+		t.Errorf("backfill record must be a no-op in the per-record path: fetches=%d updateCalls=%d, want 0/0",
+			conn.fetchCalls, repo.updateCalls)
 	}
 }
 
@@ -299,7 +306,10 @@ func TestEnrichment_DuplicateIsNoOp(t *testing.T) {
 	uow := &stubBackfillUoW{tx: stubTx{rows: 0}} // 0 rows affected = already seen
 	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
 
-	if err := enrichmentUnderTest(repo, &fakeOutbox{}, uow, payload).OnCourtRecordObserved(context.Background(), placeholderObserved()); err != nil {
+	// A LIVE re-poll (no BackfillJobID) redelivered: the dedup guard makes it a no-op.
+	ev := placeholderObserved()
+
+	if err := enrichmentUnderTest(repo, &fakeOutbox{}, uow, payload).OnCourtRecordObserved(context.Background(), ev); err != nil {
 		t.Fatalf("OnCourtRecordObserved: %v", err)
 	}
 	if repo.updateCalls != 0 {

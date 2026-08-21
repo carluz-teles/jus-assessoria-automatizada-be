@@ -89,28 +89,31 @@ WHERE t.tenant_id = $1::uuid
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
   AND ($4::text = '' OR t.source = $4::text)
-  AND ($5::date IS NULL OR t.due_date >= $5::date)
-  AND ($6::date IS NULL OR t.due_date <= $6::date)
+  AND ($5::uuid IS NULL OR t.intimation_id = $5::uuid)
+  AND ($6::date IS NULL OR t.due_date >= $6::date)
+  AND ($7::date IS NULL OR t.due_date <= $7::date)
 `
 
 type CountTasksParams struct {
-	TenantID   uuid.UUID   `json:"tenant_id"`
-	Status     string      `json:"status"`
-	AssigneeID pgtype.UUID `json:"assignee_id"`
-	Source     string      `json:"source"`
-	FromDate   pgtype.Date `json:"from_date"`
-	ToDate     pgtype.Date `json:"to_date"`
+	TenantID     uuid.UUID   `json:"tenant_id"`
+	Status       string      `json:"status"`
+	AssigneeID   pgtype.UUID `json:"assignee_id"`
+	Source       string      `json:"source"`
+	IntimationID pgtype.UUID `json:"intimation_id"`
+	FromDate     pgtype.Date `json:"from_date"`
+	ToDate       pgtype.Date `json:"to_date"`
 }
 
 // The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
-// @status / @assignee_id / @source / window. Called only when a filter is present; the
-// unfiltered "Y" reuses CountTasksByTenant.
+// @status / @assignee_id / @source / @intimation_id / window. Called only when a filter
+// is present; the unfiltered "Y" reuses CountTasksByTenant.
 func (q *Queries) CountTasks(ctx context.Context, arg CountTasksParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countTasks,
 		arg.TenantID,
 		arg.Status,
 		arg.AssigneeID,
 		arg.Source,
+		arg.IntimationID,
 		arg.FromDate,
 		arg.ToDate,
 	)
@@ -157,8 +160,12 @@ SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
        (d.end_date - CURRENT_DATE)::int AS days_left,
        d.days, d.counting, d.doubled, d.doubled_reason, d.status, d.source,
        d.holidays_applied, d.notification_id, d.rules_version,
-       (d.confirmed_by IS NOT NULL) AS confirmed
+       (d.confirmed_by IS NOT NULL) AS confirmed,
+       d.anchor_event, d.legal_citation, d.manual_extra_days,
+       d.confirmed_by, d.confirmed_at,
+       au.name AS confirmed_by_name
 FROM deadline d
+LEFT JOIN app_user au ON au.id = d.confirmed_by
 WHERE d.id = $1::uuid AND d.tenant_id = $2::uuid
 `
 
@@ -168,22 +175,28 @@ type GetPrazoParams struct {
 }
 
 type GetPrazoRow struct {
-	ID              uuid.UUID   `json:"id"`
-	CourtRecordID   uuid.UUID   `json:"court_record_id"`
-	Kind            *string     `json:"kind"`
-	StartDate       pgtype.Date `json:"start_date"`
-	EndDate         pgtype.Date `json:"end_date"`
-	DaysLeft        int32       `json:"days_left"`
-	Days            int32       `json:"days"`
-	Counting        string      `json:"counting"`
-	Doubled         bool        `json:"doubled"`
-	DoubledReason   *string     `json:"doubled_reason"`
-	Status          string      `json:"status"`
-	Source          string      `json:"source"`
-	HolidaysApplied []byte      `json:"holidays_applied"`
-	NotificationID  uuid.UUID   `json:"notification_id"`
-	RulesVersion    string      `json:"rules_version"`
-	Confirmed       interface{} `json:"confirmed"`
+	ID              uuid.UUID          `json:"id"`
+	CourtRecordID   uuid.UUID          `json:"court_record_id"`
+	Kind            *string            `json:"kind"`
+	StartDate       pgtype.Date        `json:"start_date"`
+	EndDate         pgtype.Date        `json:"end_date"`
+	DaysLeft        int32              `json:"days_left"`
+	Days            int32              `json:"days"`
+	Counting        string             `json:"counting"`
+	Doubled         bool               `json:"doubled"`
+	DoubledReason   *string            `json:"doubled_reason"`
+	Status          string             `json:"status"`
+	Source          string             `json:"source"`
+	HolidaysApplied []byte             `json:"holidays_applied"`
+	NotificationID  uuid.UUID          `json:"notification_id"`
+	RulesVersion    string             `json:"rules_version"`
+	Confirmed       interface{}        `json:"confirmed"`
+	AnchorEvent     string             `json:"anchor_event"`
+	LegalCitation   *string            `json:"legal_citation"`
+	ManualExtraDays int32              `json:"manual_extra_days"`
+	ConfirmedBy     pgtype.UUID        `json:"confirmed_by"`
+	ConfirmedAt     pgtype.Timestamptz `json:"confirmed_at"`
+	ConfirmedByName *string            `json:"confirmed_by_name"`
 }
 
 // The audit/detail view of one prazo (GET /v1/prazos/:id): every field the "por quê"
@@ -211,6 +224,12 @@ func (q *Queries) GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow
 		&i.NotificationID,
 		&i.RulesVersion,
 		&i.Confirmed,
+		&i.AnchorEvent,
+		&i.LegalCitation,
+		&i.ManualExtraDays,
+		&i.ConfirmedBy,
+		&i.ConfirmedAt,
+		&i.ConfirmedByName,
 	)
 	return i, err
 }
@@ -926,23 +945,25 @@ WHERE t.tenant_id = $1::uuid
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
   AND ($4::text = '' OR t.source = $4::text)
-  AND ($5::date IS NULL OR t.due_date >= $5::date)
-  AND ($6::date IS NULL OR t.due_date <= $6::date)
-  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($7::date, $8::uuid)
+  AND ($5::uuid IS NULL OR t.intimation_id = $5::uuid)
+  AND ($6::date IS NULL OR t.due_date >= $6::date)
+  AND ($7::date IS NULL OR t.due_date <= $7::date)
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($8::date, $9::uuid)
 ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
-LIMIT $9
+LIMIT $10
 `
 
 type ListTasksParams struct {
-	TenantID   uuid.UUID   `json:"tenant_id"`
-	Status     string      `json:"status"`
-	AssigneeID pgtype.UUID `json:"assignee_id"`
-	Source     string      `json:"source"`
-	FromDate   pgtype.Date `json:"from_date"`
-	ToDate     pgtype.Date `json:"to_date"`
-	LastDue    pgtype.Date `json:"last_due"`
-	LastID     uuid.UUID   `json:"last_id"`
-	PageLimit  int32       `json:"page_limit"`
+	TenantID     uuid.UUID   `json:"tenant_id"`
+	Status       string      `json:"status"`
+	AssigneeID   pgtype.UUID `json:"assignee_id"`
+	Source       string      `json:"source"`
+	IntimationID pgtype.UUID `json:"intimation_id"`
+	FromDate     pgtype.Date `json:"from_date"`
+	ToDate       pgtype.Date `json:"to_date"`
+	LastDue      pgtype.Date `json:"last_due"`
+	LastID       uuid.UUID   `json:"last_id"`
+	PageLimit    int32       `json:"page_limit"`
 }
 
 type ListTasksRow struct {
@@ -964,17 +985,19 @@ type ListTasksRow struct {
 
 // The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 // first (undated last). Optional filters: @status (” = all), @assignee_id (NULL = all
-// assignees; = principal.UserID for "meus"), @source (” = all), and a due_date window
-// [@from_date, @to_date] (NULL = open bound). The window filters on the REAL due_date, so it
-// naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window query wants dated
-// items. Ascending (sort_due, id) keyset; the first page passes the min sentinel
-// ('0001-01-01', zero-uuid).
+// assignees; = principal.UserID for "meus"), @source (” = all), @intimation_id (NULL =
+// all; = a specific intimation uuid to list only tasks of that intimação) and a due_date
+// window [@from_date, @to_date] (NULL = open bound). The window filters on the REAL
+// due_date, so it naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window
+// query wants dated items. Ascending (sort_due, id) keyset; the first page passes the min
+// sentinel ('0001-01-01', zero-uuid).
 func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error) {
 	rows, err := q.db.Query(ctx, listTasks,
 		arg.TenantID,
 		arg.Status,
 		arg.AssigneeID,
 		arg.Source,
+		arg.IntimationID,
 		arg.FromDate,
 		arg.ToDate,
 		arg.LastDue,

@@ -34,6 +34,10 @@ type AdjustCommand struct {
 	// DoubledReason is a pointer so an explicit "" can clear the reason while an absent field
 	// keeps the stored one (the two must not collapse to the same write).
 	DoubledReason *string
+	// AnchorEvent / ManualExtraDays are pointers (merge-over-stored, like the rest): a nil field
+	// keeps the prazo's stored value, a present one re-anchors / re-counts the extra days.
+	AnchorEvent     *AnchorEvent
+	ManualExtraDays *int
 }
 
 // UpdateDeadlineAdjustParams is the repo port's input for the ajuste UPDATE — the patched
@@ -50,6 +54,11 @@ type UpdateDeadlineAdjustParams struct {
 	DoubledReason   string
 	EndDate         time.Time
 	HolidaysApplied []time.Time
+	// StartDate is re-persisted because re-anchoring changes the start; AnchorEvent /
+	// ManualExtraDays are the merged panel choices.
+	StartDate       time.Time
+	AnchorEvent     AnchorEvent
+	ManualExtraDays int
 }
 
 // AdjustedDeadline is the recomputed prazo the ajuste returns (and deadline.updated carries):
@@ -67,6 +76,8 @@ type AdjustedDeadline struct {
 	StartDate       time.Time
 	EndDate         time.Time
 	HolidaysApplied []time.Time
+	AnchorEvent     AnchorEvent
+	ManualExtraDays int
 }
 
 // MarkedDeadline is the outcome of a manual transition (met/missed): the prazo id and its new
@@ -133,6 +144,14 @@ func (uc *UseCase) Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadl
 		if cmd.DoubledReason != nil {
 			doubledReason = *cmd.DoubledReason
 		}
+		anchorEvent := cur.AnchorEvent
+		if cmd.AnchorEvent != nil {
+			anchorEvent = *cmd.AnchorEvent
+		}
+		manualExtraDays := cur.ManualExtraDays
+		if cmd.ManualExtraDays != nil {
+			manualExtraDays = *cmd.ManualExtraDays
+		}
 
 		court, err := uc.repo.GetCourtRecordCourt(ctx, tx, cmd.TenantID, cur.CourtRecordID)
 		if err != nil {
@@ -140,14 +159,21 @@ func (uc *UseCase) Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadl
 		}
 		uf := tribunal.UF(court)
 
-		endDate, holidays, err := uc.compute(ctx, counting, cur.StartDate, effectiveDays(days, doubled), uf, court)
+		// Re-anchor the start on the merged termo inicial (DEADLINE_START keeps the stored anchor),
+		// then recompute with the merged extra days through the SAME motor.
+		start, err := uc.resolveStart(ctx, tx, cur.IntimationID, cmd.TenantID, anchorEvent, cur.StartDate)
+		if err != nil {
+			return err
+		}
+
+		endDate, holidays, err := uc.computeWithExtra(ctx, counting, start, days, doubled, manualExtraDays, uf, court)
 		if err != nil {
 			return err
 		}
 		// Belt-and-suspenders on safety-critical data (mirrors confirm): the recompute always
 		// lands after the start (days > 0 is validated at the edge), but never persist an
 		// impossible prazo silently.
-		if !endDate.After(cur.StartDate) {
+		if !endDate.After(start) {
 			return apperr.NewInvalid("deadline end date must be after start date")
 		}
 
@@ -161,6 +187,9 @@ func (uc *UseCase) Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadl
 			DoubledReason:   doubledReason,
 			EndDate:         endDate,
 			HolidaysApplied: holidays,
+			StartDate:       start,
+			AnchorEvent:     anchorEvent,
+			ManualExtraDays: manualExtraDays,
 		})
 		if err != nil {
 			return err
@@ -175,9 +204,11 @@ func (uc *UseCase) Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadl
 			Doubled:         doubled,
 			DoubledReason:   doubledReason,
 			Status:          cur.Status, // unchanged by the ajuste
-			StartDate:       cur.StartDate,
+			StartDate:       start,
 			EndDate:         endDate,
 			HolidaysApplied: holidays,
+			AnchorEvent:     anchorEvent,
+			ManualExtraDays: manualExtraDays,
 		}
 		return uc.outbox.Publish(ctx, tx, newDeadlineUpdatedFromAdjust(result))
 	})

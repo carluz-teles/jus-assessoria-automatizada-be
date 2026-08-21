@@ -292,6 +292,12 @@ func (r *pgReadRepository) GetPrazo(ctx context.Context, tenantID, id string) (P
 		IntimationID:    row.NotificationID.String(),
 		RulesVersion:    row.RulesVersion,
 		Confirmed:       confirmedBool(row.Confirmed),
+		AnchorEvent:     row.AnchorEvent,
+		LegalCitation:   derefString(row.LegalCitation),
+		ManualExtraDays: int(row.ManualExtraDays),
+		ConfirmedByID:   uuidText(row.ConfirmedBy),
+		ConfirmedByName: derefString(row.ConfirmedByName),
+		ConfirmedAt:     timestampPtr(row.ConfirmedAt),
 	}, nil
 }
 
@@ -438,17 +444,22 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 	if err != nil {
 		return nil, err
 	}
+	intimationID, err := optionalFilterUUID(q.IntimationID)
+	if err != nil {
+		return nil, err
+	}
 
 	rows, err := r.q.ListTasks(ctx, deadlinedb.ListTasksParams{
-		TenantID:   tid,
-		Status:     q.Status,
-		AssigneeID: assignee,
-		Source:     q.Source,
-		FromDate:   from,
-		ToDate:     to,
-		LastDue:    lastDue,
-		LastID:     lastID,
-		PageLimit:  int32(q.Limit),
+		TenantID:     tid,
+		Status:       q.Status,
+		AssigneeID:   assignee,
+		Source:       q.Source,
+		IntimationID: intimationID,
+		FromDate:     from,
+		ToDate:       to,
+		LastDue:      lastDue,
+		LastID:       lastID,
+		PageLimit:    int32(q.Limit),
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -490,7 +501,7 @@ func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64,
 		return 0, 0, database.WrapInfra(err)
 	}
 
-	if q.Status == "" && q.Assignee == "" && q.Source == "" && q.From == "" && q.To == "" {
+	if !q.Filtered() {
 		return total, total, nil
 	}
 
@@ -506,13 +517,18 @@ func (r *pgReadRepository) CountTasks(ctx context.Context, q TasksQuery) (int64,
 	if err != nil {
 		return 0, 0, err
 	}
+	intimationID, err := optionalFilterUUID(q.IntimationID)
+	if err != nil {
+		return 0, 0, err
+	}
 	totalCount, err := r.q.CountTasks(ctx, deadlinedb.CountTasksParams{
-		TenantID:   tid,
-		Status:     q.Status,
-		AssigneeID: assignee,
-		Source:     q.Source,
-		FromDate:   from,
-		ToDate:     to,
+		TenantID:     tid,
+		Status:       q.Status,
+		AssigneeID:   assignee,
+		Source:       q.Source,
+		IntimationID: intimationID,
+		FromDate:     from,
+		ToDate:       to,
 	})
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)

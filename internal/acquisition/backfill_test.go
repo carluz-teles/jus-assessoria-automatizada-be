@@ -43,9 +43,10 @@ func TestCalculateSlices(t *testing.T) {
 	}
 }
 
-// AC2: a 365-day horizon in 7-day windows tiles into 53 consecutive slices with
-// no gap or overlap; the first starts at `from` and the last ends exactly at `to`.
-func TestBuildSyncWindows_YearInWeeks(t *testing.T) {
+// AC2: the 30-day lean-ingestion horizon in 7-day windows tiles into 5 consecutive
+// slices with no gap or overlap; the first starts at `from` and the last ends exactly
+// at `to` (30 = 4*7 + 2, so the last slice is the 2-day remainder).
+func TestBuildSyncWindows_HorizonInWeeks(t *testing.T) {
 	t.Parallel()
 
 	from := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -53,14 +54,15 @@ func TestBuildSyncWindows_YearInWeeks(t *testing.T) {
 
 	windows := buildSyncWindows(from, to, BackfillWindowDays)
 
-	if len(windows) != 53 {
-		t.Fatalf("len(windows) = %d, want 53", len(windows))
+	want := calculateSlices(BackfillHorizonDays, BackfillWindowDays)
+	if len(windows) != want {
+		t.Fatalf("len(windows) = %d, want %d", len(windows), want)
 	}
 	if !windows[0].From.Equal(from) {
 		t.Errorf("windows[0].From = %s, want %s", windows[0].From, from)
 	}
-	if !windows[52].To.Equal(to) {
-		t.Errorf("windows[52].To = %s, want %s", windows[52].To, to)
+	if !windows[len(windows)-1].To.Equal(to) {
+		t.Errorf("windows[last].To = %s, want %s", windows[len(windows)-1].To, to)
 	}
 	for i := 0; i < len(windows)-1; i++ {
 		if !windows[i].To.Equal(windows[i+1].From) {
@@ -238,7 +240,10 @@ func TestBackfillUseCase_CutoverMatchesHistory(t *testing.T) {
 	outbox := &fakeOutbox{}
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	history := &stubHistoryMatcher{}
-	uc := NewBackfillUseCase(repo, outbox, uow, WithHistoryMatcher(history, 90))
+	// historyDays mirrors the production cutover knob (onboardingHistoryDays), now 30 to
+	// match the lean 30-day backfill horizon. The value is irrelevant to this test's
+	// assertions but is kept in sync so the test reflects the actual policy.
+	uc := NewBackfillUseCase(repo, outbox, uow, WithHistoryMatcher(history, 30))
 
 	if err := uc.OnIntegrationActivated(context.Background(), activatedEvent()); err != nil {
 		t.Fatalf("OnIntegrationActivated() error = %v", err)
@@ -260,11 +265,14 @@ func TestBackfillUseCase_CutoverMatchesHistory(t *testing.T) {
 
 // --- use case tests ----------------------------------------------------------
 
-// First activation of an integration: one RUNNING job with 53 total slices and
-// 53 sync_requested events, all in a single unit of work scoped to the payload's
-// tenant.
+// First activation of an integration: one RUNNING job with the horizon's slice
+// count of total slices and the same number of sync_requested events, all in a
+// single unit of work scoped to the payload's tenant. With the lean 30/7 horizon
+// that is 5 slices (indices 0..4).
 func TestBackfillUseCase_FirstActivation(t *testing.T) {
 	t.Parallel()
+
+	wantSlices := calculateSlices(BackfillHorizonDays, BackfillWindowDays)
 
 	repo := &stubBackfillRepo{exists: false}
 	outbox := &fakeOutbox{}
@@ -288,23 +296,23 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 	if got := repo.watchedKeys; len(got) != 2 || got[0] != "347019|SP" || got[1] != "198988|MG" {
 		t.Fatalf("watched keys = %v, want [347019|SP 198988|MG]", got)
 	}
-	if repo.lastInsert.TotalSlices != 53 || repo.lastInsert.Status != BackfillStatusRunning {
-		t.Fatalf("job = {slices:%d status:%q}, want {53 RUNNING}", repo.lastInsert.TotalSlices, repo.lastInsert.Status)
+	if repo.lastInsert.TotalSlices != wantSlices || repo.lastInsert.Status != BackfillStatusRunning {
+		t.Fatalf("job = {slices:%d status:%q}, want {%d RUNNING}", repo.lastInsert.TotalSlices, repo.lastInsert.Status, wantSlices)
 	}
-	if outbox.calls != 53 {
-		t.Fatalf("published = %d, want 53", outbox.calls)
+	if outbox.calls != wantSlices {
+		t.Fatalf("published = %d, want %d", outbox.calls, wantSlices)
 	}
 
-	// Recent-first emission: slice_index stays chronological (0..52), but the NEWEST
+	// Recent-first emission: slice_index stays chronological (0..N-1), but the NEWEST
 	// window is published FIRST so its live-deadline intimações land in the first
-	// parallel batch. So published[0] carries the highest index (52) and published[52]
-	// the oldest (0); every slice carries the job id and dated bounds.
+	// parallel batch. So published[0] carries the highest index (N-1) and the last
+	// published carries 0; every slice carries the job id and dated bounds.
 	first, ok := outbox.published[0].(SyncRequested)
 	if !ok {
 		t.Fatalf("published[0] type = %T, want SyncRequested", outbox.published[0])
 	}
-	if first.SliceIndex != 52 || first.BackfillJobID != "job-1" || first.Type() != TypeSyncRequested {
-		t.Fatalf("first published slice = %+v, want newest (index 52) emitted first", first)
+	if first.SliceIndex != wantSlices-1 || first.BackfillJobID != "job-1" || first.Type() != TypeSyncRequested {
+		t.Fatalf("first published slice = %+v, want newest (index %d) emitted first", first, wantSlices-1)
 	}
 	if first.Source != SourceDJEN {
 		t.Fatalf("first slice source = %q, want %q (carried through from the activation)", first.Source, SourceDJEN)
@@ -312,7 +320,7 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 	if first.WindowFrom == "" || first.WindowTo == "" {
 		t.Fatalf("first slice has empty window bounds: %+v", first)
 	}
-	last := outbox.published[52].(SyncRequested)
+	last := outbox.published[wantSlices-1].(SyncRequested)
 	if last.SliceIndex != 0 {
 		t.Fatalf("last published slice index = %d, want 0 (oldest emitted last)", last.SliceIndex)
 	}
@@ -486,12 +494,15 @@ func TestBackfillUseCase_SyncCompleted_LastSliceCompletes(t *testing.T) {
 	if repo.finalizeCalls != 1 || repo.finalizeStatus != BackfillStatusCompleted {
 		t.Fatalf("finalize = {calls:%d status:%q}, want {1 COMPLETED}", repo.finalizeCalls, repo.finalizeStatus)
 	}
+	// Finalize now emits exactly ONE event: backfill_finished. The ENRICHMENT capture row's
+	// fecho is owned by the batch enrichment job (which closes it when its scan drains), so no
+	// scheduled close is emitted here anymore.
 	if outbox.calls != 1 {
-		t.Fatalf("published = %d, want 1 backfill_finished", outbox.calls)
+		t.Fatalf("published = %d, want 1 (backfill_finished only)", outbox.calls)
 	}
-	fin, ok := outbox.published[0].(BackfillFinished)
+	fin, ok := findPublished[BackfillFinished](outbox.published)
 	if !ok {
-		t.Fatalf("published[0] type = %T, want BackfillFinished", outbox.published[0])
+		t.Fatalf("no BackfillFinished published; got %v", outbox.published)
 	}
 	if fin.Status != BackfillStatusCompleted || fin.Type() != TypeBackfillFinished {
 		t.Fatalf("finished event = {status:%q type:%q}, want {COMPLETED %s}", fin.Status, fin.Type(), TypeBackfillFinished)
@@ -523,9 +534,12 @@ func TestBackfillUseCase_SyncFailed_LastSlicePartial(t *testing.T) {
 		t.Fatalf("finalize = {calls:%d status:%q}, want {1 PARTIAL}", repo.finalizeCalls, repo.finalizeStatus)
 	}
 	if outbox.calls != 1 {
-		t.Fatalf("published = %d, want 1 backfill_finished", outbox.calls)
+		t.Fatalf("published = %d, want 1 (backfill_finished only)", outbox.calls)
 	}
-	fin := outbox.published[0].(BackfillFinished)
+	fin, ok := findPublished[BackfillFinished](outbox.published)
+	if !ok {
+		t.Fatalf("no BackfillFinished published; got %v", outbox.published)
+	}
 	if fin.Status != BackfillStatusPartial || fin.SlicesError != 1 || fin.SlicesOK != 2 {
 		t.Fatalf("finished event = {status:%q ok:%d err:%d}, want {PARTIAL 2 1}", fin.Status, fin.SlicesOK, fin.SlicesError)
 	}

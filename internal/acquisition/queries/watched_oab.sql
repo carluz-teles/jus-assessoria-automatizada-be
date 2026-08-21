@@ -14,3 +14,22 @@ DELETE FROM watched_oab WHERE integration_id = $1;
 INSERT INTO watched_oab (tenant_id, integration_id, oab_key)
 VALUES ($1, $2, $3)
 ON CONFLICT (integration_id, oab_key) DO NOTHING;
+
+-- name: ListWatchedOABsWithName :many
+-- Termos monitorados com nome derivado: as OABs monitoradas pelo tenant via DJEN,
+-- cada uma com o nome mais frequente encontrado em party_counsel (mode() within group).
+-- oab_key é "NUMBER|UF"; devolvemos "UFNUMBER" (canônico do FE) via uf||split_part.
+-- O LEFT JOIN garante que OABs novas (sem captura ainda) retornam com name = NULL.
+-- Ordenado por oab_key para estabilidade (sem offset, lista pequena).
+SELECT
+    (split_part(w.oab_key, '|', 2) || split_part(w.oab_key, '|', 1))::text AS oab,
+    (mode() WITHIN GROUP (ORDER BY pc.name))::text AS name
+FROM watched_oab w
+JOIN integration i ON i.id = w.integration_id AND i.source = 'DJEN'
+LEFT JOIN party_counsel pc
+    ON pc.oab  = split_part(w.oab_key, '|', 1)
+   AND pc.uf   = split_part(w.oab_key, '|', 2)
+   AND pc.tenant_id = w.tenant_id
+WHERE w.tenant_id = $1
+GROUP BY w.oab_key
+ORDER BY w.oab_key;

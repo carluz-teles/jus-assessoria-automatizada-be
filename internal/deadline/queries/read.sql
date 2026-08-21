@@ -105,8 +105,12 @@ SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
        (d.end_date - CURRENT_DATE)::int AS days_left,
        d.days, d.counting, d.doubled, d.doubled_reason, d.status, d.source,
        d.holidays_applied, d.notification_id, d.rules_version,
-       (d.confirmed_by IS NOT NULL) AS confirmed
+       (d.confirmed_by IS NOT NULL) AS confirmed,
+       d.anchor_event, d.legal_citation, d.manual_extra_days,
+       d.confirmed_by, d.confirmed_at,
+       au.name AS confirmed_by_name
 FROM deadline d
+LEFT JOIN app_user au ON au.id = d.confirmed_by
 WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid;
 
 -- name: GetPrazoSuggestContext :one
@@ -177,11 +181,12 @@ WHERE t.court_record_id = @court_record_id::uuid
 -- name: ListTasks :many
 -- The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 -- first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
--- assignees; = principal.UserID for "meus"), @source ('' = all), and a due_date window
--- [@from_date, @to_date] (NULL = open bound). The window filters on the REAL due_date, so it
--- naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window query wants dated
--- items. Ascending (sort_due, id) keyset; the first page passes the min sentinel
--- ('0001-01-01', zero-uuid).
+-- assignees; = principal.UserID for "meus"), @source ('' = all), @intimation_id (NULL =
+-- all; = a specific intimation uuid to list only tasks of that intimação) and a due_date
+-- window [@from_date, @to_date] (NULL = open bound). The window filters on the REAL
+-- due_date, so it naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window
+-- query wants dated items. Ascending (sort_due, id) keyset; the first page passes the min
+-- sentinel ('0001-01-01', zero-uuid).
 SELECT t.id, t.title, t.description, t.kind, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
@@ -198,6 +203,7 @@ WHERE t.tenant_id = @tenant_id::uuid
   AND (@status::text = '' OR t.status = @status::text)
   AND (sqlc.narg('assignee_id')::uuid IS NULL OR t.assignee_user_id = sqlc.narg('assignee_id')::uuid)
   AND (@source::text = '' OR t.source = @source::text)
+  AND (sqlc.narg('intimation_id')::uuid IS NULL OR t.intimation_id = sqlc.narg('intimation_id')::uuid)
   AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
   AND (@to_date::date IS NULL OR t.due_date <= @to_date::date)
   AND (COALESCE(t.due_date, '9999-12-31'), t.id) > (@last_due::date, @last_id::uuid)
@@ -206,13 +212,14 @@ LIMIT @page_limit;
 
 -- name: CountTasks :one
 -- The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
--- @status / @assignee_id / @source / window. Called only when a filter is present; the
--- unfiltered "Y" reuses CountTasksByTenant.
+-- @status / @assignee_id / @source / @intimation_id / window. Called only when a filter
+-- is present; the unfiltered "Y" reuses CountTasksByTenant.
 SELECT count(*) FROM task t
 WHERE t.tenant_id = @tenant_id::uuid
   AND (@status::text = '' OR t.status = @status::text)
   AND (sqlc.narg('assignee_id')::uuid IS NULL OR t.assignee_user_id = sqlc.narg('assignee_id')::uuid)
   AND (@source::text = '' OR t.source = @source::text)
+  AND (sqlc.narg('intimation_id')::uuid IS NULL OR t.intimation_id = sqlc.narg('intimation_id')::uuid)
   AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
   AND (@to_date::date IS NULL OR t.due_date <= @to_date::date);
 

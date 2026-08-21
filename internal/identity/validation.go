@@ -47,8 +47,8 @@ type UpdateOrgProfileRequest struct {
 // email a well-formed address. The address is optional AS A WHOLE: when it arrives
 // entirely blank (the zero struct) Skip suppresses Address.Validate so a profile
 // can be saved with no address; the moment ANY address field is filled, its
-// required fields (cep/logradouro/cidade/uf) apply in full — a partial address is
-// still a 400. A failure here is a 400 at the edge (KindInvalid → 400).
+// required fields (cidade/uf) apply. A failure here is a 400 at the edge
+// (KindInvalid → 400).
 func (r UpdateOrgProfileRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.CNPJ, validation.Required, validation.By(validCNPJ)),
@@ -60,14 +60,14 @@ func (r UpdateOrgProfileRequest) Validate() error {
 	)
 }
 
-// Validate enforces the address rules: cep, logradouro, cidade and uf are required
-// (numero/complemento/bairro are optional in v0). Declaring Validate on Address
-// lets ozzo validate it automatically when it is a request field — and it only
-// runs on the write path, never on reads.
+// Validate enforces the address rules: only cidade and uf are required — the
+// escritório's location. Street fields (cep/logradouro/numero/complemento/bairro)
+// are optional and no longer collected by the UI (a postal address isn't used by
+// the product), but the struct keeps them so any value already stored survives a
+// round-trip. Declaring Validate on Address lets ozzo validate it automatically
+// when it is a request field — and it only runs on the write path, never on reads.
 func (a Address) Validate() error {
 	return validation.ValidateStruct(&a,
-		validation.Field(&a.CEP, validation.Required),
-		validation.Field(&a.Logradouro, validation.Required),
 		validation.Field(&a.Cidade, validation.Required),
 		validation.Field(&a.UF, validation.Required),
 	)

@@ -292,6 +292,18 @@ func countByType(published []events.Event) map[string]int {
 	return counts
 }
 
+// findPublished returns the first published event of concrete type T (and whether one was
+// found) — a typed lookup so a test asserts on a specific event regardless of publish order.
+func findPublished[T events.Event](published []events.Event) (T, bool) {
+	for _, ev := range published {
+		if typed, ok := ev.(T); ok {
+			return typed, true
+		}
+	}
+	var zero T
+	return zero, false
+}
+
 // stubEntitlementChecker is the EntitlementChecker under the test's control: it
 // answers limit (or err) for every tenant and records how it was called so a test
 // proves the cycle consults it exactly once, scoped to the event's tenant.
@@ -414,6 +426,49 @@ func TestSyncUseCase_FirstDelivery_RunsFullCycle(t *testing.T) {
 
 	if uow.tenantID != ev.TenantID {
 		t.Fatalf("uow tenantID = %q, want %q", uow.tenantID, ev.TenantID)
+	}
+	// A backfill window (BackfillJobID set) emits ONE enrichment_batch_requested per DISTINCT
+	// tribunal it observed — the stub fixture has one TJSP record → one batch step.
+	if got := counts[TypeEnrichmentBatchRequested]; got != 1 {
+		t.Fatalf("enrichment_batch_requested = %d, want 1 (one per distinct tribunal on backfill)", got)
+	}
+}
+
+// TestSyncUseCase_LiveSync_EmitsNoBatch proves a LIVE sync (no BackfillJobID) emits NO
+// enrichment_batch_requested — those records stay on the per-record enrichment path.
+func TestSyncUseCase_LiveSync_EmitsNoBatch(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubSyncRepo{syncRunID: "run-1", docketNewCount: 2}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	conn := &stubConnector{payload: RawPayload{ConnectorID: stubConnectorID}}
+	parser := &stubParser{result: stubFixture(SourceDJEN)}
+	uc := NewSyncUseCase(repo, outbox, uow, orchestratorWith(SourceDJEN, conn), parser)
+
+	if err := uc.OnSyncRequested(context.Background(), nonBackfillSyncEvent()); err != nil {
+		t.Fatalf("OnSyncRequested() error = %v", err)
+	}
+	if got := countByType(outbox.published)[TypeEnrichmentBatchRequested]; got != 0 {
+		t.Errorf("live sync emitted %d enrichment_batch_requested, want 0", got)
+	}
+}
+
+// TestDistinctCourts proves the tribunal dedup keeps first-seen order and drops empties.
+func TestDistinctCourts(t *testing.T) {
+	t.Parallel()
+
+	got := distinctCourts([]*CourtRecord{
+		{Court: "TJSP"}, {Court: "TJRJ"}, {Court: "TJSP"}, {Court: ""}, {Court: "TJMG"},
+	})
+	want := []string{"TJSP", "TJRJ", "TJMG"}
+	if len(got) != len(want) {
+		t.Fatalf("distinctCourts = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("distinctCourts = %v, want %v", got, want)
+		}
 	}
 }
 

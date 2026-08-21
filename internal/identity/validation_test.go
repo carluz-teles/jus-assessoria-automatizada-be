@@ -72,10 +72,14 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 			field:   "trade_name",
 		},
 		{
-			name:    "address missing cep is rejected",
+			name:    "address without cep is accepted (street optional)",
 			mutate:  func(r *UpdateOrgProfileRequest) { r.Address.CEP = "" },
-			wantErr: true,
-			field:   "address",
+			wantErr: false,
+		},
+		{
+			name:    "cidade + uf only is accepted (street optional)",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Address = Address{Cidade: "Franca", UF: "SP"} },
+			wantErr: false,
 		},
 		{
 			name:    "address missing uf is rejected",
@@ -89,8 +93,8 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "partial address (only cidade) is rejected",
-			mutate:  func(r *UpdateOrgProfileRequest) { r.Address = Address{Cidade: "São Paulo"} },
+			name:    "address missing cidade is rejected",
+			mutate:  func(r *UpdateOrgProfileRequest) { r.Address = Address{UF: "SP"} },
 			wantErr: true,
 			field:   "address",
 		},

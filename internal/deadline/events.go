@@ -350,6 +350,64 @@ func newDeadlineMet(tenantID, deadlineID string) DeadlineMet {
 	}
 }
 
+// TypeDeadlineNoDeadline is the dotted id this slice PRODUCES when a human declares "mera
+// ciência" on a prazo (§3: PENDING|OPEN → NO_DEADLINE via "Remover prazo" / "Não há prazo").
+// Same "deadline" prefix/routing as deadline.met; its consumer (read models, notifications)
+// drops the prazo from the agenda de prazos a cumprir.
+const TypeDeadlineNoDeadline = "deadline.no_deadline"
+
+// DeadlineNoDeadline announces a prazo declared mera ciência (no prazo to cumprir). It mirrors
+// DeadlineMet: TenantID scopes the future consumer, DeadlineID is the prazo. Immediate (no
+// process_at). The aggregate is the deadline, so its stream orders by the deadline id.
+type DeadlineNoDeadline struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
+
+var _ events.Event = DeadlineNoDeadline{}
+
+func (DeadlineNoDeadline) Type() string          { return TypeDeadlineNoDeadline }
+func (DeadlineNoDeadline) AggregateType() string { return aggregateTypeDeadline }
+
+// newDeadlineNoDeadline builds the immediate NO_DEADLINE fact. Fresh uuid v7 event id (the
+// consumer dedup key); aggregate_id is the deadline id (a uuid, satisfying the outbox's uuid NOT
+// NULL), mirroring newDeadlineMet.
+func newDeadlineNoDeadline(tenantID, deadlineID string) DeadlineNoDeadline {
+	return DeadlineNoDeadline{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+	}
+}
+
+// TypeDeadlineReopened is the dotted id this slice PRODUCES when a human reverts a mera-ciência
+// declaration (§3: NO_DEADLINE → PENDING via "reabrir"). Same "deadline" prefix/routing as
+// deadline.opened; its consumer re-admits the prazo to the agenda as a PENDING suggestion.
+const TypeDeadlineReopened = "deadline.reopened"
+
+// DeadlineReopened announces a prazo reopened from NO_DEADLINE back to PENDING. It mirrors
+// DeadlineNoDeadline: TenantID scopes the future consumer, DeadlineID is the prazo. Immediate.
+type DeadlineReopened struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
+
+var _ events.Event = DeadlineReopened{}
+
+func (DeadlineReopened) Type() string          { return TypeDeadlineReopened }
+func (DeadlineReopened) AggregateType() string { return aggregateTypeDeadline }
+
+// newDeadlineReopened builds the immediate REOPENED fact, mirroring newDeadlineNoDeadline.
+func newDeadlineReopened(tenantID, deadlineID string) DeadlineReopened {
+	return DeadlineReopened{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+	}
+}
+
 // TypeDeadlineUpdated is the dotted id this slice PRODUCES when the F2 human confirmation
 // flips a prazo PENDING→OPEN with the recomputed dates (docs/erd-prazos.md §7: deadline.updated
 // {deadline_id, ...} — ajuste humano no F2). Same "deadline" prefix/routing as deadline.opened;

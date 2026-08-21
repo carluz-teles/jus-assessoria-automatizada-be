@@ -69,14 +69,29 @@ type SyncRunParams struct {
 // processes/intimations THIS window first discovered (items_new counts docket
 // entries, a different axis — see 0020_reconciliation_lineage).
 type SyncRunOutcome struct {
-	ID              string
-	Status          string
-	ItemsNew        int
-	ItemsDeduped    int
-	CourtRecordsNew int
-	IntimationsNew  int
-	FinishedAt      time.Time
-	Error           string
+	ID                  string
+	Status              string
+	ItemsNew            int
+	ItemsDeduped        int
+	CourtRecordsNew     int
+	CourtRecordsUpdated int
+	IntimationsNew      int
+	FinishedAt          time.Time
+	Error               string
+}
+
+// DailyCaptureParams is the DAILY_CAPTURE audit row a day's fan-out writes in its
+// per-tenant tx (WriteDailyCaptureRun). Window is the day covered; the record/intim
+// tallies are the effect that fan-out had on THIS tenant; StartedAt/FinishedAt bound
+// the write. It carries no status/errors: the synchronous fan-out only writes OK rows.
+type DailyCaptureParams struct {
+	TenantID            string
+	Window              time.Time
+	StartedAt           time.Time
+	FinishedAt          time.Time
+	CourtRecordsNew     int
+	CourtRecordsUpdated int
+	IntimationsNew      int
 }
 
 // FindOrCreateCourtRecordParams resolves-or-creates a court record and marks it
@@ -564,14 +579,19 @@ func (uc *SyncUseCase) applyResult(ctx context.Context, ev SyncRequested, syncRu
 		itemsNew := len(newDocket)
 		itemsDeduped := len(docketParams) - itemsNew
 
+		// Updated = the window's records that were NOT first-discovered here and were
+		// not gated (reobservations refreshed in place): total outcomes minus the new
+		// ones minus the blocked ones. Never negative (blocked ⊆ outcomes, new ⊆ outcomes).
+		courtRecordsUpdated := len(outcomes) - courtRecordsNew - len(blocked)
 		closed, err := uc.repo.UpdateSyncRun(ctx, tx, SyncRunOutcome{
-			ID:              syncRunID,
-			Status:          SyncStatusOK,
-			ItemsNew:        itemsNew,
-			ItemsDeduped:    itemsDeduped,
-			CourtRecordsNew: courtRecordsNew,
-			IntimationsNew:  intimationsNew,
-			FinishedAt:      uc.now(),
+			ID:                  syncRunID,
+			Status:              SyncStatusOK,
+			ItemsNew:            itemsNew,
+			ItemsDeduped:        itemsDeduped,
+			CourtRecordsNew:     courtRecordsNew,
+			CourtRecordsUpdated: courtRecordsUpdated,
+			IntimationsNew:      intimationsNew,
+			FinishedAt:          uc.now(),
 		})
 		if err != nil {
 			return err
@@ -699,8 +719,35 @@ func (uc *SyncUseCase) publishObserved(ctx context.Context, tx database.Tx, ev S
 	for _, c := range cancelledIntim {
 		evs = append(evs, newIntimationCancelled(ev, c))
 	}
+	// A backfill (onboarding import) enriches its discovered records in BATCH, not per-record:
+	// emit ONE enrichment_batch_requested per DISTINCT tribunal observed this window (coalesced
+	// in the same tx), each the first step of that (tenant, court, import) batch. The batch job
+	// owns the grade + the import's ENRICHMENT capture row; the per-record enrichment consumer
+	// early-returns for backfill records, so there is no double-enrichment. A live sync / re-poll
+	// (BackfillJobID == "") emits NONE — those records stay on the single-fetch path.
+	if ev.BackfillJobID != "" {
+		for _, court := range distinctCourts(records) {
+			evs = append(evs, newEnrichmentBatchRequested(ev.TenantID, court, ev.BackfillJobID))
+		}
+	}
 	evs = append(evs, newSyncCompleted(ev, syncRunID, itemsNew, itemsDeduped))
 	return uc.outbox.PublishBatch(ctx, tx, evs)
+}
+
+// distinctCourts returns the distinct, non-empty tribunal siglas observed in a window, in
+// first-seen order, so a backfill emits exactly one batch step per tribunal (not one per
+// record). Order is deterministic for a stable outbox/test shape.
+func distinctCourts(records []*CourtRecord) []string {
+	seen := map[string]bool{}
+	courts := make([]string, 0)
+	for _, cr := range records {
+		if cr.Court == "" || seen[cr.Court] {
+			continue
+		}
+		seen[cr.Court] = true
+		courts = append(courts, cr.Court)
+	}
+	return courts
 }
 
 // docketParamsFor resolves each parsed docket entry to its court_record id via

@@ -30,6 +30,11 @@ type ConfirmDeadlineBody struct {
 	Counting      string `json:"counting"`
 	Doubled       bool   `json:"doubled"`
 	DoubledReason string `json:"doubled_reason"`
+	// AnchorEvent is the optional termo inicial (default DEADLINE_START when ""); ManualExtraDays
+	// is the optional feriado/suspensão days count (default 0). Both are validated in the closed
+	// set / non-negative below.
+	AnchorEvent     string `json:"anchor_event"`
+	ManualExtraDays int    `json:"manual_extra_days"`
 }
 
 // Validate enforces the edge boundary rules via ozzo (method-based, not struct tags): a
@@ -50,6 +55,11 @@ func (b ConfirmDeadlineBody) Validate() error {
 		validation.Field(&b.Days, validation.Required, validation.Min(1)),
 		validation.Field(&b.Counting, validation.Required,
 			validation.In(string(CountingBusiness), string(CountingCalendar))),
+		// anchor_event is optional ("" → default DEADLINE_START at toCommand); when present it
+		// must be a member of the closed set. manual_extra_days is optional and must be >= 0.
+		validation.Field(&b.AnchorEvent, validation.In(
+			string(AnchorMadeAvailable), string(AnchorPublished), string(AnchorDeadlineStart))),
+		validation.Field(&b.ManualExtraDays, validation.Min(0)),
 	)
 }
 
@@ -59,11 +69,13 @@ func (b ConfirmDeadlineBody) Validate() error {
 // tenant_id / the prazo id / user come from the principal + path, never the body; the
 // recomputed end_date is server-derived, so it is not accepted either.
 type AdjustRequest struct {
-	Kind          *string `json:"kind"`
-	Days          *int    `json:"days"`
-	Counting      *string `json:"counting"`
-	Doubled       *bool   `json:"doubled"`
-	DoubledReason *string `json:"doubled_reason"`
+	Kind            *string `json:"kind"`
+	Days            *int    `json:"days"`
+	Counting        *string `json:"counting"`
+	Doubled         *bool   `json:"doubled"`
+	DoubledReason   *string `json:"doubled_reason"`
+	AnchorEvent     *string `json:"anchor_event"`
+	ManualExtraDays *int    `json:"manual_extra_days"`
 }
 
 // Validate enforces the edge rules for the fields that ARE present (a nil field is a no-op,
@@ -74,7 +86,35 @@ func (r AdjustRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Days, validation.By(positiveDaysIfPresent)),
 		validation.Field(&r.Counting, validation.By(validCountingIfPresent)),
+		validation.Field(&r.AnchorEvent, validation.By(validAnchorIfPresent)),
+		validation.Field(&r.ManualExtraDays, validation.By(nonNegativeExtraDaysIfPresent)),
 	)
+}
+
+// validAnchorIfPresent rejects a PRESENT anchor_event outside the closed set; an absent (nil) one
+// is a no-op (the stored anchor is kept). Mirrors validCountingIfPresent.
+func validAnchorIfPresent(value any) error {
+	a, ok := value.(*string)
+	if !ok || a == nil {
+		return nil
+	}
+	if !validAnchorEvent(AnchorEvent(*a)) {
+		return errors.New("must be MADE_AVAILABLE, PUBLISHED or DEADLINE_START")
+	}
+	return nil
+}
+
+// nonNegativeExtraDaysIfPresent rejects a PRESENT, negative manual_extra_days; an absent (nil) one
+// is a no-op (the stored value is kept).
+func nonNegativeExtraDaysIfPresent(value any) error {
+	d, ok := value.(*int)
+	if !ok || d == nil {
+		return nil
+	}
+	if *d < 0 {
+		return errors.New("must be greater than or equal to 0")
+	}
+	return nil
 }
 
 // positiveDaysIfPresent rejects a PRESENT, non-positive day count; an absent (nil) days is a
@@ -111,17 +151,22 @@ func validCountingIfPresent(value any) error {
 // present. Counting is converted *string → *Counting.
 func (r AdjustRequest) toAdjustCommand(tenantID, userID, deadlineID string) AdjustCommand {
 	cmd := AdjustCommand{
-		TenantID:      tenantID,
-		UserID:        userID,
-		DeadlineID:    deadlineID,
-		Kind:          r.Kind,
-		Days:          r.Days,
-		Doubled:       r.Doubled,
-		DoubledReason: r.DoubledReason,
+		TenantID:        tenantID,
+		UserID:          userID,
+		DeadlineID:      deadlineID,
+		Kind:            r.Kind,
+		Days:            r.Days,
+		Doubled:         r.Doubled,
+		DoubledReason:   r.DoubledReason,
+		ManualExtraDays: r.ManualExtraDays,
 	}
 	if r.Counting != nil {
 		c := Counting(*r.Counting)
 		cmd.Counting = &c
+	}
+	if r.AnchorEvent != nil {
+		a := AnchorEvent(*r.AnchorEvent)
+		cmd.AnchorEvent = &a
 	}
 	return cmd
 }
@@ -363,14 +408,77 @@ func isUUID(value any) error {
 // TenantID and UserID come from the principal (never the body). The confirm carries no tasks.
 func (r ConfirmRequest) toCommand(tenantID, userID string) ConfirmCommand {
 	return ConfirmCommand{
-		TenantID:      tenantID,
-		UserID:        userID,
-		IntimationID:  r.IntimationID,
-		Kind:          r.Deadline.Kind,
-		Days:          r.Deadline.Days,
-		Counting:      Counting(r.Deadline.Counting),
-		Doubled:       r.Deadline.Doubled,
-		DoubledReason: r.Deadline.DoubledReason,
+		TenantID:        tenantID,
+		UserID:          userID,
+		IntimationID:    r.IntimationID,
+		Kind:            r.Deadline.Kind,
+		Days:            r.Deadline.Days,
+		Counting:        Counting(r.Deadline.Counting),
+		Doubled:         r.Deadline.Doubled,
+		DoubledReason:   r.Deadline.DoubledReason,
+		AnchorEvent:     defaultAnchor(r.Deadline.AnchorEvent),
+		ManualExtraDays: r.Deadline.ManualExtraDays,
+	}
+}
+
+// defaultAnchor maps an absent ("") anchor_event to the legacy DEADLINE_START default, so the
+// domain and the NOT-NULL column always see a valid closed-set value. Validate already rejected a
+// present-but-invalid value.
+func defaultAnchor(s string) AnchorEvent {
+	if s == "" {
+		return AnchorDeadlineStart
+	}
+	return AnchorEvent(s)
+}
+
+// PreviewRequest is the POST /v1/prazos/preview body (§3): a live, non-persisted recompute. It
+// carries EITHER an intimation_id (anchor on one of the intimação's dates) OR a start_date (the
+// manual case). tenant_id comes from the verified principal, never the body. days/counting are
+// required (the recompute needs them); anchor_event/doubled/manual_extra_days are optional.
+type PreviewRequest struct {
+	IntimationID    string `json:"intimation_id"`
+	StartDate       string `json:"start_date"`
+	AnchorEvent     string `json:"anchor_event"`
+	Kind            string `json:"kind"`
+	Days            int    `json:"days"`
+	Counting        string `json:"counting"`
+	Doubled         bool   `json:"doubled"`
+	ManualExtraDays int    `json:"manual_extra_days"`
+}
+
+// Validate enforces the preview edge rules: exactly one anchor source (intimation_id XOR
+// start_date), a positive day count, a valid counting, a well-formed optional intimation_id /
+// start_date, a valid optional anchor_event and a non-negative manual_extra_days.
+func (r PreviewRequest) Validate() error {
+	if (r.IntimationID == "") == (r.StartDate == "") {
+		return apperr.NewInvalid("preview requires exactly one of intimation_id or start_date")
+	}
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Days, validation.Required, validation.Min(1)),
+		validation.Field(&r.Counting, validation.Required,
+			validation.In(string(CountingBusiness), string(CountingCalendar))),
+		validation.Field(&r.IntimationID, validation.By(uuidIfPresent)),
+		validation.Field(&r.StartDate, validation.Date(time.DateOnly)),
+		validation.Field(&r.AnchorEvent, validation.In(
+			string(AnchorMadeAvailable), string(AnchorPublished), string(AnchorDeadlineStart))),
+		validation.Field(&r.ManualExtraDays, validation.Min(0)),
+	)
+}
+
+// toPreviewCommand maps the validated request + the principal's tenant into the use-case command.
+// The wire start_date (validated) is parsed to an optional time; anchor_event defaults to
+// DEADLINE_START.
+func (r PreviewRequest) toPreviewCommand(tenantID string) PreviewCommand {
+	return PreviewCommand{
+		TenantID:        tenantID,
+		IntimationID:    r.IntimationID,
+		StartDate:       parseOptionalWireDate(r.StartDate),
+		AnchorEvent:     defaultAnchor(r.AnchorEvent),
+		Kind:            r.Kind,
+		Days:            r.Days,
+		Counting:        Counting(r.Counting),
+		Doubled:         r.Doubled,
+		ManualExtraDays: r.ManualExtraDays,
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -57,6 +58,28 @@ type Repository interface {
 	// them straight (no cross-slice consumer in v0).
 	UpsertParties(ctx context.Context, tx database.Tx, params []PartyParams) error
 
+	// Capture audit trail — the per-tenant capture writes, in the caller's tx (the same
+	// tx as the domain write they audit, under the tenant advisory lock).
+	// WriteDailyCaptureRun opens+closes a DAILY_CAPTURE row for a day's fan-out;
+	// IncrementImportEnrichmentRunBy bumps an IMPORT's ENRICHMENT row (keyed by backfill_job)
+	// by the batch step's graded count (kept RUNNING). CloseImportEnrichmentRun + the
+	// discovered total + the empty-close insert serve the batch job's deterministic fecho.
+	WriteDailyCaptureRun(ctx context.Context, tx database.Tx, params DailyCaptureParams) error
+	IncrementImportEnrichmentRun(ctx context.Context, tx database.Tx, tenantID, backfillJobID string, at time.Time) error
+	IncrementImportEnrichmentRunBy(ctx context.Context, tx database.Tx, tenantID, backfillJobID string, delta, errs int, at time.Time) error
+	GetImportEnrichmentCounter(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (updated, errs int, found bool, err error)
+	CountImportDiscoveredRecords(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (int, error)
+	CloseImportEnrichmentRun(ctx context.Context, tx database.Tx, params CloseEnrichmentRunParams) (rows int, err error)
+	InsertEmptyImportEnrichmentRun(ctx context.Context, tx database.Tx, params CloseEnrichmentRunParams) error
+
+	// Batch enrichment scan — the scan the batch job drives: SelectDueForEnrichment reads a
+	// tribunal's due records; CountRemainingDueForJob is the whole-import remaining count that
+	// gates the fecho; MarkEnrichmentAttempted stamps a batch's visited records so they drop
+	// out of the scan.
+	SelectDueForEnrichment(ctx context.Context, tx database.Tx, tenantID, court string, limit int) ([]DueRecord, error)
+	CountRemainingDueForJob(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (int, error)
+	MarkEnrichmentAttempted(ctx context.Context, tx database.Tx, tenantID string, recordIDs []string, at time.Time) error
+
 	// DATAJUD enrichment — the in-place grade (FIX B) plus the merge fallback for a
 	// rare grade conflict. The enrichment use case depends on the narrow enrichRepo
 	// view of these. GetCourtRecordByKey is the conflict lookup (natural-key resolve);
@@ -85,6 +108,18 @@ type Repository interface {
 	// the tx+RLS boundary). No outbox event yet — a future slice.
 	SetIntimationUserStatus(ctx context.Context, tx database.Tx, tenantID, intimationID, userStatus string) error
 
+	// AssignIntimacaoResponsaveis sets (or clears with nil) the conductor_user_id and
+	// reviewer_user_id of one intimação, tenant-scoped. The use case already validated
+	// membership before calling; a miss or foreign row is ErrIntimationNotFound.
+	// Tx-taking (the use case owns the tx+RLS boundary).
+	AssignIntimacaoResponsaveis(ctx context.Context, tx database.Tx, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error
+
+	// Bulk: atribui o condutor (só conductor_user_id — preserva o revisor) a várias
+	// intimações de uma vez. ByIDs = lista explícita; ByFilter = TODA a faixa/filtro
+	// atual (modo "todos" da UI, inclui não-paginados). Devolvem a contagem afetada.
+	BulkAssignConductorByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, conductorUserID *string) (int64, error)
+	BulkAssignConductorByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, conductorUserID *string) (int64, error)
+
 	// Screen reads — the keyset-paginated read models (off the write path). The read
 	// use case depends on the narrow readRepo view of these.
 	ListProcessos(ctx context.Context, q ProcessosQuery) ([]ProcessoView, error)
@@ -96,6 +131,7 @@ type Repository interface {
 	ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error)
 	CountProcessos(ctx context.Context, q ProcessosQuery) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, q IntimacoesQuery) (totalCount, total int64, err error)
+	BucketIntimacoes(ctx context.Context, q IntimacoesQuery) (IntimacaoBucketsView, error)
 	// Filter options for the list envelopes — the distinct-value reads that back the
 	// chips. Each is tenant-scoped and matches the list's own context predicate.
 	ListProcessoCourts(ctx context.Context, tenantID string) ([]string, error)
@@ -110,6 +146,10 @@ type Repository interface {
 	// + cached ai_resume + last 10 andamentos + active intimações + open prazos). Used
 	// by the resumo use case through the readRepo port.
 	GetResumoContext(ctx context.Context, tenantID, courtRecordID string) (ProcessoResumoCtx, error)
+	// GetIntimacaoAnaliseContext assembles the context for the AI intimation analysis (the
+	// teor + the court record identification). Used by the analise use case through the
+	// analiseReader port. A miss/foreign row → ErrIntimationNotFound.
+	GetIntimacaoAnaliseContext(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseCtx, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -117,6 +157,16 @@ type Repository interface {
 	ListSyncRunsByJob(ctx context.Context, tenantID, jobID string) ([]ReconciliationRunView, error)
 	ListProcessosBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]ProcessoLineView, error)
 	ListIntimacoesBySyncRun(ctx context.Context, tenantID, syncRunID string) ([]IntimacaoLineView, error)
+	// Captures screen — the audit-trail reads (capture_run UNION backfill_job + the
+	// per-row/KPI count derivations). Backed by the readRepo port of the read use case.
+	ListCaptureRuns(ctx context.Context, tenantID string, limit int) ([]CaptureRunRow, error)
+	GetCaptureRun(ctx context.Context, tenantID, id string) (CaptureRunRow, error)
+	GetCaptureSummary(ctx context.Context, tenantID string) (CaptureSummaryRow, error)
+	CountDeadlinesCreatedBetween(ctx context.Context, tenantID string, from, to time.Time) (int, error)
+	CountTasksCreatedBetween(ctx context.Context, tenantID string, from, to time.Time) (int, error)
+	CountDeadlinesCreatedToday(ctx context.Context, tenantID string) (int, error)
+	CountWatchedOABsForDJEN(ctx context.Context, tenantID string) (int, error)
+	ListWatchedOABsWithName(ctx context.Context, tenantID string) ([]WatchedOABView, error)
 
 	// Publication — the national DJEN firehose ingestion write (tenant-agnostic). The
 	// ingestion use case depends on the narrow ingestRepo view of this.
@@ -410,6 +460,180 @@ func (r *pgRepository) ListIntimacoesBySyncRun(ctx context.Context, tenantID, sy
 	return views, nil
 }
 
+// ListCaptureRuns returns the tenant's captures (daily/enrichment + initial loads),
+// newest first, for the Captures screen — a pool read scoped by tenant_id (barrier 1).
+// The mapper absorbs the pgtype columns: NULL windows/finished_at become nil pointers.
+func (r *pgRepository) ListCaptureRuns(ctx context.Context, tenantID string, limit int) ([]CaptureRunRow, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListCaptureRuns(ctx, acquisitiondb.ListCaptureRunsParams{
+		TenantID: tid,
+		Limit:    int32(limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]CaptureRunRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, CaptureRunRow{
+			ID:                  row.ID.String(),
+			Source:              row.Source,
+			Kind:                row.Kind,
+			WindowFrom:          dateStrPtr(row.WindowFrom),
+			WindowTo:            dateStrPtr(row.WindowTo),
+			StartedAt:           row.StartedAt.Time,
+			FinishedAt:          timestampPtr(row.FinishedAt),
+			Status:              row.Status,
+			CourtRecordsNew:     int(row.CourtRecordsNew),
+			IntimationsNew:      int(row.IntimationsNew),
+			CourtRecordsUpdated: int(row.CourtRecordsUpdated),
+			Errors:              int(row.Errors),
+		})
+	}
+	return out, nil
+}
+
+// GetCaptureRun returns one capture (a DAILY_CAPTURE or ENRICHMENT capture_run) by id,
+// tenant-scoped. A non-uuid id is client input → the typed 404 (a capture that cannot
+// exist); a miss or a foreign-tenant row is likewise the typed ENTITY_NOT_FOUND.
+func (r *pgRepository) GetCaptureRun(ctx context.Context, tenantID, id string) (CaptureRunRow, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return CaptureRunRow{}, database.WrapInfra(err)
+	}
+	cid, err := uuid.Parse(id)
+	if err != nil {
+		return CaptureRunRow{}, apperr.NewNotFound("captura não encontrada")
+	}
+	row, err := r.q.GetCaptureRunByID(ctx, acquisitiondb.GetCaptureRunByIDParams{
+		TenantID: tid,
+		ID:       cid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CaptureRunRow{}, apperr.NewNotFound("captura não encontrada")
+	}
+	if err != nil {
+		return CaptureRunRow{}, database.WrapInfra(err)
+	}
+	return CaptureRunRow{
+		ID:                  row.ID.String(),
+		Source:              row.Source,
+		Kind:                row.Kind,
+		WindowFrom:          dateStrPtr(row.WindowFrom),
+		WindowTo:            dateStrPtr(row.WindowTo),
+		StartedAt:           row.StartedAt.Time,
+		FinishedAt:          timestampPtr(row.FinishedAt),
+		Status:              row.Status,
+		CourtRecordsNew:     int(row.CourtRecordsNew),
+		IntimationsNew:      int(row.IntimationsNew),
+		CourtRecordsUpdated: int(row.CourtRecordsUpdated),
+		Errors:              int(row.Errors),
+	}, nil
+}
+
+// GetCaptureSummary returns the Captures KPI aggregates (last successful capture +
+// today's new intimations), tenant-scoped. A single aggregate read on the pool.
+func (r *pgRepository) GetCaptureSummary(ctx context.Context, tenantID string) (CaptureSummaryRow, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return CaptureSummaryRow{}, database.WrapInfra(err)
+	}
+	row, err := r.q.GetCaptureSummary(ctx, tid)
+	if err != nil {
+		return CaptureSummaryRow{}, database.WrapInfra(err)
+	}
+	return CaptureSummaryRow{
+		LastCaptureAt:       timestampPtr(row.LastCaptureAt),
+		IntimationsNewToday: int(row.IntimationsNewToday),
+	}, nil
+}
+
+// CountDeadlinesCreatedBetween / CountTasksCreatedBetween count the prazos/tarefas a
+// capture derived over its [started_at, finished_at] window, tenant-scoped (barrier 1).
+func (r *pgRepository) CountDeadlinesCreatedBetween(ctx context.Context, tenantID string, from, to time.Time) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	n, err := r.q.CountDeadlinesCreatedBetween(ctx, acquisitiondb.CountDeadlinesCreatedBetweenParams{
+		TenantID:    tid,
+		CreatedAt:   pgtype.Timestamptz{Time: from, Valid: true},
+		CreatedAt_2: pgtype.Timestamptz{Time: to, Valid: true},
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(n), nil
+}
+
+func (r *pgRepository) CountTasksCreatedBetween(ctx context.Context, tenantID string, from, to time.Time) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	n, err := r.q.CountTasksCreatedBetween(ctx, acquisitiondb.CountTasksCreatedBetweenParams{
+		TenantID:    tid,
+		CreatedAt:   pgtype.Timestamptz{Time: from, Valid: true},
+		CreatedAt_2: pgtype.Timestamptz{Time: to, Valid: true},
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(n), nil
+}
+
+// CountDeadlinesCreatedToday backs the "prazos derivados hoje" KPI; CountWatchedOABsForDJEN
+// backs the "OABs" card. Both tenant-scoped pool reads (barrier 1).
+func (r *pgRepository) CountDeadlinesCreatedToday(ctx context.Context, tenantID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	n, err := r.q.CountDeadlinesCreatedToday(ctx, tid)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(n), nil
+}
+
+func (r *pgRepository) CountWatchedOABsForDJEN(ctx context.Context, tenantID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	n, err := r.q.CountWatchedOABsForDJEN(ctx, tid)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(n), nil
+}
+
+// ListWatchedOABsWithName returns the tenant's DJEN-monitored OABs with the
+// most-frequent lawyer name from party_counsel. The generated row has Name as
+// string (sqlc can't infer nullability for mode() even with ::text cast), so the
+// scan uses *string; an empty string from mode() over no rows becomes nil.
+func (r *pgRepository) ListWatchedOABsWithName(ctx context.Context, tenantID string) ([]WatchedOABView, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListWatchedOABsWithName(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	views := make([]WatchedOABView, 0, len(rows))
+	for _, row := range rows {
+		view := WatchedOABView{OAB: row.Oab}
+		if row.Name != "" {
+			view.Name = &row.Name
+		}
+		views = append(views, view)
+	}
+	return views, nil
+}
+
 // GetReconciliationTotals counts the tenant's acquired acervo (ACTIVE processes +
 // intimations) for the reconciliations summary — two pool reads scoped by
 // tenant_id (barrier 1).
@@ -617,14 +841,15 @@ func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcom
 		return false, err
 	}
 	_, err = acquisitiondb.New(tx).UpdateSyncRun(ctx, acquisitiondb.UpdateSyncRunParams{
-		ID:              id,
-		Status:          outcome.Status,
-		ItemsNew:        int32(outcome.ItemsNew),
-		ItemsDeduped:    int32(outcome.ItemsDeduped),
-		CourtRecordsNew: int32(outcome.CourtRecordsNew),
-		IntimationsNew:  int32(outcome.IntimationsNew),
-		FinishedAt:      pgtype.Timestamptz{Time: outcome.FinishedAt, Valid: true},
-		Error:           errJSON,
+		ID:                  id,
+		Status:              outcome.Status,
+		ItemsNew:            int32(outcome.ItemsNew),
+		ItemsDeduped:        int32(outcome.ItemsDeduped),
+		CourtRecordsNew:     int32(outcome.CourtRecordsNew),
+		CourtRecordsUpdated: int32(outcome.CourtRecordsUpdated),
+		IntimationsNew:      int32(outcome.IntimationsNew),
+		FinishedAt:          pgtype.Timestamptz{Time: outcome.FinishedAt, Valid: true},
+		Error:               errJSON,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
@@ -633,6 +858,259 @@ func (r *pgRepository) UpdateSyncRun(ctx context.Context, tx database.Tx, outcom
 		return false, database.WrapInfra(err)
 	}
 	return true, nil
+}
+
+// WriteDailyCaptureRun records a day's DAILY_CAPTURE audit row in the caller's tx —
+// the same tx as the fan-out write it audits (writeForTenant), under the tenant
+// advisory lock. It opens+closes in one statement (the fan-out is synchronous, so the
+// tallies and OK status are known); a re-run of the same day SUMS onto the counters
+// (ON CONFLICT), so an at-least-once redelivery never zeroes the day.
+func (r *pgRepository) WriteDailyCaptureRun(ctx context.Context, tx database.Tx, params DailyCaptureParams) error {
+	tid, err := uuid.Parse(params.TenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	err = acquisitiondb.New(tx).InsertDailyCaptureRun(ctx, acquisitiondb.InsertDailyCaptureRunParams{
+		TenantID:            tid,
+		WindowFrom:          pgtype.Date{Time: params.Window, Valid: true},
+		WindowTo:            pgtype.Date{Time: params.Window, Valid: true},
+		StartedAt:           pgtype.Timestamptz{Time: params.StartedAt, Valid: true},
+		FinishedAt:          pgtype.Timestamptz{Time: params.FinishedAt, Valid: true},
+		CourtRecordsNew:     int32(params.CourtRecordsNew),
+		IntimationsNew:      int32(params.IntimationsNew),
+		CourtRecordsUpdated: int32(params.CourtRecordsUpdated),
+	})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// IncrementImportEnrichmentRun bumps an IMPORT's ENRICHMENT capture row (keyed by
+// backfillJobID) by one applied enrichment, in the caller's tx (the applyEnrichment tx,
+// under the tenant advisory lock). The first enrichment of the import creates the row
+// RUNNING; the rest increment court_records_updated and advance finished_at, staying
+// RUNNING — the terminal status is stamped by the ETA close. `at` is the enrichment's
+// wall-clock time (started_at/finished_at).
+func (r *pgRepository) IncrementImportEnrichmentRun(ctx context.Context, tx database.Tx, tenantID, backfillJobID string, at time.Time) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	bid, err := uuid.Parse(backfillJobID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	err = acquisitiondb.New(tx).IncrementImportEnrichmentRun(ctx, acquisitiondb.IncrementImportEnrichmentRunParams{
+		TenantID:      tid,
+		BackfillJobID: pgtype.UUID{Bytes: bid, Valid: true},
+		At:            pgtype.Timestamptz{Time: at, Valid: true},
+	})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// IncrementImportEnrichmentRunBy bumps an IMPORT's ENRICHMENT capture row by `delta`
+// applied enrichments (records the step graded) AND `errs` real parse errors (hits DATAJUD
+// returned but we could not parse), in the caller's tx under the tenant advisory lock. Same
+// insert-or-increment semantics as the +1 variant, batched. The caller skips it when both
+// delta and errs are 0 (an empty step must not mint a spurious RUNNING row).
+func (r *pgRepository) IncrementImportEnrichmentRunBy(ctx context.Context, tx database.Tx, tenantID, backfillJobID string, delta, errs int, at time.Time) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	bid, err := uuid.Parse(backfillJobID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	err = acquisitiondb.New(tx).IncrementImportEnrichmentRunBy(ctx, acquisitiondb.IncrementImportEnrichmentRunByParams{
+		TenantID:      tid,
+		BackfillJobID: pgtype.UUID{Bytes: bid, Valid: true},
+		At:            pgtype.Timestamptz{Time: at, Valid: true},
+		Delta:         int32(delta),
+		Errs:          int32(errs),
+	})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// SelectDueForEnrichment reads up to `limit` court_records of one tribunal (court) still
+// due for a batch enrichment (completeness < 0.9, never attempted, not superseded), in the
+// caller's tx. Scoped by tenant_id (RLS barrier 1); the scan partial index serves it.
+func (r *pgRepository) SelectDueForEnrichment(ctx context.Context, tx database.Tx, tenantID, court string, limit int) ([]DueRecord, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := acquisitiondb.New(tx).SelectDueForEnrichment(ctx, acquisitiondb.SelectDueForEnrichmentParams{
+		TenantID: tid,
+		Court:    court,
+		Lim:      int32(limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]DueRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, DueRecord{
+			ID:        row.ID.String(),
+			TenantID:  tenantID,
+			CaseID:    row.CaseID.String(),
+			CNJNumber: row.CnjNumber,
+			Degree:    row.Degree,
+			Court:     row.Court,
+		})
+	}
+	return out, nil
+}
+
+// CountRemainingDueForJob counts the court_records of the whole import (the tenant's
+// enrichment backlog) still due, in the caller's tx. The batch job closes the ENRICHMENT
+// row only when this reaches 0. Scoped by tenant_id.
+func (r *pgRepository) CountRemainingDueForJob(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	// backfillJobID is not a filter (the tenant runs one import at a time in v0); parse it
+	// only to reject a malformed id early, keeping the caller's contract honest.
+	if _, err := uuid.Parse(backfillJobID); err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	remaining, err := acquisitiondb.New(tx).CountRemainingDueForJob(ctx, tid)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(remaining), nil
+}
+
+// MarkEnrichmentAttempted stamps enrichment_attempted_at on every record a batch visited
+// (graded or not), in the caller's tx, so they drop out of the scan index. Scoped by
+// tenant_id. An empty id list is a no-op.
+func (r *pgRepository) MarkEnrichmentAttempted(ctx context.Context, tx database.Tx, tenantID string, recordIDs []string, at time.Time) error {
+	if len(recordIDs) == 0 {
+		return nil
+	}
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	ids := make([]uuid.UUID, 0, len(recordIDs))
+	for _, id := range recordIDs {
+		rid, perr := uuid.Parse(id)
+		if perr != nil {
+			return database.WrapInfra(perr)
+		}
+		ids = append(ids, rid)
+	}
+	err = acquisitiondb.New(tx).MarkEnrichmentAttempted(ctx, acquisitiondb.MarkEnrichmentAttemptedParams{
+		At:       pgtype.Timestamptz{Time: at, Valid: true},
+		TenantID: tid,
+		Ids:      ids,
+	})
+	return database.WrapInfra(err)
+}
+
+// GetImportEnrichmentCounter reads the ENRICHMENT row's counters off an import: the
+// applied-enrichment count (court_records_updated) and the REAL parse-error count (errors),
+// which is what the fecho uses to decide OK vs PARTIAL. found=false (pgx.ErrNoRows) means the
+// import applied no enrichment — the close use case then records an honest empty terminal row.
+func (r *pgRepository) GetImportEnrichmentCounter(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (updated, errs int, found bool, err error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, 0, false, database.WrapInfra(err)
+	}
+	bid, err := uuid.Parse(backfillJobID)
+	if err != nil {
+		return 0, 0, false, database.WrapInfra(err)
+	}
+	row, err := acquisitiondb.New(tx).GetImportEnrichmentCounter(ctx, acquisitiondb.GetImportEnrichmentCounterParams{
+		TenantID:      tid,
+		BackfillJobID: pgtype.UUID{Bytes: bid, Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, database.WrapInfra(err)
+	}
+	return int(row.CourtRecordsUpdated), int(row.Errors), true, nil
+}
+
+// CountImportDiscoveredRecords sums the processes an import discovered
+// (SUM(sync_run.court_records_new)) — the coverage total the ETA close compares the
+// applied-enrichment counter against.
+func (r *pgRepository) CountImportDiscoveredRecords(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (int, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	bid, err := uuid.Parse(backfillJobID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	total, err := acquisitiondb.New(tx).CountImportDiscoveredRecords(ctx, acquisitiondb.CountImportDiscoveredRecordsParams{
+		TenantID:      tid,
+		BackfillJobID: pgtype.UUID{Bytes: bid, Valid: true},
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(total), nil
+}
+
+// CloseImportEnrichmentRun stamps the terminal status (OK/PARTIAL) + finished_at on the
+// import's ENRICHMENT row. Returns the number of rows affected: 0 means the import applied
+// no enrichment (no row exists), which the use case handles via InsertEmptyImportEnrichmentRun.
+func (r *pgRepository) CloseImportEnrichmentRun(ctx context.Context, tx database.Tx, params CloseEnrichmentRunParams) (int, error) {
+	tid, err := uuid.Parse(params.TenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	bid, err := uuid.Parse(params.BackfillJobID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	rows, err := acquisitiondb.New(tx).CloseImportEnrichmentRun(ctx, acquisitiondb.CloseImportEnrichmentRunParams{
+		Status:        params.Status,
+		At:            pgtype.Timestamptz{Time: params.At, Valid: true},
+		TenantID:      tid,
+		BackfillJobID: pgtype.UUID{Bytes: bid, Valid: true},
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(rows), nil
+}
+
+// InsertEmptyImportEnrichmentRun creates the terminal ENRICHMENT row for an import that
+// applied no enrichment (court_records_updated=0, status stamped by the close). ON CONFLICT
+// DO NOTHING guards the race with a late application landing between the close UPDATE and
+// this INSERT.
+func (r *pgRepository) InsertEmptyImportEnrichmentRun(ctx context.Context, tx database.Tx, params CloseEnrichmentRunParams) error {
+	tid, err := uuid.Parse(params.TenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	bid, err := uuid.Parse(params.BackfillJobID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	err = acquisitiondb.New(tx).InsertEmptyImportEnrichmentRun(ctx, acquisitiondb.InsertEmptyImportEnrichmentRunParams{
+		TenantID:      tid,
+		BackfillJobID: pgtype.UUID{Bytes: bid, Valid: true},
+		At:            pgtype.Timestamptz{Time: params.At, Valid: true},
+		Status:        params.Status,
+	})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 // FindOrCreateCourtRecord resolves a court record by its natural key inside the
@@ -1169,6 +1647,7 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 			AssignedUserName: row.AssignedUserName,
 			LastMovementText: row.LastMovementText,
 			LastMovementAt:   timestampPtr(row.LastMovementAt),
+			NextDeadline:     mapNextDeadline(row.NextDeadlineEndDate, row.NextDeadlineDaysLeft, row.NextDeadlineKind),
 		})
 	}
 	return out, nil
@@ -1213,6 +1692,7 @@ func (r *pgRepository) GetProcesso(ctx context.Context, tenantID, id string) (Pr
 		AssignedUserName: row.AssignedUserName,
 		LastMovementText: row.LastMovementText,
 		LastMovementAt:   timestampPtr(row.LastMovementAt),
+		NextDeadline:     mapNextDeadline(row.NextDeadlineEndDate, row.NextDeadlineDaysLeft, row.NextDeadlineKind),
 	}, nil
 }
 
@@ -1238,6 +1718,8 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		Type:              q.Type,
 		UserStatus:        q.UserStatus,
 		Court:             q.Court,
+		AssigneeID:        nullUUID(q.Assignee),
+		Urgencia:          q.Urgencia,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
 	})
@@ -1247,19 +1729,27 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, IntimacaoView{
-			ID:              row.ID.String(),
-			CNJNumber:       row.CnjNumber,
-			Court:           row.Court,
-			Degree:          row.Degree,
-			Type:            deref(row.Type),
-			Status:          row.Status,
-			UserStatus:      row.UserStatus,
-			Source:          row.Source,
-			SourceURL:       deref(row.SourceUrl),
-			MadeAvailableAt: row.MadeAvailableAt.Time,
-			PublishedAt:     row.PublishedAt.Time,
-			DeadlineStartAt: row.DeadlineStartAt.Time,
-			ContentPreview:  contentPreview(row.Content),
+			ID:                row.ID.String(),
+			CNJNumber:         row.CnjNumber,
+			Class:             deref(row.Class),
+			Subject:           deref(row.Subject),
+			CourtRecordID:     row.CourtRecordID.String(),
+			Court:             row.Court,
+			Degree:            row.Degree,
+			Type:              deref(row.Type),
+			Status:            row.Status,
+			UserStatus:        row.UserStatus,
+			Source:            row.Source,
+			SourceURL:         deref(row.SourceUrl),
+			MadeAvailableAt:   row.MadeAvailableAt.Time,
+			PublishedAt:       row.PublishedAt.Time,
+			DeadlineStartAt:   row.DeadlineStartAt.Time,
+			ContentPreview:    contentPreview(row.Content),
+			Prazo:             mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			AIAnalyzedAt:      timestampPtr(row.AiAnalyzedAt),
+			ConductorUserID:   uuidPtrFromPgtype(row.ConductorUserID),
+			ConductorUserName: row.ConductorUserName,
+			ReviewerUserID:    uuidPtrFromPgtype(row.ReviewerUserID),
 		})
 	}
 	return out, nil
@@ -1286,10 +1776,17 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 	if err != nil {
 		return IntimacaoDetailView{}, database.WrapInfra(err)
 	}
+	conductorID := uuidPtrFromPgtype(row.ConductorUserID)
+	reviewerID := uuidPtrFromPgtype(row.ReviewerUserID)
+	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt)
+
 	return IntimacaoDetailView{
 		IntimacaoView: IntimacaoView{
 			ID:              row.ID.String(),
 			CNJNumber:       row.CnjNumber,
+			Class:           deref(row.Class),
+			Subject:         deref(row.Subject),
+			CourtRecordID:   row.CourtRecordID.String(),
 			Court:           row.Court,
 			Degree:          row.Degree,
 			Type:            deref(row.Type),
@@ -1303,11 +1800,96 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			// The detail carries the FULL teor below, but ContentPreview stays populated so
 			// the embedded IntimacaoView is a complete list row (nothing the FE reads breaks).
 			ContentPreview: contentPreview(row.Content),
+			Prazo:          mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
 		},
-		Content:     row.Content,
-		JudgingBody: deref(row.JudgingBody),
-		Recipients:  rawArrayOrEmpty(json.RawMessage(row.Recipients)),
+		Content:           row.Content,
+		JudgingBody:       deref(row.JudgingBody),
+		Recipients:        rawArrayOrEmpty(json.RawMessage(row.Recipients)),
+		ConductorUserID:   conductorID,
+		ConductorUserName: row.ConductorUserName,
+		ReviewerUserID:    reviewerID,
+		ReviewerUserName:  row.ReviewerUserName,
+		History:           history,
+		AISummary:         deref(row.AiSummary),
+		AIProvidencias:    decodeProvidencias(row.AiProvidencias),
+		AIAnalyzedAt:      timestampPtr(row.AiAnalyzedAt),
 	}, nil
+}
+
+// decodeProvidencias unmarshals the intimation.ai_providencias jsonb into the wire slice.
+// A NULL/empty column (pré-análise) or a malformed value yields an initialized empty slice
+// (never null) so the FE always maps over an array.
+func decodeProvidencias(raw []byte) []IntimacaoProvidenciaView {
+	out := []IntimacaoProvidenciaView{}
+	if len(raw) == 0 {
+		return out
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
+		return []IntimacaoProvidenciaView{}
+	}
+	return out
+}
+
+// GetIntimacaoAnaliseContext reads one intimation's teor + its court record identification
+// for the AI analysis prompt (POST /v1/intimacoes/:id/analise). A non-uuid :id is client
+// input → the typed KindInvalid (→ 400); a miss — or a foreign tenant's row — is the typed
+// ErrIntimationNotFound (→ 404), never (nil, nil).
+func (r *pgRepository) GetIntimacaoAnaliseContext(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseCtx, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return IntimacaoAnaliseCtx{}, database.WrapInfra(err)
+	}
+	iid, err := uuid.Parse(intimationID)
+	if err != nil {
+		return IntimacaoAnaliseCtx{}, apperr.NewInvalid("id de intimação inválido")
+	}
+	row, err := r.q.GetIntimacaoAnaliseContext(ctx, acquisitiondb.GetIntimacaoAnaliseContextParams{ID: iid, TenantID: tid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return IntimacaoAnaliseCtx{}, ErrIntimationNotFound
+	}
+	if err != nil {
+		return IntimacaoAnaliseCtx{}, database.WrapInfra(err)
+	}
+	endDate := ""
+	if row.DeadlineEndDate.Valid {
+		endDate = row.DeadlineEndDate.Time.Format(dateLayout)
+	}
+
+	members, err := r.ListActiveMembers(ctx, tenantID)
+	if err != nil {
+		return IntimacaoAnaliseCtx{}, err
+	}
+
+	return IntimacaoAnaliseCtx{
+		Content:         row.Content,
+		Type:            row.Type,
+		CNJNumber:       row.CnjNumber,
+		Court:           row.Court,
+		Degree:          row.Degree,
+		Class:           deref(row.Class),
+		Subject:         deref(row.Subject),
+		DeadlineEndDate: endDate,
+		Members:         members,
+	}, nil
+}
+
+// ListActiveMembers reads the tenant's ACTIVE firm members (internal app_user id + name) on
+// the pool — the assignable responsáveis the analyze_intimation prompt lists. A malformed
+// tenant id is infra-wrapped; the empty tenant yields an empty slice (never nil).
+func (r *pgRepository) ListActiveMembers(ctx context.Context, tenantID string) ([]MemberCtx, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListActiveMembers(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]MemberCtx, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, MemberCtx{UserID: row.ID.String(), Name: deref(row.Name)})
+	}
+	return out, nil
 }
 
 // ListAndamentosByProcesso reads one process's docket entries (keyset-paginated,
@@ -1473,6 +2055,8 @@ func (r *pgRepository) ListIntimacoesByProcesso(ctx context.Context, q Intimacoe
 		out = append(out, IntimacaoView{
 			ID:              row.ID.String(),
 			CNJNumber:       row.CnjNumber,
+			Class:           deref(row.Class),
+			CourtRecordID:   row.CourtRecordID.String(),
 			Court:           row.Court,
 			Degree:          row.Degree,
 			Type:            deref(row.Type),
@@ -1594,11 +2178,44 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, q IntimacoesQuery) (
 		Type:       q.Type,
 		UserStatus: q.UserStatus,
 		Court:      q.Court,
+		AssigneeID: nullUUID(q.Assignee),
+		Urgencia:   q.Urgencia,
 	})
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
 	}
 	return filtered, total, nil
+}
+
+// BucketIntimacoes counts intimations per urgência section (Em atraso / Vence
+// hoje / Esta semana / Mais adiante / Sem prazo) for the list envelope's `buckets`
+// object. It applies the same non-urgência filters (type, user_status, court,
+// search) as ListIntimacoes so the section headers agree with the filtered list —
+// without an extra full-scan round-trip (one aggregate query).
+func (r *pgRepository) BucketIntimacoes(ctx context.Context, q IntimacoesQuery) (IntimacaoBucketsView, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return IntimacaoBucketsView{}, database.WrapInfra(err)
+	}
+	row, err := r.q.CountIntimacoesBuckets(ctx, acquisitiondb.CountIntimacoesBucketsParams{
+		TenantID:   tid,
+		Search:     escapeLike(q.Search),
+		Type:       q.Type,
+		UserStatus: q.UserStatus,
+		Court:      q.Court,
+	})
+	if err != nil {
+		return IntimacaoBucketsView{}, database.WrapInfra(err)
+	}
+	return IntimacaoBucketsView{
+		Atraso:           row.Atraso,
+		Hoje:             row.Hoje,
+		ProximosDoisDias: row.ProximosDoisDias,
+		EstaSemana:       row.EstaSemana,
+		SemProvidencia:   row.SemProvidencia,
+		MaisAdiante:      row.MaisAdiante,
+		NaoConfirmado:    row.NaoConfirmado,
+	}, nil
 }
 
 // ListProcessoCourts reads the distinct courts of the tenant's live records (the
@@ -1693,12 +2310,15 @@ func (r *pgRepository) SummarizeIntimacoes(ctx context.Context, tenantID string)
 		return IntimacoesSummaryView{}, database.WrapInfra(err)
 	}
 	return IntimacoesSummaryView{
-		Total:      row.Total,
-		Pendentes:  row.Pendentes,
-		EmAnalise:  row.EmAnalise,
-		Resolvidas: row.Resolvidas,
-		Ignoradas:  row.Ignoradas,
-		Criticas:   row.Criticas,
+		Total:         row.Total,
+		Pendentes:     row.Pendentes,
+		EmAnalise:     row.EmAnalise,
+		Resolvidas:    row.Resolvidas,
+		Ignoradas:     row.Ignoradas,
+		Criticas:      row.Criticas,
+		EmAtraso:      row.EmAtraso,
+		VencemHoje:    row.VencemHoje,
+		NaoConfirmado: row.NaoConfirmado,
 	}, nil
 }
 
@@ -1728,6 +2348,120 @@ func (r *pgRepository) SetIntimationUserStatus(ctx context.Context, tx database.
 		return database.WrapInfra(err)
 	}
 	return nil
+}
+
+// AssignIntimacaoResponsaveis sets (or clears, with nil) the conductor_user_id and
+// reviewer_user_id on one intimação inside the caller's tx, tenant-scoped (barrier 1, RLS
+// barrier 2). The use case already validated membership; we parse & pass the UUIDs here.
+// A zero-row UPDATE surfaces as ErrIntimationNotFound (→ 404), never a silent no-op.
+func (r *pgRepository) AssignIntimacaoResponsaveis(ctx context.Context, tx database.Tx, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	iid, err := uuid.Parse(intimationID)
+	if err != nil {
+		return apperr.NewInvalid("id de intimação inválido")
+	}
+
+	toNullableUUID := func(s *string) (pgtype.UUID, error) {
+		if s == nil {
+			return pgtype.UUID{}, nil
+		}
+		u, err := uuid.Parse(*s)
+		if err != nil {
+			return pgtype.UUID{}, apperr.NewInvalid("id de usuário inválido")
+		}
+		return pgtype.UUID{Bytes: u, Valid: true}, nil
+	}
+
+	conductor, err := toNullableUUID(conductorUserID)
+	if err != nil {
+		return err
+	}
+	reviewer, err := toNullableUUID(reviewerUserID)
+	if err != nil {
+		return err
+	}
+
+	_, err = acquisitiondb.New(tx).AssignIntimationResponsaveis(ctx, acquisitiondb.AssignIntimationResponsaveisParams{
+		ID:              iid,
+		TenantID:        tid,
+		ConductorUserID: conductor,
+		ReviewerUserID:  reviewer,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrIntimationNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// conductorPtrToUUID converte *string (id do condutor; nil = desatribuir) em pgtype.UUID.
+func conductorPtrToUUID(s *string) (pgtype.UUID, error) {
+	if s == nil {
+		return pgtype.UUID{}, nil
+	}
+	u, err := uuid.Parse(*s)
+	if err != nil {
+		return pgtype.UUID{}, apperr.NewInvalid("id de usuário inválido")
+	}
+	return pgtype.UUID{Bytes: u, Valid: true}, nil
+}
+
+func (r *pgRepository) BulkAssignConductorByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, conductorUserID *string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	uuids := make([]uuid.UUID, 0, len(ids))
+	for _, id := range ids {
+		u, perr := uuid.Parse(id)
+		if perr != nil {
+			return 0, apperr.NewInvalid("id de intimação inválido")
+		}
+		uuids = append(uuids, u)
+	}
+	conductor, err := conductorPtrToUUID(conductorUserID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := acquisitiondb.New(tx).BulkAssignConductorByIDs(ctx, acquisitiondb.BulkAssignConductorByIDsParams{
+		TenantID:        tid,
+		Ids:             uuids,
+		ConductorUserID: conductor,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return n, nil
+}
+
+func (r *pgRepository) BulkAssignConductorByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, conductorUserID *string) (int64, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	conductor, err := conductorPtrToUUID(conductorUserID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := acquisitiondb.New(tx).BulkAssignConductorByFilter(ctx, acquisitiondb.BulkAssignConductorByFilterParams{
+		TenantID:        tid,
+		ConductorUserID: conductor,
+		Search:          escapeLike(q.Search),
+		Type:            q.Type,
+		UserStatus:      q.UserStatus,
+		Court:           q.Court,
+		AssigneeID:      nullUUID(q.Assignee),
+		Urgencia:        q.Urgencia,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return n, nil
 }
 
 // newCourtRecordEntity assembles the CourtRecord the use case works with from the
@@ -1809,6 +2543,17 @@ func timestampPtr(ts pgtype.Timestamptz) *time.Time {
 	}
 	t := ts.Time
 	return &t
+}
+
+// dateStrPtr formats a nullable date column to the wire layout (2006-01-02) as a
+// *string — nil when NULL, so an absent window bound serializes as JSON null (the
+// Captures view uses *string windows, unlike the reconciliation view's "" sentinel).
+func dateStrPtr(d pgtype.Date) *string {
+	if !d.Valid {
+		return nil
+	}
+	s := d.Time.Format(dateLayout)
+	return &s
 }
 
 // GetResumoContext assembles the full context for the AI process summary (GET
@@ -1926,13 +2671,153 @@ func uuidStrPtr(u pgtype.UUID) *string {
 // full (often long, HTML) content is a detail-screen concern.
 const contentPreviewLen = 500
 
-// contentPreview truncates the teor to contentPreviewLen runes for the inbox list.
+// contentPreview strips HTML tags, decodes entities, collapses whitespace, and
+// then truncates the result to contentPreviewLen runes for the inbox list. The
+// full raw HTML content is returned unchanged on the detail endpoint.
 func contentPreview(content string) string {
-	runes := []rune(content)
+	plain := htmlPlaintext(content)
+	runes := []rune(plain)
 	if len(runes) <= contentPreviewLen {
-		return content
+		return plain
 	}
 	return string(runes[:contentPreviewLen])
+}
+
+// mapPrazo converts the nullable prazo columns (LEFT JOIN deadline) from the sqlc
+// row into a *IntimacaoPrazoView. Returns nil when there is no derived deadline
+// (PrazoDeadlineID.Valid is false — the LEFT JOIN missed). PrazoDaysLeft and
+// PrazoConfirmed are interface{} (sqlc cannot infer the CASE WHEN expression type),
+// so they are decoded via type assertion from pgx's native scan types: int64 for
+// the int expression and bool for the boolean expression.
+func mapPrazo(
+	deadlineID pgtype.UUID,
+	endDate pgtype.Date,
+	daysLeft interface{},
+	status *string,
+	confirmed interface{},
+) *IntimacaoPrazoView {
+	if !deadlineID.Valid {
+		return nil
+	}
+	var days int
+	switch v := daysLeft.(type) {
+	case int64:
+		days = int(v)
+	case int32:
+		days = int(v)
+	}
+	var conf bool
+	if b, ok := confirmed.(bool); ok {
+		conf = b
+	}
+	return &IntimacaoPrazoView{
+		DeadlineID: uuid.UUID(deadlineID.Bytes).String(),
+		EndDate:    endDate.Time,
+		DaysLeft:   days,
+		Status:     deref(status),
+		Confirmed:  conf,
+	}
+}
+
+// mapNextDeadline converts the nullable next_deadline columns (LEFT JOIN LATERAL
+// deadline) from the sqlc row into a *NextDeadlineView. Returns nil when there is no
+// OPEN/PENDING prazo for the process (LATERAL returned no row — endDate.Valid is
+// false). NextDeadlineDaysLeft is interface{} (sqlc cannot infer the CASE WHEN
+// expression type), decoded via type assertion from pgx's native int64/int32.
+func mapNextDeadline(endDate pgtype.Date, daysLeft interface{}, kind *string) *NextDeadlineView {
+	if !endDate.Valid {
+		return nil
+	}
+	var days int
+	switch v := daysLeft.(type) {
+	case int64:
+		days = int(v)
+	case int32:
+		days = int(v)
+	}
+	return &NextDeadlineView{
+		EndDate:  endDate.Time,
+		DaysLeft: days,
+		Kind:     deref(kind),
+	}
+}
+
+// uuidPtrFromPgtype converts a nullable sqlc UUID field to a *string (nil when absent).
+// Used to map conductor_user_id / reviewer_user_id from GetIntimacaoRow.
+func uuidPtrFromPgtype(u pgtype.UUID) *string {
+	if !u.Valid {
+		return nil
+	}
+	s := uuid.UUID(u.Bytes).String()
+	return &s
+}
+
+// buildIntimacaoHistory assembles the derived timeline for IntimacaoDetailView from the
+// fields already fetched by GetIntimacao — no extra round-trip, no new table. The
+// function always returns an initialized (non-nil) slice. Entries:
+//  1. Capturada: made_available_at (DATE → UTC midnight).
+//  2. Prazo confirmado: deadline.confirmed_at, when confirmed_by IS NOT NULL AND
+//     status is OPEN (confirmed) or NO_DEADLINE; label includes the confirmer name when
+//     available. Absent when there is no deadline or it is not yet confirmed.
+//  3. Providências geradas: ai_analyzed_at, when the analysis has run at least once.
+//
+// Ordered ASC by occurred_at (the three sources don't have a fixed relative order — a
+// re-analysis can happen before or after the prazo is confirmed — so the slice is sorted
+// after assembly rather than relying on append order).
+func buildIntimacaoHistory(
+	madeAvailableAt pgtype.Date,
+	confirmedAt pgtype.Timestamptz,
+	confirmedByName *string,
+	deadlineStatus *string,
+	aiAnalyzedAt pgtype.Timestamptz,
+) []IntimacaoHistoryEntry {
+	entries := make([]IntimacaoHistoryEntry, 0, 3)
+
+	// 1. Captura — made_available_at is always present (NOT NULL column).
+	if madeAvailableAt.Valid {
+		entries = append(entries, IntimacaoHistoryEntry{
+			OccurredAt: madeAvailableAt.Time,
+			Label:      "Capturada do DJEN",
+		})
+	}
+
+	// 2. Prazo confirmado — only when confirmed_at is present (confirmed_by IS NOT NULL).
+	if confirmedAt.Valid && deadlineStatus != nil {
+		var label string
+		switch *deadlineStatus {
+		case "NO_DEADLINE":
+			if confirmedByName != nil && *confirmedByName != "" {
+				label = "Declarado sem prazo por " + *confirmedByName
+			} else {
+				label = "Declarado sem prazo"
+			}
+		default: // OPEN, MET, MISSED — all result from a human confirmation
+			if confirmedByName != nil && *confirmedByName != "" {
+				label = "Prazo confirmado por " + *confirmedByName
+			} else {
+				label = "Prazo confirmado"
+			}
+		}
+		entries = append(entries, IntimacaoHistoryEntry{
+			OccurredAt: confirmedAt.Time,
+			Label:      label,
+		})
+	}
+
+	// 3. Providências geradas — the analysis card was run (at least once; a re-run just
+	// bumps the timestamp, so this always reflects the LAST generation, not every attempt).
+	if aiAnalyzedAt.Valid {
+		entries = append(entries, IntimacaoHistoryEntry{
+			OccurredAt: aiAnalyzedAt.Time,
+			Label:      "Providências geradas",
+		})
+	}
+
+	sort.Slice(entries, func(a, b int) bool {
+		return entries[a].OccurredAt.Before(entries[b].OccurredAt)
+	})
+
+	return entries
 }
 
 // nullDate maps the zero time to a SQL NULL date (Valid:false) for the nullable

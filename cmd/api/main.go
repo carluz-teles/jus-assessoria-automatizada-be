@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"time"
 
@@ -151,6 +152,9 @@ func run(logger *slog.Logger) error {
 		events.NewOutbox(),
 		deadline.NewDedup(),
 		uow,
+		// The read-only confirmation-panel preview (POST /v1/prazos/preview) reads the intimação's
+		// anchors/court on the pool, off the transactional path.
+		deadline.WithPreviewPool(pool),
 	)
 	deadlineReadUC := deadline.NewReadUseCase(deadline.NewReadRepository(pool))
 	// AI task suggestion (on-demand): the meta-prompt composer + the LLM generator (OpenRouter),
@@ -192,6 +196,46 @@ func run(logger *slog.Logger) error {
 		indexing.SearchDeps{Pool: pool},
 		cfg.OpenRouterModel,
 	)
+	// Intimation analysis (AI) — POST /v1/intimacoes/:id/analise ("Analisar esta intimação").
+	// Same pattern as resumoUC: the read use case + the shared meta-prompt composer + the SAME
+	// optional LLM generator (no second OpenRouter client). No RAG (the teor is self-contained).
+	// The store OVERWRITES on each call ("Gerar novamente"); the use case degrades to an empty
+	// analysis when taskGenerator is nil, so the endpoint always answers 200 (never a boot fail).
+	analiseUC := acquisition.NewAnaliseUseCase(
+		acquisition.NewReadUseCase(acquisitionRepo),
+		advisory.NewTemplateComposer(),
+		taskGenerator,
+		acquisition.NewAnaliseStore(uow),
+	)
+	// Providência actions (aprovar/descartar) on the analysis card — flip one suggested
+	// providência's status by index over the unit of work. The real task is created by the FE
+	// via POST /v1/tasks (deadline slice) before the aprovar call, so this stays decoupled.
+	providenciaUC := acquisition.NewProvidenciaActionUseCase(uow)
+	// OAB name lookup (GET /v1/acquisition/oab-lookup, onboarding/Termos best-effort
+	// auto-fill): its own DJENConnector instance — no free public OAB registry API
+	// exists (the OAB's own CNA web service requires an institutional Authentication
+	// Key we don't have; see oab_lookup.go), so this reuses the SAME public consulta
+	// the worker's backfill uses, just a single on-demand page. Same env-derived
+	// proxy/rate/page-size options as worker-ingestao, but a SEPARATE process (a
+	// different binary/container), so its rate limiter/cooldown cannot be shared with
+	// the worker's — an accepted v0 tradeoff given this is a low-volume, occasional
+	// call (one OAB add at a time), not a bulk sweep.
+	djenLookupOpts := []acquisition.DJENOption{}
+	if cfg.DJENProxyURL != "" {
+		proxyURL, perr := url.Parse(cfg.DJENProxyURL)
+		if perr != nil {
+			return fmt.Errorf("parse DJEN_PROXY_URL: %w", perr)
+		}
+		djenLookupOpts = append(djenLookupOpts, acquisition.WithDJENProxy(proxyURL))
+	}
+	if cfg.DJENRatePerMinute > 0 {
+		djenLookupOpts = append(djenLookupOpts, acquisition.WithDJENRatePerMinute(cfg.DJENRatePerMinute))
+	}
+	if cfg.DJENPageSize > 0 {
+		djenLookupOpts = append(djenLookupOpts, acquisition.WithDJENPageSize(cfg.DJENPageSize))
+	}
+	djenLookupConnector := acquisition.NewDJENConnector(djenLookupOpts...)
+
 	// Acquisition wiring: the slice owns the domain; the binary only assembles it
 	// (repo + shared outbox + unit of work → write use case; the same repo backs the
 	// read use case for the processos/intimações screen reads; the same read use case
@@ -201,8 +245,12 @@ func run(logger *slog.Logger) error {
 	acquisitionHandler := acquisition.NewHandler(
 		acquisition.NewUseCase(acquisitionRepo, events.NewOutbox(), uow,
 			acquisition.WithActivationEntitlementChecker(acquisitionEntitlement)),
-		acquisition.NewReadUseCase(acquisitionRepo),
+		acquisition.NewReadUseCase(acquisitionRepo,
+			acquisition.WithCaptureDailyTime(cfg.CaptureDailyTime)),
 		resumoUC,
+		analiseUC,
+		providenciaUC,
+		djenLookupConnector,
 	)
 	// The suggester also captures provenance (feedback loop, camada 1): every suggestion batch
 	// is persisted (best-effort) via its own tx so the confirm can later diff it against the

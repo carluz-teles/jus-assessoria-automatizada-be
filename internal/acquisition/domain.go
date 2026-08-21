@@ -56,13 +56,12 @@ func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork, opts
 	return uc
 }
 
-// ActivateIntegration activates every requested source under one shared scope,
-// atomically: one integration row per source is upserted and an
-// integration_activated event is written to the outbox in the SAME transaction.
-// If anything fails — an upsert or a publish — the whole batch rolls back, so a
-// request that names two sources never persists one row and loses the other.
+// ActivateIntegration activates the tenant's DJEN watch under the given scope,
+// atomically: the integration row is upserted and an integration_activated event
+// is written to the outbox in the SAME transaction. DJEN is the only activatable
+// source (see ActivateIntegrationRequest) — there is no source selector.
 //
-// The event fires only when activation changed something: a brand-new source, a
+// The event fires only when activation changed something: a first activation, a
 // changed scope, or a re-activation of a source that was not ACTIVE. Re-posting
 // an identical, already-active integration is a no-op event-wise (the row's
 // updated_at still advances), so a retry does not spam consumers.
@@ -76,34 +75,31 @@ func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork, opts
 // event, and never triggers the backfill listener — the ERD's edge-of-the-API
 // entitlement gate, distinct from the worker's own per-record gate in sync.go
 // (which lets a sync cycle continue past an individual blocked record).
-func (uc *UseCase) ActivateIntegration(ctx context.Context, tenantID string, sources []string, scope Scope) ([]*Integration, error) {
+func (uc *UseCase) ActivateIntegration(ctx context.Context, tenantID string, scope Scope) (*Integration, error) {
 	if err := uc.checkEntitlement(ctx, tenantID); err != nil {
 		return nil, err
 	}
 
-	activated := make([]*Integration, 0, len(sources))
+	var activated *Integration
 
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
-		activated = activated[:0]
-		for _, source := range sources {
-			before, err := uc.currentIntegration(ctx, tx, tenantID, source)
-			if err != nil {
-				return err
-			}
-
-			after, err := uc.repo.Upsert(ctx, tx, tenantID, source, scope)
-			if err != nil {
-				return err
-			}
-
-			if activationChanged(before, after) {
-				if err := uc.outbox.Publish(ctx, tx, newIntegrationActivated(after)); err != nil {
-					return err
-				}
-			}
-
-			activated = append(activated, after)
+		before, err := uc.currentIntegration(ctx, tx, tenantID, SourceDJEN)
+		if err != nil {
+			return err
 		}
+
+		after, err := uc.repo.Upsert(ctx, tx, tenantID, SourceDJEN, scope)
+		if err != nil {
+			return err
+		}
+
+		if activationChanged(before, after) {
+			if err := uc.outbox.Publish(ctx, tx, newIntegrationActivated(after)); err != nil {
+				return err
+			}
+		}
+
+		activated = after
 		return nil
 	})
 	if err != nil {
@@ -152,6 +148,73 @@ func (uc *UseCase) AssignResponsible(ctx context.Context, tenantID, courtRecordI
 
 		return uc.repo.AssignCaseResponsible(ctx, tx, tenantID, caseID, assignedUserID)
 	})
+}
+
+// AssignIntimacaoResponsaveis sets (or clears, when nil) the conductor and reviewer on one
+// intimação, in ONE transaction (UoW → SET LOCAL app.tenant_id, RLS as a second barrier
+// under the explicit tenant filter). For each non-nil assignee, the use case guards that the
+// target user is an app_user of the same tenant (reuses AppUserInTenant, same guard as
+// AssignResponsible for processos). A nil clears the role ("desatribuir"). A miss or a
+// foreign tenant's row is ErrIntimationNotFound (→ 404).
+//
+// No outbox event here: there is no consumer of an assignment fact yet — auditoria/evento
+// is a future slice. When that lands, the event publishes in THIS same tx.
+// tenantID comes from the verified principal, never the body.
+func (uc *UseCase) AssignIntimacaoResponsaveis(
+	ctx context.Context,
+	tenantID, intimationID string,
+	conductorUserID, reviewerUserID *string,
+) error {
+	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		for _, uid := range []*string{conductorUserID, reviewerUserID} {
+			if uid == nil {
+				continue
+			}
+			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *uid)
+			if err != nil {
+				return err
+			}
+			if !member {
+				return ErrResponsibleNotMember
+			}
+		}
+		return uc.repo.AssignIntimacaoResponsaveis(ctx, tx, tenantID, intimationID, conductorUserID, reviewerUserID)
+	})
+}
+
+// BulkAssignConductor atribui o condutor a várias intimações de uma vez. Dois modos
+// (mutuamente exclusivos): All=true aplica a TODA a faixa/filtro atual (q — mesmos
+// filtros do ListIntimacoes; inclui os não paginados); senão aplica à lista ids.
+// Valida a pertinência do condutor (quando não-nil) antes do write, numa única tx
+// (UoW + RLS). Devolve quantas linhas foram afetadas.
+func (uc *UseCase) BulkAssignConductor(
+	ctx context.Context,
+	tenantID string,
+	all bool,
+	q IntimacoesQuery,
+	ids []string,
+	conductorUserID *string,
+) (int64, error) {
+	var n int64
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		if conductorUserID != nil {
+			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *conductorUserID)
+			if err != nil {
+				return err
+			}
+			if !member {
+				return ErrResponsibleNotMember
+			}
+		}
+		var err error
+		if all {
+			n, err = uc.repo.BulkAssignConductorByFilter(ctx, tx, q, conductorUserID)
+		} else {
+			n, err = uc.repo.BulkAssignConductorByIDs(ctx, tx, tenantID, ids, conductorUserID)
+		}
+		return err
+	})
+	return n, err
 }
 
 // ResolveIntimacao / IgnoreIntimacao / ReopenIntimacao are the triagem actions the user

@@ -36,10 +36,11 @@ func (p *fakeMatchParser) Parse(_ context.Context, raw RawPayload) (ParsedResult
 }
 
 type stubMatchRepo struct {
-	matches     []PublicationMatch
-	findCalls   int
-	upsertCalls int
-	lockTenants []string
+	matches       []PublicationMatch
+	findCalls     int
+	upsertCalls   int
+	lockTenants   []string
+	captureParams []DailyCaptureParams
 }
 
 func (r *stubMatchRepo) MatchPublicationsByDay(context.Context, database.Tx, time.Time) ([]PublicationMatch, error) {
@@ -60,12 +61,18 @@ func (r *stubMatchRepo) BatchUpsertCourtRecords(_ context.Context, _ database.Tx
 	}
 	return outcomes, len(params), nil
 }
-func (r *stubMatchRepo) UpsertIntimations(_ context.Context, _ database.Tx, _ []IntimationParams) ([]IntimationChange, []IntimationChange, error) {
+func (r *stubMatchRepo) UpsertIntimations(_ context.Context, _ database.Tx, params []IntimationParams) ([]IntimationChange, []IntimationChange, error) {
 	r.upsertCalls++
-	// The national match path discards the change slices (see MatchUseCase.writeForTenant),
-	// so nil expresses the discard semantics — returning N zero-value structs would falsely
-	// suggest N rows were classified as "new".
-	return nil, nil, nil
+	// The national match path discards the cancelled slice, but the NEW slice count is
+	// the capture's intimations_new — return one "new" change per param so the audit row
+	// under test carries an honest tally.
+	newRows := make([]IntimationChange, len(params))
+	return newRows, nil, nil
+}
+
+func (r *stubMatchRepo) WriteDailyCaptureRun(_ context.Context, _ database.Tx, p DailyCaptureParams) error {
+	r.captureParams = append(r.captureParams, p)
+	return nil
 }
 
 // --- tests -------------------------------------------------------------------
@@ -111,7 +118,8 @@ func TestMatchUseCase_MatchDay(t *testing.T) {
 	uow := &stubMatchUoW{}
 	uc := NewMatchUseCase(repo, uow, parser)
 
-	if err := uc.MatchDay(context.Background(), time.Now()); err != nil {
+	day := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
+	if err := uc.MatchDay(context.Background(), day); err != nil {
 		t.Fatalf("MatchDay: %v", err)
 	}
 
@@ -128,6 +136,24 @@ func TestMatchUseCase_MatchDay(t *testing.T) {
 	slices.Sort(uow.tenants)
 	if !slices.Equal(uow.tenants, []string{"A", "B"}) {
 		t.Errorf("write txs for tenants = %v, want [A B]", uow.tenants)
+	}
+	// Each tenant's fan-out writes exactly one DAILY_CAPTURE audit row (DJEN /
+	// DAILY_CAPTURE), stamped on the processed day, with the tenant's effect: the stub
+	// returns len(params) new records and one "new" intimation per param.
+	if len(repo.captureParams) != 2 {
+		t.Fatalf("DailyCaptureRun writes = %d, want 2", len(repo.captureParams))
+	}
+	for _, p := range repo.captureParams {
+		if p.CourtRecordsNew != 1 || p.CourtRecordsUpdated != 0 || p.IntimationsNew != 1 {
+			t.Errorf("capture tally = {new:%d updated:%d intim:%d}, want {1 0 1}",
+				p.CourtRecordsNew, p.CourtRecordsUpdated, p.IntimationsNew)
+		}
+		if !p.Window.Equal(day) {
+			t.Errorf("capture window = %v, want the processed day %v", p.Window, day)
+		}
+		if p.FinishedAt.Before(p.StartedAt) {
+			t.Errorf("capture finished_at %v before started_at %v", p.FinishedAt, p.StartedAt)
+		}
 	}
 }
 

@@ -17,6 +17,16 @@ import (
 // another consumer of the same intimation.observed event.
 const consumerDeadline = "deadline"
 
+// intimationTypeComunicacao is the generic-communication kind (Edital and anything that
+// is not an INTIMACAO/CITACAO). It opens no prazo. The lean-ingestion cut already drops
+// these at the DJEN parser, so in the current pipeline no intimation.observed carries it;
+// this local const backs a belt-and-suspenders no-op in OnIntimationObserved that protects
+// this slice against a FUTURE producer that emits one. Kept as a LOCAL literal (not an
+// acquisition import) to preserve the slice's rule of reading the value, never importing
+// the producer's entity — it mirrors acquisition.IntimationTypeComunicacao by contract,
+// guarded by the events round-trip test.
+const intimationTypeComunicacao = "COMUNICACAO"
+
 // consumerReconcile is the SEPARATE processed_event consumer name the docket-entry reconcile
 // dedups under. Dedup is per-consumer (docs §4c.3), so the reconcile MUST NOT reuse
 // consumerDeadline: docket_entry_observed and intimation.observed are different events, but
@@ -61,6 +71,17 @@ type Repository interface {
 	// the fixed anchor the recompute re-counts from. A missing prazo for the intimação
 	// is ErrDeadlineNotFound (→ 404 at the edge), never (nil, nil).
 	GetDeadlineForConfirm(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*DeadlineForConfirm, error)
+	// GetIntimationAnchors loads the three observed dates of the intimação (made_available_at,
+	// published_at, deadline_start_at) the confirmation panel can re-anchor a prazo on, scoped
+	// to tenantID (barrier 1). All three are NOT NULL date columns. A missing/foreign intimação
+	// is ErrDeadlineNotFound (→ 404 at the edge, the prazo's anchor cannot be resolved), never
+	// (nil, nil).
+	GetIntimationAnchors(ctx context.Context, tx database.Tx, intimationID, tenantID string) (IntimationAnchors, error)
+	// GetPreviewContext loads the confirmation panel's preview context (the three anchor dates +
+	// the process's court sigla) for an intimação, scoped to tenantID (barrier 1). It backs the
+	// read-only POST /v1/prazos/preview: the use case passes the pool (not a tx) as the Tx, so
+	// the read runs off the transactional path. A missing/foreign intimação is ErrDeadlineNotFound.
+	GetPreviewContext(ctx context.Context, tx database.Tx, intimationID, tenantID string) (PreviewContext, error)
 	// GetCourtRecordCourt reads the court sigla for the record, scoped to tenantID
 	// (barrier 1). The confirm recompute derives the UF from it (pkg/tribunal.UF); it is
 	// the confirm counterpart of GetCourtRecordClass (same read-the-table, never import
@@ -158,6 +179,19 @@ type Repository interface {
 	// ErrDeadlineNotFound (the reconcile's no-op). On a hit it returns the id so deadline.met
 	// commits in the same tx. It mirrors MarkMissed, widened to the two reconcilable statuses.
 	MarkMet(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
+	// MarkNoDeadline flips a prazo PENDING|OPEN → NO_DEADLINE ("mera ciência"), stamping
+	// confirmed_by/at, keyed by its id and scoped to tenantID (barrier 1). The
+	// `status IN ('PENDING','OPEN')` guard makes the flip safe and idempotent; the use case
+	// pre-reads the status to distinguish a 404 miss from a 409 terminal. A no-match is
+	// ErrDeadlineNotFound. Returns the flipped prazo's id so deadline.no_deadline commits in the
+	// same tx.
+	MarkNoDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID, confirmedBy string, confirmedAt time.Time) (string, error)
+	// ReopenNoDeadline reverts a NO_DEADLINE prazo → PENDING, clearing confirmed_by/at, keyed by
+	// its id and scoped to tenantID (barrier 1). The `status = 'NO_DEADLINE'` guard makes it safe
+	// and idempotent; the use case pre-reads the status to distinguish a 404 miss from a 409
+	// not-NO_DEADLINE. A no-match is ErrDeadlineNotFound. Returns the reopened prazo's id so
+	// deadline.reopened commits in the same tx.
+	ReopenNoDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
 	// EnsureTaskInTenant guards the checklist writes: it confirms the parent task exists in the
 	// tenant (POST /v1/tasks/:id/items) before any item write, scoped to tenantID (barrier 1). A
 	// missing/foreign task id is ErrTaskItemNotFound (→ 404), so an item can never be grafted onto
@@ -231,6 +265,11 @@ type UseCase struct {
 	dedup  deduper
 	uow    database.UnitOfWork
 	now    func() time.Time
+	// pool backs the read-only POST /v1/prazos/preview (no UoW, off the transactional path): it
+	// is passed as a database.Tx to the repo's pool-safe reads (barrier 1 filter, no RLS SET
+	// LOCAL — the same posture as the read models). nil disables Preview (the composition always
+	// injects it via WithPreviewPool in the api).
+	pool database.Tx
 }
 
 // Option configures a UseCase at construction. Kept as functional options so the clock
@@ -242,6 +281,13 @@ type Option func(*UseCase)
 // it to assert deterministically which D-N marks a given end_date schedules.
 func WithClock(now func() time.Time) Option {
 	return func(uc *UseCase) { uc.now = now }
+}
+
+// WithPreviewPool injects the connection pool the read-only Preview uses (as a database.Tx) so
+// POST /v1/prazos/preview reads the intimação's anchors/court off the transactional path. The
+// api composes it; the worker (which never serves preview) leaves it nil.
+func WithPreviewPool(pool database.Tx) Option {
+	return func(uc *UseCase) { uc.pool = pool }
 }
 
 // NewUseCase wires the use case to its repository, calendar, outbox publisher, dedup
@@ -278,6 +324,14 @@ var reminderDaysLeft = []int{3, 1, 0}
 // tenantID comes from the event payload (a trusted producer inside the same system, no
 // Clerk token on the worker) and scopes the transaction's RLS.
 func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserved) error {
+	// Defensive no-op: a generic COMUNICACAO opens no prazo. The DJEN parser already
+	// drops these before they become an intimation.observed, so this never fires in the
+	// current pipeline — it is the belt-and-suspenders guard against a future producer.
+	// Return before opening any transaction so a stray event is a clean, cheap ack.
+	if ev.Type == intimationTypeComunicacao {
+		return nil
+	}
+
 	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDeadline, ev.EventID)
 		if err != nil {
@@ -335,6 +389,8 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 			Status:          status,
 			Source:          SourceRule,
 			RulesVersion:    rule.RulesVersion,
+			AnchorEvent:     AnchorDeadlineStart, // born on the derived deadline_start_at anchor
+			LegalCitation:   rule.LegalCitation,  // snapshot the rule's citation at derivation
 		}
 		if err := d.validate(); err != nil {
 			return err
@@ -602,6 +658,30 @@ func (uc *UseCase) compute(ctx context.Context, counting Counting, start time.Ti
 		return uc.cal.AddCalendarDays(ctx, start, n, uf, court)
 	}
 	return uc.cal.AddBusinessDays(ctx, start, n, uf, court)
+}
+
+// computeWithExtra is the confirmation-panel recompute: it runs the SAME motor over
+// effectiveDays(days, doubled) PLUS the lawyer's manual_extra_days, all in ONE pass so the extra
+// days are counted by the motor (respecting BUSINESS/CALENDAR) with NO crude date arithmetic and
+// NO double counting against the automatic holidays. It is the single source of truth for the
+// panel's date math, reused by Confirm, Adjust and Preview.
+func (uc *UseCase) computeWithExtra(ctx context.Context, counting Counting, start time.Time, days int, doubled bool, manualExtraDays int, uf, court string) (time.Time, []time.Time, error) {
+	n := effectiveDays(days, doubled) + manualExtraDays
+	return uc.compute(ctx, counting, start, n, uf, court)
+}
+
+// resolveStart maps the chosen AnchorEvent to the intimação's matching observed date, re-anchoring
+// the recompute's start. DEADLINE_START (the default) keeps the stored anchor without an extra
+// read; MADE_AVAILABLE / PUBLISHED read the intimação's real dates (GetIntimationAnchors).
+func (uc *UseCase) resolveStart(ctx context.Context, tx database.Tx, intimationID, tenantID string, anchor AnchorEvent, stored time.Time) (time.Time, error) {
+	if anchor == "" || anchor == AnchorDeadlineStart {
+		return stored, nil
+	}
+	anchors, err := uc.repo.GetIntimationAnchors(ctx, tx, intimationID, tenantID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return anchors.startFor(anchor), nil
 }
 
 // parseWireDate parses the event's anchor (2006-01-02, the acquisition wire format).
