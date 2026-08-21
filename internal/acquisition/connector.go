@@ -21,6 +21,10 @@ type Capability string
 const (
 	// CapabilityFetchByNumber pulls one process by its CNJ number.
 	CapabilityFetchByNumber Capability = "FETCH_BY_NUMBER"
+	// CapabilityFetchBatch pulls MANY processes of one tribunal in a single request
+	// (an ES `terms` query on numeroProcesso). It is the batch enrichment's mode —
+	// ~1000 processes per request instead of one — so 6.684 processos ≈ 7 requests.
+	CapabilityFetchBatch Capability = "FETCH_BATCH"
 	// CapabilityDiscoverByOAB discovers a tenant's processes by OAB over a window
 	// — the mode an onboarding backfill slice drives.
 	CapabilityDiscoverByOAB Capability = "DISCOVER_BY_OAB"
@@ -51,6 +55,9 @@ type FetchRequest struct {
 	// Both are empty for DISCOVER_BY_OAB.
 	CNJNumber string
 	Court     string
+	// CNJNumbers drives FETCH_BATCH: the many processes of ONE tribunal (Court) to
+	// pull in a single _search `terms` request. Empty for the other capabilities.
+	CNJNumbers []string
 }
 
 // RawPayload is a connector's opaque output and the parser's input: the raw

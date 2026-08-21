@@ -45,11 +45,16 @@ func NewDATAJUDParser() *DATAJUDParser {
 
 var _ Parser = (*DATAJUDParser)(nil)
 
-// datajudResponse is the subset of the ES _search envelope the parser reads.
+// datajudResponse is the subset of the ES _search envelope the parser reads. Each hit's
+// _source is held as RawMessage and parsed INDIVIDUALLY (parseSource): DATAJUD occasionally
+// ships a single malformed process among thousands (e.g. a nested-array `assuntos`), and a
+// page-wide Unmarshal would fail the ENTIRE page on that one hit — killing a whole tribunal's
+// enrichment chain and hanging the import. Per-hit parsing isolates the bad process (logged
+// + skipped) so the sweep keeps progressing.
 type datajudResponse struct {
 	Hits struct {
 		Hits []struct {
-			Source datajudSource `json:"_source"`
+			Source json.RawMessage `json:"_source"`
 		} `json:"hits"`
 	} `json:"hits"`
 }
@@ -63,13 +68,48 @@ type datajudSource struct {
 	NivelSigilo     int                `json:"nivelSigilo"`
 	Classe          datajudCodeName    `json:"classe"`
 	OrgaoJulgador   datajudOrgao       `json:"orgaoJulgador"`
-	Assuntos        []datajudCodeName  `json:"assuntos"`
+	Assuntos        datajudAssuntos    `json:"assuntos"`
 	Movimentos      []datajudMovimento `json:"movimentos"`
 }
 
 type datajudCodeName struct {
 	Codigo int    `json:"codigo"`
 	Nome   string `json:"nome"`
+}
+
+// datajudAssuntos is a lenient list of {codigo,nome}: DATAJUD normally sends a flat array of
+// objects, but SOME processes carry a MIXED shape where an element is itself a NESTED ARRAY
+// of objects (e.g. `[{...}, [{"codigo":9580,"nome":"..."}], ...]`). A plain []datajudCodeName
+// fails to unmarshal that array-into-object. This UnmarshalJSON FLATTENS one level of nesting
+// and IGNORES any element that is neither an object nor an array of objects — the parser only
+// needs the first valid subject name, so a malformed element must never be fatal.
+type datajudAssuntos []datajudCodeName
+
+func (a *datajudAssuntos) UnmarshalJSON(data []byte) error {
+	// Decode into raw elements first so a mixed shape (object vs. nested array) does not fail
+	// the whole field; then classify each element leniently.
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		// Not even an array (null/object/garbage): treat as no subjects rather than fatal.
+		return nil
+	}
+	out := make(datajudAssuntos, 0, len(raw))
+	for _, el := range raw {
+		var obj datajudCodeName
+		if err := json.Unmarshal(el, &obj); err == nil {
+			out = append(out, obj)
+			continue
+		}
+		// Not an object — try a nested array of objects and flatten one level.
+		var nested []datajudCodeName
+		if err := json.Unmarshal(el, &nested); err == nil {
+			out = append(out, nested...)
+			continue
+		}
+		// Neither an object nor an array of objects (e.g. a bare string/number): skip it.
+	}
+	*a = out
+	return nil
 }
 
 // datajudOrgao reads only the órgão name — its codigo is an int in _source but a
@@ -170,7 +210,9 @@ func (*DATAJUDParser) CanParse(p RawPayload) bool { return p.Source == SourceDAT
 
 // Parse maps the first hit (a numeroProcesso search returns at most one process per
 // tribunal index) to the graded court record and its movimentos. No hit → empty
-// result. A movimento with an unparseable dataHora is logged and skipped, not fatal.
+// result. The single hit is parsed with the SAME per-hit path as the batch, so a
+// malformed _source (e.g. a nested-array `assuntos`) is a no-op result rather than a fatal
+// error — a bad process must never fail the whole payload.
 func (p *DATAJUDParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult, error) {
 	var resp datajudResponse
 	if err := json.Unmarshal(raw.Body, &resp); err != nil {
@@ -181,10 +223,55 @@ func (p *DATAJUDParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult
 		return ParsedResult{}, nil
 	}
 
-	src := resp.Hits.Hits[0].Source
+	proc, _, outcome := p.parseHit(ctx, resp.Hits.Hits[0].Source)
+	if outcome != hitParsed {
+		// Malformed or ungraded top hit: nothing to enrich (the by-number caller treats an
+		// empty result as a no-op ack, same as a no-hit response).
+		return ParsedResult{}, nil
+	}
+	return ParsedResult{
+		CourtRecords:  []ParsedCourtRecord{proc.Record},
+		DocketEntries: proc.Movimentos,
+	}, nil
+}
+
+// parseHitOutcome classifies what became of ONE hit's _source, so the batch can tell a REAL
+// error (DATAJUD returned a hit we could not parse) apart from a benign non-grade.
+type parseHitOutcome int
+
+const (
+	// hitParsed: the _source parsed into a graded process.
+	hitParsed parseHitOutcome = iota
+	// hitSkippedNoGrade: the _source parsed but carries no grau — nothing to grade, NOT an
+	// error (the number just is not enrichable yet).
+	hitSkippedNoGrade
+	// hitParseError: the _source itself failed to unmarshal (a hit present but not parseable)
+	// — a REAL error, counted toward capture_run.errors so the fecho can be PARTIAL.
+	hitParseError
+)
+
+// parseHit maps ONE hit's raw _source into a graded process, tolerantly. It returns the
+// numeroProcesso (recovered even on a parse failure, for the log/error tally) and an outcome:
+// a _source that fails to unmarshal is LOGGED and reported as hitParseError — never a fatal
+// error — so one bad process among thousands is skipped instead of failing the whole page. A
+// hit with an empty grau is hitSkippedNoGrade (benign, not an error).
+func (p *DATAJUDParser) parseHit(ctx context.Context, rawSource json.RawMessage) (proc ParsedProcess, numero string, outcome parseHitOutcome) {
+	var src datajudSource
+	if err := json.Unmarshal(rawSource, &src); err != nil {
+		// Try to recover the numeroProcesso for the log/tally even when the full parse failed.
+		var idOnly struct {
+			NumeroProcesso string `json:"numeroProcesso"`
+		}
+		_ = json.Unmarshal(rawSource, &idOnly)
+		slog.WarnContext(ctx, "datajud: skipping unparseable _source",
+			"numero_processo", idOnly.NumeroProcesso, "error", err.Error())
+		return ParsedProcess{}, idOnly.NumeroProcesso, hitParseError
+	}
+
 	degree := src.Grau
 	if degree == "" {
-		degree = DegreeUnknown
+		// DATAJUD did not disclose a grade — nothing to grade in place (benign, not an error).
+		return ParsedProcess{}, src.NumeroProcesso, hitSkippedNoGrade
 	}
 
 	record := ParsedCourtRecord{
@@ -222,10 +309,52 @@ func (p *DATAJUDParser) Parse(ctx context.Context, raw RawPayload) (ParsedResult
 		})
 	}
 
-	return ParsedResult{
-		CourtRecords:  []ParsedCourtRecord{record},
-		DocketEntries: entries,
-	}, nil
+	return ParsedProcess{Record: record, Movimentos: entries}, src.NumeroProcesso, hitParsed
+}
+
+// ParsedProcess is one process a batch enrichment resolved: the graded court record
+// and its movimentos, keyed back to the numeroProcesso the caller asked for. The
+// enrichment job reuses the same apply core as the single-fetch path, one process at
+// a time.
+type ParsedProcess struct {
+	Record     ParsedCourtRecord
+	Movimentos []ParsedDocketEntry
+}
+
+// ParseBatch maps a batch (`terms`) DATAJUD payload — potentially MANY hits, and
+// potentially several pages — into a map keyed by numeroProcesso, plus the numeroProcessos
+// that were SKIPPED BY A REAL PARSE ERROR (a hit present in the envelope that we could not
+// unmarshal). It is PER-HIT resilient: each hit's _source is parsed individually (parseHit),
+// so ONE malformed process (e.g. a broken _source) is logged + counted + skipped instead of
+// failing the whole page — a bad process must never kill the tribunal's chain and hang the
+// import. The `skipped` slice is what the fecho uses to decide OK vs PARTIAL: a number that
+// was simply ABSENT from the envelope (0 hits — not in the DATAJUD index) is NOT in `skipped`
+// (that is EXPECTED, not a failure); only a hit-present-but-unparseable is. A hit with an
+// empty grau is dropped silently (benign, not an error, not skipped). Only a page whose
+// ENVELOPE itself is unparseable is fatal (a transport/format fault, not a single bad process).
+func (p *DATAJUDParser) ParseBatch(ctx context.Context, pages []RawPayload) (out map[string]ParsedProcess, skipped []string, err error) {
+	out = make(map[string]ParsedProcess, len(pages)*datajudBatchPageSize)
+	for _, raw := range pages {
+		var resp datajudResponse
+		if uerr := json.Unmarshal(raw.Body, &resp); uerr != nil {
+			return nil, nil, fmt.Errorf("datajud: decode batch payload: %w", uerr)
+		}
+		for _, hit := range resp.Hits.Hits {
+			proc, numero, outcome := p.parseHit(ctx, hit.Source)
+			switch outcome {
+			case hitParsed:
+				out[proc.Record.CNJNumber] = proc
+			case hitParseError:
+				// A hit DATAJUD returned but we could not parse: a REAL error. Its number stays
+				// absent from the map (the caller marks it attempted anyway) but is counted so the
+				// fecho lands PARTIAL. An empty numero (unrecoverable) still counts.
+				skipped = append(skipped, numero)
+			case hitSkippedNoGrade:
+				// Benign — no grade to apply, not an error, not skipped-as-failure.
+			}
+		}
+	}
+	return out, skipped, nil
 }
 
 // datajudMovimentoHash derives the docket-entry dedup key: DATAJUD gives no hash of

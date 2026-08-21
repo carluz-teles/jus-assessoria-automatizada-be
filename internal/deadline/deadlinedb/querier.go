@@ -17,10 +17,11 @@ type Querier interface {
 	// doubled_reason} and the RECOMPUTED {end_date, holidays_applied}, stamping who/when
 	// (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
 	// 1). IDEMPOTENT on the deadline: re-confirming the same intimação re-UPDATEs the one row
-	// (the 1:1 notification_id) — it never opens a second prazo. source/start_date/
-	// rules_version are LEFT AS-IS: source keeps its provenance (RULE/AI), start_date is the
-	// fixed anchor, and rules_version still records which rule set first derived the prazo
-	// even when the human overrode the days. A no-match (no prazo for the intimação) yields
+	// (the 1:1 notification_id) — it never opens a second prazo. source/rules_version are LEFT
+	// AS-IS: source keeps its provenance (RULE/AI) and rules_version still records which rule set
+	// first derived the prazo even when the human overrode the days. start_date IS written now: the
+	// confirmation panel may re-anchor (anchor_event → a different intimação date), and
+	// anchor_event/manual_extra_days/legal_citation persist the panel's choices. A no-match yields
 	// NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id, $2 =
 	// tenant_id, then the confirmed fields.
 	ConfirmDeadline(ctx context.Context, arg ConfirmDeadlineParams) (ConfirmDeadlineRow, error)
@@ -36,8 +37,8 @@ type Querier interface {
 	// of any filter.
 	CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
-	// @status / @assignee_id / @source / window. Called only when a filter is present; the
-	// unfiltered "Y" reuses CountTasksByTenant.
+	// @status / @assignee_id / @source / @intimation_id / window. Called only when a filter
+	// is present; the unfiltered "Y" reuses CountTasksByTenant.
 	CountTasks(ctx context.Context, arg CountTasksParams) (int64, error)
 	// The "X de Y" total for the Tasks tab: how many tasks the process holds. Same tenant +
 	// court_record scoping as the list.
@@ -100,6 +101,14 @@ type Querier interface {
 	// never (nil, nil): confirming an intimação with no derived prazo is a 404 at the edge.
 	// $1 = intimation_id (the notification_id column), $2 = tenant_id (from the principal).
 	GetDeadlineForConfirm(ctx context.Context, arg GetDeadlineForConfirmParams) (GetDeadlineForConfirmRow, error)
+	// Load the three observed dates of the intimação the confirmation panel can re-anchor a prazo
+	// on (§3 "termo inicial"): made_available_at (disponibilização), published_at (publicação) and
+	// deadline_start_at (início da contagem — the legacy anchor). All three are NOT NULL date
+	// columns, so a present intimação always yields three real dates. Keyed by the intimation id and
+	// scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing/foreign id → pgx.ErrNoRows
+	// → typed ErrDeadlineNotFound at the mapper (the prazo's anchor cannot be resolved), never
+	// (nil, nil). $1 = intimation_id, $2 = tenant_id, both from the trusted principal's context.
+	GetIntimationAnchors(ctx context.Context, arg GetIntimationAnchorsParams) (GetIntimationAnchorsRow, error)
 	// Lê a sugestão MAIS RECENTE de um prazo, pela intimação 1:1 e escopada por tenant_id
 	// (barrier 1). O confirm (F2 "Aprovar tudo") a carrega para medir o DELTA entre o que a IA
 	// sugeriu e o que o humano confirmou. Sem sugestão (prazo manual, IA nunca usada) NÃO há
@@ -137,6 +146,13 @@ type Querier interface {
 	// (start_date > today); vencidos = MISSED or an OPEN/PENDING already past (days_left < 0);
 	// cumpridos = MET. CANCELLED is counted only in total. $1 = tenant_id.
 	GetPrazosSummary(ctx context.Context, tenantID uuid.UUID) (GetPrazosSummaryRow, error)
+	// Load the confirmation panel's PREVIEW context for an intimação (POST /v1/prazos/preview,
+	// read-only, off the transactional path): the three observed anchor dates PLUS the court sigla
+	// of the process the intimação hangs on (for the recompute's state-holiday UF). One tenant-scoped
+	// hop (barrier 1). deadline.notification_id is not involved — the preview keys directly on the
+	// intimation id (the FE has it from the intimação detail). A missing/foreign id → pgx.ErrNoRows →
+	// typed ErrDeadlineNotFound at the mapper, never (nil, nil). $1 = intimation_id, $2 = tenant_id.
+	GetPreviewContext(ctx context.Context, arg GetPreviewContextParams) (GetPreviewContextRow, error)
 	// ── task detail + checklist (GET /v1/tasks/:id) ─────────────────────────────
 	// The task detail screen (docs/erd-prazos.md, a Tarefa aberta): the task's own fields + its
 	// ordered checklist + the {done, total} progress the derived display_status reads. All
@@ -286,11 +302,12 @@ type Querier interface {
 	ListTaskTitlesByDeadline(ctx context.Context, arg ListTaskTitlesByDeadlineParams) ([]string, error)
 	// The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
 	// first (undated last). Optional filters: @status ('' = all), @assignee_id (NULL = all
-	// assignees; = principal.UserID for "meus"), @source ('' = all), and a due_date window
-	// [@from_date, @to_date] (NULL = open bound). The window filters on the REAL due_date, so it
-	// naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window query wants dated
-	// items. Ascending (sort_due, id) keyset; the first page passes the min sentinel
-	// ('0001-01-01', zero-uuid).
+	// assignees; = principal.UserID for "meus"), @source ('' = all), @intimation_id (NULL =
+	// all; = a specific intimation uuid to list only tasks of that intimação) and a due_date
+	// window [@from_date, @to_date] (NULL = open bound). The window filters on the REAL
+	// due_date, so it naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window
+	// query wants dated items. Ascending (sort_due, id) keyset; the first page passes the min
+	// sentinel ('0001-01-01', zero-uuid).
 	ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error)
 	// ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
 	// The task agenda reads soonest-due first, but due_date is NULLABLE (an undated backlog
@@ -330,6 +347,15 @@ type Querier interface {
 	// (never a phantom deadline.missed). On a hit it returns the id so deadline.missed commits
 	// in the SAME tx. $1 = id, $2 = tenant_id, both from the trusted scheduled-event payload.
 	MarkMissed(ctx context.Context, arg MarkMissedParams) (uuid.UUID, error)
+	// Declare "mera ciência" on a prazo (§3 "Máquina de estados": PENDING|OPEN → NO_DEADLINE via
+	// "Remover prazo" / "Não há prazo"), keyed by id and scoped to tenant_id (barrier 1). Stamps
+	// confirmed_by/at (the human who declared it). The `status IN ('PENDING','OPEN')` guard makes
+	// the flip SAFE and IDEMPOTENT and distinguishes the two client errors at the use case: a
+	// missing id yields no row anyway (404), while a TERMINAL prazo (MET/MISSED/CANCELLED) also
+	// yields no row — the use case pre-reads the status to return 409 for the latter. On a hit it
+	// returns the id so deadline.no_deadline commits in the SAME tx. $1 = id, $2 = tenant_id,
+	// $3 = confirmed_by, $4 = confirmed_at.
+	MarkNoDeadline(ctx context.Context, arg MarkNoDeadlineParams) (uuid.UUID, error)
 	// Manual lifecycle transition of a task (§9: POST /v1/tasks/:id/done → OPEN→DONE stamping
 	// completed_at; .../dismiss → OPEN→DISMISSED, completed_at NULL). Flips status from
 	// current_status to new_status and sets completed_at (the caller passes now() for done, NULL
@@ -344,6 +370,13 @@ type Querier interface {
 	// gap-free-ish on append (the FE may later rewrite them to reorder). $1 = task_id, $2 =
 	// tenant_id.
 	NextTaskItemPosition(ctx context.Context, arg NextTaskItemPositionParams) (int32, error)
+	// Revert a "mera ciência" declaration (§3: NO_DEADLINE → PENDING via "reabrir"), keyed by id and
+	// scoped to tenant_id (barrier 1). Clears confirmed_by/at (the prazo is a suggestion again). The
+	// `status = 'NO_DEADLINE'` guard makes it SAFE and IDEMPOTENT: a prazo in any other status
+	// updates NO row → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper; the use case
+	// pre-reads the status to distinguish a 404 miss from a 409 not-NO_DEADLINE. On a hit it returns
+	// the id so deadline.reopened commits in the SAME tx. $1 = id, $2 = tenant_id.
+	ReopenNoDeadline(ctx context.Context, arg ReopenNoDeadlineParams) (uuid.UUID, error)
 	// Resolve the conservative rule for (intimation_type, court) in a rules version. The
 	// resolution lives HERE, in SQL (decisão travada, erd-prazos.md §8/§11): the most
 	// SPECIFIC active match wins, falling back to the '*' catch-all — so an unknown type
@@ -385,11 +418,12 @@ type Querier interface {
 	// the mapper, not a phantom item on nothing (or a raw FK error). $1 = id, $2 = tenant_id.
 	TaskExistsInTenant(ctx context.Context, arg TaskExistsInTenantParams) (uuid.UUID, error)
 	// Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
-	// patched {kind, days, counting, doubled, doubled_reason} and the RECOMPUTED {end_date,
-	// holidays_applied} (from the fixed start_date), keyed by id and scoped to tenant_id (barrier
-	// 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays PENDING, an
-	// OPEN stays OPEN — the use case already refused a terminal prazo); source/start_date/
-	// rules_version/confirmed_* are untouched (the anchor and provenance persist). A no-match (the
+	// patched {kind, days, counting, doubled, doubled_reason, anchor_event, manual_extra_days} and
+	// the RECOMPUTED {end_date, holidays_applied, start_date}, keyed by id and scoped to tenant_id
+	// (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays
+	// PENDING, an OPEN stays OPEN — the use case already refused a terminal prazo); source/
+	// rules_version/confirmed_* are untouched. start_date IS written now (the panel may re-anchor via
+	// anchor_event → a different intimação date). A no-match (the
 	// row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
 	// and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
 	UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAdjustParams) (UpdateDeadlineAdjustRow, error)

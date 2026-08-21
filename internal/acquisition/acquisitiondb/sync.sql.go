@@ -695,22 +695,24 @@ SET status = $2,
     items_new = $3,
     items_deduped = $4,
     court_records_new = $5,
-    intimations_new = $6,
-    finished_at = $7,
-    error = $8
+    court_records_updated = $6,
+    intimations_new = $7,
+    finished_at = $8,
+    error = $9
 WHERE id = $1 AND status = 'RUNNING'
 RETURNING id
 `
 
 type UpdateSyncRunParams struct {
-	ID              uuid.UUID          `json:"id"`
-	Status          string             `json:"status"`
-	ItemsNew        int32              `json:"items_new"`
-	ItemsDeduped    int32              `json:"items_deduped"`
-	CourtRecordsNew int32              `json:"court_records_new"`
-	IntimationsNew  int32              `json:"intimations_new"`
-	FinishedAt      pgtype.Timestamptz `json:"finished_at"`
-	Error           []byte             `json:"error"`
+	ID                  uuid.UUID          `json:"id"`
+	Status              string             `json:"status"`
+	ItemsNew            int32              `json:"items_new"`
+	ItemsDeduped        int32              `json:"items_deduped"`
+	CourtRecordsNew     int32              `json:"court_records_new"`
+	CourtRecordsUpdated int32              `json:"court_records_updated"`
+	IntimationsNew      int32              `json:"intimations_new"`
+	FinishedAt          pgtype.Timestamptz `json:"finished_at"`
+	Error               []byte             `json:"error"`
 }
 
 // Close a sync run, but ONLY from RUNNING: the status guard makes this the single
@@ -727,6 +729,7 @@ func (q *Queries) UpdateSyncRun(ctx context.Context, arg UpdateSyncRunParams) (u
 		arg.ItemsNew,
 		arg.ItemsDeduped,
 		arg.CourtRecordsNew,
+		arg.CourtRecordsUpdated,
 		arg.IntimationsNew,
 		arg.FinishedAt,
 		arg.Error,

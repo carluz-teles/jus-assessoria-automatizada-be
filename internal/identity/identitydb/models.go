@@ -34,6 +34,25 @@ type BackfillJob struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
+type CaptureRun struct {
+	ID                  uuid.UUID          `json:"id"`
+	TenantID            uuid.UUID          `json:"tenant_id"`
+	Source              string             `json:"source"`
+	Kind                string             `json:"kind"`
+	WindowFrom          pgtype.Date        `json:"window_from"`
+	WindowTo            pgtype.Date        `json:"window_to"`
+	StartedAt           pgtype.Timestamptz `json:"started_at"`
+	FinishedAt          pgtype.Timestamptz `json:"finished_at"`
+	Status              string             `json:"status"`
+	CourtRecordsNew     int32              `json:"court_records_new"`
+	IntimationsNew      int32              `json:"intimations_new"`
+	CourtRecordsUpdated int32              `json:"court_records_updated"`
+	Errors              int32              `json:"errors"`
+	Error               []byte             `json:"error"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	BackfillJobID       pgtype.UUID        `json:"backfill_job_id"`
+}
+
 type CaseLink struct {
 	ID                uuid.UUID          `json:"id"`
 	TenantID          uuid.UUID          `json:"tenant_id"`
@@ -80,26 +99,27 @@ type CourtCase struct {
 }
 
 type CourtRecord struct {
-	ID                  uuid.UUID          `json:"id"`
-	TenantID            uuid.UUID          `json:"tenant_id"`
-	CaseID              uuid.UUID          `json:"case_id"`
-	CnjNumber           string             `json:"cnj_number"`
-	Degree              string             `json:"degree"`
-	Court               string             `json:"court"`
-	Class               *string            `json:"class"`
-	Subject             *string            `json:"subject"`
-	ClaimValue          pgtype.Numeric     `json:"claim_value"`
-	Secrecy             string             `json:"secrecy"`
-	Lifecycle           string             `json:"lifecycle"`
-	Completeness        float32            `json:"completeness"`
-	SyncPolicy          []byte             `json:"sync_policy"`
-	NextSyncAt          pgtype.Timestamptz `json:"next_sync_at"`
-	LastSyncedAt        []byte             `json:"last_synced_at"`
-	JudgingBody         *string            `json:"judging_body"`
-	FiledAt             pgtype.Date        `json:"filed_at"`
-	SyncRunID           pgtype.UUID        `json:"sync_run_id"`
-	AiResume            []byte             `json:"ai_resume"`
-	AiResumeGeneratedAt pgtype.Timestamptz `json:"ai_resume_generated_at"`
+	ID                    uuid.UUID          `json:"id"`
+	TenantID              uuid.UUID          `json:"tenant_id"`
+	CaseID                uuid.UUID          `json:"case_id"`
+	CnjNumber             string             `json:"cnj_number"`
+	Degree                string             `json:"degree"`
+	Court                 string             `json:"court"`
+	Class                 *string            `json:"class"`
+	Subject               *string            `json:"subject"`
+	ClaimValue            pgtype.Numeric     `json:"claim_value"`
+	Secrecy               string             `json:"secrecy"`
+	Lifecycle             string             `json:"lifecycle"`
+	Completeness          float32            `json:"completeness"`
+	SyncPolicy            []byte             `json:"sync_policy"`
+	NextSyncAt            pgtype.Timestamptz `json:"next_sync_at"`
+	LastSyncedAt          []byte             `json:"last_synced_at"`
+	JudgingBody           *string            `json:"judging_body"`
+	FiledAt               pgtype.Date        `json:"filed_at"`
+	SyncRunID             pgtype.UUID        `json:"sync_run_id"`
+	AiResume              []byte             `json:"ai_resume"`
+	AiResumeGeneratedAt   pgtype.Timestamptz `json:"ai_resume_generated_at"`
+	EnrichmentAttemptedAt pgtype.Timestamptz `json:"enrichment_attempted_at"`
 }
 
 type Deadline struct {
@@ -123,6 +143,10 @@ type Deadline struct {
 	AiSummary            *string            `json:"ai_summary"`
 	AiRecommendation     *string            `json:"ai_recommendation"`
 	AiSummaryGeneratedAt pgtype.Timestamptz `json:"ai_summary_generated_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	AnchorEvent          string             `json:"anchor_event"`
+	ManualExtraDays      int32              `json:"manual_extra_days"`
+	LegalCitation        *string            `json:"legal_citation"`
 }
 
 type DeadlineRule struct {
@@ -137,6 +161,7 @@ type DeadlineRule struct {
 	Priority       int32              `json:"priority"`
 	Active         bool               `json:"active"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	LegalCitation  *string            `json:"legal_citation"`
 }
 
 type DocketEntry struct {
@@ -220,24 +245,29 @@ type Integration struct {
 }
 
 type Intimation struct {
-	ID              uuid.UUID   `json:"id"`
-	TenantID        uuid.UUID   `json:"tenant_id"`
-	CaseID          uuid.UUID   `json:"case_id"`
-	CourtRecordID   uuid.UUID   `json:"court_record_id"`
-	Hash            string      `json:"hash"`
-	MadeAvailableAt pgtype.Date `json:"made_available_at"`
-	PublishedAt     pgtype.Date `json:"published_at"`
-	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
-	Content         string      `json:"content"`
-	Source          string      `json:"source"`
-	Recipients      []byte      `json:"recipients"`
-	Type            *string     `json:"type"`
-	Status          string      `json:"status"`
-	SourceUrl       *string     `json:"source_url"`
-	CancelledAt     pgtype.Date `json:"cancelled_at"`
-	CancelReason    *string     `json:"cancel_reason"`
-	SyncRunID       pgtype.UUID `json:"sync_run_id"`
-	UserStatus      string      `json:"user_status"`
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	CaseID          uuid.UUID          `json:"case_id"`
+	CourtRecordID   uuid.UUID          `json:"court_record_id"`
+	Hash            string             `json:"hash"`
+	MadeAvailableAt pgtype.Date        `json:"made_available_at"`
+	PublishedAt     pgtype.Date        `json:"published_at"`
+	DeadlineStartAt pgtype.Date        `json:"deadline_start_at"`
+	Content         string             `json:"content"`
+	Source          string             `json:"source"`
+	Recipients      []byte             `json:"recipients"`
+	Type            *string            `json:"type"`
+	Status          string             `json:"status"`
+	SourceUrl       *string            `json:"source_url"`
+	CancelledAt     pgtype.Date        `json:"cancelled_at"`
+	CancelReason    *string            `json:"cancel_reason"`
+	SyncRunID       pgtype.UUID        `json:"sync_run_id"`
+	UserStatus      string             `json:"user_status"`
+	ConductorUserID pgtype.UUID        `json:"conductor_user_id"`
+	ReviewerUserID  pgtype.UUID        `json:"reviewer_user_id"`
+	AiSummary       *string            `json:"ai_summary"`
+	AiProvidencias  []byte             `json:"ai_providencias"`
+	AiAnalyzedAt    pgtype.Timestamptz `json:"ai_analyzed_at"`
 }
 
 type Membership struct {
@@ -395,25 +425,26 @@ type Subscription struct {
 }
 
 type SyncRun struct {
-	ID               uuid.UUID          `json:"id"`
-	TenantID         uuid.UUID          `json:"tenant_id"`
-	CourtRecordID    pgtype.UUID        `json:"court_record_id"`
-	IntegrationID    uuid.UUID          `json:"integration_id"`
-	ConnectorID      string             `json:"connector_id"`
-	ConnectorVersion string             `json:"connector_version"`
-	StartedAt        pgtype.Timestamptz `json:"started_at"`
-	FinishedAt       pgtype.Timestamptz `json:"finished_at"`
-	Status           string             `json:"status"`
-	ItemsNew         int32              `json:"items_new"`
-	ItemsDeduped     int32              `json:"items_deduped"`
-	RawPayloadRefs   []byte             `json:"raw_payload_refs"`
-	Error            []byte             `json:"error"`
-	EventID          *string            `json:"event_id"`
-	WindowFrom       pgtype.Date        `json:"window_from"`
-	WindowTo         pgtype.Date        `json:"window_to"`
-	BackfillJobID    pgtype.UUID        `json:"backfill_job_id"`
-	CourtRecordsNew  int32              `json:"court_records_new"`
-	IntimationsNew   int32              `json:"intimations_new"`
+	ID                  uuid.UUID          `json:"id"`
+	TenantID            uuid.UUID          `json:"tenant_id"`
+	CourtRecordID       pgtype.UUID        `json:"court_record_id"`
+	IntegrationID       uuid.UUID          `json:"integration_id"`
+	ConnectorID         string             `json:"connector_id"`
+	ConnectorVersion    string             `json:"connector_version"`
+	StartedAt           pgtype.Timestamptz `json:"started_at"`
+	FinishedAt          pgtype.Timestamptz `json:"finished_at"`
+	Status              string             `json:"status"`
+	ItemsNew            int32              `json:"items_new"`
+	ItemsDeduped        int32              `json:"items_deduped"`
+	RawPayloadRefs      []byte             `json:"raw_payload_refs"`
+	Error               []byte             `json:"error"`
+	EventID             *string            `json:"event_id"`
+	WindowFrom          pgtype.Date        `json:"window_from"`
+	WindowTo            pgtype.Date        `json:"window_to"`
+	BackfillJobID       pgtype.UUID        `json:"backfill_job_id"`
+	CourtRecordsNew     int32              `json:"court_records_new"`
+	IntimationsNew      int32              `json:"intimations_new"`
+	CourtRecordsUpdated int32              `json:"court_records_updated"`
 }
 
 type Task struct {

@@ -398,8 +398,9 @@ func TestHandler_UpdateProfile_NoAddress_200(t *testing.T) {
 	}
 }
 
-// AC3: a partial address (any field filled but the required ones missing) is still a
-// 400 — the address is all-or-nothing; the use case never runs.
+// AC3: an address with a field filled but cidade/uf missing is a 400 (here cidade
+// present but uf absent); the use case never runs. Street fields are optional, but
+// cidade+uf are the required core.
 func TestHandler_UpdateProfile_PartialAddress_400(t *testing.T) {
 	t.Parallel()
 
@@ -472,7 +473,7 @@ func TestHandler_UpdateProfile_InvalidBody_400(t *testing.T) {
 	}{
 		{name: "cnpj wrong length", body: `{"cnpj":"123","legal_name":"L","trade_name":"T","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
 		{name: "missing legal_name", body: `{"cnpj":"12345678000195","legal_name":"","trade_name":"T","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
-		{name: "missing address cep", body: `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","address":{"cep":"","logradouro":"L","cidade":"C","uf":"SP"}}`},
+		{name: "address missing uf", body: `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","address":{"cidade":"C","uf":""}}`},
 		{name: "malformed email", body: `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","email":"not-an-email","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
 		{name: "malformed json", body: `{not json`},
 	}

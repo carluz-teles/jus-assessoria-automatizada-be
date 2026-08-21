@@ -36,12 +36,22 @@ type CaseContext struct {
 	PrazoDays      int    // dias do prazo
 	Counting       string // BUSINESS|CALENDAR
 	Phase          string // fase processual, quando conhecida
+	DeadlineDate   string // prazo final "2006-01-02" (analyze_intimation) — teto do due_date sugerido; "" sem prazo
+	Members        []MemberCtx // membros ativos do escritório (id+nome) para o IA sugerir responsável real
 
 	// Playbook é o ponto de injeção da "voz do escritório" (§3). v0: stub (vazio → nada é
 	// injetado). Depois: exemplos de tarefas HUMANO-APROVADAS (derivados do delta suggested×
 	// confirmed) entram aqui como few-shot, e o prompt "aprende" o padrão do escritório sem um
 	// LLM reescrever instruções. Preencher no futuro não muda a forma do Compose.
 	Playbook string
+}
+
+// MemberCtx is one firm member the analyze_intimation prompt lists as an assignable
+// responsável: the internal app_user id (never org_id) + display name. The model returns one
+// of these ids as suggested_assignee_user_id; the caller validates it against the same list.
+type MemberCtx struct {
+	UserID string
+	Name   string
 }
 
 // DocketEntryCtx is one recent docket entry for the process summary context.
@@ -193,17 +203,23 @@ type PromptComposer interface {
 // Agent identifiers — one per specialized advisory task (erd-ai-advisory.md §4). Each maps to a
 // template + a version below. Kept as consts so a caller never passes a free string.
 const (
-	AgentSuggestTasks     = "suggest_tasks"
-	AgentSummarizeProcess = "summarize_process"
-	AgentDraftMinuta      = "draft_minuta"
-	AgentChatGrounding    = "chat_grounding"
-	AgentReviewMinuta     = "review_minuta"
+	AgentSuggestTasks      = "suggest_tasks"
+	AgentAnalyzeIntimation = "analyze_intimation"
+	AgentSummarizeProcess  = "summarize_process"
+	AgentDraftMinuta       = "draft_minuta"
+	AgentChatGrounding     = "chat_grounding"
+	AgentReviewMinuta      = "review_minuta"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD
 // version (never silently mixed with a new one). This is the axis the A/B improvement turns on.
 const suggestTasksVersion = "suggest_tasks/v2"
+
+// analyzeIntimationVersion is the pinned version of the analyze_intimation template (the
+// "Analisar esta intimação" card: "O que aconteceu" + "Providências derivadas"). BUMP IT
+// whenever the template text changes so the feedback delta stays attributable to the version.
+const analyzeIntimationVersion = "analyze_intimation/v2"
 
 // summarizeProcessVersion is the pinned version of the summarize_process template. BUMP IT
 // whenever the template text changes so the feedback delta of the OLD prompt stays attributable
@@ -241,9 +257,84 @@ func (*TemplateComposer) Compose(agent string, c CaseContext) (Composed, error) 
 	switch agent {
 	case AgentSuggestTasks:
 		return composeSuggestTasks(c), nil
+	case AgentAnalyzeIntimation:
+		return composeAnalyzeIntimation(c), nil
 	default:
 		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
 	}
+}
+
+// composeAnalyzeIntimation renders the analyze_intimation instruction-set (the detail
+// card "Analisar esta intimação"). It reads ONE intimation's teor + its court context and
+// produces two outputs: `summary` — "O que aconteceu", a plain-language pt-BR legal
+// account of what the publication communicates — and `providencias` — the concrete steps
+// the lawyer must take, each a short `title` + an actionable `description`. The output
+// schema (summary + providencias[]) lives with the caller (AnaliseUseCase). The prompt
+// stays about WHAT to produce, not the JSON shape.
+func composeAnalyzeIntimation(c CaseContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um assistente jurídico brasileiro. A partir do TEOR de uma intimação/publicação " +
+			"e do contexto do processo, produza NA MESMA resposta um JSON com exatamente dois campos:\n" +
+			"1. `summary` (string): \"O que aconteceu\" — um resumo objetivo, em português jurídico " +
+			"conciso (2–4 frases), do que a publicação comunica (a decisão, o despacho, a intimação e seu " +
+			"efeito prático para a parte).\n" +
+			"2. `providencias` (array): as PROVIDÊNCIAS a cumprir em razão da intimação. Cada item tem:\n" +
+			"   - `title` curto e imperativo, JÁ COM a citação legal quando cabível (ex.: \"Redigir defesa " +
+			"(art. 919, CPC)\", \"Protocolar contestação (art. 335, CPC)\");\n" +
+			"   - `description` curta e acionável explicando a providência;\n" +
+			"   - `suggested_assignee_user_id`: o id de UM membro do escritório (da lista \"Membros do " +
+			"escritório\" fornecida no contexto) a quem esta providência deve ser atribuída — use " +
+			"EXATAMENTE um dos ids listados, ou null se nenhum couber ou se a lista estiver vazia. NUNCA " +
+			"invente um id.\n" +
+			"   - `due_date`: a data-limite para cumprir a providência no formato \"AAAA-MM-DD\". Quando " +
+			"houver \"Prazo final\" no contexto, o due_date DEVE ser ANTERIOR OU IGUAL a ele (reserve dias " +
+			"úteis de folga para revisão/protocolo); use null quando não houver base para uma data.\n\n" +
+			"REGRAS OBRIGATÓRIAS:\n" +
+			"- NÃO invente fatos que não estejam no teor ou no contexto; prefira providências genéricas a " +
+			"suposições.\n" +
+			"- Se o teor for insuficiente para entender o que aconteceu, mantenha `summary` como string " +
+			"vazia e `providencias` como array vazio, em vez de supor.\n" +
+			"- Não repita providências; mantenha o tom jurídico formal brasileiro.",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório (exemplos e preferências):\n")
+		sys.WriteString(pb)
+	}
+
+	lines := make([]string, 0, 6)
+	add := func(label, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			lines = append(lines, label+": "+v)
+		}
+	}
+	add("Tribunal", c.Court)
+	add("Grau", c.Degree)
+	add("Classe/rito", c.Class)
+	add("Assunto", c.Subject)
+	add("Tipo de intimação", c.IntimationType)
+	add("Prazo final", c.DeadlineDate)
+	add("Teor da intimação", c.IntimationText)
+
+	// Inject the firm's members so the model can pick a real suggested_assignee_user_id.
+	if len(c.Members) > 0 {
+		var memberLines []string
+		for _, m := range c.Members {
+			memberLines = append(memberLines, "- id="+m.UserID+" nome="+m.Name)
+		}
+		lines = append(lines, "Membros do escritório (escolha o suggested_assignee_user_id entre estes ids):\n"+strings.Join(memberLines, "\n"))
+	}
+
+	var usr strings.Builder
+	usr.WriteString("Contexto:\n")
+	if len(lines) == 0 {
+		usr.WriteString("(sem contexto adicional)")
+	} else {
+		usr.WriteString(strings.Join(lines, "\n"))
+	}
+	usr.WriteString("\n\nProduza o resumo (\"O que aconteceu\") e as providências derivadas.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: analyzeIntimationVersion}
 }
 
 // ComposeProcess builds the (system, user, version) for the summarize_process agent from the

@@ -12,6 +12,7 @@
 /worker-ai
 /worker-outbox-relay
 /seed
+/cleanup-ingestao
 
 # Env & secrets — NUNCA commitar
 .env

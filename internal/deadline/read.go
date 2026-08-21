@@ -71,6 +71,17 @@ type PrazoDetailView struct {
 	IntimationID    string    `json:"intimation_id"`
 	RulesVersion    string    `json:"rules_version"`
 	Confirmed       bool      `json:"confirmed"`
+	// Confirmation panel fields (migration 0049): the termo inicial the prazo is anchored on, the
+	// frozen legal citation snapshot, the lawyer's manual extra days, and the audit stamp (who/
+	// when confirmed, with the resolved name). LowConfidence is DEFERRED (always false/absent) —
+	// omitempty keeps it off the wire until the signal exists.
+	AnchorEvent     string     `json:"anchor_event"`
+	LegalCitation   string     `json:"legal_citation,omitempty"`
+	ManualExtraDays int        `json:"manual_extra_days"`
+	ConfirmedByID   string     `json:"confirmed_by_id,omitempty"`
+	ConfirmedByName string     `json:"confirmed_by_name,omitempty"`
+	ConfirmedAt     *time.Time `json:"confirmed_at"`
+	LowConfidence   bool       `json:"low_confidence,omitempty"`
 }
 
 // PrazoSuggestContext is the advisory case context the AI suggester (suggest.go) composes the
@@ -167,25 +178,28 @@ type TasksByProcessoQuery struct {
 }
 
 // TasksQuery carries the agenda's ascending keyset cursor plus its optional filters: Status ("" =
-// all), Assignee ("" = all assignees; = principal.UserID for "meus"), Source ("" = all), and a
-// due_date window [From, To] (each "" = open bound). The dates/assignee are the wire layout; the
-// handler validates them, the repo parses. LastDue is the coalesced sort value (see TasksByProcessoQuery).
+// all), Assignee ("" = all assignees; = principal.UserID for "meus"), Source ("" = all),
+// IntimationID ("" = all; = a specific uuid to list only tasks of that intimação), and a
+// due_date window [From, To] (each "" = open bound). The dates/assignee/intimation_id are the
+// wire layout; the handler validates them, the repo parses. LastDue is the coalesced sort value
+// (see TasksByProcessoQuery).
 type TasksQuery struct {
-	TenantID string
-	Status   string
-	Assignee string
-	Source   string
-	From     string
-	To       string
-	LastDue  string
-	LastID   string
-	Limit    int
+	TenantID     string
+	Status       string
+	Assignee     string
+	Source       string
+	IntimationID string
+	From         string
+	To           string
+	LastDue      string
+	LastID       string
+	Limit        int
 }
 
-// Filtered reports whether any agenda filter (Status/Assignee/Source/window) is active —
-// the repo uses it to decide when the "X de Y" counter needs the filtered COUNT.
+// Filtered reports whether any agenda filter (Status/Assignee/Source/IntimationID/window) is
+// active — the repo uses it to decide when the "X de Y" counter needs the filtered COUNT.
 func (q TasksQuery) Filtered() bool {
-	return q.Status != "" || q.Assignee != "" || q.Source != "" || q.From != "" || q.To != ""
+	return q.Status != "" || q.Assignee != "" || q.Source != "" || q.IntimationID != "" || q.From != "" || q.To != ""
 }
 
 // AssigneeOption is one selectable ?assignee: the responsável's name (the chip label) and user

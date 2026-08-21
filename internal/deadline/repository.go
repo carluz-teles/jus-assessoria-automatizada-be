@@ -71,11 +71,12 @@ func (r *pgRepository) ResolveRule(ctx context.Context, tx database.Tx, rulesVer
 	}
 
 	return DeadlineRule{
-		RulesVersion: row.RulesVersion,
-		Kind:         row.Kind,
-		Days:         int(row.Days),
-		Counting:     Counting(row.Counting),
-		Doubled:      row.Doubled,
+		RulesVersion:  row.RulesVersion,
+		Kind:          row.Kind,
+		Days:          int(row.Days),
+		Counting:      Counting(row.Counting),
+		Doubled:       row.Doubled,
+		LegalCitation: derefString(row.LegalCitation),
 	}, nil
 }
 
@@ -117,6 +118,8 @@ func (r *pgRepository) InsertDeadline(ctx context.Context, tx database.Tx, d *De
 		Source:          string(d.Source),
 		Kind:            textToNull(d.Kind),
 		RulesVersion:    d.RulesVersion,
+		AnchorEvent:     string(d.AnchorEvent),
+		LegalCitation:   textToNull(d.LegalCitation),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeadlineExists
@@ -161,6 +164,72 @@ func (r *pgRepository) GetDeadlineForConfirm(ctx context.Context, tx database.Tx
 		ID:            row.ID.String(),
 		CourtRecordID: row.CourtRecordID.String(),
 		StartDate:     row.StartDate.Time,
+		LegalCitation: derefString(row.LegalCitation),
+	}, nil
+}
+
+// GetIntimationAnchors loads the intimação's three observed dates inside the caller's tx,
+// filtered by tenantID (barrier 1). A missing/foreign intimação maps to the typed
+// ErrDeadlineNotFound (the prazo's anchor cannot be resolved). All three columns are NOT NULL.
+func (r *pgRepository) GetIntimationAnchors(ctx context.Context, tx database.Tx, intimationID, tenantID string) (IntimationAnchors, error) {
+	intID, err := parseUUID(intimationID)
+	if err != nil {
+		return IntimationAnchors{}, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return IntimationAnchors{}, err
+	}
+
+	row, err := deadlinedb.New(tx).GetIntimationAnchors(ctx, deadlinedb.GetIntimationAnchorsParams{
+		ID:       intID,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return IntimationAnchors{}, ErrDeadlineNotFound
+	}
+	if err != nil {
+		return IntimationAnchors{}, database.WrapInfra(err)
+	}
+
+	return IntimationAnchors{
+		MadeAvailableAt: row.MadeAvailableAt.Time,
+		PublishedAt:     row.PublishedAt.Time,
+		DeadlineStartAt: row.DeadlineStartAt.Time,
+	}, nil
+}
+
+// GetPreviewContext loads the preview's anchors + court inside the caller's tx (the pool, on the
+// read-only preview path), filtered by tenantID (barrier 1). A missing/foreign intimação maps to
+// the typed ErrDeadlineNotFound.
+func (r *pgRepository) GetPreviewContext(ctx context.Context, tx database.Tx, intimationID, tenantID string) (PreviewContext, error) {
+	intID, err := parseUUID(intimationID)
+	if err != nil {
+		return PreviewContext{}, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return PreviewContext{}, err
+	}
+
+	row, err := deadlinedb.New(tx).GetPreviewContext(ctx, deadlinedb.GetPreviewContextParams{
+		ID:       intID,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PreviewContext{}, ErrDeadlineNotFound
+	}
+	if err != nil {
+		return PreviewContext{}, database.WrapInfra(err)
+	}
+
+	return PreviewContext{
+		Anchors: IntimationAnchors{
+			MadeAvailableAt: row.MadeAvailableAt.Time,
+			PublishedAt:     row.PublishedAt.Time,
+			DeadlineStartAt: row.DeadlineStartAt.Time,
+		},
+		Court: row.Court,
 	}, nil
 }
 
@@ -229,6 +298,10 @@ func (r *pgRepository) ConfirmDeadline(ctx context.Context, tx database.Tx, p Co
 		HolidaysApplied: holidays,
 		ConfirmedBy:     confirmedBy,
 		ConfirmedAt:     pgTimestamptz(p.ConfirmedAt),
+		StartDate:       pgDate(p.StartDate),
+		AnchorEvent:     string(p.AnchorEvent),
+		ManualExtraDays: int32(p.ManualExtraDays),
+		LegalCitation:   textToNull(p.LegalCitation),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", "", ErrDeadlineNotFound
@@ -490,15 +563,18 @@ func (r *pgRepository) GetDeadlineForAdjust(ctx context.Context, tx database.Tx,
 	}
 
 	return &DeadlineForAdjust{
-		ID:            row.ID.String(),
-		CourtRecordID: row.CourtRecordID.String(),
-		StartDate:     row.StartDate.Time,
-		Status:        Status(row.Status),
-		Kind:          derefString(row.Kind),
-		Days:          int(row.Days),
-		Counting:      Counting(row.Counting),
-		Doubled:       row.Doubled,
-		DoubledReason: derefString(row.DoubledReason),
+		ID:              row.ID.String(),
+		CourtRecordID:   row.CourtRecordID.String(),
+		IntimationID:    row.NotificationID.String(),
+		StartDate:       row.StartDate.Time,
+		Status:          Status(row.Status),
+		Kind:            derefString(row.Kind),
+		Days:            int(row.Days),
+		Counting:        Counting(row.Counting),
+		Doubled:         row.Doubled,
+		DoubledReason:   derefString(row.DoubledReason),
+		AnchorEvent:     AnchorEvent(row.AnchorEvent),
+		ManualExtraDays: int(row.ManualExtraDays),
 	}, nil
 }
 
@@ -531,6 +607,9 @@ func (r *pgRepository) UpdateDeadlineAdjust(ctx context.Context, tx database.Tx,
 		DoubledReason:   textToNull(p.DoubledReason),
 		EndDate:         pgDate(p.EndDate),
 		HolidaysApplied: holidays,
+		StartDate:       pgDate(p.StartDate),
+		AnchorEvent:     string(p.AnchorEvent),
+		ManualExtraDays: int32(p.ManualExtraDays),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", "", ErrDeadlineNotFound
@@ -561,6 +640,66 @@ func (r *pgRepository) MarkDeadlineStatus(ctx context.Context, tx database.Tx, d
 		ID:            id,
 		TenantID:      tenant,
 		CurrentStatus: string(from),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrDeadlineNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return flipped.String(), nil
+}
+
+// MarkNoDeadline flips a prazo PENDING|OPEN → NO_DEADLINE inside the caller's tx, stamping
+// confirmed_by/at, keyed by its id and filtered by tenantID (barrier 1). The guarded UPDATE
+// (status IN ('PENDING','OPEN')) collapses any other case to a no-op → pgx.ErrNoRows →
+// ErrDeadlineNotFound. On a hit it returns the flipped id.
+func (r *pgRepository) MarkNoDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID, confirmedBy string, confirmedAt time.Time) (string, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+	by, err := pgUUID(confirmedBy)
+	if err != nil {
+		return "", err
+	}
+
+	flipped, err := deadlinedb.New(tx).MarkNoDeadline(ctx, deadlinedb.MarkNoDeadlineParams{
+		ID:          id,
+		TenantID:    tenant,
+		ConfirmedBy: by,
+		ConfirmedAt: pgTimestamptz(confirmedAt),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrDeadlineNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return flipped.String(), nil
+}
+
+// ReopenNoDeadline reverts a NO_DEADLINE prazo → PENDING inside the caller's tx, clearing
+// confirmed_by/at, keyed by its id and filtered by tenantID (barrier 1). The guarded UPDATE
+// (status = 'NO_DEADLINE') collapses any other case to a no-op → pgx.ErrNoRows →
+// ErrDeadlineNotFound. On a hit it returns the reopened id.
+func (r *pgRepository) ReopenNoDeadline(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	flipped, err := deadlinedb.New(tx).ReopenNoDeadline(ctx, deadlinedb.ReopenNoDeadlineParams{
+		ID:       id,
+		TenantID: tenant,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrDeadlineNotFound

@@ -65,6 +65,12 @@ var (
 	// on the first new record.
 	ErrProcessLimitReached = apperr.NewForbidden("active process limit reached")
 
+	// ErrOABNotFound — no DJEN communication in the lookup window names this OAB.
+	// Best-effort: it does NOT mean the OAB is invalid, only that we found no
+	// recent publication to read the holder's name from. The caller (onboarding,
+	// Termos) falls back to a placeholder rather than blocking on this.
+	ErrOABNotFound = apperr.NewNotFound("no recent DJEN communication names this OAB")
+
 	// ErrActivationBlocked — the tenant is already at (or above) its plan's
 	// active_process_limit at the moment it tries to ACTIVATE a source (→ 403). A
 	// sibling of ErrProcessLimitReached, not a reuse of it: that one blocks a single

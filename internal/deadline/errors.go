@@ -39,6 +39,12 @@ var (
 	// distinct from the 404 miss — the prazo exists, but its current status forbids the flip.
 	ErrDeadlineNotOpen = apperr.NewConflict("deadline transition requires an OPEN prazo")
 
+	// ErrDeadlineNotReopenable — a POST /v1/prazos/:id/reopen on a prazo that is not NO_DEADLINE.
+	// Only a "mera ciência" (NO_DEADLINE) prazo can be reopened to PENDING; any other status is
+	// not a reopen candidate. CONFLICT (→ 409), distinct from the 404 miss — the prazo exists,
+	// but its current status forbids the reopen.
+	ErrDeadlineNotReopenable = apperr.NewConflict("deadline reopen requires a NO_DEADLINE prazo")
+
 	// ErrTaskNotFound — the requested task id resolves to no row in the tenant (PATCH
 	// /v1/tasks/:id, POST /v1/tasks/:id/done | .../dismiss). Typed not-found (→ 404), never
 	// (nil, nil): a foreign or unknown id is a client-facing miss, not a swallowed empty result.

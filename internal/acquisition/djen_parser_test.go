@@ -56,14 +56,18 @@ func TestDJENParserParse(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	if len(res.Intimations) == 0 {
-		t.Fatal("no intimations parsed")
+	// The fixture holds 5 items over 5 distinct processos: 4 "Intimação" and 1 "Edital".
+	// The Edital maps to COMUNICACAO and is dropped by the lean-ingestion gate, taking
+	// its otherwise-phantom court_record with it — so exactly 4 intimations and 4 court
+	// records survive.
+	if len(res.Intimations) != 4 {
+		t.Fatalf("intimations = %d, want 4 (the Edital/COMUNICACAO item is gated out)", len(res.Intimations))
 	}
 	if len(res.DocketEntries) != 0 {
 		t.Errorf("DJEN yields no docket entries, got %d", len(res.DocketEntries))
 	}
-	if len(res.CourtRecords) == 0 || len(res.CourtRecords) > len(res.Intimations) {
-		t.Errorf("court records = %d, want between 1 and %d (deduped by CNJ)", len(res.CourtRecords), len(res.Intimations))
+	if len(res.CourtRecords) != 4 {
+		t.Errorf("court records = %d, want 4 (no phantom record for the gated Edital)", len(res.CourtRecords))
 	}
 
 	for _, cr := range res.CourtRecords {
@@ -83,8 +87,10 @@ func TestDJENParserParse(t *testing.T) {
 		if in.Hash == "" || in.CNJNumber == "" || in.Content == "" {
 			t.Errorf("intimation %s: missing hash/cnj/content", in.Hash)
 		}
-		if in.Type != IntimationTypeIntimacao && in.Type != IntimationTypeCitacao && in.Type != IntimationTypeComunicacao {
-			t.Errorf("intimation %s: type %q not in enum", in.Hash, in.Type)
+		// Lean-ingestion gate: a generic COMUNICACAO is dropped at the parser, so only
+		// INTIMACAO/CITACAO survive here — a surviving COMUNICACAO is a regression.
+		if in.Type != IntimationTypeIntimacao && in.Type != IntimationTypeCitacao {
+			t.Errorf("intimation %s: type %q survived the COMUNICACAO gate (want INTIMACAO/CITACAO)", in.Hash, in.Type)
 		}
 		// published = availability + 1 business day; deadline = published + 1 (fake cal).
 		if !in.PublishedAt.Equal(in.MadeAvailableAt.AddDate(0, 0, 1)) {
@@ -154,6 +160,74 @@ func TestDJENParserCancellation(t *testing.T) {
 	}
 	if in.SourceURL != "https://x/y" {
 		t.Errorf("source_url = %q, want the link", in.SourceURL)
+	}
+}
+
+// TestDJENParserGatesComunicacao is the lean-ingestion acceptance test: a generic
+// COMUNICACAO (here an "Edital") opens no prazo, so the parser drops it — no intimation
+// AND, when it is the only item of its processo, no court_record either (the phantom the
+// gate is designed to prevent). An INTIMACAO on a DIFFERENT processo in the same payload
+// is untouched.
+func TestDJENParserGatesComunicacao(t *testing.T) {
+	t.Parallel()
+
+	edital := `{
+		"hash":"edital-1","numero_processo":"7000001","tipoComunicacao":"Edital",
+		"nomeOrgao":"2ª Vara","siglaTribunal":"TJSP","nomeClasse":"Execução",
+		"texto":"edital de citação","data_disponibilizacao":"2024-02-01",
+		"ativo":true,"destinatarioadvogados":[]
+	}`
+	intimacao := `{
+		"hash":"intima-1","numero_processo":"7000002","tipoComunicacao":"Intimação",
+		"nomeOrgao":"3ª Vara","siglaTribunal":"TJSP","nomeClasse":"Procedimento",
+		"texto":"intime-se","data_disponibilizacao":"2024-02-01",
+		"ativo":true,"destinatarioadvogados":[]
+	}`
+
+	tests := []struct {
+		name       string
+		items      []json.RawMessage
+		wantIntims int
+		wantCRs    int
+	}{
+		{
+			name:       "comunicacao-only processo yields no intimation and no court record",
+			items:      []json.RawMessage{json.RawMessage(edital)},
+			wantIntims: 0,
+			wantCRs:    0,
+		},
+		{
+			name:       "comunicacao dropped while a sibling intimation survives",
+			items:      []json.RawMessage{json.RawMessage(edital), json.RawMessage(intimacao)},
+			wantIntims: 1,
+			wantCRs:    1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			body, err := json.Marshal(djenPayload{Items: tt.items})
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			res, err := NewDJENParser(fakeCalendar{}).Parse(context.Background(), RawPayload{Source: SourceDJEN, Body: body})
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if len(res.Intimations) != tt.wantIntims {
+				t.Errorf("intimations = %d, want %d", len(res.Intimations), tt.wantIntims)
+			}
+			if len(res.CourtRecords) != tt.wantCRs {
+				t.Errorf("court records = %d, want %d", len(res.CourtRecords), tt.wantCRs)
+			}
+			for _, in := range res.Intimations {
+				if in.Type == IntimationTypeComunicacao {
+					t.Errorf("intimation %s: COMUNICACAO survived the gate", in.Hash)
+				}
+			}
+		})
 	}
 }
 

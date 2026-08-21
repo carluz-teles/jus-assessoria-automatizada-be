@@ -1,6 +1,13 @@
 package acquisition
 
-import "github.com/jusassessoria/platform/lib/events"
+import (
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/jusassessoria/platform/lib/events"
+)
 
 // TypeIntegrationActivated is the dotted id of the only event this slice
 // produces. Other slices may import IntegrationActivated as the shape they
@@ -44,6 +51,16 @@ const (
 	TypeIntimationObserved  = "acquisition.intimation.observed"
 	TypeIntimationCancelled = "acquisition.intimation.cancelled"
 )
+
+// TypeEnrichmentBatchRequested is the dotted id of the INTERNAL, SELF-RE-ENQUEUING job
+// that DRIVES o enriquecimento DATAJUD em LOTE por (tenant, tribunal). Ele é dono do
+// ciclo de vida da linha capture_run ENRICHMENT de uma importação: cada passo varre até
+// ~1000 court_records ainda não enriquecidos do tribunal, busca-os em UM request _search
+// (terms), grada todos e MARCA todos como tentados; enquanto sobrar registro a varrer ele
+// se re-agenda (pass+1, ProcessAt=now+carência), e quando a varredura da importação inteira
+// esvazia ele FECHA a linha ENRICHMENT (OK/PARTIAL por cobertura). Produzido na descoberta
+// (sync.go, um por tribunal distinto) E consumido por este slice (nenhum outro slice o vê).
+const TypeEnrichmentBatchRequested = "acquisition.enrichment_batch_requested"
 
 const aggregateTypeIntegration = "integration"
 
@@ -276,3 +293,88 @@ var _ events.Event = BackfillFinished{}
 
 func (BackfillFinished) Type() string          { return TypeBackfillFinished }
 func (BackfillFinished) AggregateType() string { return aggregateTypeBackfillJob }
+
+// enrichmentBatchDelay is the carência between os passos de um enriquecimento em lote: o
+// job se re-agenda com ProcessAt=now+delay pra dar tempo do lote anterior (grade+supersede)
+// commitar e sumir do índice de varredura antes do próximo SELECT. Curto — o gargalo é o
+// request DATAJUD (1/limiter), não o intervalo — mas não-zero, pra o self-re-enqueue não
+// virar um hot-loop contra o Postgres.
+const enrichmentBatchDelay = 2 * time.Second
+
+// enrichmentBatchNamespace namespaces o aggregate id v5 do enrichment_batch_requested
+// (o outbox exige aggregate_id uuid NOT NULL, e (tenant|court|job) não é um uuid).
+var enrichmentBatchNamespace = uuid.MustParse("b3a4c2e1-9f7d-4c6b-8a1e-5d3f2b7c9a04")
+
+// EnrichmentBatchRequested is the self-re-enqueuing batch enrichment job for one
+// (tenant, tribunal) of one import. TenantID is the scope channel every tenant-scoped
+// consumer needs (o outbox não carrega tenant). Court names the tribunal whose index the
+// batch queries; BackfillJobID is the import whose ENRICHMENT capture row this job owns.
+// Pass is the step counter: it makes a FRESH EventID per re-enqueue ("enrich-batch:{job}:
+// {court}:{pass}"), because the relay's asynq TaskID is unique GLOBAL per event id — a
+// stable id would make the scheduled follow-up collide with the just-acked step and get
+// dropped. processAt is the ETA of the NEXT step, kept UNEXPORTED so it never serializes:
+// it feeds ProcessAt() at publish (the relay writes outbox.process_at) and is irrelevant
+// to the consumer, which re-reads the scan by (tenant, court).
+type EnrichmentBatchRequested struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	Court         string `json:"court"`
+	BackfillJobID string `json:"backfill_job_id"`
+	Pass          int    `json:"pass"`
+	processAt     time.Time
+}
+
+var (
+	_ events.Event          = EnrichmentBatchRequested{}
+	_ events.ScheduledEvent = EnrichmentBatchRequested{}
+)
+
+func (EnrichmentBatchRequested) Type() string          { return TypeEnrichmentBatchRequested }
+func (EnrichmentBatchRequested) AggregateType() string { return aggregateTypeBackfillJob }
+
+// ProcessAt opts each STEP into scheduled delivery: the first emission (from discovery)
+// runs immediately (zero processAt → deliver now); a self-re-enqueue carries now+carência
+// so the previous batch's commit clears the scan first (repo directive: ETA work is a
+// scheduled task, not polling).
+func (e EnrichmentBatchRequested) ProcessAt() (time.Time, bool) {
+	return e.processAt, !e.processAt.IsZero()
+}
+
+// newEnrichmentBatchRequested builds the FIRST step of a (tenant, court, import) batch,
+// emitted on discovery — immediate (zero processAt). The aggregate is a stable v5 of
+// (tenant|court|job) so the outbox's uuid NOT NULL is satisfied.
+func newEnrichmentBatchRequested(tenantID, court, backfillJobID string) EnrichmentBatchRequested {
+	return EnrichmentBatchRequested{
+		Base:          events.Base{EventID: enrichmentBatchEventID(backfillJobID, court, 0), Aggregate: enrichmentBatchAggregate(tenantID, court, backfillJobID)},
+		TenantID:      tenantID,
+		Court:         court,
+		BackfillJobID: backfillJobID,
+		Pass:          0,
+	}
+}
+
+// nextEnrichmentBatchStep builds the NEXT step from the current one: a fresh EventID
+// (pass+1) so the relay's global TaskID does not drop it, and ProcessAt=now+carência so
+// the previous batch's commit clears the scan first.
+func (e EnrichmentBatchRequested) nextEnrichmentBatchStep(at time.Time) EnrichmentBatchRequested {
+	return EnrichmentBatchRequested{
+		Base:          events.Base{EventID: enrichmentBatchEventID(e.BackfillJobID, e.Court, e.Pass+1), Aggregate: e.Aggregate},
+		TenantID:      e.TenantID,
+		Court:         e.Court,
+		BackfillJobID: e.BackfillJobID,
+		Pass:          e.Pass + 1,
+		processAt:     at.Add(enrichmentBatchDelay),
+	}
+}
+
+// enrichmentBatchEventID is the per-step idempotency key/TaskID: unique per (import,
+// court, pass), so each self-re-enqueued step is a distinct asynq task AND a distinct
+// consumer-dedup key (a redelivery of the SAME step is still deduped).
+func enrichmentBatchEventID(backfillJobID, court string, pass int) string {
+	return fmt.Sprintf("enrich-batch:%s:%s:%d", backfillJobID, court, pass)
+}
+
+// enrichmentBatchAggregate derives the stable v5 aggregate uuid from (tenant|court|job).
+func enrichmentBatchAggregate(tenantID, court, backfillJobID string) string {
+	return uuid.NewSHA1(enrichmentBatchNamespace, []byte(tenantID+"|"+court+"|"+backfillJobID)).String()
+}

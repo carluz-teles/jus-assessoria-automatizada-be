@@ -1,8 +1,8 @@
 // Package acquisition is the vertical slice that onboards a tenant onto the
 // external data sources it wants monitored. Its only v0 use case is activation:
-// POST /v1/acquisition/integrations upserts one integration row per requested
-// source and emits acquisition.integration_activated in the same transaction, so
-// downstream slices (sync, backfill — future) learn a source went live.
+// POST /v1/acquisition/integrations upserts the tenant's DJEN integration row and
+// emits acquisition.integration_activated in the same transaction, so downstream
+// slices (sync, backfill) learn the watch went live.
 package acquisition
 
 import (
@@ -10,9 +10,10 @@ import (
 	"time"
 )
 
-// Source constants — the data sources a tenant can subscribe to. Only DJEN and
-// DATAJUD are activatable in v0; UPLOAD exists in the schema but is not an
-// automated feed, so activation rejects it (see validation.go).
+// Source constants — the data sources involved in acquisition. Only DJEN is
+// activatable (ActivateIntegration always targets it — see validation.go).
+// DATAJUD is enrichment-only, triggered automatically by court_record_observed,
+// never by activation. UPLOAD exists in the schema but is not an automated feed.
 const (
 	SourceDJEN    = "DJEN"
 	SourceDATAJUD = "DATAJUD"
@@ -157,6 +158,17 @@ const (
 	IntimationUserStatusPending  = "PENDING"
 	IntimationUserStatusResolved = "RESOLVED"
 	IntimationUserStatusIgnored  = "IGNORED"
+)
+
+// Urgência constants — the closed set of deadline-proximity filter values for the
+// intimações inbox (?urgencia query param). The handler validates against this set;
+// the SQL predicate maps each value to a deadline subquery.
+const (
+	UrgenciaAtraso        = "atraso"         // prazo vencido (days_left < 0, status PENDING|OPEN)
+	UrgenciaHoje          = "hoje"           // vence hoje (days_left = 0, status PENDING|OPEN)
+	UrgenciaSemana        = "semana"         // vence nos próximos 7 dias (days_left 1-7, status PENDING|OPEN)
+	UrgenciaMaisAdiante   = "mais_adiante"   // vence em mais de 7 dias (days_left > 7, status PENDING|OPEN)
+	UrgenciaNaoConfirmado = "nao_confirmado" // sugerido, ainda não confirmado (status = PENDING)
 )
 
 // Party role constants — a party's polo in the process (CHECK-on-app enum). The

@@ -36,6 +36,13 @@ type enrichmentListenerUC interface {
 	OnCourtRecordObserved(ctx context.Context, ev CourtRecordObserved) error
 }
 
+// enrichmentBatchListenerUC is the port for the enrichment_batch_requested consumer: the
+// self-re-enqueuing batch job that enriches one (tenant, tribunal) of an import in LOTE and
+// owns the import's ENRICHMENT capture row lifecycle (opens, progresses, closes).
+type enrichmentBatchListenerUC interface {
+	OnEnrichmentBatchRequested(ctx context.Context, ev EnrichmentBatchRequested) error
+}
+
 // ingestionListenerUC is the port for the diario_requested consumer (national bulk
 // ingestion). It is OPTIONAL: nil when INGESTION_ENABLED is off, in which case the
 // diario_requested handler is not registered (the pivot ships inert).
@@ -49,16 +56,23 @@ type ingestionListenerUC interface {
 // enrichment (reacts to court_record_observed), and — when the national pivot is on —
 // ingestion (reacts to diario_requested).
 type Listener struct {
-	backfill   backfillListenerUC
-	sync       syncListenerUC
-	enrichment enrichmentListenerUC
-	ingestion  ingestionListenerUC
+	backfill        backfillListenerUC
+	sync            syncListenerUC
+	enrichment      enrichmentListenerUC
+	enrichmentBatch enrichmentBatchListenerUC
+	ingestion       ingestionListenerUC
 }
 
-// NewListener wires the listener to the backfill, sync, and enrichment use cases, plus
-// the optional ingestion consumer (nil disables the diario_requested handler).
-func NewListener(backfill backfillListenerUC, sync syncListenerUC, enrichment enrichmentListenerUC, ingestion ingestionListenerUC) *Listener {
-	return &Listener{backfill: backfill, sync: sync, enrichment: enrichment, ingestion: ingestion}
+// NewListener wires the listener to the backfill, sync, enrichment, and enrichment-batch
+// use cases, plus the optional ingestion consumer (nil disables the diario_requested handler).
+func NewListener(backfill backfillListenerUC, sync syncListenerUC, enrichment enrichmentListenerUC, enrichmentBatch enrichmentBatchListenerUC, ingestion ingestionListenerUC) *Listener {
+	return &Listener{
+		backfill:        backfill,
+		sync:            sync,
+		enrichment:      enrichment,
+		enrichmentBatch: enrichmentBatch,
+		ingestion:       ingestion,
+	}
 }
 
 // Register mounts the slice's task handlers on the asynq mux — the async analog
@@ -68,6 +82,11 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntegrationActivated, l.handleIntegrationActivated)
 	mux.HandleFunc(TypeSyncRequested, l.handleSyncRequested)
 	mux.HandleFunc(TypeCourtRecordObserved, l.handleCourtRecordObserved)
+
+	// enrichment_batch_requested is NOT registered here: it lives on its OWN "enrichment"
+	// queue, mounted on a dedicated low-concurrency server via RegisterEnrichment, so the
+	// batch DATAJUD job (serialized by its own rate limiter) is isolated from the sync work
+	// on "ingestao". A pattern may be registered only once, so it lives there and NOT here.
 
 	// sync_completed/sync_failed are NOT registered here: they live on their OWN
 	// "sync_status" queue and are mounted on a dedicated concurrency-2 server via
@@ -147,6 +166,27 @@ func (l *Listener) handleCourtRecordObserved(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	return l.enrichment.OnCourtRecordObserved(ctx, ev)
+}
+
+// RegisterEnrichment mounts the enrichment_batch_requested handler on a mux — meant for the
+// worker's DEDICATED low-concurrency "enrichment" server, so the batch DATAJUD job (already
+// serialized by its own rate limiter) never competes with the sync work on "ingestao". A
+// pattern may be registered only once, so this handler lives here and NOT in Register.
+func (l *Listener) RegisterEnrichment(mux *asynq.ServeMux) {
+	mux.HandleFunc(TypeEnrichmentBatchRequested, l.handleEnrichmentBatchRequested)
+}
+
+// handleEnrichmentBatchRequested is the asynq.HandlerFunc for
+// acquisition.enrichment_batch_requested — one step of the batch enrichment job. It decodes
+// the payload and hands off to the batch use case. A decode fault is SkipRetry; the use case
+// returns a retryable error on a fetch fault, SkipRetry on a parse fault, and nil (ack) when
+// there is nothing left to enrich (it closed the import).
+func (l *Listener) handleEnrichmentBatchRequested(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[EnrichmentBatchRequested](t)
+	if err != nil {
+		return err
+	}
+	return l.enrichmentBatch.OnEnrichmentBatchRequested(ctx, ev)
 }
 
 // RegisterSyncStatus mounts the sync_completed/sync_failed handlers on a mux — meant

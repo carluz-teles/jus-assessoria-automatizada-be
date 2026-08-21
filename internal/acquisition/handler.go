@@ -3,6 +3,7 @@ package acquisition
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -16,6 +17,12 @@ import (
 // errResumerNotWired is the cause of the typed 501 when no resumer port is wired.
 var errResumerNotWired = errors.New("resumer port not wired")
 
+// errLawyerLookupNotWired is the cause of the typed 501 when no lawyers port is wired.
+var errLawyerLookupNotWired = errors.New("lawyer lookup port not wired")
+
+// errAnalyzerNotWired is the cause of the typed 501 when no analyzer port is wired.
+var errAnalyzerNotWired = errors.New("analyzer port not wired")
+
 // roleAdmin is the product role allowed to activate integrations. It is the
 // wire-level string the auth middleware puts on the principal (identity.Role
 // widened to a string at the edge); activation is an onboarding action, so only
@@ -25,7 +32,7 @@ const roleAdmin = "ADMIN"
 // handlerUC is the narrow port the Handler uses from the acquisition write use
 // case — the integration activation/list methods.
 type handlerUC interface {
-	ActivateIntegration(ctx context.Context, tenantID string, sources []string, scope Scope) ([]*Integration, error)
+	ActivateIntegration(ctx context.Context, tenantID string, scope Scope) (*Integration, error)
 	ListIntegrations(ctx context.Context, tenantID string) ([]*Integration, error)
 	// AssignResponsible sets/clears the responsável on the process behind a court_record
 	// :id, in one tx. It returns only an error; the handler re-reads the ProcessoView
@@ -37,6 +44,9 @@ type handlerUC interface {
 	ResolveIntimacao(ctx context.Context, tenantID, intimationID string) error
 	IgnoreIntimacao(ctx context.Context, tenantID, intimationID string) error
 	ReopenIntimacao(ctx context.Context, tenantID, intimationID string) error
+	// AssignIntimacaoResponsaveis sets/clears the conductor and reviewer on one intimação in
+	// one tx. The handler re-reads the detail view afterwards so the FE reidrates the aside.
+	AssignIntimacaoResponsaveis(ctx context.Context, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error
 }
 
 // reader is the narrow port the Handler uses from the read use case — the
@@ -55,6 +65,9 @@ type reader interface {
 	Reconciliations(ctx context.Context, tenantID string) (ReconciliationsView, error)
 	ReconciliationDetail(ctx context.Context, tenantID, jobID string) (ReconciliationDetailView, error)
 	SyncRunItems(ctx context.Context, tenantID, syncRunID string) (SyncRunItemsView, error)
+	Captures(ctx context.Context, tenantID string) (CapturesView, error)
+	CaptureDetail(ctx context.Context, tenantID, id string) (CaptureRunView, error)
+	WatchedOABs(ctx context.Context, tenantID string) ([]WatchedOABView, error)
 }
 
 // resumer is the optional AI-summary port the Handler exposes on GET
@@ -64,18 +77,40 @@ type resumer interface {
 	Resume(ctx context.Context, tenantID, courtRecordID string) (ProcessResumoView, error)
 }
 
+// analyzer is the optional AI-analysis port the Handler exposes on POST
+// /v1/intimacoes/:id/analise ("Analisar esta intimação"). It is nil when the slice isn't
+// wired for LLM analyses — a typed 501 (same optional-port pattern as resumer). The use
+// case itself degrades internally when the LLM is off (returns an empty analysis), so a
+// wired-but-unconfigured deploy still answers 200 with the pós-análise degraded state.
+type analyzer interface {
+	Analisar(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseView, error)
+}
+
+// providenciaActions is the port for the aprovar/descartar buttons on the analysis card. It
+// flips ONE AI-suggested providência's status by index (APPROVED/DISCARDED) and returns the
+// refreshed analysis view. Optional (nil when the slice isn't wired for LLM analyses) — the
+// routes then answer the same typed 501 as the analyze route.
+type providenciaActions interface {
+	Aprovar(ctx context.Context, tenantID, intimationID string, idx int, taskID string) (IntimacaoAnaliseView, error)
+	Descartar(ctx context.Context, tenantID, intimationID string, idx int) (IntimacaoAnaliseView, error)
+}
+
 // Handler is the acquisition HTTP surface. It owns its routing; the api only
 // composes by calling RegisterV1.
 type Handler struct {
-	uc      handlerUC
-	reader  reader
-	resumer resumer // nil when no LLM summary port is wired
+	uc          handlerUC
+	reader      reader
+	resumer     resumer            // nil when no LLM summary port is wired
+	analyzer    analyzer           // nil when no LLM intimation-analysis port is wired
+	providencia providenciaActions // nil when no LLM intimation-analysis port is wired
+	lawyers     LawyerLookup       // nil when the DJEN connector isn't wired (same optional-port pattern as resumer)
 }
 
-// NewHandler wires the handler to the acquisition write and read use cases. resumer
-// is optional — nil disables the /resume route surface with a typed 501.
-func NewHandler(uc handlerUC, reader reader, resumer resumer) *Handler {
-	return &Handler{uc: uc, reader: reader, resumer: resumer}
+// NewHandler wires the handler to the acquisition write and read use cases.
+// resumer, analyzer, providencia and lawyers are optional — nil disables their route surface
+// with a typed 501 (/resume, /intimacoes/:id/analise[+providencias] and /oab-lookup).
+func NewHandler(uc handlerUC, reader reader, resumer resumer, analyzer analyzer, providencia providenciaActions, lawyers LawyerLookup) *Handler {
+	return &Handler{uc: uc, reader: reader, resumer: resumer, analyzer: analyzer, providencia: providencia, lawyers: lawyers}
 }
 
 // RegisterV1 mounts acquisition's authenticated routes on the /v1 group. The
@@ -84,10 +119,14 @@ func NewHandler(uc handlerUC, reader reader, resumer resumer) *Handler {
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/acquisition/integrations", middleware.RequireRole(roleAdmin), h.activate)
 	r.Get("/acquisition/integrations", h.list)
+	r.Get("/acquisition/oab-lookup", h.oabLookup)
 	r.Get("/acquisition/import-status", h.importStatus)
 	r.Get("/acquisition/reconciliations", h.reconciliations)
 	r.Get("/acquisition/reconciliations/:jobId", h.reconciliationDetail)
 	r.Get("/acquisition/sync-runs/:syncRunId/items", h.syncRunItems)
+	r.Get("/acquisition/captures", h.captures)
+	r.Get("/acquisition/captures/:id", h.captureDetail)
+	r.Get("/acquisition/watched-oabs", h.watchedOABs)
 	r.Get("/processos", h.listProcessos)
 	// summary before :id so the static "/summary" segment is never shadowed by the param.
 	r.Get("/processos/summary", h.processosSummary)
@@ -103,6 +142,10 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/intimacoes/:id/resolve", h.resolveIntimacao)
 	r.Post("/intimacoes/:id/ignore", h.ignoreIntimacao)
 	r.Post("/intimacoes/:id/reopen", h.reopenIntimacao)
+	r.Post("/intimacoes/:id/analise", h.analisarIntimacao)
+	r.Post("/intimacoes/:id/providencias/:idx/aprovar", h.aprovarProvidencia)
+	r.Post("/intimacoes/:id/providencias/:idx/descartar", h.descartarProvidencia)
+	r.Put("/intimacoes/:id/responsaveis", h.assignIntimacaoResponsaveis)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending processos scan
@@ -124,7 +167,7 @@ const (
 // documented mechanisms; body/other params never read query strings.
 var (
 	processosListParams  = paramSet("limit", "cursor", "search", "court", "lifecycle", "degree", "assignee")
-	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court")
+	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia")
 )
 
 // paramSet builds the route allowlist used by httpx.RejectUnknownParams.
@@ -170,6 +213,17 @@ func isKnownIntimacaoUserStatus(v string) bool {
 	}
 }
 
+// isKnownUrgencia accepts only the closed urgência set the filter exposes — the
+// handler is the app-level CHECK on the ?urgencia param.
+func isKnownUrgencia(v string) bool {
+	switch v {
+	case UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado:
+		return true
+	default:
+		return false
+	}
+}
+
 // integrationView is the read model returned to the client — a per-endpoint DTO.
 // credential_ref is deliberately absent: it is a server-side secret pointer.
 type integrationView struct {
@@ -189,8 +243,8 @@ type listEnvelope struct {
 }
 
 // activate handles POST /v1/acquisition/integrations: validates the body,
-// activates every requested source under the shared scope (rows + events in one
-// tx), and returns 201 with the activated integrations. tenant_id comes from the
+// activates the tenant's DJEN watch under the given scope (row + event in one
+// tx), and returns 201 with the activated integration. tenant_id comes from the
 // verified principal, never the body.
 func (h *Handler) activate(c *fiber.Ctx) error {
 	var req ActivateIntegrationRequest
@@ -202,12 +256,12 @@ func (h *Handler) activate(c *fiber.Ctx) error {
 	}
 
 	tenantID := httpx.TenantFromCtx(c)
-	integrations, err := h.uc.ActivateIntegration(c.UserContext(), tenantID, req.Sources, req.Scope)
+	integration, err := h.uc.ActivateIntegration(c.UserContext(), tenantID, req.Scope)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(newListEnvelope(integrations))
+	return c.Status(fiber.StatusCreated).JSON(newListEnvelope([]*Integration{integration}))
 }
 
 // list handles GET /v1/acquisition/integrations: returns the tenant's
@@ -221,6 +275,36 @@ func (h *Handler) list(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(newListEnvelope(integrations))
+}
+
+// lawyerView is the response shape of GET /v1/acquisition/oab-lookup.
+type lawyerView struct {
+	OAB  string `json:"oab"`
+	Name string `json:"name"`
+}
+
+// oabLookup handles GET /v1/acquisition/oab-lookup?oab=SP123456: a best-effort
+// name lookup that reuses the DJEN connector (see oab_lookup.go for why — no
+// free public OAB registry API exists). Any authenticated user may call it (no
+// tenant needed — it fires during onboarding, before the tenant may even be
+// fully set up). ErrOABNotFound is a normal, expected 404 — the caller (the
+// wizard) degrades to a placeholder, so this is never a hard failure.
+func (h *Handler) oabLookup(c *fiber.Ctx) error {
+	if h.lawyers == nil {
+		return httpx.WriteError(c, apperr.NewUnavailable("oab lookup indisponível: provisor não configurado", errLawyerLookupNotWired))
+	}
+
+	oab, err := parseOAB(c.Query("oab"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	name, err := h.lawyers.LookupOABName(c.UserContext(), oab)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	return c.Status(fiber.StatusOK).JSON(lawyerView{OAB: c.Query("oab"), Name: name})
 }
 
 // importStatus handles GET /v1/acquisition/import-status: the tenant's onboarding
@@ -257,6 +341,58 @@ func (h *Handler) reconciliationDetail(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// captures serves the "Capturas" screen: the KPI header + one row per capture (daily
+// fan-out, enrichment day, initial load), straight from the read model (no envelope —
+// the view is the whole payload, bounded, no pagination in v0).
+func (h *Handler) captures(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.Captures(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// captureDetail handles GET /v1/acquisition/captures/:id: one capture's detail (a
+// DAILY_CAPTURE or ENRICHMENT capture_run). A miss is the typed 404. The initial load
+// keeps its existing reconciliation endpoint.
+func (h *Handler) captureDetail(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.reader.CaptureDetail(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// watchedOABView is the per-item response shape of GET /v1/acquisition/watched-oabs.
+type watchedOABView struct {
+	OAB  string  `json:"oab"`
+	Name *string `json:"name"`
+}
+
+// watchedOABsEnvelope wraps the list in {data:[...]}.
+type watchedOABsEnvelope struct {
+	Data []watchedOABView `json:"data"`
+}
+
+// watchedOABs handles GET /v1/acquisition/watched-oabs: the tenant's monitored OABs
+// (DJEN integration) with the most-frequent lawyer name from party_counsel. Name is
+// null when no capture has occurred yet for that OAB. Used by the Termos settings
+// tab to render the card header as "NOME — OAB" or just "OAB" when name is absent.
+func (h *Handler) watchedOABs(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	views, err := h.reader.WatchedOABs(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	items := make([]watchedOABView, 0, len(views))
+	for _, v := range views {
+		items = append(items, watchedOABView{OAB: v.OAB, Name: v.Name})
+	}
+	return c.Status(fiber.StatusOK).JSON(watchedOABsEnvelope{Data: items})
 }
 
 // syncRunItems handles GET /v1/acquisition/sync-runs/:syncRunId/items: the collapse
@@ -337,6 +473,10 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	if userStatus != "" && !isKnownIntimacaoUserStatus(userStatus) {
 		return httpx.WriteError(c, apperr.NewInvalid("invalid user_status filter"))
 	}
+	urgencia := c.Query("urgencia")
+	if urgencia != "" && !isKnownUrgencia(urgencia) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid urgencia filter"))
+	}
 
 	lastMade, lastID := maxDate, maxUUID
 	if tok := c.Query("cursor"); tok != "" {
@@ -353,6 +493,7 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 		Type:       typ,
 		UserStatus: userStatus,
 		Court:      c.Query("court"),
+		Urgencia:   urgencia,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -401,6 +542,33 @@ func (h *Handler) triageIntimacao(c *fiber.Ctx, action func(ctx context.Context,
 	if err := action(c.UserContext(), tenantID, id); err != nil {
 		return httpx.WriteError(c, err)
 	}
+	view, err := h.reader.Intimacao(c.UserContext(), tenantID, id)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// assignIntimacaoResponsaveis handles PUT /v1/intimacoes/:id/responsaveis: set (or clear,
+// with null) the condutor do prazo and the revisor/assinador for one intimação. The write
+// runs in one tx (membership guard, then write); then the handler re-reads the detail view
+// through the read port and answers 200 with it, so the FE reidrates the aside cards from
+// the fresh row. tenant_id comes from the principal, never the body.
+func (h *Handler) assignIntimacaoResponsaveis(c *fiber.Ctx) error {
+	var req AssignIntimacaoResponsaveisRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	if err := h.uc.AssignIntimacaoResponsaveis(c.UserContext(), tenantID, id, req.ConductorUserID, req.ReviewerUserID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+
 	view, err := h.reader.Intimacao(c.UserContext(), tenantID, id)
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -458,6 +626,72 @@ func (h *Handler) getResume(c *fiber.Ctx) error {
 	}
 	tenantID := httpx.TenantFromCtx(c)
 	view, err := h.resumer.Resume(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// analisarIntimacao handles POST /v1/intimacoes/:id/analise ("Analisar esta intimação"):
+// the IA reads the teor and produces "O que aconteceu" (summary) + "Providências derivadas"
+// (providencias), persists them (OVERWRITE — re-executable), and returns the analysis. The
+// use case degrades internally (LLM off/erro → empty analysis, still persisted+returned), so
+// this handler only surfaces the read's typed 404/400 (unknown/foreign/non-uuid id). A nil
+// analyzer (slice not wired for LLM) is a typed 501 — the route exists but no provider is
+// configured, which the api composes away by always wiring the use case. tenant_id comes
+// from the principal, never the path/body.
+func (h *Handler) analisarIntimacao(c *fiber.Ctx) error {
+	if h.analyzer == nil {
+		return httpx.WriteError(c, apperr.NewUnavailable("análise de intimação indisponível: provisor não configurado", errAnalyzerNotWired))
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	view, err := h.analyzer.Analisar(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// aprovarProvidencia handles POST /v1/intimacoes/:id/providencias/:idx/aprovar: marks the AI
+// providência at :idx APPROVED and returns the refreshed analysis. The REAL task is created by
+// the FE via POST /v1/tasks BEFORE this call (acquisition never imports the deadline entity) —
+// this endpoint only flips the status. Idempotent; tenant_id comes from the principal. A nil
+// providencia port (slice not wired for LLM) is the same typed 501 as the analyze route.
+func (h *Handler) aprovarProvidencia(c *fiber.Ctx) error {
+	return h.providenciaAction(c, true)
+}
+
+// descartarProvidencia handles POST /v1/intimacoes/:id/providencias/:idx/descartar: marks the
+// AI providência at :idx DISCARDED and returns the refreshed analysis. Idempotent.
+func (h *Handler) descartarProvidencia(c *fiber.Ctx) error {
+	return h.providenciaAction(c, false)
+}
+
+// providenciaAction is the shared body of aprovar/descartar: guards the port, parses :idx,
+// dispatches to the use case, and returns the refreshed analysis view.
+func (h *Handler) providenciaAction(c *fiber.Ctx, approve bool) error {
+	if h.providencia == nil {
+		return httpx.WriteError(c, apperr.NewUnavailable("análise de intimação indisponível: provisor não configurado", errAnalyzerNotWired))
+	}
+	idx, err := strconv.Atoi(c.Params("idx"))
+	if err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("índice de providência inválido"))
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+
+	var view IntimacaoAnaliseView
+	if approve {
+		// Optional body {task_id}: the id of the real task the FE just created, so the
+		// approved row can link back to it. Absent/blank body is fine (idempotent re-approve).
+		var body struct {
+			TaskID string `json:"task_id"`
+		}
+		_ = c.BodyParser(&body)
+		view, err = h.providencia.Aprovar(c.UserContext(), tenantID, id, idx, body.TaskID)
+	} else {
+		view, err = h.providencia.Descartar(c.UserContext(), tenantID, id, idx)
+	}
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
@@ -579,9 +813,18 @@ func newProcessosPage(res ProcessosResult, limit int) httpx.Page[ProcessoView] {
 	return httpx.Page[ProcessoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
 }
 
+// intimacoesEnvelope is the list response for GET /v1/intimacoes. It extends the
+// standard cursor envelope with a `buckets` object: per-urgência counts computed
+// over the same non-urgência filters so section headers (Em atraso / Vence hoje /
+// Esta semana / Mais adiante / Sem prazo) agree with the list without an N+1 call.
+type intimacoesEnvelope struct {
+	httpx.Page[IntimacaoView]
+	Buckets IntimacaoBucketsView `json:"buckets"`
+}
+
 // newIntimacoesPage wraps the intimações read model in the cursor envelope; the
 // next cursor keys off the last row's (made_available_at, id) and the totals "X de Y".
-func newIntimacoesPage(res IntimacoesResult, limit int) httpx.Page[IntimacaoView] {
+func newIntimacoesPage(res IntimacoesResult, limit int) intimacoesEnvelope {
 	items := res.Items
 	if items == nil {
 		items = []IntimacaoView{}
@@ -595,7 +838,10 @@ func newIntimacoesPage(res IntimacoesResult, limit int) httpx.Page[IntimacaoView
 		})
 		meta.NextCursor = &tok
 	}
-	return httpx.Page[IntimacaoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
+	return intimacoesEnvelope{
+		Page:    httpx.Page[IntimacaoView]{Data: items, Page: meta, Filters: res.Filters.NonNil()},
+		Buckets: res.Buckets,
+	}
 }
 
 // newAndamentosPage wraps the andamentos read model in the cursor envelope; the next

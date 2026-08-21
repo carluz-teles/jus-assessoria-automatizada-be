@@ -87,6 +87,30 @@ type mockRepo struct {
 	markStatusID       string
 	markStatusErr      error
 
+	// confirmation panel (0049): anchors, preview, no-deadline / reopen transitions
+	anchors             IntimationAnchors
+	anchorsErr          error
+	anchorsCalls        int
+	gotAnchorsIntim     string
+	gotAnchorsTenant    string
+	previewContext      PreviewContext
+	previewContextErr   error
+	previewContextCalls int
+	gotPreviewIntim     string
+	gotPreviewTenant    string
+	noDeadlineID        string
+	noDeadlineErr       error
+	noDeadlineCalls     int
+	gotNoDeadlineID     string
+	gotNoDeadlineTenant string
+	gotNoDeadlineBy     string
+	gotNoDeadlineAt     time.Time
+	reopenID            string
+	reopenErr           error
+	reopenCalls         int
+	gotReopenID         string
+	gotReopenTenant     string
+
 	// task write path (5b)
 	taskForUpdate      *TaskForUpdate
 	taskForUpdateErr   error
@@ -351,6 +375,50 @@ func (m *mockRepo) MarkDeadlineStatus(_ context.Context, _ database.Tx, deadline
 		return "", m.markStatusErr
 	}
 	return m.markStatusID, nil
+}
+
+// GetIntimationAnchors returns the configured anchors and records the (intimation, tenant)
+// scoping so a re-anchor test can assert the 2-barrier key.
+func (m *mockRepo) GetIntimationAnchors(_ context.Context, _ database.Tx, intimationID, tenantID string) (IntimationAnchors, error) {
+	m.anchorsCalls++
+	m.gotAnchorsIntim = intimationID
+	m.gotAnchorsTenant = tenantID
+	return m.anchors, m.anchorsErr
+}
+
+// GetPreviewContext returns the configured preview context (anchors + court) and records the
+// (intimation, tenant) scoping.
+func (m *mockRepo) GetPreviewContext(_ context.Context, _ database.Tx, intimationID, tenantID string) (PreviewContext, error) {
+	m.previewContextCalls++
+	m.gotPreviewIntim = intimationID
+	m.gotPreviewTenant = tenantID
+	return m.previewContext, m.previewContextErr
+}
+
+// MarkNoDeadline records the (id, tenant, confirmedBy, confirmedAt) of the mera-ciência flip and
+// returns the configured id (or error), so a no-deadline test can assert the guarded flip's args.
+func (m *mockRepo) MarkNoDeadline(_ context.Context, _ database.Tx, deadlineID, tenantID, confirmedBy string, confirmedAt time.Time) (string, error) {
+	m.noDeadlineCalls++
+	m.gotNoDeadlineID = deadlineID
+	m.gotNoDeadlineTenant = tenantID
+	m.gotNoDeadlineBy = confirmedBy
+	m.gotNoDeadlineAt = confirmedAt
+	if m.noDeadlineErr != nil {
+		return "", m.noDeadlineErr
+	}
+	return m.noDeadlineID, nil
+}
+
+// ReopenNoDeadline records the (id, tenant) of the reopen flip and returns the configured id (or
+// error).
+func (m *mockRepo) ReopenNoDeadline(_ context.Context, _ database.Tx, deadlineID, tenantID string) (string, error) {
+	m.reopenCalls++
+	m.gotReopenID = deadlineID
+	m.gotReopenTenant = tenantID
+	if m.reopenErr != nil {
+		return "", m.reopenErr
+	}
+	return m.reopenID, nil
 }
 
 // InsertTask echoes the task back with a real uuid id (as the DB would), so a test can
@@ -686,6 +754,38 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 	}
 	if opened.Kind != KindContestacao || opened.EndDate != "2024-02-06" || opened.Counting != "BUSINESS" {
 		t.Errorf("opened kind/end/counting = %q/%q/%q", opened.Kind, opened.EndDate, opened.Counting)
+	}
+}
+
+// TestOnIntimationObserved_ComunicacaoIsNoOp is the belt-and-suspenders guard: a generic
+// COMUNICACAO opens no prazo, so it is dropped BEFORE any transaction — no dedup mark, no
+// tx scope, no deadline inserted, no event published. The DJEN parser already gates these,
+// so this protects the slice only against a future producer that emits one.
+func TestOnIntimationObserved_ComunicacaoIsNoOp(t *testing.T) {
+	ev := observedFixture()
+	ev.Type = "COMUNICACAO"
+
+	repo := &mockRepo{class: "Procedimento Comum Cível", rule: citacaoRule(), insertID: uuid.NewString()}
+	outbox := &fakeOutbox{}
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, dedup, uow)
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	if len(uow.scopes) != 0 {
+		t.Errorf("opened %d transactions, want 0 (no-op before any tx)", len(uow.scopes))
+	}
+	if len(dedup.marked) != 0 {
+		t.Errorf("dedup consulted %d times, want 0", len(dedup.marked))
+	}
+	if repo.inserted != nil {
+		t.Error("a deadline was inserted for a COMUNICACAO, want none")
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published %d events, want 0", len(outbox.published))
 	}
 }
 

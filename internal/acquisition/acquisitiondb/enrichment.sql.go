@@ -12,6 +12,53 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countRemainingDueForJob = `-- name: CountRemainingDueForJob :one
+SELECT count(*) AS remaining
+FROM court_record
+WHERE tenant_id = $1
+  AND completeness < 0.9
+  AND enrichment_attempted_at IS NULL
+  AND lifecycle <> 'SUPERSEDED'
+`
+
+// How many court_records of an ENTIRE import (all tribunals of the backfill_job's tenant)
+// still need enriching. The batch job closes the import's ENRICHMENT capture row ONLY when
+// this reaches 0 — the deterministic fecho: not "updated >= total" (a process DATAJUD never
+// indexed never reaches 0.9), but "no untried record remains". Not-found processes stay
+// marked-attempted-but-<0.9, so they DROP OUT of this count without ever gralduating,
+// which is what stops an infinite loop and lets the fecho land as PARTIAL. Scoped by
+// tenant; the scan index serves the predicate. @backfill_job_id is unused in the filter
+// (the tenant's whole enrichment backlog is the import's, v0 runs one import at a time),
+// kept in the signature so the caller's intent (this import) reads clearly.
+func (q *Queries) CountRemainingDueForJob(ctx context.Context, tenantID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countRemainingDueForJob, tenantID)
+	var remaining int64
+	err := row.Scan(&remaining)
+	return remaining, err
+}
+
+const markEnrichmentAttempted = `-- name: MarkEnrichmentAttempted :exec
+UPDATE court_record
+SET enrichment_attempted_at = $1
+WHERE tenant_id = $2 AND id = ANY($3::uuid[])
+`
+
+type MarkEnrichmentAttemptedParams struct {
+	At       pgtype.Timestamptz `json:"at"`
+	TenantID uuid.UUID          `json:"tenant_id"`
+	Ids      []uuid.UUID        `json:"ids"`
+}
+
+// Stamp enrichment_attempted_at = @at on EVERY record a batch visited — graded OR not
+// (a number DATAJUD did not return still counts as attempted). This is what removes the
+// record from the scan index so the next step reads fresh work and the fecho can reach
+// 0-remaining. Scoped by tenant (RLS barrier 1). Ids arrive as a uuid[] so one round-trip
+// marks the whole batch.
+func (q *Queries) MarkEnrichmentAttempted(ctx context.Context, arg MarkEnrichmentAttemptedParams) error {
+	_, err := q.db.Exec(ctx, markEnrichmentAttempted, arg.At, arg.TenantID, arg.Ids)
+	return err
+}
+
 const repointIntimations = `-- name: RepointIntimations :execrows
 UPDATE intimation
 SET court_record_id = $1
@@ -34,6 +81,65 @@ func (q *Queries) RepointIntimations(ctx context.Context, arg RepointIntimations
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const selectDueForEnrichment = `-- name: SelectDueForEnrichment :many
+SELECT id, case_id, cnj_number, degree, court
+FROM court_record
+WHERE tenant_id = $1
+  AND court = $2
+  AND completeness < 0.9
+  AND enrichment_attempted_at IS NULL
+  AND lifecycle <> 'SUPERSEDED'
+ORDER BY id
+LIMIT $3
+`
+
+type SelectDueForEnrichmentParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Court    string    `json:"court"`
+	Lim      int32     `json:"lim"`
+}
+
+type SelectDueForEnrichmentRow struct {
+	ID        uuid.UUID `json:"id"`
+	CaseID    uuid.UUID `json:"case_id"`
+	CnjNumber string    `json:"cnj_number"`
+	Degree    string    `json:"degree"`
+	Court     string    `json:"court"`
+}
+
+// The batch enrichment's scan: up to @lim court_records of ONE tribunal (@court) that
+// still need enriching — completeness below the DATAJUD ceiling (0.9), never attempted,
+// and not a superseded merge-placeholder. Served by court_record_enrichment_scan_idx
+// (tenant_id, court WHERE the same predicate). ORDER BY id is a STABLE deterministic
+// order (court_record has no created_at column; v0 priority is just "make progress",
+// not recency) so re-runs page the same way; enrichment_attempted_at IS NULL is what
+// makes the scan shrink each step, so a re-delivery re-reads the REMAINING work only.
+func (q *Queries) SelectDueForEnrichment(ctx context.Context, arg SelectDueForEnrichmentParams) ([]SelectDueForEnrichmentRow, error) {
+	rows, err := q.db.Query(ctx, selectDueForEnrichment, arg.TenantID, arg.Court, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SelectDueForEnrichmentRow
+	for rows.Next() {
+		var i SelectDueForEnrichmentRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CaseID,
+			&i.CnjNumber,
+			&i.Degree,
+			&i.Court,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const supersedeCourtRecord = `-- name: SupersedeCourtRecord :exec
@@ -85,7 +191,7 @@ type UpdateCourtRecordGradeParams struct {
 	Secrecy       string             `json:"secrecy"`
 	Completeness  float32            `json:"completeness"`
 	NextSyncAt    pgtype.Timestamptz `json:"next_sync_at"`
-	Lifecycle     string             `json:"lifecycle"`
+	Lifecycle     interface{}        `json:"lifecycle"`
 	CourtRecordID uuid.UUID          `json:"court_record_id"`
 	TenantID      uuid.UUID          `json:"tenant_id"`
 }
@@ -120,6 +226,11 @@ type UpdateCourtRecordGradeRow struct {
 // re-poll cadence. case_id is never touched (the record keeps its Pasta). RETURNING
 // carries id + case_id for the caller. The (tenant, cnj, degree) UNIQUE requires the
 // caller to ensure no OTHER record already holds @degree (the merge path handles that).
+// lifecycle is derived from DATAJUD movimentos (lifecycleFromMovimentos in the parser):
+// CASE guards that an already-SUPERSEDED row is never downgraded — superseding is a
+// structural merge operation and must survive a scheduler re-poll. When @lifecycle is
+// empty (source does not carry movimentos) the existing lifecycle is preserved via the
+// NULLIF/COALESCE: NULLIF(”, lifecycle) = NULL → COALESCE falls back to lifecycle.
 func (q *Queries) UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRecordGradeParams) (UpdateCourtRecordGradeRow, error) {
 	row := q.db.QueryRow(ctx, updateCourtRecordGrade,
 		arg.Degree,

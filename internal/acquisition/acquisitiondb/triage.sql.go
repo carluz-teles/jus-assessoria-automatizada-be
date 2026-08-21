@@ -9,7 +9,41 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const assignIntimationResponsaveis = `-- name: AssignIntimationResponsaveis :one
+UPDATE intimation
+   SET conductor_user_id = $3::uuid,
+       reviewer_user_id  = $4::uuid
+ WHERE id = $1 AND tenant_id = $2
+RETURNING id
+`
+
+type AssignIntimationResponsaveisParams struct {
+	ID              uuid.UUID   `json:"id"`
+	TenantID        uuid.UUID   `json:"tenant_id"`
+	ConductorUserID pgtype.UUID `json:"conductor_user_id"`
+	ReviewerUserID  pgtype.UUID `json:"reviewer_user_id"`
+}
+
+// Set (or clear, via NULL) the conductor_user_id and reviewer_user_id on one intimation,
+// tenant-scoped (barrier 1, RLS barrier 2). Both are nullable: passing NULL desatribui
+// the role. The use case pre-validates membership (AppUserExistsInTenant) before calling
+// this, so the FK is always satisfied when non-null. A zero-row result (unknown id or
+// foreign tenant's row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
+// Idempotent: re-assigning the same user re-writes the same value.
+func (q *Queries) AssignIntimationResponsaveis(ctx context.Context, arg AssignIntimationResponsaveisParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, assignIntimationResponsaveis,
+		arg.ID,
+		arg.TenantID,
+		arg.ConductorUserID,
+		arg.ReviewerUserID,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
 
 const setIntimationUserStatus = `-- name: SetIntimationUserStatus :one
 

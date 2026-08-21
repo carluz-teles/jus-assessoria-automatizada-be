@@ -31,6 +31,13 @@ type Querier interface {
 	// court_record above; the WHERE ties the write to the caller's own tenant so a mismatched
 	// (case, tenant) touches nothing. Idempotent — re-assigning the same user is a no-op write.
 	AssignCaseResponsible(ctx context.Context, arg AssignCaseResponsibleParams) error
+	// Set (or clear, via NULL) the conductor_user_id and reviewer_user_id on one intimation,
+	// tenant-scoped (barrier 1, RLS barrier 2). Both are nullable: passing NULL desatribui
+	// the role. The use case pre-validates membership (AppUserExistsInTenant) before calling
+	// this, so the FK is always satisfied when non-null. A zero-row result (unknown id or
+	// foreign tenant's row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
+	// Idempotent: re-assigning the same user re-writes the same value.
+	AssignIntimationResponsaveis(ctx context.Context, arg AssignIntimationResponsaveisParams) (uuid.UUID, error)
 	// backfill_job queries (acquisition slice).
 	// The backfill listener reacts to integration_activated: on the FIRST activation
 	// of an integration it creates one backfill_job and emits the sync slices. These
@@ -60,8 +67,14 @@ type Querier interface {
 	// per-tenant write lock hold short even for a process with a long movimento history.
 	BatchInsertDocketEntries(ctx context.Context, entries []byte) ([]BatchInsertDocketEntriesRow, error)
 	// Bulk MarkCourtRecordSynced for reobserved (already-existing) records: refresh
-	// completeness/next_sync_at and COALESCE judging_body (a sync that omits it keeps the
-	// prior value) for MANY records in one round-trip, from a jsonb array of rows.
+	// completeness/next_sync_at and COALESCE judging_body/class/subject (a sync that
+	// omits them keeps the prior value; a sync that supplies them overwrites — COALESCE on
+	// NULLIF('', prior) so an empty string from the source does not clobber a real value).
+	// class and subject are included so a tribunal correction in DJEN/DATAJUD propagates
+	// on the next re-sync instead of being frozen at the first-seen value.
+	// completeness uses GREATEST (never DOWNGRADE): a DJEN re-observation (0.3) must NOT
+	// clobber a prior DATAJUD enrichment (0.9). Without this the churn of a backfill
+	// re-discovering the same process across windows/OABs erases every enrichment.
 	BatchMarkCourtRecordsSynced(ctx context.Context, updates []byte) error
 	// Bulk counterpart of InsertIntimation: upsert MANY intimações in one round-trip from
 	// a jsonb array of rows. Same ON CONFLICT (tenant, case, hash) DO UPDATE as the single
@@ -102,6 +115,13 @@ type Querier interface {
 	// does not re-enqueue it; if the resync never lands, it falls due again after the
 	// interval (at-least-once).
 	ClaimCourtRecordResync(ctx context.Context, arg ClaimCourtRecordResyncParams) error
+	// Fecho por ETA da linha ENRICHMENT de uma importação: carimba o status terminal
+	// (@status = OK quando a cobertura foi atingida, PARTIAL senão) e finished_at = @at. Roda
+	// no listener do EnrichmentRunCloseScheduled, agendado no fim do backfill + carência. Só
+	// afeta a linha ENRICHMENT daquela importação. Retorna o número de linhas afetadas: 0
+	// significa que a importação não aplicou nenhum enriquecimento (nenhuma linha foi criada)
+	// — o listener trata esse caso criando uma linha honesta com updated=0.
+	CloseImportEnrichmentRun(ctx context.Context, arg CloseImportEnrichmentRunParams) (int64, error)
 	// Count the tenant's ACTIVE court records inside the caller's tx. The entitlement
 	// gate reads this against the subscription's active_process_limit before creating a
 	// BRAND-NEW record (the MISS path of FindOrCreateCourtRecord only — a reobservation
@@ -116,14 +136,36 @@ type Querier interface {
 	// holds in that lifecycle, so "X de Y" stays meaningful (X ⊆ that lifecycle). ACTIVE —
 	// the screen's default context — keeps the cheaper CountActiveCourtRecordsByTenant.
 	CountCourtRecordsByLifecycle(ctx context.Context, arg CountCourtRecordsByLifecycleParams) (int64, error)
+	// Quantos prazos (deadline) o tenant derivou dentro da janela de uma captura
+	// [started_at, finished_at] — a coluna "prazos" por linha da tabela. deadline.
+	// created_at nasce em 0046. Escopado por tenant (barreira 1 + RLS).
+	CountDeadlinesCreatedBetween(ctx context.Context, arg CountDeadlinesCreatedBetweenParams) (int64, error)
+	// O KPI "prazos derivados hoje": deadline criados hoje (created_at >= hoje),
+	// por tenant.
+	CountDeadlinesCreatedToday(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// O total de processos que a importação DESCOBRIU: SUM(sync_run.court_records_new) das
+	// janelas do backfill_job. É a métrica de cobertura contra a qual o fecho por ETA compara
+	// o contador de enriquecimentos aplicados (updated >= total → OK, senão PARTIAL).
+	CountImportDiscoveredRecords(ctx context.Context, arg CountImportDiscoveredRecordsParams) (int64, error)
+	// Bucket counts for the list envelope's `buckets` object, derived in the same
+	// request as ListIntimacoes (no N+1). Mirrors the urgência buckets of the list's
+	// WHERE clause but expressed as FILTER aggregates over the SAME non-urgencia
+	// filters (type, user_status, court, search) — so the header badges agree with
+	// what the list would show when the user picks that bucket. `sem_prazo` counts
+	// intimations with no derived deadline AND not yet resolved/ignored (user still
+	// needs to triage them but there is no urgency signal from a deadline). All four
+	// deadline buckets restrict to status IN (PENDING, OPEN): MISSED/MET deadlines
+	// belong to closed intimations and are not counted as actionable.
+	CountIntimacoesBuckets(ctx context.Context, arg CountIntimacoesBucketsParams) (CountIntimacoesBucketsRow, error)
 	// The "X de Y" total for the Intimações tab: how many intimations the process holds.
 	// Scoped by the same court_record_id + tenant_id as the list; no court_record join is
 	// needed (intimation carries tenant_id), unlike the andamentos count.
 	CountIntimacoesByProcesso(ctx context.Context, arg CountIntimacoesByProcessoParams) (int64, error)
 	// The filtered "X" of the intimations inbox's "X de Y" counter: how many intimations
 	// match the active filters (search on the court record's cnj_number, type, user_status,
-	// court). Called only when a filter is present; the unfiltered "Y" reuses
-	// CountIntimationsByTenant. SAME predicates as ListIntimacoes (minus the keyset).
+	// court, urgencia). Called only when a filter is present; the unfiltered "Y" reuses
+	// CountIntimationsByTenant. SAME predicates as ListIntimacoes (minus the keyset). The
+	// LEFT JOIN deadline mirrors ListIntimacoes so the urgencia filter agrees with the page.
 	CountIntimacoesFiltered(ctx context.Context, arg CountIntimacoesFilteredParams) (int64, error)
 	// The reconciliations totals: how many intimations the tenant holds (paired with
 	// CountActiveCourtRecordsByTenant for the processes side).
@@ -136,6 +178,22 @@ type Querier interface {
 	// counter agrees with the page. The LEFT JOIN court_case is needed for the assignee
 	// predicate; the case id is the join key, so it never multiplies rows.
 	CountProcessosFiltered(ctx context.Context, arg CountProcessosFilteredParams) (int64, error)
+	// How many court_records of an ENTIRE import (all tribunals of the backfill_job's tenant)
+	// still need enriching. The batch job closes the import's ENRICHMENT capture row ONLY when
+	// this reaches 0 — the deterministic fecho: not "updated >= total" (a process DATAJUD never
+	// indexed never reaches 0.9), but "no untried record remains". Not-found processes stay
+	// marked-attempted-but-<0.9, so they DROP OUT of this count without ever gralduating,
+	// which is what stops an infinite loop and lets the fecho land as PARTIAL. Scoped by
+	// tenant; the scan index serves the predicate. @backfill_job_id is unused in the filter
+	// (the tenant's whole enrichment backlog is the import's, v0 runs one import at a time),
+	// kept in the signature so the caller's intent (this import) reads clearly.
+	CountRemainingDueForJob(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// Quantas tarefas (task) foram criadas dentro da janela de uma captura
+	// [started_at, finished_at]. task.created_at já existe. Escopado por tenant.
+	CountTasksCreatedBetween(ctx context.Context, arg CountTasksCreatedBetweenParams) (int64, error)
+	// O card "OABs" de uma captura: quantas OABs o tenant monitora pela integração
+	// DJEN (a fonte que descobre). Junta watched_oab à integration da fonte DJEN.
+	CountWatchedOABsForDJEN(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// Drop a court_case orphaned when a concurrent sync won the court_record create
 	// race (our InsertCourtRecord hit ON CONFLICT DO NOTHING) — keeps cases 1:1 with
 	// records (v0 has no consolidation).
@@ -168,6 +226,15 @@ type Querier interface {
 	// closing it (so the cycle resumes it), while a closed (OK/FAILED) run is a no-op
 	// ack. A miss (pgx.ErrNoRows) is the typed ErrSyncRunNotFound.
 	FindSyncRunByEventID(ctx context.Context, eventID *string) (FindSyncRunByEventIDRow, error)
+	// Uma linha capture_run do tenant (detalhe de DAILY_CAPTURE / ENRICHMENT). A carga
+	// inicial (INITIAL_LOAD) continua no endpoint de reconciliation existente — este é
+	// só para as duas capturas nativas. A linha ENRICHMENT deriva a janela da importação
+	// (LEFT JOIN backfill_job), como no ListCaptureRuns. Um miss (pgx.ErrNoRows) vira o 404.
+	GetCaptureRunByID(ctx context.Context, arg GetCaptureRunByIDParams) (GetCaptureRunByIDRow, error)
+	// Os KPIs do topo da tela, escopados ao tenant. last_capture_at é a captura
+	// bem-sucedida mais recente (OK/PARTIAL, com finished_at); intimations_new_today
+	// soma as intimações novas das capturas iniciadas hoje (started_at >= hoje).
+	GetCaptureSummary(ctx context.Context, tenantID uuid.UUID) (GetCaptureSummaryRow, error)
 	// responsável do processo (case-level) — the write path for PUT
 	// /v1/processos/:id/responsavel. All three run inside the caller's tx (UoW +
 	// SET LOCAL app.tenant_id), so RLS is a second barrier under the explicit
@@ -188,19 +255,45 @@ type Querier interface {
 	// record. Keys arrive as a jsonb array of {cnj_number, degree} — one scalar param,
 	// so sqlc stays happy (it does not model multi-arg unnest).
 	GetCourtRecordsByKeys(ctx context.Context, arg GetCourtRecordsByKeysParams) ([]GetCourtRecordsByKeysRow, error)
+	// Lê os contadores da linha ENRICHMENT de uma importação: court_records_updated (quantos
+	// processos foram enriquecidos) E errors (quantos hits o DATAJUD retornou mas não conseguimos
+	// parsear — erro REAL). O fecho decide o status terminal SÓ por errors: 0 → OK ("Concluída"),
+	// >0 → PARTIAL ("Falha parcial"); os não-encontrados no índice (0 hits) NÃO entram em errors,
+	// então são normais e não rebaixam o status. Um miss (pgx.ErrNoRows) significa que a importação
+	// não aplicou nenhum enriquecimento — o listener trata criando a linha honesta com updated=0.
+	GetImportEnrichmentCounter(ctx context.Context, arg GetImportEnrichmentCounterParams) (GetImportEnrichmentCounterRow, error)
 	GetIntegrationBySource(ctx context.Context, arg GetIntegrationBySourceParams) (Integration, error)
 	// One intimation by id, for the FE deep-link into the inbox DETAIL screen (an intimation
 	// not on the loaded list page). It is a SUPERSET of the list projection: it carries the
-	// list fields (so it still maps a full IntimacaoView) PLUS the detail-only extras the
-	// inbox row omits —
-	//   • content       — the FULL teor (not the 500-rune preview the list truncates);
-	//   • judging_body  — the court record's órgão julgador (court_record.judging_body, 0014);
-	//   • recipients    — the addressee jsonb list (every destinatário + matched-OAB flag);
-	//   • user_status   — the triagem state (PENDING|RESOLVED|IGNORED), so the detail can
-	//                     render the resolve/ignore/reopen affordance.
-	// Scoped by tenant_id (barrier 1): a foreign or unknown id yields no row (→ typed 404
-	// upstream, never nil,nil). Read-only, off the write path.
+	// list fields (so it still maps a full IntimacaoView, including the prazo block) PLUS the
+	// detail-only extras the inbox row omits —
+	//   • content                — the FULL teor (not the 500-rune preview the list truncates);
+	//   • judging_body           — the court record's órgão julgador (court_record.judging_body);
+	//   • recipients             — the addressee jsonb list (every destinatário + matched-OAB flag);
+	//   • user_status            — the triagem state (PENDING|RESOLVED|IGNORED);
+	//   • conductor_user_id/name — condutor do prazo (nullable, LEFT JOIN app_user);
+	//   • reviewer_user_id/name  — revisão e assinatura (nullable, LEFT JOIN app_user);
+	//   • deadline.confirmed_at  — when the deadline was confirmed (for history derivation);
+	//   • deadline.confirmed_by_name — confirmer's name (for history label; nullable);
+	//   • deadline.status (already present) — for history label (OPEN/NO_DEADLINE branch).
+	// The LEFT JOIN deadline mirrors ListIntimacoes (same 1:1 notification_id join); NULL
+	// when the intimação has no prazo yet. Scoped by tenant_id (barrier 1): a foreign or
+	// unknown id yields no row (→ typed 404 upstream, never nil,nil). Read-only, off the
+	// write path.
 	GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error)
+	// analise.sql — queries for the AI analysis of one intimation (POST /v1/intimacoes/:id/analise).
+	// GetIntimacaoAnaliseContext reads the teor + the court context the prompt needs; the write
+	// query OVERWRITES the three ai_* columns (re-executable — "Gerar novamente" re-runs it).
+	// One intimation's teor plus its court record's identification and the derived prazo end_date
+	// (LEFT JOIN deadline on notification_id — NULL when no prazo yet; the IA uses it as the ceiling
+	// for suggested due_dates). Scoped by tenant_id + intimation id (barrier 1). A miss/foreign row →
+	// pgx.ErrNoRows → ErrIntimationNotFound (the same 404 semantics as GetIntimacao). type is nullable.
+	GetIntimacaoAnaliseContext(ctx context.Context, arg GetIntimacaoAnaliseContextParams) (GetIntimacaoAnaliseContextRow, error)
+	// Reads the ai_providencias jsonb + ai_analyzed_at of one intimation, locking the row
+	// (FOR UPDATE) so an aprovar/descartar read-modify-write is serialized. NULL ai_analyzed_at
+	// (never analysed) vs a set stamp lets the use case reject a status change on an un-analysed
+	// intimation. Scoped by tenant_id (barrier 1); a miss/foreign row → pgx.ErrNoRows.
+	GetIntimationProvidenciasForUpdate(ctx context.Context, arg GetIntimationProvidenciasForUpdateParams) (GetIntimationProvidenciasForUpdateRow, error)
 	// The tenant's most recent backfill job — status + tallies — for the import-status
 	// read (the FE banner "importando seus processos…"). Newest job wins (a re-activation
 	// opens a new job). No job ever → no row; the read use case maps that to NONE (not
@@ -212,6 +305,7 @@ type Querier interface {
 	// Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
 	// placeholder is still reachable by direct link. A foreign or unknown id yields no row
 	// (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
+	// next_deadline: same correlated LATERAL as ListProcessos (see above).
 	GetProcesso(ctx context.Context, arg GetProcessoParams) (GetProcessoRow, error)
 	// One import's reconciliação header (the detail screen), same shape/aggregation as
 	// ListReconciliations but for a single backfill_job.
@@ -246,6 +340,27 @@ type Querier interface {
 	// whether this was the last slice. Scoped by tenant_id (isolation barrier 1); a
 	// non-matching row (wrong tenant / gone) affects zero rows and returns no row.
 	IncrementBackfillSlicesOK(ctx context.Context, arg IncrementBackfillSlicesOKParams) (IncrementBackfillSlicesOKRow, error)
+	// Incrementa a linha ENRICHMENT DA IMPORTAÇÃO por UM enriquecimento DATAJUD aplicado, na
+	// MESMA tx do applyEnrichment (sob o advisory lock do tenant). A primeira aplicação da
+	// importação cria a linha em status RUNNING ("Em andamento") com court_records_updated=1;
+	// as seguintes somam +1 e avançam finished_at, MANTENDO RUNNING — o status terminal
+	// (OK/PARTIAL) é carimbado só pelo fecho por ETA (CloseImportEnrichmentRun), quando a
+	// fila de enriquecimento drenou e a cobertura é conhecida. window_from/to ficam NULL: a
+	// linha deriva a janela do backfill_job (ver ListCaptureRuns). O índice parcial
+	// capture_run_enrichment_import_uq (backfill_job_id WHERE kind='ENRICHMENT') é o alvo do
+	// conflito — uma linha por importação. Só chega aqui passado o dedup do evento, então uma
+	// re-entrega nunca conta em dobro.
+	IncrementImportEnrichmentRun(ctx context.Context, arg IncrementImportEnrichmentRunParams) error
+	// Batch counterpart of IncrementImportEnrichmentRun: bump an import's ENRICHMENT row by
+	// @delta applied enrichments (records a step graded) AND @errs REAL parse errors (hits
+	// DATAJUD returned but we could not parse — NOT the "not in the index" 0-hit case, which is
+	// expected and never counted). The first step creates the row RUNNING; later steps sum both
+	// counters and advance finished_at, staying RUNNING — the terminal status is stamped by the
+	// fecho (CloseImportEnrichmentRun), which decides OK vs PARTIAL purely from the accumulated
+	// `errors` (0 errors → OK even if some processes were not found in DATAJUD). Same partial-
+	// unique conflict target as the +1 variant. The caller skips this when delta==0 AND errs==0
+	// (a no-op upsert would mint a spurious RUNNING row).
+	IncrementImportEnrichmentRunBy(ctx context.Context, arg IncrementImportEnrichmentRunByParams) error
 	// Create the onboarding backfill job. total_slices is precomputed by the use
 	// case; the counters default to zero and status is passed explicitly so a
 	// zero-slice horizon can land COMPLETED instead of RUNNING.
@@ -260,12 +375,24 @@ type Querier interface {
 	// judging_body (órgão julgador) comes from the source when disclosed (DJEN
 	// nomeOrgao / DATAJUD orgaoJulgador), NULL when it does not.
 	InsertCourtRecord(ctx context.Context, arg InsertCourtRecordParams) (uuid.UUID, error)
+	// Grava a linha DAILY_CAPTURE de um dia, na MESMA tx do write per-tenant do fan-out
+	// (writeForTenant, sob o advisory lock do tenant). Abre e fecha de uma vez: o
+	// fan-out é síncrono (upsert dos records + intimações), então started_at/finished_at
+	// e o status final (OK) já são conhecidos. ON CONFLICT (tenant, source, kind,
+	// window_from) faz um re-run do MESMO dia SOMAR aos contadores e avançar finished_at
+	// — idempotência-friendly sob at-least-once (uma re-entrega do dia não zera o dia).
+	InsertDailyCaptureRun(ctx context.Context, arg InsertDailyCaptureRunParams) error
 	// Append one andamento, idempotent on (court_record_id, hash). On conflict the
 	// row is left untouched and no id is returned (pgx.ErrNoRows), which the caller
 	// reads as "deduped" — so a re-sync emits no docket_entry_observed for it.
 	// tpu_code (Tabela Processual Unificada) and complements are DATAJUD movimento
 	// classification; NULL for sources that do not classify the entry.
 	InsertDocketEntry(ctx context.Context, arg InsertDocketEntryParams) (uuid.UUID, error)
+	// Fecho por ETA quando a importação não aplicou NENHUM enriquecimento (CloseImportEnrichmentRun
+	// afetou 0 linhas): cria a linha ENRICHMENT terminal de forma honesta (court_records_updated=0,
+	// status carimbado pelo fecho). ON CONFLICT DO NOTHING protege contra a corrida de uma
+	// aplicação que chegou entre o UPDATE e este INSERT (o índice parcial é o alvo).
+	InsertEmptyImportEnrichmentRun(ctx context.Context, arg InsertEmptyImportEnrichmentRunParams) error
 	// Append or reconcile one intimação, keyed on (tenant_id, case_id, hash). Unlike
 	// docket entries, this is ON CONFLICT DO UPDATE (not DO NOTHING): when the DJEN
 	// retracts a publication (data_cancelamento) the SAME hash re-arrives carrying
@@ -303,12 +430,35 @@ type Querier interface {
 	// Add one watched OAB for an integration, idempotent on (integration_id, oab_key):
 	// a re-activation with the same scope is a no-op. oab_key is the normalized "NUMBER|UF".
 	InsertWatchedOAB(ctx context.Context, arg InsertWatchedOABParams) error
+	// The tenant's ACTIVE firm members (internal app_user id + name) — the assignable responsáveis
+	// the analyze_intimation prompt lists so the IA suggests a real assignee. Same join as identity's
+	// ListOrgMembers (membership status ACTIVE), projected to just id+name; ordered by name for a
+	// stable prompt. Scoped by tenant_id (barrier 1). Reused only for the AI analysis context.
+	ListActiveMembers(ctx context.Context, tenantID uuid.UUID) ([]ListActiveMembersRow, error)
 	// The "Andamentos" tab of one process: the court record's docket entries, newest
 	// first. Scoped by tenant via the court_record join (docket_entry has no tenant_id
 	// of its own) so a foreign court_record.id passed as :id yields nothing. Descending
 	// keyset on (occurred_at, id) — served by docket_entry(court_record_id, occurred_at)
 	// — the first page passes the max sentinel ('9999-12-31T23:59:59Z', max-uuid).
 	ListAndamentosByProcesso(ctx context.Context, arg ListAndamentosByProcessoParams) ([]ListAndamentosByProcessoRow, error)
+	// Tela "Capturas" (acquisition slice). Trilha de auditoria unificada dos três
+	// fluxos de captura, por-tenant:
+	//   • DAILY_CAPTURE — o fan-out diário do firehose nacional (capture_run, kind);
+	//   • ENRICHMENT    — o enriquecimento DATAJUD do dia (capture_run, kind);
+	//   • INITIAL_LOAD  — a carga inicial de onboarding (backfill_job agregando sync_run).
+	// capture_run é escrito na MESMA tx dos writes que já existem (writeForTenant /
+	// applyEnrichment); backfill_job/sync_run continuam do fluxo de reconciliação. A
+	// lista faz UNION ALL das duas fontes; o read model deriva o rótulo/DisplayStatus.
+	// As capturas do tenant, mais recentes primeiro. UNION ALL de capture_run (DAILY_
+	// CAPTURE, 1 linha por dia; ENRICHMENT, 1 linha por importação) com backfill_job
+	// (INITIAL_LOAD, uma linha por importação agregando as janelas sync_run). Os tallies do
+	// INITIAL_LOAD somam as colunas dedicadas das janelas (court_records_new/intimations_new/
+	// court_records_updated) e os errors vêm de slices_error. A linha ENRICHMENT não tem
+	// janela própria (window_from/to NULL): ela DERIVA a janela da importação via LEFT JOIN
+	// backfill_job por capture_run.backfill_job_id (COALESCE cai na coluna própria da linha
+	// quando não há import — DAILY_CAPTURE). window/started/finished normalizados para o
+	// mesmo shape das duas fontes. Bounded por $2 (sem paginação v0).
+	ListCaptureRuns(ctx context.Context, arg ListCaptureRunsParams) ([]ListCaptureRunsRow, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)
@@ -319,7 +469,9 @@ type Querier interface {
 	// the court record's number/court/degree joined in. Descending keyset on
 	// (made_available_at, id); the first page passes the max sentinel
 	// ('9999-12-31', max-uuid). Optional filters — @court (free text from the DISTINCT
-	// options), @type / @user_status (closed sets) — are additive ANDs.
+	// options), @type / @user_status (closed sets), @urgencia (deadline-proximity
+	// bucket, closed set) — are additive ANDs. The LEFT JOIN deadline exposes the
+	// derived prazo (1:1 per notification_id, UNIQUE); NULL when no prazo exists yet.
 	ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error)
 	// The "Intimações" tab of one process: the intimations filed on this court record,
 	// newest availability first, with the record's number/court/degree joined in (same
@@ -370,6 +522,12 @@ type Querier interface {
 	// the DISTINCT options), @lifecycle (a closed set; '' keeps the default ACTIVE
 	// context), @assignee_id (NULL = any; the case-level responsável) — are additive
 	// ANDs, so an absent filter matches everything.
+	// next_deadline: the nearest OPEN/PENDING prazo of the process, derived via a
+	// correlated LATERAL (LIMIT 1 — one row per process, keyset stays N rows = N
+	// processes). The path is court_record → intimation → deadline (notification_id
+	// is the historic FK name for intimation_id). NULL when no OPEN/PENDING prazo exists.
+	// CASE WHEN d.id IS NOT NULL guards all nullable deadline expressions (mirrors the
+	// ListIntimacoes pattern in this file) so sqlc infers nullable types correctly.
 	ListProcessos(ctx context.Context, arg ListProcessosParams) ([]ListProcessosRow, error)
 	// The court records a window first discovered (collapse). Scoped by tenant (RLS +
 	// filter) and the discovering sync_run_id; bounded defensively.
@@ -383,12 +541,24 @@ type Querier interface {
 	// lifted out of the error jsonb. Drives the detail screen's per-window table and
 	// the collapse (each row's id feeds ListProcessos/IntimacoesBySyncRun).
 	ListSyncRunsByJob(ctx context.Context, arg ListSyncRunsByJobParams) ([]ListSyncRunsByJobRow, error)
+	// Termos monitorados com nome derivado: as OABs monitoradas pelo tenant via DJEN,
+	// cada uma com o nome mais frequente encontrado em party_counsel (mode() within group).
+	// oab_key é "NUMBER|UF"; devolvemos "UFNUMBER" (canônico do FE) via uf||split_part.
+	// O LEFT JOIN garante que OABs novas (sem captura ainda) retornam com name = NULL.
+	// Ordenado por oab_key para estabilidade (sem offset, lista pequena).
+	ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUID) ([]ListWatchedOABsWithNameRow, error)
 	// Record that a sync touched this court record: refresh its completeness and
 	// schedule the next sweep (next_sync_at drives the scheduler slice later).
 	// judging_body is COALESCEd, not overwritten: a sync that does not disclose the
 	// órgão julgador (NULL) keeps the value a prior sync learned — DATAJUD reveals it
 	// after a DJEN discovery landed the record without it (placeholder+merge).
 	MarkCourtRecordSynced(ctx context.Context, arg MarkCourtRecordSyncedParams) error
+	// Stamp enrichment_attempted_at = @at on EVERY record a batch visited — graded OR not
+	// (a number DATAJUD did not return still counts as attempted). This is what removes the
+	// record from the scan index so the next step reads fresh work and the fecho can reach
+	// 0-remaining. Scoped by tenant (RLS barrier 1). Ids arrive as a uuid[] so one round-trip
+	// marks the whole batch.
+	MarkEnrichmentAttempted(ctx context.Context, arg MarkEnrichmentAttemptedParams) error
 	// match queries (acquisition slice). The join that turns the national publication
 	// firehose into per-tenant work: a watched_oab key ∈ a publication's recipient_oabs.
 	// Read system-wide (uow.DoSystem sets app.system='on' so the watched_oab RLS opens
@@ -409,10 +579,25 @@ type Querier interface {
 	// Unicidade de intimation é (tenant, case_id, hash), so swapping court_record_id never
 	// breaks dedup (same case). Returns the number of rows moved.
 	RepointIntimations(ctx context.Context, arg RepointIntimationsParams) (int64, error)
+	// The batch enrichment's scan: up to @lim court_records of ONE tribunal (@court) that
+	// still need enriching — completeness below the DATAJUD ceiling (0.9), never attempted,
+	// and not a superseded merge-placeholder. Served by court_record_enrichment_scan_idx
+	// (tenant_id, court WHERE the same predicate). ORDER BY id is a STABLE deterministic
+	// order (court_record has no created_at column; v0 priority is just "make progress",
+	// not recency) so re-runs page the same way; enrichment_attempted_at IS NULL is what
+	// makes the scan shrink each step, so a re-delivery re-reads the REMAINING work only.
+	SelectDueForEnrichment(ctx context.Context, arg SelectDueForEnrichmentParams) ([]SelectDueForEnrichmentRow, error)
 	// Best-effort persist of the AI-generated resume. The WHERE ai_resume IS NULL makes
 	// the write idempotent at the DB layer — a race between two first-opens updates 0
 	// rows on the loser, which is NOT an error (write-once by design).
 	SetCourtRecordAIResume(ctx context.Context, arg SetCourtRecordAIResumeParams) error
+	// Persists (OVERWRITES) the AI analysis of one intimation. Unlike SetCourtRecordAIResume
+	// there is NO write-once guard — the analysis is re-executable ("Gerar novamente"). Scoped
+	// by tenant_id (barrier 1). Degraded mode passes ai_summary='' + ai_providencias='[]'.
+	SetIntimationAIAnalysis(ctx context.Context, arg SetIntimationAIAnalysisParams) error
+	// Overwrites ONLY the ai_providencias jsonb (leaves ai_summary / ai_analyzed_at untouched) —
+	// the write half of the aprovar/descartar status flip. Scoped by tenant_id (barrier 1).
+	SetIntimationProvidencias(ctx context.Context, arg SetIntimationProvidenciasParams) error
 	// triagem da intimação — the write path for POST /v1/intimacoes/:id/{resolve,
 	// ignore,reopen}. The user drives the intimation's workflow state (user_status,
 	// 0030), SEPARATE from the DJEN cancellation `status`. Runs inside the caller's tx
@@ -427,13 +612,15 @@ type Querier interface {
 	// Idempotent: re-resolving an already-RESOLVED row rewrites the same value.
 	SetIntimationUserStatus(ctx context.Context, arg SetIntimationUserStatusParams) (uuid.UUID, error)
 	// The KPI counts for the intimações inbox header (GET /v1/intimacoes/summary), one
-	// aggregate scan over the tenant's intimations grouped by the triagem state
-	// (user_status, 0030) — served by intimation(tenant_id, user_status). pendentes are the
-	// rows still awaiting triagem (NOT resolved/ignored, i.e. PENDING); resolvidas=RESOLVED;
-	// ignoradas=IGNORED. `em_analise` (an AI-in-progress state) and `criticas` (a
-	// deadline-proximity derivation) have no source in this slice yet, so they are 0 until
-	// Fase 3 / a prazo derivation lands — kept in the projection so the FE contract is
-	// stable. tenant-scoped (barrier 1, RLS barrier 2).
+	// aggregate scan over the tenant's intimations. The LEFT JOIN deadline (1:1 per
+	// notification_id) enables the urgência buckets without a second scan.
+	//   pendentes      = triagem PENDING (awaiting user decision)
+	//   em_atraso      = prazo vencido (days_left < 0) AND status IN (PENDING, OPEN)
+	//   vencem_hoje    = prazo vence hoje (days_left = 0) AND status IN (PENDING, OPEN)
+	//   nao_confirmado = prazo sugerido ainda não confirmado (status = 'PENDING')
+	// `em_analise` (AI-in-progress) has no source yet — kept at 0 so the FE contract is
+	// stable. `criticas` is retired (replaced by em_atraso/vencem_hoje/nao_confirmado),
+	// kept at 0 for backward-compat. tenant-scoped (barrier 1, RLS barrier 2).
 	SummarizeIntimacoes(ctx context.Context, tenantID uuid.UUID) (SummarizeIntimacoesRow, error)
 	// The KPI counts for the processes list header (GET /v1/processos/summary), one
 	// aggregate scan over the tenant's court_records grouped into the FE's buckets by
@@ -474,6 +661,11 @@ type Querier interface {
 	// re-poll cadence. case_id is never touched (the record keeps its Pasta). RETURNING
 	// carries id + case_id for the caller. The (tenant, cnj, degree) UNIQUE requires the
 	// caller to ensure no OTHER record already holds @degree (the merge path handles that).
+	// lifecycle is derived from DATAJUD movimentos (lifecycleFromMovimentos in the parser):
+	// CASE guards that an already-SUPERSEDED row is never downgraded — superseding is a
+	// structural merge operation and must survive a scheduler re-poll. When @lifecycle is
+	// empty (source does not carry movimentos) the existing lifecycle is preserved via the
+	// NULLIF/COALESCE: NULLIF('', lifecycle) = NULL → COALESCE falls back to lifecycle.
 	UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRecordGradeParams) (UpdateCourtRecordGradeRow, error)
 	// Close a sync run, but ONLY from RUNNING: the status guard makes this the single
 	// winning transition (compare-and-swap), so a redelivery that resumes a run

@@ -14,11 +14,13 @@ import (
 )
 
 // Backfill onboarding constants. The horizon is how far back the first sync
-// reaches (one year); the window is how many days each sync slice covers. The
-// slice count is ceil(horizon/window) = 53 for 365/7 — the last slice is the
-// short remainder (365 = 52*7 + 1).
+// reaches; the window is how many days each sync slice covers. The slice count is
+// ceil(horizon/window) = 5 for 30/7 — the last slice is the short remainder
+// (30 = 4*7 + 2). The horizon was cut 365→30 for the lean-ingestion policy: the
+// onboarding backfill only needs the recent, live-deadline window, so the burst
+// drops from 53 slices to 5.
 const (
-	BackfillHorizonDays = 365
+	BackfillHorizonDays = 30
 	BackfillWindowDays  = 7
 )
 
@@ -163,7 +165,7 @@ type historyMatcher interface {
 type backfillOption func(*BackfillUseCase)
 
 // NewBackfillUseCase wires the backfill use case with production defaults (a
-// one-year horizon in weekly windows, the wall clock).
+// 30-day horizon in weekly windows, the wall clock).
 func NewBackfillUseCase(repo backfillRepo, outbox publisher, uow database.UnitOfWork, opts ...backfillOption) *BackfillUseCase {
 	uc := &BackfillUseCase{
 		repo:        repo,
@@ -182,7 +184,7 @@ func NewBackfillUseCase(repo backfillRepo, outbox publisher, uow database.UnitOf
 // WithBackfillWindowDays overrides how many days each backfill sync slice covers.
 // Production wires this from BACKFILL_WINDOW_DAYS so the window can be widened
 // without a rebuild; a non-positive value keeps the BackfillWindowDays default.
-// Wider windows tile the one-year horizon into FEWER slices, so the backfill
+// Wider windows tile the horizon into FEWER slices, so the backfill
 // issues fewer DJEN round-trips — the dominant cost is the per-request latency of
 // the residential-proxy egress, not the item volume, so halving the request count
 // nearly halves the wall clock. The ceiling is DJEN's ~10000-count-per-query cap:
@@ -445,6 +447,10 @@ func (uc *BackfillUseCase) finalizeIfComplete(ctx context.Context, tx database.T
 		"slices_error", counters.SlicesError,
 		"total_slices", counters.TotalSlices,
 	)
+	// Discovery is done. The DATAJUD enrichment (2nd phase) now OWNS the fecho of this
+	// import's ENRICHMENT capture row: the batch job (enrichment_batch_requested, emitted per
+	// tribunal on discovery) closes the row deterministically when its scan empties — no ETA
+	// close is scheduled here (an ETA close would race the job's own close on the same row).
 	return uc.outbox.Publish(ctx, tx, newBackfillFinished(c, counters, status))
 }
 

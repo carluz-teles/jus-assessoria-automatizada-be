@@ -198,6 +198,13 @@ type Config struct {
 	// remover a flag, se ela deixar de fazer sentido) quando a precificação for
 	// definida.
 	BillingGateEnabled bool `env:"BILLING_GATE_ENABLED" envDefault:"false"`
+
+	// CaptureDailyTime — horário (HH:MM) da captura diária, exposto na tela "Capturas"
+	// como "próxima execução" (o FE formata "amanhã, HH:MM"). Opcional e HONESTO: só o
+	// api o lê para o read model; vazio = a tela mostra "—" (sem inventar horário a
+	// partir de time.Now()). Espelha o cron da captura diária do scheduler quando ops
+	// quiser mostrá-lo; um valor mal-formado é tratado como vazio no ponto de uso.
+	CaptureDailyTime string `env:"CAPTURE_DAILY_TIME"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do

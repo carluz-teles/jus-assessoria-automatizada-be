@@ -33,12 +33,20 @@ type ConfirmCommand struct {
 	Counting      Counting
 	Doubled       bool
 	DoubledReason string
+	// AnchorEvent is the termo inicial the confirmation panel re-counts from (default
+	// DEADLINE_START — the legacy anchor). MADE_AVAILABLE / PUBLISHED re-anchor on the
+	// intimação's real dates.
+	AnchorEvent AnchorEvent
+	// ManualExtraDays are extra days the lawyer adds (feriado local / suspensão forense the
+	// calendar motor does not know); applied by the SAME motor (respecting the counting), never
+	// crude date arithmetic. 0 = none.
+	ManualExtraDays int
 }
 
 // ConfirmDeadlineParams is the repo port's input for the ConfirmDeadline UPDATE — the
 // confirmed fields plus the recomputed dates and the who/when stamp. It is a plain struct
 // (not the Deadline aggregate) because confirm updates a subset of columns and leaves
-// source/start_date/rules_version untouched.
+// source/rules_version untouched. start_date IS written (the panel may re-anchor it).
 type ConfirmDeadlineParams struct {
 	IntimationID    string
 	TenantID        string
@@ -51,6 +59,13 @@ type ConfirmDeadlineParams struct {
 	HolidaysApplied []time.Time
 	ConfirmedBy     string
 	ConfirmedAt     time.Time
+	// StartDate is re-persisted because the panel may re-anchor (a different AnchorEvent maps to
+	// a different intimação date); AnchorEvent/ManualExtraDays/LegalCitation are the panel's
+	// confirmed choices.
+	StartDate       time.Time
+	AnchorEvent     AnchorEvent
+	ManualExtraDays int
+	LegalCitation   string
 }
 
 // ConfirmedDeadline is the confirmed prazo the use case returns (and the deadline.updated
@@ -70,6 +85,9 @@ type ConfirmedDeadline struct {
 	EndDate         time.Time
 	HolidaysApplied []time.Time
 	ConfirmedBy     string
+	AnchorEvent     AnchorEvent
+	ManualExtraDays int
+	LegalCitation   string
 }
 
 // ConfirmResult is the confirmation outcome: the confirmed prazo. The handler renders it as
@@ -121,14 +139,21 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 		}
 		uf := tribunal.UF(court)
 
-		endDate, holidays, err := uc.compute(ctx, cmd.Counting, anchor.StartDate, effectiveDays(cmd.Days, cmd.Doubled), uf, court)
+		// Re-anchor the start_date on the chosen termo inicial (default DEADLINE_START keeps the
+		// stored anchor); MADE_AVAILABLE / PUBLISHED re-count from the intimação's real dates.
+		start, err := uc.resolveStart(ctx, tx, cmd.IntimationID, cmd.TenantID, cmd.AnchorEvent, anchor.StartDate)
+		if err != nil {
+			return err
+		}
+
+		endDate, holidays, err := uc.computeWithExtra(ctx, cmd.Counting, start, cmd.Days, cmd.Doubled, cmd.ManualExtraDays, uf, court)
 		if err != nil {
 			return err
 		}
 		// Belt-and-suspenders on safety-critical data: the recompute always lands after
 		// the start (days > 0 is validated at the edge), but never persist an impossible
 		// prazo silently.
-		if !endDate.After(anchor.StartDate) {
+		if !endDate.After(start) {
 			return apperr.NewInvalid("deadline end date must be after start date")
 		}
 
@@ -145,6 +170,10 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 			HolidaysApplied: holidays,
 			ConfirmedBy:     cmd.UserID,
 			ConfirmedAt:     confirmedAt,
+			StartDate:       start,
+			AnchorEvent:     cmd.AnchorEvent,
+			ManualExtraDays: cmd.ManualExtraDays,
+			LegalCitation:   anchor.LegalCitation,
 		})
 		if err != nil {
 			return err
@@ -160,10 +189,13 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 			Doubled:         cmd.Doubled,
 			DoubledReason:   cmd.DoubledReason,
 			Status:          StatusOpen,
-			StartDate:       anchor.StartDate,
+			StartDate:       start,
 			EndDate:         endDate,
 			HolidaysApplied: holidays,
 			ConfirmedBy:     cmd.UserID,
+			AnchorEvent:     cmd.AnchorEvent,
+			ManualExtraDays: cmd.ManualExtraDays,
+			LegalCitation:   anchor.LegalCitation,
 		}
 
 		if err := uc.outbox.Publish(ctx, tx, newDeadlineUpdated(confirmed)); err != nil {

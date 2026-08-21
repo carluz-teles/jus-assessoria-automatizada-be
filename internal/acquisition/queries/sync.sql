@@ -42,9 +42,10 @@ SET status = $2,
     items_new = $3,
     items_deduped = $4,
     court_records_new = $5,
-    intimations_new = $6,
-    finished_at = $7,
-    error = $8
+    court_records_updated = $6,
+    intimations_new = $7,
+    finished_at = $8,
+    error = $9
 WHERE id = $1 AND status = 'RUNNING'
 RETURNING id;
 

@@ -26,7 +26,7 @@ WHERE id = $1 AND tenant_id = $2;
 --   4. finally, higher priority wins.
 -- $1 = rules_version, $2 = intimation_type, $3 = court. A court_prefix matches when the
 -- court sigla starts with it ($3 LIKE prefix || '%'); a NULL prefix matches any court.
-SELECT rules_version, kind, days, counting, doubled
+SELECT rules_version, kind, days, counting, doubled, legal_citation
 FROM deadline_rule
 WHERE rules_version = $1
   AND active
@@ -48,11 +48,13 @@ LIMIT 1;
 INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
     start_date, end_date, days, counting, doubled, doubled_reason,
-    holidays_applied, status, source, kind, rules_version
+    holidays_applied, status, source, kind, rules_version,
+    anchor_event, legal_citation
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6, $7, $8, $9,
-    $10, $11, $12, $13, $14
+    $10, $11, $12, $13, $14,
+    $15, $16
 )
 ON CONFLICT (notification_id) DO NOTHING
 RETURNING id;
@@ -66,9 +68,33 @@ RETURNING id;
 -- barrier 2). A missing prazo → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper,
 -- never (nil, nil): confirming an intimação with no derived prazo is a 404 at the edge.
 -- $1 = intimation_id (the notification_id column), $2 = tenant_id (from the principal).
-SELECT id, court_record_id, start_date
+SELECT id, court_record_id, start_date, legal_citation
 FROM deadline
 WHERE notification_id = $1 AND tenant_id = $2;
+
+-- name: GetPreviewContext :one
+-- Load the confirmation panel's PREVIEW context for an intimação (POST /v1/prazos/preview,
+-- read-only, off the transactional path): the three observed anchor dates PLUS the court sigla
+-- of the process the intimação hangs on (for the recompute's state-holiday UF). One tenant-scoped
+-- hop (barrier 1). deadline.notification_id is not involved — the preview keys directly on the
+-- intimation id (the FE has it from the intimação detail). A missing/foreign id → pgx.ErrNoRows →
+-- typed ErrDeadlineNotFound at the mapper, never (nil, nil). $1 = intimation_id, $2 = tenant_id.
+SELECT i.made_available_at, i.published_at, i.deadline_start_at, cr.court
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.id = $1 AND i.tenant_id = $2;
+
+-- name: GetIntimationAnchors :one
+-- Load the three observed dates of the intimação the confirmation panel can re-anchor a prazo
+-- on (§3 "termo inicial"): made_available_at (disponibilização), published_at (publicação) and
+-- deadline_start_at (início da contagem — the legacy anchor). All three are NOT NULL date
+-- columns, so a present intimação always yields three real dates. Keyed by the intimation id and
+-- scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing/foreign id → pgx.ErrNoRows
+-- → typed ErrDeadlineNotFound at the mapper (the prazo's anchor cannot be resolved), never
+-- (nil, nil). $1 = intimation_id, $2 = tenant_id, both from the trusted principal's context.
+SELECT made_available_at, published_at, deadline_start_at
+FROM intimation
+WHERE id = $1 AND tenant_id = $2;
 
 -- name: GetCourtRecordCourt :one
 -- Read the court sigla for the record the prazo hangs on — the confirmation recompute
@@ -86,23 +112,28 @@ WHERE id = $1 AND tenant_id = $2;
 -- doubled_reason} and the RECOMPUTED {end_date, holidays_applied}, stamping who/when
 -- (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
 -- 1). IDEMPOTENT on the deadline: re-confirming the same intimação re-UPDATEs the one row
--- (the 1:1 notification_id) — it never opens a second prazo. source/start_date/
--- rules_version are LEFT AS-IS: source keeps its provenance (RULE/AI), start_date is the
--- fixed anchor, and rules_version still records which rule set first derived the prazo
--- even when the human overrode the days. A no-match (no prazo for the intimação) yields
+-- (the 1:1 notification_id) — it never opens a second prazo. source/rules_version are LEFT
+-- AS-IS: source keeps its provenance (RULE/AI) and rules_version still records which rule set
+-- first derived the prazo even when the human overrode the days. start_date IS written now: the
+-- confirmation panel may re-anchor (anchor_event → a different intimação date), and
+-- anchor_event/manual_extra_days/legal_citation persist the panel's choices. A no-match yields
 -- NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id, $2 =
 -- tenant_id, then the confirmed fields.
 UPDATE deadline
-SET status           = 'OPEN',
-    kind             = $3,
-    days             = $4,
-    counting         = $5,
-    doubled          = $6,
-    doubled_reason   = $7,
-    end_date         = $8,
-    holidays_applied = $9,
-    confirmed_by     = $10,
-    confirmed_at     = $11
+SET status            = 'OPEN',
+    kind              = $3,
+    days              = $4,
+    counting          = $5,
+    doubled           = $6,
+    doubled_reason    = $7,
+    end_date          = $8,
+    holidays_applied  = $9,
+    confirmed_by      = $10,
+    confirmed_at      = $11,
+    start_date        = sqlc.arg(start_date),
+    anchor_event      = sqlc.arg(anchor_event),
+    manual_extra_days = sqlc.arg(manual_extra_days),
+    legal_citation    = sqlc.arg(legal_citation)
 WHERE notification_id = $1 AND tenant_id = $2
 RETURNING id, court_record_id;
 
@@ -266,27 +297,32 @@ RETURNING id;
 -- a PENDING/OPEN prazo is adjustable). Keyed by id and scoped to tenant_id (barrier 1, on top
 -- of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at
 -- the mapper (→ 404), never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
-SELECT id, court_record_id, start_date, status, kind, days, counting, doubled, doubled_reason
+SELECT id, court_record_id, notification_id, start_date, status, kind, days, counting, doubled,
+       doubled_reason, anchor_event, manual_extra_days
 FROM deadline
 WHERE id = $1 AND tenant_id = $2;
 
 -- name: UpdateDeadlineAdjust :one
 -- Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
--- patched {kind, days, counting, doubled, doubled_reason} and the RECOMPUTED {end_date,
--- holidays_applied} (from the fixed start_date), keyed by id and scoped to tenant_id (barrier
--- 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays PENDING, an
--- OPEN stays OPEN — the use case already refused a terminal prazo); source/start_date/
--- rules_version/confirmed_* are untouched (the anchor and provenance persist). A no-match (the
+-- patched {kind, days, counting, doubled, doubled_reason, anchor_event, manual_extra_days} and
+-- the RECOMPUTED {end_date, holidays_applied, start_date}, keyed by id and scoped to tenant_id
+-- (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays
+-- PENDING, an OPEN stays OPEN — the use case already refused a terminal prazo); source/
+-- rules_version/confirmed_* are untouched. start_date IS written now (the panel may re-anchor via
+-- anchor_event → a different intimação date). A no-match (the
 -- row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
 -- and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
 UPDATE deadline
-SET kind             = $3,
-    days             = $4,
-    counting         = $5,
-    doubled          = $6,
-    doubled_reason   = $7,
-    end_date         = $8,
-    holidays_applied = $9
+SET kind              = $3,
+    days              = $4,
+    counting          = $5,
+    doubled           = $6,
+    doubled_reason    = $7,
+    end_date          = $8,
+    holidays_applied  = $9,
+    start_date        = sqlc.arg(start_date),
+    anchor_event      = sqlc.arg(anchor_event),
+    manual_extra_days = sqlc.arg(manual_extra_days)
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, court_record_id;
 
@@ -407,6 +443,36 @@ SELECT EXISTS (
 UPDATE deadline
 SET status = 'MET'
 WHERE id = $1 AND tenant_id = $2 AND status IN ('MISSED', 'OPEN')
+RETURNING id;
+
+-- name: MarkNoDeadline :one
+-- Declare "mera ciência" on a prazo (§3 "Máquina de estados": PENDING|OPEN → NO_DEADLINE via
+-- "Remover prazo" / "Não há prazo"), keyed by id and scoped to tenant_id (barrier 1). Stamps
+-- confirmed_by/at (the human who declared it). The `status IN ('PENDING','OPEN')` guard makes
+-- the flip SAFE and IDEMPOTENT and distinguishes the two client errors at the use case: a
+-- missing id yields no row anyway (404), while a TERMINAL prazo (MET/MISSED/CANCELLED) also
+-- yields no row — the use case pre-reads the status to return 409 for the latter. On a hit it
+-- returns the id so deadline.no_deadline commits in the SAME tx. $1 = id, $2 = tenant_id,
+-- $3 = confirmed_by, $4 = confirmed_at.
+UPDATE deadline
+SET status       = 'NO_DEADLINE',
+    confirmed_by = $3,
+    confirmed_at = $4
+WHERE id = $1 AND tenant_id = $2 AND status IN ('PENDING', 'OPEN')
+RETURNING id;
+
+-- name: ReopenNoDeadline :one
+-- Revert a "mera ciência" declaration (§3: NO_DEADLINE → PENDING via "reabrir"), keyed by id and
+-- scoped to tenant_id (barrier 1). Clears confirmed_by/at (the prazo is a suggestion again). The
+-- `status = 'NO_DEADLINE'` guard makes it SAFE and IDEMPOTENT: a prazo in any other status
+-- updates NO row → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper; the use case
+-- pre-reads the status to distinguish a 404 miss from a 409 not-NO_DEADLINE. On a hit it returns
+-- the id so deadline.reopened commits in the SAME tx. $1 = id, $2 = tenant_id.
+UPDATE deadline
+SET status       = 'PENDING',
+    confirmed_by = NULL,
+    confirmed_at = NULL
+WHERE id = $1 AND tenant_id = $2 AND status = 'NO_DEADLINE'
 RETURNING id;
 
 -- name: InsertTaskSuggestion :one

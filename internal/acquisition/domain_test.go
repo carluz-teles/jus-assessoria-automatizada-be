@@ -104,6 +104,64 @@ func (m *mockRepo) ListIntimacoesBySyncRun(_ context.Context, _, _ string) ([]In
 	return nil, nil
 }
 
+// Captures reads — no-ops; the activation use case under test never calls them.
+func (m *mockRepo) ListCaptureRuns(_ context.Context, _ string, _ int) ([]CaptureRunRow, error) {
+	return nil, nil
+}
+func (m *mockRepo) GetCaptureRun(_ context.Context, _, _ string) (CaptureRunRow, error) {
+	return CaptureRunRow{}, nil
+}
+func (m *mockRepo) GetCaptureSummary(_ context.Context, _ string) (CaptureSummaryRow, error) {
+	return CaptureSummaryRow{}, nil
+}
+func (m *mockRepo) CountDeadlinesCreatedBetween(_ context.Context, _ string, _, _ time.Time) (int, error) {
+	return 0, nil
+}
+func (m *mockRepo) CountTasksCreatedBetween(_ context.Context, _ string, _, _ time.Time) (int, error) {
+	return 0, nil
+}
+func (m *mockRepo) CountDeadlinesCreatedToday(_ context.Context, _ string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepo) CountWatchedOABsForDJEN(_ context.Context, _ string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepo) ListWatchedOABsWithName(_ context.Context, _ string) ([]WatchedOABView, error) {
+	return nil, nil
+}
+
+// Capture writes — no-ops; the activation use case under test never calls them.
+func (m *mockRepo) WriteDailyCaptureRun(_ context.Context, _ database.Tx, _ DailyCaptureParams) error {
+	return nil
+}
+func (m *mockRepo) IncrementImportEnrichmentRun(_ context.Context, _ database.Tx, _, _ string, _ time.Time) error {
+	return nil
+}
+func (m *mockRepo) IncrementImportEnrichmentRunBy(_ context.Context, _ database.Tx, _, _ string, _, _ int, _ time.Time) error {
+	return nil
+}
+func (m *mockRepo) SelectDueForEnrichment(_ context.Context, _ database.Tx, _, _ string, _ int) ([]DueRecord, error) {
+	return nil, nil
+}
+func (m *mockRepo) CountRemainingDueForJob(_ context.Context, _ database.Tx, _, _ string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepo) MarkEnrichmentAttempted(_ context.Context, _ database.Tx, _ string, _ []string, _ time.Time) error {
+	return nil
+}
+func (m *mockRepo) GetImportEnrichmentCounter(_ context.Context, _ database.Tx, _, _ string) (int, int, bool, error) {
+	return 0, 0, false, nil
+}
+func (m *mockRepo) CountImportDiscoveredRecords(_ context.Context, _ database.Tx, _, _ string) (int, error) {
+	return 0, nil
+}
+func (m *mockRepo) CloseImportEnrichmentRun(_ context.Context, _ database.Tx, _ CloseEnrichmentRunParams) (int, error) {
+	return 0, nil
+}
+func (m *mockRepo) InsertEmptyImportEnrichmentRun(_ context.Context, _ database.Tx, _ CloseEnrichmentRunParams) error {
+	return nil
+}
+
 func (m *mockRepo) GetReconciliationTotals(_ context.Context, _ string) (ReconciliationTotals, error) {
 	return m.totals, nil
 }
@@ -254,12 +312,20 @@ func (m *mockRepo) SetIntimationUserStatus(_ context.Context, _ database.Tx, _, 
 	return m.setUserStatusErr
 }
 
+func (m *mockRepo) AssignIntimacaoResponsaveis(_ context.Context, _ database.Tx, _, _ string, _, _ *string) error {
+	return nil
+}
+
 func (m *mockRepo) CountProcessos(_ context.Context, _ ProcessosQuery) (int64, int64, error) {
 	return 0, 0, nil
 }
 
 func (m *mockRepo) CountIntimacoes(_ context.Context, _ IntimacoesQuery) (int64, int64, error) {
 	return 0, 0, nil
+}
+
+func (m *mockRepo) BucketIntimacoes(_ context.Context, _ IntimacoesQuery) (IntimacaoBucketsView, error) {
+	return IntimacaoBucketsView{}, nil
 }
 
 func (m *mockRepo) ListProcessoCourts(_ context.Context, _ string) ([]string, error) {
@@ -306,6 +372,10 @@ func (m *mockRepo) GetResumoContext(_ context.Context, _, _ string) (ProcessoRes
 	return ProcessoResumoCtx{}, nil
 }
 
+func (m *mockRepo) GetIntimacaoAnaliseContext(_ context.Context, _, _ string) (IntimacaoAnaliseCtx, error) {
+	return IntimacaoAnaliseCtx{}, nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {
@@ -339,8 +409,9 @@ const testTenant = "tenant-1"
 
 // --- tests -------------------------------------------------------------------
 
-// AC1 (unit): two sources → two upserts and two events, in one unit of work.
-func TestUseCase_ActivateIntegration_TwoSources(t *testing.T) {
+// AC1 (unit): activation upserts the integration row and publishes the event, in
+// one unit of work.
+func TestUseCase_ActivateIntegration(t *testing.T) {
 	t.Parallel()
 
 	repo := &mockRepo{existing: map[string]*Integration{}}
@@ -349,22 +420,22 @@ func TestUseCase_ActivateIntegration_TwoSources(t *testing.T) {
 	uc := NewUseCase(repo, outbox, uow)
 
 	got, err := uc.ActivateIntegration(context.Background(), testTenant,
-		[]string{SourceDJEN, SourceDATAJUD}, Scope{OAB: []string{"SP123456"}})
+		Scope{OAB: []string{"SP123456"}})
 	if err != nil {
 		t.Fatalf("ActivateIntegration() error = %v", err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("activated = %d, want 2", len(got))
+	if got == nil {
+		t.Fatalf("activated = nil, want a non-nil integration")
 	}
-	if len(repo.upsertedFor) != 2 {
-		t.Fatalf("upserts = %d, want 2", len(repo.upsertedFor))
+	if len(repo.upsertedFor) != 1 {
+		t.Fatalf("upserts = %d, want 1", len(repo.upsertedFor))
 	}
-	if outbox.calls != 2 {
-		t.Fatalf("publishes = %d, want 2", outbox.calls)
+	if outbox.calls != 1 {
+		t.Fatalf("publishes = %d, want 1", outbox.calls)
 	}
 	if uow.calls != 1 {
-		t.Fatalf("unit of work runs = %d, want 1 (all sources in one tx)", uow.calls)
+		t.Fatalf("unit of work runs = %d, want 1", uow.calls)
 	}
 	if uow.tenantID != testTenant {
 		t.Fatalf("uow tenantID = %q, want %q", uow.tenantID, testTenant)
@@ -386,8 +457,8 @@ func TestUseCase_ActivateIntegration_TwoSources(t *testing.T) {
 	}
 }
 
-// AC1 (unit): if a publish fails, the error propagates so the unit of work rolls
-// back — no partial success. The second publish never happens.
+// AC1 (unit): if the publish fails, the error propagates so the unit of work
+// rolls back — no partial success.
 func TestUseCase_ActivateIntegration_PublishFailAborts(t *testing.T) {
 	t.Parallel()
 
@@ -397,12 +468,12 @@ func TestUseCase_ActivateIntegration_PublishFailAborts(t *testing.T) {
 	uc := NewUseCase(repo, outbox, &fakeUoW{})
 
 	_, err := uc.ActivateIntegration(context.Background(), testTenant,
-		[]string{SourceDJEN, SourceDATAJUD}, Scope{OAB: []string{"SP123456"}})
+		Scope{OAB: []string{"SP123456"}})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("ActivateIntegration() error = %v, want %v", err, sentinel)
 	}
 	if outbox.calls != 1 {
-		t.Fatalf("publishes = %d, want 1 (aborted after the first failure)", outbox.calls)
+		t.Fatalf("publishes = %d, want 1", outbox.calls)
 	}
 }
 
@@ -453,7 +524,7 @@ func TestUseCase_ActivateIntegration_EventOnlyWhenChanged(t *testing.T) {
 			uc := NewUseCase(repo, outbox, &fakeUoW{})
 
 			if _, err := uc.ActivateIntegration(context.Background(), testTenant,
-				[]string{SourceDJEN}, newScope); err != nil {
+				newScope); err != nil {
 				t.Fatalf("ActivateIntegration() error = %v", err)
 			}
 			// The row is always upserted, regardless of whether an event fires.
@@ -482,7 +553,7 @@ func TestUseCase_ActivateIntegration_NoSubscription_Blocked(t *testing.T) {
 	uc := NewUseCase(repo, outbox, uow, WithActivationEntitlementChecker(checker))
 
 	_, err := uc.ActivateIntegration(context.Background(), testTenant,
-		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}})
+		Scope{OAB: []string{"SP123456"}})
 	if !errors.Is(err, ErrActivationBlocked) {
 		t.Fatalf("ActivateIntegration() error = %v, want ErrActivationBlocked", err)
 	}
@@ -509,12 +580,12 @@ func TestUseCase_ActivateIntegration_WithinLimit_Proceeds(t *testing.T) {
 	uc := NewUseCase(repo, outbox, uow, WithActivationEntitlementChecker(checker))
 
 	got, err := uc.ActivateIntegration(context.Background(), testTenant,
-		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}})
+		Scope{OAB: []string{"SP123456"}})
 	if err != nil {
 		t.Fatalf("ActivateIntegration() error = %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("activated = %d, want 1", len(got))
+	if got == nil {
+		t.Fatalf("activated = nil, want a non-nil integration")
 	}
 	if len(repo.upsertedFor) != 1 {
 		t.Fatalf("upserts = %d, want 1", len(repo.upsertedFor))
@@ -539,7 +610,7 @@ func TestUseCase_ActivateIntegration_AtLimit_Blocked(t *testing.T) {
 	uc := NewUseCase(repo, outbox, uow, WithActivationEntitlementChecker(checker))
 
 	_, err := uc.ActivateIntegration(context.Background(), testTenant,
-		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}})
+		Scope{OAB: []string{"SP123456"}})
 	if !errors.Is(err, ErrActivationBlocked) {
 		t.Fatalf("ActivateIntegration() error = %v, want ErrActivationBlocked", err)
 	}
@@ -562,7 +633,7 @@ func TestUseCase_ActivateIntegration_NoCheckerInjected_Unlimited(t *testing.T) {
 	uc := NewUseCase(repo, outbox, &fakeUoW{})
 
 	if _, err := uc.ActivateIntegration(context.Background(), testTenant,
-		[]string{SourceDJEN}, Scope{OAB: []string{"SP123456"}}); err != nil {
+		Scope{OAB: []string{"SP123456"}}); err != nil {
 		t.Fatalf("ActivateIntegration() error = %v, want nil (no checker injected → unlimited)", err)
 	}
 }

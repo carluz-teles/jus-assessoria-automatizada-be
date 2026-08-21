@@ -39,8 +39,11 @@ type reader interface {
 type writer interface {
 	Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResult, error)
 	Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadline, error)
+	Preview(ctx context.Context, cmd PreviewCommand) (PreviewResult, error)
 	MarkMet(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
 	MarkMissed(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
+	NoDeadline(ctx context.Context, tenantID, userID, deadlineID string) (MarkedDeadline, error)
+	Reopen(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
 	CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task, error)
 	UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task, error)
 	MarkTaskDone(ctx context.Context, tenantID, taskID string) (TaskTransition, error)
@@ -88,9 +91,14 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	// AI task suggestion (on-demand): pre-fills the F2 form. Deeper path than /prazos/:id.
 	r.Get("/prazos/:id/suggested-tasks", h.getSuggestedTasks)
 	r.Post("/prazos/confirm", h.confirmPrazo)
+	// The static /prazos/preview is registered BEFORE the /prazos/:id param route (like summary)
+	// so Fiber never captures "preview" as an :id.
+	r.Post("/prazos/preview", h.previewPrazo)
 	r.Patch("/prazos/:id", h.adjustPrazo)
 	r.Post("/prazos/:id/met", h.markPrazoMet)
 	r.Post("/prazos/:id/missed", h.markPrazoMissed)
+	r.Post("/prazos/:id/no-deadline", h.markPrazoNoDeadline)
+	r.Post("/prazos/:id/reopen", h.reopenPrazo)
 	r.Get("/processos/:id/tasks", h.listTasksByProcesso)
 	r.Get("/tasks", h.listTasks)
 	// Same static-before-param ordering for /tasks/summary vs /tasks/:id.
@@ -115,8 +123,8 @@ const (
 
 // Query-param allowlists (docs/erd-backend.md §4e.3): each list route accepts only its
 // own set — a client typo or a param belonging to another route is rejected with 400
-// instead of being silently ignored. The prazos/tasks routes also accept ?intimation_id
-// / ?assignee respectively as their documented special cases.
+// instead of being silently ignored. Both prazos and tasks accept ?intimation_id as a
+// documented filter; tasks also accepts ?assignee as its special "meus prazos" shortcut.
 var (
 	prazosListParams = map[string]struct{}{
 		"status": {}, "kind": {}, "court": {}, "from": {}, "to": {},
@@ -124,7 +132,7 @@ var (
 	}
 	tasksListParams = map[string]struct{}{
 		"status": {}, "assignee": {}, "source": {}, "from": {}, "to": {},
-		"limit": {}, "cursor": {},
+		"limit": {}, "cursor": {}, "intimation_id": {},
 	}
 )
 
@@ -356,6 +364,61 @@ func (h *Handler) markPrazoMissed(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(newMarkResponse(res))
 }
 
+// previewPrazo handles POST /v1/prazos/preview: the confirmation panel's live, non-persisted
+// recompute (§3). It validates the body, then recomputes the dates read-only (no UoW). A missing
+// intimação is the use case's ErrDeadlineNotFound → 404; a bad body is a 400. tenant_id comes
+// from the verified principal.
+func (h *Handler) previewPrazo(c *fiber.Ctx) error {
+	var req PreviewRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	res, err := h.writer.Preview(c.UserContext(), req.toPreviewCommand(p.TenantID))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newPreviewResponse(res))
+}
+
+// markPrazoNoDeadline handles POST /v1/prazos/:id/no-deadline: declare "mera ciência" (§3),
+// PENDING|OPEN → NO_DEADLINE. No body — the prazo id comes from the path, tenant_id/confirmed_by
+// from the principal. A miss → 404; a terminal prazo (MET/MISSED/CANCELLED) → 409.
+func (h *Handler) markPrazoNoDeadline(c *fiber.Ctx) error {
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	res, err := h.writer.NoDeadline(c.UserContext(), p.TenantID, p.UserID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newMarkResponse(res))
+}
+
+// reopenPrazo handles POST /v1/prazos/:id/reopen: revert a mera-ciência declaration (§3),
+// NO_DEADLINE → PENDING. No body — the prazo id comes from the path, tenant_id from the principal.
+// A miss → 404; a non-NO_DEADLINE prazo → 409.
+func (h *Handler) reopenPrazo(c *fiber.Ctx) error {
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	res, err := h.writer.Reopen(c.UserContext(), p.TenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newMarkResponse(res))
+}
+
 // listTasksByProcesso handles GET /v1/processos/:id/tasks: one process's Tasks tab — its tasks
 // ordered by due_date (soonest first, undated last), keyset paginated (?limit, ?cursor). The :id
 // is the court_record id; tenant_id comes from the principal, so a foreign :id yields an empty
@@ -387,8 +450,10 @@ func (h *Handler) listTasksByProcesso(c *fiber.Ctx) error {
 // listTasks handles GET /v1/tasks: the tenant's task agenda ("meus prazos") — every task ordered
 // by due_date (soonest first, undated last), keyset paginated, optionally filtered by ?status (a
 // closed set), ?assignee (a user id, or the sentinel "me" → the principal's own id), ?source (a
-// closed set) and a due_date window ?from/?to. A bad status/date/assignee is a client error → 400;
-// a param outside the route's allowlist is likewise 400.
+// closed set), ?intimation_id (a uuid, narrows to tasks of a specific intimação — mirrors the
+// prazos route's same-name filter) and a due_date window ?from/?to. A bad
+// status/date/assignee/intimation_id is a client error → 400; a param outside the route's
+// allowlist is likewise 400.
 func (h *Handler) listTasks(c *fiber.Ctx) error {
 	if err := httpx.RejectUnknownParams(c, tasksListParams); err != nil {
 		return httpx.WriteError(c, err)
@@ -413,6 +478,12 @@ func (h *Handler) listTasks(c *fiber.Ctx) error {
 	if source != "" && !isKnownTaskSource(source) {
 		return httpx.WriteError(c, apperr.NewInvalid("invalid source filter"))
 	}
+	intimationID := c.Query("intimation_id")
+	if intimationID != "" {
+		if _, err := uuid.Parse(intimationID); err != nil {
+			return httpx.WriteError(c, apperr.NewInvalid("invalid intimation_id (want a uuid)"))
+		}
+	}
 	from, err := validateOptionalDate(c.Query("from"))
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -432,7 +503,8 @@ func (h *Handler) listTasks(c *fiber.Ctx) error {
 	}
 
 	res, err := h.reader.Tasks(c.UserContext(), TasksQuery{
-		TenantID: tenantID, Status: status, Assignee: assignee, Source: source, From: from, To: to,
+		TenantID: tenantID, Status: status, Assignee: assignee, Source: source,
+		IntimationID: intimationID, From: from, To: to,
 		LastDue: lastDue, LastID: lastID, Limit: limit,
 	})
 	if err != nil {
@@ -616,7 +688,7 @@ func newTaskItemView(item *TaskItem) TaskItemView {
 // silently returning an empty page.
 func isKnownStatus(s string) bool {
 	switch Status(s) {
-	case StatusPending, StatusOpen, StatusMet, StatusMissed, StatusCancelled:
+	case StatusPending, StatusOpen, StatusMet, StatusMissed, StatusCancelled, StatusNoDeadline:
 		return true
 	default:
 		return false
@@ -690,6 +762,9 @@ type confirmedDeadlineView struct {
 	EndDate         time.Time `json:"end_date"`
 	HolidaysApplied []string  `json:"holidays_applied"`
 	ConfirmedBy     string    `json:"confirmed_by"`
+	AnchorEvent     string    `json:"anchor_event"`
+	ManualExtraDays int       `json:"manual_extra_days"`
+	LegalCitation   string    `json:"legal_citation,omitempty"`
 }
 
 // newConfirmResponse maps the use case's ConfirmResult to the client-facing payload. The
@@ -711,6 +786,9 @@ func newConfirmResponse(res ConfirmResult) confirmResponse {
 			EndDate:         d.EndDate,
 			HolidaysApplied: formatDates(d.HolidaysApplied),
 			ConfirmedBy:     d.ConfirmedBy,
+			AnchorEvent:     string(d.AnchorEvent),
+			ManualExtraDays: d.ManualExtraDays,
+			LegalCitation:   d.LegalCitation,
 		},
 	}
 }
@@ -731,6 +809,8 @@ type adjustedDeadlineView struct {
 	StartDate       time.Time `json:"start_date"`
 	EndDate         time.Time `json:"end_date"`
 	HolidaysApplied []string  `json:"holidays_applied"`
+	AnchorEvent     string    `json:"anchor_event"`
+	ManualExtraDays int       `json:"manual_extra_days"`
 }
 
 // newAdjustResponse maps the use case's AdjustedDeadline to the client-facing payload; the
@@ -748,6 +828,31 @@ func newAdjustResponse(d AdjustedDeadline) adjustedDeadlineView {
 		StartDate:       d.StartDate,
 		EndDate:         d.EndDate,
 		HolidaysApplied: formatDates(d.HolidaysApplied),
+		AnchorEvent:     string(d.AnchorEvent),
+		ManualExtraDays: d.ManualExtraDays,
+	}
+}
+
+// previewResponse is the POST /v1/prazos/preview payload: the recomputed dates the confirmation
+// panel renders live (never persisted). weekday is the pt-BR end-date weekday; days_left is
+// calendar days from today; holidays_applied is the auditable skipped-days list.
+type previewResponse struct {
+	StartDate       time.Time `json:"start_date"`
+	EndDate         time.Time `json:"end_date"`
+	Weekday         string    `json:"weekday"`
+	DaysLeft        int       `json:"days_left"`
+	HolidaysApplied []string  `json:"holidays_applied"`
+}
+
+// newPreviewResponse maps the use case's PreviewResult to the client-facing payload; the holidays
+// audit is formatted here (always a non-nil slice, so an empty audit is []).
+func newPreviewResponse(r PreviewResult) previewResponse {
+	return previewResponse{
+		StartDate:       r.StartDate,
+		EndDate:         r.EndDate,
+		Weekday:         r.Weekday,
+		DaysLeft:        r.DaysLeft,
+		HolidaysApplied: formatDates(r.HolidaysApplied),
 	}
 }
 

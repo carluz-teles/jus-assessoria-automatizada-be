@@ -95,6 +95,14 @@ func recordEnrichmentApplied(ctx context.Context) {
 	metrics().enrichment.Add(ctx, 1)
 }
 
+// recordEnrichmentBatchApplied counts the n DATAJUD grades one batch step landed — the same
+// enrichment counter as the single path, incremented by the step's graded count.
+func recordEnrichmentBatchApplied(ctx context.Context, n int) {
+	if n > 0 {
+		metrics().enrichment.Add(ctx, int64(n))
+	}
+}
+
 // recordDiarioLanded counts the national publications one tribunal/day landed.
 func recordDiarioLanded(ctx context.Context, n int) {
 	if n > 0 {
