@@ -34,15 +34,15 @@ type IntimacaoAnaliseView struct {
 // the firm's active members (so the IA can pick a real responsável by id). Type is a pointer
 // (the column is nullable); DeadlineEndDate is "" when the intimation has no prazo yet.
 type IntimacaoAnaliseCtx struct {
-	Content        string
-	Type           *string
-	CNJNumber      string
-	Court          string
-	Degree         string
-	Class          string
-	Subject        string
+	Content         string
+	Type            *string
+	CNJNumber       string
+	Court           string
+	Degree          string
+	Class           string
+	Subject         string
 	DeadlineEndDate string      // "2006-01-02" or "" when no deadline
-	Members        []MemberCtx // active app_users of the tenant (id + name)
+	Members         []MemberCtx // active app_users of the tenant (id + name)
 }
 
 // MemberCtx is one firm member the IA may assign a providência to: the internal app_user id

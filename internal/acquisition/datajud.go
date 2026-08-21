@@ -116,8 +116,8 @@ func NewDATAJUDConnector(opts ...DATAJUDOption) *DATAJUDConnector {
 
 var _ Connector = (*DATAJUDConnector)(nil)
 
-func (c *DATAJUDConnector) ID() string                 { return datajudConnectorID }
-func (c *DATAJUDConnector) Version() string            { return datajudConnectorVersion }
+func (c *DATAJUDConnector) ID() string      { return datajudConnectorID }
+func (c *DATAJUDConnector) Version() string { return datajudConnectorVersion }
 func (c *DATAJUDConnector) Capabilities() []Capability {
 	return []Capability{CapabilityFetchByNumber, CapabilityFetchBatch}
 }

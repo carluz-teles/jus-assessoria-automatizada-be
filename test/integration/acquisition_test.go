@@ -1,10 +1,10 @@
 //go:build integration
 
 // Acquisition slice integration tests — prove ActivateIntegration against a real
-// Postgres: N sources → N integration rows + N outbox events in ONE transaction
-// (atomic; a failed publish rolls the whole batch back), the upsert emits an
-// event only when activation changed, credential_ref is never written, and both
-// the app-level tenant filter and RLS isolate one tenant from another.
+// Postgres: activating produces ONE DJEN integration row + ONE outbox event in ONE
+// transaction (atomic; a failed publish rolls the whole thing back), the upsert emits
+// an event only when activation changed, credential_ref is never written, and both the
+// app-level tenant filter and RLS isolate one tenant from another.
 package integration_test
 
 import (
@@ -62,7 +62,7 @@ func scope(oab ...string) acquisition.Scope {
 	return acquisition.Scope{OAB: oab}
 }
 
-// AC1: two sources produce two integration rows AND two outbox events, committed
+// AC1: activation produces one DJEN integration row AND one outbox event, committed
 // together in one transaction.
 func TestAcquisition_Activate_RowsAndEventsAtomic(t *testing.T) {
 	pool := newPool(t)
@@ -70,19 +70,21 @@ func TestAcquisition_Activate_RowsAndEventsAtomic(t *testing.T) {
 	seedTenant(t, pool, tenantID, "org-acq-1", 0)
 
 	uc := newAcquisitionUC(pool)
-	got, err := uc.ActivateIntegration(context.Background(), tenantID,
-		[]string{acquisition.SourceDJEN, acquisition.SourceDATAJUD}, scope("SP123456"))
+	got, err := uc.ActivateIntegration(context.Background(), tenantID, scope("SP123456"))
 	if err != nil {
 		t.Fatalf("ActivateIntegration() error = %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("activated = %d, want 2", len(got))
+	if got == nil {
+		t.Fatal("activated integration = nil, want a DJEN row")
 	}
-	if n := countIntegrations(t, pool, tenantID); n != 2 {
-		t.Fatalf("integration rows = %d, want 2", n)
+	if got.Source != acquisition.SourceDJEN {
+		t.Fatalf("activated source = %q, want %q", got.Source, acquisition.SourceDJEN)
 	}
-	if n := countActivatedOutbox(t, pool, tenantID); n != 2 {
-		t.Fatalf("outbox events = %d, want 2", n)
+	if n := countIntegrations(t, pool, tenantID); n != 1 {
+		t.Fatalf("integration rows = %d, want 1", n)
+	}
+	if n := countActivatedOutbox(t, pool, tenantID); n != 1 {
+		t.Fatalf("outbox events = %d, want 1", n)
 	}
 }
 
@@ -101,8 +103,7 @@ func TestAcquisition_Activate_PublishFailRollsBackAll(t *testing.T) {
 		database.NewUnitOfWork(pool),
 	)
 
-	_, err := uc.ActivateIntegration(context.Background(), tenantID,
-		[]string{acquisition.SourceDJEN, acquisition.SourceDATAJUD}, scope("SP123456"))
+	_, err := uc.ActivateIntegration(context.Background(), tenantID, scope("SP123456"))
 	if err == nil {
 		t.Fatal("ActivateIntegration() error = nil, want the publish failure")
 	}
@@ -129,10 +130,9 @@ func TestAcquisition_Activate_Upsert_EventOnlyWhenChanged(t *testing.T) {
 
 	uc := newAcquisitionUC(pool)
 	ctx := context.Background()
-	src := []string{acquisition.SourceDJEN}
 
 	// First activation: 1 row, 1 event.
-	if _, err := uc.ActivateIntegration(ctx, tenantID, src, scope("SP123456")); err != nil {
+	if _, err := uc.ActivateIntegration(ctx, tenantID, scope("SP123456")); err != nil {
 		t.Fatalf("first activate: %v", err)
 	}
 	if n := countIntegrations(t, pool, tenantID); n != 1 {
@@ -143,7 +143,7 @@ func TestAcquisition_Activate_Upsert_EventOnlyWhenChanged(t *testing.T) {
 	}
 
 	// Scope change: still 1 row (upsert), now 2 events.
-	if _, err := uc.ActivateIntegration(ctx, tenantID, src, scope("SP123456", "RJ99")); err != nil {
+	if _, err := uc.ActivateIntegration(ctx, tenantID, scope("SP123456", "RJ99")); err != nil {
 		t.Fatalf("scope-change activate: %v", err)
 	}
 	if n := countIntegrations(t, pool, tenantID); n != 1 {
@@ -154,7 +154,7 @@ func TestAcquisition_Activate_Upsert_EventOnlyWhenChanged(t *testing.T) {
 	}
 
 	// Identical re-post: no new event.
-	if _, err := uc.ActivateIntegration(ctx, tenantID, src, scope("SP123456", "RJ99")); err != nil {
+	if _, err := uc.ActivateIntegration(ctx, tenantID, scope("SP123456", "RJ99")); err != nil {
 		t.Fatalf("identical activate: %v", err)
 	}
 	if n := countActivatedOutbox(t, pool, tenantID); n != 2 {
@@ -169,8 +169,7 @@ func TestAcquisition_Activate_CredentialRefAlwaysNull(t *testing.T) {
 	seedTenant(t, pool, tenantID, "org-acq-4", 0)
 
 	uc := newAcquisitionUC(pool)
-	if _, err := uc.ActivateIntegration(context.Background(), tenantID,
-		[]string{acquisition.SourceDJEN}, scope("SP123456")); err != nil {
+	if _, err := uc.ActivateIntegration(context.Background(), tenantID, scope("SP123456")); err != nil {
 		t.Fatalf("ActivateIntegration() error = %v", err)
 	}
 
@@ -195,12 +194,10 @@ func TestAcquisition_List_ScopedToTenant(t *testing.T) {
 
 	uc := newAcquisitionUC(pool)
 	ctx := context.Background()
-	if _, err := uc.ActivateIntegration(ctx, tenantA,
-		[]string{acquisition.SourceDJEN, acquisition.SourceDATAJUD}, scope("SP1")); err != nil {
+	if _, err := uc.ActivateIntegration(ctx, tenantA, scope("SP1")); err != nil {
 		t.Fatalf("activate A: %v", err)
 	}
-	if _, err := uc.ActivateIntegration(ctx, tenantB,
-		[]string{acquisition.SourceDJEN}, scope("RJ2")); err != nil {
+	if _, err := uc.ActivateIntegration(ctx, tenantB, scope("RJ2")); err != nil {
 		t.Fatalf("activate B: %v", err)
 	}
 
@@ -208,8 +205,8 @@ func TestAcquisition_List_ScopedToTenant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListIntegrations(A): %v", err)
 	}
-	if len(listA) != 2 {
-		t.Fatalf("tenant A list = %d, want 2", len(listA))
+	if len(listA) != 1 {
+		t.Fatalf("tenant A list = %d, want 1", len(listA))
 	}
 	for _, integ := range listA {
 		if integ.TenantID != tenantA {
@@ -238,15 +235,13 @@ func TestAcquisition_RLS_TenantIsolation(t *testing.T) {
 	seedTenant(t, pool, tenantA, "org-acq-rls-a", 0)
 	seedTenant(t, pool, tenantB, "org-acq-rls-b", 0)
 
-	// Seed integrations as the owner (RLS bypassed): 2 for A, 1 for B.
+	// Seed integrations as the owner (RLS bypassed): 1 DJEN row each.
 	uc := newAcquisitionUC(pool)
 	ctx := context.Background()
-	if _, err := uc.ActivateIntegration(ctx, tenantA,
-		[]string{acquisition.SourceDJEN, acquisition.SourceDATAJUD}, scope("SP1")); err != nil {
+	if _, err := uc.ActivateIntegration(ctx, tenantA, scope("SP1")); err != nil {
 		t.Fatalf("activate A: %v", err)
 	}
-	if _, err := uc.ActivateIntegration(ctx, tenantB,
-		[]string{acquisition.SourceDJEN}, scope("RJ2")); err != nil {
+	if _, err := uc.ActivateIntegration(ctx, tenantB, scope("RJ2")); err != nil {
 		t.Fatalf("activate B: %v", err)
 	}
 
@@ -255,7 +250,7 @@ func TestAcquisition_RLS_TenantIsolation(t *testing.T) {
 		tenantID string // empty = do not set app.tenant_id
 		want     int
 	}{
-		{name: "tenant A sees only its own", tenantID: tenantA, want: 2},
+		{name: "tenant A sees only its own", tenantID: tenantA, want: 1},
 		{name: "tenant B sees only its own", tenantID: tenantB, want: 1},
 		{name: "no tenant set sees nothing", tenantID: "", want: 0},
 	}

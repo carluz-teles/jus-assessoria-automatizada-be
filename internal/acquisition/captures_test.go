@@ -10,7 +10,7 @@ import (
 )
 
 // strPtr / timePtr build the nullable read-model fields the capture rows carry.
-func strPtr(s string) *string    { return &s }
+func strPtr(s string) *string        { return &s }
 func timePtr(t time.Time) *time.Time { return &t }
 
 // TestCaptureDisplayStatus maps the raw capture status + error count to the user-facing
@@ -55,8 +55,8 @@ func TestReadUseCase_Captures(t *testing.T) {
 			LastCaptureAt:       timePtr(finish),
 			IntimationsNewToday: 12,
 		},
-		deadlinesToday: 9,
-		oabCount:       3,
+		deadlinesToday:   9,
+		oabCount:         3,
 		deadlinesBetween: 5,
 		tasksBetween:     2,
 		captureRows: []CaptureRunRow{

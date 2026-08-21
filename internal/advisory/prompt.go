@@ -26,17 +26,17 @@ import (
 // erd-ai-advisory.md §3 lists (court/degree/class/subject/piece_type/fase) plus the prazo the
 // suggestion hangs on and — the richest signal when present — the intimação's own text.
 type CaseContext struct {
-	Court          string // sigla do tribunal (TJSP, TRT2, STJ…)
-	Degree         string // G1|G2|JE|SUPERIOR…
-	Class          string // classe/rito processual
-	Subject        string // assunto
-	IntimationType string // CITACAO|INTIMACAO|COMUNICACAO…
-	IntimationText string // o teor da intimação, quando disponível — o contexto mais rico
-	PrazoKind      string // CONTESTACAO|RECURSO|MANIFESTACAO… (o kind do prazo derivado)
-	PrazoDays      int    // dias do prazo
-	Counting       string // BUSINESS|CALENDAR
-	Phase          string // fase processual, quando conhecida
-	DeadlineDate   string // prazo final "2006-01-02" (analyze_intimation) — teto do due_date sugerido; "" sem prazo
+	Court          string      // sigla do tribunal (TJSP, TRT2, STJ…)
+	Degree         string      // G1|G2|JE|SUPERIOR…
+	Class          string      // classe/rito processual
+	Subject        string      // assunto
+	IntimationType string      // CITACAO|INTIMACAO|COMUNICACAO…
+	IntimationText string      // o teor da intimação, quando disponível — o contexto mais rico
+	PrazoKind      string      // CONTESTACAO|RECURSO|MANIFESTACAO… (o kind do prazo derivado)
+	PrazoDays      int         // dias do prazo
+	Counting       string      // BUSINESS|CALENDAR
+	Phase          string      // fase processual, quando conhecida
+	DeadlineDate   string      // prazo final "2006-01-02" (analyze_intimation) — teto do due_date sugerido; "" sem prazo
 	Members        []MemberCtx // membros ativos do escritório (id+nome) para o IA sugerir responsável real
 
 	// Playbook é o ponto de injeção da "voz do escritório" (§3). v0: stub (vazio → nada é

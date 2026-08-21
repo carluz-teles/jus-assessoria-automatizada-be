@@ -12,12 +12,12 @@ import (
 // &Atilde;→Ã, &ordm;→º) correctly without regex fragility.
 //
 // Strategy:
-//  - <script> and <style> nodes and all their descendants are skipped.
-//  - Block-level elements (p, div, br, tr, li, hN, article, section, table,
-//    thead, tbody) inject a newline break so paragraph structure survives the tag strip.
-//  - All other tags are dropped; their text children are kept.
-//  - Whitespace within a line is collapsed to a single space; blank lines are
-//    squeezed to at most one blank line.
+//   - <script> and <style> nodes and all their descendants are skipped.
+//   - Block-level elements (p, div, br, tr, li, hN, article, section, table,
+//     thead, tbody) inject a newline break so paragraph structure survives the tag strip.
+//   - All other tags are dropped; their text children are kept.
+//   - Whitespace within a line is collapsed to a single space; blank lines are
+//     squeezed to at most one blank line.
 //
 // Input that contains no HTML ('<') or entities ('&') is returned trimmed and
 // unchanged — the fast path avoids the tokenizer overhead for plain-text content.
