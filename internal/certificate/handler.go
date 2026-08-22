@@ -2,6 +2,7 @@ package certificate
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 
 	"github.com/gofiber/fiber/v2"
@@ -29,6 +30,7 @@ const maxUploadBytes = int64(1 << 20)
 type uc interface {
 	Create(ctx context.Context, cmd CreateCommand) (CertificateView, error)
 	Preview(ctx context.Context, cmd PreviewCommand) (PreviewResult, error)
+	Sign(ctx context.Context, cmd SignCommand) (SignResult, error)
 	List(ctx context.Context, tenantID string) ([]CertificateView, error)
 	Revoke(ctx context.Context, tenantID, id string) error
 }
@@ -52,6 +54,7 @@ func NewHandler(uc uc) *Handler {
 func (h *Handler) Register(r fiber.Router) {
 	r.Post("/certificates/preview", h.preview)
 	r.Post("/certificates", h.create)
+	r.Post("/certificates/:id/sign", h.sign)
 	r.Get("/certificates", h.list)
 	r.Delete("/certificates/:id", h.revoke)
 }
@@ -147,6 +150,82 @@ func (h *Handler) preview(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(result)
+}
+
+// signRequest is the POST /v1/certificates/:id/sign body. Password is the session
+// password used ONLY to decrypt the .pfx server-side (never persisted, never
+// logged); DigestSHA256 is the base64 of the raw 32-byte SHA-256 the caller already
+// computed over its document. The certificate id comes from the path, tenant +
+// signer from the principal — never the body.
+type signRequest struct {
+	Password     string `json:"password"`
+	DigestSHA256 string `json:"digest_sha256"`
+}
+
+// Validate enforces the shape before the use case runs (ozzo-style, but the body is
+// tiny so an explicit check is clearer than a rule set): a password is required and
+// the digest must be present. The 32-byte length is enforced after base64 decoding.
+func (r signRequest) Validate() error {
+	if r.Password == "" {
+		return ErrPasswordRequired
+	}
+	if r.DigestSHA256 == "" {
+		return ErrInvalidDigest
+	}
+	return nil
+}
+
+// signResponse is the sign result: the signature and the DER cert chain (leaf
+// first), both base64. No key material — the signature is public by nature.
+type signResponse struct {
+	Signature string   `json:"signature"`
+	CertChain []string `json:"cert_chain"`
+}
+
+// sign handles POST /v1/certificates/:id/sign: JSON {password, digest_sha256}. It
+// decodes the digest, then decrypts the stored .pfx with the session password and
+// signs the digest with the certificate's RSA private key server-side. tenant +
+// signer come from the principal, the certificate id from the path. A wrong
+// password / bad digest → typed 4xx; a missing cert → 404; success → 200 +
+// {signature, cert_chain} (base64). The password is never logged.
+func (h *Handler) sign(c *fiber.Ctx) error {
+	principal, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	var req signRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	digest, err := base64.StdEncoding.DecodeString(req.DigestSHA256)
+	if err != nil {
+		return httpx.WriteError(c, ErrInvalidDigest)
+	}
+
+	res, err := h.uc.Sign(c.UserContext(), SignCommand{
+		TenantID:      principal.TenantID,
+		SignerUserID:  principal.UserID,
+		CertificateID: c.Params("id"),
+		Password:      req.Password,
+		Digest:        digest,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	chain := make([]string, 0, len(res.ChainDER))
+	for _, der := range res.ChainDER {
+		chain = append(chain, base64.StdEncoding.EncodeToString(der))
+	}
+	return c.Status(fiber.StatusOK).JSON(signResponse{
+		Signature: base64.StdEncoding.EncodeToString(res.Signature),
+		CertChain: chain,
+	})
 }
 
 // certificatesEnvelope is the {data:[...]} response for the list. The set per

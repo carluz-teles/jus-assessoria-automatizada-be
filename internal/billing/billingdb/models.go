@@ -427,6 +427,15 @@ type Review struct {
 	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
 }
 
+type SigningEvent struct {
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	CertificateID uuid.UUID          `json:"certificate_id"`
+	SignerUserID  uuid.UUID          `json:"signer_user_id"`
+	DigestSha256  []byte             `json:"digest_sha256"`
+	SignedAt      pgtype.Timestamptz `json:"signed_at"`
+}
+
 type Subscription struct {
 	ID                         uuid.UUID          `json:"id"`
 	TenantID                   uuid.UUID          `json:"tenant_id"`

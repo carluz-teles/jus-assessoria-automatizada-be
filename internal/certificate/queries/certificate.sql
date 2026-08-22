@@ -45,6 +45,28 @@ SELECT id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
 FROM certificate
 WHERE id = $1 AND tenant_id = $2;
 
+-- name: GetCertificateEnvelope :one
+-- Load one certificate's ENVELOPE (the encrypted key material) plus the fields
+-- needed to gate signing (not_after, revoked_at), scoped to tenant_id. This is the
+-- ONLY query that projects ciphertext/nonce/wrapped_dek — it exists solely for the
+-- server-side signing path (POST /v1/certificates/:id/sign), which must decrypt the
+-- .pfx to reach the private key. A miss → pgx.ErrNoRows → ErrCertificateNotFound at
+-- the mapper. The bytes never leave the backend. $1 = id, $2 = tenant_id.
+SELECT id, tenant_id, owner_user_id, not_after, revoked_at,
+       ciphertext, nonce, wrapped_dek, kek_ref
+FROM certificate
+WHERE id = $1 AND tenant_id = $2;
+
+-- name: InsertSigningEvent :one
+-- Record that a certificate signed a digest (audit trail, committed in the SAME tx
+-- as the sign so the act and its record land together). Stores the SHA-256 digest
+-- only — never the signature, the key, or the password. tenant_id + signer_user_id
+-- come from the trusted principal. $1 = tenant_id, $2 = certificate_id,
+-- $3 = signer_user_id, $4 = digest_sha256.
+INSERT INTO signing_event (tenant_id, certificate_id, signer_user_id, digest_sha256)
+VALUES ($1, $2, $3, $4)
+RETURNING id, signed_at;
+
 -- name: RevokeCertificate :one
 -- Soft-revoke a certificate (DELETE /v1/certificates/:id): stamp revoked_at = $3
 -- when it is still active (revoked_at IS NULL), scoped to tenant_id. A no-row result

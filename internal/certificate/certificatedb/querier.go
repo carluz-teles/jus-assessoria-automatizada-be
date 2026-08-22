@@ -15,6 +15,13 @@ type Querier interface {
 	// foreign id never resolves. A miss → pgx.ErrNoRows → ErrCertificateNotFound at the
 	// mapper. METADATA ONLY. $1 = id, $2 = tenant_id.
 	GetCertificate(ctx context.Context, arg GetCertificateParams) (GetCertificateRow, error)
+	// Load one certificate's ENVELOPE (the encrypted key material) plus the fields
+	// needed to gate signing (not_after, revoked_at), scoped to tenant_id. This is the
+	// ONLY query that projects ciphertext/nonce/wrapped_dek — it exists solely for the
+	// server-side signing path (POST /v1/certificates/:id/sign), which must decrypt the
+	// .pfx to reach the private key. A miss → pgx.ErrNoRows → ErrCertificateNotFound at
+	// the mapper. The bytes never leave the backend. $1 = id, $2 = tenant_id.
+	GetCertificateEnvelope(ctx context.Context, arg GetCertificateEnvelopeParams) (GetCertificateEnvelopeRow, error)
 	// certificate slice queries. Every statement runs inside the use case's tx so RLS
 	// scopes it to the principal's tenant (barrier 2) on top of the explicit tenant_id
 	// filter (barrier 1). Absence is a typed error at the mapper, never (nil, nil).
@@ -28,6 +35,12 @@ type Querier interface {
 	// seal(). tenant_id and owner_user_id come from the trusted principal, never the
 	// body. Returns the whole row so the handler renders the CertificateView.
 	InsertCertificate(ctx context.Context, arg InsertCertificateParams) (InsertCertificateRow, error)
+	// Record that a certificate signed a digest (audit trail, committed in the SAME tx
+	// as the sign so the act and its record land together). Stores the SHA-256 digest
+	// only — never the signature, the key, or the password. tenant_id + signer_user_id
+	// come from the trusted principal. $1 = tenant_id, $2 = certificate_id,
+	// $3 = signer_user_id, $4 = digest_sha256.
+	InsertSigningEvent(ctx context.Context, arg InsertSigningEventParams) (InsertSigningEventRow, error)
 	// The GET /v1/certificates read model: a tenant's certificates, newest first, with
 	// the owner lawyer's display name joined from app_user. METADATA ONLY — no envelope
 	// columns. Scoped to tenant_id (barrier 1) on top of RLS (barrier 2). $1 = tenant_id.

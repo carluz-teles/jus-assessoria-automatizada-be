@@ -26,4 +26,12 @@ var (
 
 	// ErrPasswordRequired — the password field was empty.
 	ErrPasswordRequired = apperr.NewInvalid("certificate password is required")
+
+	// ErrInvalidDigest — the digest to sign is not a 32-byte SHA-256 sum. We only
+	// sign a bare hash the caller computed, never arbitrary/structured bytes.
+	ErrInvalidDigest = apperr.NewInvalid("digest must be a 32-byte SHA-256 hash")
+
+	// ErrCertificateRevoked — the certificate has been revoked and can no longer
+	// sign. A revoked key is refused before any decryption is attempted.
+	ErrCertificateRevoked = apperr.NewInvalid("certificate is revoked")
 )

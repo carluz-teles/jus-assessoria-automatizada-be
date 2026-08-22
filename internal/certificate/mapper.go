@@ -52,6 +52,23 @@ func getRowToEntity(r certificatedb.GetCertificateRow) *Certificate {
 	}
 }
 
+// envelopeRowToSignable maps the GetCertificateEnvelope row (the ONLY row that
+// carries encrypted key material) to the internal signable. The envelope bytes
+// stay inside the backend — this type never reaches a read model.
+func envelopeRowToSignable(r certificatedb.GetCertificateEnvelopeRow) signable {
+	return signable{
+		OwnerUserID: r.OwnerUserID.String(),
+		NotAfter:    r.NotAfter.Time,
+		RevokedAt:   timestamptzToPtr(r.RevokedAt),
+		Envelope: envelope{
+			Ciphertext: r.Ciphertext,
+			Nonce:      r.Nonce,
+			WrappedDEK: r.WrappedDek,
+			KEKRef:     r.KekRef,
+		},
+	}
+}
+
 // listRowToView maps a ListCertificates row (metadata + joined owner name) to the
 // read model. This is the ONLY place owner_user_name is threaded in — the LEFT
 // JOIN yields nil when the app_user row is gone, so OwnerUserName stays nil.

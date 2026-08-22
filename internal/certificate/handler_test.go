@@ -3,11 +3,14 @@ package certificate
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +32,10 @@ type stubUC struct {
 	previewErr error
 	gotPreview PreviewCommand
 
+	signRes SignResult
+	signErr error
+	gotSign SignCommand
+
 	listRes []CertificateView
 	listErr error
 
@@ -45,6 +52,11 @@ func (s *stubUC) Create(_ context.Context, cmd CreateCommand) (CertificateView, 
 func (s *stubUC) Preview(_ context.Context, cmd PreviewCommand) (PreviewResult, error) {
 	s.gotPreview = cmd
 	return s.previewRes, s.previewErr
+}
+
+func (s *stubUC) Sign(_ context.Context, cmd SignCommand) (SignResult, error) {
+	s.gotSign = cmd
+	return s.signRes, s.signErr
 }
 
 func (s *stubUC) List(_ context.Context, _ string) ([]CertificateView, error) {
@@ -188,6 +200,92 @@ func TestHandler_Preview_WrongPassword_400(t *testing.T) {
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
+}
+
+func TestHandler_Sign_200(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	stub := &stubUC{signRes: SignResult{
+		Signature: []byte("sig-bytes"),
+		ChainDER:  [][]byte{[]byte("leaf-der"), []byte("ca-der")},
+	}}
+	app := newTestApp(NewHandler(stub))
+
+	sum := sha256.Sum256([]byte("doc"))
+	digestB64 := base64.StdEncoding.EncodeToString(sum[:])
+	body := `{"password":"pw","digest_sha256":"` + digestB64 + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-7/sign", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusOK, resp.StatusCode)
+	// tenant + signer come from the principal, the cert id from the path, the digest
+	// from the (decoded) body.
+	is.Equal("tenant-1", stub.gotSign.TenantID)
+	is.Equal("owner-1", stub.gotSign.SignerUserID)
+	is.Equal("cert-7", stub.gotSign.CertificateID)
+	is.Equal("pw", stub.gotSign.Password)
+	is.Equal(sum[:], stub.gotSign.Digest)
+
+	var got signResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	is.Equal(base64.StdEncoding.EncodeToString([]byte("sig-bytes")), got.Signature)
+	require.Len(t, got.CertChain, 2)
+	is.Equal(base64.StdEncoding.EncodeToString([]byte("leaf-der")), got.CertChain[0])
+}
+
+func TestHandler_Sign_MissingPassword_400(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	stub := &stubUC{}
+	app := newTestApp(NewHandler(stub))
+
+	sum := sha256.Sum256([]byte("doc"))
+	body := `{"digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-7/sign", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
+	is.Equal(SignCommand{}, stub.gotSign, "use case must not be called without a password")
+}
+
+func TestHandler_Sign_WrongPassword_400(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	app := newTestApp(NewHandler(&stubUC{signErr: ErrInvalidPassword}))
+	sum := sha256.Sum256([]byte("doc"))
+	body := `{"password":"wrong","digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-7/sign", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
+}
+
+func TestHandler_Sign_NotFound_404(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	app := newTestApp(NewHandler(&stubUC{signErr: ErrCertificateNotFound}))
+	sum := sha256.Sum256([]byte("doc"))
+	body := `{"password":"pw","digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/missing/sign", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusNotFound, resp.StatusCode)
 }
 
 func TestHandler_List_200_Envelope(t *testing.T) {

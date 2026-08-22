@@ -144,6 +144,73 @@ func (uc *UseCase) Preview(_ context.Context, cmd PreviewCommand) (PreviewResult
 	}, nil
 }
 
+// SignCommand is the POST /v1/certificates/:id/sign input the handler builds from
+// the JSON body + the verified principal. TenantID/SignerUserID come from the
+// principal, CertificateID from the path — NEVER the body. Password is the session
+// password used ONLY to decrypt the .pfx and is discarded when Sign returns.
+// Digest is the raw 32-byte SHA-256 the caller already computed over its document.
+type SignCommand struct {
+	TenantID      string
+	SignerUserID  string
+	CertificateID string
+	Password      string
+	Digest        []byte
+}
+
+// SignResult is the Sign output: the signature over the digest plus the DER cert
+// chain (leaf first). Both are the client's to embed/verify; neither is secret.
+type SignResult struct {
+	Signature []byte
+	ChainDER  [][]byte
+}
+
+// Sign produces a server-side RSA signature over a caller-supplied SHA-256 digest,
+// using the private key inside the stored .pfx (the server-side-signing fatia the
+// envelope's open() half was built for). Steps, all in ONE tenant-scoped tx so RLS
+// applies to both the read and the audit write:
+//  1. load the certificate's envelope (missing/foreign id → 404).
+//  2. refuse a revoked or expired certificate (typed KindInvalid) BEFORE touching
+//     the key — a dead cert must never sign.
+//  3. decrypt the .pfx (vault Unwrap + AES-GCM open), extract the private key, and
+//     sign the digest with RSA-PKCS1v15/SHA-256 (wrong password → 400).
+//  4. append a signing_event audit row in the same tx.
+//
+// SECURITY: the password lives only in the command and reaches only signDigest's
+// decrypt step; it is never stored or logged. The private key and the decrypted
+// .pfx are zeroed/dropped inside signDigest — nothing key-bearing survives this
+// call. The signature and chain are returned to the caller; the digest (a hash,
+// not the document) is the only thing persisted, for audit.
+func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (SignResult, error) {
+	if len(cmd.Digest) != len(([32]byte{})) {
+		return SignResult{}, ErrInvalidDigest
+	}
+
+	var res signResult
+	err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		cert, err := uc.repo.LoadEnvelope(ctx, tx, cmd.TenantID, cmd.CertificateID)
+		if err != nil {
+			return err
+		}
+		if cert.RevokedAt != nil {
+			return ErrCertificateRevoked
+		}
+		if uc.now().After(cert.NotAfter) {
+			return ErrCertificateExpired
+		}
+
+		res, err = signDigest(ctx, uc.vault, cert.Envelope, cmd.Password, cmd.Digest)
+		if err != nil {
+			return err
+		}
+		return uc.repo.RecordSigning(ctx, tx, cmd.TenantID, cmd.CertificateID, cmd.SignerUserID, cmd.Digest)
+	})
+	if err != nil {
+		return SignResult{}, err
+	}
+
+	return SignResult{Signature: res.Signature, ChainDER: res.ChainDER}, nil
+}
+
 // List returns a tenant's certificates (metadata only), newest first. It runs in a
 // tenant-scoped tx so RLS applies to the read (barrier 2) on top of the explicit
 // tenant filter (barrier 1). An empty tenant yields an empty slice, never an error.

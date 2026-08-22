@@ -2,6 +2,9 @@ package certificate
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
@@ -9,9 +12,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	pkcs12 "software.sslmate.com/src/go-pkcs12"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/vault"
 )
 
 // --- fakes ------------------------------------------------------------------
@@ -57,6 +62,15 @@ type fakeRepo struct {
 	revokeErr  error
 	revokedID  string
 	revokedTID string
+
+	// signing path
+	loadRes      signable
+	loadErr      error
+	recordErr    error
+	recordedDig  []byte
+	recordedCID  string
+	recordedTID  string
+	recordedUser string
 }
 
 func (r *fakeRepo) Insert(_ context.Context, _ database.Tx, p InsertParams) (*Certificate, error) {
@@ -81,6 +95,16 @@ func (r *fakeRepo) Insert(_ context.Context, _ database.Tx, p InsertParams) (*Ce
 
 func (r *fakeRepo) List(_ context.Context, _ database.Tx, _ string) ([]CertificateView, error) {
 	return r.listViews, r.listErr
+}
+
+func (r *fakeRepo) LoadEnvelope(_ context.Context, _ database.Tx, _, _ string) (signable, error) {
+	return r.loadRes, r.loadErr
+}
+
+func (r *fakeRepo) RecordSigning(_ context.Context, _ database.Tx, tenantID, certificateID, signerUserID string, digest []byte) error {
+	r.recordedTID, r.recordedCID, r.recordedUser = tenantID, certificateID, signerUserID
+	r.recordedDig = digest
+	return r.recordErr
 }
 
 func (r *fakeRepo) Revoke(_ context.Context, _ database.Tx, tenantID, id string, _ time.Time) error {
@@ -264,6 +288,149 @@ func TestRevoke_NotFound_NoEvent(t *testing.T) {
 	err := uc.Revoke(context.Background(), "t", "missing")
 	is.ErrorIs(err, ErrCertificateNotFound)
 	is.Empty(outbox.published, "no event when the revoke found nothing")
+}
+
+// --- Sign -------------------------------------------------------------------
+
+// sealedSignable builds a real envelope from a test .pfx (via the real vault +
+// seal) plus the leaf's public key, so a sign test can round-trip: sign a digest
+// through the use case, then verify the signature against this public key. This is
+// the acceptance-criterion fixture — it proves the stored, encrypted key really
+// signs and the result verifies.
+func sealedSignable(t *testing.T, v vault.SecretVault, cn, password string, notBefore, notAfter time.Time) (signable, *rsa.PublicKey) {
+	t.Helper()
+
+	pfx := makePFX(t, cn, password, notBefore, notAfter)
+	env, err := seal(context.Background(), v, pfx)
+	require.NoError(t, err)
+
+	// Recover the leaf's public key to verify the signature later (the private key
+	// itself is never exposed by the slice; the test grabs the leaf directly from
+	// the fixture .pfx via the pkcs12 package).
+	_, leaf, _, err := pkcs12.DecodeChain(pfx, password)
+	require.NoError(t, err)
+	pub, ok := leaf.PublicKey.(*rsa.PublicKey)
+	require.True(t, ok, "test fixture must be RSA")
+
+	return signable{NotAfter: notAfter, Envelope: env}, pub
+}
+
+func TestSign_RoundTrip_SignatureVerifies(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	now := time.Now()
+	v := testVault(t)
+	sgn, pub := sealedSignable(t, v, "ADV SIGNER:1", "pw", now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	repo := &fakeRepo{loadRes: sgn}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, v, &fakeOutbox{}, uow, WithClock(func() time.Time { return now }))
+
+	sum := sha256.Sum256([]byte("a document to sign"))
+	res, err := uc.Sign(context.Background(), SignCommand{
+		TenantID:      "tenant-x",
+		SignerUserID:  "user-1",
+		CertificateID: "cert-1",
+		Password:      "pw",
+		Digest:        sum[:],
+	})
+	require.NoError(t, err)
+
+	// The signature must verify against the certificate's public key with the same
+	// scheme (RSA-PKCS1v15/SHA-256) — this is the core acceptance criterion.
+	err = rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], res.Signature)
+	require.NoError(t, err, "server-side signature must verify with the cert public key")
+
+	// The chain is returned leaf-first and the audit row was written in the tenant tx.
+	require.NotEmpty(t, res.ChainDER)
+	is.Equal([]string{"tenant-x"}, uow.scopes)
+	is.Equal(sum[:], repo.recordedDig, "the audited digest is exactly what was signed")
+	is.Equal("cert-1", repo.recordedCID)
+	is.Equal("tenant-x", repo.recordedTID)
+	is.Equal("user-1", repo.recordedUser)
+}
+
+func TestSign_WrongPassword_TypedError_NoAudit(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	now := time.Now()
+	v := testVault(t)
+	sgn, _ := sealedSignable(t, v, "CN", "right", now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	repo := &fakeRepo{loadRes: sgn}
+	uc := NewUseCase(repo, v, &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
+
+	sum := sha256.Sum256([]byte("x"))
+	_, err := uc.Sign(context.Background(), SignCommand{
+		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "wrong", Digest: sum[:],
+	})
+	is.ErrorIs(err, ErrInvalidPassword)
+	is.Nil(repo.recordedDig, "no audit row on a wrong password")
+}
+
+func TestSign_Revoked_Rejected_BeforeDecrypt(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	now := time.Now()
+	v := testVault(t)
+	sgn, _ := sealedSignable(t, v, "CN", "pw", now.Add(-time.Hour), now.Add(24*time.Hour))
+	revoked := now.Add(-time.Minute)
+	sgn.RevokedAt = &revoked
+
+	repo := &fakeRepo{loadRes: sgn}
+	uc := NewUseCase(repo, v, &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
+
+	sum := sha256.Sum256([]byte("x"))
+	_, err := uc.Sign(context.Background(), SignCommand{
+		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "pw", Digest: sum[:],
+	})
+	is.ErrorIs(err, ErrCertificateRevoked)
+	is.Nil(repo.recordedDig)
+}
+
+func TestSign_Expired_Rejected(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	now := time.Now()
+	v := testVault(t)
+	// Sealed with a validity window already in the past.
+	sgn, _ := sealedSignable(t, v, "CN", "pw", now.Add(-48*time.Hour), now.Add(-time.Hour))
+
+	uc := NewUseCase(&fakeRepo{loadRes: sgn}, v, &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
+	sum := sha256.Sum256([]byte("x"))
+	_, err := uc.Sign(context.Background(), SignCommand{
+		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "pw", Digest: sum[:],
+	})
+	is.ErrorIs(err, ErrCertificateExpired)
+}
+
+func TestSign_NotFound_Propagates(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{loadErr: ErrCertificateNotFound}
+	uc := NewUseCase(repo, testVault(t), &fakeOutbox{}, &fakeUOW{})
+
+	sum := sha256.Sum256([]byte("x"))
+	_, err := uc.Sign(context.Background(), SignCommand{
+		TenantID: "t", SignerUserID: "u", CertificateID: "missing", Password: "pw", Digest: sum[:],
+	})
+	is.ErrorIs(err, ErrCertificateNotFound)
+}
+
+func TestSign_BadDigestLength_Rejected(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	uc := NewUseCase(&fakeRepo{}, testVault(t), &fakeOutbox{}, &fakeUOW{})
+	_, err := uc.Sign(context.Background(), SignCommand{
+		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "pw", Digest: []byte("too short"),
+	})
+	is.ErrorIs(err, ErrInvalidDigest)
 }
 
 // Guard: a repo insert error propagates and is not swallowed.

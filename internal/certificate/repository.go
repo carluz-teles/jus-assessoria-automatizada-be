@@ -23,6 +23,16 @@ type InsertParams struct {
 	Envelope    envelope
 }
 
+// signable is a certificate loaded for the signing path: its envelope (encrypted
+// key material) plus the fields needed to gate the sign (owner, expiry, revoked).
+// It NEVER crosses the API boundary — only signDigest consumes the envelope.
+type signable struct {
+	OwnerUserID string
+	NotAfter    time.Time
+	RevokedAt   *time.Time
+	Envelope    envelope
+}
+
 // Repository is the persistence port the use case depends on (never the concrete
 // impl). Every method receives the caller's transaction — the use case owns the
 // boundary, the repo participates — so RLS (barrier 2) scopes every statement to
@@ -35,6 +45,13 @@ type Repository interface {
 	// List returns a tenant's certificates (metadata only) newest first, with the
 	// owner's display name joined. Never carries envelope columns.
 	List(ctx context.Context, tx database.Tx, tenantID string) ([]CertificateView, error)
+	// LoadEnvelope loads one certificate's envelope + sign-gating fields, scoped to
+	// tenant. A missing/foreign id is ErrCertificateNotFound (never nil, nil). This
+	// is the ONLY repo method that reads the encrypted key material back out.
+	LoadEnvelope(ctx context.Context, tx database.Tx, tenantID, id string) (signable, error)
+	// RecordSigning appends a signing_event audit row (same tx as the sign). It
+	// stores the digest only — never the signature, key, or password.
+	RecordSigning(ctx context.Context, tx database.Tx, tenantID, certificateID, signerUserID string, digest []byte) error
 	// Revoke soft-revokes an active certificate by id, scoped to tenant. A missing,
 	// foreign, or already-revoked id is ErrCertificateNotFound (never nil, nil).
 	Revoke(ctx context.Context, tx database.Tx, tenantID, id string, revokedAt time.Time) error
@@ -99,6 +116,60 @@ func (r *pgRepository) List(ctx context.Context, tx database.Tx, tenantID string
 		views = append(views, listRowToView(row))
 	}
 	return views, nil
+}
+
+// LoadEnvelope reads the certificate's envelope + gating fields in-tx (so RLS
+// applies). A no-row / malformed-id result is the typed ErrCertificateNotFound.
+func (r *pgRepository) LoadEnvelope(ctx context.Context, tx database.Tx, tenantID, id string) (signable, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return signable{}, database.WrapInfra(err)
+	}
+	cid, err := uuid.Parse(id)
+	if err != nil {
+		// A malformed id can never match a real row; treat as not found.
+		return signable{}, ErrCertificateNotFound
+	}
+
+	row, err := certificatedb.New(tx).GetCertificateEnvelope(ctx, certificatedb.GetCertificateEnvelopeParams{
+		ID:       cid,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return signable{}, ErrCertificateNotFound
+	}
+	if err != nil {
+		return signable{}, database.WrapInfra(err)
+	}
+	return envelopeRowToSignable(row), nil
+}
+
+// RecordSigning writes the audit row in-tx. RETURNING always yields a row, so any
+// error here is infra.
+func (r *pgRepository) RecordSigning(ctx context.Context, tx database.Tx, tenantID, certificateID, signerUserID string, digest []byte) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	cid, err := uuid.Parse(certificateID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	sid, err := uuid.Parse(signerUserID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+
+	_, err = certificatedb.New(tx).InsertSigningEvent(ctx, certificatedb.InsertSigningEventParams{
+		TenantID:      tid,
+		CertificateID: cid,
+		SignerUserID:  sid,
+		DigestSha256:  digest,
+	})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 // Revoke soft-revokes the certificate in-tx. A no-row RETURNING result (missing,

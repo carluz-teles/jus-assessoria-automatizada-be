@@ -62,6 +62,53 @@ func (q *Queries) GetCertificate(ctx context.Context, arg GetCertificateParams) 
 	return i, err
 }
 
+const getCertificateEnvelope = `-- name: GetCertificateEnvelope :one
+SELECT id, tenant_id, owner_user_id, not_after, revoked_at,
+       ciphertext, nonce, wrapped_dek, kek_ref
+FROM certificate
+WHERE id = $1 AND tenant_id = $2
+`
+
+type GetCertificateEnvelopeParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetCertificateEnvelopeRow struct {
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	OwnerUserID uuid.UUID          `json:"owner_user_id"`
+	NotAfter    pgtype.Timestamptz `json:"not_after"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	Ciphertext  []byte             `json:"ciphertext"`
+	Nonce       []byte             `json:"nonce"`
+	WrappedDek  []byte             `json:"wrapped_dek"`
+	KekRef      string             `json:"kek_ref"`
+}
+
+// Load one certificate's ENVELOPE (the encrypted key material) plus the fields
+// needed to gate signing (not_after, revoked_at), scoped to tenant_id. This is the
+// ONLY query that projects ciphertext/nonce/wrapped_dek — it exists solely for the
+// server-side signing path (POST /v1/certificates/:id/sign), which must decrypt the
+// .pfx to reach the private key. A miss → pgx.ErrNoRows → ErrCertificateNotFound at
+// the mapper. The bytes never leave the backend. $1 = id, $2 = tenant_id.
+func (q *Queries) GetCertificateEnvelope(ctx context.Context, arg GetCertificateEnvelopeParams) (GetCertificateEnvelopeRow, error) {
+	row := q.db.QueryRow(ctx, getCertificateEnvelope, arg.ID, arg.TenantID)
+	var i GetCertificateEnvelopeRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.OwnerUserID,
+		&i.NotAfter,
+		&i.RevokedAt,
+		&i.Ciphertext,
+		&i.Nonce,
+		&i.WrappedDek,
+		&i.KekRef,
+	)
+	return i, err
+}
+
 const insertCertificate = `-- name: InsertCertificate :one
 
 INSERT INTO certificate (
@@ -151,6 +198,41 @@ func (q *Queries) InsertCertificate(ctx context.Context, arg InsertCertificatePa
 		&i.CreatedAt,
 		&i.RevokedAt,
 	)
+	return i, err
+}
+
+const insertSigningEvent = `-- name: InsertSigningEvent :one
+INSERT INTO signing_event (tenant_id, certificate_id, signer_user_id, digest_sha256)
+VALUES ($1, $2, $3, $4)
+RETURNING id, signed_at
+`
+
+type InsertSigningEventParams struct {
+	TenantID      uuid.UUID `json:"tenant_id"`
+	CertificateID uuid.UUID `json:"certificate_id"`
+	SignerUserID  uuid.UUID `json:"signer_user_id"`
+	DigestSha256  []byte    `json:"digest_sha256"`
+}
+
+type InsertSigningEventRow struct {
+	ID       uuid.UUID          `json:"id"`
+	SignedAt pgtype.Timestamptz `json:"signed_at"`
+}
+
+// Record that a certificate signed a digest (audit trail, committed in the SAME tx
+// as the sign so the act and its record land together). Stores the SHA-256 digest
+// only — never the signature, the key, or the password. tenant_id + signer_user_id
+// come from the trusted principal. $1 = tenant_id, $2 = certificate_id,
+// $3 = signer_user_id, $4 = digest_sha256.
+func (q *Queries) InsertSigningEvent(ctx context.Context, arg InsertSigningEventParams) (InsertSigningEventRow, error) {
+	row := q.db.QueryRow(ctx, insertSigningEvent,
+		arg.TenantID,
+		arg.CertificateID,
+		arg.SignerUserID,
+		arg.DigestSha256,
+	)
+	var i InsertSigningEventRow
+	err := row.Scan(&i.ID, &i.SignedAt)
 	return i, err
 }
 
