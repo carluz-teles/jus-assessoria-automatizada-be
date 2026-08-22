@@ -46,7 +46,9 @@ type IntimationView struct {
 }
 
 // ProcessView is the processo context — from court_record — shown in the editor
-// sidebar.
+// sidebar. Plaintiffs/Defendants/ClaimValue feed the "Partes" and "Valor da causa"
+// blocks of the peça's Contexto panel (read directly from party + court_record,
+// no acquisition import — same decision as the court_record columns).
 type ProcessView struct {
 	CaseID        string
 	CourtRecordID string
@@ -56,6 +58,15 @@ type ProcessView struct {
 	Class         string
 	Subject       string
 	JudgingBody   string
+	// ClaimValue is the valor da causa formatted as a decimal string (e.g.
+	// "15000.00"), or "" when court_record.claim_value is NULL. The FE formats it
+	// for display (R$ …).
+	ClaimValue string
+	// Plaintiffs (autor/polo ativo) and Defendants (réu/polo passivo) are the party
+	// names for the case, never nil (empty slice when none). A litisconsórcio yields
+	// multiple names.
+	Plaintiffs []string
+	Defendants []string
 }
 
 // DeadlineView is the prazo context shown in the editor header bar. DaysLeft is
@@ -105,6 +116,9 @@ func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 			Class:         derefString(r.ProcessClass),
 			Subject:       derefString(r.ProcessSubject),
 			JudgingBody:   derefString(r.ProcessJudgingBody),
+			ClaimValue:    numericToString(r.ProcessClaimValue),
+			Plaintiffs:    nonNilStrings(r.ProcessPlaintiffs),
+			Defendants:    nonNilStrings(r.ProcessDefendants),
 		}
 	}
 

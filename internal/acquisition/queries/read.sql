@@ -180,6 +180,22 @@ LIMIT $2;
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        i.recipients, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id, cr.judging_body,
+       -- partes + valor da causa (0060+): alimentam o preview da intimação (autor/réu/
+       -- valor da causa). claim_value é nullable no schema; parties agregadas por polo
+       -- via correlated subquery sobre party (mesma case_id + tenant do court_record).
+       -- Cast ::text[] p/ o sqlc inferir []string; NULL (sem partes) vira nil slice,
+       -- normalizado no mapper. Ordenado por name p/ determinismo.
+       cr.claim_value,
+       (SELECT array_agg(p.name ORDER BY p.name)
+          FROM party p
+         WHERE p.case_id = cr.case_id
+           AND p.tenant_id = cr.tenant_id
+           AND p.role = 'PLAINTIFF')::text[]                                        AS plaintiffs,
+       (SELECT array_agg(p.name ORDER BY p.name)
+          FROM party p
+         WHERE p.case_id = cr.case_id
+           AND p.tenant_id = cr.tenant_id
+           AND p.role = 'DEFENDANT')::text[]                                        AS defendants,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
        i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
        -- responsáveis (0050): nullable pairs — id + name via LEFT JOIN app_user.
