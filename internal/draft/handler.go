@@ -289,14 +289,17 @@ type intimationResponse struct {
 }
 
 type processResponse struct {
-	CaseID        string `json:"case_id"`
-	CourtRecordID string `json:"court_record_id"`
-	CNJNumber     string `json:"cnj_number"`
-	Court         string `json:"court"`
-	Degree        string `json:"degree"`
-	Class         string `json:"class"`
-	Subject       string `json:"subject"`
-	JudgingBody   string `json:"judging_body"`
+	CaseID        string   `json:"case_id"`
+	CourtRecordID string   `json:"court_record_id"`
+	CNJNumber     string   `json:"cnj_number"`
+	Court         string   `json:"court"`
+	Degree        string   `json:"degree"`
+	Class         string   `json:"class"`
+	Subject       string   `json:"subject"`
+	JudgingBody   string   `json:"judging_body"`
+	ClaimValue    string   `json:"claim_value"`
+	Plaintiffs    []string `json:"plaintiffs"`
+	Defendants    []string `json:"defendants"`
 }
 
 type deadlineResponse struct {
@@ -338,6 +341,9 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 			Class:         v.Process.Class,
 			Subject:       v.Process.Subject,
 			JudgingBody:   v.Process.JudgingBody,
+			ClaimValue:    v.Process.ClaimValue,
+			Plaintiffs:    v.Process.Plaintiffs,
+			Defendants:    v.Process.Defendants,
 		}
 	}
 

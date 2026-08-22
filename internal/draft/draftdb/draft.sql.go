@@ -357,6 +357,22 @@ SELECT
     cr.class        AS process_class,
     cr.subject      AS process_subject,
     cr.judging_body AS process_judging_body,
+    cr.claim_value  AS process_claim_value,
+    -- partes (autor/réu) do processo, agregadas por polo. Correlated subqueries
+    -- sobre party (mesma case_id + tenant do court_record) — o slice lê party
+    -- direto, sem importar acquisition (mesmo padrão do JOIN em court_record).
+    -- Cast ::text[] para o sqlc inferir []string; NULL (nenhuma parte) vira nil
+    -- slice, que o mapper normaliza para []string{} vazio. Ordenado por name.
+    (SELECT array_agg(p.name ORDER BY p.name)
+       FROM party p
+      WHERE p.case_id = cr.case_id
+        AND p.tenant_id = cr.tenant_id
+        AND p.role = 'PLAINTIFF')::text[] AS process_plaintiffs,
+    (SELECT array_agg(p.name ORDER BY p.name)
+       FROM party p
+      WHERE p.case_id = cr.case_id
+        AND p.tenant_id = cr.tenant_id
+        AND p.role = 'DEFENDANT')::text[] AS process_defendants,
 
     -- deadline fields (NULL when no intimation or no deadline derived yet)
     dl.id           AS deadline_id,
@@ -396,6 +412,9 @@ type GetDraftDetailRow struct {
 	ProcessClass              *string            `json:"process_class"`
 	ProcessSubject            *string            `json:"process_subject"`
 	ProcessJudgingBody        *string            `json:"process_judging_body"`
+	ProcessClaimValue         pgtype.Numeric     `json:"process_claim_value"`
+	ProcessPlaintiffs         []string           `json:"process_plaintiffs"`
+	ProcessDefendants         []string           `json:"process_defendants"`
 	DeadlineID                pgtype.UUID        `json:"deadline_id"`
 	DeadlineEndDate           pgtype.Date        `json:"deadline_end_date"`
 	DeadlineStatus            *string            `json:"deadline_status"`
@@ -432,6 +451,9 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.ProcessClass,
 		&i.ProcessSubject,
 		&i.ProcessJudgingBody,
+		&i.ProcessClaimValue,
+		&i.ProcessPlaintiffs,
+		&i.ProcessDefendants,
 		&i.DeadlineID,
 		&i.DeadlineEndDate,
 		&i.DeadlineStatus,
