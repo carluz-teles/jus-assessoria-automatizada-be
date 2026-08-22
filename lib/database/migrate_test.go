@@ -244,8 +244,13 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(54); err != nil || next != 55 {
 		t.Fatalf("Next(54) = (%d, %v), want (55, nil)", next, err)
 	}
-	if _, err := src.Next(55); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(55) error = %v, want fs.ErrNotExist", err)
+	// 0056–0059 are skipped: the certificate slice jumped to 0060 to avoid
+	// colliding with the task slice's 0053–0055. golang-migrate sorts numerically.
+	if next, err := src.Next(55); err != nil || next != 60 {
+		t.Fatalf("Next(55) = (%d, %v), want (60, nil)", next, err)
+	}
+	if _, err := src.Next(60); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(60) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

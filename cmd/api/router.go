@@ -8,6 +8,7 @@ import (
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
+	"github.com/jusassessoria/platform/internal/certificate"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -48,6 +49,7 @@ type routerDeps struct {
 	document             *document.Handler
 	draft                *draft.Handler
 	lookup               *lookup.Handler
+	certificate          *certificate.Handler
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -193,6 +195,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// others so the router test fixture builds without a registry.
 	if deps.lookup != nil {
 		deps.lookup.Register(v1)
+	}
+
+	// certificate owns its authenticated /v1/certificates routes (secure upload,
+	// preview, list, revoke) and mounts them via Register — the api only composes.
+	// Nil-guarded so the router test fixture builds without a use case, and so a boot
+	// with no vault configured (no CERT_KEK / AWS_KMS_KEY_ID) leaves the slice unmounted.
+	if deps.certificate != nil {
+		deps.certificate.Register(v1)
 	}
 
 	return app
