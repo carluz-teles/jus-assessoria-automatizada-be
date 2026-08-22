@@ -66,6 +66,25 @@ type CaseLink struct {
 	ConfirmedAt       pgtype.Timestamptz `json:"confirmed_at"`
 }
 
+type Certificate struct {
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	OwnerUserID uuid.UUID          `json:"owner_user_id"`
+	SubjectCn   string             `json:"subject_cn"`
+	Oab         *string            `json:"oab"`
+	Issuer      string             `json:"issuer"`
+	Serial      string             `json:"serial"`
+	NotBefore   pgtype.Timestamptz `json:"not_before"`
+	NotAfter    pgtype.Timestamptz `json:"not_after"`
+	Fingerprint string             `json:"fingerprint"`
+	Ciphertext  []byte             `json:"ciphertext"`
+	Nonce       []byte             `json:"nonce"`
+	WrappedDek  []byte             `json:"wrapped_dek"`
+	KekRef      string             `json:"kek_ref"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type ChatMessage struct {
 	ID           uuid.UUID          `json:"id"`
 	DraftID      uuid.UUID          `json:"draft_id"`

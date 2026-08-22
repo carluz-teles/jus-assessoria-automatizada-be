@@ -235,8 +235,14 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(51); err != nil || next != 52 {
 		t.Fatalf("Next(51) = (%d, %v), want (52, nil)", next, err)
 	}
-	if _, err := src.Next(52); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(52) error = %v, want fs.ErrNotExist", err)
+	// 0053–0055 are reserved for another front (not present yet); the certificate
+	// slice's migration deliberately jumps to 0060 to avoid colliding with them.
+	// golang-migrate sorts numerically, so 52's next is the 0060 tail.
+	if next, err := src.Next(52); err != nil || next != 60 {
+		t.Fatalf("Next(52) = (%d, %v), want (60, nil)", next, err)
+	}
+	if _, err := src.Next(60); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(60) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

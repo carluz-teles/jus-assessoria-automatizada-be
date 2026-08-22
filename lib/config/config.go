@@ -205,6 +205,20 @@ type Config struct {
 	// partir de time.Now()). Espelha o cron da captura diária do scheduler quando ops
 	// quiser mostrá-lo; um valor mal-formado é tratado como vazio no ponto de uso.
 	CaptureDailyTime string `env:"CAPTURE_DAILY_TIME"`
+
+	// Certificado digital A1 (slice certificate) — cofre de chave (envelope
+	// encryption). NÃO são globalmente `required`: o slice valida na sua própria
+	// construção (lazy), então os demais binários sobem sem eles. Seleção do cofre:
+	// AWS_KMS_KEY_ID setado → cofre KMS (prod); senão CERT_KEK → cofre local (dev);
+	// nenhum dos dois → o slice fica desmontado (sem endpoint de certificado).
+	//
+	// CERT_KEK é uma KEK AES-256 em base64 (32 bytes decodificados) — segredo, só
+	// por env. AWS_KMS_KEY_ID é o id/ARN da CMK; a região do KMS reusa S3Region
+	// quando CERT_KMS_REGION é vazio, e as credenciais reusam S3AccessKey/S3SecretKey
+	// (mesmo provider AWS/R2 já configurado) quando não há credencial dedicada.
+	CertKEK       string `env:"CERT_KEK"`
+	AWSKMSKeyID   string `env:"AWS_KMS_KEY_ID"`
+	CertKMSRegion string `env:"CERT_KMS_REGION"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do
@@ -259,4 +273,41 @@ func (c Config) S3Enabled() bool {
 		c.S3Region != "" &&
 		c.S3AccessKey != "" &&
 		c.S3SecretKey != ""
+}
+
+// Modo do cofre do certificado A1 (slice certificate).
+const (
+	// CertVaultKMS — cofre KMS (produção): AWS_KMS_KEY_ID setado.
+	CertVaultKMS = "kms"
+	// CertVaultLocal — cofre local (dev): sem KMS, mas CERT_KEK presente.
+	CertVaultLocal = "local"
+	// CertVaultDisabled — nenhum cofre configurado: o slice fica desmontado.
+	CertVaultDisabled = "disabled"
+)
+
+// CertificateVaultMode seleciona o cofre do slice de certificado a partir do
+// ambiente, sem tocar em nada globalmente `required`: KMS vence quando
+// AWS_KMS_KEY_ID está setado (prod); senão CERT_KEK habilita o cofre local (dev);
+// se nenhum dos dois estiver presente o slice não é montado (o api sobe sem o
+// endpoint de certificado, como faz com S3). A validação profunda (KEK base64 de
+// 32 bytes, região do KMS) acontece na construção do cofre, não aqui.
+func (c Config) CertificateVaultMode() string {
+	switch {
+	case c.AWSKMSKeyID != "":
+		return CertVaultKMS
+	case c.CertKEK != "":
+		return CertVaultLocal
+	default:
+		return CertVaultDisabled
+	}
+}
+
+// CertificateKMSRegion resolve a região do KMS: CERT_KMS_REGION quando setada,
+// senão S3Region (o mesmo provider AWS/R2 já configurado). Vazia deixa a
+// construção do cofre KMS falhar com um erro tipado — melhor do que adivinhar.
+func (c Config) CertificateKMSRegion() string {
+	if c.CertKMSRegion != "" {
+		return c.CertKMSRegion
+	}
+	return c.S3Region
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/billing"
+	"github.com/jusassessoria/platform/internal/certificate"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -37,6 +38,7 @@ import (
 	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/storage"
 	"github.com/jusassessoria/platform/lib/telemetry"
+	"github.com/jusassessoria/platform/lib/vault"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
 
@@ -391,6 +393,41 @@ func run(logger *slog.Logger) error {
 	})
 	draftHandler = draftHandler.WithReviewer(reviewUC)
 
+	// Certificate (Frente D — certificado digital A1): the secure vault + CRUD for
+	// a tenant's .pfx/.p12. The vault is selected LAZILY here (never a global
+	// `required`, so the other binaries boot unaffected): AWS_KMS_KEY_ID → KMS
+	// (prod); else CERT_KEK → local (dev); else the slice stays unmounted
+	// (certificateHandler nil → the router nil-guard skips it), exactly like S3.
+	// A misconfigured vault (bad KEK, missing KMS region) fails fast at boot.
+	var certificateHandler *certificate.Handler
+	switch cfg.CertificateVaultMode() {
+	case config.CertVaultKMS:
+		certVault, err := vault.NewKMSVault(vault.KMSOptions{
+			KeyID:     cfg.AWSKMSKeyID,
+			Region:    cfg.CertificateKMSRegion(),
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+		})
+		if err != nil {
+			return fmt.Errorf("init certificate kms vault: %w", err)
+		}
+		logger.Info("certificate vault configured", "mode", config.CertVaultKMS)
+		certificateHandler = certificate.NewHandler(
+			certificate.NewUseCase(certificate.NewRepository(), certVault, events.NewOutbox(), uow),
+		)
+	case config.CertVaultLocal:
+		certVault, err := vault.NewLocalVault(cfg.CertKEK)
+		if err != nil {
+			return fmt.Errorf("init certificate local vault: %w", err)
+		}
+		logger.Info("certificate vault configured", "mode", config.CertVaultLocal)
+		certificateHandler = certificate.NewHandler(
+			certificate.NewUseCase(certificate.NewRepository(), certVault, events.NewOutbox(), uow),
+		)
+	default:
+		logger.Info("certificate slice disabled", "reason", "no CERT_KEK or AWS_KMS_KEY_ID")
+	}
+
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,
@@ -408,6 +445,7 @@ func run(logger *slog.Logger) error {
 		document:             documentHandler,
 		draft:                draftHandler,
 		lookup:               lookupHandler,
+		certificate:          certificateHandler,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext
