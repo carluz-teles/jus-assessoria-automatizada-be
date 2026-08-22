@@ -146,10 +146,10 @@ RETURNING id, court_record_id;
 -- the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
 INSERT INTO task (
     tenant_id, court_record_id, deadline_id, intimation_id,
-    title, description, kind, due_date, status, source, assignee_user_id, created_by
+    title, description, kind, priority, due_date, status, source, assignee_user_id, created_by
 ) VALUES (
     $1, $2, $3, $4,
-    $5, $6, $7, $8, $9, $10, $11, $12
+    $5, $6, $7, $8, $9, $10, $11, $12, $13
 )
 RETURNING id;
 
@@ -162,7 +162,7 @@ RETURNING id;
 -- caller even though PATCH never changes it (edit is orthogonal to the lifecycle). deadline_id
 -- is carried so the edit can enforce ERD §4's due_date ≤ end_date invariant when it touches
 -- the task's own date.
-SELECT id, status, title, description, kind, due_date, assignee_user_id, deadline_id
+SELECT id, status, title, description, kind, priority, due_date, assignee_user_id, deadline_id
 FROM task
 WHERE id = $1 AND tenant_id = $2;
 
@@ -178,11 +178,12 @@ UPDATE task
 SET title            = $3,
     description      = $4,
     kind             = $5,
-    due_date         = $6,
-    assignee_user_id = $7
+    priority         = $6,
+    due_date         = $7,
+    assignee_user_id = $8
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, tenant_id, court_record_id, deadline_id, intimation_id,
-          title, description, kind, due_date, status, source, assignee_user_id,
+          title, description, kind, priority, due_date, status, source, assignee_user_id,
           created_by, completed_at;
 
 -- name: GetTaskForTransition :one
@@ -286,6 +287,35 @@ RETURNING id, task_id, title, position, done, done_at, created_at;
 -- $2 = task_id, $3 = tenant_id.
 DELETE FROM task_item
 WHERE id = $1 AND task_id = $2 AND tenant_id = $3
+RETURNING id;
+
+-- ── task_comment write path (discussion thread, §4/§10) ──────────────────────
+-- The Tarefa detail's Comentários tab: a task grows N free-text comments. The write is keyed
+-- by the parent task and scoped to tenant_id (barrier 1, on top of RLS barrier 2). The parent-
+-- task guard (TaskExistsInTenant, reused) turns a foreign/unknown task_id into a typed 404
+-- BEFORE the insert, so a comment can never be grafted onto another tenant's task.
+
+-- name: InsertTaskComment :one
+-- Append one comment to a task's thread (POST /v1/tasks/:id/comments). tenant_id/task_id come
+-- from the request context + the guarded parent; author_user_id is the verified principal (never
+-- the body). Returns the whole row so the handler renders it without a re-read. $1 = tenant_id,
+-- $2 = task_id, $3 = author_user_id, $4 = body.
+INSERT INTO task_comment (tenant_id, task_id, author_user_id, body)
+VALUES ($1, $2, $3, $4)
+RETURNING id, task_id, author_user_id, body, created_at;
+
+-- ── task_activity write path (audit log, §4/§10) ─────────────────────────────
+-- The Tarefa detail's Atividade tab: every meaningful mutation appends ONE row here, IN THE SAME
+-- tx as the mutation. tenant_id/task_id are the mutated task; actor_user_id is the verified
+-- principal; event_type is the closed set (entity.go). from_value/to_value carry a field change's
+-- before/after (NULL for create/lifecycle/comment).
+
+-- name: InsertTaskActivity :one
+-- Append one audit-log row. $1 = tenant_id, $2 = task_id, $3 = actor_user_id, $4 = event_type,
+-- $5 = from_value (nullable), $6 = to_value (nullable). Returns the id (the caller does not need
+-- the row back — the Atividade tab re-reads the whole log).
+INSERT INTO task_activity (tenant_id, task_id, actor_user_id, event_type, from_value, to_value)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING id;
 
 -- name: GetDeadlineForAdjust :one

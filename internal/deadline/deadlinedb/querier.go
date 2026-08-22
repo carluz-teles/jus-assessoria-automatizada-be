@@ -218,6 +218,25 @@ type Querier interface {
 	// (the prazo's context); assignee_user_id/due_date/description/kind are optional. Returns
 	// the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
 	InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UUID, error)
+	// ── task_activity write path (audit log, §4/§10) ─────────────────────────────
+	// The Tarefa detail's Atividade tab: every meaningful mutation appends ONE row here, IN THE SAME
+	// tx as the mutation. tenant_id/task_id are the mutated task; actor_user_id is the verified
+	// principal; event_type is the closed set (entity.go). from_value/to_value carry a field change's
+	// before/after (NULL for create/lifecycle/comment).
+	// Append one audit-log row. $1 = tenant_id, $2 = task_id, $3 = actor_user_id, $4 = event_type,
+	// $5 = from_value (nullable), $6 = to_value (nullable). Returns the id (the caller does not need
+	// the row back — the Atividade tab re-reads the whole log).
+	InsertTaskActivity(ctx context.Context, arg InsertTaskActivityParams) (uuid.UUID, error)
+	// ── task_comment write path (discussion thread, §4/§10) ──────────────────────
+	// The Tarefa detail's Comentários tab: a task grows N free-text comments. The write is keyed
+	// by the parent task and scoped to tenant_id (barrier 1, on top of RLS barrier 2). The parent-
+	// task guard (TaskExistsInTenant, reused) turns a foreign/unknown task_id into a typed 404
+	// BEFORE the insert, so a comment can never be grafted onto another tenant's task.
+	// Append one comment to a task's thread (POST /v1/tasks/:id/comments). tenant_id/task_id come
+	// from the request context + the guarded parent; author_user_id is the verified principal (never
+	// the body). Returns the whole row so the handler renders it without a re-read. $1 = tenant_id,
+	// $2 = task_id, $3 = author_user_id, $4 = body.
+	InsertTaskComment(ctx context.Context, arg InsertTaskCommentParams) (InsertTaskCommentRow, error)
 	// Append one checklist item to a task (POST /v1/tasks/:id/items). Born done=false (the
 	// default), done_at NULL. tenant_id/task_id come from the request context + the guarded
 	// parent; position is the computed append slot. Returns the whole row so the handler renders
@@ -281,6 +300,10 @@ type Querier interface {
 	// empty slice (a record with no reconcilable prazo), never an error. $1 = court_record_id,
 	// $2 = tenant_id, both from the trusted event payload.
 	ListReconcilableDeadlines(ctx context.Context, arg ListReconcilableDeadlinesParams) ([]ListReconcilableDeadlinesRow, error)
+	// One task's audit log, NEWEST-first (the detail view reads most-recent-first). $1 = task_id, $2 =
+	// tenant_id. An empty log is 0 rows (never an error). The actor is resolved to a name for display;
+	// from_value/to_value are the field change's before/after (NULL for create/lifecycle/comment).
+	ListTaskActivity(ctx context.Context, arg ListTaskActivityParams) ([]ListTaskActivityRow, error)
 	// Selectable ?assignee values for the task agenda ("meus prazos"): the distinct
 	// responsáveis of the tenant's tasks, deduped by id, ordered by name (case-insensitive).
 	// The LEFT JOIN app_user resolves a name when the id is a known user (the column is a bare
@@ -288,6 +311,15 @@ type Querier interface {
 	// Same DISTINCT-inner / ORDER BY-outer shape as ListPrazoKinds (Postgres rejects a bare
 	// DISTINCT with ORDER BY on an expression outside the select list).
 	ListTaskAssignees(ctx context.Context, tenantID uuid.UUID) ([]ListTaskAssigneesRow, error)
+	// ── task detail: comments + activity (GET /v1/tasks/:id/comments|activity) ────
+	// The Tarefa detail's Comentários and Atividade tabs. Both resolve the writer/actor to a name
+	// via LEFT JOIN app_user (the *_user_id columns are bare uuids with no FK, like assignee_user_id)
+	// so the FE renders "Fulano" not a uuid; an unknown id yields "" (the FE labels it). Both are
+	// scoped to (task_id, tenant_id) (barrier 1, on top of RLS barrier 2).
+	// One task's discussion thread, OLDEST-first (the detail view reads top-to-bottom). $1 = task_id,
+	// $2 = tenant_id. An empty thread is 0 rows (never an error). The comment's author is resolved to
+	// a name for display.
+	ListTaskComments(ctx context.Context, arg ListTaskCommentsParams) ([]ListTaskCommentsRow, error)
 	// One task's checklist, ordered by position (the detail view). Scoped to (task_id, tenant_id)
 	// (barrier 1). An empty checklist is 0 rows (not an error). $1 = task_id, $2 = tenant_id.
 	ListTaskItems(ctx context.Context, arg ListTaskItemsParams) ([]ListTaskItemsRow, error)

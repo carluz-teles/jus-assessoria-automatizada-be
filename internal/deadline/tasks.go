@@ -31,6 +31,7 @@ type CreateTaskCommand struct {
 	Title          string
 	Description    string
 	Kind           string
+	Priority       string
 	DueDate        *time.Time
 	AssigneeUserID string
 }
@@ -43,10 +44,12 @@ type CreateTaskCommand struct {
 // it) — the two must not collapse. The edit never touches status/source/created_by.
 type UpdateTaskCommand struct {
 	TenantID       string
+	UserID         string // the actor recorded on each per-field task_activity row (from the principal)
 	TaskID         string
 	Title          *string
 	Description    *string
 	Kind           *string
+	Priority       *string
 	DueDate        *string
 	AssigneeUserID *string
 }
@@ -62,6 +65,7 @@ type TaskForUpdate struct {
 	Title          string
 	Description    string
 	Kind           string
+	Priority       string
 	DueDate        *time.Time
 	AssigneeUserID string
 	DeadlineID     string
@@ -76,8 +80,47 @@ type UpdateTaskParams struct {
 	Title          string
 	Description    string
 	Kind           string
+	Priority       string
 	DueDate        *time.Time
 	AssigneeUserID string
+}
+
+// recordTaskEdits appends ONE task_activity row per editable field whose value actually changed
+// between the stored task (cur) and the saved one, in the caller's tx. A no-op field (patched to
+// its current value, or absent) records nothing — the audit log is the log of real changes. The
+// from/to are the human-readable before/after the detail's Atividade tab renders (a date is
+// rendered YYYY-MM-DD, an empty value renders "").
+func (uc *UseCase) recordTaskEdits(ctx context.Context, tx database.Tx, tenantID, taskID, actorID string, cur *TaskForUpdate, saved *Task) error {
+	edits := []struct {
+		event    ActivityEventType
+		from, to string
+	}{
+		{ActivityTitleChanged, cur.Title, saved.Title},
+		{ActivityDescriptionChanged, cur.Description, saved.Description},
+		{ActivityKindChanged, cur.Kind, saved.Kind},
+		{ActivityPriorityChanged, cur.Priority, saved.Priority},
+		{ActivityDueDateChanged, wireDate(cur.DueDate), wireDate(saved.DueDate)},
+		{ActivityAssigneeChanged, cur.AssigneeUserID, saved.AssigneeUserID},
+	}
+	for _, e := range edits {
+		if e.from == e.to {
+			continue
+		}
+		from, to := textToNull(e.from), textToNull(e.to)
+		if err := uc.recordActivity(ctx, tx, tenantID, taskID, actorID, e.event, from, to); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// wireDate renders an optional date as the YYYY-MM-DD the activity log stores (empty for a NULL
+// date), so a due_date change reads "de 2026-01-10 para 2026-01-15" (or "" when cleared/set).
+func wireDate(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.Format(time.DateOnly)
 }
 
 // TaskTransition is the outcome of a manual transition (done/dismiss): the task id and its new
@@ -107,6 +150,7 @@ func (uc *UseCase) CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task
 			Title:          cmd.Title,
 			Description:    cmd.Description,
 			Kind:           cmd.Kind,
+			Priority:       cmd.Priority,
 			DueDate:        cmd.DueDate,
 			Status:         TaskStatusOpen,
 			Source:         SourceManual,
@@ -117,6 +161,11 @@ func (uc *UseCase) CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task
 			return err
 		}
 		if err := uc.outbox.Publish(ctx, tx, newTaskCreatedFromTask(saved)); err != nil {
+			return err
+		}
+		// TASK_CREATED activity, same tx as the write (the audit log never diverges from the
+		// task's real history). from/to are NULL — a create is not a field change.
+		if err := uc.recordActivity(ctx, tx, saved.TenantID, saved.ID, cmd.UserID, ActivityTaskCreated, nil, nil); err != nil {
 			return err
 		}
 		created = saved
@@ -157,6 +206,10 @@ func (uc *UseCase) UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task
 		if cmd.Kind != nil {
 			kind = *cmd.Kind
 		}
+		priority := cur.Priority
+		if cmd.Priority != nil {
+			priority = *cmd.Priority
+		}
 		assignee := cur.AssigneeUserID
 		if cmd.AssigneeUserID != nil {
 			assignee = *cmd.AssigneeUserID
@@ -176,6 +229,7 @@ func (uc *UseCase) UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task
 			Title:          title,
 			Description:    description,
 			Kind:           kind,
+			Priority:       priority,
 			DueDate:        dueDate,
 			AssigneeUserID: assignee,
 		})
@@ -183,6 +237,13 @@ func (uc *UseCase) UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task
 			return err
 		}
 		if err := uc.outbox.Publish(ctx, tx, newTaskUpdated(saved.ID)); err != nil {
+			return err
+		}
+		// One task_activity row per field that actually CHANGED (de X → para Y), in the same tx.
+		// A patch that sets a field to its current value records nothing (the audit log is the log
+		// of real changes, not of submitted fields). The from/to are the human-readable before/
+		// after the detail's Atividade tab renders.
+		if err := uc.recordTaskEdits(ctx, tx, cmd.TenantID, saved.ID, cmd.UserID, cur, saved); err != nil {
 			return err
 		}
 		updated = saved
@@ -197,15 +258,15 @@ func (uc *UseCase) UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task
 // MarkTaskDone is the manual "concluir tarefa" (docs/erd-prazos.md §9, POST /v1/tasks/:id/done):
 // OPEN→DONE in ONE tenant-scoped tx, stamping completed_at and emitting task.completed. It is
 // the positive counterpart of DismissTask and shares its shape.
-func (uc *UseCase) MarkTaskDone(ctx context.Context, tenantID, taskID string) (TaskTransition, error) {
-	return uc.markTaskStatus(ctx, tenantID, taskID, TaskStatusDone)
+func (uc *UseCase) MarkTaskDone(ctx context.Context, tenantID, userID, taskID string) (TaskTransition, error) {
+	return uc.markTaskStatus(ctx, tenantID, userID, taskID, TaskStatusDone)
 }
 
 // DismissTask is the manual "dispensar tarefa" (docs/erd-prazos.md §9, POST /v1/tasks/:id/dismiss):
 // OPEN→DISMISSED in ONE tenant-scoped tx, emitting task.dismissed. completed_at is left NULL —
 // dispensar is not a completion, so only DONE stamps it.
-func (uc *UseCase) DismissTask(ctx context.Context, tenantID, taskID string) (TaskTransition, error) {
-	return uc.markTaskStatus(ctx, tenantID, taskID, TaskStatusDismissed)
+func (uc *UseCase) DismissTask(ctx context.Context, tenantID, userID, taskID string) (TaskTransition, error) {
+	return uc.markTaskStatus(ctx, tenantID, userID, taskID, TaskStatusDismissed)
 }
 
 // markTaskStatus is the shared manual-transition path behind MarkTaskDone/DismissTask: both flip
@@ -219,7 +280,7 @@ func (uc *UseCase) DismissTask(ctx context.Context, tenantID, taskID string) (Ta
 //  4. emit the target's immediate fact (task.completed / task.dismissed) in the SAME tx.
 //
 // TenantID comes from the verified principal and scopes the tx's RLS (barrier 1 + 2).
-func (uc *UseCase) markTaskStatus(ctx context.Context, tenantID, taskID string, target TaskStatus) (TaskTransition, error) {
+func (uc *UseCase) markTaskStatus(ctx context.Context, tenantID, userID, taskID string, target TaskStatus) (TaskTransition, error) {
 	var result TaskTransition
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		status, err := uc.repo.GetTaskForTransition(ctx, tx, taskID, tenantID)
@@ -245,6 +306,11 @@ func (uc *UseCase) markTaskStatus(ctx context.Context, tenantID, taskID string, 
 		if err := uc.outbox.Publish(ctx, tx, newTaskTransitionEvent(target, id)); err != nil {
 			return err
 		}
+		// TASK_DONE / TASK_DISMISSED activity, same tx as the flip. from/to are NULL — a lifecycle
+		// transition is not a field change.
+		if err := uc.recordActivity(ctx, tx, tenantID, id, userID, transitionActivity(target), nil, nil); err != nil {
+			return err
+		}
 		result = TaskTransition{ID: id, Status: target}
 		return nil
 	})
@@ -262,6 +328,16 @@ func newTaskTransitionEvent(target TaskStatus, taskID string) events.Event {
 		return newTaskCompleted(taskID)
 	}
 	return newTaskDismissed(taskID)
+}
+
+// transitionActivity picks the activity event for a manual task transition: TASK_DONE for DONE,
+// TASK_DISMISSED for DISMISSED. Mirrors newTaskTransitionEvent (only these two targets reach the
+// transition path).
+func transitionActivity(target TaskStatus) ActivityEventType {
+	if target == TaskStatusDone {
+		return ActivityTaskDone
+	}
+	return ActivityTaskDismissed
 }
 
 // validateTaskDueDate enforces ERD §4's task invariant: a task linked to a prazo (DeadlineID)

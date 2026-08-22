@@ -135,6 +135,13 @@ type mockRepo struct {
 	updateItemErr    error
 	deleteItemErr    error
 
+	// task_comment + task_activity write path (0054/0055)
+	ensureTaskExistsErr error
+	insertedComment     *TaskComment
+	insertCommentErr    error
+	insertedActivities  []*TaskActivity
+	insertActivityErr   error
+
 	// captured inputs
 	gotClassTenantID         string
 	gotClassRecordID         string
@@ -485,6 +492,34 @@ func (m *mockRepo) EnsureTaskInTenant(_ context.Context, _ database.Tx, taskID, 
 	m.gotEnsureTaskID = taskID
 	m.gotEnsureTenantID = tenantID
 	return m.ensureTaskErr
+}
+
+// EnsureTaskExistsInTenant is the comment-create parent guard; returns the configured error.
+func (m *mockRepo) EnsureTaskExistsInTenant(_ context.Context, _ database.Tx, _, _ string) error {
+	return m.ensureTaskExistsErr
+}
+
+// InsertTaskComment records the inserted comment and echoes it back with an id + created_at.
+func (m *mockRepo) InsertTaskComment(_ context.Context, _ database.Tx, c *TaskComment) (*TaskComment, error) {
+	if m.insertCommentErr != nil {
+		return nil, m.insertCommentErr
+	}
+	if m.insertedComment != nil {
+		return m.insertedComment, nil
+	}
+	saved := *c
+	saved.ID = uuid.NewString()
+	saved.CreatedAt = time.Now()
+	return &saved, nil
+}
+
+// InsertTaskActivity records every appended audit-log row so a test can assert the events written.
+func (m *mockRepo) InsertTaskActivity(_ context.Context, _ database.Tx, a *TaskActivity) error {
+	if m.insertActivityErr != nil {
+		return m.insertActivityErr
+	}
+	m.insertedActivities = append(m.insertedActivities, a)
+	return nil
 }
 
 // NextTaskItemPosition returns the configured append slot, recording the task it was asked for.

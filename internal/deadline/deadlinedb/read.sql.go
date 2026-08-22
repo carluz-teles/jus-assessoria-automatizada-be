@@ -361,7 +361,7 @@ func (q *Queries) GetPrazosSummary(ctx context.Context, tenantID uuid.UUID) (Get
 
 const getTaskDetail = `-- name: GetTaskDetail :one
 
-SELECT t.id, t.title, t.description, t.kind, t.due_date,
+SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at
 FROM task t
@@ -378,6 +378,7 @@ type GetTaskDetailRow struct {
 	Title          string             `json:"title"`
 	Description    *string            `json:"description"`
 	Kind           *string            `json:"kind"`
+	Priority       *string            `json:"priority"`
 	DueDate        pgtype.Date        `json:"due_date"`
 	Status         string             `json:"status"`
 	Source         string             `json:"source"`
@@ -405,6 +406,7 @@ func (q *Queries) GetTaskDetail(ctx context.Context, arg GetTaskDetailParams) (G
 		&i.Title,
 		&i.Description,
 		&i.Kind,
+		&i.Priority,
 		&i.DueDate,
 		&i.Status,
 		&i.Source,
@@ -833,6 +835,61 @@ func (q *Queries) ListPrazosByProcesso(ctx context.Context, arg ListPrazosByProc
 	return items, nil
 }
 
+const listTaskActivity = `-- name: ListTaskActivity :many
+SELECT a.id, a.actor_user_id, COALESCE(au.name, '')::text AS actor_name,
+       a.event_type, a.from_value, a.to_value, a.created_at
+FROM task_activity a
+LEFT JOIN app_user au ON au.id = a.actor_user_id
+WHERE a.task_id = $1::uuid AND a.tenant_id = $2::uuid
+ORDER BY a.created_at DESC, a.id DESC
+`
+
+type ListTaskActivityParams struct {
+	TaskID   uuid.UUID `json:"task_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type ListTaskActivityRow struct {
+	ID          uuid.UUID          `json:"id"`
+	ActorUserID uuid.UUID          `json:"actor_user_id"`
+	ActorName   string             `json:"actor_name"`
+	EventType   string             `json:"event_type"`
+	FromValue   *string            `json:"from_value"`
+	ToValue     *string            `json:"to_value"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+// One task's audit log, NEWEST-first (the detail view reads most-recent-first). $1 = task_id, $2 =
+// tenant_id. An empty log is 0 rows (never an error). The actor is resolved to a name for display;
+// from_value/to_value are the field change's before/after (NULL for create/lifecycle/comment).
+func (q *Queries) ListTaskActivity(ctx context.Context, arg ListTaskActivityParams) ([]ListTaskActivityRow, error) {
+	rows, err := q.db.Query(ctx, listTaskActivity, arg.TaskID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTaskActivityRow
+	for rows.Next() {
+		var i ListTaskActivityRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ActorUserID,
+			&i.ActorName,
+			&i.EventType,
+			&i.FromValue,
+			&i.ToValue,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTaskAssignees = `-- name: ListTaskAssignees :many
 SELECT assignee_user_id, name
 FROM (
@@ -866,6 +923,62 @@ func (q *Queries) ListTaskAssignees(ctx context.Context, tenantID uuid.UUID) ([]
 	for rows.Next() {
 		var i ListTaskAssigneesRow
 		if err := rows.Scan(&i.AssigneeUserID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTaskComments = `-- name: ListTaskComments :many
+
+SELECT c.id, c.author_user_id, COALESCE(au.name, '')::text AS author_name, c.body, c.created_at
+FROM task_comment c
+LEFT JOIN app_user au ON au.id = c.author_user_id
+WHERE c.task_id = $1::uuid AND c.tenant_id = $2::uuid
+ORDER BY c.created_at ASC, c.id ASC
+`
+
+type ListTaskCommentsParams struct {
+	TaskID   uuid.UUID `json:"task_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type ListTaskCommentsRow struct {
+	ID           uuid.UUID          `json:"id"`
+	AuthorUserID uuid.UUID          `json:"author_user_id"`
+	AuthorName   string             `json:"author_name"`
+	Body         string             `json:"body"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// ── task detail: comments + activity (GET /v1/tasks/:id/comments|activity) ────
+// The Tarefa detail's Comentários and Atividade tabs. Both resolve the writer/actor to a name
+// via LEFT JOIN app_user (the *_user_id columns are bare uuids with no FK, like assignee_user_id)
+// so the FE renders "Fulano" not a uuid; an unknown id yields "" (the FE labels it). Both are
+// scoped to (task_id, tenant_id) (barrier 1, on top of RLS barrier 2).
+// One task's discussion thread, OLDEST-first (the detail view reads top-to-bottom). $1 = task_id,
+// $2 = tenant_id. An empty thread is 0 rows (never an error). The comment's author is resolved to
+// a name for display.
+func (q *Queries) ListTaskComments(ctx context.Context, arg ListTaskCommentsParams) ([]ListTaskCommentsRow, error) {
+	rows, err := q.db.Query(ctx, listTaskComments, arg.TaskID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTaskCommentsRow
+	for rows.Next() {
+		var i ListTaskCommentsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AuthorUserID,
+			&i.AuthorName,
+			&i.Body,
+			&i.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -929,7 +1042,7 @@ func (q *Queries) ListTaskItems(ctx context.Context, arg ListTaskItemsParams) ([
 }
 
 const listTasks = `-- name: ListTasks :many
-SELECT t.id, t.title, t.description, t.kind, t.due_date,
+SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at,
@@ -971,6 +1084,7 @@ type ListTasksRow struct {
 	Title          string             `json:"title"`
 	Description    *string            `json:"description"`
 	Kind           *string            `json:"kind"`
+	Priority       *string            `json:"priority"`
 	DueDate        pgtype.Date        `json:"due_date"`
 	SortDue        pgtype.Date        `json:"sort_due"`
 	Status         string             `json:"status"`
@@ -1016,6 +1130,7 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTas
 			&i.Title,
 			&i.Description,
 			&i.Kind,
+			&i.Priority,
 			&i.DueDate,
 			&i.SortDue,
 			&i.Status,
@@ -1039,7 +1154,7 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTas
 
 const listTasksByProcesso = `-- name: ListTasksByProcesso :many
 
-SELECT t.id, t.title, t.description, t.kind, t.due_date,
+SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at,
@@ -1072,6 +1187,7 @@ type ListTasksByProcessoRow struct {
 	Title          string             `json:"title"`
 	Description    *string            `json:"description"`
 	Kind           *string            `json:"kind"`
+	Priority       *string            `json:"priority"`
 	DueDate        pgtype.Date        `json:"due_date"`
 	SortDue        pgtype.Date        `json:"sort_due"`
 	Status         string             `json:"status"`
@@ -1117,6 +1233,7 @@ func (q *Queries) ListTasksByProcesso(ctx context.Context, arg ListTasksByProces
 			&i.Title,
 			&i.Description,
 			&i.Kind,
+			&i.Priority,
 			&i.DueDate,
 			&i.SortDue,
 			&i.Status,

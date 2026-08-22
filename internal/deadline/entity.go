@@ -155,6 +155,7 @@ type Task struct {
 	DueDate        *time.Time // optional own date (≤ Deadline.EndDate when present)
 	Status         TaskStatus
 	Source         Source
+	Priority       string // the TaskPriority triage flag (HIGH|MEDIUM|LOW); "" = sem prioridade
 	AssigneeUserID string // optional responsável ("meus prazos")
 	CreatedBy      string
 	CompletedAt    *time.Time // stamped when the task is marked DONE; NULL while OPEN/DISMISSED
@@ -201,6 +202,32 @@ func validTaskKind(k string) bool {
 	return false
 }
 
+// TaskPriority is the triage flag a user pins on a task (docs/erd-prazos.md §4/§10, the Tarefa
+// detail's "Prioridade" property) — HIGH|MEDIUM|LOW, or none at all ("sem prioridade" is the
+// default, priority NULL in the DB). Like TaskKind it is text + app validation (validation.go)
+// + a DB CHECK (0053) for the closed non-empty set; the empty string is legal and means unset.
+type TaskPriority string
+
+const (
+	TaskPriorityHigh   TaskPriority = "HIGH"
+	TaskPriorityMedium TaskPriority = "MEDIUM"
+	TaskPriorityLow    TaskPriority = "LOW"
+)
+
+// validTaskPriority reports whether a task priority is acceptable: one of the closed set, or the
+// empty priority ("sem prioridade" — priority is NULL in the DB). Mirrors validTaskKind: any
+// NON-empty value must be one of HIGH|MEDIUM|LOW; "" is a no-op the edge rules accept.
+func validTaskPriority(p string) bool {
+	if p == "" {
+		return true
+	}
+	switch TaskPriority(p) {
+	case TaskPriorityHigh, TaskPriorityMedium, TaskPriorityLow:
+		return true
+	}
+	return false
+}
+
 // TaskItem is one checklist step of a task (docs/erd-prazos.md §4/§10, the Tarefas screen):
 // a small, orderable, tickable subtarefa ("Ler intimação", "Redigir", …). 1 task → N items
 // (task_item, migration 0031, ON DELETE CASCADE). Position orders the checklist; Done is the
@@ -215,6 +242,57 @@ type TaskItem struct {
 	Done      bool
 	DoneAt    *time.Time
 	CreatedAt time.Time
+}
+
+// TaskComment is one message in a task's discussion thread (docs/erd-prazos.md §4/§10, the Tarefa
+// detail's "Comentários" tab). 1 task → N comments (task_comment, migration 0054, ON DELETE
+// CASCADE). AuthorUserID is the internal app_user id of the writer (the verified principal, never
+// the body). CreatedAt orders the thread (oldest-first in the detail view). entity.go holds only
+// the aggregate + value types (no repo/lib import).
+type TaskComment struct {
+	ID           string
+	TenantID     string
+	TaskID       string
+	AuthorUserID string
+	Body         string
+	CreatedAt    time.Time
+}
+
+// ActivityEventType is the closed set of task_activity event kinds (docs/erd-prazos.md §4/§10, the
+// Tarefa detail's "Atividade" tab) — one per meaningful mutation of a task. Like TaskKind/
+// TaskPriority it is text + app validation (the DB column is plain text; the closed set lives
+// here). A field-change event (TITLE_CHANGED, …) carries from/to; a create/lifecycle/comment
+// event leaves them NULL.
+type ActivityEventType string
+
+const (
+	ActivityTaskCreated        ActivityEventType = "TASK_CREATED"
+	ActivityTitleChanged       ActivityEventType = "TITLE_CHANGED"
+	ActivityDescriptionChanged ActivityEventType = "DESCRIPTION_CHANGED"
+	ActivityKindChanged        ActivityEventType = "KIND_CHANGED"
+	ActivityPriorityChanged    ActivityEventType = "PRIORITY_CHANGED"
+	ActivityDueDateChanged     ActivityEventType = "DUE_DATE_CHANGED"
+	ActivityAssigneeChanged    ActivityEventType = "ASSIGNEE_CHANGED"
+	ActivityTaskDone           ActivityEventType = "TASK_DONE"
+	ActivityTaskDismissed      ActivityEventType = "TASK_DISMISSED"
+	ActivityCommented          ActivityEventType = "COMMENTED"
+)
+
+// TaskActivity is one row of a task's audit log (docs/erd-prazos.md §4/§10, the Tarefa detail's
+// "Atividade" tab): a meaningful mutation appended in the SAME tx as the mutation itself. 1 task →
+// N activity rows (task_activity, migration 0055, ON DELETE CASCADE). ActorUserID is the app_user
+// id that caused the event (the verified principal). From/To carry the "de X para Y" a field
+// change renders (both nil/"" for a create/lifecycle/comment). CreatedAt orders the log
+// (newest-first in the detail view).
+type TaskActivity struct {
+	ID          string
+	TenantID    string
+	TaskID      string
+	ActorUserID string
+	EventType   ActivityEventType
+	FromValue   string
+	ToValue     string
+	CreatedAt   time.Time
 }
 
 // TaskProgress is a task's checklist tally — Done ticked of Total items. It feeds both the

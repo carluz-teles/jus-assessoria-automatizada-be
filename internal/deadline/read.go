@@ -126,6 +126,7 @@ type TaskView struct {
 	Title       string     `json:"title"`
 	Description string     `json:"description,omitempty"`
 	Kind        string     `json:"kind,omitempty"`
+	Priority    string     `json:"priority,omitempty"` // HIGH|MEDIUM|LOW; "" = sem prioridade (omitted)
 	DueDate     *time.Time `json:"due_date"`
 	Status      string     `json:"status"`
 	// DisplayStatus is the DERIVED presentation status (Aberta|Em execução|Concluída|Atrasada;
@@ -154,6 +155,7 @@ func newTaskViewFromEntity(t *Task) TaskView {
 		Title:          t.Title,
 		Description:    t.Description,
 		Kind:           t.Kind,
+		Priority:       t.Priority,
 		DueDate:        t.DueDate,
 		Status:         string(t.Status),
 		Source:         string(t.Source),
@@ -303,6 +305,7 @@ type TaskDetailView struct {
 	Title          string         `json:"title"`
 	Description    string         `json:"description,omitempty"`
 	Kind           string         `json:"kind,omitempty"`
+	Priority       string         `json:"priority,omitempty"` // HIGH|MEDIUM|LOW; "" = sem prioridade (omitted)
 	DueDate        *time.Time     `json:"due_date"`
 	Status         string         `json:"status"`
 	DisplayStatus  string         `json:"display_status,omitempty"`
@@ -314,6 +317,32 @@ type TaskDetailView struct {
 	CompletedAt    *time.Time     `json:"completed_at"`
 	Items          []TaskItemView `json:"items"`
 	Progress       TaskProgress   `json:"progress"`
+}
+
+// TaskCommentView is one message in a task's discussion thread (GET /v1/tasks/:id/comments). The
+// author is resolved to a name for display (AuthorName "" when the id is unknown — the FE labels
+// it). AuthorUserID is carried so the FE can render "you"/avatar. CreatedAt orders the thread
+// (oldest-first).
+type TaskCommentView struct {
+	ID           string    `json:"id"`
+	AuthorUserID string    `json:"author_user_id"`
+	AuthorName   string    `json:"author_name,omitempty"`
+	Body         string    `json:"body"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// TaskActivityView is one row of a task's audit log (GET /v1/tasks/:id/activity). EventType is the
+// closed set (TASK_CREATED|TITLE_CHANGED|…); the actor is resolved to a name for display. FromValue/
+// ToValue are the "de X para Y" a field change renders (both "" for a create/lifecycle/comment).
+// CreatedAt orders the log (newest-first).
+type TaskActivityView struct {
+	ID          string    `json:"id"`
+	ActorUserID string    `json:"actor_user_id"`
+	ActorName   string    `json:"actor_name,omitempty"`
+	EventType   string    `json:"event_type"`
+	FromValue   string    `json:"from_value,omitempty"`
+	ToValue     string    `json:"to_value,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // PrazosSummary is the prazos KPI read model (GET /v1/prazos/summary), aggregated per tenant
@@ -370,6 +399,12 @@ type readRepo interface {
 	ListTaskItems(ctx context.Context, tenantID, taskID string) ([]TaskItemView, error)
 	// TaskItemProgress reads a task's {done, total} checklist tally, scoped to (taskID, tenantID).
 	TaskItemProgress(ctx context.Context, tenantID, taskID string) (TaskProgress, error)
+	// ListTaskComments reads a task's discussion thread (oldest-first), scoped to (taskID,
+	// tenantID). An empty thread yields an empty slice, never an error.
+	ListTaskComments(ctx context.Context, tenantID, taskID string) ([]TaskCommentView, error)
+	// ListTaskActivity reads a task's audit log (newest-first), scoped to (taskID, tenantID). An
+	// empty log yields an empty slice, never an error.
+	ListTaskActivity(ctx context.Context, tenantID, taskID string) ([]TaskActivityView, error)
 	// PrazosSummary reads the tenant's prazos KPI counts (single object). No pagination.
 	PrazosSummary(ctx context.Context, tenantID string) (PrazosSummary, error)
 	// TasksSummary reads the tenant's tasks KPI counts (single object). No pagination.
@@ -617,6 +652,40 @@ func (uc *ReadUseCase) TaskDetail(ctx context.Context, tenantID, id string) (Tas
 	view.Progress = progress
 	view.DisplayStatus = string(deriveDisplayStatus(TaskStatus(view.Status), progress, view.DueDate, uc.now()))
 	return view, nil
+}
+
+// TaskComments returns a task's discussion thread (GET /v1/tasks/:id/comments), oldest-first. It
+// guards the task exists in the tenant first (GetTaskDetail → ErrTaskNotFound → 404) so a foreign/
+// unknown id is a miss, not a silently-empty thread. A real task with no comments yields [].
+func (uc *ReadUseCase) TaskComments(ctx context.Context, tenantID, id string) ([]TaskCommentView, error) {
+	if _, err := uc.repo.GetTaskDetail(ctx, tenantID, id); err != nil {
+		return nil, err
+	}
+	comments, err := uc.repo.ListTaskComments(ctx, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if comments == nil {
+		comments = []TaskCommentView{}
+	}
+	return comments, nil
+}
+
+// TaskActivity returns a task's audit log (GET /v1/tasks/:id/activity), newest-first. Like
+// TaskComments it guards the task exists (→ 404 on a miss); a real task with no logged mutation
+// yields [] (a historical task not touched since 0055 simply has no rows yet).
+func (uc *ReadUseCase) TaskActivity(ctx context.Context, tenantID, id string) ([]TaskActivityView, error) {
+	if _, err := uc.repo.GetTaskDetail(ctx, tenantID, id); err != nil {
+		return nil, err
+	}
+	activity, err := uc.repo.ListTaskActivity(ctx, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if activity == nil {
+		activity = []TaskActivityView{}
+	}
+	return activity, nil
 }
 
 // PrazosSummary returns the tenant's prazos KPI counts (GET /v1/prazos/summary) — a single

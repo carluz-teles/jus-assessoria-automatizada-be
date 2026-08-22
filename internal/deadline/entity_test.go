@@ -105,3 +105,29 @@ func TestValidTaskKind(t *testing.T) {
 		})
 	}
 }
+
+// TestValidTaskPriority is the closed-set + "sem prioridade" guard for BE-1: only HIGH|MEDIUM|LOW
+// (exact case) or the empty priority are accepted; the empty string is legal ("sem prioridade" is
+// a first-class state, priority NULL in the DB).
+func TestValidTaskPriority(t *testing.T) {
+	tests := []struct {
+		priority string
+		want     bool
+	}{
+		{"HIGH", true},
+		{"MEDIUM", true},
+		{"LOW", true},
+		{"", true}, // sem prioridade
+		{"high", false},
+		{"URGENT", false},
+		{"HIGH ", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.priority, func(t *testing.T) {
+			t.Parallel()
+			if got := validTaskPriority(tt.priority); got != tt.want {
+				t.Errorf("validTaskPriority(%q) = %v, want %v", tt.priority, got, tt.want)
+			}
+		})
+	}
+}

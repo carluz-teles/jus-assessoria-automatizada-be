@@ -53,6 +53,10 @@ type recordingReadRepo struct {
 	itemsErr       error
 	taskProgress   TaskProgress
 	progressErr    error
+	taskComments   []TaskCommentView
+	commentsErr    error
+	taskActivity   []TaskActivityView
+	activityErr    error
 	prazosSummary  PrazosSummary
 	tasksSummary   TasksSummary
 	lastSummaryTID string
@@ -126,6 +130,14 @@ func (r *recordingReadRepo) ListTaskItems(_ context.Context, _, _ string) ([]Tas
 
 func (r *recordingReadRepo) TaskItemProgress(_ context.Context, _, _ string) (TaskProgress, error) {
 	return r.taskProgress, r.progressErr
+}
+
+func (r *recordingReadRepo) ListTaskComments(_ context.Context, _, _ string) ([]TaskCommentView, error) {
+	return r.taskComments, r.commentsErr
+}
+
+func (r *recordingReadRepo) ListTaskActivity(_ context.Context, _, _ string) ([]TaskActivityView, error) {
+	return r.taskActivity, r.activityErr
 }
 
 func (r *recordingReadRepo) PrazosSummary(_ context.Context, tenantID string) (PrazosSummary, error) {

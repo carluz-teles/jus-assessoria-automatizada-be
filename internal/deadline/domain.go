@@ -131,6 +131,17 @@ type Repository interface {
 	// transition; this guarded UPDATE is the concurrency floor. A no-match (already transitioned)
 	// is ErrTaskNotFound. Returns the flipped task's id.
 	MarkTaskStatus(ctx context.Context, tx database.Tx, taskID, tenantID string, from, to TaskStatus, completedAt *time.Time) (string, error)
+	// EnsureTaskExistsInTenant guards the comment create: it confirms the parent task exists in
+	// the tenant (barrier 1) BEFORE the comment write. A miss is ErrTaskNotFound (→ 404) — a
+	// comment on a foreign/unknown task is a task miss (distinct from the checklist's item miss).
+	EnsureTaskExistsInTenant(ctx context.Context, tx database.Tx, taskID, tenantID string) error
+	// InsertTaskComment appends one comment to a task's thread inside the caller's tx, scoped by
+	// the entity's TenantID + RLS. Returns the comment with its DB-assigned id + created_at.
+	InsertTaskComment(ctx context.Context, tx database.Tx, c *TaskComment) (*TaskComment, error)
+	// InsertTaskActivity appends one audit-log row inside the caller's tx (the SAME tx as the
+	// mutation it records), scoped by the entity's TenantID + RLS. It returns only the error —
+	// the caller does not need the row back (the Atividade tab re-reads the whole log).
+	InsertTaskActivity(ctx context.Context, tx database.Tx, a *TaskActivity) error
 	// GetDeadlineForAdjust loads a prazo's FULL adjustable state (id, court_record_id,
 	// start_date, status, and the current kind/days/counting/doubled/doubled_reason) by its
 	// id, scoped to tenantID (barrier 1). It backs the ajuste manual (PATCH /v1/prazos/:id):

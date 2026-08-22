@@ -378,6 +378,7 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 		Title:          t.Title,
 		Description:    textToNull(t.Description),
 		Kind:           textToNull(t.Kind),
+		Priority:       textToNull(t.Priority),
 		DueDate:        pgOptionalDate(t.DueDate),
 		Status:         string(t.Status),
 		Source:         string(t.Source),
@@ -422,6 +423,7 @@ func (r *pgRepository) GetTaskForUpdate(ctx context.Context, tx database.Tx, tas
 		Title:          row.Title,
 		Description:    derefString(row.Description),
 		Kind:           derefString(row.Kind),
+		Priority:       derefString(row.Priority),
 		DueDate:        datePtr(row.DueDate),
 		AssigneeUserID: uuidText(row.AssigneeUserID),
 		DeadlineID:     uuidText(row.DeadlineID),
@@ -453,6 +455,7 @@ func (r *pgRepository) UpdateTask(ctx context.Context, tx database.Tx, p UpdateT
 		Title:          p.Title,
 		Description:    textToNull(p.Description),
 		Kind:           textToNull(p.Kind),
+		Priority:       textToNull(p.Priority),
 		DueDate:        pgOptionalDate(p.DueDate),
 		AssigneeUserID: assignee,
 	})
@@ -472,6 +475,7 @@ func (r *pgRepository) UpdateTask(ctx context.Context, tx database.Tx, p UpdateT
 		Title:          row.Title,
 		Description:    derefString(row.Description),
 		Kind:           derefString(row.Kind),
+		Priority:       derefString(row.Priority),
 		DueDate:        datePtr(row.DueDate),
 		Status:         TaskStatus(row.Status),
 		Source:         Source(row.Source),
@@ -534,6 +538,97 @@ func (r *pgRepository) MarkTaskStatus(ctx context.Context, tx database.Tx, taskI
 		return "", database.WrapInfra(err)
 	}
 	return flipped.String(), nil
+}
+
+// EnsureTaskExistsInTenant confirms a task exists in the tenant inside the caller's tx — the
+// guard the comment create runs first. Unlike EnsureTaskInTenant (checklist items, which reports
+// ErrTaskItemNotFound), a miss here is ErrTaskNotFound (→ 404): a comment on a foreign/unknown
+// task is a task miss, not an item miss. Reuses the same TaskExistsInTenant query.
+func (r *pgRepository) EnsureTaskExistsInTenant(ctx context.Context, tx database.Tx, taskID, tenantID string) error {
+	id, err := parseUUID(taskID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).TaskExistsInTenant(ctx, deadlinedb.TaskExistsInTenantParams{ID: id, TenantID: tenant})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrTaskNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// InsertTaskComment appends one comment to a task's thread inside the caller's tx and returns it
+// with its DB-assigned id + created_at (echoing the entity, like InsertTaskItem). tenant_id/
+// task_id/author_user_id are NOT NULL uuids; the mapper lifts them via pgUUID (a malformed value
+// is an infra fault). The parent-task guard runs in the use case before this write.
+func (r *pgRepository) InsertTaskComment(ctx context.Context, tx database.Tx, c *TaskComment) (*TaskComment, error) {
+	tenant, err := parseUUID(c.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	taskID, err := parseUUID(c.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	author, err := parseUUID(c.AuthorUserID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).InsertTaskComment(ctx, deadlinedb.InsertTaskCommentParams{
+		TenantID:     tenant,
+		TaskID:       taskID,
+		AuthorUserID: author,
+		Body:         c.Body,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	saved := *c
+	saved.ID = row.ID.String()
+	saved.CreatedAt = row.CreatedAt.Time
+	return &saved, nil
+}
+
+// InsertTaskActivity appends one audit-log row inside the caller's tx (called on the SAME tx as
+// the mutation it records). tenant_id/task_id/actor_user_id are NOT NULL uuids; event_type is the
+// closed set (validated by the caller). from/to are nullable text ("" → NULL via textToNull). The
+// caller does not need the row back (the Atividade tab re-reads the whole log), so it returns only
+// the error.
+func (r *pgRepository) InsertTaskActivity(ctx context.Context, tx database.Tx, a *TaskActivity) error {
+	tenant, err := parseUUID(a.TenantID)
+	if err != nil {
+		return err
+	}
+	taskID, err := parseUUID(a.TaskID)
+	if err != nil {
+		return err
+	}
+	actor, err := parseUUID(a.ActorUserID)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).InsertTaskActivity(ctx, deadlinedb.InsertTaskActivityParams{
+		TenantID:    tenant,
+		TaskID:      taskID,
+		ActorUserID: actor,
+		EventType:   string(a.EventType),
+		FromValue:   textToNull(a.FromValue),
+		ToValue:     textToNull(a.ToValue),
+	})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 // GetDeadlineForAdjust loads a prazo's full adjustable state by its id inside the caller's

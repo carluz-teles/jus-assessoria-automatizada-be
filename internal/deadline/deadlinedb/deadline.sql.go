@@ -457,7 +457,7 @@ func (q *Queries) GetTaskForTransition(ctx context.Context, arg GetTaskForTransi
 }
 
 const getTaskForUpdate = `-- name: GetTaskForUpdate :one
-SELECT id, status, title, description, kind, due_date, assignee_user_id, deadline_id
+SELECT id, status, title, description, kind, priority, due_date, assignee_user_id, deadline_id
 FROM task
 WHERE id = $1 AND tenant_id = $2
 `
@@ -473,6 +473,7 @@ type GetTaskForUpdateRow struct {
 	Title          string      `json:"title"`
 	Description    *string     `json:"description"`
 	Kind           *string     `json:"kind"`
+	Priority       *string     `json:"priority"`
 	DueDate        pgtype.Date `json:"due_date"`
 	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
 	DeadlineID     pgtype.UUID `json:"deadline_id"`
@@ -495,6 +496,7 @@ func (q *Queries) GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdatePara
 		&i.Title,
 		&i.Description,
 		&i.Kind,
+		&i.Priority,
 		&i.DueDate,
 		&i.AssigneeUserID,
 		&i.DeadlineID,
@@ -652,10 +654,10 @@ func (q *Queries) InsertDeadline(ctx context.Context, arg InsertDeadlineParams) 
 const insertTask = `-- name: InsertTask :one
 INSERT INTO task (
     tenant_id, court_record_id, deadline_id, intimation_id,
-    title, description, kind, due_date, status, source, assignee_user_id, created_by
+    title, description, kind, priority, due_date, status, source, assignee_user_id, created_by
 ) VALUES (
     $1, $2, $3, $4,
-    $5, $6, $7, $8, $9, $10, $11, $12
+    $5, $6, $7, $8, $9, $10, $11, $12, $13
 )
 RETURNING id
 `
@@ -668,6 +670,7 @@ type InsertTaskParams struct {
 	Title          string      `json:"title"`
 	Description    *string     `json:"description"`
 	Kind           *string     `json:"kind"`
+	Priority       *string     `json:"priority"`
 	DueDate        pgtype.Date `json:"due_date"`
 	Status         string      `json:"status"`
 	Source         string      `json:"source"`
@@ -690,6 +693,7 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UU
 		arg.Title,
 		arg.Description,
 		arg.Kind,
+		arg.Priority,
 		arg.DueDate,
 		arg.Status,
 		arg.Source,
@@ -699,6 +703,93 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UU
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const insertTaskActivity = `-- name: InsertTaskActivity :one
+
+INSERT INTO task_activity (tenant_id, task_id, actor_user_id, event_type, from_value, to_value)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id
+`
+
+type InsertTaskActivityParams struct {
+	TenantID    uuid.UUID `json:"tenant_id"`
+	TaskID      uuid.UUID `json:"task_id"`
+	ActorUserID uuid.UUID `json:"actor_user_id"`
+	EventType   string    `json:"event_type"`
+	FromValue   *string   `json:"from_value"`
+	ToValue     *string   `json:"to_value"`
+}
+
+// ── task_activity write path (audit log, §4/§10) ─────────────────────────────
+// The Tarefa detail's Atividade tab: every meaningful mutation appends ONE row here, IN THE SAME
+// tx as the mutation. tenant_id/task_id are the mutated task; actor_user_id is the verified
+// principal; event_type is the closed set (entity.go). from_value/to_value carry a field change's
+// before/after (NULL for create/lifecycle/comment).
+// Append one audit-log row. $1 = tenant_id, $2 = task_id, $3 = actor_user_id, $4 = event_type,
+// $5 = from_value (nullable), $6 = to_value (nullable). Returns the id (the caller does not need
+// the row back — the Atividade tab re-reads the whole log).
+func (q *Queries) InsertTaskActivity(ctx context.Context, arg InsertTaskActivityParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertTaskActivity,
+		arg.TenantID,
+		arg.TaskID,
+		arg.ActorUserID,
+		arg.EventType,
+		arg.FromValue,
+		arg.ToValue,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const insertTaskComment = `-- name: InsertTaskComment :one
+
+INSERT INTO task_comment (tenant_id, task_id, author_user_id, body)
+VALUES ($1, $2, $3, $4)
+RETURNING id, task_id, author_user_id, body, created_at
+`
+
+type InsertTaskCommentParams struct {
+	TenantID     uuid.UUID `json:"tenant_id"`
+	TaskID       uuid.UUID `json:"task_id"`
+	AuthorUserID uuid.UUID `json:"author_user_id"`
+	Body         string    `json:"body"`
+}
+
+type InsertTaskCommentRow struct {
+	ID           uuid.UUID          `json:"id"`
+	TaskID       uuid.UUID          `json:"task_id"`
+	AuthorUserID uuid.UUID          `json:"author_user_id"`
+	Body         string             `json:"body"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// ── task_comment write path (discussion thread, §4/§10) ──────────────────────
+// The Tarefa detail's Comentários tab: a task grows N free-text comments. The write is keyed
+// by the parent task and scoped to tenant_id (barrier 1, on top of RLS barrier 2). The parent-
+// task guard (TaskExistsInTenant, reused) turns a foreign/unknown task_id into a typed 404
+// BEFORE the insert, so a comment can never be grafted onto another tenant's task.
+// Append one comment to a task's thread (POST /v1/tasks/:id/comments). tenant_id/task_id come
+// from the request context + the guarded parent; author_user_id is the verified principal (never
+// the body). Returns the whole row so the handler renders it without a re-read. $1 = tenant_id,
+// $2 = task_id, $3 = author_user_id, $4 = body.
+func (q *Queries) InsertTaskComment(ctx context.Context, arg InsertTaskCommentParams) (InsertTaskCommentRow, error) {
+	row := q.db.QueryRow(ctx, insertTaskComment,
+		arg.TenantID,
+		arg.TaskID,
+		arg.AuthorUserID,
+		arg.Body,
+	)
+	var i InsertTaskCommentRow
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.AuthorUserID,
+		&i.Body,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const insertTaskItem = `-- name: InsertTaskItem :one
@@ -1300,11 +1391,12 @@ UPDATE task
 SET title            = $3,
     description      = $4,
     kind             = $5,
-    due_date         = $6,
-    assignee_user_id = $7
+    priority         = $6,
+    due_date         = $7,
+    assignee_user_id = $8
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, tenant_id, court_record_id, deadline_id, intimation_id,
-          title, description, kind, due_date, status, source, assignee_user_id,
+          title, description, kind, priority, due_date, status, source, assignee_user_id,
           created_by, completed_at
 `
 
@@ -1314,6 +1406,7 @@ type UpdateTaskParams struct {
 	Title          string      `json:"title"`
 	Description    *string     `json:"description"`
 	Kind           *string     `json:"kind"`
+	Priority       *string     `json:"priority"`
 	DueDate        pgtype.Date `json:"due_date"`
 	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
 }
@@ -1327,6 +1420,7 @@ type UpdateTaskRow struct {
 	Title          string             `json:"title"`
 	Description    *string            `json:"description"`
 	Kind           *string            `json:"kind"`
+	Priority       *string            `json:"priority"`
 	DueDate        pgtype.Date        `json:"due_date"`
 	Status         string             `json:"status"`
 	Source         string             `json:"source"`
@@ -1349,6 +1443,7 @@ func (q *Queries) UpdateTask(ctx context.Context, arg UpdateTaskParams) (UpdateT
 		arg.Title,
 		arg.Description,
 		arg.Kind,
+		arg.Priority,
 		arg.DueDate,
 		arg.AssigneeUserID,
 	)
@@ -1362,6 +1457,7 @@ func (q *Queries) UpdateTask(ctx context.Context, arg UpdateTaskParams) (UpdateT
 		&i.Title,
 		&i.Description,
 		&i.Kind,
+		&i.Priority,
 		&i.DueDate,
 		&i.Status,
 		&i.Source,

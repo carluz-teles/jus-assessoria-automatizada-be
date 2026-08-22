@@ -359,7 +359,7 @@ func TestMarkTaskDone_OpenToDone(t *testing.T) {
 	uow := &fakeUOW{}
 	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, uow, WithClock(func() time.Time { return now }))
 
-	res, err := uc.MarkTaskDone(context.Background(), tenantID, taskID)
+	res, err := uc.MarkTaskDone(context.Background(), tenantID, uuid.NewString(), taskID)
 	if err != nil {
 		t.Fatalf("MarkTaskDone() error = %v", err)
 	}
@@ -399,7 +399,7 @@ func TestDismissTask_OpenToDismissed(t *testing.T) {
 	outbox := &fakeOutbox{}
 	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
 
-	res, err := uc.DismissTask(context.Background(), tenantID, taskID)
+	res, err := uc.DismissTask(context.Background(), tenantID, uuid.NewString(), taskID)
 	if err != nil {
 		t.Fatalf("DismissTask() error = %v", err)
 	}
@@ -426,10 +426,10 @@ func TestTask_TransitionRequiresOpen(t *testing.T) {
 		call func(uc *UseCase, tenantID, taskID string) (TaskTransition, error)
 	}{
 		{"done", func(uc *UseCase, tenantID, taskID string) (TaskTransition, error) {
-			return uc.MarkTaskDone(context.Background(), tenantID, taskID)
+			return uc.MarkTaskDone(context.Background(), tenantID, uuid.NewString(), taskID)
 		}},
 		{"dismiss", func(uc *UseCase, tenantID, taskID string) (TaskTransition, error) {
-			return uc.DismissTask(context.Background(), tenantID, taskID)
+			return uc.DismissTask(context.Background(), tenantID, uuid.NewString(), taskID)
 		}},
 	}
 	for _, tr := range transitions {
@@ -459,7 +459,7 @@ func TestTask_TransitionNotFound(t *testing.T) {
 	outbox := &fakeOutbox{}
 	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
 
-	_, err := uc.MarkTaskDone(context.Background(), uuid.NewString(), uuid.NewString())
+	_, err := uc.MarkTaskDone(context.Background(), uuid.NewString(), uuid.NewString(), uuid.NewString())
 	ae, ok := apperr.From(err)
 	if !ok || ae.Kind != apperr.KindNotFound {
 		t.Errorf("error = %v, want KindNotFound", err)

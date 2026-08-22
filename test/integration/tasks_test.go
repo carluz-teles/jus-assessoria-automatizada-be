@@ -152,7 +152,7 @@ func TestTasks_CreateThenDoneAndDismiss(t *testing.T) {
 	}
 
 	// done: OPEN→DONE, completed_at stamped, task.completed emitted.
-	res, err := uc.MarkTaskDone(ctx, tenant, doneID)
+	res, err := uc.MarkTaskDone(ctx, tenant, userID, doneID)
 	if err != nil {
 		t.Fatalf("MarkTaskDone: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestTasks_CreateThenDoneAndDismiss(t *testing.T) {
 	assertTaskEvent(ctx, t, pool, deadline.TypeTaskCompleted, doneID)
 
 	// dismiss: OPEN→DISMISSED, completed_at left NULL, task.dismissed emitted.
-	if _, err := uc.DismissTask(ctx, tenant, dismissID); err != nil {
+	if _, err := uc.DismissTask(ctx, tenant, userID, dismissID); err != nil {
 		t.Fatalf("DismissTask: %v", err)
 	}
 	var dismissStatus string
@@ -186,7 +186,7 @@ func TestTasks_CreateThenDoneAndDismiss(t *testing.T) {
 	assertTaskEvent(ctx, t, pool, deadline.TypeTaskDismissed, dismissID)
 
 	// Re-doing a terminal task is refused (ErrTaskNotOpen) — the guard holds end to end.
-	if _, err := uc.MarkTaskDone(ctx, tenant, doneID); err == nil {
+	if _, err := uc.MarkTaskDone(ctx, tenant, userID, doneID); err == nil {
 		t.Error("MarkTaskDone on a DONE task = nil error, want ErrTaskNotOpen")
 	}
 }
@@ -210,7 +210,7 @@ func TestTasks_Update(t *testing.T) {
 	newTitle := "novo título"
 	assignee := uuid.NewString()
 	saved, err := uc.UpdateTask(ctx, deadline.UpdateTaskCommand{
-		TenantID: tenant, TaskID: task.ID, Title: &newTitle, AssigneeUserID: &assignee,
+		TenantID: tenant, UserID: uuid.NewString(), TaskID: task.ID, Title: &newTitle, AssigneeUserID: &assignee,
 	})
 	if err != nil {
 		t.Fatalf("UpdateTask: %v", err)

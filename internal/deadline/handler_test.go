@@ -59,6 +59,14 @@ type recordingReader struct {
 	taskDetailErr    error
 	gotTaskDetailTID string
 	gotTaskDetailID  string
+	taskComments     []TaskCommentView
+	taskCommentsErr  error
+	gotCommentsTID   string
+	gotCommentsID    string
+	taskActivity     []TaskActivityView
+	taskActivityErr  error
+	gotActivityTID   string
+	gotActivityID    string
 	prazosSummary    PrazosSummary
 	tasksSummary     TasksSummary
 	gotSummaryTID    string
@@ -97,6 +105,16 @@ func (r *recordingReader) Tasks(_ context.Context, q TasksQuery) (TasksResult, e
 func (r *recordingReader) TaskDetail(_ context.Context, tenantID, id string) (TaskDetailView, error) {
 	r.gotTaskDetailTID, r.gotTaskDetailID = tenantID, id
 	return r.taskDetailView, r.taskDetailErr
+}
+
+func (r *recordingReader) TaskComments(_ context.Context, tenantID, id string) ([]TaskCommentView, error) {
+	r.gotCommentsTID, r.gotCommentsID = tenantID, id
+	return r.taskComments, r.taskCommentsErr
+}
+
+func (r *recordingReader) TaskActivity(_ context.Context, tenantID, id string) ([]TaskActivityView, error) {
+	r.gotActivityTID, r.gotActivityID = tenantID, id
+	return r.taskActivity, r.taskActivityErr
 }
 
 func (r *recordingReader) PrazosSummary(_ context.Context, tenantID string) (PrazosSummary, error) {
@@ -166,6 +184,10 @@ type recordingWriter struct {
 	dismissCalls                   int
 	dismissRes                     TaskTransition
 	dismissErr                     error
+	gotCreateCommentCmd            CreateTaskCommentCommand
+	createCommentCalls             int
+	createCommentRes               *TaskComment
+	createCommentErr               error
 
 	// task_item writes
 	gotCreateItemCmd                                        CreateTaskItemCommand
@@ -235,16 +257,22 @@ func (w *recordingWriter) UpdateTask(_ context.Context, cmd UpdateTaskCommand) (
 	return w.updateTaskRes, w.updateTaskErr
 }
 
-func (w *recordingWriter) MarkTaskDone(_ context.Context, tenantID, taskID string) (TaskTransition, error) {
+func (w *recordingWriter) MarkTaskDone(_ context.Context, tenantID, _, taskID string) (TaskTransition, error) {
 	w.doneCalls++
 	w.gotDoneTenant, w.gotDoneID = tenantID, taskID
 	return w.doneRes, w.doneErr
 }
 
-func (w *recordingWriter) DismissTask(_ context.Context, tenantID, taskID string) (TaskTransition, error) {
+func (w *recordingWriter) DismissTask(_ context.Context, tenantID, _, taskID string) (TaskTransition, error) {
 	w.dismissCalls++
 	w.gotDismissTenant, w.gotDismissID = tenantID, taskID
 	return w.dismissRes, w.dismissErr
+}
+
+func (w *recordingWriter) CreateTaskComment(_ context.Context, cmd CreateTaskCommentCommand) (*TaskComment, error) {
+	w.createCommentCalls++
+	w.gotCreateCommentCmd = cmd
+	return w.createCommentRes, w.createCommentErr
 }
 
 func (w *recordingWriter) CreateTaskItem(_ context.Context, cmd CreateTaskItemCommand) (*TaskItem, error) {

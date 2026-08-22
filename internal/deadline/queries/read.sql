@@ -152,7 +152,7 @@ WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid;
 -- FE decides what to show). @court_record_id is the court_record id; an avulsa task (NULL
 -- court_record_id) never matches, so it is absent from a process tab (correct — it hangs on no
 -- process). Scoped to tenant_id (barrier 1).
-SELECT t.id, t.title, t.description, t.kind, t.due_date,
+SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at,
@@ -187,7 +187,7 @@ WHERE t.court_record_id = @court_record_id::uuid
 -- due_date, so it naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window
 -- query wants dated items. Ascending (sort_due, id) keyset; the first page passes the min
 -- sentinel ('0001-01-01', zero-uuid).
-SELECT t.id, t.title, t.description, t.kind, t.due_date,
+SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at,
@@ -239,7 +239,7 @@ SELECT count(*) FROM task WHERE tenant_id = @tenant_id::uuid;
 -- A miss (foreign/unknown id) → pgx.ErrNoRows → typed ErrTaskNotFound (→ 404) at the mapper,
 -- never (nil, nil). The checklist + progress are separate queries (a task with no items still
 -- resolves). $1 = id, $2 = tenant_id.
-SELECT t.id, t.title, t.description, t.kind, t.due_date,
+SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at
 FROM task t
@@ -372,3 +372,30 @@ FROM (
     AND t.assignee_user_id IS NOT NULL
 ) assignees
 ORDER BY LOWER(name) ASC;
+
+-- ── task detail: comments + activity (GET /v1/tasks/:id/comments|activity) ────
+-- The Tarefa detail's Comentários and Atividade tabs. Both resolve the writer/actor to a name
+-- via LEFT JOIN app_user (the *_user_id columns are bare uuids with no FK, like assignee_user_id)
+-- so the FE renders "Fulano" not a uuid; an unknown id yields "" (the FE labels it). Both are
+-- scoped to (task_id, tenant_id) (barrier 1, on top of RLS barrier 2).
+
+-- name: ListTaskComments :many
+-- One task's discussion thread, OLDEST-first (the detail view reads top-to-bottom). $1 = task_id,
+-- $2 = tenant_id. An empty thread is 0 rows (never an error). The comment's author is resolved to
+-- a name for display.
+SELECT c.id, c.author_user_id, COALESCE(au.name, '')::text AS author_name, c.body, c.created_at
+FROM task_comment c
+LEFT JOIN app_user au ON au.id = c.author_user_id
+WHERE c.task_id = @task_id::uuid AND c.tenant_id = @tenant_id::uuid
+ORDER BY c.created_at ASC, c.id ASC;
+
+-- name: ListTaskActivity :many
+-- One task's audit log, NEWEST-first (the detail view reads most-recent-first). $1 = task_id, $2 =
+-- tenant_id. An empty log is 0 rows (never an error). The actor is resolved to a name for display;
+-- from_value/to_value are the field change's before/after (NULL for create/lifecycle/comment).
+SELECT a.id, a.actor_user_id, COALESCE(au.name, '')::text AS actor_name,
+       a.event_type, a.from_value, a.to_value, a.created_at
+FROM task_activity a
+LEFT JOIN app_user au ON au.id = a.actor_user_id
+WHERE a.task_id = @task_id::uuid AND a.tenant_id = @tenant_id::uuid
+ORDER BY a.created_at DESC, a.id DESC;

@@ -183,6 +183,7 @@ type CreateTaskRequest struct {
 	Title          string `json:"title"`
 	Description    string `json:"description"`
 	Kind           string `json:"kind"`
+	Priority       string `json:"priority"`
 	DueDate        string `json:"due_date"`
 	AssigneeUserID string `json:"assignee_user_id"`
 }
@@ -196,6 +197,7 @@ func (r CreateTaskRequest) Validate() error {
 		validation.Field(&r.Title, validation.Required),
 		validation.Field(&r.DueDate, validation.Date(time.DateOnly)),
 		validation.Field(&r.Kind, validation.By(validTaskKindRule)),
+		validation.Field(&r.Priority, validation.By(validTaskPriorityRule)),
 		validation.Field(&r.CourtRecordID, validation.By(uuidIfPresent)),
 		validation.Field(&r.DeadlineID, validation.By(uuidIfPresent)),
 		validation.Field(&r.IntimationID, validation.By(uuidIfPresent)),
@@ -216,6 +218,7 @@ func (r CreateTaskRequest) toCommand(tenantID, userID string) CreateTaskCommand 
 		Title:          r.Title,
 		Description:    r.Description,
 		Kind:           r.Kind,
+		Priority:       r.Priority,
 		DueDate:        parseOptionalWireDate(r.DueDate),
 		AssigneeUserID: r.AssigneeUserID,
 	}
@@ -230,6 +233,7 @@ type UpdateTaskRequest struct {
 	Title          *string `json:"title"`
 	Description    *string `json:"description"`
 	Kind           *string `json:"kind"`
+	Priority       *string `json:"priority"`
 	DueDate        *string `json:"due_date"`
 	AssigneeUserID *string `json:"assignee_user_id"`
 }
@@ -244,6 +248,7 @@ func (r UpdateTaskRequest) Validate() error {
 		validation.Field(&r.Title, validation.By(nonEmptyIfPresent)),
 		validation.Field(&r.DueDate, validation.By(wireDateOrClearIfPresent)),
 		validation.Field(&r.Kind, validation.By(validTaskKindIfPresent)),
+		validation.Field(&r.Priority, validation.By(validTaskPriorityIfPresent)),
 		validation.Field(&r.AssigneeUserID, validation.By(uuidOrClearIfPresent)),
 	)
 }
@@ -251,13 +256,15 @@ func (r UpdateTaskRequest) Validate() error {
 // toUpdateCommand maps the validated request + the principal's tenant + the path id into the
 // use-case command. TenantID comes from the principal and TaskID from the path (never the body);
 // the pointer fields carry through so the use case merges only what was present.
-func (r UpdateTaskRequest) toUpdateCommand(tenantID, taskID string) UpdateTaskCommand {
+func (r UpdateTaskRequest) toUpdateCommand(tenantID, userID, taskID string) UpdateTaskCommand {
 	return UpdateTaskCommand{
 		TenantID:       tenantID,
+		UserID:         userID,
 		TaskID:         taskID,
 		Title:          r.Title,
 		Description:    r.Description,
 		Kind:           r.Kind,
+		Priority:       r.Priority,
 		DueDate:        r.DueDate,
 		AssigneeUserID: r.AssigneeUserID,
 	}
@@ -391,6 +398,56 @@ func validTaskKindIfPresent(value any) error {
 		return errors.New("must be one of ANALISE, PECA, PROTOCOLO, PROVIDENCIA, CIENCIA")
 	}
 	return nil
+}
+
+// validTaskPriorityRule rejects a PRESENT, non-empty priority outside the closed HIGH|MEDIUM|LOW
+// set (entity.go); an empty value is a no-op ("sem prioridade"). It backs the CREATE body and
+// mirrors validTaskKindRule.
+func validTaskPriorityRule(value any) error {
+	s, _ := value.(string)
+	if !validTaskPriority(s) {
+		return errors.New("must be one of HIGH, MEDIUM, LOW")
+	}
+	return nil
+}
+
+// validTaskPriorityIfPresent accepts an absent (nil) priority, a present "" (clear → sem
+// prioridade), or a present valid TaskPriority; anything else is a client error. Pointer
+// counterpart of validTaskPriorityRule, backing the PATCH body.
+func validTaskPriorityIfPresent(value any) error {
+	s, ok := value.(*string)
+	if !ok || s == nil {
+		return nil
+	}
+	if !validTaskPriority(*s) {
+		return errors.New("must be one of HIGH, MEDIUM, LOW")
+	}
+	return nil
+}
+
+// CreateTaskCommentRequest is the POST /v1/tasks/:id/comments body (§4/§10): one message in a
+// task's thread. Body is the only user input and is required; tenant_id/author come from the
+// verified principal and the task id from the path.
+type CreateTaskCommentRequest struct {
+	Body string `json:"body"`
+}
+
+// Validate enforces the one edge rule: a non-empty body. A failure is a 400 at the edge.
+func (r CreateTaskCommentRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Body, validation.Required),
+	)
+}
+
+// toCommand maps the validated request + the principal's ids + the path task id into the use-case
+// command. TenantID/UserID come from the principal, TaskID from the path (never the body).
+func (r CreateTaskCommentRequest) toCommand(tenantID, userID, taskID string) CreateTaskCommentCommand {
+	return CreateTaskCommentCommand{
+		TenantID: tenantID,
+		UserID:   userID,
+		TaskID:   taskID,
+		Body:     r.Body,
+	}
 }
 
 // isUUID is an ozzo rule that accepts only a parseable uuid — reusing google/uuid (the

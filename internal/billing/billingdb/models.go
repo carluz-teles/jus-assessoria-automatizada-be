@@ -463,6 +463,27 @@ type Task struct {
 	CreatedBy      pgtype.UUID        `json:"created_by"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	Priority       *string            `json:"priority"`
+}
+
+type TaskActivity struct {
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	TaskID      uuid.UUID          `json:"task_id"`
+	ActorUserID uuid.UUID          `json:"actor_user_id"`
+	EventType   string             `json:"event_type"`
+	FromValue   *string            `json:"from_value"`
+	ToValue     *string            `json:"to_value"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type TaskComment struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	TaskID       uuid.UUID          `json:"task_id"`
+	AuthorUserID uuid.UUID          `json:"author_user_id"`
+	Body         string             `json:"body"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
 type TaskItem struct {

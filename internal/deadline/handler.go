@@ -28,6 +28,8 @@ type reader interface {
 	TasksByProcesso(ctx context.Context, q TasksByProcessoQuery) (TasksByProcessoResult, error)
 	Tasks(ctx context.Context, q TasksQuery) (TasksResult, error)
 	TaskDetail(ctx context.Context, tenantID, id string) (TaskDetailView, error)
+	TaskComments(ctx context.Context, tenantID, id string) ([]TaskCommentView, error)
+	TaskActivity(ctx context.Context, tenantID, id string) ([]TaskActivityView, error)
 	PrazosSummary(ctx context.Context, tenantID string) (PrazosSummary, error)
 	TasksSummary(ctx context.Context, tenantID string) (TasksSummary, error)
 }
@@ -46,8 +48,9 @@ type writer interface {
 	Reopen(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
 	CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task, error)
 	UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task, error)
-	MarkTaskDone(ctx context.Context, tenantID, taskID string) (TaskTransition, error)
-	DismissTask(ctx context.Context, tenantID, taskID string) (TaskTransition, error)
+	MarkTaskDone(ctx context.Context, tenantID, userID, taskID string) (TaskTransition, error)
+	DismissTask(ctx context.Context, tenantID, userID, taskID string) (TaskTransition, error)
+	CreateTaskComment(ctx context.Context, cmd CreateTaskCommentCommand) (*TaskComment, error)
 	CreateTaskItem(ctx context.Context, cmd CreateTaskItemCommand) (*TaskItem, error)
 	UpdateTaskItem(ctx context.Context, cmd UpdateTaskItemCommand) (*TaskItem, error)
 	DeleteTaskItem(ctx context.Context, tenantID, taskID, itemID string) error
@@ -108,6 +111,10 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Patch("/tasks/:id", h.updateTask)
 	r.Post("/tasks/:id/done", h.markTaskDone)
 	r.Post("/tasks/:id/dismiss", h.dismissTask)
+	// Discussion thread + audit log of a task (§4/§10, the Tarefa detail's Comentários/Atividade tabs).
+	r.Get("/tasks/:id/comments", h.listTaskComments)
+	r.Post("/tasks/:id/comments", h.createTaskComment)
+	r.Get("/tasks/:id/activity", h.listTaskActivity)
 	// Checklist / subtarefas of a task (§4/§10).
 	r.Post("/tasks/:id/items", h.createTaskItem)
 	r.Patch("/tasks/:id/items/:itemId", h.updateTaskItem)
@@ -551,8 +558,11 @@ func (h *Handler) updateTask(c *fiber.Ctx) error {
 		return httpx.WriteValidationError(c, err)
 	}
 
-	tenantID := httpx.TenantFromCtx(c)
-	task, err := h.writer.UpdateTask(c.UserContext(), req.toUpdateCommand(tenantID, c.Params("id")))
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	task, err := h.writer.UpdateTask(c.UserContext(), req.toUpdateCommand(p.TenantID, p.UserID, c.Params("id")))
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
@@ -563,8 +573,11 @@ func (h *Handler) updateTask(c *fiber.Ctx) error {
 // completed_at. No body — the task id comes from the path and tenant_id from the principal. A
 // miss is ErrTaskNotFound → 404; a non-OPEN task is ErrTaskNotOpen → 409.
 func (h *Handler) markTaskDone(c *fiber.Ctx) error {
-	tenantID := httpx.TenantFromCtx(c)
-	res, err := h.writer.MarkTaskDone(c.UserContext(), tenantID, c.Params("id"))
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	res, err := h.writer.MarkTaskDone(c.UserContext(), p.TenantID, p.UserID, c.Params("id"))
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
@@ -574,8 +587,11 @@ func (h *Handler) markTaskDone(c *fiber.Ctx) error {
 // dismissTask handles POST /v1/tasks/:id/dismiss: dispensar a tarefa (§9), OPEN→DISMISSED. Same
 // path/tenant/guards as markTaskDone; completed_at is left NULL (dispensar is not a completion).
 func (h *Handler) dismissTask(c *fiber.Ctx) error {
-	tenantID := httpx.TenantFromCtx(c)
-	res, err := h.writer.DismissTask(c.UserContext(), tenantID, c.Params("id"))
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+	res, err := h.writer.DismissTask(c.UserContext(), p.TenantID, p.UserID, c.Params("id"))
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
@@ -592,6 +608,56 @@ func (h *Handler) getTask(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// listTaskComments handles GET /v1/tasks/:id/comments: a task's discussion thread (oldest-first).
+// tenant_id comes from the principal; a foreign/unknown task id is the read use case's typed
+// ErrTaskNotFound → 404.
+func (h *Handler) listTaskComments(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	comments, err := h.reader.TaskComments(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"data": comments})
+}
+
+// createTaskComment handles POST /v1/tasks/:id/comments: append one comment to a task's thread. It
+// validates the body, then persists the comment (authored by the principal) + a COMMENTED activity
+// row in one tx, returning 201 with the created comment. tenant_id/author come from the verified
+// principal, the task id from the path (never the body). A foreign/unknown task id is the use
+// case's typed ErrTaskNotFound → 404.
+func (h *Handler) createTaskComment(c *fiber.Ctx) error {
+	var req CreateTaskCommentRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	comment, err := h.writer.CreateTaskComment(c.UserContext(), req.toCommand(p.TenantID, p.UserID, c.Params("id")))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(newTaskCommentResponse(comment))
+}
+
+// listTaskActivity handles GET /v1/tasks/:id/activity: a task's audit log (newest-first).
+// tenant_id comes from the principal; a foreign/unknown task id is the read use case's typed
+// ErrTaskNotFound → 404.
+func (h *Handler) listTaskActivity(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	activity, err := h.reader.TaskActivity(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"data": activity})
 }
 
 // getPrazosSummary handles GET /v1/prazos/summary: the tenant's prazos KPI counts (a single
@@ -879,6 +945,19 @@ type taskTransitionResponse struct {
 // newTaskTransitionResponse maps the use case's TaskTransition to the client-facing payload.
 func newTaskTransitionResponse(t TaskTransition) taskTransitionResponse {
 	return taskTransitionResponse{TaskID: t.ID, Status: string(t.Status)}
+}
+
+// newTaskCommentResponse renders a persisted *TaskComment as the TaskCommentView wire shape — the
+// same shape the GET .../comments list returns, so the created comment and the listed comments are
+// byte-for-byte the same JSON. AuthorName is left "" (not resolved on the write path); the FE
+// already knows the author (it is the current user) or refetches the thread.
+func newTaskCommentResponse(c *TaskComment) TaskCommentView {
+	return TaskCommentView{
+		ID:           c.ID,
+		AuthorUserID: c.AuthorUserID,
+		Body:         c.Body,
+		CreatedAt:    c.CreatedAt,
+	}
 }
 
 // newTasksByProcessoPage wraps the Tasks-tab read model in the cursor envelope; the next cursor

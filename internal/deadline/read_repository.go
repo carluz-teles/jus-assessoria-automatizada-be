@@ -381,6 +381,7 @@ func (r *pgReadRepository) ListTasksByProcesso(ctx context.Context, q TasksByPro
 			Title:          row.Title,
 			Description:    derefString(row.Description),
 			Kind:           derefString(row.Kind),
+			Priority:       derefString(row.Priority),
 			DueDate:        datePtr(row.DueDate),
 			Status:         row.Status,
 			Source:         row.Source,
@@ -472,6 +473,7 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 			Title:          row.Title,
 			Description:    derefString(row.Description),
 			Kind:           derefString(row.Kind),
+			Priority:       derefString(row.Priority),
 			DueDate:        datePtr(row.DueDate),
 			Status:         row.Status,
 			Source:         row.Source,
@@ -621,6 +623,7 @@ func (r *pgReadRepository) GetTaskDetail(ctx context.Context, tenantID, id strin
 		Title:          row.Title,
 		Description:    derefString(row.Description),
 		Kind:           derefString(row.Kind),
+		Priority:       derefString(row.Priority),
 		DueDate:        datePtr(row.DueDate),
 		Status:         row.Status,
 		Source:         row.Source,
@@ -680,6 +683,70 @@ func (r *pgReadRepository) TaskItemProgress(ctx context.Context, tenantID, taskI
 		return TaskProgress{}, database.WrapInfra(err)
 	}
 	return TaskProgress{Done: int(row.Done), Total: int(row.Total)}, nil
+}
+
+// ListTaskComments reads one task's discussion thread on the pool (oldest-first), filtered by
+// tenant_id and task_id. The author is resolved to a name (LEFT JOIN app_user); an empty thread
+// yields an empty slice (never an error).
+func (r *pgReadRepository) ListTaskComments(ctx context.Context, tenantID, taskID string) ([]TaskCommentView, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	tkid, err := parseUUID(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.q.ListTaskComments(ctx, deadlinedb.ListTaskCommentsParams{TaskID: tkid, TenantID: tid})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]TaskCommentView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, TaskCommentView{
+			ID:           row.ID.String(),
+			AuthorUserID: row.AuthorUserID.String(),
+			AuthorName:   row.AuthorName,
+			Body:         row.Body,
+			CreatedAt:    row.CreatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
+// ListTaskActivity reads one task's audit log on the pool (newest-first), filtered by tenant_id
+// and task_id. The actor is resolved to a name (LEFT JOIN app_user); the nullable from/to are
+// lifted to "" via derefString. An empty log yields an empty slice (never an error).
+func (r *pgReadRepository) ListTaskActivity(ctx context.Context, tenantID, taskID string) ([]TaskActivityView, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	tkid, err := parseUUID(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.q.ListTaskActivity(ctx, deadlinedb.ListTaskActivityParams{TaskID: tkid, TenantID: tid})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]TaskActivityView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, TaskActivityView{
+			ID:          row.ID.String(),
+			ActorUserID: row.ActorUserID.String(),
+			ActorName:   row.ActorName,
+			EventType:   row.EventType,
+			FromValue:   derefString(row.FromValue),
+			ToValue:     derefString(row.ToValue),
+			CreatedAt:   row.CreatedAt.Time,
+		})
+	}
+	return out, nil
 }
 
 // PrazosSummary reads the tenant's prazos KPI counts on the pool (a single aggregated row),
