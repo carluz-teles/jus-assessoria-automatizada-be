@@ -521,7 +521,7 @@ type ResultCommand struct {
 
 // ResultResult carries the response for a successful result update.
 type ResultResult struct {
-	PetitionID    string
+	PetitionID     string
 	ObservedResult string
 }
 
@@ -537,7 +537,7 @@ func (uc *UseCase) Result(ctx context.Context, cmd ResultCommand) (*ResultResult
 			return err
 		}
 		result = &ResultResult{
-			PetitionID:    p.ID,
+			PetitionID:     p.ID,
 			ObservedResult: p.ObservedResult,
 		}
 		return nil

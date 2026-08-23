@@ -925,7 +925,7 @@ func (h *Handler) resultPeca(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{
 		"data": resultResponse{
-			PetitionID:    result.PetitionID,
+			PetitionID:     result.PetitionID,
 			ObservedResult: result.ObservedResult,
 		},
 	})
@@ -1046,7 +1046,7 @@ type fileResponse struct {
 }
 
 type resultResponse struct {
-	PetitionID    string `json:"petition_id"`
+	PetitionID     string `json:"petition_id"`
 	ObservedResult string `json:"observed_result"`
 }
 

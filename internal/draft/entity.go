@@ -434,10 +434,10 @@ type Petition struct {
 // ObservedResult closed set — the outcome the advogado records after the petition
 // is filed.
 const (
-	ObservedResultOK           = "OK"
-	ObservedResultAmendment    = "AMENDMENT"
-	ObservedResultNotAdmitted  = "NOT_ADMITTED"
-	ObservedResultUntimely     = "UNTIMELY"
+	ObservedResultOK          = "OK"
+	ObservedResultAmendment   = "AMENDMENT"
+	ObservedResultNotAdmitted = "NOT_ADMITTED"
+	ObservedResultUntimely    = "UNTIMELY"
 )
 
 // validObservedResults is the lookup used by validation.

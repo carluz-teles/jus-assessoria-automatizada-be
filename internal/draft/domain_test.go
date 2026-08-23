@@ -870,7 +870,7 @@ func TestUseCase_Sign(t *testing.T) {
 			name: "signs DRAFT draft → SIGNED",
 			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
 			repo: &fakeRepo{
-				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusDraft},
+				getByIDResult:   &Draft{ID: draftID, TenantID: tenantID, Status: StatusDraft},
 				signDraftResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
 			},
 			wantSt: StatusSigned,
@@ -879,7 +879,7 @@ func TestUseCase_Sign(t *testing.T) {
 			name: "signs REVIEWED draft → SIGNED",
 			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
 			repo: &fakeRepo{
-				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusReviewed},
+				getByIDResult:   &Draft{ID: draftID, TenantID: tenantID, Status: StatusReviewed},
 				signDraftResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
 			},
 			wantSt: StatusSigned,
@@ -912,9 +912,9 @@ func TestUseCase_Sign(t *testing.T) {
 			errTarget: ErrInvalidStatusForSign,
 		},
 		{
-			name: "draft not found → ErrDraftNotFound",
-			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
-			repo:  &fakeRepo{getByIDErr: ErrDraftNotFound},
+			name:      "draft not found → ErrDraftNotFound",
+			cmd:       SignCommand{TenantID: tenantID, DraftID: draftID},
+			repo:      &fakeRepo{getByIDErr: ErrDraftNotFound},
 			wantErr:   true,
 			errTarget: ErrDraftNotFound,
 		},
@@ -992,7 +992,7 @@ func TestUseCase_File(t *testing.T) {
 				Receipt:  receipt,
 			},
 			repo: &fakeRepo{
-				getByIDResult:      &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned, IntimationID: intimID},
+				getByIDResult:       &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned, IntimationID: intimID},
 				courtRecordIDResult: courtRecordID,
 			},
 		},
@@ -1100,20 +1100,20 @@ func TestUseCase_Result(t *testing.T) {
 		wantOR    string
 	}{
 		{
-			name: "sets OK result",
-			cmd:  ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultOK},
-			repo:  &fakeRepo{},
+			name:   "sets OK result",
+			cmd:    ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultOK},
+			repo:   &fakeRepo{},
 			wantOR: ObservedResultOK,
 		},
 		{
-			name: "sets AMENDMENT result",
-			cmd:  ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultAmendment},
-			repo:  &fakeRepo{},
+			name:   "sets AMENDMENT result",
+			cmd:    ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultAmendment},
+			repo:   &fakeRepo{},
 			wantOR: ObservedResultAmendment,
 		},
 		{
-			name: "petition not found → ErrPetitionNotFound",
-			cmd:  ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultOK},
+			name:      "petition not found → ErrPetitionNotFound",
+			cmd:       ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultOK},
 			repo:      &fakeRepo{updateResultErr: ErrPetitionNotFound},
 			wantErr:   true,
 			errTarget: ErrPetitionNotFound,
@@ -1182,10 +1182,10 @@ func TestUseCase_Export(t *testing.T) {
 			wantURL: presignedURL,
 		},
 		{
-			name:    "empty content → ErrDraftNoContent",
-			cmd:     ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
-			repo:    &fakeRepo{getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Content: ""}},
-			storage: &fakeStorage{url: presignedURL},
+			name:      "empty content → ErrDraftNoContent",
+			cmd:       ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
+			repo:      &fakeRepo{getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Content: ""}},
+			storage:   &fakeStorage{url: presignedURL},
 			wantErr:   true,
 			errTarget: ErrDraftNoContent,
 		},
@@ -1198,10 +1198,10 @@ func TestUseCase_Export(t *testing.T) {
 			errTarget: ErrDraftNotFound,
 		},
 		{
-			name:    "nil storage → ErrExportFormatInvalid",
-			cmd:     ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
-			repo:    &fakeRepo{getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Content: "x"}},
-			storage: nil,
+			name:      "nil storage → ErrExportFormatInvalid",
+			cmd:       ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
+			repo:      &fakeRepo{getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Content: "x"}},
+			storage:   nil,
 			wantErr:   true,
 			errTarget: ErrExportFormatInvalid,
 		},
@@ -1264,22 +1264,22 @@ func TestUseCase_ListByProcess(t *testing.T) {
 		wantMore  bool
 	}{
 		{
-			name:  "returns items with hasMore=false when exact page",
-			query: ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:   &fakeRepo{listByProcessResult: items},
+			name:      "returns items with hasMore=false when exact page",
+			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listByProcessResult: items},
 			wantCount: 2,
 		},
 		{
-			name:  "returns hasMore=true when overfetch",
-			query: ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 1},
-			repo:   &fakeRepo{listByProcessResult: items},
+			name:      "returns hasMore=true when overfetch",
+			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 1},
+			repo:      &fakeRepo{listByProcessResult: items},
 			wantCount: 1,
 			wantMore:  true,
 		},
 		{
-			name:  "empty result → empty list, no error",
-			query: ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:   &fakeRepo{listByProcessResult: []DraftListItem{}},
+			name:      "empty result → empty list, no error",
+			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listByProcessResult: []DraftListItem{}},
 			wantCount: 0,
 		},
 		{
@@ -1334,21 +1334,21 @@ func TestUseCase_ListAll(t *testing.T) {
 		wantCount int
 	}{
 		{
-			name:  "returns items",
-			query: ListAllQuery{TenantID: tenantID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:   &fakeRepo{listAllResult: items},
+			name:      "returns items",
+			query:     ListAllQuery{TenantID: tenantID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listAllResult: items},
 			wantCount: 1,
 		},
 		{
-			name:  "with piece_type filter",
-			query: ListAllQuery{TenantID: tenantID, PieceType: PieceTypeDefense, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:   &fakeRepo{listAllResult: items},
+			name:      "with piece_type filter",
+			query:     ListAllQuery{TenantID: tenantID, PieceType: PieceTypeDefense, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listAllResult: items},
 			wantCount: 1,
 		},
 		{
-			name:  "with status filter",
-			query: ListAllQuery{TenantID: tenantID, Status: StatusDraft, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:   &fakeRepo{listAllResult: items},
+			name:      "with status filter",
+			query:     ListAllQuery{TenantID: tenantID, Status: StatusDraft, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listAllResult: items},
 			wantCount: 1,
 		},
 		{
