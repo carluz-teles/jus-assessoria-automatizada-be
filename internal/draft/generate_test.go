@@ -665,12 +665,12 @@ func TestBuildDraftContext_TonePropagation(t *testing.T) {
 			wantTheses:       []string{"tese-prescricao", "tese-decadencia"},
 		},
 		{
-			name: "server-side default tone (tecnico-formal) propagates like any other value",
+			name: "server-side default tone (tecnico) propagates like any other value",
 			draft: &Draft{
 				PieceType: PieceTypeDefense,
-				Tone:      ToneTecnicoFormal,
+				Tone:      ToneTecnico,
 			},
-			wantTone: ToneTecnicoFormal,
+			wantTone: ToneTecnico,
 		},
 		{
 			name:  "zero-value draft: empty tone/instructions/nil theses propagate as empty",

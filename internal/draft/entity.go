@@ -36,7 +36,7 @@ type Draft struct {
 	// draft.generation_requested event) so the async worker rereads them here.
 
 	// Tone is the closed-set writing register for Gerar. Defaults to
-	// "tecnico-formal" (the DB column default — identical wording to the
+	// "tecnico" (the DB column default — identical wording to the
 	// pre-Fatia-5 prompt).
 	Tone string
 	// Instructions is free-text advogado guidance for Gerar, capped at 2000
@@ -140,19 +140,21 @@ var validPieceTypes = map[string]bool{
 // ── Generation params (Fatia 5 — teses/tom/instruções) ──────────────────────
 
 // Tone closed set — the only values POST /v1/pecas/:id/generate accepts for
-// the `tone` field. Mirrors the DB CHECK (draft_tone_check). ToneTecnicoFormal
+// the `tone` field. Mirrors the DB CHECK (draft_tone_check). ToneTecnico
 // is the default (server-side, when the caller omits or sends "").
+// Migração 0055 encurtou os rótulos (antes: tecnico-formal / direto-assertivo /
+// conciliador-institucional) pra bater com o mockup Claude Design.
 const (
-	ToneTecnicoFormal            = "tecnico-formal"
-	ToneDiretoAssertivo          = "direto-assertivo"
-	ToneConciliadorInstitucional = "conciliador-institucional"
+	ToneTecnico  = "tecnico"
+	ToneObjetivo = "objetivo"
+	ToneEnfatico = "enfatico"
 )
 
 // validTones is the lookup used by validation.
 var validTones = map[string]bool{
-	ToneTecnicoFormal:            true,
-	ToneDiretoAssertivo:          true,
-	ToneConciliadorInstitucional: true,
+	ToneTecnico:  true,
+	ToneObjetivo: true,
+	ToneEnfatico: true,
 }
 
 // Thesis is one AI-suggested legal thesis for POST /v1/pecas/:id/theses. Unlike

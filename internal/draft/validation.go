@@ -145,13 +145,13 @@ type GenerateRequest struct {
 // (an invalid tone is a 400, never a silent default); instructions, when
 // present, is trimmed then capped at 2000 runes — same trim-then-validate
 // pattern as ChatRequest.Validate(). Tone left empty is valid: the use case
-// defaults it server-side to ToneTecnicoFormal.
+// defaults it server-side to ToneTecnico.
 func (r *GenerateRequest) Validate() error {
 	r.Instructions = strings.TrimSpace(r.Instructions)
 	return validation.ValidateStruct(r,
 		validation.Field(&r.Tone,
 			validation.When(r.Tone != "",
-				validation.In(ToneTecnicoFormal, ToneDiretoAssertivo, ToneConciliadorInstitucional)),
+				validation.In(ToneTecnico, ToneObjetivo, ToneEnfatico)),
 		),
 		validation.Field(&r.Instructions,
 			validation.RuneLength(0, 2000),

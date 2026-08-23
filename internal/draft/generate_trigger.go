@@ -60,7 +60,7 @@ func NewTriggerUseCase(uow database.UnitOfWork, rw Repository, outbox OutboxPubl
 func (uc *TriggerUseCase) TriggerGeneration(ctx context.Context, cmd TriggerGenerationCommand) (*Draft, error) {
 	tone := cmd.Tone
 	if tone == "" {
-		tone = ToneTecnicoFormal
+		tone = ToneTecnico
 	}
 
 	var updated *Draft

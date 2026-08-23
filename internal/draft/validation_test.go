@@ -149,18 +149,18 @@ func TestGenerateRequest_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "tone tecnico-formal is accepted",
-			req:     GenerateRequest{Tone: ToneTecnicoFormal},
+			name:    "tone tecnico is accepted",
+			req:     GenerateRequest{Tone: ToneTecnico},
 			wantErr: false,
 		},
 		{
-			name:    "tone direto-assertivo is accepted",
-			req:     GenerateRequest{Tone: ToneDiretoAssertivo},
+			name:    "tone objetivo is accepted",
+			req:     GenerateRequest{Tone: ToneObjetivo},
 			wantErr: false,
 		},
 		{
-			name:    "tone conciliador-institucional is accepted",
-			req:     GenerateRequest{Tone: ToneConciliadorInstitucional},
+			name:    "tone enfatico is accepted",
+			req:     GenerateRequest{Tone: ToneEnfatico},
 			wantErr: false,
 		},
 		{

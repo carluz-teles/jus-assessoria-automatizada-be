@@ -356,7 +356,7 @@ func TestTemplateComposer_ComposeDraft_ToneEmpty_BackwardCompat(t *testing.T) {
 	}
 
 	withDefault := base
-	withDefault.Tone = "tecnico-formal"
+	withDefault.Tone = "tecnico"
 	explicit, err := c.ComposeDraft(AgentDraftMinuta, withDefault)
 	if err != nil {
 		t.Fatalf("ComposeDraft(tone=tecnico-formal) error = %v", err)
@@ -383,7 +383,7 @@ func TestTemplateComposer_ComposeDraft_ToneDirectives(t *testing.T) {
 	c := NewTemplateComposer()
 	base := DraftContext{PieceType: "DEFENSE"}
 
-	tones := []string{"direto-assertivo", "conciliador-institucional"}
+	tones := []string{"objetivo", "enfatico"}
 	seen := make(map[string]bool, len(tones))
 	for _, tone := range tones {
 		ctx := base

@@ -155,9 +155,9 @@ type DraftContext struct {
 
 	// ── Fatia 5 — teses/tom/instruções (Gerar-time generation params) ─────────
 
-	// Tone is the closed-set writing register: "tecnico-formal" (default),
-	// "direto-assertivo", or "conciliador-institucional". Empty behaves exactly
-	// like "tecnico-formal" — the historical prompt wording (backward-compat).
+	// Tone is the closed-set writing register: "tecnico" (default), "objetivo",
+	// or "enfatico". Empty behaves exactly like "tecnico" — the historical
+	// prompt wording (backward-compat). Migração 0055 encurtou os rótulos.
 	Tone string
 	// Instructions is free-text advogado guidance for this generation. Empty →
 	// no extra section injected.
@@ -251,7 +251,7 @@ const summarizeProcessVersion = "process_summary/v1"
 // recipient) no prompt, eliminando os placeholders [Nome do Advogado]/OAB nº [número] e os nomes
 // de parte adivinhados do teor. Quando fornecidos, devem ser usados diretamente; marcadores só
 // quando genuinamente ausentes.
-// Bumped to v5: injeta TOM (diretiva de registro/tom quando != tecnico-formal — o default produz
+// Bumped to v5: injeta TOM (diretiva de registro/tom quando != tecnico — o default produz
 // wording IDÊNTICA ao v4, backward-compat), INSTRUÇÕES (texto livre do advogado) e TESES
 // SELECIONADAS (rótulos escolhidos em /theses) no prompt.
 const draftMinutaVersion = "draft_minuta/v5"
@@ -494,8 +494,8 @@ func composeDraftMinuta(c DraftContext) Composed {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
 		sys.WriteString(pb)
 	}
-	// Tone directive (Fatia 5): empty or "tecnico-formal" adds NOTHING — the base
-	// system prompt above already IS the tecnico-formal register, so the wording
+	// Tone directive (Fatia 5): empty or "tecnico" adds NOTHING — the base
+	// system prompt above already IS the técnico register, so the wording
 	// stays byte-identical to v4 for the default/omitted case (backward-compat).
 	if td := toneDirective(c.Tone); td != "" {
 		sys.WriteString("\n\n")
@@ -574,22 +574,22 @@ func composeDraftMinuta(c DraftContext) Composed {
 }
 
 // toneDirective returns the tone-specific system directive to append for the
-// draft_minuta prompt (Fatia 5). "" and "tecnico-formal" both return "" — the
-// base system prompt above IS already the tecnico-formal register, so omitting
-// the directive for the default/empty case keeps the prompt byte-identical to
-// the pre-Fatia-5 (v4) wording, the backward-compat contract. The literal string
+// draft_minuta prompt (Fatia 5). "" and "tecnico" both return "" — the base
+// system prompt above IS already the técnico register, so omitting the
+// directive for the default/empty case keeps the prompt byte-identical to the
+// pre-Fatia-5 (v4) wording, the backward-compat contract. The literal string
 // values mirror the closed set in internal/draft/entity.go (Tone*) without
 // importing that package (advisory has no downward dependency on any slice).
 func toneDirective(tone string) string {
 	switch tone {
-	case "direto-assertivo":
-		return "TOM: adote um registro DIRETO E ASSERTIVO — frases curtas e objetivas, " +
+	case "objetivo":
+		return "TOM: adote um registro OBJETIVO — frases curtas e diretas, " +
 			"argumentação incisiva, sem rodeios ou hedging (evite \"salvo melhor juízo\", " +
 			"\"data venia\" em excesso); mantenha o rigor técnico-jurídico."
-	case "conciliador-institucional":
-		return "TOM: adote um registro CONCILIADOR E INSTITUCIONAL — cortês, ponderado, " +
-			"que preserva a relação processual e abre espaço para composição/acordo quando " +
-			"cabível, sem abrir mão do mérito técnico da tese."
+	case "enfatico":
+		return "TOM: adote um registro ENFÁTICO — vigoroso e assertivo, sublinhando " +
+			"a força dos argumentos e a gravidade das consequências, sem abrir mão do " +
+			"rigor técnico nem escorregar em adjetivação vazia."
 	default:
 		return ""
 	}
