@@ -30,6 +30,22 @@ type Draft struct {
 	SagaState    string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+
+	// ── Generation params (Fatia 5 — teses/tom/instruções) ────────────────────
+	// Chosen on POST /v1/pecas/:id/generate and persisted on the row (not on the
+	// draft.generation_requested event) so the async worker rereads them here.
+
+	// Tone is the closed-set writing register for Gerar. Defaults to
+	// "tecnico-formal" (the DB column default — identical wording to the
+	// pre-Fatia-5 prompt).
+	Tone string
+	// Instructions is free-text advogado guidance for Gerar, capped at 2000
+	// runes at the edge. Empty when the advogado provided none.
+	Instructions string
+	// SelectedTheses are the tese labels (plain strings, not structured
+	// citations) the advogado picked from /theses to steer Gerar. Empty when
+	// none were selected.
+	SelectedTheses []string
 }
 
 // PatchResult is the thin response the autosave PATCH returns: only the fields that
@@ -121,6 +137,42 @@ var validPieceTypes = map[string]bool{
 	PieceTypeOther:     true,
 }
 
+// ── Generation params (Fatia 5 — teses/tom/instruções) ──────────────────────
+
+// Tone closed set — the only values POST /v1/pecas/:id/generate accepts for
+// the `tone` field. Mirrors the DB CHECK (draft_tone_check). ToneTecnicoFormal
+// is the default (server-side, when the caller omits or sends "").
+const (
+	ToneTecnicoFormal            = "tecnico-formal"
+	ToneDiretoAssertivo          = "direto-assertivo"
+	ToneConciliadorInstitucional = "conciliador-institucional"
+)
+
+// validTones is the lookup used by validation.
+var validTones = map[string]bool{
+	ToneTecnicoFormal:            true,
+	ToneDiretoAssertivo:          true,
+	ToneConciliadorInstitucional: true,
+}
+
+// Thesis is one AI-suggested legal thesis for POST /v1/pecas/:id/theses. Unlike
+// a Finding/Citation, Reference is a plain string — jurisprudência or a legal
+// dispositivo is not a chunk anchored in the case corpus, so it carries no
+// document_id/page/quote.
+type Thesis struct {
+	Label      string `json:"label"`
+	Confidence string `json:"confidence"` // alta|media|baixa
+	Reference  string `json:"reference"`  // jurisprudência ou dispositivo legal, texto livre
+	Foundation string `json:"foundation"`
+}
+
+// ThesisConfidence closed set.
+const (
+	ThesisConfidenceAlta  = "alta"
+	ThesisConfidenceMedia = "media"
+	ThesisConfidenceBaixa = "baixa"
+)
+
 // ── Attachment (Fatia 2) ──────────────────────────────────────────────────────
 
 // Attachment is the join between a draft and an uploaded document. It represents
@@ -186,6 +238,24 @@ const (
 	documentOriginUpload   = "UPLOAD"
 )
 
+// ── Status constants (Fatia 4 — peticionamento) ─────────────────────────────
+
+// Status is the milestone lifecycle of the peça. It is distinct from saga_state
+// (which tracks the async AI generation pipeline). The CHECK constraint on
+// draft.status enforces the closed set at the DB level.
+const (
+	StatusDraft    = "DRAFT"
+	StatusReviewed = "REVIEWED"
+	StatusSigned   = "SIGNED"
+)
+
+// validDraftStatuses is the lookup used by validation.
+var validDraftStatuses = map[string]bool{
+	StatusDraft:    true,
+	StatusReviewed: true,
+	StatusSigned:   true,
+}
+
 // ── Saga state constants (Fatia 3) ───────────────────────────────────────────
 
 // The saga_state column on draft tracks the AI generation lifecycle. No DB CHECK is
@@ -198,6 +268,7 @@ const (
 	// AI review yet. The advogado can then trigger Revisar to produce suggestions.
 	SagaStateDrafted  = "DRAFTED"
 	SagaStateReviewed = "REVIEWED"
+	SagaStateFiled    = "FILED"
 	SagaStateFailed   = "FAILED"
 )
 
@@ -345,4 +416,66 @@ func containsAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// ── Petition (Fatia 4 — peticionamento) ─────────────────────────────────────
+
+// Petition is a signed, filed peça. It is immutable after creation. No tenant_id
+// directly — isolation is via the draft FK (JOIN draft.tenant_id).
+type Petition struct {
+	ID             string
+	DraftID        string
+	CourtRecordID  string
+	FiledAt        time.Time
+	Receipt        map[string]any
+	ObservedResult string // empty until observed
+}
+
+// ObservedResult closed set — the outcome the advogado records after the petition
+// is filed.
+const (
+	ObservedResultOK           = "OK"
+	ObservedResultAmendment    = "AMENDMENT"
+	ObservedResultNotAdmitted  = "NOT_ADMITTED"
+	ObservedResultUntimely     = "UNTIMELY"
+)
+
+// validObservedResults is the lookup used by validation.
+var validObservedResults = map[string]bool{
+	ObservedResultOK:          true,
+	ObservedResultAmendment:   true,
+	ObservedResultNotAdmitted: true,
+	ObservedResultUntimely:    true,
+}
+
+// ── Coverage summary (Fatia 4 — list read model) ────────────────────────────
+
+// CoverageSummary is the trimmed review snapshot exposed in list endpoints.
+// It comes from the most recent review for a draft.
+type CoverageSummary struct {
+	Grounded         bool `json:"grounded"`
+	ChunksUsed       int  `json:"chunks_used"`
+	SuggestionsTotal int  `json:"suggestions_total"`
+}
+
+// ── List read models (Fatia 4) ──────────────────────────────────────────────
+
+// DraftListItem is one row in the paginated list of peças. It carries the
+// fields the client needs for the list card — not the full aggregate.
+type DraftListItem struct {
+	ID              string
+	PieceType       string
+	Title           string
+	Status          string
+	SagaState       string
+	CoverageSummary *CoverageSummary
+	FiledAt         *time.Time
+	ObservedResult  *string
+	CreatedAt       time.Time
+}
+
+// DraftListResult is a page of peças plus whether a further page exists.
+type DraftListResult struct {
+	Items   []DraftListItem
+	HasMore bool
 }

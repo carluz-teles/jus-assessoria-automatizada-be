@@ -122,6 +122,28 @@ func (q *Queries) GetChatThread(ctx context.Context, draftID uuid.UUID) ([]ChatM
 	return items, nil
 }
 
+const getCourtRecordIDByIntimation = `-- name: GetCourtRecordIDByIntimation :one
+SELECT cr.id AS court_record_id
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.id = $1 AND cr.tenant_id = $2
+`
+
+type GetCourtRecordIDByIntimationParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Resolve the court_record_id for an intimation, scoped to tenant via
+// court_record.tenant_id. Returns pgx.ErrNoRows when the intimation has no
+// linked court record (the caller treats empty string as "not found").
+func (q *Queries) GetCourtRecordIDByIntimation(ctx context.Context, arg GetCourtRecordIDByIntimationParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getCourtRecordIDByIntimation, arg.ID, arg.TenantID)
+	var court_record_id uuid.UUID
+	err := row.Scan(&court_record_id)
+	return court_record_id, err
+}
+
 const getDocumentForAttachment = `-- name: GetDocumentForAttachment :one
 SELECT id, tenant_id, status, origin
 FROM document
@@ -235,7 +257,8 @@ const getDraftByID = `-- name: GetDraftByID :one
 SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
-       created_at, updated_at
+       created_at, updated_at,
+       tone, instructions, selected_theses
 FROM draft
 WHERE id = $1 AND tenant_id = $2
 `
@@ -246,21 +269,27 @@ type GetDraftByIDParams struct {
 }
 
 type GetDraftByIDRow struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       pgtype.UUID        `json:"case_id"`
-	IntimationID pgtype.UUID        `json:"intimation_id"`
-	PieceType    string             `json:"piece_type"`
-	Title        string             `json:"title"`
-	Content      *string            `json:"content"`
-	Status       string             `json:"status"`
-	SagaState    string             `json:"saga_state"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	CaseID         pgtype.UUID        `json:"case_id"`
+	IntimationID   pgtype.UUID        `json:"intimation_id"`
+	PieceType      string             `json:"piece_type"`
+	Title          string             `json:"title"`
+	Content        *string            `json:"content"`
+	Status         string             `json:"status"`
+	SagaState      string             `json:"saga_state"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	Tone           string             `json:"tone"`
+	Instructions   *string            `json:"instructions"`
+	SelectedTheses []string           `json:"selected_theses"`
 }
 
 // Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
-// foreign-tenant id yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+// foreign-tenant id yields pgx.ErrNoRows → ErrDraftNotFound (→ 404). Includes the
+// Gerar-time generation params (tone/instructions/selected_theses, Fatia 5) so
+// OnGenerationRequested (the async worker, which reloads the draft) has them
+// without the event payload carrying them.
 func (q *Queries) GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (GetDraftByIDRow, error) {
 	row := q.db.QueryRow(ctx, getDraftByID, arg.ID, arg.TenantID)
 	var i GetDraftByIDRow
@@ -276,6 +305,9 @@ func (q *Queries) GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (Get
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Tone,
+		&i.Instructions,
+		&i.SelectedTheses,
 	)
 	return i, err
 }
@@ -609,6 +641,34 @@ func (q *Queries) GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraft
 	return items, nil
 }
 
+const getPetitionByDraftID = `-- name: GetPetitionByDraftID :one
+SELECT p.id, p.draft_id, p.court_record_id, p.filed_at, p.receipt, p.observed_result
+FROM petition p
+JOIN draft d ON d.id = p.draft_id
+WHERE p.draft_id = $1 AND d.tenant_id = $2
+`
+
+type GetPetitionByDraftIDParams struct {
+	DraftID  uuid.UUID `json:"draft_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Load the existing petition for a draft, scoped to tenant via JOIN. Returns
+// pgx.ErrNoRows when no petition exists (the caller treats nil as "not filed").
+func (q *Queries) GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDraftIDParams) (Petition, error) {
+	row := q.db.QueryRow(ctx, getPetitionByDraftID, arg.DraftID, arg.TenantID)
+	var i Petition
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.CourtRecordID,
+		&i.FiledAt,
+		&i.Receipt,
+		&i.ObservedResult,
+	)
+	return i, err
+}
+
 const insertChatMessage = `-- name: InsertChatMessage :one
 
 INSERT INTO chat_message (draft_id, role, content, citations, grounded, model_version)
@@ -781,6 +841,40 @@ func (q *Queries) InsertDraftAttachment(ctx context.Context, arg InsertDraftAtta
 	return i, err
 }
 
+const insertPetition = `-- name: InsertPetition :one
+INSERT INTO petition (draft_id, court_record_id, filed_at, receipt)
+VALUES ($1, $2, $3, $4)
+RETURNING id, draft_id, court_record_id, filed_at, receipt, observed_result
+`
+
+type InsertPetitionParams struct {
+	DraftID       uuid.UUID          `json:"draft_id"`
+	CourtRecordID uuid.UUID          `json:"court_record_id"`
+	FiledAt       pgtype.Timestamptz `json:"filed_at"`
+	Receipt       []byte             `json:"receipt"`
+}
+
+// Persist a filed petition (immutable). No tenant_id on petition — isolation
+// is via the draft FK (JOIN draft.tenant_id). Returns all columns.
+func (q *Queries) InsertPetition(ctx context.Context, arg InsertPetitionParams) (Petition, error) {
+	row := q.db.QueryRow(ctx, insertPetition,
+		arg.DraftID,
+		arg.CourtRecordID,
+		arg.FiledAt,
+		arg.Receipt,
+	)
+	var i Petition
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.CourtRecordID,
+		&i.FiledAt,
+		&i.Receipt,
+		&i.ObservedResult,
+	)
+	return i, err
+}
+
 const insertReview = `-- name: InsertReview :one
 INSERT INTO review (draft_id, findings, coverage, model_version, rules_version, status, generated_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -834,6 +928,279 @@ func (q *Queries) InsertReview(ctx context.Context, arg InsertReviewParams) (Ins
 		&i.Status,
 		&i.GeneratedAt,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const listDraftsAll = `-- name: ListDraftsAll :many
+SELECT
+    d.id,
+    d.piece_type,
+    d.title,
+    d.status,
+    d.saga_state,
+    d.created_at,
+    p.filed_at,
+    p.observed_result,
+    r.coverage AS review_coverage
+FROM draft d
+LEFT JOIN petition p ON p.draft_id = d.id
+LEFT JOIN LATERAL (
+    SELECT rv.coverage
+    FROM review rv
+    WHERE rv.draft_id = d.id
+    ORDER BY rv.generated_at DESC
+    LIMIT 1
+) r ON true
+WHERE d.tenant_id = $1
+  AND ($2::text = '' OR d.piece_type = $2)
+  AND ($3::text = '' OR d.status = $3)
+  AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
+ORDER BY d.created_at DESC, d.id DESC
+LIMIT $6
+`
+
+type ListDraftsAllParams struct {
+	TenantID uuid.UUID          `json:"tenant_id"`
+	Column2  string             `json:"column_2"`
+	Column3  string             `json:"column_3"`
+	Column4  pgtype.Timestamptz `json:"column_4"`
+	Column5  uuid.UUID          `json:"column_5"`
+	Limit    int32              `json:"limit"`
+}
+
+type ListDraftsAllRow struct {
+	ID             uuid.UUID          `json:"id"`
+	PieceType      string             `json:"piece_type"`
+	Title          string             `json:"title"`
+	Status         string             `json:"status"`
+	SagaState      string             `json:"saga_state"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	FiledAt        pgtype.Timestamptz `json:"filed_at"`
+	ObservedResult *string            `json:"observed_result"`
+	ReviewCoverage []byte             `json:"review_coverage"`
+}
+
+// Paginated list of all peças for a tenant, ordered by (created_at DESC,
+// id DESC). Optional piece_type and status filters. Coverage summary from
+// latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error) {
+	rows, err := q.db.Query(ctx, listDraftsAll,
+		arg.TenantID,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDraftsAllRow
+	for rows.Next() {
+		var i ListDraftsAllRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PieceType,
+			&i.Title,
+			&i.Status,
+			&i.SagaState,
+			&i.CreatedAt,
+			&i.FiledAt,
+			&i.ObservedResult,
+			&i.ReviewCoverage,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDraftsByProcess = `-- name: ListDraftsByProcess :many
+SELECT
+    d.id,
+    d.piece_type,
+    d.title,
+    d.status,
+    d.saga_state,
+    d.created_at,
+    p.filed_at,
+    p.observed_result,
+    r.coverage AS review_coverage
+FROM draft d
+JOIN court_record cr ON cr.case_id = d.case_id AND cr.tenant_id = d.tenant_id
+LEFT JOIN petition p ON p.draft_id = d.id
+LEFT JOIN LATERAL (
+    SELECT rv.coverage
+    FROM review rv
+    WHERE rv.draft_id = d.id
+    ORDER BY rv.generated_at DESC
+    LIMIT 1
+) r ON true
+WHERE d.tenant_id = $1
+  AND cr.id = $2
+  AND (d.created_at, d.id) < ($3::timestamptz, $4::uuid)
+ORDER BY d.created_at DESC, d.id DESC
+LIMIT $5
+`
+
+type ListDraftsByProcessParams struct {
+	TenantID uuid.UUID          `json:"tenant_id"`
+	ID       uuid.UUID          `json:"id"`
+	Column3  pgtype.Timestamptz `json:"column_3"`
+	Column4  uuid.UUID          `json:"column_4"`
+	Limit    int32              `json:"limit"`
+}
+
+type ListDraftsByProcessRow struct {
+	ID             uuid.UUID          `json:"id"`
+	PieceType      string             `json:"piece_type"`
+	Title          string             `json:"title"`
+	Status         string             `json:"status"`
+	SagaState      string             `json:"saga_state"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	FiledAt        pgtype.Timestamptz `json:"filed_at"`
+	ObservedResult *string            `json:"observed_result"`
+	ReviewCoverage []byte             `json:"review_coverage"`
+}
+
+// Paginated list of peças for a given court_record_id, ordered by (created_at DESC,
+// id DESC). The :id param is court_record.id; we resolve case_id via JOIN.
+// Coverage summary is resolved from the latest review via LEFT JOIN LATERAL.
+// Over-fetch by 1 for hasMore detection.
+func (q *Queries) ListDraftsByProcess(ctx context.Context, arg ListDraftsByProcessParams) ([]ListDraftsByProcessRow, error) {
+	rows, err := q.db.Query(ctx, listDraftsByProcess,
+		arg.TenantID,
+		arg.ID,
+		arg.Column3,
+		arg.Column4,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDraftsByProcessRow
+	for rows.Next() {
+		var i ListDraftsByProcessRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PieceType,
+			&i.Title,
+			&i.Status,
+			&i.SagaState,
+			&i.CreatedAt,
+			&i.FiledAt,
+			&i.ObservedResult,
+			&i.ReviewCoverage,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setGenerationParams = `-- name: SetGenerationParams :exec
+
+UPDATE draft
+SET tone            = $3,
+    instructions    = $4,
+    selected_theses = $5,
+    updated_at      = now()
+WHERE id = $1 AND tenant_id = $2
+`
+
+type SetGenerationParamsParams struct {
+	ID             uuid.UUID `json:"id"`
+	TenantID       uuid.UUID `json:"tenant_id"`
+	Tone           string    `json:"tone"`
+	Instructions   *string   `json:"instructions"`
+	SelectedTheses []string  `json:"selected_theses"`
+}
+
+// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+// These are the three new queries the async generation saga needs.
+// Persist the Gerar-time generation params (tone/instructions/selected_theses,
+// Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
+// the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event
+// payload does NOT carry these — the async worker rereads the draft row instead.
+// Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. The caller already
+// tenant-guarded (id, tenant_id) via GetDraftByID earlier in the same tx, so a
+// no-match here is not expected in practice; the repo does not re-check
+// RowsAffected (mirrors DeleteReviewsForDraft's :exec, which is also fire-and-forget
+// within an already-guarded tx).
+func (q *Queries) SetGenerationParams(ctx context.Context, arg SetGenerationParamsParams) error {
+	_, err := q.db.Exec(ctx, setGenerationParams,
+		arg.ID,
+		arg.TenantID,
+		arg.Tone,
+		arg.Instructions,
+		arg.SelectedTheses,
+	)
+	return err
+}
+
+const signDraft = `-- name: SignDraft :one
+
+UPDATE draft
+SET status     = 'SIGNED',
+    signed_at  = now(),
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at, signed_at
+`
+
+type SignDraftParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type SignDraftRow struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CaseID       pgtype.UUID        `json:"case_id"`
+	IntimationID pgtype.UUID        `json:"intimation_id"`
+	PieceType    string             `json:"piece_type"`
+	Title        string             `json:"title"`
+	Content      *string            `json:"content"`
+	Status       string             `json:"status"`
+	SagaState    string             `json:"saga_state"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	SignedAt     pgtype.Timestamptz `json:"signed_at"`
+}
+
+// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+// Transition draft.status to SIGNED and set signed_at = now(). Scoped to
+// (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+func (q *Queries) SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error) {
+	row := q.db.QueryRow(ctx, signDraft, arg.ID, arg.TenantID)
+	var i SignDraftRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CaseID,
+		&i.IntimationID,
+		&i.PieceType,
+		&i.Title,
+		&i.Content,
+		&i.Status,
+		&i.SagaState,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.SignedAt,
 	)
 	return i, err
 }
@@ -914,8 +1281,38 @@ func (q *Queries) UpdateDraftContent(ctx context.Context, arg UpdateDraftContent
 	return i, err
 }
 
-const updateSagaState = `-- name: UpdateSagaState :one
+const updateObservedResult = `-- name: UpdateObservedResult :one
+UPDATE petition
+SET observed_result = $3
+FROM draft d
+WHERE petition.draft_id = $1
+  AND d.id = petition.draft_id
+  AND d.tenant_id = $2
+RETURNING petition.id, petition.draft_id, petition.observed_result
+`
 
+type UpdateObservedResultParams struct {
+	DraftID        uuid.UUID `json:"draft_id"`
+	TenantID       uuid.UUID `json:"tenant_id"`
+	ObservedResult *string   `json:"observed_result"`
+}
+
+type UpdateObservedResultRow struct {
+	ID             uuid.UUID `json:"id"`
+	DraftID        uuid.UUID `json:"draft_id"`
+	ObservedResult *string   `json:"observed_result"`
+}
+
+// Patch the observed_result on a petition, scoped to tenant via JOIN. A miss
+// (no petition or wrong tenant) → pgx.ErrNoRows → ErrPetitionNotFound.
+func (q *Queries) UpdateObservedResult(ctx context.Context, arg UpdateObservedResultParams) (UpdateObservedResultRow, error) {
+	row := q.db.QueryRow(ctx, updateObservedResult, arg.DraftID, arg.TenantID, arg.ObservedResult)
+	var i UpdateObservedResultRow
+	err := row.Scan(&i.ID, &i.DraftID, &i.ObservedResult)
+	return i, err
+}
+
+const updateSagaState = `-- name: UpdateSagaState :one
 UPDATE draft
 SET saga_state = $3,
     content    = CASE WHEN $4::boolean THEN $5 ELSE content END,
@@ -949,8 +1346,6 @@ type UpdateSagaStateRow struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
-// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
-// These are the three new queries the async generation saga needs.
 // Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 // on success, FAILED on LLM error). Also updates content when the generator returns new
 // text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path

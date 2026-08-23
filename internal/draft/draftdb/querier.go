@@ -32,6 +32,10 @@ type Querier interface {
 	// the most-recent 50 turned back into ASC order for display).
 	// No tenant guard here — the caller must have verified draft ownership.
 	GetChatThread(ctx context.Context, draftID uuid.UUID) ([]ChatMessage, error)
+	// Resolve the court_record_id for an intimation, scoped to tenant via
+	// court_record.tenant_id. Returns pgx.ErrNoRows when the intimation has no
+	// linked court record (the caller treats empty string as "not found").
+	GetCourtRecordIDByIntimation(ctx context.Context, arg GetCourtRecordIDByIntimationParams) (uuid.UUID, error)
 	// Load the minimal document fields the POST /v1/pecas/:id/anexos use case needs to
 	// validate before linking: status (must be UPLOADED) and origin (must be UPLOAD, never
 	// COURT). Scoped to (id, tenant_id) — a foreign or missing document → pgx.ErrNoRows →
@@ -44,7 +48,10 @@ type Querier interface {
 	// Scoped to (draft_id, tenant_id) — barrier 1; RLS on draft_attachment is barrier 2.
 	GetDraftAttachments(ctx context.Context, arg GetDraftAttachmentsParams) ([]GetDraftAttachmentsRow, error)
 	// Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
-	// foreign-tenant id yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+	// foreign-tenant id yields pgx.ErrNoRows → ErrDraftNotFound (→ 404). Includes the
+	// Gerar-time generation params (tone/instructions/selected_theses, Fatia 5) so
+	// OnGenerationRequested (the async worker, which reloads the draft) has them
+	// without the event payload carrying them.
 	GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (GetDraftByIDRow, error)
 	// Fetch the draft that already exists for the (tenant_id, intimation_id) pair —
 	// used by the idempotent POST path when the INSERT fails with 23505. Filters by
@@ -77,6 +84,9 @@ type Querier interface {
 	// empty jsonb array (never NULL) when a party has no advogado. Ordered by
 	// role then name for deterministic iteration.
 	GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraftParams) ([]GetPartiesForDraftRow, error)
+	// Load the existing petition for a draft, scoped to tenant via JOIN. Returns
+	// pgx.ErrNoRows when no petition exists (the caller treats nil as "not filed").
+	GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDraftIDParams) (Petition, error)
 	// ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
 	// Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
 	// first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).
@@ -107,11 +117,39 @@ type Querier interface {
 	// NOTHING maps it to pgx.ErrNoRows so the repo can return ErrAttachmentAlreadyLinked
 	// without a 23505 transaction abort.
 	InsertDraftAttachment(ctx context.Context, arg InsertDraftAttachmentParams) (DraftAttachment, error)
+	// Persist a filed petition (immutable). No tenant_id on petition — isolation
+	// is via the draft FK (JOIN draft.tenant_id). Returns all columns.
+	InsertPetition(ctx context.Context, arg InsertPetitionParams) (Petition, error)
 	// Persist one AI review (findings + coverage as jsonb, model_version, rules_version,
 	// status, generated_at). No tenant_id — isolation is via JOIN on draft.tenant_id (the
 	// caller already tenant-guarded the draft before calling this). ON CONFLICT is absent
 	// (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
 	InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error)
+	// Paginated list of all peças for a tenant, ordered by (created_at DESC,
+	// id DESC). Optional piece_type and status filters. Coverage summary from
+	// latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+	ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error)
+	// Paginated list of peças for a given court_record_id, ordered by (created_at DESC,
+	// id DESC). The :id param is court_record.id; we resolve case_id via JOIN.
+	// Coverage summary is resolved from the latest review via LEFT JOIN LATERAL.
+	// Over-fetch by 1 for hasMore detection.
+	ListDraftsByProcess(ctx context.Context, arg ListDraftsByProcessParams) ([]ListDraftsByProcessRow, error)
+	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+	// These are the three new queries the async generation saga needs.
+	// Persist the Gerar-time generation params (tone/instructions/selected_theses,
+	// Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
+	// the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event
+	// payload does NOT carry these — the async worker rereads the draft row instead.
+	// Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. The caller already
+	// tenant-guarded (id, tenant_id) via GetDraftByID earlier in the same tx, so a
+	// no-match here is not expected in practice; the repo does not re-check
+	// RowsAffected (mirrors DeleteReviewsForDraft's :exec, which is also fire-and-forget
+	// within an already-guarded tx).
+	SetGenerationParams(ctx context.Context, arg SetGenerationParamsParams) error
+	// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+	// Transition draft.status to SIGNED and set signed_at = now(). Scoped to
+	// (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+	SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error)
 	// Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
 	// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).
@@ -120,8 +158,9 @@ type Querier interface {
 	// (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
 	// or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
 	UpdateDraftContent(ctx context.Context, arg UpdateDraftContentParams) (UpdateDraftContentRow, error)
-	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
-	// These are the three new queries the async generation saga needs.
+	// Patch the observed_result on a petition, scoped to tenant via JOIN. A miss
+	// (no petition or wrong tenant) → pgx.ErrNoRows → ErrPetitionNotFound.
+	UpdateObservedResult(ctx context.Context, arg UpdateObservedResultParams) (UpdateObservedResultRow, error)
 	// Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 	// on success, FAILED on LLM error). Also updates content when the generator returns new
 	// text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path

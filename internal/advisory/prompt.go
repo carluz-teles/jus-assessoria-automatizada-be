@@ -152,6 +152,19 @@ type DraftContext struct {
 	// Chunks are the RAG top-K hits (text only). Empty → grounded=false (degraded).
 	Chunks   []string
 	Playbook string // always empty in v0
+
+	// ── Fatia 5 — teses/tom/instruções (Gerar-time generation params) ─────────
+
+	// Tone is the closed-set writing register: "tecnico-formal" (default),
+	// "direto-assertivo", or "conciliador-institucional". Empty behaves exactly
+	// like "tecnico-formal" — the historical prompt wording (backward-compat).
+	Tone string
+	// Instructions is free-text advogado guidance for this generation. Empty →
+	// no extra section injected.
+	Instructions string
+	// SelectedTheses are tese labels (plain strings) the advogado picked from
+	// /theses to steer this generation. Empty → no extra section injected.
+	SelectedTheses []string
 }
 
 // ReviewContext is the per-draft signal the review_minuta composer uses. It carries the
@@ -198,6 +211,11 @@ type PromptComposer interface {
 	ComposeDraft(agent string, c DraftContext) (Composed, error)
 	ComposeChat(agent string, c ChatContext) (Composed, error)
 	ComposeReview(agent string, c ReviewContext) (Composed, error)
+	// ComposeTheses builds the (system, user, version) for the suggest_theses agent
+	// (POST /v1/pecas/:id/theses — stateless, read+LLM only). Reuses DraftContext
+	// (same case signal draft_minuta uses) since the theses suggestion needs the
+	// same grounding.
+	ComposeTheses(agent string, c DraftContext) (Composed, error)
 }
 
 // Agent identifiers — one per specialized advisory task (erd-ai-advisory.md §4). Each maps to a
@@ -209,6 +227,7 @@ const (
 	AgentDraftMinuta       = "draft_minuta"
 	AgentChatGrounding     = "chat_grounding"
 	AgentReviewMinuta      = "review_minuta"
+	AgentSuggestTheses     = "suggest_theses"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
@@ -232,7 +251,14 @@ const summarizeProcessVersion = "process_summary/v1"
 // recipient) no prompt, eliminando os placeholders [Nome do Advogado]/OAB nº [número] e os nomes
 // de parte adivinhados do teor. Quando fornecidos, devem ser usados diretamente; marcadores só
 // quando genuinamente ausentes.
-const draftMinutaVersion = "draft_minuta/v4"
+// Bumped to v5: injeta TOM (diretiva de registro/tom quando != tecnico-formal — o default produz
+// wording IDÊNTICA ao v4, backward-compat), INSTRUÇÕES (texto livre do advogado) e TESES
+// SELECIONADAS (rótulos escolhidos em /theses) no prompt.
+const draftMinutaVersion = "draft_minuta/v5"
+
+// suggestThesesVersion is the pinned version of the suggest_theses template (POST
+// /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
+const suggestThesesVersion = "suggest_theses/v1"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -381,6 +407,17 @@ func (*TemplateComposer) ComposeReview(agent string, c ReviewContext) (Composed,
 	}
 }
 
+// ComposeTheses builds the (system, user, version) for the suggest_theses agent from the draft
+// context. An unknown agent is a programmer error surfaced as a typed invalid.
+func (*TemplateComposer) ComposeTheses(agent string, c DraftContext) (Composed, error) {
+	switch agent {
+	case AgentSuggestTheses:
+		return composeSuggestTheses(c), nil
+	default:
+		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
+	}
+}
+
 // composeDraftMinuta renders the draft_minuta instruction-set (v4). The system message describes
 // the legal writing role with the canonical structure and the gold rule (use real data, no
 // placeholders for provided fields, including structured parties and signing-lawyer OAB). The user
@@ -457,6 +494,13 @@ func composeDraftMinuta(c DraftContext) Composed {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
 		sys.WriteString(pb)
 	}
+	// Tone directive (Fatia 5): empty or "tecnico-formal" adds NOTHING — the base
+	// system prompt above already IS the tecnico-formal register, so the wording
+	// stays byte-identical to v4 for the default/omitted case (backward-compat).
+	if td := toneDirective(c.Tone); td != "" {
+		sys.WriteString("\n\n")
+		sys.WriteString(td)
+	}
 
 	lines := make([]string, 0, 16)
 	add := func(label, value string) {
@@ -505,6 +549,19 @@ func composeDraftMinuta(c DraftContext) Composed {
 		}
 	}
 
+	// Instructions (Fatia 5): free-text advogado guidance for this generation.
+	// Omitted entirely when empty (no dangling label).
+	if instr := strings.TrimSpace(c.Instructions); instr != "" {
+		lines = append(lines, "Instruções específicas do advogado para esta minuta:\n"+instr)
+	}
+
+	// Selected theses (Fatia 5): tese labels picked from /theses to steer this
+	// generation. Omitted entirely when empty.
+	if len(c.SelectedTheses) > 0 {
+		lines = append(lines, "Teses selecionadas pelo advogado (desenvolva estas no \"II – DO DIREITO\"):\n- "+
+			strings.Join(c.SelectedTheses, "\n- "))
+	}
+
 	var usr strings.Builder
 	if len(lines) == 0 {
 		usr.WriteString("(sem contexto adicional — modo degradado)")
@@ -514,6 +571,108 @@ func composeDraftMinuta(c DraftContext) Composed {
 	usr.WriteString("\n\nRedija a minuta completa da peça seguindo as instruções.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftMinutaVersion}
+}
+
+// toneDirective returns the tone-specific system directive to append for the
+// draft_minuta prompt (Fatia 5). "" and "tecnico-formal" both return "" — the
+// base system prompt above IS already the tecnico-formal register, so omitting
+// the directive for the default/empty case keeps the prompt byte-identical to
+// the pre-Fatia-5 (v4) wording, the backward-compat contract. The literal string
+// values mirror the closed set in internal/draft/entity.go (Tone*) without
+// importing that package (advisory has no downward dependency on any slice).
+func toneDirective(tone string) string {
+	switch tone {
+	case "direto-assertivo":
+		return "TOM: adote um registro DIRETO E ASSERTIVO — frases curtas e objetivas, " +
+			"argumentação incisiva, sem rodeios ou hedging (evite \"salvo melhor juízo\", " +
+			"\"data venia\" em excesso); mantenha o rigor técnico-jurídico."
+	case "conciliador-institucional":
+		return "TOM: adote um registro CONCILIADOR E INSTITUCIONAL — cortês, ponderado, " +
+			"que preserva a relação processual e abre espaço para composição/acordo quando " +
+			"cabível, sem abrir mão do mérito técnico da tese."
+	default:
+		return ""
+	}
+}
+
+// composeSuggestTheses renders the suggest_theses instruction-set (POST
+// /v1/pecas/:id/theses — stateless, read+LLM only, no writer). The system message
+// instructs the model to SUGGEST candidate legal theses (not draft the minuta), each
+// mapped to a plain-text reference (jurisprudência or dispositivo legal) — unlike a
+// review Finding, a thesis reference is NOT a chunk anchored in the case corpus, so
+// it carries no document_id/page/quote. The output schema (theses array) lives with
+// the caller (ThesesUseCase in theses.go). Reuses the same context-injection lines as
+// composeDraftMinuta (same case signal), minus the tone/instructions/theses fields
+// (those steer Gerar, not the thesis suggestion itself).
+func composeSuggestTheses(c DraftContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um assistente jurídico brasileiro especializado em teses de defesa/ataque. " +
+			"A partir do contexto do caso (teor da intimação, partes, trechos dos autos), sugira " +
+			"TESES JURÍDICAS candidatas que o advogado pode desenvolver na peça. Cada tese tem: " +
+			"`label` (nome curto da tese, ex.: \"Prescrição intercorrente\"), `confidence` (um de: " +
+			"alta, media, baixa — a força da tese neste caso concreto), `reference` (a jurisprudência " +
+			"ou o dispositivo legal que fundamenta a tese, em texto livre, ex.: \"art. 206, §5º, I, " +
+			"CC\" ou \"STJ, REsp 1.234.567/SP\"), `foundation` (explicação curta de por que a tese " +
+			"se aplica a este caso).\n\n" +
+			"REGRAS OBRIGATÓRIAS:\n" +
+			"- NÃO invente fatos que não estejam no contexto; a tese deve ser aplicável ao caso " +
+			"descrito, não genérica.\n" +
+			"- `reference` é texto livre (não um trecho literal dos autos) — cite a norma ou o " +
+			"precedente pelo nome/número usual, sem inventar números de processo.\n" +
+			"- Máximo 8 teses, ordenadas da mais forte (confidence=alta) para a mais fraca.\n" +
+			"- Se o contexto for insuficiente para qualquer tese com fundamento real, retorne uma " +
+			"lista vazia em vez de supor.",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório:\n")
+		sys.WriteString(pb)
+	}
+
+	lines := make([]string, 0, 12)
+	add := func(label, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			lines = append(lines, label+": "+v)
+		}
+	}
+	add("Tipo da peça", c.PieceType)
+	add("Tribunal", c.Court)
+	add("Órgão julgador/Vara", c.JudgingBody)
+	add("Classe/rito", c.Class)
+	add("Assunto", c.Subject)
+	add("Grau", c.Degree)
+	add("Tipo de intimação", c.IntimationType)
+
+	for _, p := range c.Parties {
+		label := roleLabel(p.Role)
+		value := p.Name
+		if p.Counsel != "" {
+			value += " (adv. " + p.Counsel + ")"
+		}
+		add(label, value)
+	}
+
+	add("TEOR DA INTIMAÇÃO", c.IntimationText)
+
+	if len(c.Chunks) > 0 {
+		lines = append(lines, "Trechos relevantes dos autos:")
+		for i, chunk := range c.Chunks {
+			if i >= 8 {
+				break
+			}
+			lines = append(lines, strconv.Itoa(i+1)+". "+chunk)
+		}
+	}
+
+	var usr strings.Builder
+	if len(lines) == 0 {
+		usr.WriteString("(sem contexto adicional — modo degradado)")
+	} else {
+		usr.WriteString(strings.Join(lines, "\n"))
+	}
+	usr.WriteString("\n\nSugira as teses jurídicas aplicáveis a este caso.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: suggestThesesVersion}
 }
 
 // roleLabel converts the DB party role to a Portuguese label for the prompt.

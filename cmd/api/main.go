@@ -317,9 +317,11 @@ func run(logger *slog.Logger) error {
 	// shared outbox + unit of work), mirroring the deadline composition. Built to fail
 	// fast on bad credentials at boot and logged as ready. Without S3 the slice stays
 	// unmounted (documentHandler nil → the router nil-guard skips it).
+	var storageClient *storage.Client
 	var documentHandler *document.Handler
 	if cfg.S3Enabled() {
-		storageClient, err := storage.New(ctx, storage.Options{
+		var err error
+		storageClient, err = storage.New(ctx, storage.Options{
 			Endpoint:  cfg.S3Endpoint,
 			Region:    cfg.S3Region,
 			Bucket:    cfg.S3Bucket,
@@ -353,9 +355,16 @@ func run(logger *slog.Logger) error {
 	// cycle) — no outbox needed. It reuses the SAME taskGenerator + resumeEmbedder
 	// already wired above (same OpenRouter model slug, same Voyage embedder).
 	draftRepo := draft.NewRepository()
-	draftUC := draft.NewUseCase(uow, draftRepo)
+	draftOpts := []draft.Option{draft.WithOutbox(events.NewOutbox())}
+	if storageClient != nil {
+		draftOpts = append(draftOpts, draft.WithStorage(storageClient))
+	}
+	draftUC := draft.NewUseCase(uow, draftRepo, draftOpts...)
 	draftTrigger := draft.NewTriggerUseCase(uow, draftRepo, events.NewOutbox())
-	draftHandler := draft.NewHandler(draftUC).WithGenerator(draftTrigger)
+	draftHandler := draft.NewHandler(draftUC).
+		WithGenerator(draftTrigger).
+		WithLister(draftUC).
+		WithExport(draftUC)
 
 	// Chat use case (Fatia 3b): reuses taskGenerator + resumeEmbedder + advisory
 	// composer already instantiated above. nil generator / nil embedder → degraded
@@ -390,6 +399,20 @@ func run(logger *slog.Logger) error {
 		Model:    cfg.OpenRouterModel,
 	})
 	draftHandler = draftHandler.WithReviewer(reviewUC)
+
+	// Theses use case (Fatia 5 — Sugerir Teses síncrono): same deps as ReviewUseCase,
+	// minus a writer (STATELESS — read+LLM only, no saga_state transition, no
+	// persisted row). nil generator → ErrIANotConfigured (422) — never a boot failure.
+	thesesUC := draft.NewThesesUseCase(draft.ThesesUseCaseParams{
+		UoW:      uow,
+		Reader:   draftRepo,
+		Gen:      taskGenerator,
+		Emb:      chatEmbedder,
+		Search:   indexing.SearchDeps{Pool: pool},
+		Composer: advisory.NewTemplateComposer(),
+		Model:    cfg.OpenRouterModel,
+	})
+	draftHandler = draftHandler.WithTheses(thesesUC)
 
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{

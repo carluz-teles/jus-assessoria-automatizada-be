@@ -182,8 +182,8 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
 
-	if out.PromptVersion != "draft_minuta/v4" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v4", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v5" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v5", out.PromptVersion)
 	}
 
 	// System must contain the gold rule (v4: parties + signing lawyer instruction).
@@ -269,8 +269,8 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
 	if !strings.Contains(out.User, "sem contexto adicional") {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
-	if out.PromptVersion != "draft_minuta/v4" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v3", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v5" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v5", out.PromptVersion)
 	}
 }
 
@@ -332,5 +332,180 @@ func TestTemplateComposer_ComposeDraft_v4_ChunksInjected(t *testing.T) {
 		if !strings.Contains(out.User, want) {
 			t.Errorf("user prompt missing %q\n---\n%s", want, out.User)
 		}
+	}
+}
+
+// ── Fatia 5 — teses/tom/instruções ───────────────────────────────────────────
+
+// TestTemplateComposer_ComposeDraft_ToneEmpty_BackwardCompat is the pin: omitting
+// Tone (empty string) MUST produce byte-identical System/User to explicitly passing
+// the default tone — the pre-Fatia-5 wording, unchanged. This is the acceptance
+// criterion "tone vazio/omitido → default server-side tecnico-formal, wording
+// idêntica ao comportamento atual".
+func TestTemplateComposer_ComposeDraft_ToneEmpty_BackwardCompat(t *testing.T) {
+	c := NewTemplateComposer()
+	base := DraftContext{
+		PieceType:      "DEFENSE",
+		IntimationText: "Fica o réu citado a contestar.",
+		Court:          "TJSP",
+	}
+
+	empty, err := c.ComposeDraft(AgentDraftMinuta, base)
+	if err != nil {
+		t.Fatalf("ComposeDraft(tone=\"\") error = %v", err)
+	}
+
+	withDefault := base
+	withDefault.Tone = "tecnico-formal"
+	explicit, err := c.ComposeDraft(AgentDraftMinuta, withDefault)
+	if err != nil {
+		t.Fatalf("ComposeDraft(tone=tecnico-formal) error = %v", err)
+	}
+
+	if empty.System != explicit.System {
+		t.Errorf("System differs between Tone=\"\" and Tone=tecnico-formal:\n---empty---\n%s\n---explicit---\n%s",
+			empty.System, explicit.System)
+	}
+	if empty.User != explicit.User {
+		t.Errorf("User differs between Tone=\"\" and Tone=tecnico-formal:\n---empty---\n%s\n---explicit---\n%s",
+			empty.User, explicit.User)
+	}
+	// Neither carries a tone directive — the base system prompt IS the
+	// tecnico-formal register already (no "TOM:" line injected).
+	if strings.Contains(empty.System, "TOM:") {
+		t.Errorf("empty-tone system should not inject a TOM: directive\n---\n%s", empty.System)
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_ToneDirectives verifies that each non-default
+// tone injects a DISTINCT directive into the system message.
+func TestTemplateComposer_ComposeDraft_ToneDirectives(t *testing.T) {
+	c := NewTemplateComposer()
+	base := DraftContext{PieceType: "DEFENSE"}
+
+	tones := []string{"direto-assertivo", "conciliador-institucional"}
+	seen := make(map[string]bool, len(tones))
+	for _, tone := range tones {
+		ctx := base
+		ctx.Tone = tone
+		out, err := c.ComposeDraft(AgentDraftMinuta, ctx)
+		if err != nil {
+			t.Fatalf("ComposeDraft(tone=%s) error = %v", tone, err)
+		}
+		if !strings.Contains(out.System, "TOM:") {
+			t.Errorf("tone=%s: system prompt missing TOM: directive\n---\n%s", tone, out.System)
+		}
+		if seen[out.System] {
+			t.Errorf("tone=%s: system prompt identical to a previously seen tone (want distinct wording)", tone)
+		}
+		seen[out.System] = true
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_InvalidTone_NoDirective verifies that an
+// unrecognized tone string (should never happen past edge validation, but the
+// composer itself must not panic or silently invent a directive) falls back to no
+// directive — same as empty/tecnico-formal.
+func TestTemplateComposer_ComposeDraft_InvalidTone_NoDirective(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType: "DEFENSE",
+		Tone:      "not-a-real-tone",
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	if strings.Contains(out.System, "TOM:") {
+		t.Errorf("unrecognized tone should not inject a TOM: directive\n---\n%s", out.System)
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_InstructionsAndTheses verifies that
+// Instructions and SelectedTheses are injected into the user message ONLY when
+// non-empty, each under its own labeled section.
+func TestTemplateComposer_ComposeDraft_InstructionsAndTheses(t *testing.T) {
+	c := NewTemplateComposer()
+
+	// Both empty → neither section appears.
+	empty, err := c.ComposeDraft(AgentDraftMinuta, DraftContext{PieceType: "DEFENSE"})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	for _, absent := range []string{"Instruções específicas", "Teses selecionadas"} {
+		if strings.Contains(empty.User, absent) {
+			t.Errorf("empty context should omit %q section\n---\n%s", absent, empty.User)
+		}
+	}
+
+	// Both present → both sections appear with their content.
+	full, err := c.ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType:      "DEFENSE",
+		Instructions:   "Enfatizar a boa-fé do réu.",
+		SelectedTheses: []string{"Prescrição intercorrente", "Excesso de execução"},
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	for _, want := range []string{
+		"Instruções específicas do advogado para esta minuta:",
+		"Enfatizar a boa-fé do réu.",
+		"Teses selecionadas pelo advogado",
+		"Prescrição intercorrente",
+		"Excesso de execução",
+	} {
+		if !strings.Contains(full.User, want) {
+			t.Errorf("user prompt missing %q\n---\n%s", want, full.User)
+		}
+	}
+}
+
+// TestTemplateComposer_ComposeTheses verifies the suggest_theses agent renders a
+// non-empty, versioned prompt with the injected case context.
+func TestTemplateComposer_ComposeTheses(t *testing.T) {
+	c := NewTemplateComposer()
+	out, err := c.ComposeTheses(AgentSuggestTheses, DraftContext{
+		PieceType:      "DEFENSE",
+		Court:          "TJSP",
+		IntimationText: "Fica o réu citado a contestar em 15 dias.",
+		Parties: []PartyCtx{
+			{Role: "DEFENDANT", Name: "RÉU SA"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ComposeTheses() error = %v", err)
+	}
+	if out.PromptVersion != "suggest_theses/v1" {
+		t.Errorf("PromptVersion = %q, want suggest_theses/v1", out.PromptVersion)
+	}
+	if strings.TrimSpace(out.System) == "" || strings.TrimSpace(out.User) == "" {
+		t.Fatalf("empty system/user: system=%q user=%q", out.System, out.User)
+	}
+	for _, want := range []string{"label", "confidence", "reference", "foundation"} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("system prompt missing %q output field\n---\n%s", want, out.System)
+		}
+	}
+	for _, want := range []string{"TJSP", "Fica o réu citado a contestar", "RÉU SA"} {
+		if !strings.Contains(out.User, want) {
+			t.Errorf("user prompt missing %q\n---\n%s", want, out.User)
+		}
+	}
+}
+
+// TestTemplateComposer_ComposeTheses_EmptyContext verifies the degraded-mode message.
+func TestTemplateComposer_ComposeTheses_EmptyContext(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeTheses(AgentSuggestTheses, DraftContext{})
+	if err != nil {
+		t.Fatalf("ComposeTheses() error = %v", err)
+	}
+	if !strings.Contains(out.User, "sem contexto adicional") {
+		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
+	}
+}
+
+// TestTemplateComposer_ComposeTheses_UnknownAgent verifies an unknown agent stays a
+// typed invalid.
+func TestTemplateComposer_ComposeTheses_UnknownAgent(t *testing.T) {
+	if _, err := NewTemplateComposer().ComposeTheses("nope", DraftContext{}); err == nil {
+		t.Fatal("ComposeTheses(unknown) error = nil, want invalid")
 	}
 }

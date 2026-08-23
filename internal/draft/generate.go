@@ -379,6 +379,12 @@ func buildDraftContext(d *Draft, i *IntimationContext, parties []PartyInfo, chun
 	dc := advisory.DraftContext{
 		PieceType: d.PieceType,
 		Chunks:    chunks,
+		// Fatia 5: tone/instructions/selected_theses are read from the draft row
+		// (not the event payload) — TriggerGeneration persisted them in the same
+		// tx it flipped saga_state to EXTRACTING.
+		Tone:           d.Tone,
+		Instructions:   d.Instructions,
+		SelectedTheses: d.SelectedTheses,
 	}
 	// Populate structured parties (PLAINTIFF/DEFENDANT/THIRD_PARTY).
 	if len(parties) > 0 {
