@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/jusassessoria/platform/lib/database"
-	"github.com/jusassessoria/platform/lib/events"
 )
 
 // generate_trigger.go implements the synchronous trigger path: POST /v1/pecas/:id/generate.
@@ -30,15 +29,19 @@ var ErrGenerationInProgress = errGenerationInProgress
 
 // TriggerUseCase owns the synchronous trigger path. It depends on a narrow set of
 // ports (the repository's reader/writer for the draft + the outbox) so it can be
-// composed independently of the full UseCase.
+// composed independently of the full UseCase. outbox is typed as the OutboxPublisher
+// port (not the concrete *events.Outbox) so unit tests can inject a fake instead of
+// hitting a real tx.Exec — the same pattern domain.go already uses for UseCase.outbox.
 type TriggerUseCase struct {
 	uow    database.UnitOfWork
 	rw     Repository
-	outbox *events.Outbox
+	outbox OutboxPublisher
 }
 
-// NewTriggerUseCase wires the trigger use case.
-func NewTriggerUseCase(uow database.UnitOfWork, rw Repository, outbox *events.Outbox) *TriggerUseCase {
+// NewTriggerUseCase wires the trigger use case. outbox accepts anything satisfying
+// OutboxPublisher — production passes *events.Outbox (events.NewOutbox()), tests pass
+// a fake.
+func NewTriggerUseCase(uow database.UnitOfWork, rw Repository, outbox OutboxPublisher) *TriggerUseCase {
 	return &TriggerUseCase{uow: uow, rw: rw, outbox: outbox}
 }
 

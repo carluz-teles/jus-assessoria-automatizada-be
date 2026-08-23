@@ -103,6 +103,26 @@ type fakeRepo struct {
 	// GetCourtRecordIDByIntimation
 	courtRecordIDResult string
 	courtRecordIDErr    error
+
+	// ── Fatia 5 stubs (SetGenerationParams) ──────────────────────────────────
+	// setGenParamsErr lets tests force a failure from SetGenerationParams.
+	setGenParamsErr error
+	// setGenParamsCalls records every SetGenerationParams invocation (captured
+	// args) so tests can assert what TriggerGeneration persisted.
+	setGenParamsCalls []setGenerationParamsCall
+	// callOrder records, in order, which of {SetGenerationParams,
+	// UpdateSagaState} ran — so tests can assert both happened inside the same
+	// tx and in the documented order (SetGenerationParams before the saga flip).
+	callOrder []string
+}
+
+// setGenerationParamsCall captures one SetGenerationParams invocation.
+type setGenerationParamsCall struct {
+	draftID      string
+	tenantID     string
+	tone         string
+	instructions string
+	theses       []string
 }
 
 func (r *fakeRepo) InsertDraft(_ context.Context, _ database.Tx, d *Draft) (*Draft, error) {
@@ -163,11 +183,23 @@ func (r *fakeRepo) GetLatestReview(_ context.Context, _ database.Tx, _ string) (
 }
 
 func (r *fakeRepo) UpdateSagaState(_ context.Context, _ database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error) {
+	r.callOrder = append(r.callOrder, "UpdateSagaState")
 	return r.getByIDResult, nil
 }
 
-func (r *fakeRepo) SetGenerationParams(_ context.Context, _ database.Tx, _, _, _, _ string, _ []string) error {
-	return nil // no-op stub — domain_test.go covers Fatia 1–2 use cases only
+// SetGenerationParams captures every call (draftID/tenantID/tone/instructions/theses)
+// so TriggerUseCase tests can assert exactly what was persisted, in addition to
+// satisfying the Repository interface for the rest of the package's tests.
+func (r *fakeRepo) SetGenerationParams(_ context.Context, _ database.Tx, draftID, tenantID, tone, instructions string, theses []string) error {
+	r.callOrder = append(r.callOrder, "SetGenerationParams")
+	r.setGenParamsCalls = append(r.setGenParamsCalls, setGenerationParamsCall{
+		draftID:      draftID,
+		tenantID:     tenantID,
+		tone:         tone,
+		instructions: instructions,
+		theses:       theses,
+	})
+	return r.setGenParamsErr
 }
 
 func (r *fakeRepo) InsertReview(_ context.Context, _ database.Tx, rev *Review) (*Review, error) {
