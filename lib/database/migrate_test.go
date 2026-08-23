@@ -241,8 +241,23 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(53); err != nil || next != 54 {
 		t.Fatalf("Next(53) = (%d, %v), want (54, nil)", next, err)
 	}
-	if _, err := src.Next(54); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(54) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(54); err != nil || next != 55 {
+		t.Fatalf("Next(54) = (%d, %v), want (55, nil)", next, err)
+	}
+	if next, err := src.Next(55); err != nil || next != 56 {
+		t.Fatalf("Next(55) = (%d, %v), want (56, nil)", next, err)
+	}
+	if next, err := src.Next(56); err != nil || next != 57 {
+		t.Fatalf("Next(56) = (%d, %v), want (57, nil)", next, err)
+	}
+	if next, err := src.Next(57); err != nil || next != 58 {
+		t.Fatalf("Next(57) = (%d, %v), want (58, nil)", next, err)
+	}
+	if next, err := src.Next(58); err != nil || next != 59 {
+		t.Fatalf("Next(58) = (%d, %v), want (59, nil)", next, err)
+	}
+	if _, err := src.Next(59); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(59) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

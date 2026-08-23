@@ -66,6 +66,25 @@ type CaseLink struct {
 	ConfirmedAt       pgtype.Timestamptz `json:"confirmed_at"`
 }
 
+type Certificate struct {
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	OwnerUserID uuid.UUID          `json:"owner_user_id"`
+	SubjectCn   string             `json:"subject_cn"`
+	Oab         *string            `json:"oab"`
+	Issuer      string             `json:"issuer"`
+	Serial      string             `json:"serial"`
+	NotBefore   pgtype.Timestamptz `json:"not_before"`
+	NotAfter    pgtype.Timestamptz `json:"not_after"`
+	Fingerprint string             `json:"fingerprint"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	Ciphertext  []byte             `json:"ciphertext"`
+	Nonce       []byte             `json:"nonce"`
+	WrappedDek  []byte             `json:"wrapped_dek"`
+	KekRef      string             `json:"kek_ref"`
+}
+
 type ChatMessage struct {
 	ID           uuid.UUID          `json:"id"`
 	DraftID      uuid.UUID          `json:"draft_id"`
@@ -201,22 +220,24 @@ type Document struct {
 }
 
 type Draft struct {
-	ID             uuid.UUID          `json:"id"`
-	TenantID       uuid.UUID          `json:"tenant_id"`
-	CaseID         pgtype.UUID        `json:"case_id"`
-	PieceType      string             `json:"piece_type"`
-	Status         string             `json:"status"`
-	SagaState      string             `json:"saga_state"`
-	StorageKey     *string            `json:"storage_key"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	IntimationID   pgtype.UUID        `json:"intimation_id"`
-	Title          string             `json:"title"`
-	Content        *string            `json:"content"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	SignedAt       pgtype.Timestamptz `json:"signed_at"`
-	Tone           string             `json:"tone"`
-	Instructions   *string            `json:"instructions"`
-	SelectedTheses []string           `json:"selected_theses"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	PieceType         string             `json:"piece_type"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	StorageKey        *string            `json:"storage_key"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	SignedAt          pgtype.Timestamptz `json:"signed_at"`
+	Tone              string             `json:"tone"`
+	Instructions      *string            `json:"instructions"`
+	SelectedTheses    []string           `json:"selected_theses"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
 }
 
 type DraftAttachment struct {
@@ -267,8 +288,7 @@ type Intimation struct {
 	CancelReason    *string            `json:"cancel_reason"`
 	SyncRunID       pgtype.UUID        `json:"sync_run_id"`
 	UserStatus      string             `json:"user_status"`
-	ConductorUserID pgtype.UUID        `json:"conductor_user_id"`
-	ReviewerUserID  pgtype.UUID        `json:"reviewer_user_id"`
+	AssigneeUserID  pgtype.UUID        `json:"assignee_user_id"`
 	AiSummary       *string            `json:"ai_summary"`
 	AiProvidencias  []byte             `json:"ai_providencias"`
 	AiAnalyzedAt    pgtype.Timestamptz `json:"ai_analyzed_at"`
