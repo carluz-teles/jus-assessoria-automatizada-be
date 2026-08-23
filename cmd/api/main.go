@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/billing"
+	"github.com/jusassessoria/platform/internal/certificate"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -322,11 +324,12 @@ func run(logger *slog.Logger) error {
 	if cfg.S3Enabled() {
 		var err error
 		storageClient, err = storage.New(ctx, storage.Options{
-			Endpoint:  cfg.S3Endpoint,
-			Region:    cfg.S3Region,
-			Bucket:    cfg.S3Bucket,
-			AccessKey: cfg.S3AccessKey,
-			SecretKey: cfg.S3SecretKey,
+			Endpoint:     cfg.S3Endpoint,
+			Region:       cfg.S3Region,
+			Bucket:       cfg.S3Bucket,
+			AccessKey:    cfg.S3AccessKey,
+			SecretKey:    cfg.S3SecretKey,
+			UsePathStyle: cfg.S3UsePathStyle,
 		})
 		if err != nil {
 			return fmt.Errorf("init storage: %w", err)
@@ -343,6 +346,30 @@ func run(logger *slog.Logger) error {
 			document.NewReadUseCase(document.NewReadRepository(pool)),
 			documentWriteUC,
 		)
+	}
+
+	// Certificate (Assinatura Fatia 1): cadastro do .pfx A1 ICP-Brasil.
+	// Envelope encryption: DEK aleatória (AES-256-GCM local) por cert, wrapped
+	// pelo GCP KMS. Sem GCP_KMS_KEY_NAME o slice fica desmontado; o api segue.
+	// Credenciais GCP: em PaaS (Railway/Fly/Render) recebemos o JSON como env
+	// base64 (GCP_KMS_CREDENTIALS_JSON) e materializamos em disco antes de
+	// instanciar o SDK — o ADC lê de GOOGLE_APPLICATION_CREDENTIALS. Em dev
+	// local (Docker Compose) já vem via volume mount, então a var já aponta
+	// pro path certo e este ramo é no-op.
+	var certificateHandler *certificate.Handler
+	var certCipher certificate.Cipher
+	if cfg.GCPKMSKeyName != "" {
+		if err := materializeGCPCredentials(cfg.GCPKMSCredentialsJSON); err != nil {
+			return fmt.Errorf("materialize gcp creds: %w", err)
+		}
+		cipher, err := certificate.NewEnvelopeCipher(ctx, cfg.GCPKMSKeyName)
+		if err != nil {
+			return fmt.Errorf("init cert envelope cipher: %w", err)
+		}
+		certCipher = cipher
+		certUC := certificate.NewUseCase(certificate.NewRepository(), uow, cipher)
+		certificateHandler = certificate.New(certUC)
+		logger.Info("certificate slice ready", "kms_key", cfg.GCPKMSKeyName)
 	}
 
 	// Draft (Peticionamento Fatias 1–3b): the peça create/read/autosave surface +
@@ -414,6 +441,21 @@ func run(logger *slog.Logger) error {
 	})
 	draftHandler = draftHandler.WithTheses(thesesUC)
 
+	// Iterate use case (Peça v2 — POST /v1/pecas/:id/iterate síncrono). Reusa
+	// o mesmo generator + embedder + composer das outras fatias de IA. nil
+	// generator → 422 em runtime; nunca falha de boot. Stateless (no writer —
+	// FE aplica cada change via PATCH /v1/pecas/:id).
+	iterateUC := draft.NewIterateUseCase(draft.IterateParams{
+		UoW:      uow,
+		Reader:   draftRepo,
+		Composer: advisory.NewTemplateComposer(),
+		Gen:      taskGenerator,
+		Model:    cfg.OpenRouterModel,
+		Embedder: chatEmbedder,
+		Search:   indexing.SearchDeps{Pool: pool},
+	})
+	draftHandler = draftHandler.WithIterator(iterateUC)
+
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,
@@ -431,6 +473,7 @@ func run(logger *slog.Logger) error {
 		document:             documentHandler,
 		draft:                draftHandler,
 		lookup:               lookupHandler,
+		certificate:          certificateHandler,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext
@@ -459,10 +502,41 @@ func run(logger *slog.Logger) error {
 			if err := telemetryShutdown(shutdownCtx); err != nil {
 				errs = append(errs, fmt.Errorf("shutdown telemetry: %w", err))
 			}
+			if certCipher != nil {
+				if err := certCipher.Close(); err != nil {
+					errs = append(errs, fmt.Errorf("close cert cipher: %w", err))
+				}
+			}
 			return errors.Join(errs...)
 		},
 	)
 
+	return nil
+}
+
+// materializeGCPCredentials adapts PaaS-style env-only credentials into the
+// disk-file shape the GCP SDK expects. When GCP_KMS_CREDENTIALS_JSON is set
+// (base64 of the service-account JSON), decode it, write to /tmp/gcp-kms.json
+// and overwrite GOOGLE_APPLICATION_CREDENTIALS to point there. When it is
+// empty, do nothing — the caller relies on GOOGLE_APPLICATION_CREDENTIALS
+// already pointing to a mounted file (dev via Docker volume). This is the
+// standard "env-only" workaround for Railway/Fly/Render which do not allow
+// mounting arbitrary files.
+func materializeGCPCredentials(b64 string) error {
+	if b64 == "" {
+		return nil // caller relies on the mounted file path already in env
+	}
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return fmt.Errorf("decode GCP_KMS_CREDENTIALS_JSON base64: %w", err)
+	}
+	path := "/tmp/gcp-kms.json"
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write GCP creds to %s: %w", path, err)
+	}
+	if err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path); err != nil {
+		return fmt.Errorf("set GOOGLE_APPLICATION_CREDENTIALS: %w", err)
+	}
 	return nil
 }
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
+	"github.com/jusassessoria/platform/internal/certificate"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -48,6 +49,7 @@ type routerDeps struct {
 	document             *document.Handler
 	draft                *draft.Handler
 	lookup               *lookup.Handler
+	certificate          *certificate.Handler
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -170,6 +172,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	// without a use case, like the other slices.
 	if deps.draft != nil {
 		deps.draft.RegisterV1(v1)
+	}
+
+	// certificate owns /v1/certificates (upload/preview/list/revoke/sign). Nil-guarded
+	// como os demais — sem storage + CERT_MASTER_KEY, o slice não sobe e as rotas
+	// simplesmente não existem (o FE cai em 404 e mostra a lista vazia).
+	if deps.certificate != nil {
+		deps.certificate.RegisterV1(v1)
 	}
 
 	// notifications owns its authenticated /v1 in-app inbox routes (list/badge/

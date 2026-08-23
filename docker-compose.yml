@@ -13,6 +13,13 @@ name: jus-assessoria
 x-net-env: &net-env
   DATABASE_URL: postgres://jus:jus@postgres:5432/jusassessoria?sslmode=disable
   REDIS_URL: redis://redis:6379/0
+  # Object storage (dev): MinIO no compose. Prod sobrescreve via env pra R2 real.
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: us-east-1
+  S3_BUCKET: jus-assessoria-dev
+  S3_ACCESS_KEY: minioadmin
+  S3_SECRET_KEY: minioadmin
+  S3_USE_PATH_STYLE: "true"
 
 # Both deps healthy before any app container starts.
 x-deps-healthy: &deps-healthy
@@ -57,6 +64,40 @@ services:
       timeout: 5s
       retries: 10
 
+  # Object storage local S3-compatível para dev. Prod usa Cloudflare R2 real
+  # (mesmo cliente aws-sdk-go-v2). Sem MinIO, o slice certificate (upload de
+  # .pfx) fica 503 — todo endpoint que depende de storage sobe mas retorna
+  # "storage não configurado". O bucket é criado no boot pelo minio-init.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console web (http://localhost:9001)
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local 2>/dev/null || curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot init: cria o bucket dev (idempotente) e sai. Sem healthcheck (short-lived).
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing local/jus-assessoria-dev;
+      exit 0;
+      "
+
   # The api is the only service that migrates at boot.
   api:
     build:
@@ -65,7 +106,19 @@ services:
         SVC: api
     image: jus-api:local
     env_file: .env
-    environment: *net-env
+    environment:
+      <<: *net-env
+      # ADC dentro do container aponta pra /run/secrets/gcp-kms.json (montado
+      # abaixo). O host var GOOGLE_APPLICATION_CREDENTIALS aponta pra ~/.../json
+      # local; o volume mapeia esse arquivo pro path canônico dentro do container
+      # e reescreve a var pro caminho interno. Se não houver JSON local (dev sem
+      # KMS setup), o mount silenciosamente falha e o slice cert não sobe.
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-kms.json
+    volumes:
+      # Read-only, mount de arquivo único. O ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}
+      # deixa o compose subir mesmo sem a var setada (mapeia /dev/null → arquivo
+      # inexistente-porém-válido; api lê e falha, então o slice cert fica desmontado).
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/run/secrets/gcp-kms.json:ro
     ports:
       - "8080:8080"
     depends_on: *deps-healthy
@@ -116,3 +169,4 @@ services:
 
 volumes:
   pgdata:
+  miniodata:

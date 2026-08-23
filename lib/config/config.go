@@ -98,11 +98,31 @@ type Config struct {
 
 	// Object storage S3-compatível (S3/R2/MinIO). Opcional: o api só monta o
 	// storage.Client quando S3Enabled() — ver o método abaixo.
-	S3Endpoint  string `env:"S3_ENDPOINT"`
-	S3Region    string `env:"S3_REGION"`
-	S3Bucket    string `env:"S3_BUCKET"`
-	S3AccessKey string `env:"S3_ACCESS_KEY"`
-	S3SecretKey string `env:"S3_SECRET_KEY"`
+	S3Endpoint     string `env:"S3_ENDPOINT"`
+	S3Region       string `env:"S3_REGION"`
+	S3Bucket       string `env:"S3_BUCKET"`
+	S3AccessKey    string `env:"S3_ACCESS_KEY"`
+	S3SecretKey    string `env:"S3_SECRET_KEY"`
+	S3UsePathStyle bool   `env:"S3_USE_PATH_STYLE"` // MinIO exige path-style; R2/S3 default false
+
+	// GCP Cloud KMS key name (formato completo:
+	// projects/<PROJECT_ID>/locations/<REGION>/keyRings/<KEYRING>/cryptoKeys/<KEY>)
+	// usada como KEK do envelope encryption dos certificados A1. O api gera uma
+	// DEK aleatória por cert, cifra o .pfx localmente com ela, e chama KMS.Encrypt
+	// UMA vez por cert pra "wrappar" a DEK — sem essa key, sem forma de decifrar
+	// o binário armazenado. Requer também GOOGLE_APPLICATION_CREDENTIALS
+	// apontando pro JSON da service account (Application Default Credentials).
+	// Opcional no agregado — sem ela o slice certificate não sobe; api segue.
+	GCPKMSKeyName string `env:"GCP_KMS_KEY_NAME"`
+
+	// GCPKMSCredentialsJSON: JSON da service account em BASE64. Padrão para PaaS
+	// (Railway, Fly, Render) onde não dá pra montar arquivo — só passar env var.
+	// O boot decodifica e escreve em /tmp/gcp-kms.json, então seta
+	// GOOGLE_APPLICATION_CREDENTIALS internamente e o SDK GCP acha via ADC.
+	// Em dev local (Docker Compose), usar GOOGLE_APPLICATION_CREDENTIALS direto
+	// (com o volume montando o JSON) — este campo fica vazio. Mutuamente
+	// exclusivos: se ambos setados, este vence.
+	GCPKMSCredentialsJSON string `env:"GCP_KMS_CREDENTIALS_JSON"`
 
 	// Voyage — provedor de embeddings da fatia de indexação/retrieval de documentos
 	// (só o worker-documents, onde roda o listener de indexing, os consome). O
