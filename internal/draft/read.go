@@ -29,6 +29,16 @@ type DraftDetailView struct {
 	// (advogado assumiu autoria, FE shows Revisão tab). See migration 0056.
 	Authorship string
 
+	// Workflow timestamps (0060) — cada fato datado; a UI deriva o step atual:
+	//   sent_to_signing_at IS NULL                             → Construção
+	//   sent_to_signing_at ≠ NULL, signed_at IS NULL           → Assinatura
+	//   signed_at ≠ NULL, filed_at IS NULL                     → Protocolo
+	//   filed_at ≠ NULL                                        → Concluído
+	SentToSigningAt *time.Time
+	SignedAt        *time.Time
+	FiledAt         *time.Time
+	FilingNumber    string // número/protocolo do tribunal (opcional; input manual)
+
 	// Intimation is nil for blank/processo drafts.
 	Intimation *IntimationView
 	// Process is nil when no intimation (and therefore no court_record) is linked.
@@ -104,6 +114,10 @@ func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 		Attachments:       []Attachment{}, // never nil — serializes as [] not null
 		Providences:       []Providence{}, // never nil
 		Parties:           []PartyInfo{},  // never nil
+		SentToSigningAt:   pgTimestamptzPtr(r.SentToSigningAt),
+		SignedAt:          pgTimestamptzPtr(r.SignedAt),
+		FiledAt:           pgTimestamptzPtr(r.FiledAt),
+		FilingNumber:      derefString(r.FilingNumber),
 	}
 
 	// Intimation — only when the draft has an intimation_id (LEFT JOIN yields a

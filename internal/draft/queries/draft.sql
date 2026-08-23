@@ -94,6 +94,12 @@ SELECT
     d.structured_content,
     d.authorship,
 
+    -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.
+    d.sent_to_signing_at,
+    d.signed_at,
+    d.filed_at,
+    d.filing_number,
+
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
     i.type          AS intimation_type,
@@ -380,6 +386,38 @@ FROM (
 ORDER BY created_at ASC;
 
 -- ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+
+-- name: MarkSentToSigning :one
+-- Marca o gesto "usuário clicou Enviar para assinatura" (0060). Só setta se
+-- ainda não foi setado (idempotente sem sobrescrever timestamp original).
+-- Zero linhas afetadas quando (a) draft não existe, (b) tenant errado, OU
+-- (c) já estava setado — o caso (c) surface na app como "no-op" (não erro).
+UPDATE draft
+SET sent_to_signing_at = now(),
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND sent_to_signing_at IS NULL
+RETURNING id, sent_to_signing_at, updated_at;
+
+-- name: RevertToConstruction :one
+-- Nulla sent_to_signing_at (usuário voltou pra Construção). Só permite quando
+-- a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
+-- workflow não volta pra atrás sem invalidar a assinatura.
+UPDATE draft
+SET sent_to_signing_at = NULL,
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND signed_at IS NULL
+RETURNING id, updated_at;
+
+-- name: MarkFiled :one
+-- Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
+-- opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
+-- (número do protocolo no tribunal — string livre). Requer status=SIGNED.
+UPDATE draft
+SET filed_at       = COALESCE(sqlc.narg('filed_at')::timestamptz, now()),
+    filing_number  = sqlc.narg('filing_number')::text,
+    updated_at     = now()
+WHERE id = $1 AND tenant_id = $2 AND status = 'SIGNED' AND filed_at IS NULL
+RETURNING id, filed_at, filing_number, updated_at;
 
 -- name: SignDraft :one
 -- Transition draft.status to SIGNED and set signed_at = now(). Scoped to

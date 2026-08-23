@@ -74,6 +74,18 @@ func timestamptzToTime(ts pgtype.Timestamptz) time.Time {
 	return ts.Time
 }
 
+// pgTimestamptzPtr converts a pgtype.Timestamptz to *time.Time — nil on NULL,
+// *time.Time on non-NULL. Used pra timestamps opcionais (workflow steps 0060:
+// sent_to_signing_at, signed_at, filed_at) — a UI distingue "não aconteceu" (nil)
+// de "aconteceu em X" (non-nil).
+func pgTimestamptzPtr(ts pgtype.Timestamptz) *time.Time {
+	if !ts.Valid {
+		return nil
+	}
+	t := ts.Time.UTC()
+	return &t
+}
+
 // pgDateToTime converts a pgtype.Date to time.Time, zero on NULL.
 func pgDateToTime(d pgtype.Date) time.Time {
 	if !d.Valid {

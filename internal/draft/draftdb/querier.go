@@ -143,6 +143,20 @@ type Querier interface {
 	// Coverage summary is resolved from the latest review via LEFT JOIN LATERAL.
 	// Over-fetch by 1 for hasMore detection.
 	ListDraftsByProcess(ctx context.Context, arg ListDraftsByProcessParams) ([]ListDraftsByProcessRow, error)
+	// Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
+	// opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
+	// (número do protocolo no tribunal — string livre). Requer status=SIGNED.
+	MarkFiled(ctx context.Context, arg MarkFiledParams) (MarkFiledRow, error)
+	// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+	// Marca o gesto "usuário clicou Enviar para assinatura" (0060). Só setta se
+	// ainda não foi setado (idempotente sem sobrescrever timestamp original).
+	// Zero linhas afetadas quando (a) draft não existe, (b) tenant errado, OU
+	// (c) já estava setado — o caso (c) surface na app como "no-op" (não erro).
+	MarkSentToSigning(ctx context.Context, arg MarkSentToSigningParams) (MarkSentToSigningRow, error)
+	// Nulla sent_to_signing_at (usuário voltou pra Construção). Só permite quando
+	// a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
+	// workflow não volta pra atrás sem invalidar a assinatura.
+	RevertToConstruction(ctx context.Context, arg RevertToConstructionParams) (RevertToConstructionRow, error)
 	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
 	// These are the three new queries the async generation saga needs.
 	// Persist the Gerar-time generation params (tone/instructions/selected_theses,
@@ -155,7 +169,6 @@ type Querier interface {
 	// RowsAffected (mirrors DeleteReviewsForDraft's :exec, which is also fire-and-forget
 	// within an already-guarded tx).
 	SetGenerationParams(ctx context.Context, arg SetGenerationParamsParams) error
-	// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
 	// Transition draft.status to SIGNED and set signed_at = now(). Scoped to
 	// (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
 	SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error)

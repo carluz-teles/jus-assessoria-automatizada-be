@@ -238,6 +238,9 @@ type Draft struct {
 	SelectedTheses    []string           `json:"selected_theses"`
 	StructuredContent []byte             `json:"structured_content"`
 	Authorship        string             `json:"authorship"`
+	SentToSigningAt   pgtype.Timestamptz `json:"sent_to_signing_at"`
+	FilingNumber      *string            `json:"filing_number"`
+	FiledAt           pgtype.Timestamptz `json:"filed_at"`
 }
 
 type DraftAttachment struct {

@@ -385,6 +385,12 @@ SELECT
     d.structured_content,
     d.authorship,
 
+    -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.
+    d.sent_to_signing_at,
+    d.signed_at,
+    d.filed_at,
+    d.filing_number,
+
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
     i.type          AS intimation_type,
@@ -429,6 +435,10 @@ type GetDraftDetailRow struct {
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 	StructuredContent         []byte             `json:"structured_content"`
 	Authorship                string             `json:"authorship"`
+	SentToSigningAt           pgtype.Timestamptz `json:"sent_to_signing_at"`
+	SignedAt                  pgtype.Timestamptz `json:"signed_at"`
+	FiledAt                   pgtype.Timestamptz `json:"filed_at"`
+	FilingNumber              *string            `json:"filing_number"`
 	IntimationID              pgtype.UUID        `json:"intimation_id"`
 	IntimationType            *string            `json:"intimation_type"`
 	IntimationContent         *string            `json:"intimation_content"`
@@ -467,6 +477,10 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.UpdatedAt,
 		&i.StructuredContent,
 		&i.Authorship,
+		&i.SentToSigningAt,
+		&i.SignedAt,
+		&i.FiledAt,
+		&i.FilingNumber,
 		&i.IntimationID,
 		&i.IntimationType,
 		&i.IntimationContent,
@@ -1186,6 +1200,109 @@ func (q *Queries) ListDraftsByProcess(ctx context.Context, arg ListDraftsByProce
 	return items, nil
 }
 
+const markFiled = `-- name: MarkFiled :one
+UPDATE draft
+SET filed_at       = COALESCE($3::timestamptz, now()),
+    filing_number  = $4::text,
+    updated_at     = now()
+WHERE id = $1 AND tenant_id = $2 AND status = 'SIGNED' AND filed_at IS NULL
+RETURNING id, filed_at, filing_number, updated_at
+`
+
+type MarkFiledParams struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	FiledAt      pgtype.Timestamptz `json:"filed_at"`
+	FilingNumber *string            `json:"filing_number"`
+}
+
+type MarkFiledRow struct {
+	ID           uuid.UUID          `json:"id"`
+	FiledAt      pgtype.Timestamptz `json:"filed_at"`
+	FilingNumber *string            `json:"filing_number"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
+// opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
+// (número do protocolo no tribunal — string livre). Requer status=SIGNED.
+func (q *Queries) MarkFiled(ctx context.Context, arg MarkFiledParams) (MarkFiledRow, error) {
+	row := q.db.QueryRow(ctx, markFiled,
+		arg.ID,
+		arg.TenantID,
+		arg.FiledAt,
+		arg.FilingNumber,
+	)
+	var i MarkFiledRow
+	err := row.Scan(
+		&i.ID,
+		&i.FiledAt,
+		&i.FilingNumber,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markSentToSigning = `-- name: MarkSentToSigning :one
+
+UPDATE draft
+SET sent_to_signing_at = now(),
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND sent_to_signing_at IS NULL
+RETURNING id, sent_to_signing_at, updated_at
+`
+
+type MarkSentToSigningParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type MarkSentToSigningRow struct {
+	ID              uuid.UUID          `json:"id"`
+	SentToSigningAt pgtype.Timestamptz `json:"sent_to_signing_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+// Marca o gesto "usuário clicou Enviar para assinatura" (0060). Só setta se
+// ainda não foi setado (idempotente sem sobrescrever timestamp original).
+// Zero linhas afetadas quando (a) draft não existe, (b) tenant errado, OU
+// (c) já estava setado — o caso (c) surface na app como "no-op" (não erro).
+func (q *Queries) MarkSentToSigning(ctx context.Context, arg MarkSentToSigningParams) (MarkSentToSigningRow, error) {
+	row := q.db.QueryRow(ctx, markSentToSigning, arg.ID, arg.TenantID)
+	var i MarkSentToSigningRow
+	err := row.Scan(&i.ID, &i.SentToSigningAt, &i.UpdatedAt)
+	return i, err
+}
+
+const revertToConstruction = `-- name: RevertToConstruction :one
+UPDATE draft
+SET sent_to_signing_at = NULL,
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND signed_at IS NULL
+RETURNING id, updated_at
+`
+
+type RevertToConstructionParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type RevertToConstructionRow struct {
+	ID        uuid.UUID          `json:"id"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Nulla sent_to_signing_at (usuário voltou pra Construção). Só permite quando
+// a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
+// workflow não volta pra atrás sem invalidar a assinatura.
+func (q *Queries) RevertToConstruction(ctx context.Context, arg RevertToConstructionParams) (RevertToConstructionRow, error) {
+	row := q.db.QueryRow(ctx, revertToConstruction, arg.ID, arg.TenantID)
+	var i RevertToConstructionRow
+	err := row.Scan(&i.ID, &i.UpdatedAt)
+	return i, err
+}
+
 const setGenerationParams = `-- name: SetGenerationParams :exec
 
 UPDATE draft
@@ -1227,7 +1344,6 @@ func (q *Queries) SetGenerationParams(ctx context.Context, arg SetGenerationPara
 }
 
 const signDraft = `-- name: SignDraft :one
-
 UPDATE draft
 SET status     = 'SIGNED',
     signed_at  = now(),
@@ -1259,7 +1375,6 @@ type SignDraftRow struct {
 	SignedAt     pgtype.Timestamptz `json:"signed_at"`
 }
 
-// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
 // Transition draft.status to SIGNED and set signed_at = now(). Scoped to
 // (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
 func (q *Queries) SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error) {

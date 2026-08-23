@@ -27,6 +27,9 @@ type writer interface {
 	Sign(ctx context.Context, cmd SignCommand) (*SignResult, error)
 	File(ctx context.Context, cmd FileCommand) (*FileResult, error)
 	Result(ctx context.Context, cmd ResultCommand) (*ResultResult, error)
+	// Workflow steps (Fatia 2a) — apenas gestos, sem lógica de LLM/outbox.
+	SendToSigning(ctx context.Context, tenantID, draftID string) error
+	RevertToConstruction(ctx context.Context, tenantID, draftID string) error
 	// AssumeAuthorship (Peça v2) is exposed via the main UseCase — no separate
 	// wiring needed since it's a single UPDATE (no LLM, no outbox).
 	AssumeAuthorship(ctx context.Context, tenantID, draftID string) (*Draft, error)
@@ -156,6 +159,12 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/pecas/:id/file", h.filePeca)
 	r.Patch("/pecas/:id/result", h.resultPeca)
 	r.Get("/pecas/:id/export", h.exportPeca)
+
+	// Workflow steps (Fatia 2a — persistir "onde parei" do peticionamento).
+	// sent_to_signing_at é o gesto de avançar Construção → Assinatura;
+	// revert nulla o mesmo (só permite se ainda não assinado).
+	r.Post("/pecas/:id/enviar-para-assinatura", h.sendToSigning)
+	r.Post("/pecas/:id/voltar-para-construcao", h.revertToConstruction)
 
 	// Process-scoped list.
 	r.Get("/processos/:id/pecas", h.listPecasByProcess)
@@ -387,6 +396,14 @@ type detailResponse struct {
 	Providences []Providence         `json:"providences"`
 	Parties     []partyResponse      `json:"parties"`
 
+	// Workflow steps (Fatia 2a — 0060). Cada timestamp é um fato datado; o FE
+	// deriva o step atual (Construção/Assinatura/Protocolo/Concluído). Todos
+	// nullable: null = "ainda não aconteceu".
+	SentToSigningAt *string `json:"sent_to_signing_at"`
+	SignedAt        *string `json:"signed_at"`
+	FiledAt         *string `json:"filed_at"`
+	FilingNumber    string  `json:"filing_number"`
+
 	// Review is the latest AI review, or null when no generation has been run.
 	Review *reviewResponse `json:"review"`
 }
@@ -471,6 +488,10 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 		UpdatedAt:         v.UpdatedAt.Format(time.RFC3339),
 		StructuredContent: v.StructuredContent,
 		Authorship:        v.Authorship,
+		SentToSigningAt:   timePtrToRFC3339(v.SentToSigningAt),
+		SignedAt:          timePtrToRFC3339(v.SignedAt),
+		FiledAt:           timePtrToRFC3339(v.FiledAt),
+		FilingNumber:      v.FilingNumber,
 	}
 
 	if v.Intimation != nil {
@@ -1011,6 +1032,7 @@ func (h *Handler) filePeca(c *fiber.Ctx) error {
 		Receipt:       req.Receipt,
 		CourtRecordID: req.CourtRecordID,
 		FiledAt:       filedAt,
+		FilingNumber:  req.FilingNumber,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -1242,4 +1264,37 @@ func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemRe
 		meta.NextCursor = &tok
 	}
 	return httpx.Page[draftListItemResponse]{Data: items, Page: meta}
+}
+
+// timePtrToRFC3339 formats a *time.Time as *string in RFC3339. nil in → nil out.
+func timePtrToRFC3339(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.Format(time.RFC3339)
+	return &s
+}
+
+// sendToSigning handles POST /v1/pecas/:id/enviar-para-assinatura. Marca o
+// gesto "usuário terminou Construção e passou pra Assinatura". Idempotente:
+// já enviado devolve 200. Body vazio.
+func (h *Handler) sendToSigning(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	if err := h.uc.SendToSigning(c.UserContext(), tenantID, draftID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// revertToConstruction handles POST /v1/pecas/:id/voltar-para-construcao.
+// Nulla sent_to_signing_at. Só permite quando ainda NÃO assinado — se já
+// signed, devolve 404 (a UI trata como "não posso reverter" e refetch).
+func (h *Handler) revertToConstruction(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	if err := h.uc.RevertToConstruction(c.UserContext(), tenantID, draftID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }

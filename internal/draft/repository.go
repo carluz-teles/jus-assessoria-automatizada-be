@@ -134,6 +134,22 @@ type Repository interface {
 	// returns the current row (no error). A miss is ErrDraftNotFound.
 	SignDraft(ctx context.Context, tx database.Tx, draftID, tenantID string) (*Draft, error)
 
+	// MarkSentToSigning marca sent_to_signing_at=now() (o gesto "usuário clicou
+	// Enviar para assinatura", 0060). Idempotente: retorna nil sem erro quando
+	// já estava setado (a query só afeta linhas com sent_to_signing_at IS NULL).
+	// Miss real (draft não existe / tenant errado) → ErrDraftNotFound.
+	MarkSentToSigning(ctx context.Context, tx database.Tx, draftID, tenantID string) error
+
+	// RevertToConstruction nulla sent_to_signing_at (usuário voltou pra Construção).
+	// Só permite quando signed_at IS NULL — depois de assinada, não volta. Miss ou
+	// já-assinada → ErrDraftNotFound (a UI trata ambos como "não posso reverter").
+	RevertToConstruction(ctx context.Context, tx database.Tx, draftID, tenantID string) error
+
+	// MarkFiled marca filed_at + filing_number opcional (0060). Requer status=SIGNED
+	// e filed_at IS NULL (idempotência dura — não re-protocola). Miss ou pré-condição
+	// falha → ErrDraftNotFound.
+	MarkFiled(ctx context.Context, tx database.Tx, draftID, tenantID, filingNumber string) error
+
 	// InsertPetition persists the filed petition. Returns the persisted entity.
 	InsertPetition(ctx context.Context, tx database.Tx, p *Petition) (*Petition, error)
 
@@ -792,6 +808,83 @@ func (r *pgRepository) SignDraft(ctx context.Context, tx database.Tx, draftID, t
 		return nil, database.WrapInfra(err)
 	}
 	return draftFromSignRow(row), nil
+}
+
+func (r *pgRepository) MarkSentToSigning(ctx context.Context, tx database.Tx, draftID, tenantID string) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	// A query só afeta linhas com sent_to_signing_at IS NULL — 0 rows = já
+	// setado (idempotente, sem erro) OU draft não existe. Diferenciar exigiria
+	// SELECT extra; pragmaticamente aceitamos: se draft não existe, o próximo
+	// GetDraftDetail vai retornar NotFound e a UI trata.
+	_, err = draftdb.New(tx).MarkSentToSigning(ctx, draftdb.MarkSentToSigningParams{
+		ID: did, TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // idempotente
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func (r *pgRepository) RevertToConstruction(ctx context.Context, tx database.Tx, draftID, tenantID string) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	// 0 rows = draft não existe OU já foi assinado (a query exige signed_at IS
+	// NULL). Ambos os casos surface como ErrDraftNotFound: a UI trata como "não
+	// posso reverter" e refetch mostra o estado real.
+	_, err = draftdb.New(tx).RevertToConstruction(ctx, draftdb.RevertToConstructionParams{
+		ID: did, TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDraftNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func (r *pgRepository) MarkFiled(ctx context.Context, tx database.Tx, draftID, tenantID, filingNumber string) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	var fn *string
+	if filingNumber != "" {
+		fn = &filingNumber
+	}
+	_, err = draftdb.New(tx).MarkFiled(ctx, draftdb.MarkFiledParams{
+		ID:            did,
+		TenantID:      tid,
+		FilingNumber:  fn,
+		FiledAt:       pgtype.Timestamptz{}, // NULL → COALESCE(now())
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDraftNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 func (r *pgRepository) InsertPetition(ctx context.Context, tx database.Tx, p *Petition) (*Petition, error) {

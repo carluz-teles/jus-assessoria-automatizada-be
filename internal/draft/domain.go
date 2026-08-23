@@ -464,6 +464,24 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	return result, nil
 }
 
+// SendToSigning marca sent_to_signing_at=now() no draft. Sinaliza que o
+// usuário terminou a Construção e passou pra tela de Assinatura. Idempotente.
+// tenantID vem do principal, nunca do body.
+func (uc *UseCase) SendToSigning(ctx context.Context, tenantID, draftID string) error {
+	return uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.rw.MarkSentToSigning(ctx, tx, draftID, tenantID)
+	})
+}
+
+// RevertToConstruction nulla sent_to_signing_at (usuário voltou pra Construção).
+// Só permite quando a peça ainda NÃO foi assinada (a query trata a guarda).
+// Se já assinada, devolve ErrDraftNotFound — a UI trata como "não é possível".
+func (uc *UseCase) RevertToConstruction(ctx context.Context, tenantID, draftID string) error {
+	return uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.rw.RevertToConstruction(ctx, tx, draftID, tenantID)
+	})
+}
+
 // FileCommand is the input for POST /v1/pecas/:id/file.
 type FileCommand struct {
 	TenantID      string
@@ -471,6 +489,7 @@ type FileCommand struct {
 	Receipt       map[string]any
 	CourtRecordID string // optional override
 	FiledAt       *time.Time
+	FilingNumber  string // opcional — número/protocolo do tribunal (Fatia 2a v0)
 }
 
 // FileResult carries the response for a successful file.
@@ -549,6 +568,12 @@ func (uc *UseCase) File(ctx context.Context, cmd FileCommand) (*FileResult, erro
 
 		// Flip saga_state to FILED.
 		if _, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateFiled, false, "", nil); err != nil {
+			return err
+		}
+
+		// Persiste filed_at + filing_number no draft (0060). Espelho conveniente
+		// pra a UI derivar o step sem precisar fazer JOIN com petition.
+		if err := uc.rw.MarkFiled(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.FilingNumber); err != nil {
 			return err
 		}
 

@@ -253,24 +253,28 @@ func isUUID(value any) error {
 // ── Fatia 4 — peticionamento request types ──────────────────────────────────
 
 // FileRequest is the POST /v1/pecas/:id/file body.
+// Fatia 2a v0 é manual: user protocola no PJe/e-SAJ e vem aqui marcar. Todo
+// campo é opcional — só filing_number (número do protocolo) é típico. Receipt
+// (JSON com comprovante) fica pra Fatia 2b (integração automática).
 type FileRequest struct {
 	Receipt       map[string]any `json:"receipt"`
 	CourtRecordID string         `json:"court_record_id"`
 	FiledAt       string         `json:"filed_at"`
+	FilingNumber  string         `json:"filing_number"` // Fatia 2a — número do protocolo (input manual)
 }
 
-// Validate enforces edge rules: receipt must be a non-empty object (at least 1
-// key). court_record_id, when present, must be a valid UUID. filed_at, when
-// present, must be a valid RFC3339 timestamp.
+// Validate: todos os campos são opcionais na Fatia 2a. court_record_id + filed_at,
+// quando presentes, precisam ser UUID e RFC3339. filing_number: qualquer string ≤ 128
+// (limite defensivo).
 func (r *FileRequest) Validate() error {
 	return validation.ValidateStruct(r,
-		validation.Field(&r.Receipt, validation.Required, validation.By(isNonEmptyObject)),
 		validation.Field(&r.CourtRecordID,
 			validation.When(r.CourtRecordID != "", validation.By(isUUID)),
 		),
 		validation.Field(&r.FiledAt,
 			validation.When(r.FiledAt != "", validation.By(isRFC3339)),
 		),
+		validation.Field(&r.FilingNumber, validation.Length(0, 128)),
 	)
 }
 

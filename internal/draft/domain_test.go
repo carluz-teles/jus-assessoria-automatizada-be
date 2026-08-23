@@ -269,6 +269,18 @@ func (r *fakeRepo) InsertPetition(_ context.Context, _ database.Tx, p *Petition)
 	return p, nil
 }
 
+// Fatia 2a — workflow step methods. No-op stubs (os testes existentes não
+// exercem esses caminhos; testes dedicados podem sobrescrever se precisar).
+func (r *fakeRepo) MarkSentToSigning(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
+}
+func (r *fakeRepo) RevertToConstruction(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
+}
+func (r *fakeRepo) MarkFiled(_ context.Context, _ database.Tx, _, _, _ string) error {
+	return nil
+}
+
 func (r *fakeRepo) GetPetitionByDraftID(_ context.Context, _ database.Tx, _, _ string) (*Petition, error) {
 	return r.getPetitionResult, r.getPetitionErr
 }
