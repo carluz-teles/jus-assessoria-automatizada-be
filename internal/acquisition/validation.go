@@ -52,35 +52,30 @@ func (r AssignResponsibleRequest) Validate() error {
 	)
 }
 
-// AssignIntimacaoResponsaveisRequest is the PUT /v1/intimacoes/:id/responsaveis body:
-// the two optional roles — condutor do prazo (ConductorUserID) and revisor/assinador
-// (ReviewerUserID). Each is a *string so the caller can send an explicit null to
-// desatribuir that specific role. Both null = remove all assignments. tenant_id comes
-// from the verified principal, never the body.
-type AssignIntimacaoResponsaveisRequest struct {
-	ConductorUserID *string `json:"conductor_user_id"`
-	ReviewerUserID  *string `json:"reviewer_user_id"`
+// AssignIntimacaoResponsavelRequest is the PUT /v1/intimacoes/:id/responsavel body:
+// o responsável único da intimação (0057, ex-conductor/reviewer). *string permite
+// null explícito para desatribuir. tenant_id vem do principal, nunca do body.
+type AssignIntimacaoResponsavelRequest struct {
+	AssigneeUserID *string `json:"assignee_user_id"`
 }
 
-// Validate enforces the boundary rules via ozzo: when either ID is present it must be
-// a well-formed uuid (bad shape → 400 at the edge, before any DB hop). A nil is valid
-// (desatribuir). Whether a uuid names a real member of the tenant is a domain concern
-// the use case checks under the tx (ErrResponsibleNotMember), not a shape rule here.
-func (r AssignIntimacaoResponsaveisRequest) Validate() error {
+// Validate: quando presente o id precisa ser um uuid bem formado (400 na borda,
+// antes de qualquer DB hop). nil é válido (desatribuir). Se o uuid corresponde a
+// um membro real do tenant é responsabilidade do caso de uso (ErrResponsibleNotMember).
+func (r AssignIntimacaoResponsavelRequest) Validate() error {
 	return validation.ValidateStruct(&r,
-		validation.Field(&r.ConductorUserID, is.UUID),
-		validation.Field(&r.ReviewerUserID, is.UUID),
+		validation.Field(&r.AssigneeUserID, is.UUID),
 	)
 }
 
-// BulkAssignResponsaveisRequest é o corpo de POST /v1/intimacoes/bulk/responsaveis:
-// atribui o condutor a várias intimações. Dois modos: All=true aplica a TODA a
-// faixa/filtro atual (os campos de filtro espelham o GET /intimacoes; inclui os itens
-// ainda não paginados); senão aplica aos IDs. ConductorUserID nil desatribui.
-type BulkAssignResponsaveisRequest struct {
-	ConductorUserID *string  `json:"conductor_user_id"`
-	All             bool     `json:"all"`
-	IDs             []string `json:"ids"`
+// BulkAssignResponsavelRequest é o corpo de POST /v1/intimacoes/bulk/responsavel:
+// atribui o responsável a várias intimações. Dois modos: All=true aplica a TODA a
+// faixa/filtro atual (filtros espelham o GET /intimacoes; inclui os itens ainda não
+// paginados); senão aplica aos IDs. AssigneeUserID nil desatribui.
+type BulkAssignResponsavelRequest struct {
+	AssigneeUserID *string  `json:"assignee_user_id"`
+	All            bool     `json:"all"`
+	IDs            []string `json:"ids"`
 	// filtros (usados só quando All=true) — espelham o GET /intimacoes.
 	Urgencia   string `json:"urgencia"`
 	Search     string `json:"search"`
@@ -90,11 +85,11 @@ type BulkAssignResponsaveisRequest struct {
 	Assignee   string `json:"assignee"`
 }
 
-// Validate: conductor (quando presente) uuid; no modo por-ids, ao menos um id, cada
-// um uuid. A pertinência do condutor ao tenant é checada no caso de uso (sob a tx).
-func (r BulkAssignResponsaveisRequest) Validate() error {
+// Validate: assignee (quando presente) uuid; no modo por-ids, ao menos um id, cada
+// um uuid. A pertinência do assignee ao tenant é checada no caso de uso (sob a tx).
+func (r BulkAssignResponsavelRequest) Validate() error {
 	return validation.ValidateStruct(&r,
-		validation.Field(&r.ConductorUserID, is.UUID),
+		validation.Field(&r.AssigneeUserID, is.UUID),
 		validation.Field(&r.IDs,
 			validation.When(!r.All, validation.Required),
 			validation.Each(is.UUID),

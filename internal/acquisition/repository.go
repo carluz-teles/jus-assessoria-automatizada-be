@@ -108,17 +108,17 @@ type Repository interface {
 	// the tx+RLS boundary). No outbox event yet — a future slice.
 	SetIntimationUserStatus(ctx context.Context, tx database.Tx, tenantID, intimationID, userStatus string) error
 
-	// AssignIntimacaoResponsaveis sets (or clears with nil) the conductor_user_id and
-	// reviewer_user_id of one intimação, tenant-scoped. The use case already validated
-	// membership before calling; a miss or foreign row is ErrIntimationNotFound.
-	// Tx-taking (the use case owns the tx+RLS boundary).
-	AssignIntimacaoResponsaveis(ctx context.Context, tx database.Tx, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error
+	// AssignIntimacaoAssignee sets (or clears with nil) the single assignee_user_id of
+	// one intimação, tenant-scoped. The use case already validated membership before
+	// calling; a miss or foreign row is ErrIntimationNotFound. Tx-taking (the use case
+	// owns the tx+RLS boundary).
+	AssignIntimacaoAssignee(ctx context.Context, tx database.Tx, tenantID, intimationID string, assigneeUserID *string) error
 
-	// Bulk: atribui o condutor (só conductor_user_id — preserva o revisor) a várias
-	// intimações de uma vez. ByIDs = lista explícita; ByFilter = TODA a faixa/filtro
-	// atual (modo "todos" da UI, inclui não-paginados). Devolvem a contagem afetada.
-	BulkAssignConductorByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, conductorUserID *string) (int64, error)
-	BulkAssignConductorByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, conductorUserID *string) (int64, error)
+	// Bulk: atribui o responsável (assignee_user_id) a várias intimações de uma vez.
+	// ByIDs = lista explícita; ByFilter = TODA a faixa/filtro atual (modo "todos" da UI,
+	// inclui não-paginados). Devolvem a contagem afetada.
+	BulkAssignIntimacoesByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, assigneeUserID *string) (int64, error)
+	BulkAssignIntimacoesByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, assigneeUserID *string) (int64, error)
 
 	// Screen reads — the keyset-paginated read models (off the write path). The read
 	// use case depends on the narrow readRepo view of these.
@@ -1746,10 +1746,9 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 			DeadlineStartAt:   row.DeadlineStartAt.Time,
 			ContentPreview:    contentPreview(row.Content),
 			Prazo:             mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
-			AIAnalyzedAt:      timestampPtr(row.AiAnalyzedAt),
-			ConductorUserID:   uuidPtrFromPgtype(row.ConductorUserID),
-			ConductorUserName: row.ConductorUserName,
-			ReviewerUserID:    uuidPtrFromPgtype(row.ReviewerUserID),
+			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
+			AssigneeUserID:   uuidPtrFromPgtype(row.AssigneeUserID),
+			AssigneeUserName: row.AssigneeUserName,
 		})
 	}
 	return out, nil
@@ -1776,8 +1775,7 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 	if err != nil {
 		return IntimacaoDetailView{}, database.WrapInfra(err)
 	}
-	conductorID := uuidPtrFromPgtype(row.ConductorUserID)
-	reviewerID := uuidPtrFromPgtype(row.ReviewerUserID)
+	assigneeID := uuidPtrFromPgtype(row.AssigneeUserID)
 	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt)
 
 	return IntimacaoDetailView{
@@ -1799,20 +1797,18 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			DeadlineStartAt: row.DeadlineStartAt.Time,
 			// The detail carries the FULL teor below, but ContentPreview stays populated so
 			// the embedded IntimacaoView is a complete list row (nothing the FE reads breaks).
-			ContentPreview: contentPreview(row.Content),
-			Prazo:          mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			ContentPreview:   contentPreview(row.Content),
+			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
+			AssigneeUserID:   assigneeID,
+			AssigneeUserName: row.AssigneeUserName,
 		},
-		Content:           row.Content,
-		JudgingBody:       deref(row.JudgingBody),
-		Recipients:        rawArrayOrEmpty(json.RawMessage(row.Recipients)),
-		ConductorUserID:   conductorID,
-		ConductorUserName: row.ConductorUserName,
-		ReviewerUserID:    reviewerID,
-		ReviewerUserName:  row.ReviewerUserName,
-		History:           history,
-		AISummary:         deref(row.AiSummary),
-		AIProvidencias:    decodeProvidencias(row.AiProvidencias),
-		AIAnalyzedAt:      timestampPtr(row.AiAnalyzedAt),
+		Content:        row.Content,
+		JudgingBody:    deref(row.JudgingBody),
+		Recipients:     rawArrayOrEmpty(json.RawMessage(row.Recipients)),
+		History:        history,
+		AISummary:      deref(row.AiSummary),
+		AIProvidencias: decodeProvidencias(row.AiProvidencias),
 	}, nil
 }
 
@@ -2350,11 +2346,11 @@ func (r *pgRepository) SetIntimationUserStatus(ctx context.Context, tx database.
 	return nil
 }
 
-// AssignIntimacaoResponsaveis sets (or clears, with nil) the conductor_user_id and
-// reviewer_user_id on one intimação inside the caller's tx, tenant-scoped (barrier 1, RLS
-// barrier 2). The use case already validated membership; we parse & pass the UUIDs here.
-// A zero-row UPDATE surfaces as ErrIntimationNotFound (→ 404), never a silent no-op.
-func (r *pgRepository) AssignIntimacaoResponsaveis(ctx context.Context, tx database.Tx, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error {
+// AssignIntimacaoAssignee sets (or clears, with nil) the single assignee_user_id on one
+// intimação inside the caller's tx, tenant-scoped (barrier 1, RLS barrier 2). The use case
+// already validated membership; we parse & pass the UUID here. A zero-row UPDATE surfaces
+// as ErrIntimationNotFound (→ 404), never a silent no-op.
+func (r *pgRepository) AssignIntimacaoAssignee(ctx context.Context, tx database.Tx, tenantID, intimationID string, assigneeUserID *string) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return database.WrapInfra(err)
@@ -2363,32 +2359,14 @@ func (r *pgRepository) AssignIntimacaoResponsaveis(ctx context.Context, tx datab
 	if err != nil {
 		return apperr.NewInvalid("id de intimação inválido")
 	}
-
-	toNullableUUID := func(s *string) (pgtype.UUID, error) {
-		if s == nil {
-			return pgtype.UUID{}, nil
-		}
-		u, err := uuid.Parse(*s)
-		if err != nil {
-			return pgtype.UUID{}, apperr.NewInvalid("id de usuário inválido")
-		}
-		return pgtype.UUID{Bytes: u, Valid: true}, nil
-	}
-
-	conductor, err := toNullableUUID(conductorUserID)
+	assignee, err := assigneePtrToUUID(assigneeUserID)
 	if err != nil {
 		return err
 	}
-	reviewer, err := toNullableUUID(reviewerUserID)
-	if err != nil {
-		return err
-	}
-
-	_, err = acquisitiondb.New(tx).AssignIntimationResponsaveis(ctx, acquisitiondb.AssignIntimationResponsaveisParams{
-		ID:              iid,
-		TenantID:        tid,
-		ConductorUserID: conductor,
-		ReviewerUserID:  reviewer,
+	_, err = acquisitiondb.New(tx).AssignIntimationAssignee(ctx, acquisitiondb.AssignIntimationAssigneeParams{
+		ID:             iid,
+		TenantID:       tid,
+		AssigneeUserID: assignee,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrIntimationNotFound
@@ -2399,8 +2377,8 @@ func (r *pgRepository) AssignIntimacaoResponsaveis(ctx context.Context, tx datab
 	return nil
 }
 
-// conductorPtrToUUID converte *string (id do condutor; nil = desatribuir) em pgtype.UUID.
-func conductorPtrToUUID(s *string) (pgtype.UUID, error) {
+// assigneePtrToUUID converte *string (id do assignee; nil = desatribuir) em pgtype.UUID.
+func assigneePtrToUUID(s *string) (pgtype.UUID, error) {
 	if s == nil {
 		return pgtype.UUID{}, nil
 	}
@@ -2411,7 +2389,7 @@ func conductorPtrToUUID(s *string) (pgtype.UUID, error) {
 	return pgtype.UUID{Bytes: u, Valid: true}, nil
 }
 
-func (r *pgRepository) BulkAssignConductorByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, conductorUserID *string) (int64, error) {
+func (r *pgRepository) BulkAssignIntimacoesByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, assigneeUserID *string) (int64, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return 0, database.WrapInfra(err)
@@ -2424,14 +2402,14 @@ func (r *pgRepository) BulkAssignConductorByIDs(ctx context.Context, tx database
 		}
 		uuids = append(uuids, u)
 	}
-	conductor, err := conductorPtrToUUID(conductorUserID)
+	assignee, err := assigneePtrToUUID(assigneeUserID)
 	if err != nil {
 		return 0, err
 	}
-	n, err := acquisitiondb.New(tx).BulkAssignConductorByIDs(ctx, acquisitiondb.BulkAssignConductorByIDsParams{
-		TenantID:        tid,
-		Ids:             uuids,
-		ConductorUserID: conductor,
+	n, err := acquisitiondb.New(tx).BulkAssignIntimacoesByIDs(ctx, acquisitiondb.BulkAssignIntimacoesByIDsParams{
+		TenantID:       tid,
+		Ids:            uuids,
+		AssigneeUserID: assignee,
 	})
 	if err != nil {
 		return 0, database.WrapInfra(err)
@@ -2439,24 +2417,24 @@ func (r *pgRepository) BulkAssignConductorByIDs(ctx context.Context, tx database
 	return n, nil
 }
 
-func (r *pgRepository) BulkAssignConductorByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, conductorUserID *string) (int64, error) {
+func (r *pgRepository) BulkAssignIntimacoesByFilter(ctx context.Context, tx database.Tx, q IntimacoesQuery, assigneeUserID *string) (int64, error) {
 	tid, err := uuid.Parse(q.TenantID)
 	if err != nil {
 		return 0, database.WrapInfra(err)
 	}
-	conductor, err := conductorPtrToUUID(conductorUserID)
+	assignee, err := assigneePtrToUUID(assigneeUserID)
 	if err != nil {
 		return 0, err
 	}
-	n, err := acquisitiondb.New(tx).BulkAssignConductorByFilter(ctx, acquisitiondb.BulkAssignConductorByFilterParams{
-		TenantID:        tid,
-		ConductorUserID: conductor,
-		Search:          escapeLike(q.Search),
-		Type:            q.Type,
-		UserStatus:      q.UserStatus,
-		Court:           q.Court,
-		AssigneeID:      nullUUID(q.Assignee),
-		Urgencia:        q.Urgencia,
+	n, err := acquisitiondb.New(tx).BulkAssignIntimacoesByFilter(ctx, acquisitiondb.BulkAssignIntimacoesByFilterParams{
+		TenantID:         tid,
+		AssigneeUserID:   assignee,
+		Search:           escapeLike(q.Search),
+		Type:             q.Type,
+		UserStatus:       q.UserStatus,
+		Court:            q.Court,
+		FilterAssigneeID: nullUUID(q.Assignee),
+		Urgencia:         q.Urgencia,
 	})
 	if err != nil {
 		return 0, database.WrapInfra(err)

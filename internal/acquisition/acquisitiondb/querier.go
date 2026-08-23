@@ -31,13 +31,13 @@ type Querier interface {
 	// court_record above; the WHERE ties the write to the caller's own tenant so a mismatched
 	// (case, tenant) touches nothing. Idempotent — re-assigning the same user is a no-op write.
 	AssignCaseResponsible(ctx context.Context, arg AssignCaseResponsibleParams) error
-	// Set (or clear, via NULL) the conductor_user_id and reviewer_user_id on one intimation,
-	// tenant-scoped (barrier 1, RLS barrier 2). Both are nullable: passing NULL desatribui
-	// the role. The use case pre-validates membership (AppUserExistsInTenant) before calling
-	// this, so the FK is always satisfied when non-null. A zero-row result (unknown id or
-	// foreign tenant's row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
-	// Idempotent: re-assigning the same user re-writes the same value.
-	AssignIntimationResponsaveis(ctx context.Context, arg AssignIntimationResponsaveisParams) (uuid.UUID, error)
+	// Set (or clear, via NULL) the single assignee_user_id on one intimation,
+	// tenant-scoped (barrier 1, RLS barrier 2). Nullable: passing NULL desatribui.
+	// The use case pre-validates membership (AppUserExistsInTenant) before calling
+	// this, so the FK is always satisfied when non-null. A zero-row result (unknown
+	// id or foreign tenant's row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound
+	// (→ 404). Idempotent: re-assigning the same user re-writes the same value.
+	AssignIntimationAssignee(ctx context.Context, arg AssignIntimationAssigneeParams) (uuid.UUID, error)
 	// backfill_job queries (acquisition slice).
 	// The backfill listener reacts to integration_activated: on the FIRST activation
 	// of an integration it creates one backfill_job and emits the sync slices. These
@@ -111,14 +111,14 @@ type Querier interface {
 	// neither duplicates nor errors. source is DJEN. The name is refreshed only on insert
 	// (a DO NOTHING leaves the existing row) — an advogado's OAB is the stable identity.
 	BatchUpsertPartyCounsels(ctx context.Context, arg BatchUpsertPartyCounselsParams) error
-	// Atribuição em massa do condutor para TODA a faixa/filtro atual (modo "todos" da UI —
-	// inclui as linhas ainda não paginadas). Reusa EXATAMENTE a cláusula de filtro do
-	// ListIntimacoes (search/type/user_status/court/assignee/urgencia) via subquery. SÓ toca
-	// conductor_user_id (preserva o revisor). tenant-scoped (barrier 1, RLS barrier 2).
-	BulkAssignConductorByFilter(ctx context.Context, arg BulkAssignConductorByFilterParams) (int64, error)
-	// Atribuição em massa do condutor (SÓ conductor_user_id — preserva o revisor) para
-	// uma lista explícita de ids, tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
-	BulkAssignConductorByIDs(ctx context.Context, arg BulkAssignConductorByIDsParams) (int64, error)
+	// Atribuição em massa do responsável para TODA a faixa/filtro atual (modo
+	// "todos" da UI — inclui linhas ainda não paginadas). Reusa EXATAMENTE a
+	// cláusula de filtro do ListIntimacoes (search/type/user_status/court/assignee/
+	// urgencia) via subquery. tenant-scoped (barrier 1, RLS barrier 2).
+	BulkAssignIntimacoesByFilter(ctx context.Context, arg BulkAssignIntimacoesByFilterParams) (int64, error)
+	// Atribuição em massa do responsável para uma lista explícita de ids,
+	// tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
+	BulkAssignIntimacoesByIDs(ctx context.Context, arg BulkAssignIntimacoesByIDsParams) (int64, error)
 	// Push a record's next_sync_at forward as its re-poll is enqueued, so the next tick
 	// does not re-enqueue it; if the resync never lands, it falls due again after the
 	// interval (at-least-once).
@@ -283,8 +283,7 @@ type Querier interface {
 	//   • judging_body           — the court record's órgão julgador (court_record.judging_body);
 	//   • recipients             — the addressee jsonb list (every destinatário + matched-OAB flag);
 	//   • user_status            — the triagem state (PENDING|RESOLVED|IGNORED);
-	//   • conductor_user_id/name — condutor do prazo (nullable, LEFT JOIN app_user);
-	//   • reviewer_user_id/name  — revisão e assinatura (nullable, LEFT JOIN app_user);
+	//   • assignee_user_id/name  — responsável pela intimação (nullable, LEFT JOIN app_user);
 	//   • deadline.confirmed_at  — when the deadline was confirmed (for history derivation);
 	//   • deadline.confirmed_by_name — confirmer's name (for history label; nullable);
 	//   • deadline.status (already present) — for history label (OPEN/NO_DEADLINE branch).
@@ -483,11 +482,11 @@ type Querier interface {
 	// ('9999-12-31', max-uuid). Optional filters — @court (free text from the DISTINCT
 	// options), @type / @user_status (closed sets), @urgencia (deadline-proximity /
 	// providência bucket, closed set), @search (cnj_number/class/judging_body ILIKE),
-	// @assignee_id (condutor OR revisor, the "Minhas" toggle) — are additive ANDs. The
-	// LEFT JOIN deadline exposes the derived prazo (1:1 per notification_id, UNIQUE);
-	// NULL when no prazo exists yet. ai_analyzed_at + conductor_user_id/name mirror
-	// GetIntimacao's projection (same LEFT JOIN app_user pattern) so the inbox row can
-	// render the "não analisada" badge and the condutor label without a deep-link.
+	// @assignee_id (the "Minhas" toggle) — are additive ANDs. The LEFT JOIN deadline
+	// exposes the derived prazo (1:1 per notification_id, UNIQUE); NULL when no prazo
+	// exists yet. ai_analyzed_at + assignee_user_id/name mirror GetIntimacao's
+	// projection (same LEFT JOIN app_user pattern) so the inbox row can render the
+	// "não analisada" badge and the responsável label without a deep-link.
 	ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error)
 	// The "Intimações" tab of one process: the intimations filed on this court record,
 	// newest availability first, with the record's number/court/degree joined in (same

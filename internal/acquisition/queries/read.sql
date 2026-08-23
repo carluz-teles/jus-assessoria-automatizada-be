@@ -109,15 +109,15 @@ WHERE cr.id = $1 AND cr.tenant_id = $2;
 -- ('9999-12-31', max-uuid). Optional filters — @court (free text from the DISTINCT
 -- options), @type / @user_status (closed sets), @urgencia (deadline-proximity /
 -- providência bucket, closed set), @search (cnj_number/class/judging_body ILIKE),
--- @assignee_id (condutor OR revisor, the "Minhas" toggle) — are additive ANDs. The
--- LEFT JOIN deadline exposes the derived prazo (1:1 per notification_id, UNIQUE);
--- NULL when no prazo exists yet. ai_analyzed_at + conductor_user_id/name mirror
--- GetIntimacao's projection (same LEFT JOIN app_user pattern) so the inbox row can
--- render the "não analisada" badge and the condutor label without a deep-link.
+-- @assignee_id (the "Minhas" toggle) — are additive ANDs. The LEFT JOIN deadline
+-- exposes the derived prazo (1:1 per notification_id, UNIQUE); NULL when no prazo
+-- exists yet. ai_analyzed_at + assignee_user_id/name mirror GetIntimacao's
+-- projection (same LEFT JOIN app_user pattern) so the inbox row can render the
+-- "não analisada" badge and the responsável label without a deep-link.
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id,
-       i.ai_analyzed_at, i.conductor_user_id, uc.name AS conductor_user_name, i.reviewer_user_id,
+       i.ai_analyzed_at, i.assignee_user_id, ua.name AS assignee_user_name,
        -- prazo derivado (nullable — nem toda intimação tem prazo ainda). CASE WHEN
        -- garante que todas as expressões derivadas sejam NULL quando não há prazo
        -- (LEFT JOIN miss), forçando o sqlc a inferir os tipos como nullable (*T).
@@ -129,7 +129,7 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
-LEFT JOIN app_user uc ON uc.id = i.conductor_user_id
+LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
 WHERE i.tenant_id = $1
   AND (
     @search::text = ''
@@ -142,8 +142,7 @@ WHERE i.tenant_id = $1
   AND (@court::text = '' OR cr.court = @court::text)
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
-    OR i.conductor_user_id = sqlc.narg('assignee_id')::uuid
-    OR i.reviewer_user_id = sqlc.narg('assignee_id')::uuid
+    OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
   )
   AND (
     @urgencia::text = ''
@@ -168,8 +167,7 @@ LIMIT $2;
 --   • judging_body           — the court record's órgão julgador (court_record.judging_body);
 --   • recipients             — the addressee jsonb list (every destinatário + matched-OAB flag);
 --   • user_status            — the triagem state (PENDING|RESOLVED|IGNORED);
---   • conductor_user_id/name — condutor do prazo (nullable, LEFT JOIN app_user);
---   • reviewer_user_id/name  — revisão e assinatura (nullable, LEFT JOIN app_user);
+--   • assignee_user_id/name  — responsável pela intimação (nullable, LEFT JOIN app_user);
 --   • deadline.confirmed_at  — when the deadline was confirmed (for history derivation);
 --   • deadline.confirmed_by_name — confirmer's name (for history label; nullable);
 --   • deadline.status (already present) — for history label (OPEN/NO_DEADLINE branch).
@@ -182,11 +180,9 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.recipients, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id, cr.judging_body,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
        i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
-       -- responsáveis (0050): nullable pairs — id + name via LEFT JOIN app_user.
-       i.conductor_user_id,
-       uc.name                                                                     AS conductor_user_name,
-       i.reviewer_user_id,
-       ur.name                                                                     AS reviewer_user_name,
+       -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
+       i.assignee_user_id,
+       ua.name                                                                     AS assignee_user_name,
        -- prazo derivado (nullable — nem toda intimação tem prazo ainda). CASE WHEN
        -- garante que todas as expressões derivadas sejam NULL quando não há prazo
        -- (LEFT JOIN miss), forçando o sqlc a inferir os tipos como nullable (*T).
@@ -201,8 +197,7 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
-LEFT JOIN app_user uc  ON uc.id = i.conductor_user_id
-LEFT JOIN app_user ur  ON ur.id = i.reviewer_user_id
+LEFT JOIN app_user ua  ON ua.id = i.assignee_user_id
 LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
 WHERE i.id = $1 AND i.tenant_id = $2;
 
@@ -252,8 +247,7 @@ WHERE i.tenant_id = $1
   AND (@court::text = '' OR cr.court = @court::text)
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
-    OR i.conductor_user_id = sqlc.narg('assignee_id')::uuid
-    OR i.reviewer_user_id = sqlc.narg('assignee_id')::uuid
+    OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
   )
   AND (
     @urgencia::text = ''

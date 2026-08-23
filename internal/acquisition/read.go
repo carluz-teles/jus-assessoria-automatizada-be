@@ -89,16 +89,12 @@ type IntimacaoView struct {
 	DeadlineStartAt time.Time           `json:"deadline_start_at"`
 	ContentPreview  string              `json:"content_preview"`
 	Prazo           *IntimacaoPrazoView `json:"prazo"` // nil (JSON null) when no prazo derived yet
-	// Análise IA (0051) + condutor do prazo (0050), surfaced on the list row (not just the
-	// detail) for the master-detail inbox: AIAnalyzedAt nil = "não analisada" badge; non-nil =
-	// already analyzed. ConductorUserID/Name back the "Minhas" toggle and the row's condutor
-	// label, joined the same way as GetIntimacao (LEFT JOIN app_user) — nil = não atribuído.
-	AIAnalyzedAt      *time.Time `json:"ai_analyzed_at"`
-	ConductorUserID   *string    `json:"conductor_user_id"`
-	ConductorUserName *string    `json:"conductor_user_name"`
-	// ReviewerUserID: surfaced on the list row so a row-level "atribuir condutor"
-	// (PUT /responsaveis, full replace) can preserve the reviewer instead of clearing it.
-	ReviewerUserID *string `json:"reviewer_user_id"`
+	// Análise IA (0051) + responsável (0057, ex-conductor/reviewer). AIAnalyzedAt nil = "não
+	// analisada" badge; non-nil = já analisada. AssigneeUserID/Name backam o toggle "Minhas"
+	// e o rótulo do responsável na linha, joined via LEFT JOIN app_user — nil = não atribuído.
+	AIAnalyzedAt     *time.Time `json:"ai_analyzed_at"`
+	AssigneeUserID   *string    `json:"assignee_user_id"`
+	AssigneeUserName *string    `json:"assignee_user_name"`
 }
 
 // IntimacaoHistoryEntry is one event in the intimation's derived timeline (Histórico
@@ -145,27 +141,23 @@ type IntimacaoProvidenciaView struct {
 // /v1/intimacoes/:id). It embeds the full IntimacaoView (so every list field the FE
 // already renders is present — additive, nothing removed) and adds the detail-only
 // extras the inbox row omits: the FULL teor (not the truncated preview), the court
-// record's órgão julgador, the addressee list, the two responsáveis, and the derived
-// Histórico timeline. Recipients is the jsonb column forwarded verbatim (a list of
-// {name, oab, matched}); it defaults to an empty array, never JSON null.
-// History is always an initialized slice (never null), ordered by occurred_at ASC.
+// record's órgão julgador, the addressee list, and the derived Histórico timeline.
+// Recipients is the jsonb column forwarded verbatim (a list of {name, oab, matched});
+// it defaults to an empty array, never JSON null. History is always an initialized
+// slice (never null), ordered by occurred_at ASC. The single responsável is already
+// carried by the embedded IntimacaoView (AssigneeUserID/Name).
 type IntimacaoDetailView struct {
 	IntimacaoView
-	Content           string                  `json:"content"`             // FULL teor (untruncated), for the detail screen
-	JudgingBody       string                  `json:"judging_body"`        // court_record.judging_body (órgão julgador)
-	Recipients        json.RawMessage         `json:"recipients"`          // destinatários (jsonb array), verbatim
-	ConductorUserID   *string                 `json:"conductor_user_id"`   // condutor do prazo (nil = não atribuído)
-	ConductorUserName *string                 `json:"conductor_user_name"` // joined from app_user (nil = não atribuído)
-	ReviewerUserID    *string                 `json:"reviewer_user_id"`    // revisão e assinatura (nil = não atribuído)
-	ReviewerUserName  *string                 `json:"reviewer_user_name"`  // joined from app_user (nil = não atribuído)
-	History           []IntimacaoHistoryEntry `json:"history"`             // timeline derivada, ASC, nunca null
+	Content     string                  `json:"content"`      // FULL teor (untruncated), for the detail screen
+	JudgingBody string                  `json:"judging_body"` // court_record.judging_body (órgão julgador)
+	Recipients  json.RawMessage         `json:"recipients"`   // destinatários (jsonb array), verbatim
+	History     []IntimacaoHistoryEntry `json:"history"`      // timeline derivada, ASC, nunca null
 
-	// Análise IA (0051) — o card "Analisar esta intimação". AIAnalyzedAt nil = pré-análise
-	// (o FE mostra o CTA); non-nil = pós-análise. AISummary vazio com AIAnalyzedAt non-nil =
-	// modo degradado (IA indisponível). AIProvidencias é sempre inicializado (nunca null).
+	// Análise IA (0051) — o card "Analisar esta intimação". AISummary vazio com
+	// AIAnalyzedAt (no embedded IntimacaoView) non-nil = modo degradado (IA
+	// indisponível). AIProvidencias é sempre inicializado (nunca null).
 	AISummary      string                     `json:"ai_summary,omitempty"`
 	AIProvidencias []IntimacaoProvidenciaView `json:"ai_providencias"`
-	AIAnalyzedAt   *time.Time                 `json:"ai_analyzed_at"`
 }
 
 // ProcessosSummaryView is the KPI header of the processes list (GET

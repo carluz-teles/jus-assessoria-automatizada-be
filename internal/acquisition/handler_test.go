@@ -93,11 +93,11 @@ func (f *fakeHandlerUC) ReopenIntimacao(_ context.Context, tenantID, intimationI
 	return f.triageErr
 }
 
-func (f *fakeHandlerUC) AssignIntimacaoResponsaveis(_ context.Context, _, _ string, _, _ *string) error {
+func (f *fakeHandlerUC) AssignIntimacaoAssignee(_ context.Context, _, _ string, _ *string) error {
 	return nil
 }
 
-func (f *fakeHandlerUC) BulkAssignConductor(_ context.Context, _ string, _ bool, _ IntimacoesQuery, ids []string, _ *string) (int64, error) {
+func (f *fakeHandlerUC) BulkAssignIntimacoes(_ context.Context, _ string, _ bool, _ IntimacoesQuery, ids []string, _ *string) (int64, error) {
 	return int64(len(ids)), nil
 }
 

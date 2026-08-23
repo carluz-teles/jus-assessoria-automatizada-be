@@ -312,15 +312,15 @@ func (m *mockRepo) SetIntimationUserStatus(_ context.Context, _ database.Tx, _, 
 	return m.setUserStatusErr
 }
 
-func (m *mockRepo) AssignIntimacaoResponsaveis(_ context.Context, _ database.Tx, _, _ string, _, _ *string) error {
+func (m *mockRepo) AssignIntimacaoAssignee(_ context.Context, _ database.Tx, _, _ string, _ *string) error {
 	return nil
 }
 
-func (m *mockRepo) BulkAssignConductorByIDs(_ context.Context, _ database.Tx, _ string, ids []string, _ *string) (int64, error) {
+func (m *mockRepo) BulkAssignIntimacoesByIDs(_ context.Context, _ database.Tx, _ string, ids []string, _ *string) (int64, error) {
 	return int64(len(ids)), nil
 }
 
-func (m *mockRepo) BulkAssignConductorByFilter(_ context.Context, _ database.Tx, _ IntimacoesQuery, _ *string) (int64, error) {
+func (m *mockRepo) BulkAssignIntimacoesByFilter(_ context.Context, _ database.Tx, _ IntimacoesQuery, _ *string) (int64, error) {
 	return 0, nil
 }
 
