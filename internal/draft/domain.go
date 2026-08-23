@@ -161,6 +161,11 @@ type PatchCommand struct {
 	DraftID  string
 	Content  string
 	Title    *string
+	// StructuredContent is Peça v2's block-structured version. Non-nil means
+	// dual-write: the plain-text `Content` is persisted alongside the JSONB
+	// StructuredContent (source of truth for the FE). Nil leaves the
+	// structured_content column untouched — the legacy PATCH path (pre-Fatia B).
+	StructuredContent *StructuredContent
 }
 
 // Patch implements PATCH /v1/pecas/:id (autosave). Runs in a single tenant-scoped tx:
@@ -171,7 +176,7 @@ func (uc *UseCase) Patch(ctx context.Context, cmd PatchCommand) (*PatchResult, e
 	var result *PatchResult
 
 	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		r, err := uc.rw.UpdateDraftContent(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.Content, cmd.Title)
+		r, err := uc.rw.UpdateDraftContent(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.Content, cmd.Title, cmd.StructuredContent)
 		if err != nil {
 			return err
 		}
@@ -210,6 +215,44 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 		}
 		v.Review = rev
 
+		// Providences: tasks linked to the intimation, shown on the FE sidebar
+		// (Peça v2). Empty for drafts without an intimation. Non-fatal on error
+		// (a task read failure shouldn't break the peça detail).
+		if v.Intimation != nil {
+			provs, e := uc.rw.GetProvidencesForIntimation(ctx, tx, tenantID, v.Intimation.ID)
+			if e == nil {
+				v.Providences = provs
+			}
+		}
+
+		// Parties: autor/réu/terceiros of the peça's case, shown on the FE
+		// sidebar (Peça v2 — bloco PARTES). Empty for drafts without a process
+		// (blank drafts). Non-fatal on error (same rationale as providences).
+		if v.Process != nil {
+			parties, e := uc.rw.GetPartiesForDraft(ctx, tx, tenantID, v.Process.CaseID)
+			if e == nil {
+				v.Parties = parties
+			}
+		}
+
+		// Peça v2 (migration 0056): lazy backfill of structured_content for
+		// drafts that were persisted before the Fatia B pipeline (or by a
+		// legacy PATCH path). When the column is NULL but there IS content,
+		// parse it here and write back best-effort — subsequent reads skip the
+		// parser. When both are empty the peça is truly empty (never
+		// generated) and we leave nil so the FE renders the empty state.
+		if v.StructuredContent == nil && v.Content != "" {
+			parsed := ParseStructured(v.Content)
+			if parsed != nil {
+				v.StructuredContent = parsed
+				// Fire-and-forget: WHERE structured_content IS NULL guards
+				// against a race with a concurrent writer. An infra error
+				// here does NOT fail the read — the FE already got the
+				// parsed shape in this response.
+				_ = uc.rw.WriteBackStructuredContent(ctx, tx, v.ID, tenantID, parsed)
+			}
+		}
+
 		view = v
 		return nil
 	})
@@ -217,6 +260,25 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 		return nil, err
 	}
 	return view, nil
+}
+
+// AssumeAuthorship flips draft.authorship to "human_taken" (Peça v2). The
+// advogado clicked "Assumir autoria"; from now on the FE hides the Iterar tab
+// and shows Revisão. Idempotent — a repeat call is a harmless UPDATE.
+func (uc *UseCase) AssumeAuthorship(ctx context.Context, tenantID, draftID string) (*Draft, error) {
+	var draft *Draft
+	err := uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		d, err := uc.rw.UpdateAuthorship(ctx, tx, draftID, tenantID, AuthorshipHumanTaken)
+		if err != nil {
+			return err
+		}
+		draft = d
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return draft, nil
 }
 
 // ── Attachment use cases (Fatia 2) ────────────────────────────────────────────
@@ -486,7 +548,7 @@ func (uc *UseCase) File(ctx context.Context, cmd FileCommand) (*FileResult, erro
 		}
 
 		// Flip saga_state to FILED.
-		if _, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateFiled, false, ""); err != nil {
+		if _, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateFiled, false, "", nil); err != nil {
 			return err
 		}
 

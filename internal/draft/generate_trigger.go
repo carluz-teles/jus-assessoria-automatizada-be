@@ -80,7 +80,7 @@ func (uc *TriggerUseCase) TriggerGeneration(ctx context.Context, cmd TriggerGene
 			return err
 		}
 
-		u, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateExtracting, false, "")
+		u, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateExtracting, false, "", nil)
 		if err != nil {
 			return err
 		}

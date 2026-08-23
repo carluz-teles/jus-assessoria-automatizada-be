@@ -87,6 +87,15 @@ type Querier interface {
 	// Load the existing petition for a draft, scoped to tenant via JOIN. Returns
 	// pgx.ErrNoRows when no petition exists (the caller treats nil as "not filed").
 	GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDraftIDParams) (Petition, error)
+	// Read model helper (Peça v2): providences shown on the FE sidebar are the
+	// tasks linked to the draft's intimation. Tenant-scoped (barrier 1), OPEN +
+	// DONE only (DISMISSED tasks disappear from the peça sidebar — the advogado
+	// discarded them). Ordered by (status ASC — OPEN first, DONE below, then
+	// created_at ASC for stable display).
+	//
+	// Read cross-slice directly (same pattern as GetDraftDetail reading court_record
+	// and party without importing acquisition — see docs §5b.2).
+	GetProvidencesForIntimation(ctx context.Context, arg GetProvidencesForIntimationParams) ([]GetProvidencesForIntimationRow, error)
 	// ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
 	// Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
 	// first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).
@@ -154,19 +163,36 @@ type Querier interface {
 	// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).
 	UpdateAttachmentCategory(ctx context.Context, arg UpdateAttachmentCategoryParams) (DraftAttachment, error)
-	// Autosave: update content (and optionally title) + bump updated_at, scoped to
-	// (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
-	// or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+	// Flip the peça's authorship marker. Called by POST /v1/pecas/:id/assume-authorship
+	// when the advogado clicks "Assumir autoria" — from that moment the FE hides the
+	// Iterar tab and shows Revisão. Idempotent: a repeat call is a no-op at the DB level
+	// (same UPDATE). Scoped to (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+	UpdateDraftAuthorship(ctx context.Context, arg UpdateDraftAuthorshipParams) (UpdateDraftAuthorshipRow, error)
+	// Autosave: update content (and optionally title + structured_content) + bump
+	// updated_at, scoped to (id, tenant_id). Returns the minimal patch response fields.
+	// A no-match (wrong id or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound.
+	//
+	// structured_content is dual-written: when $6::boolean is true, $7 (jsonb) is
+	// persisted; otherwise the existing structured_content is left untouched. The FE
+	// always sends both (Peça v2), older PATCH callers can send just content.
 	UpdateDraftContent(ctx context.Context, arg UpdateDraftContentParams) (UpdateDraftContentRow, error)
 	// Patch the observed_result on a petition, scoped to tenant via JOIN. A miss
 	// (no petition or wrong tenant) → pgx.ErrNoRows → ErrPetitionNotFound.
 	UpdateObservedResult(ctx context.Context, arg UpdateObservedResultParams) (UpdateObservedResultRow, error)
 	// Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 	// on success, FAILED on LLM error). Also updates content when the generator returns new
-	// text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
-	// which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
-	// A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+	// text ($4=true → $5 overwrites; false → leaves content unchanged — used for the FAILED
+	// path). Same for structured_content ($6=true → $7 jsonb overwrites) — the DRAFTED path
+	// writes BOTH content + structured_content in one tx (dual write for Peça v2).
+	// Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. No-match → ErrDraftNotFound.
 	UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams) (UpdateSagaStateRow, error)
+	// Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
+	// into a StructuredContent on the fly (structured_content IS NULL for drafts
+	// created before migration 0056 / Fatia B), this UPDATE persists the parsed shape
+	// so subsequent reads skip the parser. Fire-and-forget within the same tx — the
+	// caller does NOT check RowsAffected (a race where another writer already
+	// populated it is harmless — the last writer wins). Scoped to (id, tenant_id).
+	WriteBackStructuredContent(ctx context.Context, arg WriteBackStructuredContentParams) error
 }
 
 var _ Querier = (*Queries)(nil)

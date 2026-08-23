@@ -27,6 +27,9 @@ type writer interface {
 	Sign(ctx context.Context, cmd SignCommand) (*SignResult, error)
 	File(ctx context.Context, cmd FileCommand) (*FileResult, error)
 	Result(ctx context.Context, cmd ResultCommand) (*ResultResult, error)
+	// AssumeAuthorship (Peça v2) is exposed via the main UseCase — no separate
+	// wiring needed since it's a single UPDATE (no LLM, no outbox).
+	AssumeAuthorship(ctx context.Context, tenantID, draftID string) (*Draft, error)
 }
 
 // generator is the narrow port for the POST /v1/pecas/:id/generate trigger. It is a
@@ -55,6 +58,13 @@ type thesisSuggester interface {
 	SuggestTheses(ctx context.Context, cmd SuggestThesesCommand) (*SuggestThesesResult, error)
 }
 
+// iterator is the narrow port for POST /v1/pecas/:id/iterate (Peça v2). Composed
+// independently — it is stateless (no writer; the FE applies changes via PATCH).
+type iterator interface {
+	Iterate(ctx context.Context, cmd IterateCommand) (*IterateResult, error)
+}
+
+
 // lister is the narrow port for the paginated list endpoints.
 type lister interface {
 	ListByProcess(ctx context.Context, q ListByProcessQuery) (DraftListResult, error)
@@ -72,10 +82,11 @@ type Handler struct {
 	uc     writer
 	gen    generator       // nil when the generation use case is not wired (no AI key)
 	chat   chatter         // nil when the chat use case is not wired
-	review reviewer        // nil when the review use case is not wired
-	theses thesisSuggester // nil when the theses use case is not wired (no AI key)
-	lister lister          // nil when the list use case is not wired
-	export presigner       // nil when the export use case is not wired
+	review     reviewer        // nil when the review use case is not wired
+	theses     thesisSuggester // nil when the theses use case is not wired (no AI key)
+	lister     lister          // nil when the list use case is not wired
+	export     presigner       // nil when the export use case is not wired
+	iter iterator // nil when the iterate use case is not wired
 }
 
 // NewHandler wires the handler to the use case.
@@ -123,6 +134,13 @@ func (h *Handler) WithExport(e presigner) *Handler {
 	return h
 }
 
+// WithIterator attaches the iterate use case (Peça v2). Called by cmd/api when
+// the LLM is configured.
+func (h *Handler) WithIterator(i iterator) *Handler {
+	h.iter = i
+	return h
+}
+
 // RegisterV1 mounts the peças routes on the /v1 group. The static-vs-param ordering
 // matters: /pecas/:id/anexos must be declared before /pecas/:id so Fiber routes them
 // correctly. Fiber's router is declaration-order-sensitive for sub-resources under a
@@ -150,6 +168,10 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 	// AI thesis suggestion (Fatia 5 — Sugerir Teses síncrono).
 	r.Post("/pecas/:id/theses", h.thesesPeca)
+
+	// Iteração + assumir autoria (Peça v2).
+	r.Post("/pecas/:id/iterate", h.iteratePeca)
+	r.Post("/pecas/:id/assume-authorship", h.assumeAuthorship)
 
 	// Grounded chat (Fatia 3b).
 	r.Post("/pecas/:id/chat", h.postChat)
@@ -209,6 +231,56 @@ func (h *Handler) getPeca(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"data": detailToResponse(view)})
 }
 
+// ─── POST /v1/pecas/:id/iterate (Peça v2) ───────────────────────────────────
+
+// iteratePeca dispatches the synchronous iteration to the LLM. Body carries
+// scope + kind/instruction; response carries the SectionChange list.
+func (h *Handler) iteratePeca(c *fiber.Ctx) error {
+	if h.iter == nil {
+		return httpx.WriteError(c, apperr.NewInvalid("Iteração pela IA não está configurada."))
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	var req IterateRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	result, err := h.iter.Iterate(c.UserContext(), IterateCommand{
+		TenantID:    tenantID,
+		DraftID:     draftID,
+		Scope:       IterateScope{Kind: req.Scope.Kind, SectionID: req.Scope.SectionID},
+		Kind:        req.Kind,
+		Instruction: req.Instruction,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": result})
+}
+
+// ─── POST /v1/pecas/:id/assume-authorship (Peça v2) ─────────────────────────
+
+// assumeAuthorship flips the peça to human_taken. Idempotent — a repeat call
+// returns the same shape.
+func (h *Handler) assumeAuthorship(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	d, err := h.uc.AssumeAuthorship(c.UserContext(), tenantID, draftID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": fiber.Map{
+		"authorship": d.Authorship,
+		"updated_at": d.UpdatedAt.Format(time.RFC3339),
+	}})
+}
+
 // ─── PATCH /v1/pecas/:id ─────────────────────────────────────────────────────
 
 // patchPeca handles PATCH /v1/pecas/:id (autosave).
@@ -225,10 +297,11 @@ func (h *Handler) patchPeca(c *fiber.Ctx) error {
 	}
 
 	result, err := h.uc.Patch(c.UserContext(), PatchCommand{
-		TenantID: tenantID,
-		DraftID:  draftID,
-		Content:  req.Content,
-		Title:    req.Title,
+		TenantID:          tenantID,
+		DraftID:           draftID,
+		Content:           req.Content,
+		Title:             req.Title,
+		StructuredContent: req.StructuredContent,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -301,10 +374,18 @@ type detailResponse struct {
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 
+	// Peça v2 (migration 0056) — structured_content is the source of truth for
+	// the FE; content stays for legacy/export. authorship drives which panel
+	// tab (Iterar vs Revisão) the FE shows.
+	StructuredContent *StructuredContent `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
+
 	Intimation  *intimationResponse  `json:"intimation,omitempty"`
 	Process     *processResponse     `json:"process,omitempty"`
 	Deadline    *deadlineResponse    `json:"deadline,omitempty"`
 	Attachments []attachmentResponse `json:"attachments"`
+	Providences []Providence         `json:"providences"`
+	Parties     []partyResponse      `json:"parties"`
 
 	// Review is the latest AI review, or null when no generation has been run.
 	Review *reviewResponse `json:"review"`
@@ -362,16 +443,34 @@ type deadlineResponse struct {
 	Status   string `json:"status"`
 }
 
+// partyResponse is one party in GET /v1/pecas/:id. role is the raw DB enum
+// (PLAINTIFF | DEFENDANT | THIRD_PARTY) — the FE maps to autor/reu/procurador.
+// counsels is always an array (empty when the party has no advogado registered).
+type partyResponse struct {
+	Role     string            `json:"role"`
+	Name     string            `json:"name"`
+	Counsels []counselResponse `json:"counsels"`
+}
+
+// counselResponse is one advogado aggregated under a party.
+type counselResponse struct {
+	Name string `json:"name"`
+	OAB  string `json:"oab"`
+	UF   string `json:"uf"`
+}
+
 func detailToResponse(v *DraftDetailView) detailResponse {
 	resp := detailResponse{
-		ID:        v.ID,
-		PieceType: v.PieceType,
-		Title:     v.Title,
-		Content:   v.Content,
-		Status:    v.Status,
-		SagaState: v.SagaState,
-		CreatedAt: v.CreatedAt.Format(time.RFC3339),
-		UpdatedAt: v.UpdatedAt.Format(time.RFC3339),
+		ID:                v.ID,
+		PieceType:         v.PieceType,
+		Title:             v.Title,
+		Content:           v.Content,
+		Status:            v.Status,
+		SagaState:         v.SagaState,
+		CreatedAt:         v.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:         v.UpdatedAt.Format(time.RFC3339),
+		StructuredContent: v.StructuredContent,
+		Authorship:        v.Authorship,
 	}
 
 	if v.Intimation != nil {
@@ -409,6 +508,17 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 
 	// Attachments: always an array (empty when none), never omitted.
 	resp.Attachments = attachmentsToResponse(v.Attachments)
+
+	// Providences: always an array (empty when none — drafts without an intimation,
+	// or with no tasks yet). Peça v2 FE renders the sidebar bullet list.
+	resp.Providences = v.Providences
+	if resp.Providences == nil {
+		resp.Providences = []Providence{}
+	}
+
+	// Parties: always an array (empty when the draft has no process, or the
+	// case genuinely has no party materialized). Peça v2 FE renders bloco PARTES.
+	resp.Parties = partiesToResponse(v.Parties)
 
 	// Review: nil when no generation has run yet, otherwise the latest review.
 	if v.Review != nil {
@@ -717,6 +827,25 @@ func attachmentToResponse(a *Attachment) attachmentResponse {
 		Position:   a.Position,
 		CreatedAt:  a.CreatedAt.Format(time.RFC3339),
 	}
+}
+
+// partiesToResponse maps []PartyInfo to the wire representation, preserving
+// role as-is (FE handles the PLAINTIFF→autor / DEFENDANT→reu mapping). counsels
+// is always an array (never nil), so the FE can iterate safely.
+func partiesToResponse(parties []PartyInfo) []partyResponse {
+	out := make([]partyResponse, 0, len(parties))
+	for i := range parties {
+		counsels := make([]counselResponse, 0, len(parties[i].Counsels))
+		for _, c := range parties[i].Counsels {
+			counsels = append(counsels, counselResponse{Name: c.Name, OAB: c.OAB, UF: c.UF})
+		}
+		out = append(out, partyResponse{
+			Role:     parties[i].Role,
+			Name:     parties[i].Name,
+			Counsels: counsels,
+		})
+	}
+	return out
 }
 
 func attachmentsToResponse(atts []Attachment) []attachmentResponse {

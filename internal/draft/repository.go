@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jusassessoria/platform/internal/draft/draftdb"
 	"github.com/jusassessoria/platform/lib/apperr"
@@ -38,12 +39,29 @@ type Repository interface {
 	// by the generation pipeline to inject structured party data into the AI prompt.
 	// An empty case or one with no parties returns an empty slice, never nil.
 	GetPartiesForDraft(ctx context.Context, tx database.Tx, tenantID, caseID string) ([]PartyInfo, error)
-	// UpdateDraftContent patches content (+optional title) and bumps updated_at. A
-	// no-match (wrong id or foreign tenant) is ErrDraftNotFound.
-	UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string) (*PatchResult, error)
+	// GetProvidencesForIntimation loads the OPEN/DONE tasks linked to the draft's
+	// intimation. Surfaced in the FE sidebar (Peça v2). Empty slice for drafts
+	// without an intimation or with no linked tasks.
+	GetProvidencesForIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) ([]Providence, error)
+	// UpdateDraftContent patches content (+optional title, +optional structured
+	// content) and bumps updated_at. When structured is non-nil it is dual-written
+	// to structured_content jsonb; nil leaves that column untouched. A no-match
+	// (wrong id or foreign tenant) is ErrDraftNotFound.
+	UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string, structured *StructuredContent) (*PatchResult, error)
 	// GetDraftDetail runs the JOIN read model for GET /v1/pecas/:id. A miss is
 	// ErrDraftNotFound.
 	GetDraftDetail(ctx context.Context, tx database.Tx, tenantID, draftID string) (*DraftDetailView, error)
+
+	// UpdateAuthorship flips draft.authorship (assistant → human_taken). Idempotent
+	// at the DB level. A no-match is ErrDraftNotFound. Returns the updated Draft
+	// (Peça v2, migration 0056).
+	UpdateAuthorship(ctx context.Context, tx database.Tx, draftID, tenantID, authorship string) (*Draft, error)
+
+	// WriteBackStructuredContent persists a lazily-parsed StructuredContent to
+	// draft.structured_content — only when the column is still NULL (a WHERE guard
+	// makes it a no-op if a concurrent writer already populated it). Best-effort;
+	// the caller does not check RowsAffected. (Peça v2, migration 0056).
+	WriteBackStructuredContent(ctx context.Context, tx database.Tx, draftID, tenantID string, sc *StructuredContent) error
 
 	// ── Attachment methods (Fatia 2) ─────────────────────────────────────────
 
@@ -78,9 +96,10 @@ type Repository interface {
 	SetGenerationParams(ctx context.Context, tx database.Tx, draftID, tenantID, tone, instructions string, theses []string) error
 
 	// UpdateSagaState transitions the draft's saga_state column and optionally
-	// overwrites content (when updateContent=true). Scoped to (draftID, tenantID).
-	// A miss is ErrDraftNotFound.
-	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error)
+	// overwrites content (when updateContent=true) and structured_content (when
+	// structured is non-nil — dual-write for the DRAFTED path). Scoped to
+	// (draftID, tenantID). A miss is ErrDraftNotFound.
+	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error)
 
 	// InsertReview persists one AI review row. No tenant guard here — the caller
 	// already tenant-guarded the draft before entering the tx. Returns the persisted
@@ -291,7 +310,37 @@ func (r *pgRepository) GetPartiesForDraft(ctx context.Context, tx database.Tx, t
 	return partiesFromRows(rows), nil
 }
 
-func (r *pgRepository) UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string) (*PatchResult, error) {
+func (r *pgRepository) GetProvidencesForIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) ([]Providence, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	iid, err := parseUUID(intimationID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := draftdb.New(tx).GetProvidencesForIntimation(ctx, draftdb.GetProvidencesForIntimationParams{
+		TenantID:     tid,
+		IntimationID: pgtype.UUID{Bytes: iid, Valid: true},
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]Providence, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, Providence{
+			ID:     r.ID.String(),
+			Title:  r.Title,
+			Kind:   derefString(r.Kind),
+			Source: r.Source,
+			Status: r.Status,
+		})
+	}
+	return out, nil
+}
+
+func (r *pgRepository) UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string, structured *StructuredContent) (*PatchResult, error) {
 	did, err := parseUUID(draftID)
 	if err != nil {
 		return nil, err
@@ -307,12 +356,17 @@ func (r *pgRepository) UpdateDraftContent(ctx context.Context, tx database.Tx, d
 		titleVal = *title
 	}
 
+	updateStructured := structured != nil
+	structuredJSON := structuredContentToJSON(structured)
+
 	row, err := draftdb.New(tx).UpdateDraftContent(ctx, draftdb.UpdateDraftContentParams{
-		ID:       did,
-		TenantID: tid,
-		Content:  textToNull(content),
-		Column4:  updateTitle,
-		Title:    titleVal,
+		ID:                did,
+		TenantID:          tid,
+		Content:           textToNull(content),
+		Column4:           updateTitle,
+		Title:             titleVal,
+		Column6:           updateStructured,
+		StructuredContent: structuredJSON,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDraftNotFound
@@ -325,6 +379,58 @@ func (r *pgRepository) UpdateDraftContent(ctx context.Context, tx database.Tx, d
 		Title:     row.Title,
 		UpdatedAt: timestamptzToTime(row.UpdatedAt),
 	}, nil
+}
+
+// UpdateAuthorship flips the peça's authorship marker (assistant ↔ human_taken).
+// Reused by POST /v1/pecas/:id/assume-authorship (Peça v2).
+func (r *pgRepository) UpdateAuthorship(ctx context.Context, tx database.Tx, draftID, tenantID, authorship string) (*Draft, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).UpdateDraftAuthorship(ctx, draftdb.UpdateDraftAuthorshipParams{
+		ID:         did,
+		TenantID:   tid,
+		Authorship: authorship,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDraftNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return draftFromAuthorshipRow(row), nil
+}
+
+// WriteBackStructuredContent lazily persists a parsed StructuredContent to a
+// draft that still has structured_content = NULL. The SQL guards on IS NULL so
+// concurrent writes are safe. Fire-and-forget (no RowsAffected check).
+func (r *pgRepository) WriteBackStructuredContent(ctx context.Context, tx database.Tx, draftID, tenantID string, sc *StructuredContent) error {
+	if sc == nil {
+		return nil
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+
+	if err := draftdb.New(tx).WriteBackStructuredContent(ctx, draftdb.WriteBackStructuredContentParams{
+		ID:                did,
+		TenantID:          tid,
+		StructuredContent: structuredContentToJSON(sc),
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 func (r *pgRepository) GetDraftDetail(ctx context.Context, tx database.Tx, tenantID, draftID string) (*DraftDetailView, error) {
@@ -525,7 +631,7 @@ func (r *pgRepository) SetGenerationParams(ctx context.Context, tx database.Tx, 
 	return nil
 }
 
-func (r *pgRepository) UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error) {
+func (r *pgRepository) UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error) {
 	did, err := parseUUID(draftID)
 	if err != nil {
 		return nil, err
@@ -540,12 +646,17 @@ func (r *pgRepository) UpdateSagaState(ctx context.Context, tx database.Tx, draf
 		contentPtr = &content
 	}
 
+	updateStructured := structured != nil
+	structuredJSON := structuredContentToJSON(structured)
+
 	row, err := draftdb.New(tx).UpdateSagaState(ctx, draftdb.UpdateSagaStateParams{
-		ID:        did,
-		TenantID:  tid,
-		SagaState: sagaState,
-		Column4:   updateContent,
-		Content:   contentPtr,
+		ID:                did,
+		TenantID:          tid,
+		SagaState:         sagaState,
+		Column4:           updateContent,
+		Content:           contentPtr,
+		Column6:           updateStructured,
+		StructuredContent: structuredJSON,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDraftNotFound
@@ -765,7 +876,7 @@ func (r *pgRepository) UpdateObservedResult(ctx context.Context, tx database.Tx,
 func (r *pgRepository) UpdateSagaStateAndSignedAt(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string) (*Draft, error) {
 	// For now, reuse UpdateSagaState (signed_at is set by SignDraft).
 	// This method exists for the File use case to update saga_state atomically.
-	return r.UpdateSagaState(ctx, tx, draftID, tenantID, sagaState, false, "")
+	return r.UpdateSagaState(ctx, tx, draftID, tenantID, sagaState, false, "", nil)
 }
 
 func (r *pgRepository) ListDraftsByProcess(ctx context.Context, tx database.Tx, tenantID, caseID, lastCreated, lastID string, limit int) ([]DraftListItem, error) {

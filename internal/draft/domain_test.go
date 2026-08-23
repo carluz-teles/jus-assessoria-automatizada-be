@@ -143,8 +143,19 @@ func (r *fakeRepo) GetIntimationForDraft(_ context.Context, _ database.Tx, _, _ 
 	return r.getIntimationResult, r.getIntimationErr
 }
 
-func (r *fakeRepo) UpdateDraftContent(_ context.Context, _ database.Tx, _, _, _ string, _ *string) (*PatchResult, error) {
+func (r *fakeRepo) UpdateDraftContent(_ context.Context, _ database.Tx, _, _, _ string, _ *string, _ *StructuredContent) (*PatchResult, error) {
 	return r.updateResult, r.updateErr
+}
+
+// UpdateAuthorship (Peça v2, migration 0056) — stub. Tests that cover the
+// authorship endpoint override this in a dedicated fake if needed.
+func (r *fakeRepo) UpdateAuthorship(_ context.Context, _ database.Tx, _, _, _ string) (*Draft, error) {
+	return r.getByIDResult, nil
+}
+
+// WriteBackStructuredContent (Peça v2, migration 0056) — best-effort no-op stub.
+func (r *fakeRepo) WriteBackStructuredContent(_ context.Context, _ database.Tx, _, _ string, _ *StructuredContent) error {
+	return nil
 }
 
 func (r *fakeRepo) GetDraftDetail(_ context.Context, _ database.Tx, _, _ string) (*DraftDetailView, error) {
@@ -182,7 +193,7 @@ func (r *fakeRepo) GetLatestReview(_ context.Context, _ database.Tx, _ string) (
 	return nil, nil // no review by default
 }
 
-func (r *fakeRepo) UpdateSagaState(_ context.Context, _ database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error) {
+func (r *fakeRepo) UpdateSagaState(_ context.Context, _ database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, _ *StructuredContent) (*Draft, error) {
 	r.callOrder = append(r.callOrder, "UpdateSagaState")
 	return r.getByIDResult, nil
 }
@@ -213,6 +224,10 @@ func (r *fakeRepo) DeleteReviewsForDraft(_ context.Context, _ database.Tx, _ str
 
 // GetPartiesForDraft stub — domain_test.go covers Fatia 1–2 use cases only;
 // parties are loaded by the generation pipeline (generate.go), not the Fatia 1 UseCase.
+func (r *fakeRepo) GetProvidencesForIntimation(_ context.Context, _ database.Tx, _, _ string) ([]Providence, error) {
+	return []Providence{}, nil
+}
+
 func (r *fakeRepo) GetPartiesForDraft(_ context.Context, _ database.Tx, _, _ string) ([]PartyInfo, error) {
 	return []PartyInfo{}, nil
 }

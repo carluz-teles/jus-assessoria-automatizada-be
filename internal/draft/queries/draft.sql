@@ -29,7 +29,8 @@ ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHIN
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
-          created_at, updated_at;
+          created_at, updated_at,
+          structured_content, authorship;
 
 -- name: GetDraftByIntimationID :one
 -- Fetch the draft that already exists for the (tenant_id, intimation_id) pair —
@@ -38,7 +39,8 @@ RETURNING id, tenant_id, case_id, intimation_id,
 SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
-       created_at, updated_at
+       created_at, updated_at,
+       structured_content, authorship
 FROM draft
 WHERE tenant_id = $1 AND intimation_id = $2;
 
@@ -52,18 +54,24 @@ SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
        created_at, updated_at,
-       tone, instructions, selected_theses
+       tone, instructions, selected_theses,
+       structured_content, authorship
 FROM draft
 WHERE id = $1 AND tenant_id = $2;
 
 -- name: UpdateDraftContent :one
--- Autosave: update content (and optionally title) + bump updated_at, scoped to
--- (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
--- or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+-- Autosave: update content (and optionally title + structured_content) + bump
+-- updated_at, scoped to (id, tenant_id). Returns the minimal patch response fields.
+-- A no-match (wrong id or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound.
+--
+-- structured_content is dual-written: when $6::boolean is true, $7 (jsonb) is
+-- persisted; otherwise the existing structured_content is left untouched. The FE
+-- always sends both (Peça v2), older PATCH callers can send just content.
 UPDATE draft
-SET content    = $3,
-    title      = CASE WHEN $4::boolean THEN $5 ELSE title END,
-    updated_at = now()
+SET content            = $3,
+    title              = CASE WHEN $4::boolean THEN $5 ELSE title END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, title, updated_at;
 
@@ -83,6 +91,8 @@ SELECT
     d.saga_state,
     d.created_at,
     d.updated_at,
+    d.structured_content,
+    d.authorship,
 
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
@@ -211,6 +221,22 @@ JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline dl ON dl.notification_id = i.id
 WHERE i.id = $1 AND cr.tenant_id = $2;
 
+-- name: GetProvidencesForIntimation :many
+-- Read model helper (Peça v2): providences shown on the FE sidebar are the
+-- tasks linked to the draft's intimation. Tenant-scoped (barrier 1), OPEN +
+-- DONE only (DISMISSED tasks disappear from the peça sidebar — the advogado
+-- discarded them). Ordered by (status ASC — OPEN first, DONE below, then
+-- created_at ASC for stable display).
+--
+-- Read cross-slice directly (same pattern as GetDraftDetail reading court_record
+-- and party without importing acquisition — see docs §5b.2).
+SELECT id, title, kind, source, status
+FROM task
+WHERE tenant_id = $1 AND intimation_id = $2 AND status IN ('OPEN', 'DONE')
+ORDER BY
+    CASE status WHEN 'OPEN' THEN 0 WHEN 'DONE' THEN 1 ELSE 2 END,
+    created_at ASC;
+
 -- name: GetPartiesForDraft :many
 -- Load the parties (autor/réu/terceiro) and their advogados for a given case,
 -- tenant-scoped (barrier 1). Used by the draft generation pipeline to inject
@@ -256,18 +282,47 @@ WHERE id = $1 AND tenant_id = $2;
 -- name: UpdateSagaState :one
 -- Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 -- on success, FAILED on LLM error). Also updates content when the generator returns new
--- text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
--- which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
--- A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+-- text ($4=true → $5 overwrites; false → leaves content unchanged — used for the FAILED
+-- path). Same for structured_content ($6=true → $7 jsonb overwrites) — the DRAFTED path
+-- writes BOTH content + structured_content in one tx (dual write for Peça v2).
+-- Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. No-match → ErrDraftNotFound.
 UPDATE draft
-SET saga_state = $3,
-    content    = CASE WHEN $4::boolean THEN $5 ELSE content END,
-    updated_at = now()
+SET saga_state         = $3,
+    content            = CASE WHEN $4::boolean THEN $5 ELSE content END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
           created_at, updated_at;
+
+-- name: UpdateDraftAuthorship :one
+-- Flip the peça's authorship marker. Called by POST /v1/pecas/:id/assume-authorship
+-- when the advogado clicks "Assumir autoria" — from that moment the FE hides the
+-- Iterar tab and shows Revisão. Idempotent: a repeat call is a no-op at the DB level
+-- (same UPDATE). Scoped to (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+UPDATE draft
+SET authorship = $3,
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at,
+          structured_content, authorship;
+
+-- name: WriteBackStructuredContent :exec
+-- Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
+-- into a StructuredContent on the fly (structured_content IS NULL for drafts
+-- created before migration 0056 / Fatia B), this UPDATE persists the parsed shape
+-- so subsequent reads skip the parser. Fire-and-forget within the same tx — the
+-- caller does NOT check RowsAffected (a race where another writer already
+-- populated it is harmless — the last writer wins). Scoped to (id, tenant_id).
+UPDATE draft
+SET structured_content = $3
+WHERE id = $1 AND tenant_id = $2
+  AND structured_content IS NULL;
 
 -- name: InsertReview :one
 -- Persist one AI review (findings + coverage as jsonb, model_version, rules_version,

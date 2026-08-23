@@ -65,7 +65,7 @@ type fakeWriter struct {
 	deleteReviewsDraftID string
 }
 
-func (f *fakeWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, updateContent bool, content string) (*Draft, error) {
+func (f *fakeWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, updateContent bool, content string, _ *StructuredContent) (*Draft, error) {
 	f.updatedSagaState = sagaState
 	if updateContent {
 		f.updatedContent = content

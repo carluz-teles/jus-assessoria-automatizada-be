@@ -62,17 +62,90 @@ func (r CreateRequest) Validate() error {
 	)
 }
 
+// IterateRequest is the POST /v1/pecas/:id/iterate body (Peça v2). Either kind
+// OR instruction must be present (both empty is invalid). scope.kind ∈ {whole,
+// section}; when section, scope.section_id is required.
+type IterateRequest struct {
+	Scope       IterateScopeRequest `json:"scope"`
+	Kind        string              `json:"kind,omitempty"`
+	Instruction string              `json:"instruction,omitempty"`
+}
+
+// IterateScopeRequest is the escopo do pedido (peça toda ou uma seção).
+type IterateScopeRequest struct {
+	Kind      string `json:"kind"`
+	SectionID string `json:"section_id,omitempty"`
+}
+
+// Validate enforces edge rules for iterate.
+func (r IterateRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Scope, validation.Required, validation.By(validateIterateScope)),
+		validation.Field(&r.Kind, validation.By(validateQuickAdjustKind)),
+		// At least one of (Kind, Instruction) must be non-empty. Validated by
+		// the closure below since ozzo doesn't have a natural cross-field rule.
+		validation.Field(&r.Instruction, validation.By(func(_ any) error {
+			if r.Kind == "" && r.Instruction == "" {
+				return validation.NewError(
+					"validation_required_hint",
+					"informe um kind (ajuste rápido) ou uma instruction (texto livre)")
+			}
+			return nil
+		})),
+	)
+}
+
+func validateIterateScope(value any) error {
+	s, ok := value.(IterateScopeRequest)
+	if !ok {
+		return validation.NewError("validation_scope_type", "escopo em formato inválido")
+	}
+	switch s.Kind {
+	case "whole":
+		return nil
+	case "section":
+		if s.SectionID == "" {
+			return validation.NewError(
+				"validation_scope_section_id",
+				"scope.section_id é obrigatório quando kind=section")
+		}
+		return nil
+	default:
+		return validation.NewError(
+			"validation_scope_kind",
+			"scope.kind deve ser 'whole' ou 'section'")
+	}
+}
+
+func validateQuickAdjustKind(value any) error {
+	k, ok := value.(string)
+	if !ok || k == "" {
+		return nil // empty is valid (free instruction)
+	}
+	if _, ok := validQuickAdjustKinds[k]; !ok {
+		return validation.NewError(
+			"validation_kind_enum",
+			"kind deve ser um de: concise, emphatic, reinforce_thesis, add_grounds")
+	}
+	return nil
+}
+
 // PatchRequest is the PATCH /v1/pecas/:id body. content is the autosave payload
 // (empty string is valid — the editor cleared it). title is optional (only updated
-// when the pointer is non-nil).
+// when the pointer is non-nil). structured_content (Peça v2, migration 0056) is
+// optional too: when non-nil, dual-write persists both the plain text (content)
+// and the JSONB structure. FE v2 always sends both.
 type PatchRequest struct {
-	Content string  `json:"content"`
-	Title   *string `json:"title"`
+	Content           string             `json:"content"`
+	Title             *string            `json:"title"`
+	StructuredContent *StructuredContent `json:"structured_content,omitempty"`
 }
 
 // Validate has no rules for PATCH: content empty is valid (clearing is allowed),
-// and title is optional. The method exists so httpx.WriteValidationError can be
-// called uniformly at the edge.
+// title is optional. structured_content shape is trusted (comes from a client
+// that hydrated it from our own read model); a malformed shape would fail at
+// the JSON decode step above. The method exists so httpx.WriteValidationError
+// can be called uniformly at the edge.
 func (r PatchRequest) Validate() error { return nil }
 
 // ── Attachment request types (Fatia 2) ───────────────────────────────────────

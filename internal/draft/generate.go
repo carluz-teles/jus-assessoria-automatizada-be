@@ -69,7 +69,7 @@ type generationDepsReader interface {
 // generationWriter is the narrow write port the generation use case needs. A separate
 // interface (not the full Repository) keeps the fake in tests minimal.
 type generationWriter interface {
-	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error)
+	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error)
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
 	DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error
 }
@@ -307,7 +307,14 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		if e := uc.writer.DeleteReviewsForDraft(ctx, tx, ev.DraftID); e != nil {
 			return fmt.Errorf("delete prior reviews: %w", e)
 		}
-		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, out.DraftContent); e != nil {
+		// Peça v2 (migration 0056 / Fatia B): parse the generated plain text into
+		// the block-structured shape (preamble + Roman sections) so both columns
+		// are populated in one commit — the FE consumes structured_content
+		// directly; content stays for legacy/export.
+		// ParseStructured returns nil for empty input; when the LLM produced no
+		// Roman headings the whole text lands in Preamble (degraded but usable).
+		structured := ParseStructured(out.DraftContent)
+		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, out.DraftContent, structured); e != nil {
 			return fmt.Errorf("update saga state: %w", e)
 		}
 		return nil
@@ -336,7 +343,7 @@ func (uc *GenerateUseCase) persistFailure(ctx context.Context, tenantID, draftID
 				return nil
 			}
 		}
-		if _, e := uc.writer.UpdateSagaState(ctx, tx, draftID, tenantID, SagaStateFailed, false, ""); e != nil {
+		if _, e := uc.writer.UpdateSagaState(ctx, tx, draftID, tenantID, SagaStateFailed, false, "", nil); e != nil {
 			return e
 		}
 		_, e := uc.writer.InsertReview(ctx, tx, &Review{

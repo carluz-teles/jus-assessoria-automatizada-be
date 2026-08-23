@@ -189,6 +189,61 @@ type ChatTurn struct {
 	Content string
 }
 
+// IterateSection is one Roman-numbered section of the peça as seen by the
+// iterate composer — mirrors the draft.StructuredContent shape without
+// importing the slice (advisory has no downward dependency).
+type IterateSection struct {
+	ID         string
+	Roman      string
+	Title      string
+	Paragraphs []string
+}
+
+// IterateScope tells the composer whether the advogado is asking for a
+// reescrita of the whole peça ("whole") or of a single section ("section",
+// with SectionID matching one of the IterateSection.ID entries).
+type IterateScope struct {
+	Kind      string // "whole" | "section"
+	SectionID string // present only when Kind == "section"
+}
+
+// IterateContext is the per-iteration signal the draft_iterate composer uses.
+// It carries the CURRENT structured draft (so the LLM sees exactly what the
+// advogado is looking at), the case context (for legal register + grounding),
+// the RAG chunks, and the iteration params (scope + kind/instruction).
+type IterateContext struct {
+	PieceType   string // DEFENSE|COMPLAINT|APPEAL|MOTION|OTHER
+	Court       string
+	Degree      string
+	Class       string
+	Subject     string
+	CNJNumber   string
+	JudgingBody string
+
+	// Preamble is the pre-section block of the current draft (endereçamento
+	// + qualificação) — read only, the composer never asks the LLM to
+	// rewrite the preamble (it's mechanical + risky).
+	Preamble []string
+	// Sections is the current list of Roman-numbered sections — the LLM
+	// picks which to rewrite based on Scope + Kind/Instruction.
+	Sections []IterateSection
+
+	// Scope tells the LLM whether to rewrite one section or all of them.
+	Scope IterateScope
+	// Kind is the "quick adjust" hint (empty when the advogado wrote a free
+	// instruction). Closed set — mirrors QuickAdjustKind in the FE.
+	Kind string
+	// Instruction is the advogado's free-text ask, empty when a Kind was
+	// clicked instead.
+	Instruction string
+
+	// Parties + Chunks for grounding (same shape as DraftContext).
+	Parties []PartyCtx
+	Chunks  []string
+
+	Playbook string
+}
+
 // ChatContext is the per-question signal the chat_grounding composer uses. It carries the
 // draft's current content (so the assistant can refer to the peça), the RAG chunks retrieved
 // for the question (empty → ungrounded path), the conversation history (up to 50 turns), and
@@ -216,6 +271,12 @@ type PromptComposer interface {
 	// (same case signal draft_minuta uses) since the theses suggestion needs the
 	// same grounding.
 	ComposeTheses(agent string, c DraftContext) (Composed, error)
+	// ComposeIterate builds the (system, user, version) for the draft_iterate
+	// agent (POST /v1/pecas/:id/iterate — Peça v2, synchronous). Takes the
+	// current structured draft + iteration params and instructs the LLM to
+	// return 1..N SectionChange objects with category + explanation +
+	// new_paragraphs.
+	ComposeIterate(agent string, c IterateContext) (Composed, error)
 }
 
 // Agent identifiers — one per specialized advisory task (erd-ai-advisory.md §4). Each maps to a
@@ -228,6 +289,11 @@ const (
 	AgentChatGrounding     = "chat_grounding"
 	AgentReviewMinuta      = "review_minuta"
 	AgentSuggestTheses     = "suggest_theses"
+	// AgentDraftIterate is the iteration/rewrite agent (Peça v2 — POST
+	// /v1/pecas/:id/iterate). Given the current structured draft + an
+	// escopo + kind/instruction, returns 1..N SectionChange objects with
+	// category + explanation + new_paragraphs. Synchronous LLM call.
+	AgentDraftIterate = "draft_iterate"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
@@ -267,6 +333,11 @@ const chatGroundingVersion = "chat_grounding/v1"
 // reviewMinutaVersion is the pinned version of the review_minuta template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
 const reviewMinutaVersion = "review_minuta/v1"
+
+// draftIterateVersion is the pinned version of the draft_iterate template
+// (POST /v1/pecas/:id/iterate — Peça v2). BUMP IT whenever the template text
+// changes so the feedback delta of the OLD prompt stays attributable.
+const draftIterateVersion = "draft_iterate/v1"
 
 // TemplateComposer is the deterministic v0 composer: templates + context injection, no LLM. It is
 // stateless.
@@ -413,6 +484,18 @@ func (*TemplateComposer) ComposeTheses(agent string, c DraftContext) (Composed, 
 	switch agent {
 	case AgentSuggestTheses:
 		return composeSuggestTheses(c), nil
+	default:
+		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
+	}
+}
+
+// ComposeIterate builds the (system, user, version) for the draft_iterate agent
+// from the iterate context. An unknown agent is a programmer error surfaced
+// as a typed invalid. (Peça v2 — synchronous LLM iteration.)
+func (*TemplateComposer) ComposeIterate(agent string, c IterateContext) (Composed, error) {
+	switch agent {
+	case AgentDraftIterate:
+		return composeDraftIterate(c), nil
 	default:
 		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
 	}
@@ -983,4 +1066,169 @@ func composeSummarizeProcess(c ProcessContext) Composed {
 	usr.WriteString("\n\nProduza o resumo estruturado do processo (JSON).")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: summarizeProcessVersion}
+}
+
+// composeDraftIterate renders the draft_iterate instruction-set (Peça v2 —
+// POST /v1/pecas/:id/iterate). Given the CURRENT structured draft + an escopo
+// (whole ou uma seção específica) + kind ("quick adjust") ou instruction (livre),
+// instrui o LLM a devolver 1..N mudanças por seção, cada uma com categoria e
+// explicação curta do porquê. O JSON schema fica no caller (IterateUseCase).
+//
+// Regras-chave do prompt:
+//   - NUNCA reescrever o preâmbulo (endereçamento + qualificação são mecânicos).
+//   - Devolver mudanças SOMENTE nas seções afetadas pelo escopo.
+//   - Cada mudança traz section_id (do array fornecido), category (enum fechado),
+//     explanation curta e new_paragraphs (o texto novo, em ordem).
+//   - Sem placeholders inventados; se contexto insuficiente, devolver changes vazio.
+func composeDraftIterate(c IterateContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um assistente jurídico brasileiro especializado em reescrita cirúrgica " +
+			"de peças processuais. O advogado tem uma peça JÁ redigida e quer ajustar " +
+			"trecho(s) dela — nunca redigir de novo, nunca tocar no preâmbulo (endereçamento " +
+			"+ qualificação são mecânicos). Sua resposta é um JSON com o campo `changes` — " +
+			"um array de mudanças, uma por SEÇÃO afetada. Cada mudança tem:\n" +
+			"1. `section_id` (string): o id da seção alterada, EXATAMENTE como aparece na " +
+			"lista de seções fornecida no contexto (\"fatos\", \"direito\", \"pedidos\"…).\n" +
+			"2. `category` (string): a categoria da mudança, um dos valores exatos: " +
+			"CLAREZA, CONCISÃO, ÊNFASE, FUNDAMENTAÇÃO, COMPLETUDE, COERÊNCIA, AJUSTE. " +
+			"Use AJUSTE quando nenhuma outra couber.\n" +
+			"3. `explanation` (string): 1 frase (até 140 chars) explicando POR QUÊ da " +
+			"mudança, do ponto de vista do advogado (o que melhora).\n" +
+			"4. `new_paragraphs` (array de strings): o novo conteúdo COMPLETO da seção, " +
+			"parágrafo a parágrafo. Substitui os parágrafos atuais dessa seção.\n\n" +
+			"REGRAS OBRIGATÓRIAS:\n" +
+			"- Respeite o ESCOPO fornecido:\n" +
+			"  · scope=whole → considere reescrever qualquer seção que possa melhorar; " +
+			"NÃO se obrigue a mexer em todas (só onde a mudança agrega).\n" +
+			"  · scope=section (com section_id) → devolva NO MÁXIMO 1 mudança, para essa " +
+			"seção específica. Ignore outras.\n" +
+			"- NÃO reescreva o preâmbulo (endereçamento + qualificação). Nunca inclua uma " +
+			"mudança para \"preambulo\" / \"preâmbulo\".\n" +
+			"- Se nada melhora com o pedido, devolva `changes: []` (não force reescritas).\n" +
+			"- NÃO invente fatos, valores, súmulas, datas ou nºs de processo que não " +
+			"constem do contexto.\n" +
+			"- Preserve tom técnico-jurídico brasileiro, artigos de lei no formato " +
+			"\"art. XXX, inciso, da Lei nº .../CPC\".",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório:\n")
+		sys.WriteString(pb)
+	}
+
+	// Kind-specific system directive (concise, emphatic, etc.) — appended
+	// AFTER the base rules so the model still respects the JSON schema.
+	if kd := kindDirective(c.Kind); kd != "" {
+		sys.WriteString("\n\n")
+		sys.WriteString(kd)
+	}
+
+	var usr strings.Builder
+
+	// ── Case context (grounding) ─────────────────────────────────────────────
+	lines := make([]string, 0, 12)
+	add := func(label, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			lines = append(lines, label+": "+v)
+		}
+	}
+	add("Tipo da peça", c.PieceType)
+	add("Tribunal", c.Court)
+	add("Órgão julgador/Vara", c.JudgingBody)
+	add("Nº do processo", c.CNJNumber)
+	add("Classe/rito", c.Class)
+	add("Assunto", c.Subject)
+	add("Grau", c.Degree)
+	for _, p := range c.Parties {
+		add(roleLabel(p.Role), p.Name)
+	}
+	if len(c.Chunks) > 0 {
+		lines = append(lines, "Trechos relevantes dos autos:")
+		for i, ch := range c.Chunks {
+			if i >= 8 {
+				break
+			}
+			lines = append(lines, strconv.Itoa(i+1)+". "+ch)
+		}
+	}
+	if len(lines) > 0 {
+		usr.WriteString("Contexto do caso:\n")
+		usr.WriteString(strings.Join(lines, "\n"))
+		usr.WriteString("\n\n")
+	}
+
+	// ── Current draft (preamble + sections) ──────────────────────────────────
+	if len(c.Preamble) > 0 {
+		usr.WriteString("Preâmbulo atual (NÃO reescreva — só leitura):\n")
+		for _, p := range c.Preamble {
+			usr.WriteString(p)
+			usr.WriteString("\n")
+		}
+		usr.WriteString("\n")
+	}
+	if len(c.Sections) > 0 {
+		usr.WriteString("Seções atuais:\n")
+		for _, s := range c.Sections {
+			usr.WriteString("• section_id=\"" + s.ID + "\" — " + s.Roman + " — " + s.Title + "\n")
+			for _, p := range s.Paragraphs {
+				usr.WriteString("  " + p + "\n")
+			}
+		}
+		usr.WriteString("\n")
+	}
+
+	// ── Iteration params ─────────────────────────────────────────────────────
+	usr.WriteString("Escopo do pedido: ")
+	if c.Scope.Kind == "section" && c.Scope.SectionID != "" {
+		usr.WriteString("APENAS a seção com section_id=\"" + c.Scope.SectionID + "\".\n")
+	} else {
+		usr.WriteString("A peça toda (qualquer seção pode ser reescrita).\n")
+	}
+	if instr := strings.TrimSpace(c.Instruction); instr != "" {
+		usr.WriteString("Instrução do advogado: " + instr + "\n")
+	} else if kl := kindLabel(c.Kind); kl != "" {
+		usr.WriteString("Tipo de ajuste (quick): " + kl + "\n")
+	}
+	usr.WriteString("\nProduza as mudanças (JSON) conforme as regras.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftIterateVersion}
+}
+
+// kindDirective returns the extra system directive for a "quick adjust" kind.
+// Empty when kind is empty (free instruction) or unknown.
+func kindDirective(kind string) string {
+	switch kind {
+	case "concise":
+		return "DIRETIVA CONCISÃO: corte redundâncias e repetições; mantenha o essencial. " +
+			"Frases curtas, sem \"data venia\", \"salvo melhor juízo\" em excesso."
+	case "emphatic":
+		return "DIRETIVA ÊNFASE: reforce a força retórica sem perder rigor técnico. " +
+			"Argumentos sublinhados, verbos assertivos; evite adjetivação vazia."
+	case "reinforce_thesis":
+		return "DIRETIVA REFORÇAR A TESE PRINCIPAL: identifique o eixo argumentativo " +
+			"central e traga-o de volta em cada seção; elimine desvios que enfraquecem a tese."
+	case "add_grounds":
+		return "DIRETIVA ADICIONAR FUNDAMENTO: ancore a argumentação em base legal ou " +
+			"precedente citando o inciso específico do artigo e, quando cabível, " +
+			"jurisprudência do STJ/STF ou súmula. Nunca invente números de processo."
+	default:
+		return ""
+	}
+}
+
+// kindLabel is the human-readable label of a kind, for injection in the user
+// prompt when there's no free-text instruction. Returns "" for empty/unknown.
+func kindLabel(kind string) string {
+	switch kind {
+	case "concise":
+		return "Mais conciso"
+	case "emphatic":
+		return "Mais enfático"
+	case "reinforce_thesis":
+		return "Reforçar a tese principal"
+	case "add_grounds":
+		return "Adicionar fundamento"
+	default:
+		return ""
+	}
 }

@@ -50,7 +50,7 @@ type reviewDepsReader interface {
 // reviewWriter is the narrow write port the ReviewUseCase needs.
 type reviewWriter interface {
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
-	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error)
+	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error)
 }
 
 // reviewSchema is the JSON Schema constraining the LLM's output for Revisar (strict mode).
@@ -240,7 +240,7 @@ func (uc *ReviewUseCase) ReviewDraft(ctx context.Context, cmd ReviewDraftCommand
 			return fmt.Errorf("review: insert review: %w", e)
 		}
 
-		updated, e := uc.writer.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateReviewed, false, "")
+		updated, e := uc.writer.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateReviewed, false, "", nil)
 		if e != nil {
 			return fmt.Errorf("review: update saga state: %w", e)
 		}

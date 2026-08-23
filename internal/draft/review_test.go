@@ -32,7 +32,7 @@ func (f *fakeReviewWriter) InsertReview(_ context.Context, _ database.Tx, r *Rev
 	return r, f.writeErr
 }
 
-func (f *fakeReviewWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, _ bool, _ string) (*Draft, error) {
+func (f *fakeReviewWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, _ bool, _ string, _ *StructuredContent) (*Draft, error) {
 	f.updatedSagaState = sagaState
 	if f.returnedDraft != nil {
 		return f.returnedDraft, f.writeErr

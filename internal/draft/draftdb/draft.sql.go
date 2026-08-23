@@ -258,7 +258,8 @@ SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
        created_at, updated_at,
-       tone, instructions, selected_theses
+       tone, instructions, selected_theses,
+       structured_content, authorship
 FROM draft
 WHERE id = $1 AND tenant_id = $2
 `
@@ -269,20 +270,22 @@ type GetDraftByIDParams struct {
 }
 
 type GetDraftByIDRow struct {
-	ID             uuid.UUID          `json:"id"`
-	TenantID       uuid.UUID          `json:"tenant_id"`
-	CaseID         pgtype.UUID        `json:"case_id"`
-	IntimationID   pgtype.UUID        `json:"intimation_id"`
-	PieceType      string             `json:"piece_type"`
-	Title          string             `json:"title"`
-	Content        *string            `json:"content"`
-	Status         string             `json:"status"`
-	SagaState      string             `json:"saga_state"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	Tone           string             `json:"tone"`
-	Instructions   *string            `json:"instructions"`
-	SelectedTheses []string           `json:"selected_theses"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	Tone              string             `json:"tone"`
+	Instructions      *string            `json:"instructions"`
+	SelectedTheses    []string           `json:"selected_theses"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
 }
 
 // Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
@@ -308,6 +311,8 @@ func (q *Queries) GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (Get
 		&i.Tone,
 		&i.Instructions,
 		&i.SelectedTheses,
+		&i.StructuredContent,
+		&i.Authorship,
 	)
 	return i, err
 }
@@ -316,7 +321,8 @@ const getDraftByIntimationID = `-- name: GetDraftByIntimationID :one
 SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
-       created_at, updated_at
+       created_at, updated_at,
+       structured_content, authorship
 FROM draft
 WHERE tenant_id = $1 AND intimation_id = $2
 `
@@ -327,17 +333,19 @@ type GetDraftByIntimationIDParams struct {
 }
 
 type GetDraftByIntimationIDRow struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       pgtype.UUID        `json:"case_id"`
-	IntimationID pgtype.UUID        `json:"intimation_id"`
-	PieceType    string             `json:"piece_type"`
-	Title        string             `json:"title"`
-	Content      *string            `json:"content"`
-	Status       string             `json:"status"`
-	SagaState    string             `json:"saga_state"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
 }
 
 // Fetch the draft that already exists for the (tenant_id, intimation_id) pair —
@@ -358,6 +366,8 @@ func (q *Queries) GetDraftByIntimationID(ctx context.Context, arg GetDraftByInti
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
 	)
 	return i, err
 }
@@ -372,6 +382,8 @@ SELECT
     d.saga_state,
     d.created_at,
     d.updated_at,
+    d.structured_content,
+    d.authorship,
 
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
@@ -415,6 +427,8 @@ type GetDraftDetailRow struct {
 	SagaState                 string             `json:"saga_state"`
 	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent         []byte             `json:"structured_content"`
+	Authorship                string             `json:"authorship"`
 	IntimationID              pgtype.UUID        `json:"intimation_id"`
 	IntimationType            *string            `json:"intimation_type"`
 	IntimationContent         *string            `json:"intimation_content"`
@@ -451,6 +465,8 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
 		&i.IntimationID,
 		&i.IntimationType,
 		&i.IntimationContent,
@@ -669,6 +685,62 @@ func (q *Queries) GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDra
 	return i, err
 }
 
+const getProvidencesForIntimation = `-- name: GetProvidencesForIntimation :many
+SELECT id, title, kind, source, status
+FROM task
+WHERE tenant_id = $1 AND intimation_id = $2 AND status IN ('OPEN', 'DONE')
+ORDER BY
+    CASE status WHEN 'OPEN' THEN 0 WHEN 'DONE' THEN 1 ELSE 2 END,
+    created_at ASC
+`
+
+type GetProvidencesForIntimationParams struct {
+	TenantID     uuid.UUID   `json:"tenant_id"`
+	IntimationID pgtype.UUID `json:"intimation_id"`
+}
+
+type GetProvidencesForIntimationRow struct {
+	ID     uuid.UUID `json:"id"`
+	Title  string    `json:"title"`
+	Kind   *string   `json:"kind"`
+	Source string    `json:"source"`
+	Status string    `json:"status"`
+}
+
+// Read model helper (Peça v2): providences shown on the FE sidebar are the
+// tasks linked to the draft's intimation. Tenant-scoped (barrier 1), OPEN +
+// DONE only (DISMISSED tasks disappear from the peça sidebar — the advogado
+// discarded them). Ordered by (status ASC — OPEN first, DONE below, then
+// created_at ASC for stable display).
+//
+// Read cross-slice directly (same pattern as GetDraftDetail reading court_record
+// and party without importing acquisition — see docs §5b.2).
+func (q *Queries) GetProvidencesForIntimation(ctx context.Context, arg GetProvidencesForIntimationParams) ([]GetProvidencesForIntimationRow, error) {
+	rows, err := q.db.Query(ctx, getProvidencesForIntimation, arg.TenantID, arg.IntimationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetProvidencesForIntimationRow
+	for rows.Next() {
+		var i GetProvidencesForIntimationRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.Kind,
+			&i.Source,
+			&i.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertChatMessage = `-- name: InsertChatMessage :one
 
 INSERT INTO chat_message (draft_id, role, content, citations, grounded, model_version)
@@ -731,7 +803,8 @@ ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHIN
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
-          created_at, updated_at
+          created_at, updated_at,
+          structured_content, authorship
 `
 
 type InsertDraftParams struct {
@@ -744,17 +817,19 @@ type InsertDraftParams struct {
 }
 
 type InsertDraftRow struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       pgtype.UUID        `json:"case_id"`
-	IntimationID pgtype.UUID        `json:"intimation_id"`
-	PieceType    string             `json:"piece_type"`
-	Title        string             `json:"title"`
-	Content      *string            `json:"content"`
-	Status       string             `json:"status"`
-	SagaState    string             `json:"saga_state"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
 }
 
 // draft slice queries (peticionamento Fatia 1). Every write runs inside the use
@@ -793,6 +868,8 @@ func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (Inser
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
 	)
 	return i, err
 }
@@ -1242,21 +1319,83 @@ func (q *Queries) UpdateAttachmentCategory(ctx context.Context, arg UpdateAttach
 	return i, err
 }
 
+const updateDraftAuthorship = `-- name: UpdateDraftAuthorship :one
+UPDATE draft
+SET authorship = $3,
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at,
+          structured_content, authorship
+`
+
+type UpdateDraftAuthorshipParams struct {
+	ID         uuid.UUID `json:"id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	Authorship string    `json:"authorship"`
+}
+
+type UpdateDraftAuthorshipRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
+}
+
+// Flip the peça's authorship marker. Called by POST /v1/pecas/:id/assume-authorship
+// when the advogado clicks "Assumir autoria" — from that moment the FE hides the
+// Iterar tab and shows Revisão. Idempotent: a repeat call is a no-op at the DB level
+// (same UPDATE). Scoped to (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+func (q *Queries) UpdateDraftAuthorship(ctx context.Context, arg UpdateDraftAuthorshipParams) (UpdateDraftAuthorshipRow, error) {
+	row := q.db.QueryRow(ctx, updateDraftAuthorship, arg.ID, arg.TenantID, arg.Authorship)
+	var i UpdateDraftAuthorshipRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CaseID,
+		&i.IntimationID,
+		&i.PieceType,
+		&i.Title,
+		&i.Content,
+		&i.Status,
+		&i.SagaState,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
+	)
+	return i, err
+}
+
 const updateDraftContent = `-- name: UpdateDraftContent :one
 UPDATE draft
-SET content    = $3,
-    title      = CASE WHEN $4::boolean THEN $5 ELSE title END,
-    updated_at = now()
+SET content            = $3,
+    title              = CASE WHEN $4::boolean THEN $5 ELSE title END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, title, updated_at
 `
 
 type UpdateDraftContentParams struct {
-	ID       uuid.UUID `json:"id"`
-	TenantID uuid.UUID `json:"tenant_id"`
-	Content  *string   `json:"content"`
-	Column4  bool      `json:"column_4"`
-	Title    string    `json:"title"`
+	ID                uuid.UUID `json:"id"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	Content           *string   `json:"content"`
+	Column4           bool      `json:"column_4"`
+	Title             string    `json:"title"`
+	Column6           bool      `json:"column_6"`
+	StructuredContent []byte    `json:"structured_content"`
 }
 
 type UpdateDraftContentRow struct {
@@ -1265,9 +1404,13 @@ type UpdateDraftContentRow struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Autosave: update content (and optionally title) + bump updated_at, scoped to
-// (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
-// or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+// Autosave: update content (and optionally title + structured_content) + bump
+// updated_at, scoped to (id, tenant_id). Returns the minimal patch response fields.
+// A no-match (wrong id or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound.
+//
+// structured_content is dual-written: when $6::boolean is true, $7 (jsonb) is
+// persisted; otherwise the existing structured_content is left untouched. The FE
+// always sends both (Peça v2), older PATCH callers can send just content.
 func (q *Queries) UpdateDraftContent(ctx context.Context, arg UpdateDraftContentParams) (UpdateDraftContentRow, error) {
 	row := q.db.QueryRow(ctx, updateDraftContent,
 		arg.ID,
@@ -1275,6 +1418,8 @@ func (q *Queries) UpdateDraftContent(ctx context.Context, arg UpdateDraftContent
 		arg.Content,
 		arg.Column4,
 		arg.Title,
+		arg.Column6,
+		arg.StructuredContent,
 	)
 	var i UpdateDraftContentRow
 	err := row.Scan(&i.ID, &i.Title, &i.UpdatedAt)
@@ -1314,9 +1459,10 @@ func (q *Queries) UpdateObservedResult(ctx context.Context, arg UpdateObservedRe
 
 const updateSagaState = `-- name: UpdateSagaState :one
 UPDATE draft
-SET saga_state = $3,
-    content    = CASE WHEN $4::boolean THEN $5 ELSE content END,
-    updated_at = now()
+SET saga_state         = $3,
+    content            = CASE WHEN $4::boolean THEN $5 ELSE content END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
@@ -1325,11 +1471,13 @@ RETURNING id, tenant_id, case_id, intimation_id,
 `
 
 type UpdateSagaStateParams struct {
-	ID        uuid.UUID `json:"id"`
-	TenantID  uuid.UUID `json:"tenant_id"`
-	SagaState string    `json:"saga_state"`
-	Column4   bool      `json:"column_4"`
-	Content   *string   `json:"content"`
+	ID                uuid.UUID `json:"id"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	SagaState         string    `json:"saga_state"`
+	Column4           bool      `json:"column_4"`
+	Content           *string   `json:"content"`
+	Column6           bool      `json:"column_6"`
+	StructuredContent []byte    `json:"structured_content"`
 }
 
 type UpdateSagaStateRow struct {
@@ -1348,9 +1496,10 @@ type UpdateSagaStateRow struct {
 
 // Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 // on success, FAILED on LLM error). Also updates content when the generator returns new
-// text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
-// which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
-// A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+// text ($4=true → $5 overwrites; false → leaves content unchanged — used for the FAILED
+// path). Same for structured_content ($6=true → $7 jsonb overwrites) — the DRAFTED path
+// writes BOTH content + structured_content in one tx (dual write for Peça v2).
+// Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. No-match → ErrDraftNotFound.
 func (q *Queries) UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams) (UpdateSagaStateRow, error) {
 	row := q.db.QueryRow(ctx, updateSagaState,
 		arg.ID,
@@ -1358,6 +1507,8 @@ func (q *Queries) UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams
 		arg.SagaState,
 		arg.Column4,
 		arg.Content,
+		arg.Column6,
+		arg.StructuredContent,
 	)
 	var i UpdateSagaStateRow
 	err := row.Scan(
@@ -1374,4 +1525,28 @@ func (q *Queries) UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const writeBackStructuredContent = `-- name: WriteBackStructuredContent :exec
+UPDATE draft
+SET structured_content = $3
+WHERE id = $1 AND tenant_id = $2
+  AND structured_content IS NULL
+`
+
+type WriteBackStructuredContentParams struct {
+	ID                uuid.UUID `json:"id"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	StructuredContent []byte    `json:"structured_content"`
+}
+
+// Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
+// into a StructuredContent on the fly (structured_content IS NULL for drafts
+// created before migration 0056 / Fatia B), this UPDATE persists the parsed shape
+// so subsequent reads skip the parser. Fire-and-forget within the same tx — the
+// caller does NOT check RowsAffected (a race where another writer already
+// populated it is harmless — the last writer wins). Scoped to (id, tenant_id).
+func (q *Queries) WriteBackStructuredContent(ctx context.Context, arg WriteBackStructuredContentParams) error {
+	_, err := q.db.Exec(ctx, writeBackStructuredContent, arg.ID, arg.TenantID, arg.StructuredContent)
+	return err
 }
