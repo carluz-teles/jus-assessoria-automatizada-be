@@ -95,6 +95,11 @@ jobs:
       VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
       # OpenRouter (geração LLM do advisory — sugestão de tarefas etc.). Opcional.
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # GCP KMS (envelope encryption dos certificados A1 — só o api consome).
+      # Ambos opcionais: vazios = slice `certificate` fica desmontado, resto segue.
+      # GCP_KMS_CREDENTIALS_JSON é o BASE64 do JSON da service account.
+      GCP_KMS_KEY_NAME: ${{ secrets.GCP_KMS_KEY_NAME }}
+      GCP_KMS_CREDENTIALS_JSON: ${{ secrets.GCP_KMS_CREDENTIALS_JSON }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3

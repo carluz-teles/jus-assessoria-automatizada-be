@@ -176,3 +176,24 @@ variable "openrouter_api_key" {
   sensitive = true
   default   = ""
 }
+
+# ---- GCP Cloud KMS (envelope encryption dos certificados A1 — só o api consome) ----
+# Ambos opcionais: sem eles o slice `certificate` fica desmontado no api (endpoints
+# /v1/certificates retornam 404); os demais slices seguem funcionando.
+#
+# gcp_kms_key_name: resource name completo da key (formato
+# projects/<id>/locations/<region>/keyRings/<ring>/cryptoKeys/<key>).
+# Não é segredo — é só uma referência estável ao recurso GCP.
+variable "gcp_kms_key_name" {
+  type    = string
+  default = ""
+}
+
+# gcp_kms_credentials_json: JSON da service account em BASE64 (Railway/Fly/Render
+# não permitem montar arquivo; o api decodifica no boot e escreve em /tmp).
+# SENSITIVE: é o segredo que autentica o api no GCP.
+variable "gcp_kms_credentials_json" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
