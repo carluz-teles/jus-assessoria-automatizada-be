@@ -38,6 +38,10 @@ type DraftDetailView struct {
 	SignedAt        *time.Time
 	FiledAt         *time.Time
 	FilingNumber    string // número/protocolo do tribunal (opcional; input manual)
+	// SignedPDFKey é o storage key interno do PDF assinado (Fatia 2b — 0061).
+	// O handler o converte em signed_pdf_url (presigned GET) antes de responder;
+	// o cliente nunca vê o key cru. Vazio antes de assinar.
+	SignedPDFKey string
 
 	// Intimation is nil for blank/processo drafts.
 	Intimation *IntimationView
@@ -118,6 +122,7 @@ func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 		SignedAt:          pgTimestamptzPtr(r.SignedAt),
 		FiledAt:           pgTimestamptzPtr(r.FiledAt),
 		FilingNumber:      derefString(r.FilingNumber),
+		SignedPDFKey:      derefString(r.SignedPdfKey),
 	}
 
 	// Intimation — only when the draft has an intimation_id (LEFT JOIN yields a

@@ -134,6 +134,10 @@ type Repository interface {
 	// returns the current row (no error). A miss is ErrDraftNotFound.
 	SignDraft(ctx context.Context, tx database.Tx, draftID, tenantID string) (*Draft, error)
 
+	// SignDraftWithPDF (Fatia 2b) transitions status=SIGNED + signed_at=now() +
+	// signed_pdf_key=<storage key do PDF assinado>. Miss = ErrDraftNotFound.
+	SignDraftWithPDF(ctx context.Context, tx database.Tx, draftID, tenantID, signedPDFKey string) (*Draft, error)
+
 	// MarkSentToSigning marca sent_to_signing_at=now() (o gesto "usuário clicou
 	// Enviar para assinatura", 0060). Idempotente: retorna nil sem erro quando
 	// já estava setado (a query só afeta linhas com sent_to_signing_at IS NULL).
@@ -786,6 +790,47 @@ func (r *pgRepository) GetChatThread(ctx context.Context, tx database.Tx, draftI
 }
 
 // ── Peticionamento repository methods (Fatia 4) ─────────────────────────────
+
+func (r *pgRepository) SignDraftWithPDF(ctx context.Context, tx database.Tx, draftID, tenantID, signedPDFKey string) (*Draft, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).SignDraftWithPDF(ctx, draftdb.SignDraftWithPDFParams{
+		ID:           did,
+		TenantID:     tid,
+		SignedPdfKey: &signedPDFKey,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDraftNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return draftFromSignRow(signRowFromSignWithPDF(row)), nil
+}
+
+// signRowFromSignWithPDF adapta SignDraftWithPDFRow → SignDraftRow (mesmo shape).
+func signRowFromSignWithPDF(r draftdb.SignDraftWithPDFRow) draftdb.SignDraftRow {
+	return draftdb.SignDraftRow{
+		ID:            r.ID,
+		TenantID:      r.TenantID,
+		CaseID:        r.CaseID,
+		IntimationID:  r.IntimationID,
+		PieceType:     r.PieceType,
+		Title:         r.Title,
+		Content:       r.Content,
+		Status:        r.Status,
+		SagaState:     r.SagaState,
+		CreatedAt:     r.CreatedAt,
+		UpdatedAt:     r.UpdatedAt,
+		SignedAt:      r.SignedAt,
+	}
+}
 
 func (r *pgRepository) SignDraft(ctx context.Context, tx database.Tx, draftID, tenantID string) (*Draft, error) {
 	did, err := parseUUID(draftID)

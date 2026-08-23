@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -358,6 +360,7 @@ func run(logger *slog.Logger) error {
 	// pro path certo e este ramo é no-op.
 	var certificateHandler *certificate.Handler
 	var certCipher certificate.Cipher
+	var certUC *certificate.UseCase // exposto pra outros slices (ex.: draft.Sign)
 	if cfg.GCPKMSKeyName != "" {
 		if err := materializeGCPCredentials(cfg.GCPKMSCredentialsJSON); err != nil {
 			return fmt.Errorf("materialize gcp creds: %w", err)
@@ -367,7 +370,7 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("init cert envelope cipher: %w", err)
 		}
 		certCipher = cipher
-		certUC := certificate.NewUseCase(certificate.NewRepository(), uow, cipher)
+		certUC = certificate.NewUseCase(certificate.NewRepository(), uow, cipher)
 		certificateHandler = certificate.New(certUC)
 		logger.Info("certificate slice ready", "kms_key", cfg.GCPKMSKeyName)
 	}
@@ -385,6 +388,14 @@ func run(logger *slog.Logger) error {
 	draftOpts := []draft.Option{draft.WithOutbox(events.NewOutbox())}
 	if storageClient != nil {
 		draftOpts = append(draftOpts, draft.WithStorage(storageClient))
+		// Fatia 2b: PDF assinado passa pelo BE (server-side PutBytes). Reusa
+		// o mesmo storage.Client — Put/Get direto (bypass presigned).
+		draftOpts = append(draftOpts, draft.WithPDFStorage(storageClient))
+	}
+	if certUC != nil {
+		// certUC.NewSigner satisfaz o port draft.CertSigner via adapter direto —
+		// mesma assinatura, só encaminha a chamada. Isolamento cross-slice.
+		draftOpts = append(draftOpts, draft.WithCertSigner(certSignerFunc(certUC.NewSigner)))
 	}
 	draftUC := draft.NewUseCase(uow, draftRepo, draftOpts...)
 	draftTrigger := draft.NewTriggerUseCase(uow, draftRepo, events.NewOutbox())
@@ -392,6 +403,9 @@ func run(logger *slog.Logger) error {
 		WithGenerator(draftTrigger).
 		WithLister(draftUC).
 		WithExport(draftUC)
+	if storageClient != nil {
+		draftHandler = draftHandler.WithStorage(storageClient)
+	}
 
 	// Chat use case (Fatia 3b): reuses taskGenerator + resumeEmbedder + advisory
 	// composer already instantiated above. nil generator / nil embedder → degraded
@@ -512,6 +526,15 @@ func run(logger *slog.Logger) error {
 	)
 
 	return nil
+}
+
+// certSignerFunc adapta a assinatura de certificate.UseCase.NewSigner ao port
+// draft.CertSigner sem struct nova — o UC já tem exatamente a shape que o draft
+// precisa (ctx, tenantID, certID) → (Signer, leaf, intermediates, err).
+type certSignerFunc func(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error)
+
+func (f certSignerFunc) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error) {
+	return f(ctx, tenantID, id)
 }
 
 // materializeGCPCredentials adapts PaaS-style env-only credentials into the

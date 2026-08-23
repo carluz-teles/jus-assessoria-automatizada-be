@@ -172,6 +172,10 @@ type Querier interface {
 	// Transition draft.status to SIGNED and set signed_at = now(). Scoped to
 	// (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
 	SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error)
+	// Fatia 2b: assina + grava a chave do PDF assinado no storage. Difere de
+	// SignDraft porque também popula signed_pdf_key. Idempotente: re-assinar
+	// devolve nil (a UI trata via Idempot flag).
+	SignDraftWithPDF(ctx context.Context, arg SignDraftWithPDFParams) (SignDraftWithPDFRow, error)
 	// Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
 	// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).

@@ -90,6 +90,7 @@ type Handler struct {
 	lister     lister          // nil when the list use case is not wired
 	export     presigner       // nil when the export use case is not wired
 	iter iterator // nil when the iterate use case is not wired
+	storage StoragePresigner // nil quando storage não configurado — download do PDF fica indisponível
 }
 
 // NewHandler wires the handler to the use case.
@@ -128,6 +129,13 @@ func (h *Handler) WithTheses(t thesisSuggester) *Handler {
 // WithLister attaches the list use case to the handler.
 func (h *Handler) WithLister(l lister) *Handler {
 	h.lister = l
+	return h
+}
+
+// WithStorage anexa o presigner do object storage. Necessário pra gerar
+// signed_pdf_url no read model (Fatia 2b). Sem storage, o campo fica null.
+func (h *Handler) WithStorage(s StoragePresigner) *Handler {
+	h.storage = s
 	return h
 }
 
@@ -237,7 +245,16 @@ func (h *Handler) getPeca(c *fiber.Ctx) error {
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	return c.JSON(fiber.Map{"data": detailToResponse(view)})
+	resp := detailToResponse(view)
+	// Fatia 2b: se a peça já foi assinada e temos storage, gera presigned URL
+	// do PDF. TTL curto (15 min). Erro no presign é degradação silenciosa
+	// (deixa nil e o FE mostra "Baixar indisponível").
+	if view.SignedPDFKey != "" && h.storage != nil {
+		if u, err := h.storage.PresignedGet(c.UserContext(), view.SignedPDFKey, 15*time.Minute); err == nil {
+			resp.SignedPDFURL = &u
+		}
+	}
+	return c.JSON(fiber.Map{"data": resp})
 }
 
 // ─── POST /v1/pecas/:id/iterate (Peça v2) ───────────────────────────────────
@@ -403,6 +420,10 @@ type detailResponse struct {
 	SignedAt        *string `json:"signed_at"`
 	FiledAt         *string `json:"filed_at"`
 	FilingNumber    string  `json:"filing_number"`
+	// Presigned GET URL do PDF assinado (Fatia 2b). null antes de assinar OU
+	// quando o storage não está configurado. TTL curto (15 min) — se o link
+	// expirar, o FE faz GET /pecas/:id de novo pra pegar um novo.
+	SignedPDFURL *string `json:"signed_pdf_url"`
 
 	// Review is the latest AI review, or null when no generation has been run.
 	Review *reviewResponse `json:"review"`
@@ -981,15 +1002,24 @@ const maxCreatedAt = "9999-12-31T23:59:59.999999Z"
 // UUID, so the scan starts at the top.
 const maxUUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
-// signPeca handles POST /v1/pecas/:id/sign. Body is intentionally empty (the
-// signing happens server-side). Returns 200 {data:{id, status, signed_at}}.
+// signPeca handles POST /v1/pecas/:id/sign. Fatia 2b: recebe body
+// {certificate_id} pra escolher qual cert do tenant vai assinar. Retorna
+// 200 {data:{id, status, signed_at}}.
 func (h *Handler) signPeca(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	draftID := c.Params("id")
 
+	var req struct {
+		CertificateID string `json:"certificate_id"`
+	}
+	// Body opcional só pra idempotência (draft já SIGNED continua funcionando
+	// mesmo sem cert_id); o UseCase valida cert_id quando for necessário.
+	_ = c.BodyParser(&req)
+
 	result, err := h.uc.Sign(c.UserContext(), SignCommand{
-		TenantID: tenantID,
-		DraftID:  draftID,
+		TenantID:      tenantID,
+		DraftID:       draftID,
+		CertificateID: req.CertificateID,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)

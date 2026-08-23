@@ -1,12 +1,22 @@
 package draft
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"time"
 
+	pdfreader "github.com/digitorus/pdf"
+	pdfsign "github.com/digitorus/pdfsign/sign"
+
+	"github.com/jusassessoria/platform/internal/draft/pdfgen"
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/storage"
 )
 
 // UseCase owns the domain logic for the peticionamento Fatia 1 write path.
@@ -18,11 +28,13 @@ import (
 // no worker drains the "default" queue — events would accumulate silently.
 // TODO(F2): emit draft.created once a listener is registered on the correct queue.
 type UseCase struct {
-	repo    database.UnitOfWork
-	rw      Repository
-	now     func() time.Time
-	outbox  OutboxPublisher
-	storage StoragePresigner
+	repo       database.UnitOfWork
+	rw         Repository
+	now        func() time.Time
+	outbox     OutboxPublisher
+	storage    StoragePresigner
+	pdfStorage PDFStorage
+	certSigner CertSigner
 }
 
 // OutboxPublisher is the narrow port for event publishing within a tx.
@@ -33,6 +45,21 @@ type OutboxPublisher interface {
 // StoragePresigner is the narrow port for presigned URL generation.
 type StoragePresigner interface {
 	PresignedGet(ctx context.Context, key string, ttl time.Duration) (string, error)
+}
+
+// PDFStorage é a porta que o Sign usa pra subir o PDF assinado direto pelo
+// server (bypass presigned — o binário passa pelo api porque a assinatura
+// é montada aqui). Implementado por lib/storage.Client (PutBytes/GetBytes).
+type PDFStorage interface {
+	PutBytes(ctx context.Context, key, contentType string, data []byte) error
+	GetBytes(ctx context.Context, key string) ([]byte, error)
+}
+
+// CertSigner é a porta que o Sign usa pra pegar um crypto.Signer KMS-backed
+// pra um certificado do tenant. Implementado pelo internal/certificate.
+// A leaf + chain acompanham (pdfsign precisa delas pra montar o CMS PAdES).
+type CertSigner interface {
+	NewSigner(ctx context.Context, tenantID, certificateID string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error)
 }
 
 // NewUseCase wires the use case to its dependencies. uow owns the transaction
@@ -63,6 +90,19 @@ func WithOutbox(ob OutboxPublisher) Option {
 // WithStorage attaches the presigned URL generator. Called by cmd/api composition.
 func WithStorage(s StoragePresigner) Option {
 	return func(uc *UseCase) { uc.storage = s }
+}
+
+// WithPDFStorage attaches the server-side blob storage (put/get). Required
+// for Sign (Fatia 2b): the signed PDF is uploaded here and its key persisted
+// on draft.signed_pdf_key. Without this option, Sign returns ErrPDFStorageUnavailable.
+func WithPDFStorage(s PDFStorage) Option {
+	return func(uc *UseCase) { uc.pdfStorage = s }
+}
+
+// WithCertSigner attaches the certificate signer port. Required for Sign
+// (Fatia 2b). Without this option, Sign returns ErrCertSignerUnavailable.
+func WithCertSigner(c CertSigner) Option {
+	return func(uc *UseCase) { uc.certSigner = c }
 }
 
 // CreateCommand is the input the handler builds from the request + the verified
@@ -393,68 +433,136 @@ func (uc *UseCase) RemoveAttachment(ctx context.Context, cmd RemoveAttachmentCom
 
 // SignCommand is the input for POST /v1/pecas/:id/sign.
 type SignCommand struct {
-	TenantID string
-	DraftID  string
+	TenantID      string
+	DraftID       string
+	CertificateID string // Fatia 2b — cert usado pra assinar (obrigatório)
 }
 
 // SignResult carries the response for a successful sign.
 type SignResult struct {
-	ID        string
-	Status    string
-	SignedAt  time.Time
-	IsIdempot bool // true when the draft was already SIGNED (200, not fresh)
+	ID           string
+	Status       string
+	SignedAt     time.Time
+	SignedPDFKey string // storage key do PDF assinado (Fatia 2b)
+	IsIdempot    bool   // true when the draft was already SIGNED (200, not fresh)
 }
 
-// Sign implements POST /v1/pecas/:id/sign. In ONE tenant-scoped tx:
-//  1. GetDraftByID (tenant guard → 404 if not found).
-//  2. Guard: status must be DRAFT or REVIEWED → ErrInvalidStatusForSign.
-//  3. If already SIGNED → return current data (idempotent, no error).
-//  4. SignDraft → status=SIGNED, signed_at=now().
-//  5. outbox.Publish(draft.signed) — same tx.
-//  6. Return {id, status, signed_at}.
+// ErrPDFStorageUnavailable / ErrCertSignerUnavailable — Fatia 2b só sobe se
+// wire trouxe as duas deps. Sem elas o handler cai em 503.
+var (
+	ErrPDFStorageUnavailable = apperr.NewInfra("PDF storage não configurado", nil)
+	ErrCertSignerUnavailable = apperr.NewInfra("cert signer não configurado", nil)
+)
+
+// Sign implements POST /v1/pecas/:id/sign (Fatia 2b — assinatura real). Fluxo:
+//  1. Tenta idempotência (draft já SIGNED → 200 com dados atuais);
+//  2. Guarda status ∈ {DRAFT, REVIEWED};
+//  3. Renderiza PDF via pdfgen a partir do structured_content;
+//  4. Cria crypto.Signer KMS-backed via certSigner.NewSigner(cert_id);
+//  5. Aplica PAdES via digitorus/pdfsign (signer + leaf + chain no SignData);
+//  6. Upload do PDF assinado no storage em {tenant}/pecas/{draft_id}/signed.pdf;
+//  7. UPDATE draft: status=SIGNED, signed_at=now(), signed_pdf_key=<key>.
+//  8. Emite draft.signed no outbox.
+//
+// Roda tudo na mesma tx da tabela draft — se o KMS ou o upload falhar, nada é
+// persistido. O único efeito colateral externo é o PutBytes no storage antes do
+// commit da tx; num rollback, o blob fica órfão (aceitável — GC eventual).
 func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, error) {
+	if uc.pdfStorage == nil {
+		return nil, ErrPDFStorageUnavailable
+	}
+	if uc.certSigner == nil {
+		return nil, ErrCertSignerUnavailable
+	}
+	if cmd.CertificateID == "" {
+		return nil, apperr.NewInvalid("certificate_id é obrigatório")
+	}
+
+	// 1) Fetch draft + structured_content via read model (evita novo query).
+	var view *DraftDetailView
+	if err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		v, e := uc.rw.GetDraftDetail(ctx, tx, cmd.TenantID, cmd.DraftID)
+		if e != nil {
+			return e
+		}
+		view = v
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	// Idempotente: já assinado → devolve dados atuais sem re-assinar.
+	if view.Status == StatusSigned {
+		var signedAt time.Time
+		if view.SignedAt != nil {
+			signedAt = *view.SignedAt
+		}
+		return &SignResult{
+			ID:        view.ID,
+			Status:    view.Status,
+			SignedAt:  signedAt,
+			IsIdempot: true,
+		}, nil
+	}
+	if view.Status != StatusDraft && view.Status != StatusReviewed {
+		return nil, ErrInvalidStatusForSign
+	}
+	if view.StructuredContent == nil {
+		return nil, apperr.NewInvalid("peça sem conteúdo estruturado — não é possível gerar PDF")
+	}
+
+	// 2) Render PDF (determinístico — mesma peça, mesmos bytes).
+	cnj := ""
+	if view.Process != nil {
+		cnj = view.Process.CNJNumber
+	}
+	pdfBytes, err := pdfgen.Render(pdfgen.Draft{
+		Title:    view.Title,
+		CNJ:      cnj,
+		Preamble: view.StructuredContent.Preamble.Paragraphs,
+		Sections: sectionsToPDF(view.StructuredContent.Sections),
+	})
+	if err != nil {
+		return nil, apperr.NewInfra("render pdf", err)
+	}
+
+	// 3) crypto.Signer KMS-backed.
+	signer, leaf, intermediates, err := uc.certSigner.NewSigner(ctx, cmd.TenantID, cmd.CertificateID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4) PAdES via digitorus/pdfsign.
+	signedPDF, err := signPDFPAdES(pdfBytes, signer, leaf, intermediates)
+	if err != nil {
+		return nil, apperr.NewInfra("sign pdf", err)
+	}
+
+	// 5) Upload no storage (server-side put — o binário passa por aqui).
+	key := storage.NewKey(cmd.TenantID, fmt.Sprintf("pecas/%s", cmd.DraftID))
+	if err := uc.pdfStorage.PutBytes(ctx, key, "application/pdf", signedPDF); err != nil {
+		return nil, err
+	}
+
+	// 6) UPDATE draft + outbox na mesma tx (as duas coisas são atômicas —
+	// o blob no storage pode ficar órfão em rollback, aceitável).
 	var result *SignResult
-
-	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		d, err := uc.rw.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
-		if err != nil {
-			return err
+	err = uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		signed, e := uc.rw.SignDraftWithPDF(ctx, tx, cmd.DraftID, cmd.TenantID, key)
+		if e != nil {
+			return e
 		}
-
-		// Idempotent: already signed → return current data.
-		if d.Status == StatusSigned {
-			result = &SignResult{
-				ID:        d.ID,
-				Status:    d.Status,
-				SignedAt:  d.UpdatedAt, // best approximation without signed_at on entity
-				IsIdempot: true,
-			}
-			return nil
-		}
-
-		// Guard: must be DRAFT or REVIEWED.
-		if d.Status != StatusDraft && d.Status != StatusReviewed {
-			return ErrInvalidStatusForSign
-		}
-
-		signed, err := uc.rw.SignDraft(ctx, tx, cmd.DraftID, cmd.TenantID)
-		if err != nil {
-			return err
-		}
-
-		// Emit draft.signed event (outbox).
 		if uc.outbox != nil {
 			ev := newDraftSigned(signed)
-			if err := uc.outbox.Publish(ctx, tx, ev); err != nil {
-				return err
+			if e := uc.outbox.Publish(ctx, tx, ev); e != nil {
+				return e
 			}
 		}
-
 		result = &SignResult{
-			ID:        signed.ID,
-			Status:    signed.Status,
-			SignedAt:  signed.UpdatedAt, // mapper sets updated_at = now() on sign
-			IsIdempot: false,
+			ID:           signed.ID,
+			Status:       signed.Status,
+			SignedAt:     signed.UpdatedAt,
+			SignedPDFKey: key,
+			IsIdempot:    false,
 		}
 		return nil
 	})
@@ -462,6 +570,60 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 		return nil, err
 	}
 	return result, nil
+}
+
+// sectionsToPDF converte []StructuredSection (do read model) em []pdfgen.Section.
+func sectionsToPDF(in []StructuredSection) []pdfgen.Section {
+	out := make([]pdfgen.Section, 0, len(in))
+	for _, s := range in {
+		out = append(out, pdfgen.Section{
+			Roman:      s.Roman,
+			Title:      s.Title,
+			Paragraphs: s.Paragraphs,
+		})
+	}
+	return out
+}
+
+// signPDFPAdES aplica PAdES-BASIC ao PDF usando o signer/cert fornecidos.
+// Uses digitorus/pdfsign. Detalhes:
+//   - DigestAlgorithm = SHA-256 (padrão ICP-Brasil AD-RB básico);
+//   - CertType = ApprovalSignature (não é certificação — permite assinaturas
+//     adicionais e edição limitada);
+//   - Sem TSA (timestamp) nesta fatia. AD-RT (com carimbo de tempo) fica pra
+//     fatia futura — precisa provedor TSA cadastrado (ex.: LuxTrust, Bry, etc).
+func signPDFPAdES(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate) ([]byte, error) {
+	reader := bytes.NewReader(pdfBytes)
+	pdfDoc, err := pdfreader.NewReader(reader, int64(len(pdfBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("pdf reader: %w", err)
+	}
+	// Reset reader depois do pdf.NewReader — ele consumiu partes do stream.
+	if _, err := reader.Seek(0, 0); err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	// CertificateChains: 1 chain contendo leaf primeiro + intermediates.
+	chain := append([]*x509.Certificate{cert}, intermediates...)
+	err = pdfsign.Sign(reader, &out, pdfDoc, int64(len(pdfBytes)), pdfsign.SignData{
+		Signer:            signer,
+		DigestAlgorithm:   crypto.SHA256,
+		Certificate:       cert,
+		CertificateChains: [][]*x509.Certificate{chain},
+		Signature: pdfsign.SignDataSignature{
+			CertType:   pdfsign.ApprovalSignature,
+			DocMDPPerm: pdfsign.AllowFillingExistingFormFieldsAndSignaturesPerms,
+			Info: pdfsign.SignDataSignatureInfo{
+				Name:   cert.Subject.CommonName,
+				Reason: "Assinatura da peça",
+				Date:   time.Now(),
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 // SendToSigning marca sent_to_signing_at=now() no draft. Sinaliza que o

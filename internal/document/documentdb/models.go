@@ -241,6 +241,7 @@ type Draft struct {
 	SentToSigningAt   pgtype.Timestamptz `json:"sent_to_signing_at"`
 	FilingNumber      *string            `json:"filing_number"`
 	FiledAt           pgtype.Timestamptz `json:"filed_at"`
+	SignedPdfKey      *string            `json:"signed_pdf_key"`
 }
 
 type DraftAttachment struct {

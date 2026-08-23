@@ -2,6 +2,11 @@ package certificate
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
@@ -50,8 +55,20 @@ func (uc *UseCase) Upload(ctx context.Context, tenantID, ownerUserID string, pfx
 		return nil, ErrCertificateExpired
 	}
 
-	// Envelope: DEK aleatória cifra o .pfx localmente; KMS wrappa a DEK.
-	env, err := uc.cipher.Seal(ctx, pfx)
+	// Envelope: cifra {pfx, password} juntos como blob JSON. Trade-off consciente
+	// (Fatia 2b, ver commit): armazenar a senha permite assinar sem re-digitação
+	// por parte do advogado — 1 clique. Perda: se o api for comprometido, o
+	// atacante consegue assinar sem prova de posse humana. Mitigação prevista:
+	// audit log por assinatura + rate limit. Prior art: DocuSign REST usa mesma
+	// abordagem quando o usuário opta por "remember password".
+	blob, err := json.Marshal(vaultBlob{
+		PFXBase64: base64.StdEncoding.EncodeToString(pfx),
+		Password:  password,
+	})
+	if err != nil {
+		return nil, err
+	}
+	env, err := uc.cipher.Seal(ctx, blob)
 	if err != nil {
 		return nil, err
 	}
@@ -106,10 +123,36 @@ func (uc *UseCase) Revoke(ctx context.Context, tenantID, id string) error {
 	})
 }
 
+// vaultBlob é o payload interno cifrado pelo envelope: {pfx, password} juntos
+// como JSON. NUNCA vaza pra fora do pacote — só o Sign/openVault manipulam.
+type vaultBlob struct {
+	PFXBase64 string `json:"pfx"`      // .pfx bytes em base64
+	Password  string `json:"password"` // senha do PKCS#12 (protegida por KMS at-rest)
+}
+
+// openVault decodifica o envelope e devolve o parsedPFX pronto pra assinar.
+// Centraliza pra Sign e o KMSBackedSigner reusar a mesma lógica.
+func (uc *UseCase) openVault(ctx context.Context, cert *Certificate) (*parsedPFX, error) {
+	blob, err := uc.cipher.Open(ctx, &cert.Envelope)
+	if err != nil {
+		return nil, err
+	}
+	var v vaultBlob
+	if err := json.Unmarshal(blob, &v); err != nil {
+		return nil, err
+	}
+	pfx, err := base64.StdEncoding.DecodeString(v.PFXBase64)
+	if err != nil {
+		return nil, err
+	}
+	return parsePFX(pfx, v.Password)
+}
+
 // Sign assina um digest SHA-256 com a chave do certificado. Fluxo: busca cert
-// (metadata + envelope); Cipher.Open (KMS.Decrypt na DEK, AES-GCM local); abre
-// PKCS#12 com a senha do user; assina digest; descarta chave.
-func (uc *UseCase) Sign(ctx context.Context, tenantID, id, password string, digest []byte) (*SignResult, error) {
+// (metadata + envelope); openVault (KMS.Decrypt → JSON → parsePFX com senha
+// armazenada); assina digest. O parâmetro `password` fica aqui por compat
+// com o handler antigo — quando presente, é IGNORADO (senha vem do vault).
+func (uc *UseCase) Sign(ctx context.Context, tenantID, id, _ string, digest []byte) (*SignResult, error) {
 	var cert *Certificate
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		c, e := uc.repo.GetByID(ctx, tx, tenantID, id)
@@ -125,12 +168,7 @@ func (uc *UseCase) Sign(ctx context.Context, tenantID, id, password string, dige
 	if err != nil {
 		return nil, err
 	}
-
-	pfx, err := uc.cipher.Open(ctx, &cert.Envelope)
-	if err != nil {
-		return nil, err
-	}
-	p, err := parsePFX(pfx, password)
+	p, err := uc.openVault(ctx, cert)
 	if err != nil {
 		return nil, err
 	}
@@ -143,4 +181,42 @@ func (uc *UseCase) Sign(ctx context.Context, tenantID, id, password string, dige
 		chain = append(chain, cc.Raw)
 	}
 	return &SignResult{Signature: sig, Chain: chain}, nil
+}
+
+// NewSigner devolve um crypto.Signer que assina digests SHA-256 usando este
+// certificado (KMS-backed). Usado por libs externas como digitorus/pdfsign
+// que exigem crypto.Signer pra montar a assinatura CMS/PAdES.
+//
+// A leaf certificate + chain acompanham o retorno pra o chamador passar pra
+// pdfsign junto com o signer. O erro é imediato se cert/leaf não existir.
+func (uc *UseCase) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error) {
+	var cert *Certificate
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		c, e := uc.repo.GetByID(ctx, tx, tenantID, id)
+		if e != nil {
+			return e
+		}
+		if c.RevokedAt != nil {
+			return ErrCertificateNotFound
+		}
+		cert = c
+		return nil
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	p, err := uc.openVault(ctx, cert)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// Chain vem da leaf pra CA (skip leaf pra intermediates).
+	var intermediates []*x509.Certificate
+	if len(p.Chain) > 1 {
+		intermediates = p.Chain[1:]
+	}
+	rsaKey, ok := p.Key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, nil, nil, ErrPKCS12Parse
+	}
+	return rsaKey, p.Leaf, intermediates, nil
 }

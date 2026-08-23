@@ -390,6 +390,9 @@ SELECT
     d.signed_at,
     d.filed_at,
     d.filing_number,
+    -- storage key do PDF assinado (Fatia 2b — 0061). NULL antes de assinar.
+    -- O handler transforma em presigned URL antes de devolver ao cliente.
+    d.signed_pdf_key,
 
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
@@ -439,6 +442,7 @@ type GetDraftDetailRow struct {
 	SignedAt                  pgtype.Timestamptz `json:"signed_at"`
 	FiledAt                   pgtype.Timestamptz `json:"filed_at"`
 	FilingNumber              *string            `json:"filing_number"`
+	SignedPdfKey              *string            `json:"signed_pdf_key"`
 	IntimationID              pgtype.UUID        `json:"intimation_id"`
 	IntimationType            *string            `json:"intimation_type"`
 	IntimationContent         *string            `json:"intimation_content"`
@@ -481,6 +485,7 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.SignedAt,
 		&i.FiledAt,
 		&i.FilingNumber,
+		&i.SignedPdfKey,
 		&i.IntimationID,
 		&i.IntimationType,
 		&i.IntimationContent,
@@ -1380,6 +1385,63 @@ type SignDraftRow struct {
 func (q *Queries) SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error) {
 	row := q.db.QueryRow(ctx, signDraft, arg.ID, arg.TenantID)
 	var i SignDraftRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CaseID,
+		&i.IntimationID,
+		&i.PieceType,
+		&i.Title,
+		&i.Content,
+		&i.Status,
+		&i.SagaState,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.SignedAt,
+	)
+	return i, err
+}
+
+const signDraftWithPDF = `-- name: SignDraftWithPDF :one
+UPDATE draft
+SET status         = 'SIGNED',
+    signed_at      = now(),
+    signed_pdf_key = $3,
+    updated_at     = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at, signed_at
+`
+
+type SignDraftWithPDFParams struct {
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	SignedPdfKey *string   `json:"signed_pdf_key"`
+}
+
+type SignDraftWithPDFRow struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CaseID       pgtype.UUID        `json:"case_id"`
+	IntimationID pgtype.UUID        `json:"intimation_id"`
+	PieceType    string             `json:"piece_type"`
+	Title        string             `json:"title"`
+	Content      *string            `json:"content"`
+	Status       string             `json:"status"`
+	SagaState    string             `json:"saga_state"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	SignedAt     pgtype.Timestamptz `json:"signed_at"`
+}
+
+// Fatia 2b: assina + grava a chave do PDF assinado no storage. Difere de
+// SignDraft porque também popula signed_pdf_key. Idempotente: re-assinar
+// devolve nil (a UI trata via Idempot flag).
+func (q *Queries) SignDraftWithPDF(ctx context.Context, arg SignDraftWithPDFParams) (SignDraftWithPDFRow, error) {
+	row := q.db.QueryRow(ctx, signDraftWithPDF, arg.ID, arg.TenantID, arg.SignedPdfKey)
+	var i SignDraftWithPDFRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
