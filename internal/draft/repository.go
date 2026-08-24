@@ -48,6 +48,11 @@ type Repository interface {
 	// to structured_content jsonb; nil leaves that column untouched. A no-match
 	// (wrong id or foreign tenant) is ErrDraftNotFound.
 	UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string, structured *StructuredContent) (*PatchResult, error)
+	// UpdateDraftContentHtml persiste o HTML rico do editor Tiptap
+	// (Fase B). A partir desse save, content_html vira source-of-truth
+	// pro renderer PDF; structured_content fica congelado. Escopo
+	// (draftID, tenantID). No-match → ErrDraftNotFound.
+	UpdateDraftContentHtml(ctx context.Context, tx database.Tx, draftID, tenantID, html string) error
 	// GetDraftDetail runs the JOIN read model for GET /v1/pecas/:id. A miss is
 	// ErrDraftNotFound.
 	GetDraftDetail(ctx context.Context, tx database.Tx, tenantID, draftID string) (*DraftDetailView, error)
@@ -358,6 +363,29 @@ func (r *pgRepository) GetProvidencesForIntimation(ctx context.Context, tx datab
 		})
 	}
 	return out, nil
+}
+
+func (r *pgRepository) UpdateDraftContentHtml(ctx context.Context, tx database.Tx, draftID, tenantID, html string) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	_, err = draftdb.New(tx).UpdateDraftContentHtml(ctx, draftdb.UpdateDraftContentHtmlParams{
+		ID:          did,
+		TenantID:    tid,
+		ContentHtml: &html,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDraftNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 func (r *pgRepository) UpdateDraftContent(ctx context.Context, tx database.Tx, draftID, tenantID, content string, title *string, structured *StructuredContent) (*PatchResult, error) {

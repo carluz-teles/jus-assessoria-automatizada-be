@@ -528,47 +528,54 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	if view.Status != StatusDraft && view.Status != StatusReviewed {
 		return nil, ErrInvalidStatusForSign
 	}
-	if view.StructuredContent == nil {
-		return nil, apperr.NewInvalid("peça sem conteúdo estruturado — não é possível gerar PDF")
+	// Aceita content_html (Fase B: editor rico) OU structured_content (legacy).
+	// content_html tem prioridade quando disponível — foi editado pelo humano.
+	hasHTML := view.ContentHtml != nil && *view.ContentHtml != ""
+	if !hasHTML && view.StructuredContent == nil {
+		return nil, apperr.NewInvalid("peça sem conteúdo — não é possível gerar PDF")
 	}
 
-	// 2) Render PDF (determinístico — mesma peça, mesmos bytes).
 	cnj := ""
 	if view.Process != nil {
 		cnj = view.Process.CNJNumber
 	}
 	signedAt := uc.now()
-	pdfBytes, err := pdfgen.Render(pdfgen.Draft{
-		Title:    view.Title,
-		CNJ:      cnj,
-		Preamble: fillPlaceholders(view.StructuredContent.Preamble.Paragraphs, signedAt),
-		Sections: sectionsToPDF(view.StructuredContent.Sections, signedAt),
-	})
-	if err != nil {
-		return nil, apperr.NewInfra("render pdf", err)
-	}
 
-	// 3) crypto.Signer KMS-backed.
+	// 3) crypto.Signer KMS-backed (antes do render pra saber Signer.Name+OAB).
 	signer, leaf, intermediates, signerInfo, err := uc.certSigner.NewSigner(ctx, cmd.TenantID, cmd.CertificateID)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3.5) Re-render com bloco de assinatura preenchido (nome+OAB do cert
-	// usado). Não dá pra fazer no passo 2 porque o certSigner depende do
-	// commandID e a validação do cert só acontece agora.
-	pdfBytes, err = pdfgen.Render(pdfgen.Draft{
-		Title:    view.Title,
-		CNJ:      cnj,
-		Preamble: fillPlaceholders(view.StructuredContent.Preamble.Paragraphs, signedAt),
-		Sections: sectionsToPDF(view.StructuredContent.Sections, signedAt),
-		Signer: pdfgen.Signer{
-			Name: signerInfo.SubjectCN,
-			OAB:  signerInfo.OAB,
-		},
-	})
-	if err != nil {
-		return nil, apperr.NewInfra("render pdf com assinatura", err)
+	// 4) Render PDF — HTML path (Fase C) quando content_html presente,
+	// legacy maroto path quando só structured_content existe.
+	var pdfBytes []byte
+	if hasHTML {
+		pdfBytes, err = pdfgen.RenderHTML(ctx, pdfgen.RenderHTMLInput{
+			HTML: *view.ContentHtml,
+			Signer: pdfgen.Signer{
+				Name: signerInfo.SubjectCN,
+				OAB:  signerInfo.OAB,
+			},
+			SignedAt: signedAt,
+		})
+		if err != nil {
+			return nil, apperr.NewInfra("render pdf (html)", err)
+		}
+	} else {
+		pdfBytes, err = pdfgen.Render(pdfgen.Draft{
+			Title:    view.Title,
+			CNJ:      cnj,
+			Preamble: fillPlaceholders(view.StructuredContent.Preamble.Paragraphs, signedAt),
+			Sections: sectionsToPDF(view.StructuredContent.Sections, signedAt),
+			Signer: pdfgen.Signer{
+				Name: signerInfo.SubjectCN,
+				OAB:  signerInfo.OAB,
+			},
+		})
+		if err != nil {
+			return nil, apperr.NewInfra("render pdf (structured)", err)
+		}
 	}
 
 	// 4) PAdES via digitorus/pdfsign (+TSA se tsaURL configurada = PAdES-T).
@@ -826,6 +833,16 @@ func isTSATransient(err error) bool {
 		}
 	}
 	return false
+}
+
+// SaveContentHtml (Fase B do editor rico) persiste o HTML do Tiptap na coluna
+// draft.content_html. Após o primeiro save, content_html vira source-of-truth
+// pro renderer PDF (Fase C, via chromedp); structured_content fica congelado.
+// tenantID vem do principal, nunca do body. Chamado pelo autosave do FE.
+func (uc *UseCase) SaveContentHtml(ctx context.Context, tenantID, draftID, html string) error {
+	return uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.rw.UpdateDraftContentHtml(ctx, tx, draftID, tenantID, html)
+	})
 }
 
 // SendToSigning marca sent_to_signing_at=now() no draft. Sinaliza que o

@@ -25,6 +25,10 @@ type DraftDetailView struct {
 	// backfilled by the lazy parser; nil for empty drafts (no content yet).
 	// The FE consumes this directly to render section cards.
 	StructuredContent *StructuredContent
+	// ContentHtml carrega a peça em HTML rico do editor Tiptap (Fase B).
+	// Nil para peças legacy ou recém-geradas (structured_content ainda é a
+	// fonte). Quando não-nil, source-of-truth pro renderer PDF (Fase C).
+	ContentHtml *string
 	// Authorship is "assistant" (default, FE shows Iterar tab) or "human_taken"
 	// (advogado assumiu autoria, FE shows Revisão tab). See migration 0056.
 	Authorship string
@@ -114,6 +118,7 @@ func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 		CreatedAt:         timestamptzToTime(r.CreatedAt),
 		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
 		StructuredContent: structuredContentFromJSON(r.StructuredContent),
+		ContentHtml:       r.ContentHtml,
 		Authorship:        r.Authorship,
 		Attachments:       []Attachment{}, // never nil — serializes as [] not null
 		Providences:       []Providence{}, // never nil

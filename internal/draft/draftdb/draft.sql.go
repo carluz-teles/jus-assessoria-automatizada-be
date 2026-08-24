@@ -383,6 +383,7 @@ SELECT
     d.created_at,
     d.updated_at,
     d.structured_content,
+    d.content_html,
     d.authorship,
 
     -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.
@@ -437,6 +438,7 @@ type GetDraftDetailRow struct {
 	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 	StructuredContent         []byte             `json:"structured_content"`
+	ContentHtml               *string            `json:"content_html"`
 	Authorship                string             `json:"authorship"`
 	SentToSigningAt           pgtype.Timestamptz `json:"sent_to_signing_at"`
 	SignedAt                  pgtype.Timestamptz `json:"signed_at"`
@@ -480,6 +482,7 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.StructuredContent,
+		&i.ContentHtml,
 		&i.Authorship,
 		&i.SentToSigningAt,
 		&i.SignedAt,
@@ -1600,6 +1603,38 @@ func (q *Queries) UpdateDraftContent(ctx context.Context, arg UpdateDraftContent
 	)
 	var i UpdateDraftContentRow
 	err := row.Scan(&i.ID, &i.Title, &i.UpdatedAt)
+	return i, err
+}
+
+const updateDraftContentHtml = `-- name: UpdateDraftContentHtml :one
+UPDATE draft
+SET content_html = $3,
+    updated_at   = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, updated_at
+`
+
+type UpdateDraftContentHtmlParams struct {
+	ID          uuid.UUID `json:"id"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	ContentHtml *string   `json:"content_html"`
+}
+
+type UpdateDraftContentHtmlRow struct {
+	ID        uuid.UUID          `json:"id"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Autosave do editor rico (Fase B): grava o HTML do Tiptap direto na coluna
+// content_html. A partir deste save, content_html é source-of-truth pro
+// renderer PDF (pdfgen HTML→PDF via chromedp, Fase C); structured_content
+// fica congelado (a IA continua gerando pra novas gerações, mas edição
+// humana só toca em content_html). Escopo (id, tenant_id); no-match →
+// ErrDraftNotFound. Retorna id + updated_at.
+func (q *Queries) UpdateDraftContentHtml(ctx context.Context, arg UpdateDraftContentHtmlParams) (UpdateDraftContentHtmlRow, error) {
+	row := q.db.QueryRow(ctx, updateDraftContentHtml, arg.ID, arg.TenantID, arg.ContentHtml)
+	var i UpdateDraftContentHtmlRow
+	err := row.Scan(&i.ID, &i.UpdatedAt)
 	return i, err
 }
 

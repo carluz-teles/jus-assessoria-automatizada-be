@@ -242,6 +242,8 @@ type Draft struct {
 	FilingNumber      *string            `json:"filing_number"`
 	FiledAt           pgtype.Timestamptz `json:"filed_at"`
 	SignedPdfKey      *string            `json:"signed_pdf_key"`
+	// HTML rico do editor Tiptap. NULL = usar structured_content como fonte.
+	ContentHtml *string `json:"content_html"`
 }
 
 type DraftAttachment struct {

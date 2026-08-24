@@ -193,6 +193,13 @@ type Querier interface {
 	// persisted; otherwise the existing structured_content is left untouched. The FE
 	// always sends both (Peça v2), older PATCH callers can send just content.
 	UpdateDraftContent(ctx context.Context, arg UpdateDraftContentParams) (UpdateDraftContentRow, error)
+	// Autosave do editor rico (Fase B): grava o HTML do Tiptap direto na coluna
+	// content_html. A partir deste save, content_html é source-of-truth pro
+	// renderer PDF (pdfgen HTML→PDF via chromedp, Fase C); structured_content
+	// fica congelado (a IA continua gerando pra novas gerações, mas edição
+	// humana só toca em content_html). Escopo (id, tenant_id); no-match →
+	// ErrDraftNotFound. Retorna id + updated_at.
+	UpdateDraftContentHtml(ctx context.Context, arg UpdateDraftContentHtmlParams) (UpdateDraftContentHtmlRow, error)
 	// Patch the observed_result on a petition, scoped to tenant via JOIN. A miss
 	// (no petition or wrong tenant) → pgx.ErrNoRows → ErrPetitionNotFound.
 	UpdateObservedResult(ctx context.Context, arg UpdateObservedResultParams) (UpdateObservedResultRow, error)

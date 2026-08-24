@@ -30,6 +30,8 @@ type writer interface {
 	// Workflow steps (Fatia 2a) — apenas gestos, sem lógica de LLM/outbox.
 	SendToSigning(ctx context.Context, tenantID, draftID string) error
 	RevertToConstruction(ctx context.Context, tenantID, draftID string) error
+	// SaveContentHtml (Fase B do editor rico) grava o HTML do Tiptap.
+	SaveContentHtml(ctx context.Context, tenantID, draftID, html string) error
 	// AssumeAuthorship (Peça v2) is exposed via the main UseCase — no separate
 	// wiring needed since it's a single UPDATE (no LLM, no outbox).
 	AssumeAuthorship(ctx context.Context, tenantID, draftID string) (*Draft, error)
@@ -173,6 +175,9 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	// revert nulla o mesmo (só permite se ainda não assinado).
 	r.Post("/pecas/:id/enviar-para-assinatura", h.sendToSigning)
 	r.Post("/pecas/:id/voltar-para-construcao", h.revertToConstruction)
+
+	// Editor rico (Fase B) — autosave do HTML do Tiptap.
+	r.Put("/pecas/:id/content-html", h.saveContentHtml)
 
 	// Process-scoped list.
 	r.Get("/processos/:id/pecas", h.listPecasByProcess)
@@ -404,7 +409,10 @@ type detailResponse struct {
 	// the FE; content stays for legacy/export. authorship drives which panel
 	// tab (Iterar vs Revisão) the FE shows.
 	StructuredContent *StructuredContent `json:"structured_content"`
-	Authorship        string             `json:"authorship"`
+	// ContentHTML (Fase B do editor rico) — HTML do Tiptap. null pra peças
+	// legacy ou geradas pela IA antes do 1º save do editor humano.
+	ContentHTML *string `json:"content_html"`
+	Authorship  string  `json:"authorship"`
 
 	Intimation  *intimationResponse  `json:"intimation,omitempty"`
 	Process     *processResponse     `json:"process,omitempty"`
@@ -508,6 +516,7 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 		CreatedAt:         v.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:         v.UpdatedAt.Format(time.RFC3339),
 		StructuredContent: v.StructuredContent,
+		ContentHTML:       v.ContentHtml,
 		Authorship:        v.Authorship,
 		SentToSigningAt:   timePtrToRFC3339(v.SentToSigningAt),
 		SignedAt:          timePtrToRFC3339(v.SignedAt),
@@ -1312,6 +1321,27 @@ func (h *Handler) sendToSigning(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	draftID := c.Params("id")
 	if err := h.uc.SendToSigning(c.UserContext(), tenantID, draftID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// saveContentHtml handles PUT /v1/pecas/:id/content-html. Autosave do editor
+// rico (Fase B). Body: {"content_html": "<p>..."}. 200 vazio quando ok.
+// Limite defensivo: 500 KB de HTML — peças jurídicas raramente ultrapassam.
+func (h *Handler) saveContentHtml(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	var req struct {
+		ContentHTML string `json:"content_html"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
+	}
+	if len(req.ContentHTML) > 500_000 {
+		return httpx.WriteError(c, apperr.NewInvalid("content_html excede 500 KB"))
+	}
+	if err := h.uc.SaveContentHtml(c.UserContext(), tenantID, draftID, req.ContentHTML); err != nil {
 		return httpx.WriteError(c, err)
 	}
 	return c.SendStatus(fiber.StatusNoContent)

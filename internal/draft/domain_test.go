@@ -147,6 +147,10 @@ func (r *fakeRepo) UpdateDraftContent(_ context.Context, _ database.Tx, _, _, _ 
 	return r.updateResult, r.updateErr
 }
 
+func (r *fakeRepo) UpdateDraftContentHtml(_ context.Context, _ database.Tx, _, _, _ string) error {
+	return nil
+}
+
 // UpdateAuthorship (Peça v2, migration 0056) — stub. Tests that cover the
 // authorship endpoint override this in a dedicated fake if needed.
 func (r *fakeRepo) UpdateAuthorship(_ context.Context, _ database.Tx, _, _, _ string) (*Draft, error) {

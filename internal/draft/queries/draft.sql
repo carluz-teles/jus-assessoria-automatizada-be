@@ -75,6 +75,19 @@ SET content            = $3,
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, title, updated_at;
 
+-- name: UpdateDraftContentHtml :one
+-- Autosave do editor rico (Fase B): grava o HTML do Tiptap direto na coluna
+-- content_html. A partir deste save, content_html é source-of-truth pro
+-- renderer PDF (pdfgen HTML→PDF via chromedp, Fase C); structured_content
+-- fica congelado (a IA continua gerando pra novas gerações, mas edição
+-- humana só toca em content_html). Escopo (id, tenant_id); no-match →
+-- ErrDraftNotFound. Retorna id + updated_at.
+UPDATE draft
+SET content_html = $3,
+    updated_at   = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, updated_at;
+
 -- name: GetDraftDetail :one
 -- Read model for GET /v1/pecas/:id: a JOIN over draft, intimation (optional),
 -- court_record (via intimation), and deadline (via intimation 1:1 UNIQUE). All
@@ -92,6 +105,7 @@ SELECT
     d.created_at,
     d.updated_at,
     d.structured_content,
+    d.content_html,
     d.authorship,
 
     -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.
