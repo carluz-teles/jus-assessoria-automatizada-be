@@ -35,6 +35,18 @@ func (f *fakeAnaliseGen) GenerateJSON(_ context.Context, req llm.Request) ([]byt
 	return f.out, f.err
 }
 
+func (f *fakeAnaliseGen) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(string) error) ([]byte, error) {
+	f.calls++
+	f.gotReq = req
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		_ = onChunk(string(f.out))
+	}
+	return f.out, nil
+}
+
 // fakeAnaliseStore records the persisted analysis and can be told to fail.
 type fakeAnaliseStore struct {
 	calls       int

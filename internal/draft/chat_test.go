@@ -34,6 +34,16 @@ func (f *fakeChatGen) GenerateJSON(_ context.Context, _ llm.Request) ([]byte, er
 	return f.out, f.err
 }
 
+func (f *fakeChatGen) GenerateJSONStream(_ context.Context, _ llm.Request, onChunk func(string) error) ([]byte, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		_ = onChunk(string(f.out))
+	}
+	return f.out, nil
+}
+
 // fakeChatEmb is a fake embedder for chat tests. Satisfies the package-level
 // embedder interface (same as fakeEmbedder in generate_test.go, but kept separate
 // so each test file controls its own fake independently).

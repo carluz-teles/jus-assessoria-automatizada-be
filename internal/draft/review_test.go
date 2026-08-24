@@ -402,3 +402,19 @@ func (f *fakeGenTracked) GenerateJSON(_ context.Context, req llm.Request) ([]byt
 	}
 	return f.out, f.err
 }
+
+func (f *fakeGenTracked) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(string) error) ([]byte, error) {
+	f.gotReq = req
+	if f.onCall != nil {
+		f.onCall()
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		if err := onChunk(string(f.out)); err != nil {
+			return f.out, err
+		}
+	}
+	return f.out, nil
+}

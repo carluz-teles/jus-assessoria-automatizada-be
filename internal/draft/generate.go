@@ -88,6 +88,17 @@ type VoyageEmbedder = embedder
 // GenerateUseCase is the async handler for draft.generation_requested events. It holds
 // all its ports as interfaces so tests inject fakes — the real LLM/embedder APIs are
 // NEVER called under test.
+// chunkPublisher é a porta narrow que o worker usa pra empurrar chunks do
+// stream do LLM ao canal Redis. Satisfeita por lib/pubsub.Publisher.
+// Injetada como Option (nil → geração roda em modo batch, sem streaming).
+type chunkPublisher interface {
+	Publish(ctx context.Context, channel string, payload []byte) error
+}
+
+// chunkChannel monta o nome do canal pub/sub pra um draft — usado pelo
+// worker (produtor) e pelo endpoint SSE (consumidor) sem depender um do outro.
+func chunkChannel(draftID string) string { return "draft:" + draftID + ":stream" }
+
 type GenerateUseCase struct {
 	uow      database.UnitOfWork
 	reader   generationDepsReader
@@ -98,7 +109,8 @@ type GenerateUseCase struct {
 	emb      embedder            // nil → degraded (no grounding)
 	search   indexing.SearchDeps // Pool may be nil → degraded
 	composer advisory.PromptComposer
-	model    string // OpenRouter model slug (from config); falls back to generationModel
+	chunkPub chunkPublisher // nil → geração em modo batch (não streama)
+	model    string         // OpenRouter model slug (from config); falls back to generationModel
 	now      func() time.Time
 }
 
@@ -114,6 +126,7 @@ type GenerateUseCaseParams struct {
 	Emb      embedder
 	Search   indexing.SearchDeps
 	Composer advisory.PromptComposer
+	ChunkPub chunkPublisher   // nil → sem streaming
 	Model    string           // OpenRouter model slug; empty → generationModel fallback
 	Now      func() time.Time // defaults to time.Now
 }
@@ -137,6 +150,7 @@ func NewGenerateUseCase(p GenerateUseCaseParams) *GenerateUseCase {
 		emb:      p.Emb,
 		search:   p.Search,
 		composer: p.Composer,
+		chunkPub: p.ChunkPub,
 		model:    p.Model,
 		now:      p.Now,
 	}
@@ -271,14 +285,42 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("compose prompt: %v", err2))
 	}
 
-	rawBytes, err3 := uc.gen.GenerateJSON(ctx, llm.Request{
-		System:     composed.System,
-		User:       composed.User,
-		Schema:     generateSchema,
-		SchemaName: "draft_minuta",
-		Model:      uc.model,
-		MaxTokens:  4096,
-	})
+	// STREAMING — publica cada chunk bruto no canal pub/sub `draft:<id>:stream`
+	// pra o SSE do api encaminhar ao FE. Ao final, `rawBytes` carrega a
+	// resposta completa (idêntica ao modo batch) pra fazer json.Unmarshal.
+	// Se o Publisher não foi wireado (uc.chunkPub == nil), degrada pra batch
+	// mode (mesmo comportamento anterior).
+	var rawBytes []byte
+	var err3 error
+	if uc.chunkPub != nil {
+		channel := chunkChannel(ev.DraftID)
+		rawBytes, err3 = uc.gen.GenerateJSONStream(ctx, llm.Request{
+			System:     composed.System,
+			User:       composed.User,
+			Schema:     generateSchema,
+			SchemaName: "draft_minuta",
+			Model:      uc.model,
+			MaxTokens:  4096,
+		}, func(chunk string) error {
+			// Best-effort: erro no pub não aborta geração. Cliente que perder
+			// chunks refaz o fetch quando saga_state=DRAFTED.
+			if pubErr := uc.chunkPub.Publish(ctx, channel, []byte(chunk)); pubErr != nil {
+				slog.WarnContext(ctx, "draft chunk publish failed",
+					slog.String("draft_id", ev.DraftID),
+					slog.String("err", pubErr.Error()))
+			}
+			return nil
+		})
+	} else {
+		rawBytes, err3 = uc.gen.GenerateJSON(ctx, llm.Request{
+			System:     composed.System,
+			User:       composed.User,
+			Schema:     generateSchema,
+			SchemaName: "draft_minuta",
+			Model:      uc.model,
+			MaxTokens:  4096,
+		})
+	}
 	if err3 != nil {
 		// Transient LLM errors stay retryable; terminal (bad key / parse) become FAILED.
 		if isTerminalGenErr(err3) {

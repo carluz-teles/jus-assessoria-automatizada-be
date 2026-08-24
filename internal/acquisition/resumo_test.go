@@ -38,6 +38,18 @@ func (f *fakeResumoGen) GenerateJSON(_ context.Context, req llm.Request) ([]byte
 	return f.out, f.err
 }
 
+func (f *fakeResumoGen) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(string) error) ([]byte, error) {
+	f.calls++
+	f.gotReq = req
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		_ = onChunk(string(f.out))
+	}
+	return f.out, nil
+}
+
 // fakeResumoStore is the resumoStore fake. It records the persisted JSON and can be
 // told to fail — the use case must NOT propagate a store fault (best-effort).
 type fakeResumoStore struct {

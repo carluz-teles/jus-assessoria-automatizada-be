@@ -128,6 +128,21 @@ func (f *fakeGen) GenerateJSON(_ context.Context, req llm.Request) ([]byte, erro
 	return f.out, f.err
 }
 
+// GenerateJSONStream: pra testes, entrega o output inteiro num único chunk
+// e depois retorna. Basta pra validar o worker sem SSE real.
+func (f *fakeGen) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(chunk string) error) ([]byte, error) {
+	f.gotReq = req
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		if err := onChunk(string(f.out)); err != nil {
+			return f.out, err
+		}
+	}
+	return f.out, nil
+}
+
 // fakeEmbedder returns preset vectors.
 type fakeEmbedder struct {
 	vecs [][]float32

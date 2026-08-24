@@ -93,7 +93,19 @@ type Handler struct {
 	export     presigner       // nil when the export use case is not wired
 	iter iterator // nil when the iterate use case is not wired
 	storage StoragePresigner // nil quando storage não configurado — download do PDF fica indisponível
+	chunkSub  chunkSubscriber   // nil → SSE stream não montado (streaming desabilitado)
+	getSaga   getSagaFn         // reader minimal pra saga_state (fecha stream quando DRAFTED/FAILED)
 }
+
+// chunkSubscriber é a porta narrow que o SSE precisa pra subscrever no canal
+// pub/sub do draft. Satisfeita por lib/pubsub.Subscriber.
+type chunkSubscriber interface {
+	Subscribe(ctx context.Context, channel string) (<-chan []byte, error)
+}
+
+// getSagaFn devolve o saga_state atual pra o SSE poder terminar quando a
+// geração já concluiu (evita stream infinito depois do DRAFTED/FAILED).
+type getSagaFn func(ctx context.Context, tenantID, draftID string) (string, error)
 
 // NewHandler wires the handler to the use case.
 func NewHandler(uc writer) *Handler {
@@ -104,6 +116,15 @@ func NewHandler(uc writer) *Handler {
 // cmd/api composition when the generation use case is available.
 func (h *Handler) WithGenerator(gen generator) *Handler {
 	h.gen = gen
+	return h
+}
+
+// WithGenerationStream ativa o endpoint SSE de streaming da geração. Requer
+// tanto o Subscriber (pra ler chunks do canal Redis) quanto o getSaga
+// (pra saber quando fechar). Ambos vêm do api composition.
+func (h *Handler) WithGenerationStream(sub chunkSubscriber, getSaga getSagaFn) *Handler {
+	h.chunkSub = sub
+	h.getSaga = getSaga
 	return h
 }
 
@@ -178,6 +199,11 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 	// Editor rico (Fase B) — autosave do HTML do Tiptap.
 	r.Put("/pecas/:id/content-html", h.saveContentHtml)
+
+	// Streaming da geração (Fatia 2 do streaming). SSE: cliente conecta
+	// durante EXTRACTING e recebe chunks do LLM em tempo real. Fecha
+	// quando saga_state=DRAFTED/FAILED.
+	r.Get("/pecas/:id/generation-stream", h.generationStream)
 
 	// Process-scoped list.
 	r.Get("/processos/:id/pecas", h.listPecasByProcess)

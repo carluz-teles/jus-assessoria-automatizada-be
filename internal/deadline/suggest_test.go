@@ -31,6 +31,17 @@ func (f *fakeGen) GenerateJSON(_ context.Context, req llm.Request) ([]byte, erro
 	return f.out, f.err
 }
 
+func (f *fakeGen) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(string) error) ([]byte, error) {
+	f.gotReq = req
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		_ = onChunk(string(f.out))
+	}
+	return f.out, nil
+}
+
 type fakeStore struct {
 	got   SuggestionRecord
 	calls int

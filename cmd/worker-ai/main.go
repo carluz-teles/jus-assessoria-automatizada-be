@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -22,6 +23,7 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
 	"github.com/jusassessoria/platform/lib/llm"
+	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
@@ -131,6 +133,16 @@ func run(logger *slog.Logger) error {
 			logger.Warn("VOYAGE_API_KEY unset — AI generation will run without RAG grounding")
 		}
 
+		// Publisher pub/sub Redis pro streaming da geração — cada chunk cai
+		// no canal draft:<id>:stream e o endpoint SSE do api encaminha ao FE.
+		// Parseia direto de cfg.RedisURL (asynq.RedisConnOpt é opaco).
+		redisRawOpt, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			return fmt.Errorf("parse redis url pra pubsub: %w", err)
+		}
+		redisClient := redis.NewClient(redisRawOpt)
+		chunkPub := pubsub.NewRedisPubSub(redisClient)
+
 		generateUC := draft.NewGenerateUseCase(draft.GenerateUseCaseParams{
 			UoW:      uow,
 			Reader:   repo,
@@ -141,6 +153,7 @@ func run(logger *slog.Logger) error {
 			Emb:      emb,
 			Search:   searchDeps,
 			Composer: advisory.NewTemplateComposer(),
+			ChunkPub: chunkPub,
 			Model:    cfg.OpenRouterModel,
 		})
 

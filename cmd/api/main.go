@@ -414,6 +414,20 @@ func run(logger *slog.Logger) error {
 		draftHandler = draftHandler.WithStorage(storageClient)
 	}
 
+	// Streaming da geração (Fatia 2 do streaming). Subscriber compartilha o
+	// mesmo Redis do resto da app; getSaga consulta o read model do próprio
+	// slice pra saber quando fechar a stream (DRAFTED/FAILED).
+	draftHandler = draftHandler.WithGenerationStream(
+		pubsub.NewRedisPubSub(pubsubClient),
+		func(ctx context.Context, tenantID, draftID string) (string, error) {
+			view, err := draftUC.GetDetail(ctx, tenantID, draftID)
+			if err != nil {
+				return "", err
+			}
+			return view.SagaState, nil
+		},
+	)
+
 	// Chat use case (Fatia 3b): reuses taskGenerator + resumeEmbedder + advisory
 	// composer already instantiated above. nil generator / nil embedder → degraded
 	// (ErrIANotConfigured / grounded=false) — never a boot failure.
