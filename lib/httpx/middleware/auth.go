@@ -125,10 +125,18 @@ func authError(err error) error {
 // bearerToken extracts the token from an "Authorization: Bearer <jwt>" header,
 // returning "" when the header is absent or not a bearer credential. The scheme
 // match is case-insensitive per RFC 7235.
+//
+// Fallback pra SSE (EventSource): a spec HTML5 EventSource não permite headers
+// custom, então endpoints de stream aceitam ?token=<jwt> na query. Só é lido
+// quando o header Authorization está ausente — mantém segurança normal do REST.
 func bearerToken(c *fiber.Ctx) string {
 	h := c.Get(fiber.HeaderAuthorization)
-	if len(h) < len(bearerPrefix) || !strings.EqualFold(h[:len(bearerPrefix)], bearerPrefix) {
-		return ""
+	if len(h) >= len(bearerPrefix) && strings.EqualFold(h[:len(bearerPrefix)], bearerPrefix) {
+		return strings.TrimSpace(h[len(bearerPrefix):])
 	}
-	return strings.TrimSpace(h[len(bearerPrefix):])
+	// SSE fallback
+	if q := strings.TrimSpace(c.Query("token")); q != "" {
+		return q
+	}
+	return ""
 }
