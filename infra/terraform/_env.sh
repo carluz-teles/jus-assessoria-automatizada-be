@@ -57,3 +57,7 @@ export TF_VAR_openrouter_api_key="${OPENROUTER_API_KEY:-}" # opcional: vazio = a
 # é o BASE64 do JSON da service account (guardado como secret do GH Actions).
 export TF_VAR_gcp_kms_key_name="${GCP_KMS_KEY_NAME:-}"
 export TF_VAR_gcp_kms_credentials_json="${GCP_KMS_CREDENTIALS_JSON:-}"
+
+# TSA (RFC 3161 — PAdES-T). Vazio = default do variables.tf (digicert público).
+# Sobrescrever só quando migrarmos pra TSA paga (LSITEC, digicert enterprise, etc).
+export TF_VAR_tsa_url="${TSA_URL:-}"

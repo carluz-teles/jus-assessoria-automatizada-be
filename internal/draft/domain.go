@@ -7,6 +7,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	pdfreader "github.com/digitorus/pdf"
@@ -544,7 +546,7 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	}
 
 	// 4) PAdES via digitorus/pdfsign (+TSA se tsaURL configurada = PAdES-T).
-	signedPDF, err := signPDFPAdES(pdfBytes, signer, leaf, intermediates, uc.tsaURL)
+	signedPDF, err := signPDFPAdES(ctx, pdfBytes, signer, leaf, intermediates, uc.tsaURL)
 	if err != nil {
 		return nil, apperr.NewInfra("sign pdf", err)
 	}
@@ -603,20 +605,67 @@ func sectionsToPDF(in []StructuredSection) []pdfgen.Section {
 //   - DigestAlgorithm = SHA-256 (padrão ICP-Brasil AD-RB/AD-RT);
 //   - CertType = ApprovalSignature (não é certificação — permite assinaturas
 //     adicionais e edição limitada);
-//   - TSA sem auth (Username/Password vazios): serve pra freetsa.org. Provedor
-//     com Basic Auth exigiria expor TSA_USER/TSA_PASS — não é o caso hoje.
-func signPDFPAdES(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
+//   - TSA sem auth (Username/Password vazios): serve pra freetsa.org / digicert.
+//     Provedor com Basic Auth exigiria expor TSA_USER/TSA_PASS.
+//
+// Retry: só se a TSA estiver configurada. TSAs públicas gratuitas (digicert)
+// aplicam rate limit; a digitorus/pdfsign propaga a resposta HTTP como
+// "non success response (429): ...". Detectamos 429/502/503/504 + timeout
+// como transitório e retentamos com backoff exponencial. Erros não-transitórios
+// (chave inválida, cert expirado, PDF malformado) falham imediatamente.
+// Cada tentativa loga estruturado — grep tsa_url + attempt no NR pra decidir
+// migrar pra TSA paga (LSITEC, digicert enterprise, etc.).
+func signPDFPAdES(ctx context.Context, pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
+	if tsaURL == "" {
+		return signOnce(pdfBytes, signer, cert, intermediates, "")
+	}
+	const maxAttempts = 3
+	backoff := []time.Duration{0, 500 * time.Millisecond, 2 * time.Second}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff[attempt-1]):
+			}
+		}
+		signed, err := signOnce(pdfBytes, signer, cert, intermediates, tsaURL)
+		if err == nil {
+			if attempt > 1 {
+				slog.WarnContext(ctx, "TSA recuperada após retry",
+					slog.String("tsa_url", tsaURL),
+					slog.Int("attempt", attempt))
+			}
+			return signed, nil
+		}
+		lastErr = err
+		if !isTSATransient(err) {
+			return nil, err
+		}
+		slog.WarnContext(ctx, "TSA erro transitório — retentando",
+			slog.String("tsa_url", tsaURL),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", maxAttempts),
+			slog.String("err", err.Error()))
+	}
+	slog.ErrorContext(ctx, "TSA falhou após retries — considere provedor pago (rate limit persistente = migrar)",
+		slog.String("tsa_url", tsaURL),
+		slog.Int("attempts", maxAttempts),
+		slog.String("err", lastErr.Error()))
+	return nil, fmt.Errorf("TSA %s falhou após %d tentativas: %w", tsaURL, maxAttempts, lastErr)
+}
+
+func signOnce(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
 	reader := bytes.NewReader(pdfBytes)
 	pdfDoc, err := pdfreader.NewReader(reader, int64(len(pdfBytes)))
 	if err != nil {
 		return nil, fmt.Errorf("pdf reader: %w", err)
 	}
-	// Reset reader depois do pdf.NewReader — ele consumiu partes do stream.
 	if _, err := reader.Seek(0, 0); err != nil {
 		return nil, err
 	}
 	var out bytes.Buffer
-	// CertificateChains: 1 chain contendo leaf primeiro + intermediates.
 	chain := append([]*x509.Certificate{cert}, intermediates...)
 	signData := pdfsign.SignData{
 		Signer:            signer,
@@ -636,11 +685,38 @@ func signPDFPAdES(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate,
 	if tsaURL != "" {
 		signData.TSA = pdfsign.TSA{URL: tsaURL}
 	}
-	err = pdfsign.Sign(reader, &out, pdfDoc, int64(len(pdfBytes)), signData)
-	if err != nil {
+	if err := pdfsign.Sign(reader, &out, pdfDoc, int64(len(pdfBytes)), signData); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// isTSATransient classifica erros vindos do GetTSA da digitorus/pdfsign como
+// transitórios. Base: pdfsignature.go:415-421 formata como
+// `non success response (<code>): <body>` e propaga erros de rede como-são.
+func isTSATransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	transientMarkers := []string{
+		"non success response (429",
+		"non success response (502",
+		"non success response (503",
+		"non success response (504",
+		"context deadline exceeded",
+		"i/o timeout",
+		"connection reset",
+		"connection refused",
+		"no such host",
+		"EOF",
+	}
+	for _, m := range transientMarkers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // SendToSigning marca sent_to_signing_at=now() no draft. Sinaliza que o

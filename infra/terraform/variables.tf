@@ -197,3 +197,17 @@ variable "gcp_kms_credentials_json" {
   sensitive = true
   default   = ""
 }
+
+# ---- TSA (RFC 3161 TimeStamp Protocol — PAdES-T) — só o api consome ----
+# Default aponta pra digicert público (grátis, estável, aceitado pelo Adobe
+# Reader como "trusted timestamp"). Sem AD-RT ICP-Brasil — é o selo Adobe, não
+# vale carimbo homologado, mas evita o aviso amarelo "signature date from
+# signer's computer" e serve pro nosso caso (peça é peticionada logo depois =
+# tribunal aplica o carimbo oficial no protocolo). Custo: 0. Rate limit: sim,
+# não publicado. O signPDFPAdES faz retry/backoff em 429 e loga estruturado —
+# grep "TSA falhou após retries" no NR pra decidir migrar pra LSITEC/digicert
+# enterprise (paga). Vazio = PAdES-BASIC (assinatura válida, sem carimbo).
+variable "tsa_url" {
+  type    = string
+  default = "http://timestamp.digicert.com"
+}

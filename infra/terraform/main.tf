@@ -74,6 +74,9 @@ locals {
       # canônica no processo (padrão PaaS onde não dá pra montar arquivo).
       GCP_KMS_KEY_NAME         = var.gcp_kms_key_name
       GCP_KMS_CREDENTIALS_JSON = var.gcp_kms_credentials_json
+      # TSA (PAdES-T). Default = digicert público (grátis). Retry+backoff no
+      # signPDFPAdES; se rate limit persistir nos logs → migrar pra TSA paga.
+      TSA_URL = var.tsa_url
     })
     # worker-ingestao: roda o listener de notifications (e-mail via Resend) e o
     # backfill/sync DJEN por-OAB (on-demand no onboarding). Todo egress DJEN sai pelo
