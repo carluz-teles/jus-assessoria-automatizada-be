@@ -70,6 +70,7 @@ type generationDepsReader interface {
 // interface (not the full Repository) keeps the fake in tests minimal.
 type generationWriter interface {
 	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error)
+	UpdateDraftContentHtml(ctx context.Context, tx database.Tx, draftID, tenantID, html string) error
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
 	DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error
 }
@@ -142,9 +143,10 @@ func NewGenerateUseCase(p GenerateUseCaseParams) *GenerateUseCase {
 }
 
 // generatedOutput is the LLM's structured response for one generation call.
-// Gerar now produces ONLY draft_content — suggestions are produced by Revisar.
+// v7: DraftHtml carrega HTML rico (Tiptap-compatible) — vai direto pro
+// content_html do draft, sem passo de conversão structured→html no FE.
 type generatedOutput struct {
-	DraftContent string `json:"draft_content"`
+	DraftHtml string `json:"draft_html"`
 }
 
 // rawSuggestion is one LLM-suggested improvement before validation.
@@ -165,14 +167,14 @@ type rawCitation struct {
 }
 
 // generateSchema is the JSON Schema constraining the LLM's output via
-// structured output (strict). Gerar now produces ONLY draft_content — suggestions
-// are a separate concern handled by Revisar (review.go).
+// structured output (strict). v7: draft_html é o HTML da peça pronto pro
+// editor rico (Tiptap) e pro renderer PDF (chromedp).
 var generateSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "draft_content": { "type": "string" }
+    "draft_html": { "type": "string" }
   },
-  "required": ["draft_content"],
+  "required": ["draft_html"],
   "additionalProperties": false
 }`)
 
@@ -307,14 +309,18 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		if e := uc.writer.DeleteReviewsForDraft(ctx, tx, ev.DraftID); e != nil {
 			return fmt.Errorf("delete prior reviews: %w", e)
 		}
-		// Peça v2 (migration 0056 / Fatia B): parse the generated plain text into
-		// the block-structured shape (preamble + Roman sections) so both columns
-		// are populated in one commit — the FE consumes structured_content
-		// directly; content stays for legacy/export.
-		// ParseStructured returns nil for empty input; when the LLM produced no
-		// Roman headings the whole text lands in Preamble (degraded but usable).
-		structured := ParseStructured(out.DraftContent)
-		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, out.DraftContent, structured); e != nil {
+		// v7 (streaming pipeline): a IA gera HTML rico direto no campo `draft_html`.
+		// Persistência:
+		//   - content_html ← source-of-truth pro editor Tiptap + renderer PDF (chromedp)
+		//   - content ← plain text derivado (backup pra search/export)
+		//   - structured_content ← derivado do HTML (mantém compat pro iterate
+		//     legacy que ainda opera por seção; será migrado numa fatia futura)
+		plainText := stripHTMLTagsForSearch(out.DraftHtml)
+		structured := parseHTMLToStructured(out.DraftHtml)
+		if e := uc.writer.UpdateDraftContentHtml(ctx, tx, ev.DraftID, ev.TenantID, out.DraftHtml); e != nil {
+			return fmt.Errorf("update content_html: %w", e)
+		}
+		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, plainText, structured); e != nil {
 			return fmt.Errorf("update saga state: %w", e)
 		}
 		return nil

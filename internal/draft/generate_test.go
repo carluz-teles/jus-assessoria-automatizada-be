@@ -73,6 +73,10 @@ func (f *fakeWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sag
 	return f.returnedDraft, f.writeErr
 }
 
+func (f *fakeWriter) UpdateDraftContentHtml(_ context.Context, _ database.Tx, _, _, _ string) error {
+	return nil
+}
+
 func (f *fakeWriter) InsertReview(_ context.Context, _ database.Tx, r *Review) (*Review, error) {
 	f.insertedReview = r
 	if f.returnedReview != nil {
@@ -159,7 +163,7 @@ func ev() GenerationRequested {
 // cannedJSON is the JSON the fake generator returns on the happy path.
 // Gerar now produces ONLY draft_content — no suggestions.
 const cannedJSON = `{
-  "draft_content": "Revised draft content here for substring tests. Argumento claro."
+  "draft_html": "<p>Revised draft content here for substring tests. Argumento claro.</p>"
 }`
 
 // buildUC assembles the GenerateUseCase with the given overridable parts.
@@ -285,7 +289,7 @@ func TestGenerateUseCase_DegradedNoChunks(t *testing.T) {
 	d := makeDraft()
 	w := &fakeWriter{returnedDraft: d}
 	ob := &fakeOutbox{}
-	gen := &fakeGen{out: []byte(`{"draft_content":"text here"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_html":"text here"}`)}
 
 	// No embedder (nil) → degraded path.
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, ob, fakeDedup{}, gen, nil)
@@ -328,7 +332,7 @@ func TestGenerateUseCase_GeneratorError_FAILED(t *testing.T) {
 func TestGenerateUseCase_Idempotency_SeenEvent(t *testing.T) {
 	d := makeDraft()
 	w := &fakeWriter{returnedDraft: d}
-	gen := &fakeGen{out: []byte(`{"draft_content":"x"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_html":"x"}`)}
 
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, &fakeOutbox{}, fakeDedup{seen: true}, gen, nil)
 
@@ -350,7 +354,7 @@ func TestGenerateUseCase_ObsoleteSaga_SkipRetry(t *testing.T) {
 	d.SagaState = SagaStateReviewed
 
 	w := &fakeWriter{returnedDraft: d}
-	gen := &fakeGen{out: []byte(`{"draft_content":"x"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_html":"x"}`)}
 
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, &fakeOutbox{}, fakeDedup{}, gen, nil)
 
@@ -527,7 +531,7 @@ func TestGenerateUseCase_WithIntimation_CRIDPropagated(t *testing.T) {
 	}
 	w := &fakeWriter{returnedDraft: d}
 	ob := &fakeOutbox{}
-	gen := &fakeGen{out: []byte(`{"draft_content":"text","suggestions":[]}`)}
+	gen := &fakeGen{out: []byte(`{"draft_html":"text","suggestions":[]}`)}
 
 	// Embedder non-nil but pool nil → runRAG degrades after the embed step is skipped
 	// by the pool gate (degraded, grounded=false). This still exercises the crid resolution
@@ -555,7 +559,7 @@ func TestGenerateUseCase_WithoutIntimation_WholeTenantSearch(t *testing.T) {
 	d.IntimationID = ""
 	w := &fakeWriter{returnedDraft: d}
 	ob := &fakeOutbox{}
-	gen := &fakeGen{out: []byte(`{"draft_content":"text"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_html":"text"}`)}
 
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, ob, fakeDedup{}, gen, nil)
 

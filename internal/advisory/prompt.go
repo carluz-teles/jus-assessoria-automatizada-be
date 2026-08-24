@@ -324,7 +324,12 @@ const summarizeProcessVersion = "process_summary/v1"
 // (nome + OAB do titular do CERTIFICADO) é adicionado no PDF pelo pdfgen no momento do Sign
 // — não pela IA. Isso desacopla a intimação (que traz o advogado do recipient) da assinatura
 // (que é do cert usado). O fecho agora termina em "Local, [data]." e para.
-const draftMinutaVersion = "draft_minuta/v6"
+// Bumped to v7: output agora é `draft_html` (HTML rico do Tiptap) em vez de `draft_content`
+// (texto puro). Formatação inline (<strong>, <em>, <blockquote>, <table>, <ol>) sai direto
+// da IA e chega intacta ao editor e ao PDF final (chromedp). Elimina o passo de conversão
+// structured_content → HTML no FE e prepara o pipeline pra streaming (cada chunk cai
+// diretamente no editor sem parser incremental).
+const draftMinutaVersion = "draft_minuta/v7"
 
 // suggestThesesVersion is the pinned version of the suggest_theses template (POST
 // /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
@@ -517,8 +522,9 @@ func composeDraftMinuta(c DraftContext) Composed {
 	var sys strings.Builder
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro que redige a MINUTA COMPLETA de uma peça processual, " +
-			"pronta para revisão do advogado. Produza SOMENTE o campo `draft_content`: o texto integral " +
-			"da minuta em formato jurídico brasileiro.\n\n" +
+			"pronta para revisão do advogado no editor rico (Tiptap). Produza SOMENTE o campo `draft_html`: " +
+			"o HTML da minuta, pronto pra renderizar no editor e no PDF final (sem <html>/<head>/<body> — " +
+			"apenas os blocos internos do documento).\n\n" +
 
 			"REGRA DE OURO (a mais importante): USE OS DADOS REAIS fornecidos no contexto. NUNCA deixe " +
 			"placeholder (___, [assim], \"NOME DA PARTE\") para um dado que foi fornecido. Só use " +
@@ -570,10 +576,22 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"- RECURSO (APPEAL): síntese do decidido + razões de reforma + pedido de provimento. No JE, " +
 			"recurso inominado (art. 41 Lei 9.099/95).\n\n" +
 
-			"FORMATAÇÃO: títulos de seção em CAIXA ALTA com romanos; parágrafos em arábico; pedidos em " +
-			"alíneas; negrito com **markdown** para ênfase pontual (nome da peça, valores, nº do processo). " +
-			"Se faltar dado essencial, escreva a melhor minuta possível com marcador claro no que faltar — " +
-			"NUNCA invente fatos, valores, súmulas, datas ou nºs de processo que não constem do contexto.",
+			"FORMATAÇÃO HTML (obrigatória — nada de markdown, nada de texto puro):\n" +
+			"- Endereçamento: <p><strong>EXCELENTÍSSIMO...</strong></p>\n" +
+			"- Referência do processo: <p>Processo nº [CNJ] — [Classe] ([Assunto])</p>\n" +
+			"- Qualificação/exórdio: <p>...</p> (um por parágrafo)\n" +
+			"- Cabeçalho de seção: <h2>I — DOS FATOS</h2> · <h2>II — DO DIREITO</h2> · <h2>III — DOS PEDIDOS</h2>\n" +
+			"- Parágrafos numerados dos fatos/direito: <p>1. ...</p><p>2. ...</p> (o número faz parte do texto, não use <ol>)\n" +
+			"- Pedidos com alíneas: use <ol type=\"a\"><li>...</li><li>...</li></ol>\n" +
+			"- Ênfase pontual (nome da peça, valores, nº do processo, artigos citados): <strong>...</strong>\n" +
+			"- Termos técnicos em latim/estrangeiro: <em>...</em>\n" +
+			"- Citações longas (>3 linhas de lei/jurisprudência): <blockquote>...</blockquote>\n" +
+			"- Tabelas de cálculo (impugnação de valor): <table><tr><th>Coluna</th></tr><tr><td>Valor</td></tr></table>\n" +
+			"- Fecho: <p>Nestes termos, pede deferimento.</p><p style=\"text-align:right\">[Comarca]/[UF], [data].</p>\n" +
+			"NÃO escreva ```html ``` code fences. NÃO envolva em <html> ou <body>. Devolva apenas os blocos " +
+			"HTML soltos. Se faltar dado essencial, escreva a melhor minuta possível com marcador entre " +
+			"colchetes no que faltar — NUNCA invente fatos, valores, súmulas, datas ou nºs de processo que " +
+			"não constem do contexto.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
