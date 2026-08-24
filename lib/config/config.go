@@ -115,6 +115,13 @@ type Config struct {
 	// Opcional no agregado — sem ela o slice certificate não sobe; api segue.
 	GCPKMSKeyName string `env:"GCP_KMS_KEY_NAME"`
 
+	// TSAURL: endpoint RFC 3161 (TimeStamp Protocol) usado pelo PAdES-T na
+	// assinatura de peças. Opcional: vazio = PAdES-BASIC (sem carimbo);
+	// preenchido = draft.Sign chama a TSA e embute o TimeStampToken no PDF.
+	// Provedores comuns: http://freetsa.org/tsr (grátis, sem auth, uptime
+	// razoável pra dev); http://timestamp.digicert.com (comercial estável).
+	TSAURL string `env:"TSA_URL"`
+
 	// GCPKMSCredentialsJSON: JSON da service account em BASE64. Padrão para PaaS
 	// (Railway, Fly, Render) onde não dá pra montar arquivo — só passar env var.
 	// O boot decodifica e escreve em /tmp/gcp-kms.json, então seta

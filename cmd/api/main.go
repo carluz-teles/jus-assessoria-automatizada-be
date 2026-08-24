@@ -397,6 +397,13 @@ func run(logger *slog.Logger) error {
 		// mesma assinatura, só encaminha a chamada. Isolamento cross-slice.
 		draftOpts = append(draftOpts, draft.WithCertSigner(certSignerFunc(certUC.NewSigner)))
 	}
+	if cfg.TSAURL != "" {
+		// PAdES-T: carimbo de tempo RFC 3161 embutido na assinatura. Sem esta
+		// var, o Sign gera PAdES-BASIC (data da assinatura = clock do assinante,
+		// não confiável). Provedor típico: http://freetsa.org/tsr (dev).
+		draftOpts = append(draftOpts, draft.WithTSAURL(cfg.TSAURL))
+		logger.Info("PAdES-T habilitado", "tsa_url", cfg.TSAURL)
+	}
 	draftUC := draft.NewUseCase(uow, draftRepo, draftOpts...)
 	draftTrigger := draft.NewTriggerUseCase(uow, draftRepo, events.NewOutbox())
 	draftHandler := draft.NewHandler(draftUC).

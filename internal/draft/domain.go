@@ -35,6 +35,9 @@ type UseCase struct {
 	storage    StoragePresigner
 	pdfStorage PDFStorage
 	certSigner CertSigner
+	// tsaURL: endpoint RFC 3161 pra carimbo de tempo (PAdES-T). Vazio =
+	// PAdES-BASIC (sem carimbo). Injetado por WithTSAURL. Ver docs/erd-pecas.md.
+	tsaURL string
 }
 
 // OutboxPublisher is the narrow port for event publishing within a tx.
@@ -103,6 +106,15 @@ func WithPDFStorage(s PDFStorage) Option {
 // (Fatia 2b). Without this option, Sign returns ErrCertSignerUnavailable.
 func WithCertSigner(c CertSigner) Option {
 	return func(uc *UseCase) { uc.certSigner = c }
+}
+
+// WithTSAURL habilita PAdES-T (carimbo de tempo RFC 3161) na assinatura.
+// URL vazia = PAdES-BASIC (comportamento default). Provedores conhecidos:
+// http://freetsa.org/tsr (grátis, dev), http://timestamp.digicert.com (prod).
+// Sem esta option, assinatura sai sem carimbo — verificadores mostram "data
+// da assinatura: relógio do assinante" (não confiável).
+func WithTSAURL(url string) Option {
+	return func(uc *UseCase) { uc.tsaURL = url }
 }
 
 // CreateCommand is the input the handler builds from the request + the verified
@@ -531,8 +543,8 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 		return nil, err
 	}
 
-	// 4) PAdES via digitorus/pdfsign.
-	signedPDF, err := signPDFPAdES(pdfBytes, signer, leaf, intermediates)
+	// 4) PAdES via digitorus/pdfsign (+TSA se tsaURL configurada = PAdES-T).
+	signedPDF, err := signPDFPAdES(pdfBytes, signer, leaf, intermediates, uc.tsaURL)
 	if err != nil {
 		return nil, apperr.NewInfra("sign pdf", err)
 	}
@@ -585,14 +597,15 @@ func sectionsToPDF(in []StructuredSection) []pdfgen.Section {
 	return out
 }
 
-// signPDFPAdES aplica PAdES-BASIC ao PDF usando o signer/cert fornecidos.
-// Uses digitorus/pdfsign. Detalhes:
-//   - DigestAlgorithm = SHA-256 (padrão ICP-Brasil AD-RB básico);
+// signPDFPAdES aplica PAdES ao PDF. Se tsaURL for vazia, gera PAdES-BASIC
+// (só a assinatura CMS embedded); se preenchida, chama a TSA RFC 3161 e embute
+// o TimeStampToken → PAdES-T. Detalhes:
+//   - DigestAlgorithm = SHA-256 (padrão ICP-Brasil AD-RB/AD-RT);
 //   - CertType = ApprovalSignature (não é certificação — permite assinaturas
 //     adicionais e edição limitada);
-//   - Sem TSA (timestamp) nesta fatia. AD-RT (com carimbo de tempo) fica pra
-//     fatia futura — precisa provedor TSA cadastrado (ex.: LuxTrust, Bry, etc).
-func signPDFPAdES(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate) ([]byte, error) {
+//   - TSA sem auth (Username/Password vazios): serve pra freetsa.org. Provedor
+//     com Basic Auth exigiria expor TSA_USER/TSA_PASS — não é o caso hoje.
+func signPDFPAdES(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
 	reader := bytes.NewReader(pdfBytes)
 	pdfDoc, err := pdfreader.NewReader(reader, int64(len(pdfBytes)))
 	if err != nil {
@@ -605,7 +618,7 @@ func signPDFPAdES(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate,
 	var out bytes.Buffer
 	// CertificateChains: 1 chain contendo leaf primeiro + intermediates.
 	chain := append([]*x509.Certificate{cert}, intermediates...)
-	err = pdfsign.Sign(reader, &out, pdfDoc, int64(len(pdfBytes)), pdfsign.SignData{
+	signData := pdfsign.SignData{
 		Signer:            signer,
 		DigestAlgorithm:   crypto.SHA256,
 		Certificate:       cert,
@@ -619,7 +632,11 @@ func signPDFPAdES(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate,
 				Date:   time.Now(),
 			},
 		},
-	})
+	}
+	if tsaURL != "" {
+		signData.TSA = pdfsign.TSA{URL: tsaURL}
+	}
+	err = pdfsign.Sign(reader, &out, pdfDoc, int64(len(pdfBytes)), signData)
 	if err != nil {
 		return nil, err
 	}
