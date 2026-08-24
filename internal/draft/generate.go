@@ -89,13 +89,15 @@ type VoyageEmbedder = embedder
 // all its ports as interfaces so tests inject fakes — the real LLM/embedder APIs are
 // NEVER called under test.
 // chunkPublisher é a porta narrow que o worker usa pra empurrar chunks do
-// stream do LLM ao canal Redis. Satisfeita por lib/pubsub.Publisher.
+// LLM num Redis Stream (XADD com MAXLEN + EXPIRE). Cada chunk vira um entry
+// com ID sequencial — o SSE handler pode retomar via Last-Event-ID quando o
+// cliente reconecta, sem perder chunks. Satisfeita por lib/pubsub.StreamPublisher.
 // Injetada como Option (nil → geração roda em modo batch, sem streaming).
 type chunkPublisher interface {
-	Publish(ctx context.Context, channel string, payload []byte) error
+	XPublish(ctx context.Context, streamKey string, payload []byte) (string, error)
 }
 
-// chunkChannel monta o nome do canal pub/sub pra um draft — usado pelo
+// chunkChannel monta o nome do stream Redis pra um draft — usado pelo
 // worker (produtor) e pelo endpoint SSE (consumidor) sem depender um do outro.
 func chunkChannel(draftID string) string { return "draft:" + draftID + ":stream" }
 
@@ -302,9 +304,10 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			Model:      uc.model,
 			MaxTokens:  4096,
 		}, func(chunk string) error {
-			// Best-effort: erro no pub não aborta geração. Cliente que perder
-			// chunks refaz o fetch quando saga_state=DRAFTED.
-			if pubErr := uc.chunkPub.Publish(ctx, channel, []byte(chunk)); pubErr != nil {
+			// Best-effort: erro no XADD não aborta geração. Cliente que
+			// reconecta usa Last-Event-ID pra retomar; se o key expirou,
+			// faz refetch do content_html quando saga_state=DRAFTED.
+			if _, pubErr := uc.chunkPub.XPublish(ctx, channel, []byte(chunk)); pubErr != nil {
 				slog.WarnContext(ctx, "draft chunk publish failed",
 					slog.String("draft_id", ev.DraftID),
 					slog.String("err", pubErr.Error()))

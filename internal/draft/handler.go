@@ -9,6 +9,7 @@ import (
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
+	"github.com/jusassessoria/platform/lib/pubsub"
 )
 
 // handler.go is the draft slice's HTTP surface — POST /v1/pecas, GET /v1/pecas/:id,
@@ -93,14 +94,16 @@ type Handler struct {
 	export     presigner       // nil when the export use case is not wired
 	iter iterator // nil when the iterate use case is not wired
 	storage StoragePresigner // nil quando storage não configurado — download do PDF fica indisponível
-	chunkSub  chunkSubscriber   // nil → SSE stream não montado (streaming desabilitado)
-	getSaga   getSagaFn         // reader minimal pra saga_state (fecha stream quando DRAFTED/FAILED)
+	chunkSub     chunkSubscriber   // nil → SSE stream não montado
+	getSaga      getSagaFn         // reader minimal pra saga_state
+	streamTokens StreamTokenStore  // nil → issuer de stream-token não habilitado
 }
 
-// chunkSubscriber é a porta narrow que o SSE precisa pra subscrever no canal
-// pub/sub do draft. Satisfeita por lib/pubsub.Subscriber.
+// chunkSubscriber é a porta narrow que o SSE precisa pra ler entries do
+// Redis Stream do draft. lastID vazio = replay do começo; ID do último
+// entry conhecido = retoma dali. Satisfeita por lib/pubsub.StreamSubscriber.
 type chunkSubscriber interface {
-	Subscribe(ctx context.Context, channel string) (<-chan []byte, error)
+	XSubscribe(ctx context.Context, streamKey string, lastID string) (<-chan pubsub.StreamMessage, error)
 }
 
 // getSagaFn devolve o saga_state atual pra o SSE poder terminar quando a
@@ -202,7 +205,9 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 	// Streaming da geração (Fatia 2 do streaming). SSE: cliente conecta
 	// durante EXTRACTING e recebe chunks do LLM em tempo real. Fecha
-	// quando saga_state=DRAFTED/FAILED.
+	// quando saga_state=DRAFTED/FAILED. Auth alternativa via
+	// ?stream_token=xxx (curto, opaco, gerado pelo POST /stream-token).
+	r.Post("/pecas/:id/stream-token", h.issueStreamToken)
 	r.Get("/pecas/:id/generation-stream", h.generationStream)
 
 	// Process-scoped list.

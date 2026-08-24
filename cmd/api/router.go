@@ -50,6 +50,7 @@ type routerDeps struct {
 	draft                *draft.Handler
 	lookup               *lookup.Handler
 	certificate          *certificate.Handler
+	streamTokenStore     draft.StreamTokenStore
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -125,6 +126,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	v1.Use(func(c *fiber.Ctx) error {
 		if strings.HasPrefix(c.Path(), lookupPrefix) || c.Path() == identityMePath {
 			return userAuth(c)
+		}
+		// SSE da geração aceita stream_token opaco (2min) via query. Se
+		// vier stream_token válido → popula principal e segue; senão cai
+		// pro tenantAuth normal (que falha porque EventSource não manda
+		// Bearer, mas mantém o gate).
+		if deps.streamTokenStore != nil && strings.HasSuffix(c.Path(), "/generation-stream") {
+			return draft.StreamTokenAuth(deps.streamTokenStore, tenantAuth)(c)
 		}
 		return tenantAuth(c)
 	})

@@ -427,6 +427,10 @@ func run(logger *slog.Logger) error {
 			return view.SagaState, nil
 		},
 	)
+	// Stream token store — usado pelo issuer (POST /stream-token) e pelo
+	// middleware específico da rota SSE (fluxo alternativo ao Bearer).
+	streamTokenStore := draft.NewRedisStreamTokenStore(pubsubClient)
+	draftHandler = draftHandler.WithStreamTokenStore(streamTokenStore)
 
 	// Chat use case (Fatia 3b): reuses taskGenerator + resumeEmbedder + advisory
 	// composer already instantiated above. nil generator / nil embedder → degraded
@@ -509,6 +513,7 @@ func run(logger *slog.Logger) error {
 		draft:                draftHandler,
 		lookup:               lookupHandler,
 		certificate:          certificateHandler,
+		streamTokenStore:     streamTokenStore,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext
