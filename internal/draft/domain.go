@@ -615,9 +615,16 @@ func sectionsToPDF(in []StructuredSection) []pdfgen.Section {
 // (chave inválida, cert expirado, PDF malformado) falham imediatamente.
 // Cada tentativa loga estruturado — grep tsa_url + attempt no NR pra decidir
 // migrar pra TSA paga (LSITEC, digicert enterprise, etc.).
+// signAttemptTimeout limita cada tentativa de assinatura. Cobre PDF render,
+// KMS Sign remoto e TSA round-trip. 15s é folgado pro caminho feliz (~500ms
+// digicert, ~1s freetsa) e curto o bastante pra falhar rápido se a TSA travar
+// (a digitorus/pdfsign usa http.Client sem timeout — a única forma de garantir
+// wallclock bound é wrapar em goroutine + select).
+const signAttemptTimeout = 15 * time.Second
+
 func signPDFPAdES(ctx context.Context, pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
 	if tsaURL == "" {
-		return signOnce(pdfBytes, signer, cert, intermediates, "")
+		return signOnceBounded(ctx, pdfBytes, signer, cert, intermediates, "")
 	}
 	const maxAttempts = 3
 	backoff := []time.Duration{0, 500 * time.Millisecond, 2 * time.Second}
@@ -630,7 +637,7 @@ func signPDFPAdES(ctx context.Context, pdfBytes []byte, signer crypto.Signer, ce
 			case <-time.After(backoff[attempt-1]):
 			}
 		}
-		signed, err := signOnce(pdfBytes, signer, cert, intermediates, tsaURL)
+		signed, err := signOnceBounded(ctx, pdfBytes, signer, cert, intermediates, tsaURL)
 		if err == nil {
 			if attempt > 1 {
 				slog.WarnContext(ctx, "TSA recuperada após retry",
@@ -654,6 +661,30 @@ func signPDFPAdES(ctx context.Context, pdfBytes []byte, signer crypto.Signer, ce
 		slog.Int("attempts", maxAttempts),
 		slog.String("err", lastErr.Error()))
 	return nil, fmt.Errorf("TSA %s falhou após %d tentativas: %w", tsaURL, maxAttempts, lastErr)
+}
+
+// signOnceBounded envolve signOnce em wallclock timeout. A goroutine "leaked"
+// no timeout é bounded (max 1 por request) e limpa sozinha quando o TCP da TSA
+// finalmente falha (OS timeout ~2-3min); seu output vai pro GC (bytes.Buffer
+// local). Sem side effect no storage (upload é feito só depois de sign OK).
+func signOnceBounded(ctx context.Context, pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
+	type result struct {
+		pdf []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		pdf, err := signOnce(pdfBytes, signer, cert, intermediates, tsaURL)
+		ch <- result{pdf, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.pdf, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(signAttemptTimeout):
+		return nil, fmt.Errorf("sign timeout após %v (tsa_url=%q)", signAttemptTimeout, tsaURL)
+	}
 }
 
 func signOnce(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
@@ -710,6 +741,7 @@ func isTSATransient(err error) bool {
 		"connection refused",
 		"no such host",
 		"EOF",
+		"sign timeout após",
 	}
 	for _, m := range transientMarkers {
 		if strings.Contains(s, m) {
