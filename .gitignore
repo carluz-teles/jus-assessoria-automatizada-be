@@ -31,3 +31,4 @@ go.work.sum
 *.swp
 
 CODE_REVIEW.md
+tmp/

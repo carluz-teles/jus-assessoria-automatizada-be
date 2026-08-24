@@ -183,13 +183,22 @@ func (uc *UseCase) Sign(ctx context.Context, tenantID, id, _ string, digest []by
 	return &SignResult{Signature: sig, Chain: chain}, nil
 }
 
+// SignerInfo carrega metadados legíveis do titular do certificado, além do
+// que sai do x509 leaf. Serve pra montar bloco de assinatura no PDF sem
+// query extra (OAB fica na nossa tabela, não é parte parseável do cert).
+type SignerInfo struct {
+	OAB       string // "347019/SP" — como salvo em certificate.oab
+	SubjectCN string // "CARLOS TELES TESTE" — redundante com leaf.Subject.CommonName mas explícito
+}
+
 // NewSigner devolve um crypto.Signer que assina digests SHA-256 usando este
 // certificado (KMS-backed). Usado por libs externas como digitorus/pdfsign
 // que exigem crypto.Signer pra montar a assinatura CMS/PAdES.
 //
 // A leaf certificate + chain acompanham o retorno pra o chamador passar pra
-// pdfsign junto com o signer. O erro é imediato se cert/leaf não existir.
-func (uc *UseCase) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error) {
+// pdfsign junto com o signer. O SignerInfo carrega OAB (que só está na nossa
+// tabela) pra o chamador montar bloco de assinatura no PDF sem query extra.
+func (uc *UseCase) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, SignerInfo, error) {
 	var cert *Certificate
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		c, e := uc.repo.GetByID(ctx, tx, tenantID, id)
@@ -203,20 +212,20 @@ func (uc *UseCase) NewSigner(ctx context.Context, tenantID, id string) (crypto.S
 		return nil
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, SignerInfo{}, err
 	}
 	p, err := uc.openVault(ctx, cert)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, SignerInfo{}, err
 	}
-	// Chain vem da leaf pra CA (skip leaf pra intermediates).
 	var intermediates []*x509.Certificate
 	if len(p.Chain) > 1 {
 		intermediates = p.Chain[1:]
 	}
 	rsaKey, ok := p.Key.(*rsa.PrivateKey)
 	if !ok {
-		return nil, nil, nil, ErrPKCS12Parse
+		return nil, nil, nil, SignerInfo{}, ErrPKCS12Parse
 	}
-	return rsaKey, p.Leaf, intermediates, nil
+	info := SignerInfo{OAB: cert.OAB, SubjectCN: cert.SubjectCN}
+	return rsaKey, p.Leaf, intermediates, info, nil
 }

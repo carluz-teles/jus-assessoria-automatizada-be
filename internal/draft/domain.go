@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -63,8 +64,15 @@ type PDFStorage interface {
 // CertSigner é a porta que o Sign usa pra pegar um crypto.Signer KMS-backed
 // pra um certificado do tenant. Implementado pelo internal/certificate.
 // A leaf + chain acompanham (pdfsign precisa delas pra montar o CMS PAdES).
+// SignerInfo carrega metadados (OAB, subject_cn) que não estão no x509 leaf
+// — usado pra montar bloco de assinatura no PDF sem query extra.
+type SignerInfo struct {
+	OAB       string
+	SubjectCN string
+}
+
 type CertSigner interface {
-	NewSigner(ctx context.Context, tenantID, certificateID string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error)
+	NewSigner(ctx context.Context, tenantID, certificateID string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, SignerInfo, error)
 }
 
 // NewUseCase wires the use case to its dependencies. uow owns the transaction
@@ -529,20 +537,38 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	if view.Process != nil {
 		cnj = view.Process.CNJNumber
 	}
+	signedAt := uc.now()
 	pdfBytes, err := pdfgen.Render(pdfgen.Draft{
 		Title:    view.Title,
 		CNJ:      cnj,
-		Preamble: view.StructuredContent.Preamble.Paragraphs,
-		Sections: sectionsToPDF(view.StructuredContent.Sections),
+		Preamble: fillPlaceholders(view.StructuredContent.Preamble.Paragraphs, signedAt),
+		Sections: sectionsToPDF(view.StructuredContent.Sections, signedAt),
 	})
 	if err != nil {
 		return nil, apperr.NewInfra("render pdf", err)
 	}
 
 	// 3) crypto.Signer KMS-backed.
-	signer, leaf, intermediates, err := uc.certSigner.NewSigner(ctx, cmd.TenantID, cmd.CertificateID)
+	signer, leaf, intermediates, signerInfo, err := uc.certSigner.NewSigner(ctx, cmd.TenantID, cmd.CertificateID)
 	if err != nil {
 		return nil, err
+	}
+
+	// 3.5) Re-render com bloco de assinatura preenchido (nome+OAB do cert
+	// usado). Não dá pra fazer no passo 2 porque o certSigner depende do
+	// commandID e a validação do cert só acontece agora.
+	pdfBytes, err = pdfgen.Render(pdfgen.Draft{
+		Title:    view.Title,
+		CNJ:      cnj,
+		Preamble: fillPlaceholders(view.StructuredContent.Preamble.Paragraphs, signedAt),
+		Sections: sectionsToPDF(view.StructuredContent.Sections, signedAt),
+		Signer: pdfgen.Signer{
+			Name: signerInfo.SubjectCN,
+			OAB:  signerInfo.OAB,
+		},
+	})
+	if err != nil {
+		return nil, apperr.NewInfra("render pdf com assinatura", err)
 	}
 
 	// 4) PAdES via digitorus/pdfsign (+TSA se tsaURL configurada = PAdES-T).
@@ -586,14 +612,21 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	return result, nil
 }
 
-// sectionsToPDF converte []StructuredSection (do read model) em []pdfgen.Section.
-func sectionsToPDF(in []StructuredSection) []pdfgen.Section {
+// sectionsToPDF converte []StructuredSection (do read model) em []pdfgen.Section
+// e substitui placeholders textuais (ex.: [data]) pela data da assinatura.
+// A última seção passa por stripSignatureBlock — remove bloco de assinatura
+// deixado pela IA (defensivo; o bloco real vem via pdfgen.Signer do cert).
+func sectionsToPDF(in []StructuredSection, signedAt time.Time) []pdfgen.Section {
 	out := make([]pdfgen.Section, 0, len(in))
-	for _, s := range in {
+	for i, s := range in {
+		paragraphs := s.Paragraphs
+		if i == len(in)-1 {
+			paragraphs = stripSignatureBlock(paragraphs)
+		}
 		out = append(out, pdfgen.Section{
 			Roman:      s.Roman,
 			Title:      s.Title,
-			Paragraphs: s.Paragraphs,
+			Paragraphs: fillPlaceholders(paragraphs, signedAt),
 		})
 	}
 	return out
@@ -615,6 +648,50 @@ func sectionsToPDF(in []StructuredSection) []pdfgen.Section {
 // (chave inválida, cert expirado, PDF malformado) falham imediatamente.
 // Cada tentativa loga estruturado — grep tsa_url + attempt no NR pra decidir
 // migrar pra TSA paga (LSITEC, digicert enterprise, etc.).
+// signatureBlockRe reconhece parágrafos que parecem bloco de assinatura
+// deixado pela IA no fim da peça (mesmo com o prompt v6 dizendo pra não
+// gerar). Padrão típico: "NOME EM CAIXA\nOAB/UF nº 123456" — captura via
+// menção de "OAB" seguido de UF e número. Case-insensitive.
+var signatureBlockRe = regexp.MustCompile(`(?i)OAB\s*/?\s*[A-Z]{2}[^\n]{0,20}\d{3,}`)
+
+// stripSignatureBlock remove os últimos parágrafos que pareçam bloco de
+// assinatura (nome + OAB) — a assinatura visual real é injetada no PDF via
+// pdfgen.Signer com dados do CERTIFICADO usado. Preserva "Nestes termos,
+// pede deferimento" e "Local, [data]" (que ficam antes do bloco).
+func stripSignatureBlock(paragraphs []string) []string {
+	// itera do fim pra o começo e corta enquanto encontrar bloco de assinatura.
+	end := len(paragraphs)
+	for end > 0 && signatureBlockRe.MatchString(paragraphs[end-1]) {
+		end--
+	}
+	return paragraphs[:end]
+}
+
+// placeholderMonthsPT são os meses em português — RFC de peças jurídicas usa
+// "dia de mês por extenso de ano". time.Format não tem locale, então usamos
+// tabela fixa (não vamos internacionalizar isso tão cedo).
+var placeholderMonthsPT = [...]string{
+	"janeiro", "fevereiro", "março", "abril", "maio", "junho",
+	"julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+}
+
+// placeholderDateRe captura [data] com espaços opcionais dentro dos colchetes.
+// A IA às vezes gera "[ data ]" ou "[DATA]" — pega tudo. Case-insensitive.
+var placeholderDateRe = regexp.MustCompile(`(?i)\[\s*data\s*\]`)
+
+// fillPlaceholders substitui os placeholders textuais que a IA deixa na minuta
+// pelos valores conhecidos no momento da assinatura. Hoje só [data] (data de
+// assinatura em pt-BR); ampliar quando aparecer novo placeholder (ex.: [local]).
+func fillPlaceholders(paragraphs []string, signedAt time.Time) []string {
+	dateStr := fmt.Sprintf("%d de %s de %d",
+		signedAt.Day(), placeholderMonthsPT[signedAt.Month()-1], signedAt.Year())
+	out := make([]string, len(paragraphs))
+	for i, p := range paragraphs {
+		out[i] = placeholderDateRe.ReplaceAllString(p, dateStr)
+	}
+	return out
+}
+
 // signAttemptTimeout limita cada tentativa de assinatura. Cobre PDF render,
 // KMS Sign remoto e TSA round-trip. 15s é folgado pro caminho feliz (~500ms
 // digicert, ~1s freetsa) e curto o bastante pra falhar rápido se a TSA travar

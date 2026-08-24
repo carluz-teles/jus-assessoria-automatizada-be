@@ -320,7 +320,11 @@ const summarizeProcessVersion = "process_summary/v1"
 // Bumped to v5: injeta TOM (diretiva de registro/tom quando != tecnico — o default produz
 // wording IDÊNTICA ao v4, backward-compat), INSTRUÇÕES (texto livre do advogado) e TESES
 // SELECIONADAS (rótulos escolhidos em /theses) no prompt.
-const draftMinutaVersion = "draft_minuta/v5"
+// Bumped to v6: removeu o ADVOGADO SIGNATÁRIO do prompt e do fecho. O bloco de assinatura
+// (nome + OAB do titular do CERTIFICADO) é adicionado no PDF pelo pdfgen no momento do Sign
+// — não pela IA. Isso desacopla a intimação (que traz o advogado do recipient) da assinatura
+// (que é do cert usado). O fecho agora termina em "Local, [data]." e para.
+const draftMinutaVersion = "draft_minuta/v6"
 
 // suggestThesesVersion is the pinned version of the suggest_theses template (POST
 // /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
@@ -521,11 +525,9 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"marcador [entre colchetes] quando o dado for genuinamente DESCONHECIDO (não fornecido no " +
 			"contexto). Se o tribunal, a vara (órgão julgador), o número do processo, a classe e o " +
 			"assunto foram dados, escreva-os.\n" +
-			"As PARTES do processo (autor/réu) e o ADVOGADO SIGNATÁRIO são fornecidos ESTRUTURADOS no " +
-			"contexto — USE-OS: os nomes das partes na qualificação/endereçamento conforme o papel " +
-			"(PLAINTIFF = autor/exequente/requerente; DEFENDANT = réu/executado/requerido); o advogado " +
-			"signatário (nome + OAB/UF fornecidos) no FECHO, substituindo os marcadores " +
-			"[Nome do Advogado]/[número]. Só use os marcadores se o advogado NÃO for fornecido. " +
+			"As PARTES do processo (autor/réu) são fornecidas ESTRUTURADAS no " +
+			"contexto — USE-AS na qualificação/endereçamento conforme o papel " +
+			"(PLAINTIFF = autor/exequente/requerente; DEFENDANT = réu/executado/requerido). " +
 			"Prefira SEMPRE a parte estruturada ao que você extrairia do teor da intimação.\n\n" +
 
 			"ESTRUTURA CANÔNICA (nesta ordem, blocos separados por linha em branco):\n" +
@@ -549,11 +551,11 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"7) \"III – DOS PEDIDOS\" (CAIXA ALTA): \"Ante o exposto, requer a Vossa Excelência:\" + " +
 			"alíneas a), b), c) (pedido certo e determinado, art. 322/324 CPC; inclua produção de provas " +
 			"e sucumbência quando cabível).\n" +
-			"8) FECHO: \"Nestes termos,\\nPede deferimento.\" + \"[Comarca]/[UF], [data].\" + assinatura " +
-			"do advogado. Quando o advogado signatário for fornecido no contexto, use exatamente: " +
-			"\"<Nome>\\nOAB/<UF> nº <oab>\". Quando não fornecido, use os marcadores literais " +
-			"\"[Nome do Advogado]\\nOAB/[UF] nº [número]\". JAMAIS invente, preencha ou deduza um número " +
-			"de OAB ausente. A COMARCA você preenche do contexto, mas a DATA do fecho é SEMPRE o marcador " +
+			"8) FECHO: \"Nestes termos,\\nPede deferimento.\" seguido de UMA linha em branco e depois " +
+			"\"[Comarca]/[UF], [data].\" — E PARE AÍ. NÃO adicione nome nem OAB do advogado no fim da " +
+			"peça: o bloco de assinatura (nome + OAB do titular do certificado) é adicionado " +
+			"automaticamente no PDF no momento da assinatura. A COMARCA você preenche do contexto, mas " +
+			"a DATA do fecho é SEMPRE o marcador " +
 			"literal [data] — a data de protocolo é definida pelo advogado ao assinar; NUNCA infira, " +
 			"calcule ou copie uma data do teor/prazo para o fecho.\n\n" +
 
@@ -611,14 +613,11 @@ func composeDraftMinuta(c DraftContext) Composed {
 		add(label, value)
 	}
 
-	// Inject signing lawyer when resolved from the matched OAB recipient.
-	if name := strings.TrimSpace(c.SigningLawyerName); name != "" || strings.TrimSpace(c.SigningLawyerOAB) != "" {
-		uf := c.SigningLawyerUF
-		if uf == "" {
-			uf = "??"
-		}
-		lines = append(lines, "Advogado signatário: "+c.SigningLawyerName+", OAB/"+uf+" nº "+c.SigningLawyerOAB)
-	}
+	// Advogado signatário: não injetado no prompt. O bloco de assinatura vem
+	// do TITULAR DO CERTIFICADO usado na hora do Sign (pdfgen.Signer), não do
+	// recipient da intimação — o cert pode pertencer a um sócio diferente do
+	// que foi intimado. Campos SigningLawyer* na struct mantidos para compat
+	// com testes/callers antigos; ficam ignorados aqui.
 
 	add("TEOR DA INTIMAÇÃO", c.IntimationText)
 

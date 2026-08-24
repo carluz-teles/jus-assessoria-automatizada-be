@@ -536,12 +536,13 @@ func run(logger *slog.Logger) error {
 }
 
 // certSignerFunc adapta a assinatura de certificate.UseCase.NewSigner ao port
-// draft.CertSigner sem struct nova — o UC já tem exatamente a shape que o draft
-// precisa (ctx, tenantID, certID) → (Signer, leaf, intermediates, err).
-type certSignerFunc func(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error)
+// draft.CertSigner. O UC devolve certificate.SignerInfo, que é convertido pro
+// draft.SignerInfo local — evita import cíclico (draft não conhece certificate).
+type certSignerFunc func(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, certificate.SignerInfo, error)
 
-func (f certSignerFunc) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error) {
-	return f(ctx, tenantID, id)
+func (f certSignerFunc) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, draft.SignerInfo, error) {
+	signer, leaf, chain, info, err := f(ctx, tenantID, id)
+	return signer, leaf, chain, draft.SignerInfo{OAB: info.OAB, SubjectCN: info.SubjectCN}, err
 }
 
 // materializeGCPCredentials adapts PaaS-style env-only credentials into the
