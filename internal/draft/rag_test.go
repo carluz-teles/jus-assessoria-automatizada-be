@@ -64,7 +64,7 @@ func TestRunRAG_NilPool(t *testing.T) {
 		context.Background(),
 		emb,
 		indexing.SearchDeps{Pool: nil}, // pool nil
-		nil,                             // ragCache
+		nil,                            // ragCache
 		"tenant-1",
 		nil,
 		"query text",

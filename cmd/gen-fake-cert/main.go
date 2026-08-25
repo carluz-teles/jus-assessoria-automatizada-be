@@ -5,8 +5,9 @@
 // pipeline works end-to-end.
 //
 // Usage:
-//   go run ./cmd/gen-fake-cert                       # writes /tmp/fake-cert.pfx (password: senha123)
-//   go run ./cmd/gen-fake-cert -out ~/mycert.pfx -password test -cn "MARIA SILVA" -oab 123456/SP
+//
+//	go run ./cmd/gen-fake-cert                       # writes /tmp/fake-cert.pfx (password: senha123)
+//	go run ./cmd/gen-fake-cert -out ~/mycert.pfx -password test -cn "MARIA SILVA" -oab 123456/SP
 package main
 
 import (

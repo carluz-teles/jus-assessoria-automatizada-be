@@ -54,13 +54,13 @@ type IterateResult struct {
 // explanation come from the LLM; old_paragraphs is filled from the current
 // draft state (never trust the LLM to echo it back).
 type SectionChange struct {
-	SectionID      string   `json:"section_id"`
-	SectionRoman   string   `json:"section_roman"`
-	SectionTitle   string   `json:"section_title"`
-	Category       string   `json:"category"`
-	Explanation    string   `json:"explanation"`
-	OldParagraphs  []string `json:"old_paragraphs"`
-	NewParagraphs  []string `json:"new_paragraphs"`
+	SectionID     string   `json:"section_id"`
+	SectionRoman  string   `json:"section_roman"`
+	SectionTitle  string   `json:"section_title"`
+	Category      string   `json:"category"`
+	Explanation   string   `json:"explanation"`
+	OldParagraphs []string `json:"old_paragraphs"`
+	NewParagraphs []string `json:"new_paragraphs"`
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

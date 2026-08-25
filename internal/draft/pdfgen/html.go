@@ -231,6 +231,7 @@ th { background: #eee; font-weight: 700; text-align: left; }
 //  2. chromium (Dockerfile runtime-chromium; Alpine/Debian)
 //  3. chromium-browser (Debian antigo)
 //  4. google-chrome / google-chrome-stable (dev local, macOS/Ubuntu desktop)
+//
 // Retorna "" se nenhum encontrado — chromedp cai no default (que pode falhar
 // em ambientes minimalistas, mas o log de erro será claro).
 func resolveChromePath() string {

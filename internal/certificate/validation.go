@@ -9,7 +9,7 @@ import (
 // sessão (obrigatória; nunca persistida) e o digest base64 SHA-256 do documento
 // a assinar (32 bytes decodificados). Contrato bate 1:1 com o FE.
 type SignRequest struct {
-	Password      string `json:"password"`
+	Password        string `json:"password"`
 	DigestSHA256B64 string `json:"digest_sha256"`
 }
 

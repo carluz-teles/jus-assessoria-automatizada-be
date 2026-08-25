@@ -17,27 +17,27 @@ import (
 
 type fkRepo struct {
 	*fakeRepo
-	draftByID *Draft
-	draftErr  error
-	esaj      *EsajCredentialEnvelope
-	esajErr   error
-	active    *FilingAttempt
-	inserted  *FilingAttempt
-	insertErr error
-	insertErrAfter int // return insertErr after this many calls
-	insertCalls int
-	detail     *DraftDetailView
-	crID       string
-	petition   *Petition
-	markFiledCalls int
-	protoCalls int
-	failedCalls int
-	getAttempt *FilingAttempt
+	draftByID       *Draft
+	draftErr        error
+	esaj            *EsajCredentialEnvelope
+	esajErr         error
+	active          *FilingAttempt
+	inserted        *FilingAttempt
+	insertErr       error
+	insertErrAfter  int // return insertErr after this many calls
+	insertCalls     int
+	detail          *DraftDetailView
+	crID            string
+	petition        *Petition
+	markFiledCalls  int
+	protoCalls      int
+	failedCalls     int
+	getAttempt      *FilingAttempt
 	getAttemptCalls int
-	latest    *FilingAttempt
-	getLatestCalls int
-	lastSha256 string
-	lastSnapKey string
+	latest          *FilingAttempt
+	getLatestCalls  int
+	lastSha256      string
+	lastSnapKey     string
 	lastRequestedBy string
 }
 
@@ -172,7 +172,7 @@ func TestApproveFiling_ConsentRequired(t *testing.T) {
 func TestApproveFiling_IdempotentDoubleClick(t *testing.T) {
 	st := &bndStorage{got: map[string][]byte{"signed-key": []byte("PDFBYTES")}}
 	r := &fkRepo{
-		fakeRepo: &fakeRepo{},
+		fakeRepo:  &fakeRepo{},
 		draftByID: &Draft{Status: StatusSigned},
 		esaj:      &EsajCredentialEnvelope{ID: "c1", Login: "lav"},
 		detail:    &DraftDetailView{SignedPDFKey: "signed-key"},
@@ -202,7 +202,7 @@ func TestApproveFiling_IdempotentDoubleClick(t *testing.T) {
 func TestApproveFiling_InsertConflictReturnsActive(t *testing.T) {
 	st := &bndStorage{got: map[string][]byte{"signed-key": []byte("PDFBYTES")}}
 	r := &fkRepo{
-		fakeRepo: &fakeRepo{},
+		fakeRepo:  &fakeRepo{},
 		draftByID: &Draft{Status: StatusSigned},
 		esaj:      &EsajCredentialEnvelope{ID: "c1", Login: "lav"},
 		detail:    &DraftDetailView{SignedPDFKey: "signed-key"},
@@ -224,7 +224,7 @@ func TestApproveFiling_SnapshotFreezesSignedPDF(t *testing.T) {
 	signed := []byte("SIGNED-PDF-BYTES")
 	st := &bndStorage{got: map[string][]byte{"signed-key": signed}}
 	r := &fkRepo{
-		fakeRepo: &fakeRepo{},
+		fakeRepo:  &fakeRepo{},
 		draftByID: &Draft{Status: StatusSigned},
 		esaj:      &EsajCredentialEnvelope{ID: "c1", Login: "lav"},
 		detail:    &DraftDetailView{SignedPDFKey: "signed-key"},
@@ -272,7 +272,7 @@ func TestOnFilingEnqueued_NotEnfileiradoNoOp(t *testing.T) {
 func TestOnFilingEnqueued_HappyPath(t *testing.T) {
 	g := &fakeGateway{num: "202400112345"}
 	r := &fkRepo{
-		fakeRepo: &fakeRepo{},
+		fakeRepo:   &fakeRepo{},
 		getAttempt: &FilingAttempt{ID: "a1", Status: StatusEnfileirado, DraftID: "d1", RequestedBy: "u1", PdfStorageKey: "snap"},
 		esaj:       &EsajCredentialEnvelope{ID: "c1", Login: "lav", Ciphertext: []byte("pw")},
 		draftByID:  &Draft{ID: "d1", IntimationID: "i1", Status: StatusSigned},

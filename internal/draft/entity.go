@@ -72,7 +72,7 @@ type Draft struct {
 // AuthorshipAssistant / AuthorshipHumanTaken are the closed-set values for
 // Draft.Authorship (Peça v2). Match the CHECK constraint in migration 0056.
 const (
-	AuthorshipAssistant = "assistant"
+	AuthorshipAssistant  = "assistant"
 	AuthorshipHumanTaken = "human_taken"
 )
 
@@ -86,7 +86,7 @@ const (
 // back to parsing Content) vs "populated but empty" (a truly empty peça,
 // which today isn't a real state).
 type StructuredContent struct {
-	Preamble StructuredPreamble `json:"preamble"`
+	Preamble StructuredPreamble  `json:"preamble"`
 	Sections []StructuredSection `json:"sections"`
 }
 
@@ -595,7 +595,7 @@ type DraftListItem struct {
 	// Prazo da intimação de origem (join com deadline via notification_id) —
 	// alimenta chips "Prazo em atraso"/"Prazo hoje" e o rótulo colorido no
 	// card. Ambos nil quando não há deadline derivado.
-	DeadlineEndDate *time.Time
+	DeadlineEndDate  *time.Time
 	DeadlineDaysLeft *int32
 }
 
