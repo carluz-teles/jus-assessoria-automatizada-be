@@ -59,6 +59,18 @@ func (f *integrationFakeGen) GenerateJSON(_ context.Context, _ llm.Request) ([]b
 	return f.out, f.err
 }
 
+func (f *integrationFakeGen) GenerateJSONStream(_ context.Context, _ llm.Request, onChunk func(string) error) ([]byte, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		if err := onChunk(string(f.out)); err != nil {
+			return nil, err
+		}
+	}
+	return f.out, nil
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 // cannedGenerationJSON is the JSON returned by the fake generator.

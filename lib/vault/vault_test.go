@@ -10,8 +10,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/jusassessoria/platform/lib/apperr"
 )
 
 // newTestKEK returns a valid base64-encoded 32-byte KEK for tests.
@@ -42,9 +40,8 @@ func TestNew_ConfigValidation(t *testing.T) {
 
 			v, err := New(tt.kek)
 			is.Nil(v)
-			ae, ok := apperr.From(err)
-			is.True(ok)
-			is.Equal(apperr.KindInvalid, ae.Kind)
+			is.Error(err)
+			is.ErrorIs(err, ErrInvalidKEK)
 		})
 	}
 }
@@ -211,9 +208,8 @@ func TestVault_Unwrap_WrongKEK_Fails(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = v2.Unwrap(context.Background(), wrapped)
-	ae, ok := apperr.From(err)
-	is.True(ok)
-	is.Equal(apperr.KindInfra, ae.Kind)
+	is.Error(err)
+	is.ErrorIs(err, ErrSealedSecretTampered)
 }
 
 func TestVault_Unwrap_TooShort_Fails(t *testing.T) {
@@ -224,9 +220,8 @@ func TestVault_Unwrap_TooShort_Fails(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = v.Unwrap(context.Background(), []byte("short"))
-	ae, ok := apperr.From(err)
-	is.True(ok)
-	is.Equal(apperr.KindInfra, ae.Kind)
+	is.Error(err)
+	is.ErrorIs(err, ErrSealedSecretTampered)
 }
 
 func TestVault_SealOpen_TamperedCiphertext(t *testing.T) {

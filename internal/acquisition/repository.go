@@ -1804,17 +1804,17 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			AssigneeUserID:   assigneeID,
 			AssigneeUserName: row.AssigneeUserName,
 		},
-		Content:           row.Content,
-		JudgingBody:       deref(row.JudgingBody),
-		DistributionDate:  dateStringOrEmpty(row.DistributionDate),
-		Recipients:        rawArrayOrEmpty(json.RawMessage(row.Recipients)),
-		History:           history,
-		AISummary:         deref(row.AiSummary),
-		AIProvidencias:    decodeProvidencias(row.AiProvidencias),
-		AIAnalyzedAt:      timestampPtr(row.AiAnalyzedAt),
-		ClaimValue:        numericStr(row.ClaimValue),
-		Plaintiffs:        stringsOrEmpty(row.Plaintiffs),
-		Defendants:        stringsOrEmpty(row.Defendants),
+		Content:          row.Content,
+		JudgingBody:      deref(row.JudgingBody),
+		DistributionDate: dateStringOrEmpty(row.DistributionDate),
+		Recipients:       rawArrayOrEmpty(json.RawMessage(row.Recipients)),
+		History:          history,
+		AISummary:        deref(row.AiSummary),
+		AIProvidencias:   decodeProvidencias(row.AiProvidencias),
+		AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
+		ClaimValue:       numericStr(row.ClaimValue),
+		Plaintiffs:       stringsOrEmpty(row.Plaintiffs),
+		Defendants:       stringsOrEmpty(row.Defendants),
 	}, nil
 }
 
@@ -1835,7 +1835,6 @@ func dateStringOrEmpty(d pgtype.Date) string {
 		return ""
 	}
 	return d.Time.Format("2006-01-02")
-}
 }
 
 // decodeProvidencias unmarshals the intimation.ai_providencias jsonb into the wire slice.

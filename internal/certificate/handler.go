@@ -108,8 +108,12 @@ func (h *Handler) sign(c *fiber.Ctx) error {
 		return httpx.WriteError(c, apperr.NewInvalid("digest_sha256 deve ser SHA-256 base64 (32 bytes)"))
 	}
 	tenantID := httpx.TenantFromCtx(c)
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
 	id := c.Params("id")
-	res, err := h.uc.Sign(c.UserContext(), tenantID, id, req.Password, digest)
+	res, err := h.uc.Sign(c.UserContext(), tenantID, id, p.UserID, req.Password, digest)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}

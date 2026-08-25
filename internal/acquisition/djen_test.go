@@ -25,7 +25,7 @@ func djenItem(hash string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"hash":%q,"numero_processo":"1","tipoComunicacao":"Intimação"}`, hash))
 }
 
-func djenEnvelope(t *testing.T, items ...json.RawMessage) []byte {
+func djenBody(t *testing.T, items ...json.RawMessage) []byte {
 	t.Helper()
 	body, err := json.Marshal(djenResponse{Status: djenStatusSuccess, Count: len(items), Items: items})
 	if err != nil {
@@ -107,15 +107,15 @@ func TestDJENConnectorFetch(t *testing.T) {
 		switch {
 		case q.Get("numeroOab") == "111" && q.Get("pagina") == "1":
 			// full page (== pageSize) → the walk continues to page 2
-			_, _ = w.Write(djenEnvelope(t, djenItem("X"), djenItem("Y")))
+			_, _ = w.Write(djenBody(t, djenItem("X"), djenItem("Y")))
 		case q.Get("numeroOab") == "111" && q.Get("pagina") == "2":
 			// short page → the walk stops
-			_, _ = w.Write(djenEnvelope(t, djenItem("Z")))
+			_, _ = w.Write(djenBody(t, djenItem("Z")))
 		case q.Get("numeroOab") == "222" && q.Get("pagina") == "1":
 			// "Y" overlaps OAB 111 (same process, both advogados) → deduped
-			_, _ = w.Write(djenEnvelope(t, djenItem("Y")))
+			_, _ = w.Write(djenBody(t, djenItem("Y")))
 		default:
-			_, _ = w.Write(djenEnvelope(t))
+			_, _ = w.Write(djenBody(t))
 		}
 	}))
 	defer srv.Close()

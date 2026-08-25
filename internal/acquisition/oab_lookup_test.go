@@ -39,7 +39,7 @@ func TestLookupOABName_Found(t *testing.T) {
 			"itensPorPagina": q.Get("itensPorPagina"),
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(djenEnvelope(t,
+		_, _ = w.Write(djenBody(t,
 			djenComunicacaoWithAdvogado("h1", "OUTRO ADVOGADO", "999999", "RJ"),
 			djenComunicacaoWithAdvogado("h2", "LUAN GOMES", "347019", "SP"),
 		))
@@ -70,7 +70,7 @@ func TestLookupOABName_NotFound(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(djenEnvelope(t, djenComunicacaoWithAdvogado("h1", "OUTRO", "999999", "RJ")))
+		_, _ = w.Write(djenBody(t, djenComunicacaoWithAdvogado("h1", "OUTRO", "999999", "RJ")))
 	}))
 	defer srv.Close()
 

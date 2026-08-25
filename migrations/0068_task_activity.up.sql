@@ -1,4 +1,4 @@
--- 0055_task_activity — the audit log of a task (docs/erd-prazos.md §4/§10, the Tarefa detail's
+-- 0068_task_activity — the audit log of a task (docs/erd-prazos.md §4/§10, the Tarefa detail's
 -- "Atividade" tab). Every meaningful mutation of a task appends ONE row here, IN THE SAME TX as
 -- the mutation itself (transactional — the log never diverges from the task's real history):
 -- create, each edited field (title/description/due_date/assignee/priority), done, dismiss, and

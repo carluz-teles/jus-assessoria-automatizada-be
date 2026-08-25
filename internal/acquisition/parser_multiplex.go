@@ -1,6 +1,9 @@
 package acquisition
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // parser_multiplex.go composes several source-specific parsers behind the single
 // Parser port the sync use case consumes. The use case fetches a payload and
@@ -38,10 +41,10 @@ func (m *MultiParser) CanParse(p RawPayload) bool {
 // Parse delegates to the first member that CanParse the payload. When none does,
 // it returns ErrNoParserForPayload — a wiring bug (a source has a connector but no
 // parser) that the sync use case surfaces as a terminal parse failure.
-func (m *MultiParser) Parse(p RawPayload) (ParsedResult, error) {
+func (m *MultiParser) Parse(ctx context.Context, p RawPayload) (ParsedResult, error) {
 	for _, parser := range m.parsers {
 		if parser.CanParse(p) {
-			return parser.Parse(p)
+			return parser.Parse(ctx, p)
 		}
 	}
 	return ParsedResult{}, fmt.Errorf("djen parser multiplex: source %q connector %q: %w",

@@ -1,4 +1,4 @@
--- 0053_task_priority — add an optional priority to a task (docs/erd-prazos.md §4/§10, the
+-- 0066_task_priority — add an optional priority to a task (docs/erd-prazos.md §4/§10, the
 -- Tarefa detail's "Prioridade" property). A task can be flagged HIGH|MEDIUM|LOW, or carry no
 -- priority at all (the column is NULLABLE — "sem prioridade" is a first-class state, the
 -- default). The enum is text + app validation (validation.go), mirroring source/kind above

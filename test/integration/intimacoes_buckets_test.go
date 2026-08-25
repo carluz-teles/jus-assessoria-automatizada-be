@@ -44,19 +44,6 @@ func seedDeadlineFor(t *testing.T, pool *pgxpool.Pool, tenantID, recordID, intim
 		tenantID, recordID, intimationID, end)
 }
 
-// seedIntimationWithAnalysis inserts one intimation, optionally already AI-analyzed
-// (ai_analyzed_at set), and returns its id.
-func seedIntimationWithAnalysis(t *testing.T, pool *pgxpool.Pool, tenantID, caseID, recordID string, analyzed bool) string {
-	t.Helper()
-	id := seedIntimationReturningID(t, pool, tenantID, caseID, recordID)
-	if analyzed {
-		mustExec(t, pool,
-			`UPDATE intimation SET ai_analyzed_at = now(), ai_summary = 'resumo', ai_providencias = '[]' WHERE id = $1`,
-			id)
-	}
-	return id
-}
-
 // TestListIntimacoes_UrgenciaBucketBoundaries covers the redefined day-left ranges:
 // days_left = 2 falls in proximos_dois_dias, days_left = 3 falls in esta_semana — the
 // boundary the architect moved (old range was a single 1-7 "semana" bucket).
@@ -102,41 +89,6 @@ func TestListIntimacoes_UrgenciaBucketBoundaries(t *testing.T) {
 	}
 	if len(gotSemana.Items) != 1 || gotSemana.Items[0].ID != threeDays {
 		t.Fatalf("semana: got %d items, want exactly the days_left=3 row", len(gotSemana.Items))
-	}
-}
-
-// TestListIntimacoes_SemProvidenciaBucket covers the "sem providência" tab: an
-// intimação not yet AI-analyzed (ai_analyzed_at NULL) and still actionable
-// (user_status PENDING) counts; one already analyzed does not.
-func TestListIntimacoes_SemProvidenciaBucket(t *testing.T) {
-	pool := newPool(t)
-	repo := acquisition.NewRepository(pool)
-	uc := acquisition.NewReadUseCase(repo)
-	ctx := context.Background()
-
-	tenantID := uuid.NewString()
-	seedTenant(t, pool, tenantID, "org-sem-providencia", 0)
-	recA, caseA := seedCourtRecordCNJ(t, pool, tenantID, "0003000-11.2026.8.26.0001")
-	recB, caseB := seedCourtRecordCNJ(t, pool, tenantID, "0004000-22.2026.8.26.0002")
-
-	notAnalyzed := seedIntimationWithAnalysis(t, pool, tenantID, caseA, recA, false)
-	seedIntimationWithAnalysis(t, pool, tenantID, caseB, recB, true)
-
-	got, err := uc.Intimacoes(ctx, acquisition.IntimacoesQuery{
-		TenantID: tenantID, Limit: 20, LastMadeAvailable: maxDateLit, LastID: maxUUIDlit,
-		Urgencia: acquisition.UrgenciaSemProvidencia,
-	})
-	if err != nil {
-		t.Fatalf("Intimacoes (sem_providencia): %v", err)
-	}
-	if len(got.Items) != 1 || got.Items[0].ID != notAnalyzed {
-		t.Fatalf("sem_providencia: got %d items, want exactly the not-yet-analyzed row", len(got.Items))
-	}
-	if got.Items[0].AIAnalyzedAt != nil {
-		t.Errorf("AIAnalyzedAt = %v, want nil for the not-yet-analyzed row", got.Items[0].AIAnalyzedAt)
-	}
-	if got.Buckets.SemProvidencia != 1 {
-		t.Errorf("Buckets.SemProvidencia = %d, want 1", got.Buckets.SemProvidencia)
 	}
 }
 

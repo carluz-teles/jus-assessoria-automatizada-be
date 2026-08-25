@@ -55,8 +55,8 @@ type routerDeps struct {
 	// when VAULT_KEK_BASE64 is unset. S1 carries it here so S2 (court_connection
 	// credential wiring) can extend routerDeps without touching main.go's boot
 	// sequence — the router nil-guards the consumer handler exactly like document.
-	vault                *vault.Vault
-	streamTokenStore     draft.StreamTokenStore
+	vault            *vault.Vault
+	streamTokenStore draft.StreamTokenStore
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -222,9 +222,6 @@ func newRouter(deps routerDeps) *fiber.App {
 	// preview, list, revoke) and mounts them via Register — the api only composes.
 	// Nil-guarded so the router test fixture builds without a use case, and so a boot
 	// with no vault configured (no CERT_KEK / AWS_KMS_KEY_ID) leaves the slice unmounted.
-	if deps.certificate != nil {
-		deps.certificate.Register(v1)
-	}
 
 	return app
 }

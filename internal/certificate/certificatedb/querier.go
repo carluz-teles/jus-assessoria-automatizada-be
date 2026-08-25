@@ -13,24 +13,33 @@ import (
 type Querier interface {
 	// Um certificado por id, tenant-scoped. Inclui o envelope (uso interno pra o
 	// Sign decifrar o .pfx). Devolve linhas revogadas também — o domain decide.
-	GetCertificateByID(ctx context.Context, arg GetCertificateByIDParams) (GetCertificateByIDRow, error)
-	// Certificados A1 (ICP-Brasil) por advogado. Tenant-scoped em toda linha
-	// (barrier 1 sempre no WHERE + RLS como barrier 2). ListCertificatesByTenant
-	// OMITE ciphertext/wrapped_dek/nonce (lista pública não precisa do binário —
-	// só o Get, chamado pelo Sign, os traz).
-	// Cadastra um certificado após o BE parsear o .pfx, extrair metadata e cifrar
-	// o binário com envelope (DEK+KMS). Dedup ativo é garantido pelo unique index
-	// parcial (tenant, fingerprint) WHERE revoked_at IS NULL — se colidir, sqlc
-	// devolve ErrUniqueViolation → o domain mapeia pra ErrCertificateAlreadyExists.
+	GetCertificateByID(ctx context.Context, arg GetCertificateByIDParams) (Certificate, error)
+	// certificate slice queries. Every statement runs inside the use case's tx so RLS
+	// scopes it to the principal's tenant (barrier 2) on top of the explicit tenant_id
+	// filter (barrier 1). Absence is a typed error at the mapper, never (nil, nil).
+	//
+	// SECURITY: the SELECT for the list read (ListCertificatesByTenant) deliberately
+	// does NOT project ciphertext/nonce/wrapped_dek — a screen read never carries key
+	// material. Only GetCertificateByID (the sign path) projects the envelope.
+	// Persist a parsed + envelope-encrypted certificate (POST /v1/certificates). All
+	// metadata columns come from the parsed x509; the four envelope columns come from
+	// seal(). tenant_id and owner_user_id come from the trusted principal, never the
+	// body. Returns the whole row so the handler renders the CertificateView.
 	InsertCertificate(ctx context.Context, arg InsertCertificateParams) (InsertCertificateRow, error)
+	// Record that a certificate signed a digest (audit trail, committed in the SAME tx
+	// as the sign so the act and its record land together). Stores the SHA-256 digest
+	// only — never the signature, the key, or the password. tenant_id + signer_user_id
+	// come from the trusted principal. $1 = tenant_id, $2 = certificate_id,
+	// $3 = signer_user_id, $4 = digest_sha256.
+	InsertSigningEvent(ctx context.Context, arg InsertSigningEventParams) (InsertSigningEventRow, error)
 	// Lista os ATIVOS do tenant (revoked_at IS NULL), ordenados por criação DESC.
 	// Junção LEFT com app_user pra devolver o nome do owner. tenant-scoped.
 	ListCertificatesByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListCertificatesByTenantRow, error)
-	// Soft-delete: marca revoked_at=now(). Idempotente (re-executar em linha
-	// já revogada mantém a data original — o WHERE bloqueia). Zero linhas
-	// afetadas quando a linha não existe ou já está revogada → ErrCertificateNotFound
-	// no domain.
-	RevokeCertificate(ctx context.Context, arg RevokeCertificateParams) (uuid.UUID, error)
+	// Soft-revoke a certificate (DELETE /v1/certificates/:id): stamp revoked_at = $3
+	// when it is still active (revoked_at IS NULL), scoped to tenant_id. A no-row result
+	// (missing, foreign, or already revoked) → pgx.ErrNoRows → ErrCertificateNotFound at
+	// the mapper. The row stays for audit. $1 = id, $2 = tenant_id, $3 = revoked_at.
+	RevokeCertificate(ctx context.Context, arg RevokeCertificateParams) (RevokeCertificateRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

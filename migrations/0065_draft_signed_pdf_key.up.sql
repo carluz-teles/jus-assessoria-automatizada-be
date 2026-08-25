@@ -1,4 +1,4 @@
--- 0061_draft_signed_pdf_key — Fatia 2b: assinatura real de PDF (PAdES via GCP
+-- 0065_draft_signed_pdf_key — Fatia 2b: assinatura real de PDF (PAdES via GCP
 -- KMS + digitorus/pdfsign). O PDF assinado vive no object storage; o draft
 -- guarda só o ponteiro. NULL antes de assinar.
 --

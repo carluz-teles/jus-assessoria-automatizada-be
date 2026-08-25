@@ -10,7 +10,14 @@ import (
 	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/events"
 )
+
+// publisher is the narrow outbox port — the producer half of the transactional
+// outbox. *events.Outbox satisfies it structurally.
+type publisher interface {
+	Publish(ctx context.Context, tx database.Tx, ev events.Event) error
+}
 
 // UseCase orquestra os fluxos: preview, upload, list, revoke, sign. NÃO owns tx
 // (usa UoW). tenantID + userID sempre vêm do principal verificado, nunca do body.
@@ -20,12 +27,13 @@ type UseCase struct {
 	repo   Repository
 	uow    database.UnitOfWork
 	cipher Cipher
+	outbox publisher
 }
 
 // NewUseCase constrói o caso de uso. cipher é exigido — o wire no api só chama
 // isso quando o GCP KMS tá configurado (senão o slice não sobe).
-func NewUseCase(repo Repository, uow database.UnitOfWork, c Cipher) *UseCase {
-	return &UseCase{repo: repo, uow: uow, cipher: c}
+func NewUseCase(repo Repository, uow database.UnitOfWork, c Cipher, outbox publisher) *UseCase {
+	return &UseCase{repo: repo, uow: uow, cipher: c, outbox: outbox}
 }
 
 // Preview parseia o .pfx com a senha, devolve metadata + checks. NADA é
@@ -93,7 +101,7 @@ func (uc *UseCase) Upload(ctx context.Context, tenantID, ownerUserID string, pfx
 		}
 		cert.ID = id
 		cert.CreatedAt = createdAt
-		return nil
+		return uc.outbox.Publish(ctx, tx, newCertificateAdded(cert))
 	})
 	if err != nil {
 		return nil, err
@@ -119,7 +127,10 @@ func (uc *UseCase) List(ctx context.Context, tenantID string) ([]CertificateWith
 // devolve ErrCertificateNotFound (já não está ativo).
 func (uc *UseCase) Revoke(ctx context.Context, tenantID, id string) error {
 	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
-		return uc.repo.Revoke(ctx, tx, tenantID, id)
+		if err := uc.repo.Revoke(ctx, tx, tenantID, id); err != nil {
+			return err
+		}
+		return uc.outbox.Publish(ctx, tx, newCertificateRevoked(tenantID, id))
 	})
 }
 
@@ -150,9 +161,10 @@ func (uc *UseCase) openVault(ctx context.Context, cert *Certificate) (*parsedPFX
 
 // Sign assina um digest SHA-256 com a chave do certificado. Fluxo: busca cert
 // (metadata + envelope); openVault (KMS.Decrypt → JSON → parsePFX com senha
-// armazenada); assina digest. O parâmetro `password` fica aqui por compat
+// armazenada); assina digest; grava o audit row (signing_event) numa tx própria,
+// só depois de assinar com sucesso. O parâmetro `password` fica aqui por compat
 // com o handler antigo — quando presente, é IGNORADO (senha vem do vault).
-func (uc *UseCase) Sign(ctx context.Context, tenantID, id, _ string, digest []byte) (*SignResult, error) {
+func (uc *UseCase) Sign(ctx context.Context, tenantID, id, signerUserID, _ string, digest []byte) (*SignResult, error) {
 	var cert *Certificate
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		c, e := uc.repo.GetByID(ctx, tx, tenantID, id)
@@ -179,6 +191,13 @@ func (uc *UseCase) Sign(ctx context.Context, tenantID, id, _ string, digest []by
 	chain := make([][]byte, 0, len(p.Chain))
 	for _, cc := range p.Chain {
 		chain = append(chain, cc.Raw)
+	}
+
+	err = uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.repo.RecordSigning(ctx, tx, tenantID, id, signerUserID, digest)
+	})
+	if err != nil {
+		return nil, err
 	}
 	return &SignResult{Signature: sig, Chain: chain}, nil
 }

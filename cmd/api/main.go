@@ -376,7 +376,7 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("init cert envelope cipher: %w", err)
 		}
 		certCipher = cipher
-		certUC = certificate.NewUseCase(certificate.NewRepository(), uow, cipher)
+		certUC = certificate.NewUseCase(certificate.NewRepository(), uow, cipher, events.NewOutbox())
 		certificateHandler = certificate.New(certUC)
 		logger.Info("certificate slice ready", "kms_key", cfg.GCPKMSKeyName)
 	}

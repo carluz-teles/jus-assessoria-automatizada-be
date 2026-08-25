@@ -1,4 +1,4 @@
--- 0046_tenant_secret — generic envelope-encryption vault for per-tenant secrets
+-- 0069_tenant_secret — generic envelope-encryption vault for per-tenant secrets
 -- (lib/vault, docs/erd-execucao-judicial-tjsp.md §9). Each row holds a single
 -- secret's AES-256-GCM ciphertext and its wrapped DEK; the KEK lives only in
 -- process memory (VAULT_KEK_BASE64 env var), never in the database.

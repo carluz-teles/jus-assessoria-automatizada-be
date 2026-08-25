@@ -1,4 +1,4 @@
--- 0061_signing_event.up.sql — audit trail for server-side signatures produced by
+-- 0060_signing_event.up.sql — audit trail for server-side signatures produced by
 -- POST /v1/certificates/:id/sign. Each row records that a certificate was used to
 -- sign a specific digest, WITHOUT ever storing the signature, the private key, or
 -- the .pfx password (all of which live in memory only for the duration of the

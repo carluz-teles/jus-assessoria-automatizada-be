@@ -1,4 +1,4 @@
--- 0060_draft_workflow_steps — persiste o step em que o usuário está no
+-- 0059_draft_workflow_steps — persiste o step em que o usuário está no
 -- peticionamento (Construção → Assinatura → Protocolo → Concluído).
 --
 -- Modelagem por FATOS DATADOS (não por coluna "current_step"). Cada etapa é

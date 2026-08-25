@@ -12,39 +12,26 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getCertificate = `-- name: GetCertificate :one
-SELECT id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
-       not_before, not_after, fingerprint, created_at, revoked_at
+const getCertificateByID = `-- name: GetCertificateByID :one
+SELECT id, tenant_id, owner_user_id,
+       subject_cn, oab, issuer, serial,
+       not_before, not_after, fingerprint,
+       ciphertext, nonce, wrapped_dek, kek_ref,
+       created_at, revoked_at
 FROM certificate
 WHERE id = $1 AND tenant_id = $2
 `
 
-type GetCertificateParams struct {
+type GetCertificateByIDParams struct {
 	ID       uuid.UUID `json:"id"`
 	TenantID uuid.UUID `json:"tenant_id"`
 }
 
-type GetCertificateRow struct {
-	ID          uuid.UUID          `json:"id"`
-	TenantID    uuid.UUID          `json:"tenant_id"`
-	OwnerUserID uuid.UUID          `json:"owner_user_id"`
-	SubjectCn   string             `json:"subject_cn"`
-	Oab         *string            `json:"oab"`
-	Issuer      string             `json:"issuer"`
-	Serial      string             `json:"serial"`
-	NotBefore   pgtype.Timestamptz `json:"not_before"`
-	NotAfter    pgtype.Timestamptz `json:"not_after"`
-	Fingerprint string             `json:"fingerprint"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
-}
-
-// Load one certificate's metadata for the revoke path — scoped to tenant_id so a
-// foreign id never resolves. A miss → pgx.ErrNoRows → ErrCertificateNotFound at the
-// mapper. METADATA ONLY. $1 = id, $2 = tenant_id.
-func (q *Queries) GetCertificate(ctx context.Context, arg GetCertificateParams) (GetCertificateRow, error) {
-	row := q.db.QueryRow(ctx, getCertificate, arg.ID, arg.TenantID)
-	var i GetCertificateRow
+// Um certificado por id, tenant-scoped. Inclui o envelope (uso interno pra o
+// Sign decifrar o .pfx). Devolve linhas revogadas também — o domain decide.
+func (q *Queries) GetCertificateByID(ctx context.Context, arg GetCertificateByIDParams) (Certificate, error) {
+	row := q.db.QueryRow(ctx, getCertificateByID, arg.ID, arg.TenantID)
+	var i Certificate
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -56,55 +43,12 @@ func (q *Queries) GetCertificate(ctx context.Context, arg GetCertificateParams) 
 		&i.NotBefore,
 		&i.NotAfter,
 		&i.Fingerprint,
-		&i.CreatedAt,
-		&i.RevokedAt,
-	)
-	return i, err
-}
-
-const getCertificateEnvelope = `-- name: GetCertificateEnvelope :one
-SELECT id, tenant_id, owner_user_id, not_after, revoked_at,
-       ciphertext, nonce, wrapped_dek, kek_ref
-FROM certificate
-WHERE id = $1 AND tenant_id = $2
-`
-
-type GetCertificateEnvelopeParams struct {
-	ID       uuid.UUID `json:"id"`
-	TenantID uuid.UUID `json:"tenant_id"`
-}
-
-type GetCertificateEnvelopeRow struct {
-	ID          uuid.UUID          `json:"id"`
-	TenantID    uuid.UUID          `json:"tenant_id"`
-	OwnerUserID uuid.UUID          `json:"owner_user_id"`
-	NotAfter    pgtype.Timestamptz `json:"not_after"`
-	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
-	Ciphertext  []byte             `json:"ciphertext"`
-	Nonce       []byte             `json:"nonce"`
-	WrappedDek  []byte             `json:"wrapped_dek"`
-	KekRef      string             `json:"kek_ref"`
-}
-
-// Load one certificate's ENVELOPE (the encrypted key material) plus the fields
-// needed to gate signing (not_after, revoked_at), scoped to tenant_id. This is the
-// ONLY query that projects ciphertext/nonce/wrapped_dek — it exists solely for the
-// server-side signing path (POST /v1/certificates/:id/sign), which must decrypt the
-// .pfx to reach the private key. A miss → pgx.ErrNoRows → ErrCertificateNotFound at
-// the mapper. The bytes never leave the backend. $1 = id, $2 = tenant_id.
-func (q *Queries) GetCertificateEnvelope(ctx context.Context, arg GetCertificateEnvelopeParams) (GetCertificateEnvelopeRow, error) {
-	row := q.db.QueryRow(ctx, getCertificateEnvelope, arg.ID, arg.TenantID)
-	var i GetCertificateEnvelopeRow
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.OwnerUserID,
-		&i.NotAfter,
-		&i.RevokedAt,
 		&i.Ciphertext,
 		&i.Nonce,
 		&i.WrappedDek,
 		&i.KekRef,
+		&i.CreatedAt,
+		&i.RevokedAt,
 	)
 	return i, err
 }
@@ -159,10 +103,9 @@ type InsertCertificateRow struct {
 // scopes it to the principal's tenant (barrier 2) on top of the explicit tenant_id
 // filter (barrier 1). Absence is a typed error at the mapper, never (nil, nil).
 //
-// SECURITY: the SELECT for the list read (ListCertificates) deliberately does NOT
-// project ciphertext/nonce/wrapped_dek — a screen read never carries key material.
-// The insert stores the envelope; there is no query in this fatia that reads the
-// ciphertext back out (no download-the-key endpoint exists).
+// SECURITY: the SELECT for the list read (ListCertificatesByTenant) deliberately
+// does NOT project ciphertext/nonce/wrapped_dek — a screen read never carries key
+// material. Only GetCertificateByID (the sign path) projects the envelope.
 // Persist a parsed + envelope-encrypted certificate (POST /v1/certificates). All
 // metadata columns come from the parsed x509; the four envelope columns come from
 // seal(). tenant_id and owner_user_id come from the trusted principal, never the
@@ -236,17 +179,20 @@ func (q *Queries) InsertSigningEvent(ctx context.Context, arg InsertSigningEvent
 	return i, err
 }
 
-const listCertificates = `-- name: ListCertificates :many
-SELECT c.id, c.tenant_id, c.owner_user_id, c.subject_cn, c.oab, c.issuer, c.serial,
-       c.not_before, c.not_after, c.fingerprint, c.created_at, c.revoked_at,
+const listCertificatesByTenant = `-- name: ListCertificatesByTenant :many
+SELECT c.id, c.tenant_id, c.owner_user_id,
+       c.subject_cn, c.oab, c.issuer, c.serial,
+       c.not_before, c.not_after, c.fingerprint,
+       c.created_at, c.revoked_at,
        u.name AS owner_user_name
 FROM certificate c
 LEFT JOIN app_user u ON u.id = c.owner_user_id
 WHERE c.tenant_id = $1
-ORDER BY c.created_at DESC, c.id DESC
+  AND c.revoked_at IS NULL
+ORDER BY c.created_at DESC
 `
 
-type ListCertificatesRow struct {
+type ListCertificatesByTenantRow struct {
 	ID            uuid.UUID          `json:"id"`
 	TenantID      uuid.UUID          `json:"tenant_id"`
 	OwnerUserID   uuid.UUID          `json:"owner_user_id"`
@@ -262,18 +208,17 @@ type ListCertificatesRow struct {
 	OwnerUserName *string            `json:"owner_user_name"`
 }
 
-// The GET /v1/certificates read model: a tenant's certificates, newest first, with
-// the owner lawyer's display name joined from app_user. METADATA ONLY — no envelope
-// columns. Scoped to tenant_id (barrier 1) on top of RLS (barrier 2). $1 = tenant_id.
-func (q *Queries) ListCertificates(ctx context.Context, tenantID uuid.UUID) ([]ListCertificatesRow, error) {
-	rows, err := q.db.Query(ctx, listCertificates, tenantID)
+// Lista os ATIVOS do tenant (revoked_at IS NULL), ordenados por criação DESC.
+// Junção LEFT com app_user pra devolver o nome do owner. tenant-scoped.
+func (q *Queries) ListCertificatesByTenant(ctx context.Context, tenantID uuid.UUID) ([]ListCertificatesByTenantRow, error) {
+	rows, err := q.db.Query(ctx, listCertificatesByTenant, tenantID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListCertificatesRow
+	var items []ListCertificatesByTenantRow
 	for rows.Next() {
-		var i ListCertificatesRow
+		var i ListCertificatesByTenantRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,

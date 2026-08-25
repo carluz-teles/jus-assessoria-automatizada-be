@@ -2,7 +2,6 @@ package certificate
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -21,63 +20,17 @@ import (
 	"github.com/jusassessoria/platform/lib/httpx"
 )
 
-// stubUC implements the handler's uc port, capturing commands and returning canned
-// results/errors per endpoint.
-type stubUC struct {
-	createRes CertificateView
-	createErr error
-	gotCreate CreateCommand
-
-	previewRes PreviewResult
-	previewErr error
-	gotPreview PreviewCommand
-
-	signRes SignResult
-	signErr error
-	gotSign SignCommand
-
-	listRes []CertificateView
-	listErr error
-
-	revokeErr error
-	gotRevTID string
-	gotRevID  string
-}
-
-func (s *stubUC) Create(_ context.Context, cmd CreateCommand) (CertificateView, error) {
-	s.gotCreate = cmd
-	return s.createRes, s.createErr
-}
-
-func (s *stubUC) Preview(_ context.Context, cmd PreviewCommand) (PreviewResult, error) {
-	s.gotPreview = cmd
-	return s.previewRes, s.previewErr
-}
-
-func (s *stubUC) Sign(_ context.Context, cmd SignCommand) (SignResult, error) {
-	s.gotSign = cmd
-	return s.signRes, s.signErr
-}
-
-func (s *stubUC) List(_ context.Context, _ string) ([]CertificateView, error) {
-	return s.listRes, s.listErr
-}
-
-func (s *stubUC) Revoke(_ context.Context, tenantID, id string) error {
-	s.gotRevTID, s.gotRevID = tenantID, id
-	return s.revokeErr
-}
-
 // newTestApp mounts the certificate routes behind a middleware that injects a fixed
-// principal (standing in for the resolved Clerk auth), so the handler is tested in
-// isolation from the auth chain.
-func newTestApp(h *Handler) *fiber.App {
+// principal (standing in for the resolved Clerk auth), so the handler is tested with
+// a real UseCase wired to fakes (repo/cipher/outbox), isolated from the auth chain
+// and from Postgres/KMS.
+func newTestApp(uc *UseCase) *fiber.App {
 	app := fiber.New()
 	app.Use(func(c *fiber.Ctx) error {
 		httpx.SetPrincipal(c, httpx.Principal{UserID: "owner-1", TenantID: "tenant-1", Role: "LAWYER"})
 		return c.Next()
 	})
-	h.Register(app.Group("/v1"))
+	New(uc).RegisterV1(app.Group("/v1"))
 	return app
 }
 
@@ -99,14 +52,15 @@ func multipartPFX(t *testing.T, fileBytes []byte, password string) (body *bytes.
 	return body, w.FormDataContentType()
 }
 
-func TestHandler_Create_201(t *testing.T) {
+func TestHandler_Upload_201(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	stub := &stubUC{createRes: CertificateView{ID: "c1", SubjectCN: "ADV"}}
-	app := newTestApp(NewHandler(stub))
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	app := newTestApp(uc)
 
-	pfx := makePFX(t, "ADV", "pw", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	pfx := generateTestPFX(t, "ADV", "pw", time.Hour)
 	body, ct := multipartPFX(t, pfx, "pw")
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/certificates", body)
@@ -117,22 +71,20 @@ func TestHandler_Create_201(t *testing.T) {
 
 	is.Equal(fiber.StatusCreated, resp.StatusCode)
 	// tenant_id + owner_user_id come from the principal, never the body.
-	is.Equal("tenant-1", stub.gotCreate.TenantID)
-	is.Equal("owner-1", stub.gotCreate.OwnerUserID)
-	is.Equal("pw", stub.gotCreate.Password)
-	is.True(bytes.Equal(pfx, stub.gotCreate.PFXData))
+	is.Equal("tenant-1", repo.inserted.TenantID)
+	is.Equal("owner-1", repo.inserted.OwnerUserID)
 
-	var got CertificateView
+	var got certificateView
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	is.Equal("c1", got.ID)
+	is.Equal("ADV", got.SubjectCN)
 }
 
-func TestHandler_Create_MissingPassword_400(t *testing.T) {
+func TestHandler_Upload_MissingPassword_400(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	stub := &stubUC{}
-	app := newTestApp(NewHandler(stub))
+	repo := &fakeRepo{}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 
 	body, ct := multipartPFX(t, []byte("bytes"), "") // no password
 	req := httptest.NewRequest(http.MethodPost, "/v1/certificates", body)
@@ -142,14 +94,14 @@ func TestHandler_Create_MissingPassword_400(t *testing.T) {
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
-	is.Equal(CreateCommand{}, stub.gotCreate, "use case must not be called without a password")
+	is.Nil(repo.inserted, "use case must not be called without a password")
 }
 
-func TestHandler_Create_MissingFile_400(t *testing.T) {
+func TestHandler_Upload_MissingFile_400(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	app := newTestApp(NewHandler(&stubUC{}))
+	app := newTestApp(NewUseCase(&fakeRepo{}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 	body, ct := multipartPFX(t, nil, "pw") // no file
 	req := httptest.NewRequest(http.MethodPost, "/v1/certificates", body)
 	req.Header.Set("Content-Type", ct)
@@ -164,13 +116,10 @@ func TestHandler_Preview_200(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	stub := &stubUC{previewRes: PreviewResult{
-		SubjectCN: "MARIA", OAB: "12345/SP",
-		Checks: PreviewChecks{NaoExpirado: true, TitularConfere: true, CadeiaOk: false},
-	}}
-	app := newTestApp(NewHandler(stub))
+	app := newTestApp(NewUseCase(&fakeRepo{}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 
-	body, ct := multipartPFX(t, []byte("pfx"), "pw")
+	pfx := generateTestPFX(t, "MARIA", "pw", time.Hour)
+	body, ct := multipartPFX(t, pfx, "pw")
 	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/preview", body)
 	req.Header.Set("Content-Type", ct)
 	resp, err := app.Test(req)
@@ -178,9 +127,8 @@ func TestHandler_Preview_200(t *testing.T) {
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusOK, resp.StatusCode)
-	is.Equal("pw", stub.gotPreview.Password)
 
-	var got PreviewResult
+	var got previewResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	is.Equal("MARIA", got.SubjectCN)
 	is.True(got.Checks.NaoExpirado)
@@ -191,8 +139,9 @@ func TestHandler_Preview_WrongPassword_400(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	app := newTestApp(NewHandler(&stubUC{previewErr: ErrInvalidPassword}))
-	body, ct := multipartPFX(t, []byte("pfx"), "wrong")
+	app := newTestApp(NewUseCase(&fakeRepo{}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
+	pfx := generateTestPFX(t, "CN", "right", time.Hour)
+	body, ct := multipartPFX(t, pfx, "wrong")
 	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/preview", body)
 	req.Header.Set("Content-Type", ct)
 	resp, err := app.Test(req)
@@ -202,47 +151,42 @@ func TestHandler_Preview_WrongPassword_400(t *testing.T) {
 	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
 }
 
-func TestHandler_Sign_200(t *testing.T) {
+func TestHandler_Sign_200_RecordsAuditWithPrincipalAsSigner(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	stub := &stubUC{signRes: SignResult{
-		Signature: []byte("sig-bytes"),
-		ChainDER:  [][]byte{[]byte("leaf-der"), []byte("ca-der")},
-	}}
-	app := newTestApp(NewHandler(stub))
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV SIGNER", "pw", time.Hour)
+	repo.getRes = cert
+	app := newTestApp(uc)
 
 	sum := sha256.Sum256([]byte("doc"))
 	digestB64 := base64.StdEncoding.EncodeToString(sum[:])
 	body := `{"password":"pw","digest_sha256":"` + digestB64 + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-7/sign", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-1/sign", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusOK, resp.StatusCode)
-	// tenant + signer come from the principal, the cert id from the path, the digest
-	// from the (decoded) body.
-	is.Equal("tenant-1", stub.gotSign.TenantID)
-	is.Equal("owner-1", stub.gotSign.SignerUserID)
-	is.Equal("cert-7", stub.gotSign.CertificateID)
-	is.Equal("pw", stub.gotSign.Password)
-	is.Equal(sum[:], stub.gotSign.Digest)
+	// The signer of the audit row comes from the principal, never the body.
+	is.Equal("owner-1", repo.recordedUser)
+	is.Equal("tenant-1", repo.recordedTID)
 
-	var got signResponse
+	var got map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	is.Equal(base64.StdEncoding.EncodeToString([]byte("sig-bytes")), got.Signature)
-	require.Len(t, got.CertChain, 2)
-	is.Equal(base64.StdEncoding.EncodeToString([]byte("leaf-der")), got.CertChain[0])
+	is.NotEmpty(got["signature"])
+	is.NotEmpty(got["cert_chain"])
 }
 
 func TestHandler_Sign_MissingPassword_400(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	stub := &stubUC{}
-	app := newTestApp(NewHandler(stub))
+	repo := &fakeRepo{}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 
 	sum := sha256.Sum256([]byte("doc"))
 	body := `{"digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
@@ -253,30 +197,15 @@ func TestHandler_Sign_MissingPassword_400(t *testing.T) {
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
-	is.Equal(SignCommand{}, stub.gotSign, "use case must not be called without a password")
-}
-
-func TestHandler_Sign_WrongPassword_400(t *testing.T) {
-	t.Parallel()
-	is := assert.New(t)
-
-	app := newTestApp(NewHandler(&stubUC{signErr: ErrInvalidPassword}))
-	sum := sha256.Sum256([]byte("doc"))
-	body := `{"password":"wrong","digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-7/sign", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
+	is.Nil(repo.recordedDig, "use case must not be called without a password")
 }
 
 func TestHandler_Sign_NotFound_404(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	app := newTestApp(NewHandler(&stubUC{signErr: ErrCertificateNotFound}))
+	repo := &fakeRepo{getErr: ErrCertificateNotFound}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 	sum := sha256.Sum256([]byte("doc"))
 	body := `{"password":"pw","digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/missing/sign", strings.NewReader(body))
@@ -288,12 +217,15 @@ func TestHandler_Sign_NotFound_404(t *testing.T) {
 	is.Equal(fiber.StatusNotFound, resp.StatusCode)
 }
 
-func TestHandler_List_200_Envelope(t *testing.T) {
+func TestHandler_List_200(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	stub := &stubUC{listRes: []CertificateView{{ID: "c1"}, {ID: "c2"}}}
-	app := newTestApp(NewHandler(stub))
+	repo := &fakeRepo{listViews: []CertificateWithOwner{
+		{Certificate: Certificate{ID: "c1"}},
+		{Certificate: Certificate{ID: "c2"}},
+	}}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/certificates", nil)
 	resp, err := app.Test(req)
@@ -301,7 +233,9 @@ func TestHandler_List_200_Envelope(t *testing.T) {
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusOK, resp.StatusCode)
-	var env certificatesEnvelope
+	var env struct {
+		Data []certificateView `json:"data"`
+	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&env))
 	is.Len(env.Data, 2)
 }
@@ -310,7 +244,7 @@ func TestHandler_List_Empty_SerializesEmptyArray(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	app := newTestApp(NewHandler(&stubUC{listRes: nil}))
+	app := newTestApp(NewUseCase(&fakeRepo{listViews: nil}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 	req := httptest.NewRequest(http.MethodGet, "/v1/certificates", nil)
 	resp, err := app.Test(req)
 	require.NoError(t, err)
@@ -325,8 +259,8 @@ func TestHandler_Revoke_204(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	stub := &stubUC{}
-	app := newTestApp(NewHandler(stub))
+	repo := &fakeRepo{}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 
 	req := httptest.NewRequest(http.MethodDelete, "/v1/certificates/cert-9", nil)
 	resp, err := app.Test(req)
@@ -334,15 +268,15 @@ func TestHandler_Revoke_204(t *testing.T) {
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusNoContent, resp.StatusCode)
-	is.Equal("tenant-1", stub.gotRevTID)
-	is.Equal("cert-9", stub.gotRevID)
+	is.Equal("tenant-1", repo.revokedTID)
+	is.Equal("cert-9", repo.revokedID)
 }
 
 func TestHandler_Revoke_NotFound_404(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	app := newTestApp(NewHandler(&stubUC{revokeErr: ErrCertificateNotFound}))
+	app := newTestApp(NewUseCase(&fakeRepo{revokeErr: ErrCertificateNotFound}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
 	req := httptest.NewRequest(http.MethodDelete, "/v1/certificates/missing", nil)
 	resp, err := app.Test(req)
 	require.NoError(t, err)

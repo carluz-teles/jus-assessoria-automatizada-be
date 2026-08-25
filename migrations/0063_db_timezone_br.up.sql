@@ -1,4 +1,4 @@
--- 0064_db_timezone_br — CURRENT_DATE em queries de prazo (deadline.end_date -
+-- 0063_db_timezone_br — CURRENT_DATE em queries de prazo (deadline.end_date -
 -- CURRENT_DATE) precisa ser a data do FORO no Brasil. Postgres em UTC retorna
 -- a data um dia à frente entre 21:00 e 23:59 BRT (00:00-03:00 UTC), gerando
 -- days_left errado, filtros de urgência (atraso/hoje/próximos) errados e

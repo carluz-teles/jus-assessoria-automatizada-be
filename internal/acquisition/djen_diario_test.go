@@ -40,11 +40,11 @@ func TestDJENConnector_FetchDiario(t *testing.T) {
 		}
 		switch q.Get("pagina") {
 		case "1":
-			_, _ = w.Write(djenEnvelope(t, djenItem("A"), djenItem("B"))) // full page (size 2)
+			_, _ = w.Write(djenBody(t, djenItem("A"), djenItem("B"))) // full page (size 2)
 		case "2":
-			_, _ = w.Write(djenEnvelope(t, djenItem("C"))) // short page → stop
+			_, _ = w.Write(djenBody(t, djenItem("C"))) // short page → stop
 		default:
-			_, _ = w.Write(djenEnvelope(t))
+			_, _ = w.Write(djenBody(t))
 		}
 	}))
 	defer srv.Close()

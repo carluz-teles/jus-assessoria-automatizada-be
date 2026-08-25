@@ -1,6 +1,7 @@
 package acquisition
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -15,7 +16,7 @@ type predicateParser struct {
 
 func (p predicateParser) CanParse(payload RawPayload) bool { return p.canParse(payload) }
 
-func (p predicateParser) Parse(RawPayload) (ParsedResult, error) {
+func (p predicateParser) Parse(context.Context, RawPayload) (ParsedResult, error) {
 	// Tag the run through the first court record's Court field.
 	return ParsedResult{CourtRecords: []ParsedCourtRecord{{Court: p.tag}}}, nil
 }
@@ -45,7 +46,7 @@ func TestMultiParser_ParseRoutesToFirstMatch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := mp.Parse(tc.payload)
+			got, err := mp.Parse(context.Background(), tc.payload)
 			if err != nil {
 				t.Fatalf("Parse() error = %v", err)
 			}
@@ -64,7 +65,7 @@ func TestMultiParser_ParsePrefersFirstListed(t *testing.T) {
 	second := predicateParser{canParse: func(RawPayload) bool { return true }, tag: "second"}
 	mp := NewMultiParser(first, second)
 
-	got, err := mp.Parse(RawPayload{Source: SourceDJEN})
+	got, err := mp.Parse(context.Background(), RawPayload{Source: SourceDJEN})
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
@@ -81,7 +82,7 @@ func TestMultiParser_ParseNoMatch(t *testing.T) {
 	djen := predicateParser{canParse: bySource(SourceDJEN), tag: "djen"}
 	mp := NewMultiParser(djen)
 
-	_, err := mp.Parse(RawPayload{Source: SourceDATAJUD, ConnectorID: "stub"})
+	_, err := mp.Parse(context.Background(), RawPayload{Source: SourceDATAJUD, ConnectorID: "stub"})
 	if !errors.Is(err, ErrNoParserForPayload) {
 		t.Fatalf("Parse() error = %v, want ErrNoParserForPayload", err)
 	}

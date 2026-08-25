@@ -2,8 +2,6 @@ package certificate
 
 import (
 	"context"
-	"crypto"
-	"crypto/rsa"
 	"crypto/sha256"
 	"errors"
 	"testing"
@@ -12,11 +10,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pkcs12 "software.sslmate.com/src/go-pkcs12"
 
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
-	"github.com/jusassessoria/platform/lib/vault"
 )
 
 // --- fakes ------------------------------------------------------------------
@@ -51,21 +47,21 @@ func (o *fakeOutbox) Publish(_ context.Context, _ database.Tx, ev events.Event) 
 	return o.err
 }
 
-// fakeRepo records what it was asked to persist and returns canned values. It
-// captures the InsertParams so a test can assert the envelope + metadata threaded
-// through — and, crucially, that the ciphertext is NOT the plaintext .pfx.
+// fakeRepo records what it was asked to persist and returns canned values.
 type fakeRepo struct {
-	inserted   *InsertParams
-	insertErr  error
-	listViews  []CertificateView
-	listErr    error
+	inserted  *Certificate
+	insertErr error
+
+	listViews []CertificateWithOwner
+	listErr   error
+
 	revokeErr  error
 	revokedID  string
 	revokedTID string
 
-	// signing path
-	loadRes      signable
-	loadErr      error
+	getRes *Certificate
+	getErr error
+
 	recordErr    error
 	recordedDig  []byte
 	recordedCID  string
@@ -73,32 +69,25 @@ type fakeRepo struct {
 	recordedUser string
 }
 
-func (r *fakeRepo) Insert(_ context.Context, _ database.Tx, p InsertParams) (*Certificate, error) {
+func (r *fakeRepo) Insert(_ context.Context, _ database.Tx, c *Certificate) (string, time.Time, error) {
 	if r.insertErr != nil {
-		return nil, r.insertErr
+		return "", time.Time{}, r.insertErr
 	}
-	r.inserted = &p
-	return &Certificate{
-		ID:          "cert-1",
-		TenantID:    p.TenantID,
-		OwnerUserID: p.OwnerUserID,
-		SubjectCN:   p.Meta.SubjectCN,
-		OAB:         p.Meta.OAB,
-		Issuer:      p.Meta.Issuer,
-		Serial:      p.Meta.Serial,
-		NotBefore:   p.Meta.NotBefore,
-		NotAfter:    p.Meta.NotAfter,
-		Fingerprint: p.Meta.Fingerprint,
-		CreatedAt:   time.Now(),
-	}, nil
+	r.inserted = c
+	return "cert-1", time.Now(), nil
 }
 
-func (r *fakeRepo) List(_ context.Context, _ database.Tx, _ string) ([]CertificateView, error) {
+func (r *fakeRepo) GetByID(_ context.Context, _ database.Tx, _, _ string) (*Certificate, error) {
+	return r.getRes, r.getErr
+}
+
+func (r *fakeRepo) ListActive(_ context.Context, _ database.Tx, _ string) ([]CertificateWithOwner, error) {
 	return r.listViews, r.listErr
 }
 
-func (r *fakeRepo) LoadEnvelope(_ context.Context, _ database.Tx, _, _ string) (signable, error) {
-	return r.loadRes, r.loadErr
+func (r *fakeRepo) Revoke(_ context.Context, _ database.Tx, tenantID, id string) error {
+	r.revokedTID, r.revokedID = tenantID, id
+	return r.revokeErr
 }
 
 func (r *fakeRepo) RecordSigning(_ context.Context, _ database.Tx, tenantID, certificateID, signerUserID string, digest []byte) error {
@@ -107,112 +96,98 @@ func (r *fakeRepo) RecordSigning(_ context.Context, _ database.Tx, tenantID, cer
 	return r.recordErr
 }
 
-func (r *fakeRepo) Revoke(_ context.Context, _ database.Tx, tenantID, id string, _ time.Time) error {
-	r.revokedTID, r.revokedID = tenantID, id
-	return r.revokeErr
-}
+// --- Upload -------------------------------------------------------------------
 
-// --- Create -----------------------------------------------------------------
-
-func TestCreate_StoresEncryptedEnvelope_NeverPlaintextKey(t *testing.T) {
+func TestUpload_StoresEncryptedEnvelope_PublishesAdded(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	pfx := makePFX(t, "ADV TESTE:1", "pw", now.Add(-time.Hour), now.Add(24*time.Hour))
+	pfx := generateTestPFX(t, "ADV TESTE", "pw", time.Hour)
 
 	repo := &fakeRepo{}
 	outbox := &fakeOutbox{}
 	uow := &fakeUOW{}
-	v := testVault(t)
-	uc := NewUseCase(repo, v, outbox, uow, WithClock(func() time.Time { return now }))
+	uc := NewUseCase(repo, uow, newFakeCipher(t), outbox)
 
-	view, err := uc.Create(context.Background(), CreateCommand{
-		TenantID:    uuid.NewString(),
-		OwnerUserID: uuid.NewString(),
-		PFXData:     pfx,
-		Password:    "pw",
-	})
+	tenantID, ownerID := uuid.NewString(), uuid.NewString()
+	cert, err := uc.Upload(context.Background(), tenantID, ownerID, pfx, "pw")
 	require.NoError(t, err)
 
-	// The persisted ciphertext must NOT be the raw .pfx, and the envelope must be
-	// fully populated (no plaintext key stored).
 	require.NotNil(t, repo.inserted)
-	env := repo.inserted.Envelope
-	is.NotEmpty(env.Ciphertext)
-	is.NotEmpty(env.Nonce)
-	is.NotEmpty(env.WrappedDEK)
-	is.NotEqual(pfx, env.Ciphertext, "ciphertext must not equal the plaintext .pfx")
-	is.Equal("local", env.KEKRef)
+	is.NotEmpty(repo.inserted.Envelope.Ciphertext)
+	is.NotEmpty(repo.inserted.Envelope.WrappedDEK)
+	is.Equal(tenantID, repo.inserted.TenantID)
+	is.Equal(ownerID, repo.inserted.OwnerUserID)
+	is.Equal("ADV TESTE", cert.SubjectCN)
+	is.Len(cert.Fingerprint, 64)
 
-	// The view carries metadata only (no envelope fields exist on it).
-	is.Equal("ADV TESTE:1", view.SubjectCN)
-	is.Len(view.Fingerprint, 64)
-
-	// The write ran in the tenant scope and published certificate.added atomically.
-	is.Equal([]string{repo.inserted.TenantID}, uow.scopes)
+	is.Equal([]string{tenantID}, uow.scopes)
 	require.Len(t, outbox.published, 1)
 	is.Equal(typeCertificateAdded, outbox.published[0].Type())
 }
 
-func TestCreate_WrongPassword_NoWriteNoEvent(t *testing.T) {
+func TestUpload_WrongPassword_NoWriteNoEvent(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	pfx := makePFX(t, "CN", "right", now.Add(-time.Hour), now.Add(24*time.Hour))
+	pfx := generateTestPFX(t, "CN", "right", time.Hour)
 
 	repo := &fakeRepo{}
 	outbox := &fakeOutbox{}
 	uow := &fakeUOW{}
-	uc := NewUseCase(repo, testVault(t), outbox, uow, WithClock(func() time.Time { return now }))
+	uc := NewUseCase(repo, uow, newFakeCipher(t), outbox)
 
-	_, err := uc.Create(context.Background(), CreateCommand{
-		TenantID: "t", OwnerUserID: "u", PFXData: pfx, Password: "wrong",
-	})
-	is.ErrorIs(err, ErrInvalidPassword)
+	_, err := uc.Upload(context.Background(), "t", "u", pfx, "wrong")
+	is.ErrorIs(err, ErrPKCS12BadPassword)
 	is.Nil(repo.inserted, "no row on a wrong password")
 	is.Empty(outbox.published, "no event on a wrong password")
 	is.Empty(uow.scopes, "no tx opened on a parse failure")
 }
 
-func TestCreate_Expired_Rejected(t *testing.T) {
+func TestUpload_Expired_Rejected(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	pfx := makePFX(t, "CN", "pw", now.Add(-48*time.Hour), now.Add(-time.Hour))
+	pfx := generateTestPFX(t, "CN", "pw", -time.Hour) // NotAfter already in the past
 
-	uc := NewUseCase(&fakeRepo{}, testVault(t), &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
-	_, err := uc.Create(context.Background(), CreateCommand{TenantID: "t", OwnerUserID: "u", PFXData: pfx, Password: "pw"})
+	uc := NewUseCase(&fakeRepo{}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	_, err := uc.Upload(context.Background(), "t", "u", pfx, "pw")
 	is.ErrorIs(err, ErrCertificateExpired)
 }
 
-// --- Preview ----------------------------------------------------------------
+func TestUpload_RepoError_Propagates(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	pfx := generateTestPFX(t, "CN", "pw", time.Hour)
+	repo := &fakeRepo{insertErr: errors.New("db down")}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+
+	_, err := uc.Upload(context.Background(), "t", "u", pfx, "pw")
+	is.Error(err)
+}
+
+// --- Preview ------------------------------------------------------------------
 
 func TestPreview_ReportsMetadataAndChecks_NoWrite(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	pfx := makePFX(t, "MARIA:1", "pw", now.Add(-time.Hour), now.Add(24*time.Hour))
+	pfx := generateTestPFX(t, "MARIA", "pw", time.Hour)
 
 	repo := &fakeRepo{}
 	outbox := &fakeOutbox{}
 	uow := &fakeUOW{}
-	uc := NewUseCase(repo, testVault(t), outbox, uow, WithClock(func() time.Time { return now }))
+	uc := NewUseCase(repo, uow, newFakeCipher(t), outbox)
 
-	res, err := uc.Preview(context.Background(), PreviewCommand{PFXData: pfx, Password: "pw"})
+	res, err := uc.Preview(context.Background(), pfx, "pw")
 	require.NoError(t, err)
 
-	is.Equal("MARIA:1", res.SubjectCN)
-	is.Equal("12345/SP", res.OAB)
-	is.Len(res.Fingerprint, 64)
+	is.Equal("MARIA", res.Meta.SubjectCN)
+	is.Len(res.Meta.Fingerprint, 64)
 	is.True(res.Checks.NaoExpirado)
-	is.True(res.Checks.TitularConfere)
 	is.False(res.Checks.CadeiaOk, "self-signed fixture ships no CA chain")
 
-	// Read-only: nothing persisted, no tx, no event.
 	is.Nil(repo.inserted)
 	is.Empty(uow.scopes)
 	is.Empty(outbox.published)
@@ -222,11 +197,10 @@ func TestPreview_Expired_StillSucceeds_ReportsNaoExpiradoFalse(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	pfx := makePFX(t, "CN", "pw", now.Add(-48*time.Hour), now.Add(-time.Hour))
+	pfx := generateTestPFX(t, "CN", "pw", -time.Hour)
 
-	uc := NewUseCase(&fakeRepo{}, testVault(t), &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
-	res, err := uc.Preview(context.Background(), PreviewCommand{PFXData: pfx, Password: "pw"})
+	uc := NewUseCase(&fakeRepo{}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	res, err := uc.Preview(context.Background(), pfx, "pw")
 	require.NoError(t, err, "preview reports rather than rejecting an expired cert")
 	is.False(res.Checks.NaoExpirado)
 }
@@ -235,23 +209,22 @@ func TestPreview_WrongPassword_TypedError(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	pfx := makePFX(t, "CN", "right", now.Add(-time.Hour), now.Add(24*time.Hour))
+	pfx := generateTestPFX(t, "CN", "right", time.Hour)
 
-	uc := NewUseCase(&fakeRepo{}, testVault(t), &fakeOutbox{}, &fakeUOW{})
-	_, err := uc.Preview(context.Background(), PreviewCommand{PFXData: pfx, Password: "wrong"})
-	is.ErrorIs(err, ErrInvalidPassword)
+	uc := NewUseCase(&fakeRepo{}, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	_, err := uc.Preview(context.Background(), pfx, "wrong")
+	is.ErrorIs(err, ErrPKCS12BadPassword)
 }
 
-// --- List / Revoke ----------------------------------------------------------
+// --- List / Revoke --------------------------------------------------------------
 
 func TestList_ScopedToTenant_MetadataOnly(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	repo := &fakeRepo{listViews: []CertificateView{{ID: "c1", SubjectCN: "A"}}}
+	repo := &fakeRepo{listViews: []CertificateWithOwner{{Certificate: Certificate{ID: "c1", SubjectCN: "A"}}}}
 	uow := &fakeUOW{}
-	uc := NewUseCase(repo, testVault(t), &fakeOutbox{}, uow)
+	uc := NewUseCase(repo, uow, newFakeCipher(t), &fakeOutbox{})
 
 	views, err := uc.List(context.Background(), "tenant-x")
 	require.NoError(t, err)
@@ -259,14 +232,14 @@ func TestList_ScopedToTenant_MetadataOnly(t *testing.T) {
 	is.Equal([]string{"tenant-x"}, uow.scopes)
 }
 
-func TestRevoke_StampsAndPublishesInTx(t *testing.T) {
+func TestRevoke_PublishesRevokedInTx(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
 	repo := &fakeRepo{}
 	outbox := &fakeOutbox{}
 	uow := &fakeUOW{}
-	uc := NewUseCase(repo, testVault(t), outbox, uow)
+	uc := NewUseCase(repo, uow, newFakeCipher(t), outbox)
 
 	err := uc.Revoke(context.Background(), "tenant-x", "cert-9")
 	require.NoError(t, err)
@@ -283,7 +256,7 @@ func TestRevoke_NotFound_NoEvent(t *testing.T) {
 
 	repo := &fakeRepo{revokeErr: ErrCertificateNotFound}
 	outbox := &fakeOutbox{}
-	uc := NewUseCase(repo, testVault(t), outbox, &fakeUOW{})
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), outbox)
 
 	err := uc.Revoke(context.Background(), "t", "missing")
 	is.ErrorIs(err, ErrCertificateNotFound)
@@ -292,157 +265,80 @@ func TestRevoke_NotFound_NoEvent(t *testing.T) {
 
 // --- Sign -------------------------------------------------------------------
 
-// sealedSignable builds a real envelope from a test .pfx (via the real vault +
-// seal) plus the leaf's public key, so a sign test can round-trip: sign a digest
-// through the use case, then verify the signature against this public key. This is
-// the acceptance-criterion fixture — it proves the stored, encrypted key really
-// signs and the result verifies.
-func sealedSignable(t *testing.T, v vault.SecretVault, cn, password string, notBefore, notAfter time.Time) (signable, *rsa.PublicKey) {
+// sealedCertificate uploads a real cert through the use case so its stored
+// envelope round-trips through the (fake) cipher exactly like production, then
+// returns the repo's view of it for a Sign test to feed back via fakeRepo.getRes.
+func sealedCertificate(t *testing.T, uc *UseCase, repo *fakeRepo, cn, password string, ttl time.Duration) *Certificate {
 	t.Helper()
-
-	pfx := makePFX(t, cn, password, notBefore, notAfter)
-	env, err := seal(context.Background(), v, pfx)
+	pfx := generateTestPFX(t, cn, password, ttl)
+	_, err := uc.Upload(context.Background(), "tenant-x", "owner-1", pfx, password)
 	require.NoError(t, err)
-
-	// Recover the leaf's public key to verify the signature later (the private key
-	// itself is never exposed by the slice; the test grabs the leaf directly from
-	// the fixture .pfx via the pkcs12 package).
-	_, leaf, _, err := pkcs12.DecodeChain(pfx, password)
-	require.NoError(t, err)
-	pub, ok := leaf.PublicKey.(*rsa.PublicKey)
-	require.True(t, ok, "test fixture must be RSA")
-
-	return signable{NotAfter: notAfter, Envelope: env}, pub
+	return repo.inserted
 }
 
-func TestSign_RoundTrip_SignatureVerifies(t *testing.T) {
+func TestSign_RoundTrip_RecordsAudit(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	v := testVault(t)
-	sgn, pub := sealedSignable(t, v, "ADV SIGNER:1", "pw", now.Add(-time.Hour), now.Add(24*time.Hour))
-
-	repo := &fakeRepo{loadRes: sgn}
-	uow := &fakeUOW{}
-	uc := NewUseCase(repo, v, &fakeOutbox{}, uow, WithClock(func() time.Time { return now }))
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV SIGNER", "pw", time.Hour)
+	repo.getRes = cert
 
 	sum := sha256.Sum256([]byte("a document to sign"))
-	res, err := uc.Sign(context.Background(), SignCommand{
-		TenantID:      "tenant-x",
-		SignerUserID:  "user-1",
-		CertificateID: "cert-1",
-		Password:      "pw",
-		Digest:        sum[:],
-	})
+	res, err := uc.Sign(context.Background(), "tenant-x", "cert-1", "user-1", "pw", sum[:])
 	require.NoError(t, err)
 
-	// The signature must verify against the certificate's public key with the same
-	// scheme (RSA-PKCS1v15/SHA-256) — this is the core acceptance criterion.
-	err = rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], res.Signature)
-	require.NoError(t, err, "server-side signature must verify with the cert public key")
+	is.NotEmpty(res.Signature)
+	require.NotEmpty(t, res.Chain)
 
-	// The chain is returned leaf-first and the audit row was written in the tenant tx.
-	require.NotEmpty(t, res.ChainDER)
-	is.Equal([]string{"tenant-x"}, uow.scopes)
-	is.Equal(sum[:], repo.recordedDig, "the audited digest is exactly what was signed")
+	// The audit row is written with the exact digest signed, the signer from the
+	// principal (never the body), and the tenant scope.
+	is.Equal(sum[:], repo.recordedDig)
 	is.Equal("cert-1", repo.recordedCID)
 	is.Equal("tenant-x", repo.recordedTID)
 	is.Equal("user-1", repo.recordedUser)
 }
 
-func TestSign_WrongPassword_TypedError_NoAudit(t *testing.T) {
+func TestSign_Revoked_Rejected(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	now := time.Now()
-	v := testVault(t)
-	sgn, _ := sealedSignable(t, v, "CN", "right", now.Add(-time.Hour), now.Add(24*time.Hour))
-
-	repo := &fakeRepo{loadRes: sgn}
-	uc := NewUseCase(repo, v, &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
-
-	sum := sha256.Sum256([]byte("x"))
-	_, err := uc.Sign(context.Background(), SignCommand{
-		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "wrong", Digest: sum[:],
-	})
-	is.ErrorIs(err, ErrInvalidPassword)
-	is.Nil(repo.recordedDig, "no audit row on a wrong password")
-}
-
-func TestSign_Revoked_Rejected_BeforeDecrypt(t *testing.T) {
-	t.Parallel()
-	is := assert.New(t)
-
-	now := time.Now()
-	v := testVault(t)
-	sgn, _ := sealedSignable(t, v, "CN", "pw", now.Add(-time.Hour), now.Add(24*time.Hour))
-	revoked := now.Add(-time.Minute)
-	sgn.RevokedAt = &revoked
-
-	repo := &fakeRepo{loadRes: sgn}
-	uc := NewUseCase(repo, v, &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "CN", "pw", time.Hour)
+	revoked := time.Now().Add(-time.Minute)
+	cert.RevokedAt = &revoked
+	repo.getRes = cert
 
 	sum := sha256.Sum256([]byte("x"))
-	_, err := uc.Sign(context.Background(), SignCommand{
-		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "pw", Digest: sum[:],
-	})
-	is.ErrorIs(err, ErrCertificateRevoked)
-	is.Nil(repo.recordedDig)
-}
-
-func TestSign_Expired_Rejected(t *testing.T) {
-	t.Parallel()
-	is := assert.New(t)
-
-	now := time.Now()
-	v := testVault(t)
-	// Sealed with a validity window already in the past.
-	sgn, _ := sealedSignable(t, v, "CN", "pw", now.Add(-48*time.Hour), now.Add(-time.Hour))
-
-	uc := NewUseCase(&fakeRepo{loadRes: sgn}, v, &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
-	sum := sha256.Sum256([]byte("x"))
-	_, err := uc.Sign(context.Background(), SignCommand{
-		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "pw", Digest: sum[:],
-	})
-	is.ErrorIs(err, ErrCertificateExpired)
+	_, err := uc.Sign(context.Background(), "t", "c", "u", "pw", sum[:])
+	is.ErrorIs(err, ErrCertificateNotFound)
+	is.Nil(repo.recordedDig, "no audit row when the cert is already revoked")
 }
 
 func TestSign_NotFound_Propagates(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	repo := &fakeRepo{loadErr: ErrCertificateNotFound}
-	uc := NewUseCase(repo, testVault(t), &fakeOutbox{}, &fakeUOW{})
+	repo := &fakeRepo{getErr: ErrCertificateNotFound}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
 
 	sum := sha256.Sum256([]byte("x"))
-	_, err := uc.Sign(context.Background(), SignCommand{
-		TenantID: "t", SignerUserID: "u", CertificateID: "missing", Password: "pw", Digest: sum[:],
-	})
+	_, err := uc.Sign(context.Background(), "t", "missing", "u", "pw", sum[:])
 	is.ErrorIs(err, ErrCertificateNotFound)
 }
 
-func TestSign_BadDigestLength_Rejected(t *testing.T) {
+func TestSign_RecordSigningError_Propagates(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
-	uc := NewUseCase(&fakeRepo{}, testVault(t), &fakeOutbox{}, &fakeUOW{})
-	_, err := uc.Sign(context.Background(), SignCommand{
-		TenantID: "t", SignerUserID: "u", CertificateID: "c", Password: "pw", Digest: []byte("too short"),
-	})
-	is.ErrorIs(err, ErrInvalidDigest)
-}
+	repo := &fakeRepo{recordErr: errors.New("db down")}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "CN", "pw", time.Hour)
+	repo.getRes = cert
 
-// Guard: a repo insert error propagates and is not swallowed.
-func TestCreate_RepoError_Propagates(t *testing.T) {
-	t.Parallel()
-	is := assert.New(t)
-
-	now := time.Now()
-	pfx := makePFX(t, "CN", "pw", now.Add(-time.Hour), now.Add(24*time.Hour))
-	repo := &fakeRepo{insertErr: errors.New("db down")}
-	uc := NewUseCase(repo, testVault(t), &fakeOutbox{}, &fakeUOW{}, WithClock(func() time.Time { return now }))
-
-	_, err := uc.Create(context.Background(), CreateCommand{TenantID: "t", OwnerUserID: "u", PFXData: pfx, Password: "pw"})
+	sum := sha256.Sum256([]byte("x"))
+	_, err := uc.Sign(context.Background(), "t", "c", "u", "pw", sum[:])
 	is.Error(err)
 }

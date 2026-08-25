@@ -25,6 +25,9 @@ type Repository interface {
 	GetByID(ctx context.Context, tx database.Tx, tenantID, id string) (*Certificate, error)
 	ListActive(ctx context.Context, tx database.Tx, tenantID string) ([]CertificateWithOwner, error)
 	Revoke(ctx context.Context, tx database.Tx, tenantID, id string) error
+	// RecordSigning appends an audit row (signing_event) for a server-side signature —
+	// digest only, never the signature or key material.
+	RecordSigning(ctx context.Context, tx database.Tx, tenantID, certificateID, signerUserID string, digest []byte) error
 }
 
 // CertificateWithOwner é o shape do read model da lista — inclui o nome do
@@ -163,6 +166,31 @@ func (r *pgRepository) Revoke(ctx context.Context, tx database.Tx, tenantID, id 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrCertificateNotFound
 	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func (r *pgRepository) RecordSigning(ctx context.Context, tx database.Tx, tenantID, certificateID, signerUserID string, digest []byte) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return apperr.NewInvalid("tenant id inválido")
+	}
+	cid, err := uuid.Parse(certificateID)
+	if err != nil {
+		return apperr.NewInvalid("id do certificado inválido")
+	}
+	uid, err := uuid.Parse(signerUserID)
+	if err != nil {
+		return apperr.NewInvalid("signer id inválido")
+	}
+	_, err = certificatedb.New(tx).InsertSigningEvent(ctx, certificatedb.InsertSigningEventParams{
+		TenantID:      tid,
+		CertificateID: cid,
+		SignerUserID:  uid,
+		DigestSha256:  digest,
+	})
 	if err != nil {
 		return database.WrapInfra(err)
 	}

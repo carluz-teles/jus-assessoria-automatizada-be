@@ -1,4 +1,4 @@
--- 0054_task_comment — the discussion thread of a task (docs/erd-prazos.md §4/§10, the Tarefa
+-- 0067_task_comment — the discussion thread of a task (docs/erd-prazos.md §4/§10, the Tarefa
 -- detail's "Comentários" tab). A task (the actionable work item, 0024) grows a chronological
 -- list of free-text comments written by team members ("Já protocolei", "Aguardando cliente",
 -- …). The detail view lists them oldest-first with the author resolved to a name.
