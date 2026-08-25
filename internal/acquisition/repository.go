@@ -1813,7 +1813,20 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		AISummary:         deref(row.AiSummary),
 		AIProvidencias:    decodeProvidencias(row.AiProvidencias),
 		AIAnalyzedAt:      timestampPtr(row.AiAnalyzedAt),
+		ClaimValue:        numericStr(row.ClaimValue),
+		Plaintiffs:        stringsOrEmpty(row.Plaintiffs),
+		Defendants:        stringsOrEmpty(row.Defendants),
 	}, nil
+}
+
+// stringsOrEmpty normalizes a possibly-nil string slice (array_agg over zero rows
+// comes back nil) to an initialized empty slice, so the read model never carries nil
+// and the JSON serializes as [] rather than null.
+func stringsOrEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // decodeProvidencias unmarshals the intimation.ai_providencias jsonb into the wire slice.

@@ -166,6 +166,15 @@ type IntimacaoDetailView struct {
 	AISummary      string                     `json:"ai_summary,omitempty"`
 	AIProvidencias []IntimacaoProvidenciaView `json:"ai_providencias"`
 	AIAnalyzedAt   *time.Time                 `json:"ai_analyzed_at"`
+
+	// Partes + valor da causa (débito do preview da intimação): lidos direto de
+	// party + court_record no GetIntimacao. ClaimValue é o valor da causa como
+	// string decimal (nil/JSON null quando NULL); Plaintiffs (autor/polo ativo) e
+	// Defendants (réu/polo passivo) são os nomes das partes, nunca null (array
+	// vazio quando não há partes cadastradas — dado ainda não ingerido).
+	ClaimValue *string  `json:"claim_value"`
+	Plaintiffs []string `json:"plaintiffs"`
+	Defendants []string `json:"defendants"`
 }
 
 // ProcessosSummaryView is the KPI header of the processes list (GET

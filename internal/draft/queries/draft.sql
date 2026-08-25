@@ -100,6 +100,22 @@ SELECT
     cr.class        AS process_class,
     cr.subject      AS process_subject,
     cr.judging_body AS process_judging_body,
+    cr.claim_value  AS process_claim_value,
+    -- partes (autor/réu) do processo, agregadas por polo. Correlated subqueries
+    -- sobre party (mesma case_id + tenant do court_record) — o slice lê party
+    -- direto, sem importar acquisition (mesmo padrão do JOIN em court_record).
+    -- Cast ::text[] para o sqlc inferir []string; NULL (nenhuma parte) vira nil
+    -- slice, que o mapper normaliza para []string{} vazio. Ordenado por name.
+    (SELECT array_agg(p.name ORDER BY p.name)
+       FROM party p
+      WHERE p.case_id = cr.case_id
+        AND p.tenant_id = cr.tenant_id
+        AND p.role = 'PLAINTIFF')::text[] AS process_plaintiffs,
+    (SELECT array_agg(p.name ORDER BY p.name)
+       FROM party p
+      WHERE p.case_id = cr.case_id
+        AND p.tenant_id = cr.tenant_id
+        AND p.role = 'DEFENDANT')::text[] AS process_defendants,
 
     -- deadline fields (NULL when no intimation or no deadline derived yet)
     dl.id           AS deadline_id,
