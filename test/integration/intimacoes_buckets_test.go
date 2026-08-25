@@ -92,10 +92,10 @@ func TestListIntimacoes_UrgenciaBucketBoundaries(t *testing.T) {
 	}
 }
 
-// TestListIntimacoes_AssigneeMe_MatchesConductorOrReviewer covers the "Minhas" toggle:
-// ?assignee resolves to a user id that matches EITHER the condutor OR the revisor —
-// the Architect's OR-between-roles decision.
-func TestListIntimacoes_AssigneeMe_MatchesConductorOrReviewer(t *testing.T) {
+// TestListIntimacoes_AssigneeMe_MatchesSingleAssignee covers the "Minhas" toggle:
+// ?assignee resolves to a user id that matches assignee_user_id (0057 consolidated
+// the old condutor/revisor pair into this single column).
+func TestListIntimacoes_AssigneeMe_MatchesSingleAssignee(t *testing.T) {
 	pool := newPool(t)
 	repo := acquisition.NewRepository(pool)
 	uc := acquisition.NewReadUseCase(repo)
@@ -104,21 +104,16 @@ func TestListIntimacoes_AssigneeMe_MatchesConductorOrReviewer(t *testing.T) {
 	tenantID := uuid.NewString()
 	seedTenant(t, pool, tenantID, "org-assignee-me", 0)
 
-	// The SAME target user (underTest) is the condutor of one intimação and the revisor
-	// of another — proving the OR between the two roles, not just a single-column match.
 	underTest := seedAppUserReturningID(t, pool, tenantID, "org-assignee-me-under-test", "under-test@org-assignee-me.test")
 	otherID := seedAppUserReturningID(t, pool, tenantID, "org-assignee-me-other", "other@org-assignee-me.test")
 
 	recA, caseA := seedCourtRecordCNJ(t, pool, tenantID, "0005000-11.2026.8.26.0001")
-	recB, caseB := seedCourtRecordCNJ(t, pool, tenantID, "0006000-22.2026.8.26.0002")
 	recC, caseC := seedCourtRecordCNJ(t, pool, tenantID, "0007000-33.2026.8.26.0003")
 
-	asConductor := seedIntimationReturningID(t, pool, tenantID, caseA, recA)
-	mustExec(t, pool, `UPDATE intimation SET conductor_user_id = $1 WHERE id = $2`, underTest, asConductor)
-	asReviewer := seedIntimationReturningID(t, pool, tenantID, caseB, recB)
-	mustExec(t, pool, `UPDATE intimation SET reviewer_user_id = $1 WHERE id = $2`, underTest, asReviewer)
+	assigned := seedIntimationReturningID(t, pool, tenantID, caseA, recA)
+	mustExec(t, pool, `UPDATE intimation SET assignee_user_id = $1 WHERE id = $2`, underTest, assigned)
 	unrelated := seedIntimationReturningID(t, pool, tenantID, caseC, recC)
-	mustExec(t, pool, `UPDATE intimation SET conductor_user_id = $1 WHERE id = $2`, otherID, unrelated)
+	mustExec(t, pool, `UPDATE intimation SET assignee_user_id = $1 WHERE id = $2`, otherID, unrelated)
 
 	got, err := uc.Intimacoes(ctx, acquisition.IntimacoesQuery{
 		TenantID: tenantID, Limit: 20, LastMadeAvailable: maxDateLit, LastID: maxUUIDlit,
@@ -127,14 +122,7 @@ func TestListIntimacoes_AssigneeMe_MatchesConductorOrReviewer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Intimacoes (assignee): %v", err)
 	}
-	gotIDs := map[string]bool{}
-	for _, item := range got.Items {
-		gotIDs[item.ID] = true
-	}
-	if len(got.Items) != 2 || !gotIDs[asConductor] || !gotIDs[asReviewer] {
-		t.Fatalf("assignee=underTest: got %v, want exactly [%s, %s] (condutor OR revisor)", gotIDs, asConductor, asReviewer)
-	}
-	if gotIDs[unrelated] {
-		t.Errorf("assignee=underTest unexpectedly matched an unrelated intimação %s", unrelated)
+	if len(got.Items) != 1 || got.Items[0].ID != assigned {
+		t.Fatalf("assignee=underTest: got %d items, want exactly [%s]", len(got.Items), assigned)
 	}
 }

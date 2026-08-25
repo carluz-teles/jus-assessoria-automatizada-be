@@ -16,5 +16,13 @@
 -- Persistência: pg_db_role_setting sobrevive a restart do container. Em prod
 -- (Railway), esta migration garante que o setting seja aplicado a novos
 -- ambientes sem ter que rodar comando manual.
+--
+-- ALTER DATABASE exige um identificador literal (não aceita current_database()
+-- direto) — current_database() via EXECUTE dinâmico faz a migration funcionar
+-- em qualquer nome de banco (dev, testcontainers, Railway), não só "jusassessoria".
 
-ALTER DATABASE jusassessoria SET timezone = 'America/Sao_Paulo';
+DO $$
+BEGIN
+  EXECUTE format('ALTER DATABASE %I SET timezone = %L', current_database(), 'America/Sao_Paulo');
+END
+$$;

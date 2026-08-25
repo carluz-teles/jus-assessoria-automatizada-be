@@ -74,10 +74,11 @@ func (f *integrationFakeGen) GenerateJSONStream(_ context.Context, _ llm.Request
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 // cannedGenerationJSON is the JSON returned by the fake generator.
-// Gerar (OnGenerationRequested) only produces draft_content now — suggestions are
+// Gerar (OnGenerationRequested) only produces draft_markdown now (v8 streaming
+// markdown — converted to HTML via goldmark before persisting) — suggestions are
 // the responsibility of Revisar (ReviewDraft). No "suggestions" field here.
 const cannedGenerationJSON = `{
-  "draft_content": "Excelentíssimo Senhor Juiz, vem o réu apresentar contestação. Argumento jurídico claro."
+  "draft_markdown": "Excelentíssimo Senhor Juiz, vem o réu apresentar contestação. Argumento jurídico claro."
 }`
 
 // cannedReviewJSON is the JSON returned by the fake generator for Revisar

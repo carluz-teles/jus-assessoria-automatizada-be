@@ -2,4 +2,8 @@
 -- Só use em rollback intencional — o efeito reintroduz o bug de "1 dia em
 -- atraso" após 21h BRT nas queries de prazo (documentado no up).
 
-ALTER DATABASE jusassessoria RESET timezone;
+DO $$
+BEGIN
+  EXECUTE format('ALTER DATABASE %I RESET timezone', current_database());
+END
+$$;

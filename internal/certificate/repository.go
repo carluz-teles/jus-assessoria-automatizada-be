@@ -160,8 +160,9 @@ func (r *pgRepository) Revoke(ctx context.Context, tx database.Tx, tenantID, id 
 		return apperr.NewInvalid("id do certificado inválido")
 	}
 	_, err = certificatedb.New(tx).RevokeCertificate(ctx, certificatedb.RevokeCertificateParams{
-		ID:       cid,
-		TenantID: tid,
+		ID:        cid,
+		TenantID:  tid,
+		RevokedAt: pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrCertificateNotFound

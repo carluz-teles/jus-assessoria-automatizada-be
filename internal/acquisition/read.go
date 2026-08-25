@@ -285,7 +285,7 @@ type IntimacoesQuery struct {
 	Court             string // ?court: exact match (from ListIntimacaoCourts); "" = all
 	Urgencia          string // ?urgencia: closed set (atraso|hoje|proximos_dois_dias|semana|este_mes|mais_adiante|sem_data_definida); "" = all
 	NaoConfirmado     bool   // ?nao_confirmado: server-side triage toggle; true = only suggested-not-confirmed deadlines (d.status = 'PENDING')
-	Assignee          string // ?assignee: a user id ("me" resolved by the handler); matches condutor OR revisor; "" = any
+	Assignee          string // ?assignee: a user id ("me" resolved by the handler); matches assignee_user_id (0057 single-assignee); "" = any
 }
 
 // Filtered reports whether any list filter (search included) is active.
