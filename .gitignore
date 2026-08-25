@@ -11,8 +11,11 @@
 /worker-documents
 /worker-ai
 /worker-outbox-relay
+/worker-filing
 /seed
 /cleanup-ingestao
+/eproc-dump
+/gen-fake-cert
 
 # Env & secrets — NUNCA commitar
 .env
