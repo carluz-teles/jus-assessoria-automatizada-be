@@ -135,37 +135,53 @@ type datajudMovimento struct {
 // it always signals an irrecoverable end state. Unknown codes fall through silently
 // to ACTIVE (the safe default).
 //
-// Validated codes:
-//   - 22: Baixa Definitiva (definitive removal from the court's docket)
+// Validated against real DJEN/DATAJUD data (QA sweep). Extend only after confirming a
+// code's semantics in the CNJ TPU (Tabela de Movimentos Processuais).
+//
+// Validated terminal codes:
+//   - 22:  Baixa Definitiva (definitive removal from the court's docket)
+//   - 196: Extinção da execução ou do cumprimento da sentença
 var terminalMovementCodes = map[int]bool{
-	22: true, // Baixa Definitiva
+	22:  true, // Baixa Definitiva
+	196: true, // Extinção da execução ou do cumprimento da sentença
 }
 
-// suspensionMovementCodes is the CONSERVATIVE set of CNJ TPU movement codes that
-// signal a process suspension (Suspensão/Sobrestamento). A process is marked
-// SUSPENDED only when the absolute most-recent movement belongs to this set (i.e.
-// no later movement reverted it, which would mean the process resumed). Unknown
-// codes fall through silently to ACTIVE (safe default).
+// suspensionMovementCodes signal a process suspension (Suspensão/Sobrestamento).
 //
-// Validated codes:
-//   - 25: Suspensão/Sobrestamento
+// Validated suspension codes:
+//   - 25:    Suspensão/Sobrestamento (parent code)
+//   - 12065: Cumprimento de Suspensão ou Sobrestamento
 var suspensionMovementCodes = map[int]bool{
-	25: true, // Suspensão/Sobrestamento
+	25:    true, // Suspensão/Sobrestamento
+	12065: true, // Cumprimento de Suspensão ou Sobrestamento
+}
+
+// reactivationMovementCodes REOPEN a case after a prior close/suspension. When the
+// most-recent STATE signal is a reactivation, the process is ACTIVE regardless of an
+// earlier terminal/suspension movement — this is what makes the derivation robust to
+// a baixa-then-desarquivamento (or suspensão-then-levantamento) history.
+//
+// Validated reactivation codes:
+//   - 893:   Desarquivamento
+//   - 12066: Cumprimento de Levantamento da Suspensão
+var reactivationMovementCodes = map[int]bool{
+	893:   true, // Desarquivamento
+	12066: true, // Cumprimento de Levantamento da Suspensão
 }
 
 // lifecycleFromMovimentos derives the court_record lifecycle from a DATAJUD payload's
 // movimento list, conservative-first: when in doubt, prefer ACTIVE (a false-negative
-// is invisible; a false-positive hides the process from the user).
+// is invisible; a false-positive HIDES the process from the user).
 //
-// Algorithm:
-//  1. Exclude movimentos with unparseable dataHora (same as the entry builder).
-//  2. Sort remaining by dataHora descending (most recent first).
-//  3. Walk the sorted list: if any movement's code is in terminalMovementCodes,
-//     return ARCHIVED — a later procedural step does not un-close a definitively
-//     closed case, so the terminal code wins regardless of position.
-//  4. If the absolute most-recent movement's code is in suspensionMovementCodes,
-//     return SUSPENDED — no later movement overrode it.
-//  5. Otherwise return ACTIVE.
+// Terminal is STICKY, suspension is FRAGILE — they resume differently:
+//  1. Exclude movimentos with unparseable dataHora; sort the rest DESC (newest first).
+//  2. ARCHIVED (sticky): walk newest→oldest — if a terminal code (baixa/extinção) is
+//     reached BEFORE any reactivation code, the case is archived. A reactivation code
+//     (desarquivamento/levantamento) more recent than the terminal short-circuits: the
+//     case was reopened → not archived. Procedural paperwork does NOT un-archive.
+//  3. SUSPENDED (fragile): only when the ABSOLUTE most-recent movement is a suspension
+//     code — any later movement (even procedural) means the process resumed → ACTIVE.
+//  4. Otherwise ACTIVE.
 func lifecycleFromMovimentos(movs []datajudMovimento) string {
 	type timed struct {
 		codigo int
@@ -190,14 +206,17 @@ func lifecycleFromMovimentos(movs []datajudMovimento) string {
 		}
 	}
 
-	// Terminal check: walk all movements; first terminal code encountered → ARCHIVED.
+	// Terminal is sticky: newest→oldest, a reactivation short-circuits before a terminal.
 	for _, m := range valid {
+		if reactivationMovementCodes[m.codigo] {
+			break // reopened after (or with no) terminal → not archived
+		}
 		if terminalMovementCodes[m.codigo] {
 			return LifecycleArchived
 		}
 	}
 
-	// Suspension check: only if the absolute most-recent movement signals suspension.
+	// Suspension is fragile: only if the absolute most-recent movement suspends.
 	if suspensionMovementCodes[valid[0].codigo] {
 		return LifecycleSuspended
 	}

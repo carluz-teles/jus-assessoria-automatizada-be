@@ -232,7 +232,7 @@ const summarizeProcessVersion = "process_summary/v1"
 // recipient) no prompt, eliminando os placeholders [Nome do Advogado]/OAB nº [número] e os nomes
 // de parte adivinhados do teor. Quando fornecidos, devem ser usados diretamente; marcadores só
 // quando genuinamente ausentes.
-const draftMinutaVersion = "draft_minuta/v4"
+const draftMinutaVersion = "draft_minuta/v5"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -406,7 +406,9 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"(PLAINTIFF = autor/exequente/requerente; DEFENDANT = réu/executado/requerido); o advogado " +
 			"signatário (nome + OAB/UF fornecidos) no FECHO, substituindo os marcadores " +
 			"[Nome do Advogado]/[número]. Só use os marcadores se o advogado NÃO for fornecido. " +
-			"Prefira SEMPRE a parte estruturada ao que você extrairia do teor da intimação.\n\n" +
+			"Prefira SEMPRE a parte estruturada ao que você extrairia do teor da intimação. " +
+			"Escreva os nomes das partes e do advogado EXATAMENTE como fornecidos (verbatim) — NUNCA " +
+			"corrija, abrevie, traduza, complete ou altere um nome próprio.\n\n" +
 
 			"ESTRUTURA CANÔNICA (nesta ordem, blocos separados por linha em branco):\n" +
 			"1) ENDEREÇAMENTO em CAIXA ALTA, adaptado ao foro: Vara Cível comum → " +
