@@ -10,10 +10,14 @@
 -- name: InsertBackfillJob :one
 -- Create the onboarding backfill job. total_slices is precomputed by the use
 -- case; the counters default to zero and status is passed explicitly so a
--- zero-slice horizon can land COMPLETED instead of RUNNING.
+-- zero-slice horizon can land COMPLETED instead of RUNNING. trigger_reason/
+-- trigger_oabs attribute the job to the OAB(s) that caused it (always
+-- 'OAB_ADDED' today — see backfill.go's createBackfillForScope), so the
+-- Capturas screen can show "OAB adicionada — SP347019" instead of an anonymous
+-- "carga inicial".
 INSERT INTO backfill_job
-    (tenant_id, integration_id, window_from, window_to, total_slices, status)
-VALUES ($1, $2, $3, $4, $5, $6)
+    (tenant_id, integration_id, window_from, window_to, total_slices, status, trigger_reason, trigger_oabs)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id;
 
 -- name: IncrementBackfillSlicesOK :one

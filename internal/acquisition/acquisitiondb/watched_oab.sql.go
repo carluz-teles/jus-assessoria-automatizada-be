@@ -35,9 +35,9 @@ func (q *Queries) ClearWatchedOABCatchUp(ctx context.Context, arg ClearWatchedOA
 
 const disableWatchedOAB = `-- name: DisableWatchedOAB :one
 UPDATE watched_oab
-   SET enabled = false, disabled_at = now()
+   SET enabled = false, disabled_at = now(), last_action = 'DISABLED', last_action_at = now()
  WHERE integration_id = $1 AND oab_key = $2 AND enabled = true
-RETURNING id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since
+RETURNING id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since, last_action, last_action_at
 `
 
 type DisableWatchedOABParams struct {
@@ -61,12 +61,14 @@ func (q *Queries) DisableWatchedOAB(ctx context.Context, arg DisableWatchedOABPa
 		&i.Enabled,
 		&i.DisabledAt,
 		&i.CatchUpSince,
+		&i.LastAction,
+		&i.LastActionAt,
 	)
 	return i, err
 }
 
 const getWatchedOAB = `-- name: GetWatchedOAB :one
-SELECT id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since FROM watched_oab WHERE integration_id = $1 AND oab_key = $2
+SELECT id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since, last_action, last_action_at FROM watched_oab WHERE integration_id = $1 AND oab_key = $2
 `
 
 type GetWatchedOABParams struct {
@@ -88,6 +90,8 @@ func (q *Queries) GetWatchedOAB(ctx context.Context, arg GetWatchedOABParams) (W
 		&i.Enabled,
 		&i.DisabledAt,
 		&i.CatchUpSince,
+		&i.LastAction,
+		&i.LastActionAt,
 	)
 	return i, err
 }
@@ -96,7 +100,12 @@ const listWatchedOABsWithName = `-- name: ListWatchedOABsWithName :many
 SELECT
     (split_part(w.oab_key, '|', 2) || split_part(w.oab_key, '|', 1))::text AS oab,
     COALESCE(mode() WITHIN GROUP (ORDER BY pc.name), '')::text AS name,
-    bool_and(w.enabled)::bool AS enabled
+    bool_and(w.enabled)::bool AS enabled,
+    -- COALESCE to '' (not a bare ::text cast) so sqlc infers a NOT NULL string
+    -- without a scan panic on rows created before this column existed (NULL) —
+    -- same fix as the ` + "`" + `name` + "`" + ` COALESCE above, for the same sqlc-nullability gotcha.
+    COALESCE(max(w.last_action), '')::text AS last_action,
+    max(w.last_action_at)::timestamptz AS last_action_at
 FROM watched_oab w
 JOIN integration i ON i.id = w.integration_id AND i.source = 'DJEN'
 LEFT JOIN party_counsel pc
@@ -109,9 +118,11 @@ ORDER BY w.oab_key
 `
 
 type ListWatchedOABsWithNameRow struct {
-	Oab     string `json:"oab"`
-	Name    string `json:"name"`
-	Enabled bool   `json:"enabled"`
+	Oab          string             `json:"oab"`
+	Name         string             `json:"name"`
+	Enabled      bool               `json:"enabled"`
+	LastAction   string             `json:"last_action"`
+	LastActionAt pgtype.Timestamptz `json:"last_action_at"`
 }
 
 // Termos monitorados com nome derivado: as OABs monitoradas pelo tenant via DJEN,
@@ -133,7 +144,13 @@ func (q *Queries) ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUI
 	var items []ListWatchedOABsWithNameRow
 	for rows.Next() {
 		var i ListWatchedOABsWithNameRow
-		if err := rows.Scan(&i.Oab, &i.Name, &i.Enabled); err != nil {
+		if err := rows.Scan(
+			&i.Oab,
+			&i.Name,
+			&i.Enabled,
+			&i.LastAction,
+			&i.LastActionAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -151,14 +168,16 @@ WITH prior_row AS (
     FROM watched_oab wo
     WHERE wo.integration_id = $2 AND wo.oab_key = $3
 ), upsert AS (
-    INSERT INTO watched_oab (tenant_id, integration_id, oab_key, enabled)
-    VALUES ($1, $2, $3, true)
+    INSERT INTO watched_oab (tenant_id, integration_id, oab_key, enabled, last_action, last_action_at)
+    VALUES ($1, $2, $3, true, 'ADDED', now())
     ON CONFLICT (integration_id, oab_key) DO UPDATE
        SET enabled        = true,
-           catch_up_since = COALESCE(watched_oab.catch_up_since, watched_oab.disabled_at)
-    RETURNING id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since
+           catch_up_since = COALESCE(watched_oab.catch_up_since, watched_oab.disabled_at),
+           last_action    = CASE WHEN watched_oab.enabled THEN watched_oab.last_action ELSE 'REENABLED' END,
+           last_action_at = CASE WHEN watched_oab.enabled THEN watched_oab.last_action_at ELSE now() END
+    RETURNING id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since, last_action, last_action_at
 )
-SELECT upsert.id, upsert.tenant_id, upsert.integration_id, upsert.oab_key, upsert.created_at, upsert.enabled, upsert.disabled_at, upsert.catch_up_since, prior_row.enabled AS was_enabled
+SELECT upsert.id, upsert.tenant_id, upsert.integration_id, upsert.oab_key, upsert.created_at, upsert.enabled, upsert.disabled_at, upsert.catch_up_since, upsert.last_action, upsert.last_action_at, prior_row.enabled AS was_enabled
 FROM upsert
 LEFT JOIN prior_row ON true
 `
@@ -178,6 +197,8 @@ type UpsertWatchedOABRow struct {
 	Enabled       bool               `json:"enabled"`
 	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
 	CatchUpSince  pgtype.Timestamptz `json:"catch_up_since"`
+	LastAction    *string            `json:"last_action"`
+	LastActionAt  pgtype.Timestamptz `json:"last_action_at"`
 	WasEnabled    *bool              `json:"was_enabled"`
 }
 
@@ -204,6 +225,11 @@ type UpsertWatchedOABRow struct {
 // alias (rather than an unqualified watched_oab reference) works around a sqlc analyzer
 // limitation: with a sibling writable CTE also touching watched_oab, an unqualified
 // column here is reported as ambiguous even though plain Postgres parses it fine.
+// last_action/last_action_at feed the Termos "última ação" label. The INSERT branch
+// (brand-new row) always stamps ADDED. The DO UPDATE branch only stamps REENABLED
+// when the row was actually disabled before (watched_oab.enabled, like
+// catch_up_since above, reads the PRE-update row inside DO UPDATE) — an idempotent
+// replay of an already-enabled row leaves the prior action/timestamp untouched.
 func (q *Queries) UpsertWatchedOAB(ctx context.Context, arg UpsertWatchedOABParams) (UpsertWatchedOABRow, error) {
 	row := q.db.QueryRow(ctx, upsertWatchedOAB, arg.TenantID, arg.IntegrationID, arg.OabKey)
 	var i UpsertWatchedOABRow
@@ -216,6 +242,8 @@ func (q *Queries) UpsertWatchedOAB(ctx context.Context, arg UpsertWatchedOABPara
 		&i.Enabled,
 		&i.DisabledAt,
 		&i.CatchUpSince,
+		&i.LastAction,
+		&i.LastActionAt,
 		&i.WasEnabled,
 	)
 	return i, err

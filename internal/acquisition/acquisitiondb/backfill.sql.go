@@ -135,8 +135,8 @@ func (q *Queries) IncrementBackfillSlicesOK(ctx context.Context, arg IncrementBa
 const insertBackfillJob = `-- name: InsertBackfillJob :one
 
 INSERT INTO backfill_job
-    (tenant_id, integration_id, window_from, window_to, total_slices, status)
-VALUES ($1, $2, $3, $4, $5, $6)
+    (tenant_id, integration_id, window_from, window_to, total_slices, status, trigger_reason, trigger_oabs)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id
 `
 
@@ -147,6 +147,8 @@ type InsertBackfillJobParams struct {
 	WindowTo      pgtype.Date `json:"window_to"`
 	TotalSlices   int32       `json:"total_slices"`
 	Status        string      `json:"status"`
+	TriggerReason *string     `json:"trigger_reason"`
+	TriggerOabs   []string    `json:"trigger_oabs"`
 }
 
 // backfill_job queries (acquisition slice).
@@ -159,7 +161,11 @@ type InsertBackfillJobParams struct {
 // belong to the sync slice, not here.
 // Create the onboarding backfill job. total_slices is precomputed by the use
 // case; the counters default to zero and status is passed explicitly so a
-// zero-slice horizon can land COMPLETED instead of RUNNING.
+// zero-slice horizon can land COMPLETED instead of RUNNING. trigger_reason/
+// trigger_oabs attribute the job to the OAB(s) that caused it (always
+// 'OAB_ADDED' today — see backfill.go's createBackfillForScope), so the
+// Capturas screen can show "OAB adicionada — SP347019" instead of an anonymous
+// "carga inicial".
 func (q *Queries) InsertBackfillJob(ctx context.Context, arg InsertBackfillJobParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertBackfillJob,
 		arg.TenantID,
@@ -168,6 +174,8 @@ func (q *Queries) InsertBackfillJob(ctx context.Context, arg InsertBackfillJobPa
 		arg.WindowTo,
 		arg.TotalSlices,
 		arg.Status,
+		arg.TriggerReason,
+		arg.TriggerOabs,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)

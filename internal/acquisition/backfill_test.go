@@ -448,6 +448,12 @@ func TestBackfillUseCase_NewOABAddedToActiveIntegration_BackfillsOnlyDelta(t *te
 	if repo.insertCalls != 1 {
 		t.Fatalf("backfill job inserts = %d, want 1 (one delta job for the new OAB)", repo.insertCalls)
 	}
+	if repo.lastInsert.TriggerReason != TriggerReasonOABAdded {
+		t.Fatalf("job trigger_reason = %q, want %q", repo.lastInsert.TriggerReason, TriggerReasonOABAdded)
+	}
+	if len(repo.lastInsert.TriggerOABs) != 1 || repo.lastInsert.TriggerOABs[0] != "MG198988" {
+		t.Fatalf("job trigger_oabs = %v, want exactly [MG198988] (the delta), not the pre-existing SP347019", repo.lastInsert.TriggerOABs)
+	}
 	if outbox.calls != wantSlices {
 		t.Fatalf("published = %d, want %d (one delta backfill's slices)", outbox.calls, wantSlices)
 	}
@@ -755,8 +761,8 @@ func TestBackfillUseCase_OnWatchedOABReenabled_Legacy_FiresCatchUpSync(t *testin
 	if req.BackfillJobID != "" {
 		t.Fatalf("catch-up sync backfill_job_id = %q, want empty (standalone)", req.BackfillJobID)
 	}
-	if req.CatchUpOABKey != "347019|SP" || req.CatchUpSince != since.Format(time.RFC3339) {
-		t.Fatalf("catch-up identity = {key:%q since:%q}, want {347019|SP %q}", req.CatchUpOABKey, req.CatchUpSince, since.Format(time.RFC3339))
+	if req.CatchUpOABKey != "347019|SP" || req.CatchUpSince != since.Format(time.RFC3339Nano) {
+		t.Fatalf("catch-up identity = {key:%q since:%q}, want {347019|SP %q}", req.CatchUpOABKey, req.CatchUpSince, since.Format(time.RFC3339Nano))
 	}
 	if len(req.Scope.OAB) != 1 || req.Scope.OAB[0] != "SP347019" {
 		t.Fatalf("catch-up scope = %v, want exactly [SP347019]", req.Scope.OAB)
@@ -811,10 +817,10 @@ func TestBackfillUseCase_OnWatchedOABReenabled_DuplicateNoOps(t *testing.T) {
 func TestBackfillUseCase_SyncCompleted_ClearsCatchUp(t *testing.T) {
 	t.Parallel()
 
-	// RFC3339 (the wire format CatchUpSince travels as) is second precision, so the
-	// expectation must be truncated the same way the parse-and-compare roundtrip
-	// naturally does — a sub-second discrepancy would otherwise be a false failure.
-	since, _ := time.Parse(time.RFC3339, time.Now().AddDate(0, 0, -3).Format(time.RFC3339))
+	// RFC3339Nano round-trips full precision (unlike plain RFC3339, which truncates
+	// to whole seconds and used to make the compare-and-clear below silently never
+	// match a real Postgres timestamptz — see newCatchUpSyncRequested).
+	since := time.Now().AddDate(0, 0, -3)
 	repo := &stubBackfillRepo{}
 	repo.preDisable("347019|SP", since)
 	outbox := &fakeOutbox{}
@@ -827,7 +833,7 @@ func TestBackfillUseCase_SyncCompleted_ClearsCatchUp(t *testing.T) {
 		SyncRunID:     "run-catchup-1",
 		IntegrationID: "integ-1",
 		CatchUpOABKey: "347019|SP",
-		CatchUpSince:  since.Format(time.RFC3339),
+		CatchUpSince:  since.Format(time.RFC3339Nano),
 	}
 	if err := uc.OnSyncCompleted(context.Background(), ev); err != nil {
 		t.Fatalf("OnSyncCompleted() error = %v", err)
@@ -862,7 +868,7 @@ func TestBackfillUseCase_SyncFailed_DoesNotClearCatchUp(t *testing.T) {
 		SyncRunID:     "run-catchup-2",
 		IntegrationID: "integ-1",
 		CatchUpOABKey: "347019|SP",
-		CatchUpSince:  since.Format(time.RFC3339),
+		CatchUpSince:  since.Format(time.RFC3339Nano),
 		Reason:        "fetch timeout",
 	}
 	if err := uc.OnSyncFailed(context.Background(), ev); err != nil {
@@ -870,5 +876,18 @@ func TestBackfillUseCase_SyncFailed_DoesNotClearCatchUp(t *testing.T) {
 	}
 	if repo.clearCalls != 0 {
 		t.Fatalf("catch-up clears on a FAILED sync = %d, want 0", repo.clearCalls)
+	}
+}
+
+// catchUpTriggerReason: the sync_run trigger label is OAB_REENABLED only when the
+// event actually carries a catch-up OAB — an ordinary sync (daily/backfill-windowed/
+// scheduler) has no single OAB to attribute and must stay "".
+func TestCatchUpTriggerReason(t *testing.T) {
+	t.Parallel()
+	if got := catchUpTriggerReason("347019|SP"); got != TriggerReasonOABReenabled {
+		t.Fatalf("catchUpTriggerReason(oab) = %q, want %q", got, TriggerReasonOABReenabled)
+	}
+	if got := catchUpTriggerReason(""); got != "" {
+		t.Fatalf("catchUpTriggerReason(\"\") = %q, want \"\"", got)
 	}
 }

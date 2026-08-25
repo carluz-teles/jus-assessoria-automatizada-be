@@ -497,6 +497,8 @@ func (r *pgRepository) ListCaptureRuns(ctx context.Context, tenantID string, lim
 			IntimationsNew:      int(row.IntimationsNew),
 			CourtRecordsUpdated: int(row.CourtRecordsUpdated),
 			Errors:              int(row.Errors),
+			TriggerReason:       row.TriggerReason,
+			TriggerOABs:         row.TriggerOabs,
 		})
 	}
 	return out, nil
@@ -537,6 +539,8 @@ func (r *pgRepository) GetCaptureRun(ctx context.Context, tenantID, id string) (
 		IntimationsNew:      int(row.IntimationsNew),
 		CourtRecordsUpdated: int(row.CourtRecordsUpdated),
 		Errors:              int(row.Errors),
+		TriggerReason:       row.TriggerReason,
+		TriggerOABs:         row.TriggerOabs,
 	}, nil
 }
 
@@ -632,9 +636,12 @@ func (r *pgRepository) ListWatchedOABsWithName(ctx context.Context, tenantID str
 	}
 	views := make([]WatchedOABView, 0, len(rows))
 	for _, row := range rows {
-		view := WatchedOABView{OAB: row.Oab, Enabled: row.Enabled}
+		view := WatchedOABView{OAB: row.Oab, Enabled: row.Enabled, LastActionAt: timestampPtr(row.LastActionAt)}
 		if row.Name != "" {
 			view.Name = &row.Name
+		}
+		if row.LastAction != "" {
+			view.LastAction = &row.LastAction
 		}
 		views = append(views, view)
 	}
@@ -682,6 +689,8 @@ func (r *pgRepository) InsertBackfillJob(ctx context.Context, tx database.Tx, pa
 		WindowTo:      pgtype.Date{Time: params.WindowTo, Valid: true},
 		TotalSlices:   int32(params.TotalSlices),
 		Status:        params.Status,
+		TriggerReason: nullString(params.TriggerReason),
+		TriggerOabs:   params.TriggerOABs,
 	})
 	if err != nil {
 		return "", database.WrapInfra(err)
@@ -794,6 +803,8 @@ func (r *pgRepository) InsertSyncRun(ctx context.Context, tx database.Tx, params
 		WindowFrom:       wireDateOrNull(params.WindowFrom),
 		WindowTo:         wireDateOrNull(params.WindowTo),
 		BackfillJobID:    nullUUID(params.BackfillJobID),
+		TriggerReason:    nullString(params.TriggerReason),
+		TriggerOab:       nullString(params.TriggerOAB),
 	})
 	if err != nil {
 		return "", database.WrapInfra(err)

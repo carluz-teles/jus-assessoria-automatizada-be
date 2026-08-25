@@ -8,15 +8,21 @@
 -- lista faz UNION ALL das duas fontes; o read model deriva o rótulo/DisplayStatus.
 
 -- name: ListCaptureRuns :many
--- As capturas do tenant, mais recentes primeiro. UNION ALL de capture_run (DAILY_
--- CAPTURE, 1 linha por dia; ENRICHMENT, 1 linha por importação) com backfill_job
--- (INITIAL_LOAD, uma linha por importação agregando as janelas sync_run). Os tallies do
--- INITIAL_LOAD somam as colunas dedicadas das janelas (court_records_new/intimations_new/
--- court_records_updated) e os errors vêm de slices_error. A linha ENRICHMENT não tem
--- janela própria (window_from/to NULL): ela DERIVA a janela da importação via LEFT JOIN
--- backfill_job por capture_run.backfill_job_id (COALESCE cai na coluna própria da linha
--- quando não há import — DAILY_CAPTURE). window/started/finished normalizados para o
--- mesmo shape das duas fontes. Bounded por $2 (sem paginação v0).
+-- As capturas do tenant, mais recentes primeiro. UNION ALL de TRÊS fontes:
+-- capture_run (DAILY_CAPTURE, 1 linha por dia; ENRICHMENT, 1 linha por importação),
+-- backfill_job (INITIAL_LOAD, uma linha por importação agregando as janelas sync_run)
+-- e sync_run avulso (CATCH_UP, uma linha por religada de OAB — backfill_job_id NULL
+-- + trigger_reason preenchido, ver newCatchUpSyncRequested/InsertSyncRun). Os tallies
+-- do INITIAL_LOAD somam as colunas dedicadas das janelas (court_records_new/
+-- intimations_new/court_records_updated) e os errors vêm de slices_error. A linha
+-- ENRICHMENT não tem janela própria (window_from/to NULL): ela DERIVA a janela da
+-- importação via LEFT JOIN backfill_job por capture_run.backfill_job_id (COALESCE cai
+-- na coluna própria da linha quando não há import — DAILY_CAPTURE). window/started/
+-- finished normalizados para o mesmo shape das três fontes. trigger_reason/
+-- trigger_oabs atribuem a linha a uma OAB (INITIAL_LOAD sempre 'OAB_ADDED'; CATCH_UP
+-- sempre 'OAB_REENABLED', envolto num array de 1 pra bater o tipo com trigger_oabs);
+-- DAILY_CAPTURE/ENRICHMENT nunca têm uma OAB única a atribuir (NULL). Bounded por $2
+-- (sem paginação v0).
 SELECT
     cr.id,
     cr.source,
@@ -29,7 +35,9 @@ SELECT
     cr.court_records_new,
     cr.intimations_new,
     cr.court_records_updated,
-    cr.errors
+    cr.errors,
+    NULL::text                                     AS trigger_reason,
+    NULL::text[]                                    AS trigger_oabs
 FROM capture_run cr
 LEFT JOIN backfill_job bj ON bj.id = cr.backfill_job_id
 WHERE cr.tenant_id = $1
@@ -46,12 +54,33 @@ SELECT
     COALESCE(SUM(s.court_records_new), 0)::int                  AS court_records_new,
     COALESCE(SUM(s.intimations_new), 0)::int                    AS intimations_new,
     COALESCE(SUM(s.court_records_updated), 0)::int              AS court_records_updated,
-    b.slices_error                                              AS errors
+    b.slices_error                                              AS errors,
+    b.trigger_reason,
+    b.trigger_oabs
 FROM backfill_job b
 JOIN integration i ON i.id = b.integration_id
 LEFT JOIN sync_run s ON s.backfill_job_id = b.id
 WHERE b.tenant_id = $1
 GROUP BY b.id, i.source
+UNION ALL
+SELECT
+    s.id,
+    i.source,
+    'CATCH_UP'::text                                            AS kind,
+    s.window_from,
+    s.window_to,
+    s.started_at,
+    s.finished_at,
+    s.status,
+    s.court_records_new,
+    s.intimations_new,
+    s.court_records_updated,
+    (CASE WHEN s.status = 'FAILED' THEN 1 ELSE 0 END)::int      AS errors,
+    s.trigger_reason,
+    ARRAY[s.trigger_oab]::text[]                                AS trigger_oabs
+FROM sync_run s
+JOIN integration i ON i.id = s.integration_id
+WHERE s.tenant_id = $1 AND s.backfill_job_id IS NULL AND s.trigger_reason IS NOT NULL
 ORDER BY started_at DESC
 LIMIT $2;
 
@@ -72,7 +101,9 @@ SELECT
     cr.court_records_new,
     cr.intimations_new,
     cr.court_records_updated,
-    cr.errors
+    cr.errors,
+    NULL::text                                     AS trigger_reason,
+    NULL::text[]                                    AS trigger_oabs
 FROM capture_run cr
 LEFT JOIN backfill_job bj ON bj.id = cr.backfill_job_id
 WHERE cr.tenant_id = $1 AND cr.id = $2;

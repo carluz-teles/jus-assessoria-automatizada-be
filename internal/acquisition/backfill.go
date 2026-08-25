@@ -33,6 +33,25 @@ const (
 	BackfillStatusPartial   = "PARTIAL"
 )
 
+// Trigger reasons attribute a backfill_job/sync_run to the watched-OAB action that
+// caused it, for the Capturas/Termos "what happened and why" labels. OAB_ADDED
+// marks a delta backfill_job (createBackfillForScope); OAB_REENABLED marks a
+// standalone catch-up sync_run (newCatchUpSyncRequested). Every other run (daily
+// firehose, enrichment, scheduler) has no single OAB to attribute and stays "".
+const (
+	TriggerReasonOABAdded     = "OAB_ADDED"
+	TriggerReasonOABReenabled = "OAB_REENABLED"
+)
+
+// catchUpTriggerReason returns the sync_run trigger_reason for a sync_requested
+// event: OAB_REENABLED when it carries a catch-up OAB, "" for every ordinary sync.
+func catchUpTriggerReason(catchUpOABKey string) string {
+	if catchUpOABKey == "" {
+		return ""
+	}
+	return TriggerReasonOABReenabled
+}
+
 // consumerBackfill is the integration_activated listener's identity in
 // processed_event. Dedup is per-consumer, so marking an event here never blocks
 // another consumer.
@@ -134,6 +153,10 @@ type BackfillJobParams struct {
 	WindowTo      time.Time
 	TotalSlices   int
 	Status        string
+	// TriggerReason/TriggerOABs attribute the job to the OAB(s) that caused it
+	// (see TriggerReasonOABAdded) — createBackfillForScope always sets both.
+	TriggerReason string
+	TriggerOABs   []string
 }
 
 // BackfillUseCase reacts to integration_activated by opening the onboarding
@@ -367,6 +390,8 @@ func (uc *BackfillUseCase) createBackfillForScope(ctx context.Context, tx databa
 		WindowTo:      to,
 		TotalSlices:   totalSlices,
 		Status:        status,
+		TriggerReason: TriggerReasonOABAdded,
+		TriggerOABs:   scope.OAB,
 	})
 	if err != nil {
 		return err
@@ -423,7 +448,13 @@ func newCatchUpSyncRequested(tenantID, integrationID, source, oabKey string, sin
 		WindowTo:      to.Format(dateLayout),
 		Scope:         Scope{OAB: []string{canonicalOAB(oabKey)}},
 		CatchUpOABKey: oabKey,
-		CatchUpSince:  since.Format(time.RFC3339),
+		// RFC3339Nano (not RFC3339): since comes from a Postgres timestamptz with
+		// microsecond precision (disabled_at/catch_up_since), and clearCatchUp's
+		// compare-and-clear requires an EXACT match against the stored column —
+		// RFC3339 truncates to whole seconds, which silently made the clear never
+		// fire (a real bug this migration surfaced: catch_up_since stayed stuck
+		// after every "successful" catch-up).
+		CatchUpSince: since.Format(time.RFC3339Nano),
 	}
 }
 
@@ -565,7 +596,7 @@ func (uc *BackfillUseCase) onSliceClosed(ctx context.Context, c sliceClose) erro
 // WatchedOABReenabled as RFC3339) is logged and skipped rather than failing the
 // whole sync-close, since retrying cannot fix a producer bug.
 func (uc *BackfillUseCase) clearCatchUp(ctx context.Context, tx database.Tx, c sliceClose) error {
-	since, err := time.Parse(time.RFC3339, c.catchUpSince)
+	since, err := time.Parse(time.RFC3339Nano, c.catchUpSince)
 	if err != nil {
 		slog.ErrorContext(ctx, "acquisition: malformed catch_up_since on sync_completed, skipping clear",
 			obs.KeyTenantID, c.tenantID,

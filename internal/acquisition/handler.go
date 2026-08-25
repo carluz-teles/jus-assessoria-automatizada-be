@@ -410,9 +410,11 @@ func (h *Handler) captureDetail(c *fiber.Ctx) error {
 // and also what POST/PATCH answer with (Name omitted — those two never know it, no
 // capture may have happened yet). Enabled backs the Termos liga/desliga toggle.
 type watchedOABView struct {
-	OAB     string  `json:"oab"`
-	Name    *string `json:"name,omitempty"`
-	Enabled bool    `json:"enabled"`
+	OAB          string     `json:"oab"`
+	Name         *string    `json:"name,omitempty"`
+	Enabled      bool       `json:"enabled"`
+	LastAction   *string    `json:"last_action,omitempty"`
+	LastActionAt *time.Time `json:"last_action_at,omitempty"`
 }
 
 // watchedOABsEnvelope wraps the list in {data:[...]}.
@@ -432,7 +434,10 @@ func (h *Handler) watchedOABs(c *fiber.Ctx) error {
 	}
 	items := make([]watchedOABView, 0, len(views))
 	for _, v := range views {
-		items = append(items, watchedOABView{OAB: v.OAB, Name: v.Name, Enabled: v.Enabled})
+		items = append(items, watchedOABView{
+			OAB: v.OAB, Name: v.Name, Enabled: v.Enabled,
+			LastAction: v.LastAction, LastActionAt: v.LastActionAt,
+		})
 	}
 	return c.Status(fiber.StatusOK).JSON(watchedOABsEnvelope{Data: items})
 }

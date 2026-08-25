@@ -378,7 +378,11 @@ type Querier interface {
 	// belong to the sync slice, not here.
 	// Create the onboarding backfill job. total_slices is precomputed by the use
 	// case; the counters default to zero and status is passed explicitly so a
-	// zero-slice horizon can land COMPLETED instead of RUNNING.
+	// zero-slice horizon can land COMPLETED instead of RUNNING. trigger_reason/
+	// trigger_oabs attribute the job to the OAB(s) that caused it (always
+	// 'OAB_ADDED' today — see backfill.go's createBackfillForScope), so the
+	// Capturas screen can show "OAB adicionada — SP347019" instead of an anonymous
+	// "carga inicial".
 	InsertBackfillJob(ctx context.Context, arg InsertBackfillJobParams) (uuid.UUID, error)
 	// Create the lide a first-seen court record hangs on. v0 has no consolidation
 	// yet, so every new record gets its own case; merging is a later slice.
@@ -441,6 +445,9 @@ type Querier interface {
 	// records the sync_requested event that opened it, so a re-delivery can find and
 	// resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
 	// slice's date window so the reconciliations read can show it (NULL when absent).
+	// trigger_reason/trigger_oab are set only on a standalone catch-up sync (the OAB
+	// toggle re-enable path — see SyncRequested.CatchUpOABKey); NULL for every other
+	// run (daily, backfill-windowed, scheduler), which have no single OAB to attribute.
 	InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error)
 	// The tenant's ACTIVE firm members (internal app_user id + name) — the assignable responsáveis
 	// the analyze_intimation prompt lists so the IA suggests a real assignee. Same join as identity's
@@ -461,15 +468,21 @@ type Querier interface {
 	// capture_run é escrito na MESMA tx dos writes que já existem (writeForTenant /
 	// applyEnrichment); backfill_job/sync_run continuam do fluxo de reconciliação. A
 	// lista faz UNION ALL das duas fontes; o read model deriva o rótulo/DisplayStatus.
-	// As capturas do tenant, mais recentes primeiro. UNION ALL de capture_run (DAILY_
-	// CAPTURE, 1 linha por dia; ENRICHMENT, 1 linha por importação) com backfill_job
-	// (INITIAL_LOAD, uma linha por importação agregando as janelas sync_run). Os tallies do
-	// INITIAL_LOAD somam as colunas dedicadas das janelas (court_records_new/intimations_new/
-	// court_records_updated) e os errors vêm de slices_error. A linha ENRICHMENT não tem
-	// janela própria (window_from/to NULL): ela DERIVA a janela da importação via LEFT JOIN
-	// backfill_job por capture_run.backfill_job_id (COALESCE cai na coluna própria da linha
-	// quando não há import — DAILY_CAPTURE). window/started/finished normalizados para o
-	// mesmo shape das duas fontes. Bounded por $2 (sem paginação v0).
+	// As capturas do tenant, mais recentes primeiro. UNION ALL de TRÊS fontes:
+	// capture_run (DAILY_CAPTURE, 1 linha por dia; ENRICHMENT, 1 linha por importação),
+	// backfill_job (INITIAL_LOAD, uma linha por importação agregando as janelas sync_run)
+	// e sync_run avulso (CATCH_UP, uma linha por religada de OAB — backfill_job_id NULL
+	// + trigger_reason preenchido, ver newCatchUpSyncRequested/InsertSyncRun). Os tallies
+	// do INITIAL_LOAD somam as colunas dedicadas das janelas (court_records_new/
+	// intimations_new/court_records_updated) e os errors vêm de slices_error. A linha
+	// ENRICHMENT não tem janela própria (window_from/to NULL): ela DERIVA a janela da
+	// importação via LEFT JOIN backfill_job por capture_run.backfill_job_id (COALESCE cai
+	// na coluna própria da linha quando não há import — DAILY_CAPTURE). window/started/
+	// finished normalizados para o mesmo shape das três fontes. trigger_reason/
+	// trigger_oabs atribuem a linha a uma OAB (INITIAL_LOAD sempre 'OAB_ADDED'; CATCH_UP
+	// sempre 'OAB_REENABLED', envolto num array de 1 pra bater o tipo com trigger_oabs);
+	// DAILY_CAPTURE/ENRICHMENT nunca têm uma OAB única a atribuir (NULL). Bounded por $2
+	// (sem paginação v0).
 	ListCaptureRuns(ctx context.Context, arg ListCaptureRunsParams) ([]ListCaptureRunsRow, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
@@ -724,6 +737,11 @@ type Querier interface {
 	// alias (rather than an unqualified watched_oab reference) works around a sqlc analyzer
 	// limitation: with a sibling writable CTE also touching watched_oab, an unqualified
 	// column here is reported as ambiguous even though plain Postgres parses it fine.
+	// last_action/last_action_at feed the Termos "última ação" label. The INSERT branch
+	// (brand-new row) always stamps ADDED. The DO UPDATE branch only stamps REENABLED
+	// when the row was actually disabled before (watched_oab.enabled, like
+	// catch_up_since above, reads the PRE-update row inside DO UPDATE) — an idempotent
+	// replay of an already-enabled row leaves the prior action/timestamp untouched.
 	UpsertWatchedOAB(ctx context.Context, arg UpsertWatchedOABParams) (UpsertWatchedOABRow, error)
 }
 
