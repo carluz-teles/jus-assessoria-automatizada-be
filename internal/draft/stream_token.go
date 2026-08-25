@@ -125,20 +125,35 @@ func StreamTokenAuth(store StreamTokenStore, fallback fiber.Handler) fiber.Handl
 		if value == "" {
 			return httpx.WriteError(c, apperr.NewUnauthorized("stream_token inválido ou expirado"))
 		}
-		// value = "<tenant>|<draft>|<kind>". Valida escopo do draft na URL.
 		parts := strings.Split(value, "|")
 		if len(parts) != 3 || parts[2] != streamTokenKind {
 			return httpx.WriteError(c, apperr.NewUnauthorized("stream_token com escopo inválido"))
 		}
 		tenantID, draftID := parts[0], parts[1]
-		if urlDraft := c.Params("id"); urlDraft != draftID {
+		// Rodando como middleware do Group v1, c.Params("id") ainda vazio (o
+		// route pattern só resolve quando o handler final é matched). Extrai
+		// o segmento do path manualmente: /v1/pecas/{id}/generation-stream.
+		if urlDraft := extractDraftIDFromStreamPath(c.Path()); urlDraft != draftID {
 			return httpx.WriteError(c, apperr.NewUnauthorized("stream_token não corresponde ao draft"))
 		}
-		// Popula principal só com tenant + userID vazio (não temos user id
-		// no token; o SSE só precisa do tenant pra derivar saga_state).
 		httpx.SetPrincipal(c, httpx.Principal{TenantID: tenantID})
 		return c.Next()
 	}
+}
+
+// extractDraftIDFromStreamPath parses `/v1/pecas/{id}/generation-stream` and
+// returns {id}. Returns "" if the path shape doesn't match.
+func extractDraftIDFromStreamPath(path string) string {
+	const suffix = "/generation-stream"
+	if !strings.HasSuffix(path, suffix) {
+		return ""
+	}
+	trimmed := strings.TrimSuffix(path, suffix)
+	idx := strings.LastIndex(trimmed, "/")
+	if idx < 0 {
+		return ""
+	}
+	return trimmed[idx+1:]
 }
 
 // newOpaqueToken retorna 24 bytes random encodados em base64url (~32 chars).

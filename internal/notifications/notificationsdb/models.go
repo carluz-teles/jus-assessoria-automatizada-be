@@ -243,7 +243,8 @@ type Draft struct {
 	FiledAt           pgtype.Timestamptz `json:"filed_at"`
 	SignedPdfKey      *string            `json:"signed_pdf_key"`
 	// HTML rico do editor Tiptap. NULL = usar structured_content como fonte.
-	ContentHtml *string `json:"content_html"`
+	ContentHtml *string     `json:"content_html"`
+	CreatedBy   pgtype.UUID `json:"created_by"`
 }
 
 type DraftAttachment struct {

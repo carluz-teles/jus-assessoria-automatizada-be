@@ -221,6 +221,9 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 	// AI thesis suggestion (Fatia 5 — Sugerir Teses síncrono).
 	r.Post("/pecas/:id/theses", h.thesesPeca)
+	// Variante pre-criação: sugere teses direto da intimação, sem draft ainda
+	// (tela /pecas/nova no FE — evita criar draft zumbi a cada clique).
+	r.Post("/theses", h.thesesFromIntimation)
 
 	// Iteração + assumir autoria (Peça v2).
 	r.Post("/pecas/:id/iterate", h.iteratePeca)
@@ -242,6 +245,13 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 // idempotent (same tenant+intimation_id already has a draft).
 func (h *Handler) createPeca(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
+	// UserID vem do principal — usado como created_by da peça pra o read model
+	// da lista mostrar o autor. Pode ser vazio se a rota estiver sob AuthUser
+	// (não é o caso hoje pra /pecas, mas o repo tolera vazio → NULL).
+	var createdBy string
+	if p, ok := httpx.PrincipalFromCtx(c); ok {
+		createdBy = p.UserID
+	}
 
 	var req CreateRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -253,6 +263,7 @@ func (h *Handler) createPeca(c *fiber.Ctx) error {
 
 	result, err := h.uc.Create(c.UserContext(), CreateCommand{
 		TenantID:     tenantID,
+		CreatedBy:    createdBy,
 		Source:       req.Source,
 		IntimationID: req.IntimationID,
 		CaseID:       req.CaseID,
@@ -746,22 +757,81 @@ func (h *Handler) thesesPeca(c *fiber.Ctx) error {
 	})
 }
 
+// ─── POST /v1/theses ──────────────────────────────────────────────────────────
+
+// thesesFromIntimationRequest is the body of POST /v1/theses. piece_type é
+// obrigatório porque o use case usa como parte do query text da RAG e como
+// PieceType no DraftContext do prompt.
+//
+// ModelOverride é debug-only: se != "", ignora o cfg.OpenRouterModel e usa
+// esse slug pra esta chamada. Serve pra bateria de A/B de modelos direto do
+// FE sem re-deploy (ex: `{"model":"google/gemini-2.5-flash"}`). Remover
+// depois que o modelo default for escolhido em prod.
+type thesesFromIntimationRequest struct {
+	IntimationID  string `json:"intimation_id"`
+	PieceType     string `json:"piece_type"`
+	ModelOverride string `json:"model,omitempty"`
+}
+
+// thesesFromIntimation handles POST /v1/theses — variante sem draft do fluxo de
+// Sugerir Teses. Usado pela tela /pecas/nova, que difere a criação do draft
+// até o commit (Gerar/Manual). Guarda thesisSuggester nil + campos obrigatórios.
+// Retorna 200 {data:{theses:[...]}}.
+func (h *Handler) thesesFromIntimation(c *fiber.Ctx) error {
+	if h.theses == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+	tenantID := httpx.TenantFromCtx(c)
+
+	var req thesesFromIntimationRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if req.IntimationID == "" {
+		return httpx.WriteError(c, apperr.NewInvalid("intimation_id é obrigatório"))
+	}
+	if req.PieceType == "" {
+		return httpx.WriteError(c, apperr.NewInvalid("piece_type é obrigatório"))
+	}
+
+	result, err := h.theses.SuggestTheses(c.UserContext(), SuggestThesesCommand{
+		TenantID:      tenantID,
+		IntimationID:  req.IntimationID,
+		PieceType:     req.PieceType,
+		ModelOverride: req.ModelOverride,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"data": fiber.Map{
+			"theses": thesesToResponse(result.Theses),
+		},
+	})
+}
+
 // thesisResponse is one item in the /theses response.
 type thesisResponse struct {
-	Label      string `json:"label"`
-	Confidence string `json:"confidence"`
-	Reference  string `json:"reference"`
-	Foundation string `json:"foundation"`
+	Label      string   `json:"label"`
+	Confidence string   `json:"confidence"`
+	Reference  string   `json:"reference"`
+	Foundation string   `json:"foundation"`
+	Evidence   []string `json:"evidence"`
 }
 
 func thesesToResponse(theses []Thesis) []thesisResponse {
 	out := make([]thesisResponse, 0, len(theses))
 	for _, t := range theses {
+		ev := t.Evidence
+		if ev == nil {
+			ev = []string{} // wire: nunca null (JSON contract)
+		}
 		out = append(out, thesisResponse{
 			Label:      t.Label,
 			Confidence: t.Confidence,
 			Reference:  t.Reference,
 			Foundation: t.Foundation,
+			Evidence:   ev,
 		})
 	}
 	return out
@@ -1227,6 +1297,10 @@ func (h *Handler) listPecas(c *fiber.Ctx) error {
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
 	pieceType := c.Query("piece_type")
 	status := c.Query("status")
+	// workflow_state: chip "Aguardando assinatura"/"Aguardando protocolo"
+	// urgencia: chip "Prazo em atraso"/"Prazo hoje" (contra deadline da intimation)
+	workflowState := c.Query("workflow_state")
+	urgencia := c.Query("urgencia")
 
 	lastCreated, lastID := maxCreatedAt, maxUUID
 	if tok := c.Query("cursor"); tok != "" {
@@ -1238,12 +1312,14 @@ func (h *Handler) listPecas(c *fiber.Ctx) error {
 	}
 
 	res, err := h.lister.ListAll(c.UserContext(), ListAllQuery{
-		TenantID:    tenantID,
-		PieceType:   pieceType,
-		Status:      status,
-		LastCreated: lastCreated,
-		LastID:      lastID,
-		Limit:       limit,
+		TenantID:      tenantID,
+		PieceType:     pieceType,
+		Status:        status,
+		WorkflowState: workflowState,
+		Urgencia:      urgencia,
+		LastCreated:   lastCreated,
+		LastID:        lastID,
+		Limit:         limit,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -1284,9 +1360,19 @@ type draftListItemResponse struct {
 	Status          string            `json:"status"`
 	SagaState       string            `json:"saga_state"`
 	CoverageSummary *coverageSummaryR `json:"coverage_summary,omitempty"`
+	SentToSigningAt *string           `json:"sent_to_signing_at,omitempty"`
+	SignedAt        *string           `json:"signed_at,omitempty"`
 	FiledAt         *string           `json:"filed_at,omitempty"`
 	ObservedResult  *string           `json:"observed_result,omitempty"`
 	CreatedAt       string            `json:"created_at"`
+	// Contexto do processo pra card sem 2ª chamada.
+	CNJNumber string `json:"cnj_number,omitempty"`
+	// Nome do autor da peça — vazio quando o draft não tem created_by
+	// (peça pré-0063 ou usuário removido do escritório).
+	ResponsibleName string `json:"responsible_name,omitempty"`
+	// Prazo da intimação de origem — nil quando não há deadline derivado.
+	DeadlineEndDate  *string `json:"deadline_end_date,omitempty"`
+	DeadlineDaysLeft *int32  `json:"deadline_days_left,omitempty"`
 }
 
 type coverageSummaryR struct {
@@ -1300,12 +1386,14 @@ func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemRe
 	items := make([]draftListItemResponse, 0, len(res.Items))
 	for _, it := range res.Items {
 		resp := draftListItemResponse{
-			ID:        it.ID,
-			PieceType: it.PieceType,
-			Title:     it.Title,
-			Status:    it.Status,
-			SagaState: it.SagaState,
-			CreatedAt: it.CreatedAt.Format(time.RFC3339),
+			ID:              it.ID,
+			PieceType:       it.PieceType,
+			Title:           it.Title,
+			Status:          it.Status,
+			SagaState:       it.SagaState,
+			CreatedAt:       it.CreatedAt.Format(time.RFC3339),
+			CNJNumber:       it.CNJNumber,
+			ResponsibleName: it.ResponsibleName,
 		}
 		if it.CoverageSummary != nil {
 			resp.CoverageSummary = &coverageSummaryR{
@@ -1314,9 +1402,22 @@ func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemRe
 				SuggestionsTotal: it.CoverageSummary.SuggestionsTotal,
 			}
 		}
+		if it.SentToSigningAt != nil {
+			s := it.SentToSigningAt.Format(time.RFC3339)
+			resp.SentToSigningAt = &s
+		}
+		if it.SignedAt != nil {
+			s := it.SignedAt.Format(time.RFC3339)
+			resp.SignedAt = &s
+		}
 		if it.FiledAt != nil {
 			s := it.FiledAt.Format(time.RFC3339)
 			resp.FiledAt = &s
+		}
+		if it.DeadlineEndDate != nil {
+			s := it.DeadlineEndDate.Format("2006-01-02")
+			resp.DeadlineEndDate = &s
+			resp.DeadlineDaysLeft = it.DeadlineDaysLeft
 		}
 		if it.ObservedResult != nil {
 			resp.ObservedResult = it.ObservedResult

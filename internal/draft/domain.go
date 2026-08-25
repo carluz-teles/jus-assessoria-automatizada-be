@@ -128,9 +128,10 @@ func WithTSAURL(url string) Option {
 }
 
 // CreateCommand is the input the handler builds from the request + the verified
-// principal. TenantID comes from the principal, never the body.
+// principal. TenantID e CreatedBy vêm do principal, nunca do body.
 type CreateCommand struct {
 	TenantID     string
+	CreatedBy    string // app_user.id do autor (do principal, nunca do body)
 	Source       string
 	IntimationID string
 	CaseID       string
@@ -159,6 +160,7 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
 		d := &Draft{
 			TenantID:  cmd.TenantID,
+			CreatedBy: cmd.CreatedBy,
 			PieceType: cmd.PieceType,
 			Title:     cmd.Title,
 		}
@@ -186,6 +188,14 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 			if d.PieceType == "" {
 				d.PieceType = PieceTypeOther
 			}
+		}
+
+		// Título default: se o caller não passou nada, monta "<Tipo> · <CNJ>"
+		// ou só "<Tipo>" quando o CNJ ainda não é conhecido. Evita cards com
+		// "—" na lista de peças e dá ao advogado um handle legível pra
+		// renomear depois. Nunca sobrescreve título vindo do body.
+		if d.Title == "" {
+			d.Title = defaultDraftTitle(d.PieceType, "")
 		}
 
 		created, err := uc.rw.InsertDraft(ctx, tx, d)
@@ -512,20 +522,23 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	}); err != nil {
 		return nil, err
 	}
-	// Idempotente: já assinado → devolve dados atuais sem re-assinar.
-	if view.Status == StatusSigned {
-		var signedAt time.Time
-		if view.SignedAt != nil {
-			signedAt = *view.SignedAt
-		}
+	// Idempotente: só devolve early quando o par (Status=SIGNED, SignedAt!=nil)
+	// está coerente. Se o status é SIGNED mas SignedAt está NULL, temos um
+	// estado inconsistente (crash entre o UPDATE do status e o UPDATE do
+	// signed_at, ou reset SQL parcial no dev) — cair na re-assinatura corrige
+	// sozinho em vez de devolver timestamp zero pro FE, que confundia o
+	// deriveStep (mostrava peça como assinada sem data válida).
+	if view.Status == StatusSigned && view.SignedAt != nil {
 		return &SignResult{
 			ID:        view.ID,
 			Status:    view.Status,
-			SignedAt:  signedAt,
+			SignedAt:  *view.SignedAt,
 			IsIdempot: true,
 		}, nil
 	}
-	if view.Status != StatusDraft && view.Status != StatusReviewed {
+	// Status inválido pra assinar. StatusSigned sem SignedAt cai aqui e é
+	// tratado como recuperável (o Sign completo grava o par coerente).
+	if view.Status != StatusDraft && view.Status != StatusReviewed && view.Status != StatusSigned {
 		return nil, ErrInvalidStatusForSign
 	}
 	// Aceita content_html (Fase B: editor rico) OU structured_content (legacy).
@@ -551,11 +564,16 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	// legacy maroto path quando só structured_content existe.
 	var pdfBytes []byte
 	if hasHTML {
+		place := ""
+		if view.Process != nil {
+			place = parseCityFromJudgingBody(view.Process.JudgingBody)
+		}
 		pdfBytes, err = pdfgen.RenderHTML(ctx, pdfgen.RenderHTMLInput{
 			HTML: *view.ContentHtml,
 			Signer: pdfgen.Signer{
-				Name: signerInfo.SubjectCN,
-				OAB:  signerInfo.OAB,
+				Name:  signerInfo.SubjectCN,
+				OAB:   signerInfo.OAB,
+				Place: place,
 			},
 			SignedAt: signedAt,
 		})
@@ -685,6 +703,38 @@ var placeholderMonthsPT = [...]string{
 // placeholderDateRe captura [data] com espaços opcionais dentro dos colchetes.
 // A IA às vezes gera "[ data ]" ou "[DATA]" — pega tudo. Case-insensitive.
 var placeholderDateRe = regexp.MustCompile(`(?i)\[\s*data\s*\]`)
+
+// judgingBodyComarcaRe extrai a cidade do órgão julgador — o campo vem no
+// formato "Juízo Titular I - Vara do Juizado Especial Cível da Comarca de
+// Franca" e queremos só "Franca". A regex casa qualquer variação de "Comarca
+// de X" / "Comarca do X" / "Foro de X"; a cidade é o restante do texto.
+// Case-insensitive; usa (?s) pra deixar . casar quebras (defensivo).
+var judgingBodyComarcaRe = regexp.MustCompile(
+	`(?i)(?:comarca|foro|subseção judiciária|seção judiciária)\s+d[aeo]\s+(.+?)\s*$`,
+)
+
+// parseCityFromJudgingBody extrai a cidade do foro do texto do órgão julgador.
+// Usado pra popular pdfgen.Signer.Place ("[Cidade], [data]." no rodapé fixo
+// do PDF). Retorna "" quando não consegue parsear — o renderer degrada pra
+// apenas a data (sem cidade), o que ainda é válido processualmente.
+//
+// Formatos suportados (case-insensitive):
+//
+//   - "... Comarca de Franca"                → "Franca"
+//   - "... Comarca do Rio de Janeiro"        → "Rio de Janeiro"
+//   - "... Foro de São Paulo"                → "São Paulo"
+//   - "... Subseção Judiciária de Campinas"  → "Campinas"
+func parseCityFromJudgingBody(jb string) string {
+	jb = strings.TrimSpace(jb)
+	if jb == "" {
+		return ""
+	}
+	m := judgingBodyComarcaRe.FindStringSubmatch(jb)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
 
 // fillPlaceholders substitui os placeholders textuais que a IA deixa na minuta
 // pelos valores conhecidos no momento da assinatura. Hoje só [data] (data de
@@ -909,6 +959,19 @@ func (uc *UseCase) File(ctx context.Context, cmd FileCommand) (*FileResult, erro
 			return err
 		}
 		if existing != nil {
+			// Idempotente: petition já existe. Mas se o advogado esqueceu de
+			// digitar o número na 1ª vez (ou digitou errado) e agora está
+			// mandando um valor, precisamos permitir a correção. Regra
+			// conservadora: só atualiza quando (a) chegou um valor NÃO-vazio E
+			// (b) o draft ainda não tem número persistido. Nunca sobrescreve
+			// um número já gravado — pra não zerar por engano com "".
+			// UpdateFilingNumber :exec — no-op silencioso quando já tem valor
+			// (guard SQL `filing_number IS NULL`), então extra defesa.
+			if cmd.FilingNumber != "" && d.FilingNumber == "" {
+				if err := uc.rw.UpdateFilingNumber(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.FilingNumber); err != nil {
+					return err
+				}
+			}
 			result = &FileResult{
 				PetitionID:   existing.ID,
 				DraftID:      existing.DraftID,
@@ -1081,12 +1144,14 @@ type ListByProcessQuery struct {
 
 // ListAllQuery is the input for GET /v1/pecas (tenant library).
 type ListAllQuery struct {
-	TenantID    string
-	PieceType   string // optional filter
-	Status      string // optional filter
-	LastCreated string
-	LastID      string
-	Limit       int
+	TenantID      string
+	PieceType     string // optional filter
+	Status        string // optional filter
+	WorkflowState string // "aguardando_assinatura" | "aguardando_protocolo" | ""
+	Urgencia      string // "atraso" | "hoje" | "" (contra deadline.end_date da intimation)
+	LastCreated   string
+	LastID        string
+	Limit         int
 }
 
 // ListByProcess implements GET /v1/processos/:id/pecas. Runs in a read-only tx.
@@ -1114,7 +1179,7 @@ func (uc *UseCase) ListByProcess(ctx context.Context, q ListByProcessQuery) (Dra
 func (uc *UseCase) ListAll(ctx context.Context, q ListAllQuery) (DraftListResult, error) {
 	var result DraftListResult
 	err := uc.repo.Do(ctx, q.TenantID, func(tx database.Tx) error {
-		rows, err := uc.rw.ListDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.LastCreated, q.LastID, q.Limit+1)
+		rows, err := uc.rw.ListDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.WorkflowState, q.Urgencia, q.LastCreated, q.LastID, q.Limit+1)
 		if err != nil {
 			return err
 		}

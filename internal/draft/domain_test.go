@@ -295,6 +295,9 @@ func (r *fakeRepo) RevertToConstruction(_ context.Context, _ database.Tx, _, _ s
 func (r *fakeRepo) MarkFiled(_ context.Context, _ database.Tx, _, _, _ string) error {
 	return nil
 }
+func (r *fakeRepo) UpdateFilingNumber(_ context.Context, _ database.Tx, _, _, _ string) error {
+	return nil
+}
 
 func (r *fakeRepo) GetPetitionByDraftID(_ context.Context, _ database.Tx, _, _ string) (*Petition, error) {
 	return r.getPetitionResult, r.getPetitionErr
@@ -318,7 +321,7 @@ func (r *fakeRepo) ListDraftsByProcess(_ context.Context, _ database.Tx, _, _, _
 	return r.listByProcessResult, nil
 }
 
-func (r *fakeRepo) ListDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _ string, _ int) ([]DraftListItem, error) {
+func (r *fakeRepo) ListDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _, _, _ string, _ int) ([]DraftListItem, error) {
 	if r.listAllErr != nil {
 		return nil, r.listAllErr
 	}

@@ -55,19 +55,26 @@ func makeThesesDraft() *Draft {
 }
 
 // cannedThesesJSON is the JSON the fake generator returns for Sugerir Teses.
+// cannedThesesJSON reflete o wire do prompt v2: campo evidence obrigatório,
+// alta com ≥2 trechos (respeita a rubric — sem downgrade), media com 1.
 const cannedThesesJSON = `{
   "theses": [
     {
       "label": "Prescrição intercorrente",
       "confidence": "alta",
       "reference": "art. 206, §5º, I, CC",
-      "foundation": "O prazo prescricional de 5 anos transcorreu sem movimentação útil."
+      "foundation": "O prazo prescricional de 5 anos transcorreu sem movimentação útil.",
+      "evidence": [
+        "última movimentação útil ocorreu em 2019, sem impulso desde então",
+        "não houve pedido de suspensão nem causa interruptiva no período"
+      ]
     },
     {
       "label": "Excesso de execução",
       "confidence": "media",
       "reference": "art. 917, §2º, CPC",
-      "foundation": "O valor exequendo diverge do título."
+      "foundation": "O valor exequendo diverge do título.",
+      "evidence": ["valor cobrado supera o principal atualizado do título"]
     }
   ]
 }`
@@ -141,6 +148,36 @@ func TestThesesUseCase_HappyPath(t *testing.T) {
 	}
 	if result.Theses[0].Reference != "art. 206, §5º, I, CC" {
 		t.Errorf("theses[0].Reference = %q, want the plain-string reference", result.Theses[0].Reference)
+	}
+}
+
+// TestThesesUseCase_AltaDowngradedWhenEvidenceShort verifies the rubric guard:
+// se o LLM cuspir confidence=alta mas com <2 evidências (violação da rubric do
+// prompt v2), o use case downgrade pra media antes de retornar. Sem esse guard,
+// ~40% das "altas" observadas em prod vinham com só 1 evidência.
+func TestThesesUseCase_AltaDowngradedWhenEvidenceShort(t *testing.T) {
+	// LLM diz alta mas manda só 1 evidence → deve virar media.
+	// A segunda tese vem alta com 2 evidences → mantém alta.
+	json := `{"theses":[
+	  {"label":"Alta suspeita","confidence":"alta","reference":"x","foundation":"y","evidence":["um trecho só"]},
+	  {"label":"Alta legítima","confidence":"alta","reference":"x","foundation":"y","evidence":["um","dois"]},
+	  {"label":"Alta sem prova","confidence":"alta","reference":"x","foundation":"y","evidence":[]}
+	]}`
+	gen := &fakeGen{out: []byte(json)}
+	uc := buildThesesUC(fakeUoW{}, fakeReader{draft: makeThesesDraft()}, gen, nil)
+
+	result, err := uc.SuggestTheses(context.Background(), thesesCmd())
+	if err != nil {
+		t.Fatalf("want nil err, got %v", err)
+	}
+	if result.Theses[0].Confidence != ThesisConfidenceMedia {
+		t.Errorf("theses[0] com 1 evidência: Confidence = %q, want media (downgrade)", result.Theses[0].Confidence)
+	}
+	if result.Theses[1].Confidence != ThesisConfidenceAlta {
+		t.Errorf("theses[1] com 2 evidências: Confidence = %q, want alta (preservada)", result.Theses[1].Confidence)
+	}
+	if result.Theses[2].Confidence != ThesisConfidenceMedia {
+		t.Errorf("theses[2] com 0 evidências: Confidence = %q, want media (downgrade)", result.Theses[2].Confidence)
 	}
 }
 

@@ -268,6 +268,10 @@ const getIntimacao = `-- name: GetIntimacao :one
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        i.recipients, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id, cr.judging_body,
+       -- data de distribuição/ajuizamento (nullable — DJEN não carrega, só o
+       -- enriquecimento DATAJUD preenche via migration 0015). Exposto no
+       -- detail pra alimentar a linha "Distribuição" da barra rica.
+       cr.filed_at AS distribution_date,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
        i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
        -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
@@ -316,6 +320,7 @@ type GetIntimacaoRow struct {
 	Subject              *string            `json:"subject"`
 	CourtRecordID        uuid.UUID          `json:"court_record_id"`
 	JudgingBody          *string            `json:"judging_body"`
+	DistributionDate     pgtype.Date        `json:"distribution_date"`
 	AiSummary            *string            `json:"ai_summary"`
 	AiProvidencias       []byte             `json:"ai_providencias"`
 	AiAnalyzedAt         pgtype.Timestamptz `json:"ai_analyzed_at"`
@@ -369,6 +374,7 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 		&i.Subject,
 		&i.CourtRecordID,
 		&i.JudgingBody,
+		&i.DistributionDate,
 		&i.AiSummary,
 		&i.AiProvidencias,
 		&i.AiAnalyzedAt,

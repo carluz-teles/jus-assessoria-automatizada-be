@@ -40,9 +40,12 @@ type StreamMessage struct {
 }
 
 // StreamPublisher: XADD com MAXLEN + EXPIRE. Retorna o ID do entry
-// gravado (útil pra observabilidade e debug).
+// gravado (útil pra observabilidade e debug). XReset apaga o stream
+// inteiro — usado antes de uma nova geração pra evitar que o cliente
+// SSE receba replay de chunks das gerações passadas ainda dentro do TTL.
 type StreamPublisher interface {
 	XPublish(ctx context.Context, streamKey string, payload []byte) (string, error)
+	XReset(ctx context.Context, streamKey string) error
 }
 
 // StreamSubscriber: XREAD BLOCK a partir de lastID. lastID vazio = "0-0"
@@ -74,6 +77,17 @@ func (r *redisPubSub) XPublish(ctx context.Context, streamKey string, payload []
 	// Best-effort renew TTL; ignora erro (não crítico).
 	_ = r.client.Expire(ctx, streamKey, streamTTL).Err()
 	return id, nil
+}
+
+// XReset deleta o stream key inteiro. Chamado no início de uma nova
+// geração (worker-ai) pra garantir que o cliente SSE que abrir logo em
+// seguida só veja os chunks da geração atual — o TTL de 10min do stream
+// não é curto o bastante pra evitar replay entre gerações consecutivas.
+func (r *redisPubSub) XReset(ctx context.Context, streamKey string) error {
+	if err := r.client.Del(ctx, streamKey).Err(); err != nil {
+		return fmt.Errorf("del %s: %w", streamKey, err)
+	}
+	return nil
 }
 
 // XSubscribe lê a partir de lastID em loop com XREAD BLOCK. "0" = do

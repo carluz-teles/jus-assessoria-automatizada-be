@@ -198,7 +198,8 @@ func run(logger *slog.Logger) error {
 		acquisition.NewResumoStore(uow),
 		resumeEmbedder,
 		indexing.SearchDeps{Pool: pool},
-		cfg.OpenRouterModel,
+		// QUALITY: resumo executivo do processo é referência decisória — precisa fidelidade.
+		cfg.OpenRouterModelQuality,
 	)
 	// Intimation analysis (AI) — POST /v1/intimacoes/:id/analise ("Analisar esta intimação").
 	// Same pattern as resumoUC: the read use case + the shared meta-prompt composer + the SAME
@@ -210,6 +211,8 @@ func run(logger *slog.Logger) error {
 		advisory.NewTemplateComposer(),
 		taskGenerator,
 		acquisition.NewAnaliseStore(uow),
+		// QUALITY: providências viram tasks reais no calendário — falso positivo custa.
+		cfg.OpenRouterModelQuality,
 	)
 	// Providência actions (aprovar/descartar) on the analysis card — flip one suggested
 	// providência's status by index over the unit of work. The real task is created by the FE
@@ -263,7 +266,9 @@ func run(logger *slog.Logger) error {
 	// time a prazo is summarized, so later opens serve the cache instead of asking the LLM again.
 	deadlineSuggestUC := deadline.NewSuggestUseCase(
 		deadlineReadUC, advisory.NewTemplateComposer(), taskGenerator,
-		deadline.NewSuggestionStore(uow), deadline.NewAISummaryStore(uow), cfg.OpenRouterModel,
+		deadline.NewSuggestionStore(uow), deadline.NewAISummaryStore(uow),
+		// FAST: sugestão de tasks é background/on-demand curta — rápido melhor.
+		cfg.OpenRouterModelFast,
 	)
 	deadlineHandler := deadline.NewHandler(
 		deadlineReadUC,
@@ -439,14 +444,21 @@ func run(logger *slog.Logger) error {
 	if resumeEmbedder != nil {
 		chatEmbedder = resumeEmbedder
 	}
+	// RAG cache: reduz p95 de teses/chat/review/iterate quando o mesmo query
+	// text é chamado várias vezes em janela de 5min (troca de tipo na Partida,
+	// teses→generate na mesma sessão). Nil-safe: se pubsubClient falha, o cache
+	// vira nil e as use cases seguem como antes (Voyage + pgvector direto).
+	ragCache := draft.NewRAGCache(pubsubClient, 5*time.Minute)
 	chatUC := draft.NewChatUseCase(draft.ChatUseCaseParams{
 		UoW:      uow,
 		Repo:     draftRepo,
 		Gen:      taskGenerator,
 		Emb:      chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
 		Composer: advisory.NewTemplateComposer(),
-		Model:    cfg.OpenRouterModel,
+		// FAST: chat é loop de pergunta/resposta — UX exige rapidez.
+		Model: cfg.OpenRouterModelFast,
 	})
 	draftHandler = draftHandler.WithChat(chatUC)
 
@@ -461,8 +473,10 @@ func run(logger *slog.Logger) error {
 		Gen:      taskGenerator,
 		Emb:      chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
 		Composer: advisory.NewTemplateComposer(),
-		Model:    cfg.OpenRouterModel,
+		// QUALITY: findings viram edits no texto — precisão importa.
+		Model: cfg.OpenRouterModelQuality,
 	})
 	draftHandler = draftHandler.WithReviewer(reviewUC)
 
@@ -475,8 +489,10 @@ func run(logger *slog.Logger) error {
 		Gen:      taskGenerator,
 		Emb:      chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
 		Composer: advisory.NewTemplateComposer(),
-		Model:    cfg.OpenRouterModel,
+		// FAST: teses re-disparam a cada troca de tipo no dropdown — velocidade > exaustividade.
+		Model: cfg.OpenRouterModelFast,
 	})
 	draftHandler = draftHandler.WithTheses(thesesUC)
 
@@ -489,9 +505,11 @@ func run(logger *slog.Logger) error {
 		Reader:   draftRepo,
 		Composer: advisory.NewTemplateComposer(),
 		Gen:      taskGenerator,
-		Model:    cfg.OpenRouterModel,
+		// QUALITY: cada iteração edita texto real que vai no PDF — erro custa caro.
+		Model:    cfg.OpenRouterModelQuality,
 		Embedder: chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
 	})
 	draftHandler = draftHandler.WithIterator(iterateUC)
 

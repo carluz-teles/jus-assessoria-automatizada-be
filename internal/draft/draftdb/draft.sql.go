@@ -259,7 +259,8 @@ SELECT id, tenant_id, case_id, intimation_id,
        status, saga_state,
        created_at, updated_at,
        tone, instructions, selected_theses,
-       structured_content, authorship
+       structured_content, authorship,
+       filing_number
 FROM draft
 WHERE id = $1 AND tenant_id = $2
 `
@@ -286,6 +287,7 @@ type GetDraftByIDRow struct {
 	SelectedTheses    []string           `json:"selected_theses"`
 	StructuredContent []byte             `json:"structured_content"`
 	Authorship        string             `json:"authorship"`
+	FilingNumber      *string            `json:"filing_number"`
 }
 
 // Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
@@ -313,6 +315,7 @@ func (q *Queries) GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (Get
 		&i.SelectedTheses,
 		&i.StructuredContent,
 		&i.Authorship,
+		&i.FilingNumber,
 	)
 	return i, err
 }
@@ -814,11 +817,13 @@ INSERT INTO draft (
     tenant_id, case_id, intimation_id,
     piece_type, title, content,
     status, saga_state,
+    created_by,
     created_at, updated_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     'DRAFT', 'CREATED',
+    NULLIF($7, '00000000-0000-0000-0000-000000000000'::uuid),
     now(), now()
 )
 ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHING
@@ -836,6 +841,7 @@ type InsertDraftParams struct {
 	PieceType    string      `json:"piece_type"`
 	Title        string      `json:"title"`
 	Content      *string     `json:"content"`
+	Column7      interface{} `json:"column_7"`
 }
 
 type InsertDraftRow struct {
@@ -876,6 +882,7 @@ func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (Inser
 		arg.PieceType,
 		arg.Title,
 		arg.Content,
+		arg.Column7,
 	)
 	var i InsertDraftRow
 	err := row.Scan(
@@ -1039,10 +1046,18 @@ SELECT
     d.status,
     d.saga_state,
     d.created_at,
+    d.sent_to_signing_at,
+    d.signed_at,
+    d.filed_at AS draft_filed_at,
     p.filed_at,
     p.observed_result,
-    r.coverage AS review_coverage
+    r.coverage AS review_coverage,
+    COALESCE(cr.cnj_number, '')                AS cnj_number,
+    dl.end_date                                AS deadline_end_date,
+    COALESCE(au.name, '')                      AS responsible_name
 FROM draft d
+LEFT JOIN court_record cr ON cr.case_id = d.case_id AND cr.tenant_id = d.tenant_id
+LEFT JOIN app_user au ON au.id = d.created_by AND au.tenant_id = d.tenant_id
 LEFT JOIN petition p ON p.draft_id = d.id
 LEFT JOIN LATERAL (
     SELECT rv.coverage
@@ -1051,12 +1066,32 @@ LEFT JOIN LATERAL (
     ORDER BY rv.generated_at DESC
     LIMIT 1
 ) r ON true
+LEFT JOIN LATERAL (
+    SELECT dln.end_date
+    FROM deadline dln
+    WHERE dln.notification_id = d.intimation_id
+      AND dln.tenant_id = d.tenant_id
+    ORDER BY dln.end_date ASC
+    LIMIT 1
+) dl ON true
 WHERE d.tenant_id = $1
   AND ($2::text = '' OR d.piece_type = $2)
   AND ($3::text = '' OR d.status = $3)
+  -- workflow_state: 'aguardando_assinatura' | 'aguardando_protocolo' | ''
+  AND (
+    $6::text = ''
+    OR ($6::text = 'aguardando_assinatura' AND d.sent_to_signing_at IS NOT NULL AND d.signed_at IS NULL)
+    OR ($6::text = 'aguardando_protocolo'  AND d.signed_at IS NOT NULL AND d.filed_at IS NULL AND p.filed_at IS NULL)
+  )
+  -- urgencia: 'atraso' | 'hoje' | ''
+  AND (
+    $7::text = ''
+    OR ($7::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
+    OR ($7::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
+  )
   AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
-LIMIT $6
+LIMIT $8
 `
 
 type ListDraftsAllParams struct {
@@ -1065,24 +1100,34 @@ type ListDraftsAllParams struct {
 	Column3  string             `json:"column_3"`
 	Column4  pgtype.Timestamptz `json:"column_4"`
 	Column5  uuid.UUID          `json:"column_5"`
+	Column6  string             `json:"column_6"`
+	Column7  string             `json:"column_7"`
 	Limit    int32              `json:"limit"`
 }
 
 type ListDraftsAllRow struct {
-	ID             uuid.UUID          `json:"id"`
-	PieceType      string             `json:"piece_type"`
-	Title          string             `json:"title"`
-	Status         string             `json:"status"`
-	SagaState      string             `json:"saga_state"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	FiledAt        pgtype.Timestamptz `json:"filed_at"`
-	ObservedResult *string            `json:"observed_result"`
-	ReviewCoverage []byte             `json:"review_coverage"`
+	ID              uuid.UUID          `json:"id"`
+	PieceType       string             `json:"piece_type"`
+	Title           string             `json:"title"`
+	Status          string             `json:"status"`
+	SagaState       string             `json:"saga_state"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	SentToSigningAt pgtype.Timestamptz `json:"sent_to_signing_at"`
+	SignedAt        pgtype.Timestamptz `json:"signed_at"`
+	DraftFiledAt    pgtype.Timestamptz `json:"draft_filed_at"`
+	FiledAt         pgtype.Timestamptz `json:"filed_at"`
+	ObservedResult  *string            `json:"observed_result"`
+	ReviewCoverage  []byte             `json:"review_coverage"`
+	CnjNumber       string             `json:"cnj_number"`
+	DeadlineEndDate pgtype.Date        `json:"deadline_end_date"`
+	ResponsibleName string             `json:"responsible_name"`
 }
 
 // Paginated list of all peças for a tenant, ordered by (created_at DESC,
-// id DESC). Optional piece_type and status filters. Coverage summary from
-// latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+// id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
+// urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+// da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
+// Over-fetch por 1 pra hasMore.
 func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error) {
 	rows, err := q.db.Query(ctx, listDraftsAll,
 		arg.TenantID,
@@ -1090,6 +1135,8 @@ func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([
 		arg.Column3,
 		arg.Column4,
 		arg.Column5,
+		arg.Column6,
+		arg.Column7,
 		arg.Limit,
 	)
 	if err != nil {
@@ -1106,9 +1153,15 @@ func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([
 			&i.Status,
 			&i.SagaState,
 			&i.CreatedAt,
+			&i.SentToSigningAt,
+			&i.SignedAt,
+			&i.DraftFiledAt,
 			&i.FiledAt,
 			&i.ObservedResult,
 			&i.ReviewCoverage,
+			&i.CnjNumber,
+			&i.DeadlineEndDate,
+			&i.ResponsibleName,
 		); err != nil {
 			return nil, err
 		}
@@ -1312,7 +1365,6 @@ func (q *Queries) RevertToConstruction(ctx context.Context, arg RevertToConstruc
 }
 
 const setGenerationParams = `-- name: SetGenerationParams :exec
-
 UPDATE draft
 SET tone            = $3,
     instructions    = $4,
@@ -1329,8 +1381,6 @@ type SetGenerationParamsParams struct {
 	SelectedTheses []string  `json:"selected_theses"`
 }
 
-// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
-// These are the three new queries the async generation saga needs.
 // Persist the Gerar-time generation params (tone/instructions/selected_theses,
 // Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
 // the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event
@@ -1636,6 +1686,33 @@ func (q *Queries) UpdateDraftContentHtml(ctx context.Context, arg UpdateDraftCon
 	var i UpdateDraftContentHtmlRow
 	err := row.Scan(&i.ID, &i.UpdatedAt)
 	return i, err
+}
+
+const updateFilingNumber = `-- name: UpdateFilingNumber :exec
+
+UPDATE draft
+SET filing_number = $3,
+    updated_at    = now()
+WHERE id = $1 AND tenant_id = $2 AND filing_number IS NULL
+`
+
+type UpdateFilingNumberParams struct {
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	FilingNumber *string   `json:"filing_number"`
+}
+
+// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+// These are the three new queries the async generation saga needs.
+// Atualiza APENAS o filing_number de uma peça já protocolada. Diferente do
+// MarkFiled (que só grava no INSERT do filing, `filed_at IS NULL`), este roda
+// no branch idempotente do File quando o advogado esqueceu de digitar o
+// número na primeira vez OU digitou errado e agora está corrigindo. Guard:
+// só sobrescreve quando o valor atual é NULL (nunca zera um número já
+// gravado). Scoped (id, tenant_id).
+func (q *Queries) UpdateFilingNumber(ctx context.Context, arg UpdateFilingNumberParams) error {
+	_, err := q.db.Exec(ctx, updateFilingNumber, arg.ID, arg.TenantID, arg.FilingNumber)
+	return err
 }
 
 const updateObservedResult = `-- name: UpdateObservedResult :one

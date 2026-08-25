@@ -182,8 +182,8 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
 
-	if out.PromptVersion != "draft_minuta/v7" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v7", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v9" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v9", out.PromptVersion)
 	}
 
 	// System must contain the gold rule (v4: parties + signing lawyer instruction).
@@ -274,8 +274,8 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
 	if !strings.Contains(out.User, "sem contexto adicional") {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
-	if out.PromptVersion != "draft_minuta/v7" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v7", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v9" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v9", out.PromptVersion)
 	}
 }
 
@@ -478,15 +478,21 @@ func TestTemplateComposer_ComposeTheses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComposeTheses() error = %v", err)
 	}
-	if out.PromptVersion != "suggest_theses/v1" {
-		t.Errorf("PromptVersion = %q, want suggest_theses/v1", out.PromptVersion)
+	if out.PromptVersion != "suggest_theses/v2" {
+		t.Errorf("PromptVersion = %q, want suggest_theses/v2", out.PromptVersion)
 	}
 	if strings.TrimSpace(out.System) == "" || strings.TrimSpace(out.User) == "" {
 		t.Fatalf("empty system/user: system=%q user=%q", out.System, out.User)
 	}
-	for _, want := range []string{"label", "confidence", "reference", "foundation"} {
+	// v2: campo `evidence` obrigatório + critérios objetivos por confidence.
+	for _, want := range []string{"label", "confidence", "reference", "foundation", "evidence"} {
 		if !strings.Contains(out.System, want) {
 			t.Errorf("system prompt missing %q output field\n---\n%s", want, out.System)
+		}
+	}
+	for _, want := range []string{"CRITÉRIOS DE CONFIDENCE", "evidence.length"} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("system prompt missing v2 rubric %q\n---\n%s", want, out.System)
 		}
 	}
 	for _, want := range []string{"TJSP", "Fica o réu citado a contestar", "RÉU SA"} {

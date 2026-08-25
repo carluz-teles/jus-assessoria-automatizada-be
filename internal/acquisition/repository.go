@@ -1803,13 +1803,23 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			AssigneeUserID:   assigneeID,
 			AssigneeUserName: row.AssigneeUserName,
 		},
-		Content:        row.Content,
-		JudgingBody:    deref(row.JudgingBody),
-		Recipients:     rawArrayOrEmpty(json.RawMessage(row.Recipients)),
-		History:        history,
-		AISummary:      deref(row.AiSummary),
-		AIProvidencias: decodeProvidencias(row.AiProvidencias),
+		Content:          row.Content,
+		JudgingBody:      deref(row.JudgingBody),
+		DistributionDate: dateStringOrEmpty(row.DistributionDate),
+		Recipients:       rawArrayOrEmpty(json.RawMessage(row.Recipients)),
+		History:          history,
+		AISummary:        deref(row.AiSummary),
+		AIProvidencias:   decodeProvidencias(row.AiProvidencias),
 	}, nil
+}
+
+// dateStringOrEmpty formats a pgtype.Date as "YYYY-MM-DD", "" when NULL.
+// Usado no wire pra manter contrato JSON (date puro, sem UTC drift).
+func dateStringOrEmpty(d pgtype.Date) string {
+	if !d.Valid {
+		return ""
+	}
+	return d.Time.Format("2006-01-02")
 }
 
 // decodeProvidencias unmarshals the intimation.ai_providencias jsonb into the wire slice.

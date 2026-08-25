@@ -158,9 +158,18 @@ type Config struct {
 	// BASE_URL têm default sensato, trocáveis por env sem redeploy (o tiering do §7: light aqui,
 	// strong pra peça). Opcional no agregado — o adapter valida a chave no ponto de uso (Generate
 	// devolve Invalid) e o binário que não gera não morre por falta dela.
-	OpenRouterAPIKey  string `env:"OPENROUTER_API_KEY"`
-	OpenRouterModel   string `env:"OPENROUTER_MODEL" envDefault:"openai/gpt-4o-mini"`
-	OpenRouterBaseURL string `env:"OPENROUTER_BASE_URL" envDefault:"https://openrouter.ai/api/v1"`
+	OpenRouterAPIKey string `env:"OPENROUTER_API_KEY"`
+	// OpenRouterModel é o modelo LEGADO (usado quando FAST/QUALITY vazios) e
+	// também o baseline global. Kept as fallback pra migração suave.
+	OpenRouterModel string `env:"OPENROUTER_MODEL" envDefault:"openai/gpt-4o-mini"`
+	// Modelos por tier (tiering do §7 do ERD): FAST pra loops iterativos
+	// curtos (teses, chat, sugerir tasks) onde velocidade > exaustividade;
+	// QUALITY pra escritas críticas (gerar minuta, iterar peça, revisar,
+	// analisar intimação, resumir processo). Cada campo vazio cai no
+	// OpenRouterModel legado — permite ligar tier a tier sem breaking.
+	OpenRouterModelFast    string `env:"OPENROUTER_MODEL_FAST"    envDefault:"google/gemini-2.5-flash-lite"`
+	OpenRouterModelQuality string `env:"OPENROUTER_MODEL_QUALITY" envDefault:"google/gemini-2.5-flash"`
+	OpenRouterBaseURL      string `env:"OPENROUTER_BASE_URL" envDefault:"https://openrouter.ai/api/v1"`
 
 	// Calendário de prazos.
 	// HolidaySeedYearsAhead — quantos anos ALÉM do corrente o seeder nacional de

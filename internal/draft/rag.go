@@ -26,16 +26,30 @@ import (
 // the raw ChunkHit slice (for citation validation in chat), and whether grounding was
 // achieved (len(hits) > 0).
 //
-// It degrades gracefully on any failure — the caller continues ungrounded.
+// Quando `cache` é não-nil, consulta antes de chamar embed/search — hit poupa
+// 500ms-1s (Voyage) + 50-200ms (pgvector) por request repetida. Cache nulo =
+// comportamento legado (sem cache). Erros de cache degradam pra miss e não
+// bloqueiam a request.
+//
+// Degrada graciosamente em qualquer falha — o caller segue ungrounded.
 func runRAG(
 	ctx context.Context,
 	emb embedder,
 	search indexing.SearchDeps,
+	cache *RAGCache,
 	tenantID string,
 	courtRecordID *string,
 	queryText string,
 	topK int,
 ) (texts []string, hits []indexing.ChunkHit, grounded bool) {
+	// Cache lookup — só quando o cache está montado. Miss ou erro cai no
+	// caminho normal abaixo sem branch adicional.
+	if cache != nil {
+		if t, h, g, ok := cache.Get(ctx, tenantID, courtRecordID, queryText, topK); ok {
+			return t, h, g
+		}
+	}
+
 	if emb == nil || search.Pool == nil {
 		return nil, nil, false
 	}
@@ -65,5 +79,13 @@ func runRAG(
 	for i, hit := range h {
 		out[i] = hit.Text
 	}
+
+	// Só cacheia resultado grounded — miss/degrade não é útil cachear (o
+	// próximo request paga o mesmo custo, e se o corpus for indexado no
+	// meio-tempo o cache atrapalha).
+	if cache != nil {
+		cache.Set(ctx, tenantID, courtRecordID, queryText, topK, out, h, true)
+	}
+
 	return out, h, true
 }

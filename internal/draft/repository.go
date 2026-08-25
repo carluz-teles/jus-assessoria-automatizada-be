@@ -159,6 +159,13 @@ type Repository interface {
 	// falha → ErrDraftNotFound.
 	MarkFiled(ctx context.Context, tx database.Tx, draftID, tenantID, filingNumber string) error
 
+	// UpdateFilingNumber atualiza APENAS o filing_number quando o advogado
+	// esqueceu de digitar na 1ª vez OU digitou errado. Guard SQL: só grava
+	// quando filing_number atual IS NULL — nunca zera um valor existente.
+	// No-op silencioso quando não bate (WHERE não encontra). Usado no branch
+	// idempotente do File.
+	UpdateFilingNumber(ctx context.Context, tx database.Tx, draftID, tenantID, filingNumber string) error
+
 	// InsertPetition persists the filed petition. Returns the persisted entity.
 	InsertPetition(ctx context.Context, tx database.Tx, p *Petition) (*Petition, error)
 
@@ -179,9 +186,12 @@ type Repository interface {
 	ListDraftsByProcess(ctx context.Context, tx database.Tx, tenantID, caseID string, lastCreated string, lastID string, limit int) ([]DraftListItem, error)
 
 	// ListDraftsAll returns draft list items across all processes for a tenant,
-	// keyset paginated (created_at DESC, id DESC). Optional filters for
-	// piece_type and status. Over-fetches by 1 for hasMore.
-	ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, lastCreated, lastID string, limit int) ([]DraftListItem, error)
+	// keyset paginated (created_at DESC, id DESC). Filtros opcionais (vazio = ignorado):
+	//   pieceType, status  — colunas próprias do draft
+	//   workflowState      — "aguardando_assinatura" | "aguardando_protocolo"
+	//   urgencia           — "atraso" | "hoje" (contra deadline.end_date da intimation)
+	// Over-fetches por 1 pra hasMore.
+	ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, lastCreated, lastID string, limit int) ([]DraftListItem, error)
 
 	// GetCourtRecordIDByIntimation returns the court_record_id for an intimation,
 	// or empty string if the intimation has no linked court record.
@@ -213,6 +223,9 @@ func (r *pgRepository) InsertDraft(ctx context.Context, tx database.Tx, d *Draft
 	// intimation_id), the INSERT is silently skipped and RETURNING yields no rows
 	// (pgx.ErrNoRows). We map that to ErrDraftAlreadyExists so the use case can
 	// fetch the existing row — the transaction stays healthy (no 23505 abort).
+	// created_by opcional — vazio vira UUID zero e o NULLIF no SQL grava NULL,
+	// mantendo compat com callers que ainda não passam o principal.
+	createdByRaw, _ := parseUUID(d.CreatedBy)
 	row, err := draftdb.New(tx).InsertDraft(ctx, draftdb.InsertDraftParams{
 		TenantID:     tenantID,
 		CaseID:       optUUID(d.CaseID),
@@ -220,6 +233,7 @@ func (r *pgRepository) InsertDraft(ctx context.Context, tx database.Tx, d *Draft
 		PieceType:    d.PieceType,
 		Title:        d.Title,
 		Content:      textToNull(d.Content),
+		Column7:      createdByRaw,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDraftAlreadyExists
@@ -960,6 +974,28 @@ func (r *pgRepository) MarkFiled(ctx context.Context, tx database.Tx, draftID, t
 	return nil
 }
 
+func (r *pgRepository) UpdateFilingNumber(ctx context.Context, tx database.Tx, draftID, tenantID, filingNumber string) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	var fn *string
+	if filingNumber != "" {
+		fn = &filingNumber
+	}
+	// :exec — não retorna row. WHERE filing_number IS NULL no SQL garante
+	// que só grava quando ainda não tem valor; caso contrário no-op.
+	return draftdb.New(tx).UpdateFilingNumber(ctx, draftdb.UpdateFilingNumberParams{
+		ID:           did,
+		TenantID:     tid,
+		FilingNumber: fn,
+	})
+}
+
 func (r *pgRepository) InsertPetition(ctx context.Context, tx database.Tx, p *Petition) (*Petition, error) {
 	did, err := parseUUID(p.DraftID)
 	if err != nil {
@@ -1082,7 +1118,7 @@ func (r *pgRepository) ListDraftsByProcess(ctx context.Context, tx database.Tx, 
 	return items, nil
 }
 
-func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, lastCreated, lastID string, limit int) ([]DraftListItem, error) {
+func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, lastCreated, lastID string, limit int) ([]DraftListItem, error) {
 	tid, err := parseUUID(tenantID)
 	if err != nil {
 		return nil, err
@@ -1103,6 +1139,8 @@ func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenant
 		Column3:  status,
 		Column4:  timeToTimestamptz(created),
 		Column5:  lid,
+		Column6:  workflowState,
+		Column7:  urgencia,
 		Limit:    int32(limit),
 	})
 	if err != nil {

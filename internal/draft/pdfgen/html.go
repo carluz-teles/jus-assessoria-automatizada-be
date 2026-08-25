@@ -57,6 +57,24 @@ type RenderHTMLInput struct {
 // do internal/draft).
 var dateRegexHTML = regexp.MustCompile(`(?i)\[\s*data\s*\]`)
 
+// closingLineRegex captura o parágrafo de fechamento que o LLM às vezes
+// escreve mesmo com o prompt v9 proibindo. Casa qualquer <p> (com ou sem
+// atributos) cujo conteúdo seja "Cidade[/UF], [data]" OU "Cidade[/UF], data
+// por extenso". O rodapé fixo (buildFullHTML → sigBlock) já injeta lugar+data
+// autoritativos do processo/assinatura, então este parágrafo VAI DUPLICAR se
+// não removido. Escopo cirúrgico: só parágrafos curtos que casam o padrão
+// exato (evita apagar texto útil por engano).
+//
+// Formatos cobertos:
+//
+//	<p>Franca/SP, [data].</p>
+//	<p>Franca, 24 de agosto de 2026.</p>
+//	<p>São Paulo/SP, 15 de outubro de 2025</p>
+//	<p style="text-align:right">Rio de Janeiro/RJ, [ data ].</p>
+var closingLineRegex = regexp.MustCompile(
+	`(?is)<p\b[^>]*>\s*[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][A-Za-zÀ-ÿ\s\.]{1,50}(?:/[A-Z]{2})?\s*,\s*(?:\[\s*data\s*\]|\d{1,2}\s+de\s+[a-zç]+\s+de\s+\d{4})\.?\s*</p>`,
+)
+
 // monthsPT é a tabela de meses em português usada pra formatar [data].
 var monthsPT = [...]string{
 	"janeiro", "fevereiro", "março", "abril", "maio", "junho",
@@ -124,21 +142,46 @@ func RenderHTML(ctx context.Context, in RenderHTMLInput) ([]byte, error) {
 func buildFullHTML(in RenderHTMLInput) string {
 	dateStr := fmt.Sprintf("%d de %s de %d",
 		in.SignedAt.Day(), monthsPT[in.SignedAt.Month()-1], in.SignedAt.Year())
-	content := dateRegexHTML.ReplaceAllString(in.HTML, dateStr)
+	// Strip da linha de fechamento gerada pelo LLM (Débito #1). Rodapé fixo
+	// injetado abaixo (sigBlock) é a fonte autoritativa — sem strip a data
+	// aparece 2x no PDF. Vem antes do dateRegex pra remover mesmo o formato
+	// com marcador [data] literal.
+	content := closingLineRegex.ReplaceAllString(in.HTML, "")
+	content = dateRegexHTML.ReplaceAllString(content, dateStr)
 
-	// Bloco de assinatura visual — só quando Signer.Name veio.
+	// Bloco de fechamento fixo — lugar + data + assinatura. NÃO gerado pelo
+	// LLM (prompt draft_minuta v9 proíbe explicitamente): é injetado aqui,
+	// centralizado, com dados AUTORITATIVOS do processo (judging_body) e
+	// do certificado usado na assinatura. Evita:
+	//   • LLM inventar cidade/OAB errados
+	//   • Data da minuta divergir da data do protocolo
+	//   • Rodapé genérico que precisa ser reescrito ao trocar certificado
 	sigBlock := ""
 	if in.Signer.Name != "" {
+		placeDateLine := ""
+		if in.Signer.Place != "" {
+			placeDateLine = fmt.Sprintf(
+				`<div style="text-align:right; margin-top:40px">%s, %s.</div>`,
+				htmlEscape(in.Signer.Place), dateStr,
+			)
+		} else {
+			// Fallback: sem cidade parseada, ainda mostra a data no bloco.
+			placeDateLine = fmt.Sprintf(
+				`<div style="text-align:right; margin-top:40px">%s.</div>`,
+				dateStr,
+			)
+		}
 		oabLine := ""
 		if in.Signer.OAB != "" {
 			oabLine = fmt.Sprintf(`<div style="text-align:center">OAB %s</div>`, htmlEscape(in.Signer.OAB))
 		}
 		sigBlock = fmt.Sprintf(`
+			%s
 			<div style="margin-top:60px; text-align:center; page-break-inside:avoid">
 				<div style="border-top:1px solid #000; width:40%%; margin:0 auto 4px auto"></div>
 				<div style="font-weight:bold">%s</div>
 				%s
-			</div>`, htmlEscape(in.Signer.Name), oabLine)
+			</div>`, placeDateLine, htmlEscape(in.Signer.Name), oabLine)
 	}
 
 	// @font-face embute a Liberation Serif via data:URL — bate 1:1 com o

@@ -148,10 +148,15 @@ type IntimacaoProvidenciaView struct {
 // carried by the embedded IntimacaoView (AssigneeUserID/Name).
 type IntimacaoDetailView struct {
 	IntimacaoView
-	Content     string                  `json:"content"`      // FULL teor (untruncated), for the detail screen
-	JudgingBody string                  `json:"judging_body"` // court_record.judging_body (órgão julgador)
-	Recipients  json.RawMessage         `json:"recipients"`   // destinatários (jsonb array), verbatim
-	History     []IntimacaoHistoryEntry `json:"history"`      // timeline derivada, ASC, nunca null
+	Content string `json:"content"` // FULL teor (untruncated), for the detail screen
+	JudgingBody string `json:"judging_body"` // court_record.judging_body (órgão julgador)
+	// DistributionDate é a data de ajuizamento/distribuição (court_record.filed_at
+	// — migration 0015). Nullable porque DJEN não carrega (só o enriquecimento
+	// DATAJUD preenche). Formato "YYYY-MM-DD" (date puro, sem timezone) — a UI
+	// só exibe a linha "Distribuição" quando não-vazio.
+	DistributionDate string                  `json:"distribution_date,omitempty"`
+	Recipients       json.RawMessage         `json:"recipients"` // destinatários (jsonb array), verbatim
+	History          []IntimacaoHistoryEntry `json:"history"`    // timeline derivada, ASC, nunca null
 
 	// Análise IA (0051) — o card "Analisar esta intimação". AISummary vazio com
 	// AIAnalyzedAt (no embedded IntimacaoView) non-nil = modo degradado (IA

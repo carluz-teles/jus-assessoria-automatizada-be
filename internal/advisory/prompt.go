@@ -329,11 +329,18 @@ const summarizeProcessVersion = "process_summary/v1"
 // da IA e chega intacta ao editor e ao PDF final (chromedp). Elimina o passo de conversão
 // structured_content → HTML no FE e prepara o pipeline pra streaming (cada chunk cai
 // diretamente no editor sem parser incremental).
-const draftMinutaVersion = "draft_minuta/v7"
+// Bumped to v8: output agora é `draft_markdown` em vez de `draft_html`. Motivo: streaming
+// char-a-char do LLM corta tags HTML no meio (`<h2>` chega como `<`, `h`, `2>`) e o
+// ProseMirror escapa fragmentos incompletos como texto (`&lt;`). Markdown é robusto ao
+// streaming (não tem tags pareadas pra corromper) e é o padrão da indústria (ChatGPT
+// Canvas, Claude Artifacts, Cursor). O BE converte markdown → HTML via goldmark antes
+// de persistir em content_html; o FE usa tiptap-markdown pra renderizar incrementalmente
+// no editor via streamContent().
+const draftMinutaVersion = "draft_minuta/v9"
 
 // suggestThesesVersion is the pinned version of the suggest_theses template (POST
 // /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
-const suggestThesesVersion = "suggest_theses/v1"
+const suggestThesesVersion = "suggest_theses/v2"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -522,9 +529,9 @@ func composeDraftMinuta(c DraftContext) Composed {
 	var sys strings.Builder
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro que redige a MINUTA COMPLETA de uma peça processual, " +
-			"pronta para revisão do advogado no editor rico (Tiptap). Produza SOMENTE o campo `draft_html`: " +
-			"o HTML da minuta, pronto pra renderizar no editor e no PDF final (sem <html>/<head>/<body> — " +
-			"apenas os blocos internos do documento).\n\n" +
+			"pronta para revisão do advogado no editor rico. Produza SOMENTE o campo `draft_markdown`: " +
+			"o texto da minuta em MARKDOWN (CommonMark + GFM tables), sem front-matter e sem code fences " +
+			"envolvendo o output.\n\n" +
 
 			"REGRA DE OURO (a mais importante): USE OS DADOS REAIS fornecidos no contexto. NUNCA deixe " +
 			"placeholder (___, [assim], \"NOME DA PARTE\") para um dado que foi fornecido. Só use " +
@@ -557,13 +564,14 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"7) \"III – DOS PEDIDOS\" (CAIXA ALTA): \"Ante o exposto, requer a Vossa Excelência:\" + " +
 			"alíneas a), b), c) (pedido certo e determinado, art. 322/324 CPC; inclua produção de provas " +
 			"e sucumbência quando cabível).\n" +
-			"8) FECHO: \"Nestes termos,\\nPede deferimento.\" seguido de UMA linha em branco e depois " +
-			"\"[Comarca]/[UF], [data].\" — E PARE AÍ. NÃO adicione nome nem OAB do advogado no fim da " +
-			"peça: o bloco de assinatura (nome + OAB do titular do certificado) é adicionado " +
-			"automaticamente no PDF no momento da assinatura. A COMARCA você preenche do contexto, mas " +
-			"a DATA do fecho é SEMPRE o marcador " +
-			"literal [data] — a data de protocolo é definida pelo advogado ao assinar; NUNCA infira, " +
-			"calcule ou copie uma data do teor/prazo para o fecho.\n\n" +
+			"8) FECHO: escreva EXATAMENTE \"Nestes termos,\\nPede deferimento.\" e PARE AÍ. NÃO " +
+			"escreva NADA depois disso. Especificamente PROIBIDO: cidade, UF, comarca, data, dia/mês/" +
+			"ano por extenso, marcador [data], marcador [local], nome do advogado, OAB, assinatura, " +
+			"linha em branco extra para assinatura, traços/underscores simulando linha de assinatura. " +
+			"O bloco COMPLETO de fechamento (cidade do foro, data por extenso e nome+OAB do titular " +
+			"do certificado) é adicionado AUTOMATICAMENTE pelo sistema no momento da geração do PDF, " +
+			"a partir do court_record e do certificado digital. Qualquer coisa que você escreva após " +
+			"\"Pede deferimento.\" vai aparecer duplicado no PDF final.\n\n" +
 
 			"REQUISITOS LEGAIS POR TIPO DE PEÇA:\n" +
 			"- PETIÇÃO INICIAL (COMPLAINT): art. 319 CPC (juízo, partes, causa de pedir, pedido, valor " +
@@ -576,22 +584,27 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"- RECURSO (APPEAL): síntese do decidido + razões de reforma + pedido de provimento. No JE, " +
 			"recurso inominado (art. 41 Lei 9.099/95).\n\n" +
 
-			"FORMATAÇÃO HTML (obrigatória — nada de markdown, nada de texto puro):\n" +
-			"- Endereçamento: <p><strong>EXCELENTÍSSIMO...</strong></p>\n" +
-			"- Referência do processo: <p>Processo nº [CNJ] — [Classe] ([Assunto])</p>\n" +
-			"- Qualificação/exórdio: <p>...</p> (um por parágrafo)\n" +
-			"- Cabeçalho de seção: <h2>I — DOS FATOS</h2> · <h2>II — DO DIREITO</h2> · <h2>III — DOS PEDIDOS</h2>\n" +
-			"- Parágrafos numerados dos fatos/direito: <p>1. ...</p><p>2. ...</p> (o número faz parte do texto, não use <ol>)\n" +
-			"- Pedidos com alíneas: use <ol type=\"a\"><li>...</li><li>...</li></ol>\n" +
-			"- Ênfase pontual (nome da peça, valores, nº do processo, artigos citados): <strong>...</strong>\n" +
-			"- Termos técnicos em latim/estrangeiro: <em>...</em>\n" +
-			"- Citações longas (>3 linhas de lei/jurisprudência): <blockquote>...</blockquote>\n" +
-			"- Tabelas de cálculo (impugnação de valor): <table><tr><th>Coluna</th></tr><tr><td>Valor</td></tr></table>\n" +
-			"- Fecho: <p>Nestes termos, pede deferimento.</p><p style=\"text-align:right\">[Comarca]/[UF], [data].</p>\n" +
-			"NÃO escreva ```html ``` code fences. NÃO envolva em <html> ou <body>. Devolva apenas os blocos " +
-			"HTML soltos. Se faltar dado essencial, escreva a melhor minuta possível com marcador entre " +
-			"colchetes no que faltar — NUNCA invente fatos, valores, súmulas, datas ou nºs de processo que " +
-			"não constem do contexto.",
+			"FORMATAÇÃO MARKDOWN (CommonMark + GFM tables — nada de HTML, nada de code fences):\n" +
+			"- Endereçamento (linha inteira em negrito): `**EXCELENTÍSSIMO SENHOR DOUTOR JUIZ...**`\n" +
+			"- Referência do processo: `Processo nº [CNJ] — [Classe] ([Assunto])` (parágrafo simples)\n" +
+			"- Qualificação/exórdio: parágrafos simples separados por linha em branco\n" +
+			"- Cabeçalho de seção: `## I — DOS FATOS`  ·  `## II — DO DIREITO`  ·  `## III — DOS PEDIDOS`\n" +
+			"- Parágrafos numerados dos fatos/direito: escreva o número no início do texto, sem lista: " +
+			"`1. Trata-se de ...` em parágrafo próprio; próxima linha em branco; `2. ...`\n" +
+			"- Pedidos com alíneas: lista ordenada markdown `1. ...\\n2. ...` (o renderer converte para a), b), c) — " +
+			"não use asteriscos nem letras manualmente)\n" +
+			"- Ênfase pontual (nome da peça, valores, nº do processo, artigos citados): `**texto**`\n" +
+			"- Termos técnicos em latim/estrangeiro: `*texto*`\n" +
+			"- Citações longas (>3 linhas de lei/jurisprudência): `> ...` (blockquote, uma linha por linha citada)\n" +
+			"- Tabelas de cálculo (impugnação de valor): tabela GFM `| Coluna | Valor |\\n|---|---|\\n| ... | ... |`\n" +
+			"- Fecho: EXATAMENTE `Nestes termos,\\nPede deferimento.` em um parágrafo e PARE. Sem " +
+			"nova linha, sem cidade/data/nome/OAB, sem espaços em branco para assinatura. O PDF " +
+			"final injeta o bloco de assinatura completo (cidade do foro + data + nome + OAB do " +
+			"certificado) automaticamente — sua saída termina em \"deferimento.\".\n" +
+			"NUNCA escreva tags HTML (`<p>`, `<strong>`, `<h2>`, etc). NUNCA envolva o output em ```markdown``` " +
+			"ou qualquer code fence. Devolva apenas o markdown puro. Se faltar dado essencial, escreva a melhor " +
+			"minuta possível com marcador entre colchetes no que faltar — NUNCA invente fatos, valores, súmulas, " +
+			"datas ou nºs de processo que não constem do contexto.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
@@ -709,20 +722,21 @@ func composeSuggestTheses(c DraftContext) Composed {
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro especializado em teses de defesa/ataque. " +
 			"A partir do contexto do caso (teor da intimação, partes, trechos dos autos), sugira " +
-			"TESES JURÍDICAS candidatas que o advogado pode desenvolver na peça. Cada tese tem: " +
-			"`label` (nome curto da tese, ex.: \"Prescrição intercorrente\"), `confidence` (um de: " +
-			"alta, media, baixa — a força da tese neste caso concreto), `reference` (a jurisprudência " +
-			"ou o dispositivo legal que fundamenta a tese, em texto livre, ex.: \"art. 206, §5º, I, " +
-			"CC\" ou \"STJ, REsp 1.234.567/SP\"), `foundation` (explicação curta de por que a tese " +
-			"se aplica a este caso).\n\n" +
+			"TESES JURÍDICAS candidatas que o advogado pode desenvolver na peça. Cada tese tem:\n" +
+			"- `label`: nome curto da tese (ex.: \"Prescrição intercorrente\").\n" +
+			"- `confidence`: um de alta|media|baixa — CLASSIFIQUE COM RIGOR conforme os critérios abaixo.\n" +
+			"- `reference`: jurisprudência ou dispositivo legal, texto livre (ex.: \"art. 206, §5º, I, CC\" ou \"STJ, REsp 1.234.567/SP\"). NÃO invente números de processo.\n" +
+			"- `foundation`: explicação CURTA (1-2 frases) de por que a tese se aplica a este caso.\n" +
+			"- `evidence`: ARRAY de trechos LITERAIS extraídos do TEOR DA INTIMAÇÃO ou dos Trechos relevantes dos autos que sustentam a tese. Cada item é um recorte curto (10-40 palavras), copiado sem alterar. NÃO parafraseie. NÃO invente. Se não houver trecho literal, deixe o array vazio — e nesse caso confidence DEVE ser baixa.\n\n" +
+			"CRITÉRIOS DE CONFIDENCE (siga à risca):\n" +
+			"- alta: ao menos 2 trechos literais do contexto (evidence.length ≥ 2) apoiam DIRETAMENTE a tese, e o dispositivo/precedente citado é claramente aplicável ao caso concreto.\n" +
+			"- media: 1 trecho literal apoia (evidence.length == 1), OU 2+ trechos apoiam de forma indireta (contexto sugere mas não afirma o fato-chave).\n" +
+			"- baixa: nenhum trecho literal (evidence.length == 0), OU a tese é aplicável só em tese/doutrina sem amarração ao caso. Prefira retornar tese baixa a inventar evidência.\n\n" +
 			"REGRAS OBRIGATÓRIAS:\n" +
-			"- NÃO invente fatos que não estejam no contexto; a tese deve ser aplicável ao caso " +
-			"descrito, não genérica.\n" +
-			"- `reference` é texto livre (não um trecho literal dos autos) — cite a norma ou o " +
-			"precedente pelo nome/número usual, sem inventar números de processo.\n" +
-			"- Máximo 8 teses, ordenadas da mais forte (confidence=alta) para a mais fraca.\n" +
-			"- Se o contexto for insuficiente para qualquer tese com fundamento real, retorne uma " +
-			"lista vazia em vez de supor.",
+			"- NÃO invente fatos que não estejam no contexto; a tese deve ser aplicável ao caso descrito, não genérica.\n" +
+			"- Todo item de `evidence` deve ser cópia literal do TEOR DA INTIMAÇÃO ou de um dos Trechos relevantes dos autos. Não parafraseie, não resuma. Copiar exato o recorte que sustenta.\n" +
+			"- Máximo 8 teses, ordenadas da mais forte (alta) para a mais fraca (baixa).\n" +
+			"- Se o contexto for insuficiente para qualquer tese com fundamento real, retorne uma lista vazia em vez de supor.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")

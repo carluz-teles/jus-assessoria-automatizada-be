@@ -30,6 +30,15 @@ type Draft struct {
 	SagaState    string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// CreatedBy é o app_user.id do advogado que clicou "Redigir peça". Persistido
+	// no INSERT (migration 0063) e usado pelo read model da lista pra mostrar
+	// avatar/nome no card. Vazio pra peças criadas antes da migration.
+	CreatedBy string
+
+	// FilingNumber é o número/protocolo do tribunal (migration 0060), gravado
+	// via MarkFiled quando o advogado marca a peça como protocolada. Vazio =
+	// pré-protocolo OU protocolado sem número informado.
+	FilingNumber string
 
 	// ── Generation params (Fatia 5 — teses/tom/instruções) ────────────────────
 	// Chosen on POST /v1/pecas/:id/generate and persisted on the row (not on the
@@ -204,6 +213,31 @@ var validPieceTypes = map[string]bool{
 	PieceTypeOther:     true,
 }
 
+// pieceTypeLabelPT maps the closed piece_type set to a human-readable label —
+// espelha o dicionário do FE (pecas-list-page.tsx) pra o BE conseguir montar
+// o título default sem exigir uma passada extra no cliente.
+var pieceTypeLabelPT = map[string]string{
+	PieceTypeDefense:   "Defesa",
+	PieceTypeComplaint: "Petição inicial",
+	PieceTypeAppeal:    "Recurso",
+	PieceTypeMotion:    "Petição",
+	PieceTypeOther:     "Peça",
+}
+
+// defaultDraftTitle monta o título fallback pra draft.title quando o caller
+// não passa nada. Retorna "<Tipo> · <CNJ>" quando o CNJ é conhecido, senão
+// só "<Tipo>". Usado pra evitar rows com title vazio na lista.
+func defaultDraftTitle(pieceType, cnj string) string {
+	label := pieceTypeLabelPT[pieceType]
+	if label == "" {
+		label = "Peça"
+	}
+	if cnj != "" {
+		return label + " · " + cnj
+	}
+	return label
+}
+
 // ── Generation params (Fatia 5 — teses/tom/instruções) ──────────────────────
 
 // Tone closed set — the only values POST /v1/pecas/:id/generate accepts for
@@ -228,11 +262,19 @@ var validTones = map[string]bool{
 // a Finding/Citation, Reference is a plain string — jurisprudência or a legal
 // dispositivo is not a chunk anchored in the case corpus, so it carries no
 // document_id/page/quote.
+//
+// Evidence carrega trechos LITERAIS do teor/chunks que sustentam a tese —
+// serve pra justificar a confidence pro advogado (a "prova" por trás do
+// rótulo alta/media/baixa) e pra reduzir alucinação (o LLM é forçado a citar
+// o que leu, não inventar). Vazio = tese sem base literal no contexto (o
+// prompt permite quando é doutrina/dispositivo puro, mas força confidence
+// baixa nesse caso).
 type Thesis struct {
-	Label      string `json:"label"`
-	Confidence string `json:"confidence"` // alta|media|baixa
-	Reference  string `json:"reference"`  // jurisprudência ou dispositivo legal, texto livre
-	Foundation string `json:"foundation"`
+	Label      string   `json:"label"`
+	Confidence string   `json:"confidence"` // alta|media|baixa
+	Reference  string   `json:"reference"`  // jurisprudência ou dispositivo legal, texto livre
+	Foundation string   `json:"foundation"`
+	Evidence   []string `json:"evidence"`
 }
 
 // ThesisConfidence closed set.
@@ -538,9 +580,23 @@ type DraftListItem struct {
 	Status          string
 	SagaState       string
 	CoverageSummary *CoverageSummary
+	// Workflow timestamps — o FE deriva o step visível (Rascunho, Aguardando
+	// assinatura, Aguardando protocolo, Protocolada) a partir do combo dos 3.
+	SentToSigningAt *time.Time
+	SignedAt        *time.Time
 	FiledAt         *time.Time
 	ObservedResult  *string
 	CreatedAt       time.Time
+	// Contexto do processo — pra mostrar CNJ no card sem 2ª chamada.
+	CNJNumber string
+	// Nome do autor da peça (join com app_user via created_by). Vazio pra
+	// peças pré-migration 0063 ou quando o usuário foi removido do escritório.
+	ResponsibleName string
+	// Prazo da intimação de origem (join com deadline via notification_id) —
+	// alimenta chips "Prazo em atraso"/"Prazo hoje" e o rótulo colorido no
+	// card. Ambos nil quando não há deadline derivado.
+	DeadlineEndDate *time.Time
+	DeadlineDaysLeft *int32
 }
 
 // DraftListResult is a page of peças plus whether a further page exists.

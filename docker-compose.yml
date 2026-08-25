@@ -105,6 +105,11 @@ services:
   api:
     build:
       context: .
+      # runtime-chromium: pdfgen/html.go chama Chromium headless via chromedp
+      # pra renderizar HTML→PDF na assinatura. Sem esse target, cai no
+      # distroless default (sem exec) e o sign() falha 500 "google-chrome
+      # not found in $PATH".
+      target: runtime-chromium
       args:
         SVC: api
     image: jus-api:local

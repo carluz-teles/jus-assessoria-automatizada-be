@@ -132,6 +132,7 @@ func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
 		SelectedTheses:    derefStringSlice(r.SelectedTheses),
 		StructuredContent: structuredContentFromJSON(r.StructuredContent),
 		Authorship:        r.Authorship,
+		FilingNumber:      derefString(r.FilingNumber),
 	}
 }
 
@@ -603,16 +604,41 @@ func draftListItemFromProcessRow(r draftdb.ListDraftsByProcessRow) DraftListItem
 // draftListItemFromAllRow maps a ListDraftsAllRow to a DraftListItem.
 func draftListItemFromAllRow(r draftdb.ListDraftsAllRow) DraftListItem {
 	item := DraftListItem{
-		ID:        r.ID.String(),
-		PieceType: r.PieceType,
-		Title:     r.Title,
-		Status:    r.Status,
-		SagaState: r.SagaState,
-		CreatedAt: timestamptzToTime(r.CreatedAt),
+		ID:              r.ID.String(),
+		PieceType:       r.PieceType,
+		Title:           r.Title,
+		Status:          r.Status,
+		SagaState:       r.SagaState,
+		CreatedAt:       timestamptzToTime(r.CreatedAt),
+		CNJNumber:       r.CnjNumber,
+		ResponsibleName: r.ResponsibleName,
 	}
-	if r.FiledAt.Valid {
+	if r.SentToSigningAt.Valid {
+		t := timestamptzToTime(r.SentToSigningAt)
+		item.SentToSigningAt = &t
+	}
+	if r.SignedAt.Valid {
+		t := timestamptzToTime(r.SignedAt)
+		item.SignedAt = &t
+	}
+	// filed_at pode vir do draft (novo) OU do petition (legacy). O primeiro
+	// que estiver preenchido ganha.
+	if r.DraftFiledAt.Valid {
+		t := timestamptzToTime(r.DraftFiledAt)
+		item.FiledAt = &t
+	} else if r.FiledAt.Valid {
 		t := timestamptzToTime(r.FiledAt)
 		item.FiledAt = &t
+	}
+	if r.DeadlineEndDate.Valid {
+		t := r.DeadlineEndDate.Time
+		item.DeadlineEndDate = &t
+		// days_left calculado no Go pra evitar o CASE...NULL::int no SQL
+		// (sqlc infere non-null e o scan quebra pra rows sem deadline).
+		today := time.Now().UTC().Truncate(24 * time.Hour)
+		end := t.UTC().Truncate(24 * time.Hour)
+		days := int32(end.Sub(today) / (24 * time.Hour))
+		item.DeadlineDaysLeft = &days
 	}
 	if r.ObservedResult != nil {
 		item.ObservedResult = r.ObservedResult

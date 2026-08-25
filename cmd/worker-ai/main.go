@@ -142,6 +142,10 @@ func run(logger *slog.Logger) error {
 		}
 		redisClient := redis.NewClient(redisRawOpt)
 		chunkPub := pubsub.NewRedisPubSub(redisClient)
+		// RAG cache — mesmo Redis client, mesma TTL do api. Se advogado
+		// gerou teses e depois pediu Generate na mesma sessão, o cache do
+		// api pré-aqueceu a chave; aqui é hit direto (poupa Voyage+pgvector).
+		ragCache := draft.NewRAGCache(redisClient, 5*time.Minute)
 
 		generateUC := draft.NewGenerateUseCase(draft.GenerateUseCaseParams{
 			UoW:      uow,
@@ -152,9 +156,12 @@ func run(logger *slog.Logger) error {
 			Gen:      gen,
 			Emb:      emb,
 			Search:   searchDeps,
+			RAGCache: ragCache,
 			Composer: advisory.NewTemplateComposer(),
 			ChunkPub: chunkPub,
-			Model:    cfg.OpenRouterModel,
+			// QUALITY: gerar minuta é a peça final que o advogado revisa/assina.
+			// Qualidade > velocidade (streaming mascara a latência).
+			Model: cfg.OpenRouterModelQuality,
 		})
 
 		listener := draft.NewListener(generateUC)

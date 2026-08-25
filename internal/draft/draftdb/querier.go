@@ -135,8 +135,10 @@ type Querier interface {
 	// (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
 	InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error)
 	// Paginated list of all peças for a tenant, ordered by (created_at DESC,
-	// id DESC). Optional piece_type and status filters. Coverage summary from
-	// latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+	// id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
+	// urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+	// da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
+	// Over-fetch por 1 pra hasMore.
 	ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error)
 	// Paginated list of peças for a given court_record_id, ordered by (created_at DESC,
 	// id DESC). The :id param is court_record.id; we resolve case_id via JOIN.
@@ -157,8 +159,6 @@ type Querier interface {
 	// a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
 	// workflow não volta pra atrás sem invalidar a assinatura.
 	RevertToConstruction(ctx context.Context, arg RevertToConstructionParams) (RevertToConstructionRow, error)
-	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
-	// These are the three new queries the async generation saga needs.
 	// Persist the Gerar-time generation params (tone/instructions/selected_theses,
 	// Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
 	// the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event
@@ -200,6 +200,15 @@ type Querier interface {
 	// humana só toca em content_html). Escopo (id, tenant_id); no-match →
 	// ErrDraftNotFound. Retorna id + updated_at.
 	UpdateDraftContentHtml(ctx context.Context, arg UpdateDraftContentHtmlParams) (UpdateDraftContentHtmlRow, error)
+	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+	// These are the three new queries the async generation saga needs.
+	// Atualiza APENAS o filing_number de uma peça já protocolada. Diferente do
+	// MarkFiled (que só grava no INSERT do filing, `filed_at IS NULL`), este roda
+	// no branch idempotente do File quando o advogado esqueceu de digitar o
+	// número na primeira vez OU digitou errado e agora está corrigindo. Guard:
+	// só sobrescreve quando o valor atual é NULL (nunca zera um número já
+	// gravado). Scoped (id, tenant_id).
+	UpdateFilingNumber(ctx context.Context, arg UpdateFilingNumberParams) error
 	// Patch the observed_result on a petition, scoped to tenant via JOIN. A miss
 	// (no petition or wrong tenant) → pgx.ErrNoRows → ErrPetitionNotFound.
 	UpdateObservedResult(ctx context.Context, arg UpdateObservedResultParams) (UpdateObservedResultRow, error)

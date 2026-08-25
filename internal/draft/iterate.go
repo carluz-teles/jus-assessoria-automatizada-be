@@ -148,8 +148,9 @@ type IterateUseCase struct {
 	composer advisory.PromptComposer
 	gen      llm.Generator
 	model    string
-	emb      embedder      // optional — RAG fallback (degraded when nil)
+	emb      embedder            // optional — RAG fallback (degraded when nil)
 	search   indexing.SearchDeps // optional — RAG fallback (degraded when nil)
+	ragCache *RAGCache           // nil → sem cache
 }
 
 // IterateParams is the DI bundle for NewIterateUseCase.
@@ -161,6 +162,7 @@ type IterateParams struct {
 	Model    string
 	Embedder embedder
 	Search   indexing.SearchDeps
+	RAGCache *RAGCache
 }
 
 // NewIterateUseCase constructs the use case with the injected ports.
@@ -173,6 +175,7 @@ func NewIterateUseCase(p IterateParams) *IterateUseCase {
 		model:    p.Model,
 		emb:      p.Embedder,
 		search:   p.Search,
+		ragCache: p.RAGCache,
 	}
 }
 
@@ -250,7 +253,7 @@ func (uc *IterateUseCase) Iterate(ctx context.Context, cmd IterateCommand) (*Ite
 		crid = &intimation.CourtRecordID
 	}
 	queryText := buildIterateQuery(cmd, structured)
-	chunks, _, _ := runRAG(ctx, uc.emb, uc.search, cmd.TenantID, crid, queryText, 6)
+	chunks, _, _ := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, queryText, 6)
 
 	// ── Compose prompt + call LLM ────────────────────────────────────────────
 	iterCtx := buildIterateContext(draft, intimation, parties, structured, cmd, chunks)

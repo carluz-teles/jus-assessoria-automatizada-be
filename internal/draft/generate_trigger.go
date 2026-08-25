@@ -80,6 +80,16 @@ func (uc *TriggerUseCase) TriggerGeneration(ctx context.Context, cmd TriggerGene
 			return err
 		}
 
+		// Regenerar = a IA vai reescrever a peça inteira. Se a autoria estava
+		// como "human_taken" (advogado clicou "Assumir autoria" numa versão
+		// anterior), voltamos pra "assistant" — assim o painel lateral mostra
+		// a aba Iterar/banner de assistant, não a de Revisão.
+		if d.Authorship != AuthorshipAssistant {
+			if _, err := uc.rw.UpdateAuthorship(ctx, tx, cmd.DraftID, cmd.TenantID, AuthorshipAssistant); err != nil {
+				return err
+			}
+		}
+
 		u, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateExtracting, false, "", nil)
 		if err != nil {
 			return err

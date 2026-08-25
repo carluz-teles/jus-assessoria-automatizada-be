@@ -80,9 +80,15 @@ type Section struct {
 
 // Signer identifica o titular do cert que assinou a peça. Se Name vazio,
 // o bloco de assinatura não é impresso (usado só quando o Sign roda).
+//
+// Place é a cidade do foro, extraída do court_record.judging_body pelo
+// domain.Sign (parseCityFromJudgingBody). Vai no bloco de fechamento como
+// "[Place], [data por extenso]." — a data é a SignedAt do render. Vazio =
+// omite a linha lugar/data (fallback defensivo; o BE tenta sempre extrair).
 type Signer struct {
-	Name string // CN do cert ("CARLOS TELES TESTE")
-	OAB  string // "347019/SP" — pode vir vazio se o cert não tiver
+	Name  string // CN do cert ("CARLOS TELES TESTE")
+	OAB   string // "347019/SP" — pode vir vazio se o cert não tiver
+	Place string // Cidade do foro ("Franca") — parseada do judging_body
 }
 
 // Medidas em mm (padrão do maroto). 1cm = 10mm.
