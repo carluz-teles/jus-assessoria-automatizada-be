@@ -49,7 +49,7 @@ func (q *Queries) InsertWatchedOAB(ctx context.Context, arg InsertWatchedOABPara
 const listWatchedOABsWithName = `-- name: ListWatchedOABsWithName :many
 SELECT
     (split_part(w.oab_key, '|', 2) || split_part(w.oab_key, '|', 1))::text AS oab,
-    (mode() WITHIN GROUP (ORDER BY pc.name))::text AS name
+    COALESCE(mode() WITHIN GROUP (ORDER BY pc.name), '')::text AS name
 FROM watched_oab w
 JOIN integration i ON i.id = w.integration_id AND i.source = 'DJEN'
 LEFT JOIN party_counsel pc
@@ -69,7 +69,10 @@ type ListWatchedOABsWithNameRow struct {
 // Termos monitorados com nome derivado: as OABs monitoradas pelo tenant via DJEN,
 // cada uma com o nome mais frequente encontrado em party_counsel (mode() within group).
 // oab_key é "NUMBER|UF"; devolvemos "UFNUMBER" (canônico do FE) via uf||split_part.
-// O LEFT JOIN garante que OABs novas (sem captura ainda) retornam com name = NULL.
+// O LEFT JOIN garante que OABs novas (sem captura ainda) casam zero linhas de
+// party_counsel; mode() sobre um grupo todo NULL também devolve NULL — o COALESCE
+// pra ” evita isso (sqlc infere a coluna como NOT NULL pelo ::text, e o scan do pgx
+// falha contra um NULL de verdade; repository.go já trata "" como "sem nome").
 // Ordenado por oab_key para estabilidade (sem offset, lista pequena).
 func (q *Queries) ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUID) ([]ListWatchedOABsWithNameRow, error) {
 	rows, err := q.db.Query(ctx, listWatchedOABsWithName, tenantID)

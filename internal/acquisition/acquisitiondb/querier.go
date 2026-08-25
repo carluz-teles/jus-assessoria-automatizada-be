@@ -559,7 +559,10 @@ type Querier interface {
 	// Termos monitorados com nome derivado: as OABs monitoradas pelo tenant via DJEN,
 	// cada uma com o nome mais frequente encontrado em party_counsel (mode() within group).
 	// oab_key é "NUMBER|UF"; devolvemos "UFNUMBER" (canônico do FE) via uf||split_part.
-	// O LEFT JOIN garante que OABs novas (sem captura ainda) retornam com name = NULL.
+	// O LEFT JOIN garante que OABs novas (sem captura ainda) casam zero linhas de
+	// party_counsel; mode() sobre um grupo todo NULL também devolve NULL — o COALESCE
+	// pra '' evita isso (sqlc infere a coluna como NOT NULL pelo ::text, e o scan do pgx
+	// falha contra um NULL de verdade; repository.go já trata "" como "sem nome").
 	// Ordenado por oab_key para estabilidade (sem offset, lista pequena).
 	ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUID) ([]ListWatchedOABsWithNameRow, error)
 	// Record that a sync touched this court record: refresh its completeness and
