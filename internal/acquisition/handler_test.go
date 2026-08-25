@@ -649,9 +649,9 @@ func TestHandler_ListIntimacoes_ValidUrgencia_ForwardedToReader(t *testing.T) {
 		{name: "hoje", urgencia: UrgenciaHoje},
 		{name: "proximos_dois_dias", urgencia: UrgenciaProximosDoisDias},
 		{name: "semana", urgencia: UrgenciaSemana},
+		{name: "este_mes", urgencia: UrgenciaEsteMes},
 		{name: "mais_adiante", urgencia: UrgenciaMaisAdiante},
-		{name: "nao_confirmado", urgencia: UrgenciaNaoConfirmado},
-		{name: "sem_providencia", urgencia: UrgenciaSemProvidencia},
+		{name: "sem_data_definida", urgencia: UrgenciaSemDataDefinida},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -672,6 +672,62 @@ func TestHandler_ListIntimacoes_ValidUrgencia_ForwardedToReader(t *testing.T) {
 	}
 }
 
+// ?urgencia=sem_providencia is a deprecated/removed bucket: it must NOT 400 (legacy
+// deep-links keep working) and is demoted to "no filter" before reaching the read port.
+func TestHandler_ListIntimacoes_SemProvidenciaDemotedToNoFilter(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet,
+		"/v1/intimacoes?urgencia="+UrgenciaSemProvidencia, "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", status, body)
+	}
+	if rd.gotIntiListQ.Urgencia != "" {
+		t.Errorf("forwarded Urgencia = %q, want empty (demoted from sem_providencia)", rd.gotIntiListQ.Urgencia)
+	}
+}
+
+// ?nao_confirmado is the server-side "Não confirmadas" triage toggle: it forwards as a
+// separate boolean filter on the query (combines with any temporal tab), independent of
+// ?urgencia. Accepted values are "true"/"1".
+func TestHandler_ListIntimacoes_NaoConfirmadoForwarded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		param string
+		want  bool
+	}{
+		{name: "true", param: "true", want: true},
+		{name: "1", param: "1", want: true},
+		{name: "absent", param: "", want: false},
+		{name: "false", param: "false", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rd := &recordingReader{}
+			app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+			path := "/v1/intimacoes?urgencia=" + UrgenciaAtraso
+			if tt.param != "" {
+				path += "&nao_confirmado=" + tt.param
+			}
+			status, body := do(t, app, http.MethodGet, path, "", "jwt")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", status, body)
+			}
+			if rd.gotIntiListQ.NaoConfirmado != tt.want {
+				t.Errorf("forwarded NaoConfirmado = %v, want %v", rd.gotIntiListQ.NaoConfirmado, tt.want)
+			}
+		})
+	}
+}
+
 // ?urgencia with a value outside the closed set is a client error → 400.
 func TestHandler_ListIntimacoes_InvalidUrgencia_400(t *testing.T) {
 	t.Parallel()
@@ -683,6 +739,7 @@ func TestHandler_ListIntimacoes_InvalidUrgencia_400(t *testing.T) {
 		{name: "typo", urgencia: "urgente"},
 		{name: "uppercase", urgencia: "ATRASO"},
 		{name: "arbitrary", urgencia: "this_week"},
+		{name: "nao_confirmado_is_now_a_chip_not_urgencia", urgencia: UrgenciaNaoConfirmado},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -704,7 +761,7 @@ func TestHandler_ListIntimacoes_EnvelopeFiltersIncludesUrgencia(t *testing.T) {
 	t.Parallel()
 
 	f := httpx.Filters{}
-	f.SetEnum("urgencia", UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado)
+	f.SetEnum("urgencia", UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana, UrgenciaEsteMes, UrgenciaMaisAdiante, UrgenciaSemDataDefinida)
 	rd := &recordingReader{intiListRes: IntimacoesResult{Filters: f}}
 	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
 
@@ -717,11 +774,11 @@ func TestHandler_ListIntimacoes_EnvelopeFiltersIncludesUrgencia(t *testing.T) {
 		t.Fatalf("decode envelope: %v; body=%s", err, body)
 	}
 	opts, ok := env.Filters["urgencia"]
-	if !ok || len(opts) != 5 {
-		t.Fatalf("filters.urgencia = %v (len=%d), want 5 options", opts, len(opts))
+	if !ok || len(opts) != 7 {
+		t.Fatalf("filters.urgencia = %v (len=%d), want 7 options", opts, len(opts))
 	}
-	// Verify the five canonical values are all present in order.
-	want := []string{UrgenciaAtraso, UrgenciaHoje, UrgenciaSemana, UrgenciaMaisAdiante, UrgenciaNaoConfirmado}
+	// Verify the canonical values are all present in order.
+	want := []string{UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana, UrgenciaEsteMes, UrgenciaMaisAdiante, UrgenciaSemDataDefinida}
 	for i, w := range want {
 		if opts[i].Value != w {
 			t.Errorf("filters.urgencia[%d].value = %q, want %q", i, opts[i].Value, w)
@@ -1604,8 +1661,9 @@ func TestHandler_Resume_NoResumer_501(t *testing.T) {
 	}
 }
 
-// GET /v1/intimacoes: the envelope must carry a `buckets` object with the five
-// section counts (atraso, hoje, proximos_dois_dias, esta_semana, sem_providencia).
+// GET /v1/intimacoes: the envelope must carry a `buckets` object with the seven
+// disjoint section counts (atraso, hoje, proximos_dois_dias, esta_semana, este_mes,
+// mais_adiante, sem_data_definida).
 func TestHandler_ListIntimacoes_EnvelopeCarriesBuckets(t *testing.T) {
 	t.Parallel()
 
@@ -1614,9 +1672,9 @@ func TestHandler_ListIntimacoes_EnvelopeCarriesBuckets(t *testing.T) {
 		Hoje:             1,
 		ProximosDoisDias: 2,
 		EstaSemana:       5,
-		SemProvidencia:   7,
+		EsteMes:          8,
 		MaisAdiante:      12,
-		NaoConfirmado:    4,
+		SemDataDefinida:  4,
 	}
 	rd := &recordingReader{intiListRes: IntimacoesResult{Buckets: buckets}}
 	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")

@@ -323,6 +323,15 @@ const (
 	// the body divides by 100 to show reais.
 	paymentFailedTitle = "Falha no pagamento da assinatura"
 	paymentFailedBody  = "Não conseguimos cobrar sua fatura de R$ %.2f. Atualize a forma de pagamento para evitar a suspensão do acesso."
+
+	// Filing avisos (Fatia 1 — e-SAJ). O sucesso traz o número de protocolo no
+	// payload (não no body fixo). A falha aponta pro protocolo manual e, quando
+	// há motivo, o exibe inline.
+	filingSucceededTitle    = "Peça protocolada automaticamente"
+	filingSucceededBody     = "Sua peça foi protocolada no e-SAJ com sucesso."
+	filingFailedTitle       = "Falha no protocolo automático"
+	filingFailedBodyGeneric = "Não foi possível protocolar a peça no e-SAJ automaticamente. Protocole manualmente."
+	filingFailedBodyReason  = "Não foi possível protocolar a peça no e-SAJ: %s. Protocole manualmente."
 )
 
 // InAppUseCase turns two acquisition events into IN_APP avisos (slice 1a): a
@@ -589,6 +598,81 @@ func (uc *InAppUseCase) OnPaymentFailed(ctx context.Context, ev PaymentFailed) e
 // AmountDue from cents (Stripe's unit) to reais for the message.
 func renderPaymentFailed(amountDueCents int64) (title, body string) {
 	return paymentFailedTitle, fmt.Sprintf(paymentFailedBody, float64(amountDueCents)/100)
+}
+
+// OnFilingSucceeded consome filing.succeeded (Fatia 1): a peça foi protocolada
+// automaticamente no e-SAJ. Cria um aviso in-app com o número de protocolo.
+// Idempotente via dedup de consumer por EventID.
+func (uc *InAppUseCase) OnFilingSucceeded(ctx context.Context, ev FilingSucceeded) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerFilingSucceeded, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+		title, body := renderFilingSucceeded()
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeFilingSucceededAviso, title, body, map[string]any{
+			"draft_id":          ev.DraftID,
+			"filing_attempt_id": ev.FilingAttemptID,
+			"filing_number":     ev.FilingNumber,
+		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	uc.publish(ctx, ev.TenantID, TypeFilingSucceeded, created)
+	return nil
+}
+
+// OnFilingFailed consome filing.failed (Fatia 1): a tentativa de protocolo automático
+// no e-SAJ falhou. Cria um aviso in-app apontando para o protocolo manual, com o
+// motivo. Idempotente via dedup de consumer por EventID.
+func (uc *InAppUseCase) OnFilingFailed(ctx context.Context, ev FilingFailed) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerFilingFailed, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+		title, body := renderFilingFailed(ev.FailureReason)
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeFilingFailedAviso, title, body, map[string]any{
+			"draft_id":          ev.DraftID,
+			"filing_attempt_id": ev.FilingAttemptID,
+			"failure_reason":    ev.FailureReason,
+		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	uc.publish(ctx, ev.TenantID, TypeFilingFailed, created)
+	return nil
+}
+
+func renderFilingSucceeded() (title, body string) {
+	return filingSucceededTitle, filingSucceededBody
+}
+
+func renderFilingFailed(reason string) (title, body string) {
+	if reason == "" {
+		return filingFailedTitle, filingFailedBodyGeneric
+	}
+	return filingFailedTitle, fmt.Sprintf(filingFailedBodyReason, reason)
 }
 
 // renderDeadlineDueSoon materializes the due_soon title/body from days_left. The title is

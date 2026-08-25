@@ -1720,6 +1720,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		Court:             q.Court,
 		AssigneeID:        nullUUID(q.Assignee),
 		Urgencia:          q.Urgencia,
+		NaoConfirmado:     q.NaoConfirmado,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
 	})
@@ -1729,23 +1730,23 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, IntimacaoView{
-			ID:                row.ID.String(),
-			CNJNumber:         row.CnjNumber,
-			Class:             deref(row.Class),
-			Subject:           deref(row.Subject),
-			CourtRecordID:     row.CourtRecordID.String(),
-			Court:             row.Court,
-			Degree:            row.Degree,
-			Type:              deref(row.Type),
-			Status:            row.Status,
-			UserStatus:        row.UserStatus,
-			Source:            row.Source,
-			SourceURL:         deref(row.SourceUrl),
-			MadeAvailableAt:   row.MadeAvailableAt.Time,
-			PublishedAt:       row.PublishedAt.Time,
-			DeadlineStartAt:   row.DeadlineStartAt.Time,
-			ContentPreview:    contentPreview(row.Content),
-			Prazo:             mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			ID:               row.ID.String(),
+			CNJNumber:        row.CnjNumber,
+			Class:            deref(row.Class),
+			Subject:          deref(row.Subject),
+			CourtRecordID:    row.CourtRecordID.String(),
+			Court:            row.Court,
+			Degree:           row.Degree,
+			Type:             deref(row.Type),
+			Status:           row.Status,
+			UserStatus:       row.UserStatus,
+			Source:           row.Source,
+			SourceURL:        deref(row.SourceUrl),
+			MadeAvailableAt:  row.MadeAvailableAt.Time,
+			PublishedAt:      row.PublishedAt.Time,
+			DeadlineStartAt:  row.DeadlineStartAt.Time,
+			ContentPreview:   contentPreview(row.Content),
+			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
 			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 			AssigneeUserID:   uuidPtrFromPgtype(row.AssigneeUserID),
 			AssigneeUserName: row.AssigneeUserName,
@@ -2179,13 +2180,14 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, q IntimacoesQuery) (
 		return total, total, nil
 	}
 	filtered, err := r.q.CountIntimacoesFiltered(ctx, acquisitiondb.CountIntimacoesFilteredParams{
-		TenantID:   tid,
-		Search:     escapeLike(q.Search),
-		Type:       q.Type,
-		UserStatus: q.UserStatus,
-		Court:      q.Court,
-		AssigneeID: nullUUID(q.Assignee),
-		Urgencia:   q.Urgencia,
+		TenantID:      tid,
+		Search:        escapeLike(q.Search),
+		Type:          q.Type,
+		UserStatus:    q.UserStatus,
+		Court:         q.Court,
+		AssigneeID:    nullUUID(q.Assignee),
+		Urgencia:      q.Urgencia,
+		NaoConfirmado: q.NaoConfirmado,
 	})
 	if err != nil {
 		return 0, 0, database.WrapInfra(err)
@@ -2218,9 +2220,9 @@ func (r *pgRepository) BucketIntimacoes(ctx context.Context, q IntimacoesQuery) 
 		Hoje:             row.Hoje,
 		ProximosDoisDias: row.ProximosDoisDias,
 		EstaSemana:       row.EstaSemana,
-		SemProvidencia:   row.SemProvidencia,
+		EsteMes:          row.EsteMes,
 		MaisAdiante:      row.MaisAdiante,
-		NaoConfirmado:    row.NaoConfirmado,
+		SemDataDefinida:  row.SemDataDefinida,
 	}, nil
 }
 
@@ -2445,6 +2447,7 @@ func (r *pgRepository) BulkAssignIntimacoesByFilter(ctx context.Context, tx data
 		Court:            q.Court,
 		FilterAssigneeID: nullUUID(q.Assignee),
 		Urgencia:         q.Urgencia,
+		NaoConfirmado:    q.NaoConfirmado,
 	})
 	if err != nil {
 		return 0, database.WrapInfra(err)

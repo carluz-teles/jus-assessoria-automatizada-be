@@ -804,9 +804,11 @@ func TestReadUseCase_Intimacoes_ForwardsUrgencia(t *testing.T) {
 	}{
 		{name: "atraso", urgencia: UrgenciaAtraso},
 		{name: "hoje", urgencia: UrgenciaHoje},
+		{name: "proximos_dois_dias", urgencia: UrgenciaProximosDoisDias},
 		{name: "semana", urgencia: UrgenciaSemana},
+		{name: "este_mes", urgencia: UrgenciaEsteMes},
 		{name: "mais_adiante", urgencia: UrgenciaMaisAdiante},
-		{name: "nao_confirmado", urgencia: UrgenciaNaoConfirmado},
+		{name: "sem_data_definida", urgencia: UrgenciaSemDataDefinida},
 		{name: "empty passes through", urgencia: ""},
 	}
 	for _, tt := range tests {
@@ -849,6 +851,46 @@ func (r *recordingIntimacoesRepo) ListIntimacoes(_ context.Context, q Intimacoes
 		r.onList(q)
 	}
 	return nil, nil
+}
+
+// The "Não confirmadas" triage toggle is a separate filter from urgencia: it must be
+// forwarded to the repo query (server-side) and is independent of the temporal tab.
+func TestReadUseCase_Intimacoes_ForwardsNaoConfirmado(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		urgencia      string
+		naoConfirmado bool
+		wantChip      bool
+	}{
+		{name: "chip off, tab atraso", urgencia: UrgenciaAtraso, naoConfirmado: false, wantChip: false},
+		{name: "chip on, tab atraso", urgencia: UrgenciaAtraso, naoConfirmado: true, wantChip: true},
+		{name: "chip on, tab sem_data_definida", urgencia: UrgenciaSemDataDefinida, naoConfirmado: true, wantChip: true},
+		{name: "chip on, no tab", urgencia: "", naoConfirmado: true, wantChip: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var got IntimacoesQuery
+			repo := newRecordingIntimacoesRepo(func(q IntimacoesQuery) { got = q })
+			uc := NewReadUseCase(repo)
+
+			_, err := uc.Intimacoes(context.Background(), IntimacoesQuery{
+				TenantID: "t-1", LastMadeAvailable: "9999-12-31", LastID: maxUUID, Limit: 10,
+				Urgencia: tt.urgencia, NaoConfirmado: tt.naoConfirmado,
+			})
+			if err != nil {
+				t.Fatalf("Intimacoes: %v", err)
+			}
+			if got.Urgencia != tt.urgencia {
+				t.Errorf("forwarded urgencia = %q, want %q", got.Urgencia, tt.urgencia)
+			}
+			if got.NaoConfirmado != tt.wantChip {
+				t.Errorf("forwarded NaoConfirmado = %v, want %v", got.NaoConfirmado, tt.wantChip)
+			}
+		})
+	}
 }
 
 func (r *recordingIntimacoesRepo) CountIntimacoes(context.Context, IntimacoesQuery) (int64, int64, error) {
@@ -931,9 +973,9 @@ func TestReadUseCase_Intimacoes_BucketCountsForwarded(t *testing.T) {
 		Hoje:             1,
 		ProximosDoisDias: 2,
 		EstaSemana:       5,
-		SemProvidencia:   7,
+		EsteMes:          8,
 		MaisAdiante:      12,
-		NaoConfirmado:    4,
+		SemDataDefinida:  4,
 	}
 	repo := newBucketsRepo(want)
 	uc := NewReadUseCase(repo)
@@ -1006,7 +1048,7 @@ func TestReadUseCase_Intimacoes_UrgenciaFilterIncludesMaisAdiante(t *testing.T) 
 	opts := res.Filters["urgencia"]
 	want := []string{
 		UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana,
-		UrgenciaMaisAdiante, UrgenciaNaoConfirmado, UrgenciaSemProvidencia,
+		UrgenciaEsteMes, UrgenciaMaisAdiante, UrgenciaSemDataDefinida,
 	}
 	if len(opts) != len(want) {
 		t.Fatalf("urgencia filter options = %d, want %d: %+v", len(opts), len(want), opts)

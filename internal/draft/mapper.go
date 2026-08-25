@@ -2,16 +2,34 @@ package draft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jusassessoria/platform/internal/draft/draftdb"
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 )
+
+// isNoRows reports whether err is pgx.ErrNoRows (the repo's not-found sentinel).
+func isNoRows(err error) bool {
+	return errors.Is(err, pgx.ErrNoRows)
+}
+
+// isUniqueViolation reports whether err is a Postgres 23505 (unique/partial
+// unique violation) — used to map to a typed conflict AppError.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
 
 // mapper.go is the boundary where driver types die (docs §4b.3): uuid.UUID,
 // pgtype.* are absorbed here so the entity, use case and read models stay pure Go.
@@ -480,7 +498,6 @@ func firstCounselLabelFrom(counsels []PartyCounselInfo) string {
 	}
 	return fmt.Sprintf("%s (OAB/%s nº %s)", c.Name, uf, c.OAB)
 }
-
 
 // ── Chat mappers (Fatia 3b) ──────────────────────────────────────────────────
 

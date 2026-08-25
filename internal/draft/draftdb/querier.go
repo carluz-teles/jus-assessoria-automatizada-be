@@ -23,6 +23,12 @@ type Querier interface {
 	// tenant via GetDraftByID(tenantID, draftID) earlier in the same tx. Do NOT "fix"
 	// this with a JOIN — the app-layer barrier is intentional (see 0044_review_status).
 	DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error
+	// Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
+	// pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
+	GetActiveEsajCredential(ctx context.Context, arg GetActiveEsajCredentialParams) (GetActiveEsajCredentialRow, error)
+	// Tentativa ativa (ENFILEIRADO/PROTOCOLANDO) p/ o clique ser idempotente.
+	// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+	GetActiveFilingAttempt(ctx context.Context, arg GetActiveFilingAttemptParams) (GetActiveFilingAttemptRow, error)
 	// Load an attachment for update/delete guard: resolves (id, draft_id, tenant_id) to
 	// confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).
@@ -64,6 +70,8 @@ type Querier interface {
 	// (barrier 1); RLS on draft is barrier 2. The court_record columns are read here
 	// without importing the acquisition slice (decisão: read the table directly).
 	GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) (GetDraftDetailRow, error)
+	// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+	GetFilingAttempt(ctx context.Context, arg GetFilingAttemptParams) (GetFilingAttemptRow, error)
 	// Load the intimation context needed to build a draft from source=intimation:
 	// the case_id (via court_record), the court_record_id, the type (for piece_type
 	// inference), the rich context fields (content, process metadata, deadline)
@@ -72,6 +80,9 @@ type Querier interface {
 	// by intimation.id and tenant_id (barrier 1 via court_record).
 	// A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 	GetIntimationForDraft(ctx context.Context, arg GetIntimationForDraftParams) (GetIntimationForDraftRow, error)
+	// Última tentativa do draft (qualquer status, inclusive PROTOCOLADO/FALHOU) —
+	// usada pelo endpoint de status, que deve refletir o estado terminal.
+	GetLatestFilingAttempt(ctx context.Context, draftID uuid.UUID) (GetLatestFilingAttemptRow, error)
 	// Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.
 	// Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.
 	// A draft with no reviews → pgx.ErrNoRows (the read model maps this to nil, not an error).
@@ -126,6 +137,15 @@ type Querier interface {
 	// NOTHING maps it to pgx.ErrNoRows so the repo can return ErrAttachmentAlreadyLinked
 	// without a 23505 transaction abort.
 	InsertDraftAttachment(ctx context.Context, arg InsertDraftAttachmentParams) (DraftAttachment, error)
+	// ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
+	// Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA
+	// persiste em claro. O consentimento dos termos é registrado por auditoria.
+	InsertEsajCredential(ctx context.Context, arg InsertEsajCredentialParams) (InsertEsajCredentialRow, error)
+	// ── filing_attempt (Fatia 1 — peticionamento automático) ──────────────────────
+	// Snapshot do PDF congelado no clique. O unique parcial (draft_id WHERE ativo)
+	// impede 2ª tentativa ativa — barreira de idempotência contra duplo-clique.
+	// tenant_id é explícito (RLS + coluna NOT NULL); o UoW já seta app.tenant_id.
+	InsertFilingAttempt(ctx context.Context, arg InsertFilingAttemptParams) (InsertFilingAttemptRow, error)
 	// Persist a filed petition (immutable). No tenant_id on petition — isolation
 	// is via the draft FK (JOIN draft.tenant_id). Returns all columns.
 	InsertPetition(ctx context.Context, arg InsertPetitionParams) (Petition, error)
@@ -145,10 +165,16 @@ type Querier interface {
 	// Coverage summary is resolved from the latest review via LEFT JOIN LATERAL.
 	// Over-fetch by 1 for hasMore detection.
 	ListDraftsByProcess(ctx context.Context, arg ListDraftsByProcessParams) ([]ListDraftsByProcessRow, error)
+	// Metadados públicos (sem o envelope) das credenciais ATIVAS do tenant.
+	ListEsajCredentials(ctx context.Context, tenantID uuid.UUID) ([]ListEsajCredentialsRow, error)
 	// Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
 	// opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
 	// (número do protocolo no tribunal — string livre). Requer status=SIGNED.
 	MarkFiled(ctx context.Context, arg MarkFiledParams) (MarkFiledRow, error)
+	MarkFilingFailed(ctx context.Context, arg MarkFilingFailedParams) error
+	MarkFilingProtocolado(ctx context.Context, arg MarkFilingProtocoladoParams) (MarkFilingProtocoladoRow, error)
+	// Transição ENFILEIRADO → PROTOCOLANDO. Guarda status pra não dar replay.
+	MarkFilingProtocolando(ctx context.Context, id uuid.UUID) error
 	// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
 	// Marca o gesto "usuário clicou Enviar para assinatura" (0060). Só setta se
 	// ainda não foi setado (idempotente sem sobrescrever timestamp original).
@@ -159,6 +185,8 @@ type Querier interface {
 	// a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
 	// workflow não volta pra atrás sem invalidar a assinatura.
 	RevertToConstruction(ctx context.Context, arg RevertToConstructionParams) (RevertToConstructionRow, error)
+	// Soft-delete idempotente: só marca revoked_at quando ainda ativa.
+	RevokeEsajCredential(ctx context.Context, arg RevokeEsajCredentialParams) error
 	// Persist the Gerar-time generation params (tone/instructions/selected_theses,
 	// Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
 	// the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event

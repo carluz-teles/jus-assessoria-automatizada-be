@@ -29,6 +29,8 @@ type inAppUC interface {
 	OnDeadlineMissed(ctx context.Context, ev DeadlineMissed) error
 	OnTrialEndingSoon(ctx context.Context, ev TrialEndingSoon) error
 	OnPaymentFailed(ctx context.Context, ev PaymentFailed) error
+	OnFilingSucceeded(ctx context.Context, ev FilingSucceeded) error
+	OnFilingFailed(ctx context.Context, ev FilingFailed) error
 }
 
 // Listener is notifications' asynq consumer. It holds no transport state; the use
@@ -57,6 +59,8 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeDeadlineMissed, l.handleDeadlineMissed)
 	mux.HandleFunc(TypeTrialEndingSoon, l.handleTrialEndingSoon)
 	mux.HandleFunc(TypePaymentFailed, l.handlePaymentFailed)
+	mux.HandleFunc(TypeFilingSucceeded, l.handleFilingSucceeded)
+	mux.HandleFunc(TypeFilingFailed, l.handleFilingFailed)
 }
 
 // handleNotificationRequested is the asynq.HandlerFunc for notification.requested. It
@@ -138,4 +142,26 @@ func (l *Listener) handlePaymentFailed(ctx context.Context, t *asynq.Task) error
 		return err
 	}
 	return l.inApp.OnPaymentFailed(ctx, ev)
+}
+
+// handleFilingSucceeded is the asynq.HandlerFunc for filing.succeeded (Fatia 1 — e-SAJ
+// protocolado). Decodes the payload and hands off to the in-app use case (→ a
+// filing_succeeded aviso). Same error contract as the other handlers.
+func (l *Listener) handleFilingSucceeded(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[FilingSucceeded](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnFilingSucceeded(ctx, ev)
+}
+
+// handleFilingFailed is the asynq.HandlerFunc for filing.failed (Fatia 1 — falha no
+// RPA e-SAJ). Decodes the payload and hands off to the in-app use case (→ a
+// filing_failed aviso, apontando para protocolo manual). Same error contract.
+func (l *Listener) handleFilingFailed(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[FilingFailed](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnFilingFailed(ctx, ev)
 }

@@ -114,6 +114,9 @@ type fakeRepo struct {
 	// UpdateSagaState} ran — so tests can assert both happened inside the same
 	// tx and in the documented order (SetGenerationParams before the saga flip).
 	callOrder []string
+
+	// ── Fatia 7 (peticionamento) stubs ─────────────────────────────────────
+	latestAttempt *FilingAttempt
 }
 
 // setGenerationParamsCall captures one SetGenerationParams invocation.
@@ -330,6 +333,57 @@ func (r *fakeRepo) ListDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _
 
 func (r *fakeRepo) GetCourtRecordIDByIntimation(_ context.Context, _ database.Tx, _, _ string) (string, error) {
 	return r.courtRecordIDResult, r.courtRecordIDErr
+}
+
+// ── Fatia 1 (peticionamento automático e-SAJ) stubs ──────────────────────────
+// domain_test.go cobre os use cases das Fatias 1–4; estes stubs apenas satisfazem
+// a interface Repository para os testes existentes continuarem compilando.
+
+func (r *fakeRepo) InsertEsajCredential(_ context.Context, _ database.Tx, _, _, _ string, _ *Envelope, _, _, _ string) (*EsajCredential, error) {
+	return nil, nil
+}
+
+func (r *fakeRepo) GetActiveEsajCredential(_ context.Context, _ database.Tx, _, _ string) (*EsajCredentialEnvelope, error) {
+	return nil, nil
+}
+
+func (r *fakeRepo) ListEsajCredentials(_ context.Context, _ database.Tx, _ string) ([]EsajCredential, error) {
+	return []EsajCredential{}, nil
+}
+
+func (r *fakeRepo) RevokeEsajCredential(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
+}
+
+func (r *fakeRepo) InsertFilingAttempt(_ context.Context, _ database.Tx, _, _, _, _, _ string) (*FilingAttempt, error) {
+	return nil, nil
+}
+
+func (r *fakeRepo) GetActiveFilingAttempt(_ context.Context, _ database.Tx, _, _ string) (*FilingAttempt, error) {
+	return nil, nil
+}
+
+func (r *fakeRepo) GetLatestFilingAttempt(_ context.Context, _ database.Tx, _ string) (*FilingAttempt, error) {
+	if r.latestAttempt != nil {
+		return r.latestAttempt, nil
+	}
+	return nil, ErrFilingAttemptNotFound
+}
+
+func (r *fakeRepo) GetFilingAttempt(_ context.Context, _ database.Tx, _, _ string) (*FilingAttempt, error) {
+	return nil, nil
+}
+
+func (r *fakeRepo) MarkFilingProtocolando(_ context.Context, _ database.Tx, _ string) error {
+	return nil
+}
+
+func (r *fakeRepo) MarkFilingProtocolado(_ context.Context, _ database.Tx, _, _, _ string, _ []string) (*FilingAttempt, error) {
+	return nil, nil
+}
+
+func (r *fakeRepo) MarkFilingFailed(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────

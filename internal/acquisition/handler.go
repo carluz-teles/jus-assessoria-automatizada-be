@@ -171,7 +171,7 @@ const (
 // documented mechanisms; body/other params never read query strings.
 var (
 	processosListParams  = paramSet("limit", "cursor", "search", "court", "lifecycle", "degree", "assignee")
-	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia", "assignee")
+	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia", "nao_confirmado", "assignee")
 )
 
 // paramSet builds the route allowlist used by httpx.RejectUnknownParams.
@@ -240,11 +240,16 @@ func resolveIntimacaoAssignee(assignee, principalUserID string) (string, error) 
 }
 
 // isKnownUrgencia accepts only the closed urgência set the filter exposes — the
-// handler is the app-level CHECK on the ?urgencia param.
+// handler is the app-level CHECK on the ?urgencia param. UrgenciaSemProvidencia is
+// retained here as a DEPRECATED alias (redesign v1): it is no longer a real bucket,
+// so the caller demotes it to "no filter" rather than rejecting — legacy deep-links
+// degrade gracefully instead of 400-ing. UrgenciaNaoConfirmado is intentionally NOT
+// here: it graduated to the separate ?nao_confirmado triage toggle.
 func isKnownUrgencia(v string) bool {
 	switch v {
-	case UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana, UrgenciaMaisAdiante,
-		UrgenciaNaoConfirmado, UrgenciaSemProvidencia:
+	case UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana,
+		UrgenciaEsteMes, UrgenciaMaisAdiante, UrgenciaSemDataDefinida,
+		UrgenciaSemProvidencia:
 		return true
 	default:
 		return false
@@ -504,6 +509,12 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	if urgencia != "" && !isKnownUrgencia(urgencia) {
 		return httpx.WriteError(c, apperr.NewInvalid("invalid urgencia filter"))
 	}
+	// Deprecated alias: demote "sem_providencia" to "no filter" so legacy deep-links
+	// keep working instead of erroring out.
+	if urgencia == UrgenciaSemProvidencia {
+		urgencia = ""
+	}
+	naoConfirmado := c.Query("nao_confirmado") == "true" || c.Query("nao_confirmado") == "1"
 	p, ok := httpx.PrincipalFromCtx(c)
 	if !ok {
 		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
@@ -524,12 +535,13 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 
 	res, err := h.reader.Intimacoes(c.UserContext(), IntimacoesQuery{
 		TenantID: tenantID, LastMadeAvailable: lastMade, LastID: lastID, Limit: limit,
-		Search:     c.Query("search"),
-		Type:       typ,
-		UserStatus: userStatus,
-		Court:      c.Query("court"),
-		Urgencia:   urgencia,
-		Assignee:   assignee,
+		Search:        c.Query("search"),
+		Type:          typ,
+		UserStatus:    userStatus,
+		Court:         c.Query("court"),
+		Urgencia:      urgencia,
+		NaoConfirmado: naoConfirmado,
+		Assignee:      assignee,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -627,6 +639,10 @@ func (h *Handler) bulkAssignIntimacaoResponsavel(c *fiber.Ctx) error {
 	if req.All && req.Urgencia != "" && !isKnownUrgencia(req.Urgencia) {
 		return httpx.WriteError(c, apperr.NewInvalid("invalid urgencia filter"))
 	}
+	// Deprecated alias: demote "sem_providencia" to "no filter" for legacy deep-links.
+	if req.Urgencia == UrgenciaSemProvidencia {
+		req.Urgencia = ""
+	}
 
 	tenantID := httpx.TenantFromCtx(c)
 	p, ok := httpx.PrincipalFromCtx(c)
@@ -639,13 +655,14 @@ func (h *Handler) bulkAssignIntimacaoResponsavel(c *fiber.Ctx) error {
 	}
 
 	q := IntimacoesQuery{
-		TenantID:   tenantID,
-		Search:     req.Search,
-		Type:       req.Type,
-		UserStatus: req.UserStatus,
-		Court:      req.Court,
-		Urgencia:   req.Urgencia,
-		Assignee:   assignee,
+		TenantID:      tenantID,
+		Search:        req.Search,
+		Type:          req.Type,
+		UserStatus:    req.UserStatus,
+		Court:         req.Court,
+		Urgencia:      req.Urgencia,
+		NaoConfirmado: req.NaoConfirmado,
+		Assignee:      assignee,
 	}
 	n, err := h.uc.BulkAssignIntimacoes(c.UserContext(), tenantID, req.All, q, req.IDs, req.AssigneeUserID)
 	if err != nil {

@@ -77,12 +77,13 @@ type BulkAssignResponsavelRequest struct {
 	All            bool     `json:"all"`
 	IDs            []string `json:"ids"`
 	// filtros (usados só quando All=true) — espelham o GET /intimacoes.
-	Urgencia   string `json:"urgencia"`
-	Search     string `json:"search"`
-	Type       string `json:"type"`
-	UserStatus string `json:"user_status"`
-	Court      string `json:"court"`
-	Assignee   string `json:"assignee"`
+	Urgencia      string `json:"urgencia"`
+	NaoConfirmado bool   `json:"nao_confirmado"`
+	Search        string `json:"search"`
+	Type          string `json:"type"`
+	UserStatus    string `json:"user_status"`
+	Court         string `json:"court"`
+	Assignee      string `json:"assignee"`
 }
 
 // Validate: assignee (quando presente) uuid; no modo por-ids, ao menos um id, cada

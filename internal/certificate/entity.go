@@ -1,11 +1,14 @@
 // Package certificate is the vertical slice for digital certificates (ICP-Brasil
 // A1 .pfx/PKCS#12) used by the advogado to sign peças. It stores metadata + a
-// server-encrypted copy of the .pfx so the API can re-open and sign on demand,
-// but NEVER persists the user's password (it is asked on every sign). See
+// server-encrypted copy of the .pfx AND the cert password, both sealed in a KMS
+// envelope (see crypto.go / EnvelopeCipher). Persisting the password (encrypted)
+// is what enables unattended signing (draft.sign re-opens the cert without
+// re-prompting) and lets the e-SAJ filing flow reuse the same credential. See
 // docs/erd-pecas.md (§Assinatura) for the product story.
 //
 // Fatia 1 (this slice) implements CRUD + preview + digest sign. The integration
-// with draft.sign (assinar a PDF de verdade) is fatia 2.
+// with draft.sign (assinar a PDF de verdade) is fatia 2; the e-SAJ credential
+// reuse (draft) is fatia 1 do peticionamento automático.
 package certificate
 
 import "time"

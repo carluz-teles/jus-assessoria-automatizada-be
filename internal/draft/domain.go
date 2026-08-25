@@ -38,6 +38,10 @@ type UseCase struct {
 	storage    StoragePresigner
 	pdfStorage PDFStorage
 	certSigner CertSigner
+	// secretVault é a porta KMS (envelope) que cifra/decifra a senha do e-SAJ.
+	// Reusa o MESMO envelope do certificate (structural typing — veja cmd/api).
+	// Exigido para o CRUD de credenciais eSAJ e o peticionamento automático.
+	secretVault SecretVault
 	// tsaURL: endpoint RFC 3161 pra carimbo de tempo (PAdES-T). Vazio =
 	// PAdES-BASIC (sem carimbo). Injetado por WithTSAURL. Ver docs/erd-pecas.md.
 	tsaURL string
@@ -116,6 +120,13 @@ func WithPDFStorage(s PDFStorage) Option {
 // (Fatia 2b). Without this option, Sign returns ErrCertSignerUnavailable.
 func WithCertSigner(c CertSigner) Option {
 	return func(uc *UseCase) { uc.certSigner = c }
+}
+
+// WithSecretVault anexa a porta KMS (envelope) para cifrar/decifrar a senha do
+// e-SAJ. Exigido para o CRUD de credenciais (Fatia 1 — peticionamento automático).
+// Sem esta option, UploadEsajCredential retorna ErrSecretVaultUnavailable.
+func WithSecretVault(v SecretVault) Option {
+	return func(uc *UseCase) { uc.secretVault = v }
 }
 
 // WithTSAURL habilita PAdES-T (carimbo de tempo RFC 3161) na assinatura.

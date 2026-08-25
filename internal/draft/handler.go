@@ -2,6 +2,7 @@ package draft
 
 import (
 	"context"
+	"errors"
 	"math"
 	"time"
 
@@ -34,8 +35,14 @@ type writer interface {
 	// SaveContentHtml (Fase B do editor rico) grava o HTML do Tiptap.
 	SaveContentHtml(ctx context.Context, tenantID, draftID, html string) error
 	// AssumeAuthorship (Peça v2) is exposed via the main UseCase — no separate
-	// wiring needed since it's a single UPDATE (no LLM, no outbox).
+	// wiring needed since it's a single UPDATE (no LLM, outbox).
 	AssumeAuthorship(ctx context.Context, tenantID, draftID string) (*Draft, error)
+	// ── Peticionamento automático (Fatia 1 — e-SAJ) ──
+	ApproveFiling(ctx context.Context, cmd ApproveFilingCommand) (*ApproveFilingResult, error)
+	GetFilingStatus(ctx context.Context, tenantID, draftID string) (*FilingAttempt, error)
+	UploadEsajCredential(ctx context.Context, cmd UploadEsajCredentialCommand) (*EsajCredential, error)
+	ListEsajCredentials(ctx context.Context, tenantID string) ([]EsajCredential, error)
+	RevokeEsajCredential(ctx context.Context, tenantID, id string) error
 }
 
 // generator is the narrow port for the POST /v1/pecas/:id/generate trigger. It is a
@@ -70,7 +77,6 @@ type iterator interface {
 	Iterate(ctx context.Context, cmd IterateCommand) (*IterateResult, error)
 }
 
-
 // lister is the narrow port for the paginated list endpoints.
 type lister interface {
 	ListByProcess(ctx context.Context, q ListByProcessQuery) (DraftListResult, error)
@@ -85,18 +91,18 @@ type presigner interface {
 // Handler is the draft HTTP surface. It owns its routing; cmd/api composes via
 // RegisterV1.
 type Handler struct {
-	uc     writer
-	gen    generator       // nil when the generation use case is not wired (no AI key)
-	chat   chatter         // nil when the chat use case is not wired
-	review     reviewer        // nil when the review use case is not wired
-	theses     thesisSuggester // nil when the theses use case is not wired (no AI key)
-	lister     lister          // nil when the list use case is not wired
-	export     presigner       // nil when the export use case is not wired
-	iter iterator // nil when the iterate use case is not wired
-	storage StoragePresigner // nil quando storage não configurado — download do PDF fica indisponível
-	chunkSub     chunkSubscriber   // nil → SSE stream não montado
-	getSaga      getSagaFn         // reader minimal pra saga_state
-	streamTokens StreamTokenStore  // nil → issuer de stream-token não habilitado
+	uc           writer
+	gen          generator        // nil when the generation use case is not wired (no AI key)
+	chat         chatter          // nil when the chat use case is not wired
+	review       reviewer         // nil when the review use case is not wired
+	theses       thesisSuggester  // nil when the theses use case is not wired (no AI key)
+	lister       lister           // nil when the list use case is not wired
+	export       presigner        // nil when the export use case is not wired
+	iter         iterator         // nil when the iterate use case is not wired
+	storage      StoragePresigner // nil quando storage não configurado — download do PDF fica indisponível
+	chunkSub     chunkSubscriber  // nil → SSE stream não montado
+	getSaga      getSagaFn        // reader minimal pra saga_state
+	streamTokens StreamTokenStore // nil → issuer de stream-token não habilitado
 }
 
 // chunkSubscriber é a porta narrow que o SSE precisa pra ler entries do
@@ -193,6 +199,13 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/pecas/:id/file", h.filePeca)
 	r.Patch("/pecas/:id/result", h.resultPeca)
 	r.Get("/pecas/:id/export", h.exportPeca)
+
+	// Peticionamento automático (Fatia 1 — e-SAJ RPA).
+	r.Post("/pecas/:id/filing/approve", h.approveFiling)
+	r.Get("/pecas/:id/filing", h.getFilingStatus)
+	r.Post("/esaj-credentials", h.uploadEsajCredential)
+	r.Get("/esaj-credentials", h.listEsajCredentials)
+	r.Delete("/esaj-credentials/:id", h.revokeEsajCredential)
 
 	// Workflow steps (Fatia 2a — persistir "onde parei" do peticionamento).
 	// sent_to_signing_at é o gesto de avançar Construção → Assinatura;
@@ -1220,6 +1233,172 @@ func (h *Handler) resultPeca(c *fiber.Ctx) error {
 			ObservedResult: result.ObservedResult,
 		},
 	})
+}
+
+// ─── Peticionamento automático (Fatia 1 — e-SAJ) ─────────────────────────────
+
+// approveFiling handles POST /v1/pecas/:id/filing/approve. NUNCA auto-file sem
+// este clique. Guarda SIGNED + credencial ativa (consentimento), congela o PDF
+// assinado (snapshot) e enfileira filing.enqueued. Duplo-clique → 200 idempotente
+// (mesma tentativa). Retorna 201 na 1ª vez, 200 se já estava enfileirado.
+func (h *Handler) approveFiling(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	userID := ""
+	if p, ok := httpx.PrincipalFromCtx(c); ok {
+		userID = p.UserID
+	}
+
+	result, err := h.uc.ApproveFiling(c.UserContext(), ApproveFilingCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+		UserID:   userID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	status := fiber.StatusCreated
+	if result.IsIdempotent {
+		status = fiber.StatusOK
+	}
+	return c.Status(status).JSON(fiber.Map{
+		"data": filingApproveResponse{
+			FilingAttemptID: result.FilingAttemptID,
+			Status:          result.Status,
+			IsIdempotent:    result.IsIdempotent,
+		},
+	})
+}
+
+// getFilingStatus handles GET /v1/pecas/:id/filing. Devolve a tentativa ativa de
+// protocolo (ou 200 {data:null} se ainda não iniciado).
+func (h *Handler) getFilingStatus(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	attempt, err := h.uc.GetFilingStatus(c.UserContext(), tenantID, draftID)
+	if err != nil {
+		if errors.Is(err, ErrFilingAttemptNotFound) {
+			return c.JSON(fiber.Map{"data": nil})
+		}
+		return httpx.WriteError(c, err)
+	}
+	var finishedAt *time.Time
+	if !attempt.FinishedAt.IsZero() {
+		finishedAt = &attempt.FinishedAt
+	}
+	return c.JSON(fiber.Map{"data": filingStatusResponse{
+		ID:            attempt.ID,
+		DraftID:       attempt.DraftID,
+		Status:        attempt.Status,
+		RequestedAt:   attempt.RequestedAt,
+		FinishedAt:    finishedAt,
+		FailureReason: attempt.FailureReason,
+		FilingNumber:  attempt.FilingNumber,
+	}})
+}
+
+// uploadEsajCredential handles POST /v1/esaj-credentials. Cadastra login + senha
+// (cifrada no envelope KMS) + consentimento dos termos. Owner = principal.
+func (h *Handler) uploadEsajCredential(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	userID := ""
+	userName := ""
+	if p, ok := httpx.PrincipalFromCtx(c); ok {
+		userID = p.UserID
+		userName = p.UserID // usado só p/ log; o nome real vem do join no list
+	}
+	_ = userName
+
+	var req struct {
+		Login        string `json:"login"`
+		Password     string `json:"password"`
+		TermsVersion string `json:"terms_version"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if req.Login == "" || req.Password == "" || req.TermsVersion == "" {
+		return httpx.WriteError(c, apperr.NewInvalid("login, password e terms_version são obrigatórios"))
+	}
+
+	cred, err := h.uc.UploadEsajCredential(c.UserContext(), UploadEsajCredentialCommand{
+		TenantID:        tenantID,
+		OwnerUserID:     userID,
+		Login:           req.Login,
+		Password:        req.Password,
+		TermsVersion:    req.TermsVersion,
+		TermsAcceptedAt: time.Now(),
+		TermsAcceptedBy: userID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"data": esajCredentialResponse(cred),
+	})
+}
+
+// listEsajCredentials handles GET /v1/esaj-credentials → {data: [...]}.
+func (h *Handler) listEsajCredentials(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	items, err := h.uc.ListEsajCredentials(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	views := make([]esajCredentialView, 0, len(items))
+	for i := range items {
+		views = append(views, esajCredentialResponse(&items[i]))
+	}
+	return c.JSON(fiber.Map{"data": views})
+}
+
+// revokeEsajCredential handles DELETE /v1/esaj-credentials/:id → 204.
+func (h *Handler) revokeEsajCredential(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	if err := h.uc.RevokeEsajCredential(c.UserContext(), tenantID, id); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// ── response DTOs (e-SAJ + filing) ───────────────────────────────────────────
+
+type filingApproveResponse struct {
+	FilingAttemptID string `json:"filing_attempt_id"`
+	Status          string `json:"status"`
+	IsIdempotent    bool   `json:"is_idempotent"`
+}
+
+type filingStatusResponse struct {
+	ID            string     `json:"id"`
+	DraftID       string     `json:"draft_id"`
+	Status        string     `json:"status"`
+	RequestedAt   time.Time  `json:"requested_at"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	FilingNumber  string     `json:"filing_number,omitempty"`
+}
+
+type esajCredentialView struct {
+	ID              string `json:"id"`
+	OwnerUserID     string `json:"owner_user_id"`
+	Login           string `json:"login"`
+	TermsVersion    string `json:"terms_version"`
+	TermsAcceptedAt string `json:"terms_accepted_at"`
+	CreatedAt       string `json:"created_at"`
+}
+
+func esajCredentialResponse(c *EsajCredential) esajCredentialView {
+	return esajCredentialView{
+		ID:              c.ID,
+		OwnerUserID:     c.OwnerUserID,
+		Login:           c.Login,
+		TermsVersion:    c.TermsVersion,
+		TermsAcceptedAt: c.TermsAcceptedAt.Format(time.RFC3339),
+		CreatedAt:       c.CreatedAt.Format(time.RFC3339),
+	}
 }
 
 // exportPeca handles GET /v1/pecas/:id/export?format=docx|pdf. Returns 200

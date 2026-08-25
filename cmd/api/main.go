@@ -401,6 +401,10 @@ func run(logger *slog.Logger) error {
 		// certUC.NewSigner satisfaz o port draft.CertSigner via adapter direto —
 		// mesma assinatura, só encaminha a chamada. Isolamento cross-slice.
 		draftOpts = append(draftOpts, draft.WithCertSigner(certSignerFunc(certUC.NewSigner)))
+		// certCipher (KMS envelope) satisfaz o port draft.SecretVault para
+		// cifrar login/senha e-SAJ. Structural typing — o adapter converte
+		// certificate.Envelope ↔ draft.Envelope (campos idênticos).
+		draftOpts = append(draftOpts, draft.WithSecretVault(secretVaultAdapter{certCipher}))
 	}
 	if cfg.TSAURL != "" {
 		// PAdES-T: carimbo de tempo RFC 3161 embutido na assinatura. Sem esta
@@ -580,6 +584,39 @@ type certSignerFunc func(ctx context.Context, tenantID, id string) (crypto.Signe
 func (f certSignerFunc) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, draft.SignerInfo, error) {
 	signer, leaf, chain, info, err := f(ctx, tenantID, id)
 	return signer, leaf, chain, draft.SignerInfo{OAB: info.OAB, SubjectCN: info.SubjectCN}, err
+}
+
+// secretVaultAdapter adapta certificate.Cipher (KMS envelope: Seal/Open/Close)
+// ao port draft.SecretVault. Os Envelopes têm campos idênticos; o adapter só
+// converte os tipos nomeados para evitar import cíclico.
+type secretVaultAdapter struct {
+	cipher certificate.Cipher
+}
+
+func (a secretVaultAdapter) Seal(ctx context.Context, plaintext []byte) (*draft.Envelope, error) {
+	env, err := a.cipher.Seal(ctx, plaintext)
+	if err != nil {
+		return nil, err
+	}
+	return &draft.Envelope{
+		Ciphertext: env.Ciphertext,
+		Nonce:      env.Nonce,
+		WrappedDEK: env.WrappedDEK,
+		KEKRef:     env.KEKRef,
+	}, nil
+}
+
+func (a secretVaultAdapter) Open(ctx context.Context, env *draft.Envelope) ([]byte, error) {
+	return a.cipher.Open(ctx, &certificate.Envelope{
+		Ciphertext: env.Ciphertext,
+		Nonce:      env.Nonce,
+		WrappedDEK: env.WrappedDEK,
+		KEKRef:     env.KEKRef,
+	})
+}
+
+func (a secretVaultAdapter) Close() error {
+	return a.cipher.Close()
 }
 
 // materializeGCPCredentials adapts PaaS-style env-only credentials into the

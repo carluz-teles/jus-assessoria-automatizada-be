@@ -146,14 +146,18 @@ WHERE i.tenant_id = $1
   )
   AND (
     @urgencia::text = ''
-    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'nao_confirmado'     AND d.status = 'PENDING')
-    OR (@urgencia::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
   )
+  -- "Não confirmadas" triage toggle (?nao_confirmado): server-side, combines with any
+  -- temporal tab. Reuses the former nao_confirmado predicate — a suggested (not yet
+  -- human-confirmed) deadline has d.status = 'PENDING'. When off, no extra filter.
+  AND (@nao_confirmado::bool = false OR d.status = 'PENDING')
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
@@ -255,14 +259,15 @@ WHERE i.tenant_id = $1
   )
   AND (
     @urgencia::text = ''
-    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'nao_confirmado'     AND d.status = 'PENDING')
-    OR (@urgencia::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-  );
+    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+  )
+  AND (@nao_confirmado::bool = false OR d.status = 'PENDING');
 
 -- ── filter options (the envelope's selectable sets) ──────────────────────────
 -- Distinct-value reads that back the list envelopes' filter chips. Each is
@@ -492,24 +497,24 @@ WHERE i.tenant_id = $1;
 -- name: CountIntimacoesBuckets :one
 -- Bucket counts for the list envelope's `buckets` object, derived in the same
 -- request as ListIntimacoes (no N+1). Mirrors the urgência buckets of the list's
--- WHERE clause but expressed as FILTER aggregates over the SAME non-urgencia
+-- WHERE clause but expressed as FILTER aggregates over the SAME non-urgência
 -- filters (type, user_status, court, search — assignee is deliberately NOT
 -- applied here, mirroring how the processes screen's other chips don't gate its
 -- own filter options) — so the header badges agree with what the list would show
--- when the user picks that bucket. `sem_providencia` counts intimações not yet
--- AI-analyzed AND not yet resolved/ignored (user still needs to act, independent
--- of whether a deadline was derived). The four deadline buckets restrict to
--- status IN (PENDING, OPEN): MISSED/MET deadlines belong to closed intimations
--- and are not counted as actionable. `mais_adiante`/`nao_confirmado` stay in the
--- projection (not removed) though the FE renders only the five tabs above.
+-- when the user picks that bucket. The seven buckets are mutually disjoint and
+-- all exclude user_status RESOLVED/IGNORED. The four+ temporal buckets restrict
+-- to status IN (PENDING, OPEN): MISSED/MET deadlines belong to closed intimations
+-- and are not counted as actionable. `sem_data_definida` counts intimations with
+-- no derived deadline (deadline LEFT JOIN miss). The buckets do NOT apply the
+-- `nao_confirmado` triage toggle (it is a per-list filter, independent of tabs).
 SELECT
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) < 0   AND d.status IN ('PENDING', 'OPEN'))::bigint AS atraso,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) = 0   AND d.status IN ('PENDING', 'OPEN'))::bigint AS hoje,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))::bigint AS proximos_dois_dias,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))::bigint AS esta_semana,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))::bigint AS mais_adiante,
-    count(*) FILTER (WHERE d.status = 'PENDING')::bigint AS nao_confirmado,
-    count(*) FILTER (WHERE i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS sem_providencia
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) < 0   AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS atraso,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) = 0   AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS hoje,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS proximos_dois_dias,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS esta_semana,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS este_mes,
+    count(*) FILTER (WHERE d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS mais_adiante,
+    count(*) FILTER (WHERE d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS sem_data_definida
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id

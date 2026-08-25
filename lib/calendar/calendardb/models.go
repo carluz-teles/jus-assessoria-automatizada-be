@@ -257,6 +257,39 @@ type DraftAttachment struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type EsajCredential struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	Nonce           []byte             `json:"nonce"`
+	WrappedDek      []byte             `json:"wrapped_dek"`
+	KekRef          string             `json:"kek_ref"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type FilingAttempt struct {
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	DraftID        uuid.UUID          `json:"draft_id"`
+	PetitionID     pgtype.UUID        `json:"petition_id"`
+	Status         string             `json:"status"`
+	PdfStorageKey  string             `json:"pdf_storage_key"`
+	PdfSha256      string             `json:"pdf_sha256"`
+	RequestedBy    uuid.UUID          `json:"requested_by"`
+	RequestedAt    pgtype.Timestamptz `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	FinishedAt     pgtype.Timestamptz `json:"finished_at"`
+	FailureReason  *string            `json:"failure_reason"`
+	FilingNumber   *string            `json:"filing_number"`
+	ScreenshotKeys []string           `json:"screenshot_keys"`
+}
+
 type Holiday struct {
 	ID      uuid.UUID   `json:"id"`
 	Scope   string      `json:"scope"`

@@ -6,6 +6,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
+	"github.com/jusassessoria/platform/internal/draft"
 	"github.com/jusassessoria/platform/lib/events"
 )
 
@@ -102,4 +103,38 @@ type NotificationRequested struct {
 	RecipientUserID string         `json:"recipient_user_id"`
 	Type            string         `json:"type"`
 	Payload         map[string]any `json:"payload"`
+}
+
+// Os dois eventos de peticionamento automático (Fatia 1) que este slice também
+// consome. Seguem o molde do deadline: só a CONST do tipo cruza a fronteira
+// (TypeFilingSucceeded/TypeFilingFailed = draft.…), enquanto o SHAPE do payload é
+// redefinido LOCALMENTE abaixo — assim este slice nunca importa o struct de evento
+// do draft, apenas o id pontuado. Um teste de round-trip (events_test.go) marca o
+// struct do produtor e desmarca no shape local, protegendo contra drift silencioso.
+// O import é acíclico (draft não importa notifications).
+const (
+	TypeFilingSucceeded = draft.TypeFilingSucceeded
+	TypeFilingFailed    = draft.TypeFilingFailed
+)
+
+// FilingSucceeded é o shape LOCAL de decode de filing.succeeded: a peça foi
+// protocolada no e-SAJ. TenantID scopa o aviso (barreira 1); FilingNumber é o
+// número de protocolo exibido. Base cede o event id para dedup.
+type FilingSucceeded struct {
+	events.Base
+	TenantID        string `json:"tenant_id"`
+	DraftID         string `json:"draft_id"`
+	FilingAttemptID string `json:"filing_attempt_id"`
+	FilingNumber    string `json:"filing_number"`
+}
+
+// FilingFailed é o shape LOCAL de decode de filing.failed: a tentativa de protocolo
+// automático falhou. TenantID scopa o aviso; FailureReason é exibida para o usuário
+// decidir pelo protocolo manual. Base cede o event id para dedup.
+type FilingFailed struct {
+	events.Base
+	TenantID        string `json:"tenant_id"`
+	DraftID         string `json:"draft_id"`
+	FilingAttemptID string `json:"filing_attempt_id"`
+	FailureReason   string `json:"failure_reason"`
 }

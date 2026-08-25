@@ -157,16 +157,16 @@ type Querier interface {
 	CountImportDiscoveredRecords(ctx context.Context, arg CountImportDiscoveredRecordsParams) (int64, error)
 	// Bucket counts for the list envelope's `buckets` object, derived in the same
 	// request as ListIntimacoes (no N+1). Mirrors the urgência buckets of the list's
-	// WHERE clause but expressed as FILTER aggregates over the SAME non-urgencia
+	// WHERE clause but expressed as FILTER aggregates over the SAME non-urgência
 	// filters (type, user_status, court, search — assignee is deliberately NOT
 	// applied here, mirroring how the processes screen's other chips don't gate its
 	// own filter options) — so the header badges agree with what the list would show
-	// when the user picks that bucket. `sem_providencia` counts intimações not yet
-	// AI-analyzed AND not yet resolved/ignored (user still needs to act, independent
-	// of whether a deadline was derived). The four deadline buckets restrict to
-	// status IN (PENDING, OPEN): MISSED/MET deadlines belong to closed intimations
-	// and are not counted as actionable. `mais_adiante`/`nao_confirmado` stay in the
-	// projection (not removed) though the FE renders only the five tabs above.
+	// when the user picks that bucket. The seven buckets are mutually disjoint and
+	// all exclude user_status RESOLVED/IGNORED. The four+ temporal buckets restrict
+	// to status IN (PENDING, OPEN): MISSED/MET deadlines belong to closed intimations
+	// and are not counted as actionable. `sem_data_definida` counts intimations with
+	// no derived deadline (deadline LEFT JOIN miss). The buckets do NOT apply the
+	// `nao_confirmado` triage toggle (it is a per-list filter, independent of tabs).
 	CountIntimacoesBuckets(ctx context.Context, arg CountIntimacoesBucketsParams) (CountIntimacoesBucketsRow, error)
 	// The "X de Y" total for the Intimações tab: how many intimations the process holds.
 	// Scoped by the same court_record_id + tenant_id as the list; no court_record join is

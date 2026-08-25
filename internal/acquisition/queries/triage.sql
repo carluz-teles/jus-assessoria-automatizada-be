@@ -64,14 +64,15 @@ UPDATE intimation
          sqlc.narg('filter_assignee_id')::uuid IS NULL
          OR i.assignee_user_id = sqlc.narg('filter_assignee_id')::uuid
        )
-       AND (
-         @urgencia::text = ''
-         OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
-         OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
-         OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
-         OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
-         OR (@urgencia::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
-         OR (@urgencia::text = 'nao_confirmado'     AND d.status = 'PENDING')
-         OR (@urgencia::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-       )
-   );
+        AND (
+          @urgencia::text = ''
+          OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR (@urgencia::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR (@urgencia::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR (@urgencia::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+        )
+        AND (@nao_confirmado::bool = false OR d.status = 'PENDING')
+    );

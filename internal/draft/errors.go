@@ -77,4 +77,41 @@ var (
 	// ErrDraftNotSigned — POST /v1/pecas/:id/file called when draft.status is not
 	// SIGNED. The piece must be signed before filing. INVALID (→ 422).
 	ErrDraftNotSigned = apperr.NewInvalid("draft must be signed before filing")
+
+	// ── Fatia 1 — peticionamento automático (e-SAJ) ──────────────────────────
+
+	// ErrSecretVaultUnavailable — o slice de certificados (KMS envelope) não está
+	// montado (GCP_KMS_KEY_NAME vazio). Bloqueia o CRUD de credenciais e-SAJ.
+	// CONFLICT (→ 409) — o cliente deve provisionar o KMS antes.
+	ErrSecretVaultUnavailable = apperr.NewConflict("secret vault (KMS) indisponível: credenciais e-SAJ requerem envelope criptográfico")
+
+	// ErrEsajCredentialNotFound — não há credencial e-SAJ ativa para o usuário.
+	// NOT_FOUND (→ 404).
+	ErrEsajCredentialNotFound = apperr.NewNotFound("credencial e-SAJ não encontrada para este usuário")
+
+	// ErrFilingAlreadyEnqueued — POST /v1/pecas/:id/filing/approve chamado com uma
+	// tentativa já ativa (ENFILEIRADO/PROTOCOLANDO). O handler devolve a tentativa
+	// existente (200 idempotente), não um erro.
+	ErrFilingAlreadyEnqueued = apperr.NewConflict("já existe um protocolo automático em andamento para esta peça")
+
+	// ErrFilingNotSigned — POST /v1/pecas/:id/filing/approve chamado quando o draft
+	// não está SIGNED. INVALID (→ 422).
+	ErrFilingNotSigned = apperr.NewInvalid("a peça deve estar assinada antes de protocolar")
+
+	// ErrFilingConsentRequired — falta a credencial e-SAJ ativa (ou o consentimento
+	// dos termos) para protocolar automaticamente. INVALID (→ 422).
+	ErrFilingConsentRequired = apperr.NewInvalid("credencial e-SAJ ativa obrigatória para protocolo automático")
+
+	// ErrEsajCredentialConflict — já existe uma credencial e-SAJ ativa para o
+	// usuário (unique parcial). O FE deve revogar a anterior antes de cadastrar.
+	// CONFLICT (→ 409).
+	ErrEsajCredentialConflict = apperr.NewConflict("já existe uma credencial e-SAJ ativa para este usuário")
+
+	// ErrFilingAttemptConflict — o unique parcial (draft_id ativo) impediu a 2ª
+	// tentativa ativa. O handler trata como idempotência (devolve a existente).
+	ErrFilingAttemptConflict = apperr.NewConflict("já existe um protocolo automático em andamento para esta peça")
+
+	// ErrFilingAttemptNotFound — GET /v1/pecas/:id/filing com id inexistente.
+	// NOT_FOUND (→ 404).
+	ErrFilingAttemptNotFound = apperr.NewNotFound("tentativa de protocolo não encontrada")
 )

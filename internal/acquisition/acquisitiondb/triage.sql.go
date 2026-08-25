@@ -61,17 +61,18 @@ UPDATE intimation
          $7::uuid IS NULL
          OR i.assignee_user_id = $7::uuid
        )
-       AND (
-         $8::text = ''
-         OR ($8::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'nao_confirmado'     AND d.status = 'PENDING')
-         OR ($8::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-       )
-   )
+        AND (
+          $8::text = ''
+          OR ($8::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+        )
+        AND ($9::bool = false OR d.status = 'PENDING')
+    )
 `
 
 type BulkAssignIntimacoesByFilterParams struct {
@@ -83,6 +84,7 @@ type BulkAssignIntimacoesByFilterParams struct {
 	Court            string      `json:"court"`
 	FilterAssigneeID pgtype.UUID `json:"filter_assignee_id"`
 	Urgencia         string      `json:"urgencia"`
+	NaoConfirmado    bool        `json:"nao_confirmado"`
 }
 
 // Atribuição em massa do responsável para TODA a faixa/filtro atual (modo
@@ -99,6 +101,7 @@ func (q *Queries) BulkAssignIntimacoesByFilter(ctx context.Context, arg BulkAssi
 		arg.Court,
 		arg.FilterAssigneeID,
 		arg.Urgencia,
+		arg.NaoConfirmado,
 	)
 	if err != nil {
 		return 0, err

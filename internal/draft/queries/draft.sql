@@ -604,3 +604,85 @@ WHERE d.tenant_id = $1
   AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
 LIMIT $8;
+
+-- ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
+-- Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA
+-- persiste em claro. O consentimento dos termos é registrado por auditoria.
+
+-- name: InsertEsajCredential :one
+INSERT INTO esaj_credential (
+  tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref,
+  terms_version, terms_accepted_at, terms_accepted_by
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at;
+
+-- name: ListEsajCredentials :many
+-- Metadados públicos (sem o envelope) das credenciais ATIVAS do tenant.
+SELECT id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at
+FROM esaj_credential
+WHERE tenant_id = $1 AND revoked_at IS NULL
+ORDER BY created_at DESC;
+
+-- name: GetActiveEsajCredential :one
+-- Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
+-- pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
+SELECT id, tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref, terms_version
+FROM esaj_credential
+WHERE tenant_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL;
+
+-- name: RevokeEsajCredential :exec
+-- Soft-delete idempotente: só marca revoked_at quando ainda ativa.
+UPDATE esaj_credential SET revoked_at = now()
+WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL;
+
+-- ── filing_attempt (Fatia 1 — peticionamento automático) ──────────────────────
+
+-- name: InsertFilingAttempt :one
+-- Snapshot do PDF congelado no clique. O unique parcial (draft_id WHERE ativo)
+-- impede 2ª tentativa ativa — barreira de idempotência contra duplo-clique.
+-- tenant_id é explícito (RLS + coluna NOT NULL); o UoW já seta app.tenant_id.
+INSERT INTO filing_attempt (tenant_id, draft_id, pdf_storage_key, pdf_sha256, requested_by, status)
+VALUES ($1, $2, $3, $4, $5, 'ENFILEIRADO')
+RETURNING id, draft_id, status, requested_by, requested_at, pdf_storage_key, pdf_sha256;
+
+-- name: GetActiveFilingAttempt :one
+-- Tentativa ativa (ENFILEIRADO/PROTOCOLANDO) p/ o clique ser idempotente.
+-- tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+SELECT id, draft_id, status, pdf_storage_key, pdf_sha256
+FROM filing_attempt
+WHERE tenant_id = $1 AND draft_id = $2 AND status IN ('ENFILEIRADO', 'PROTOCOLANDO')
+ORDER BY requested_at DESC
+LIMIT 1;
+
+-- name: GetLatestFilingAttempt :one
+-- Última tentativa do draft (qualquer status, inclusive PROTOCOLADO/FALHOU) —
+-- usada pelo endpoint de status, que deve refletir o estado terminal.
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, filing_number, screenshot_keys
+FROM filing_attempt
+WHERE draft_id = $1
+ORDER BY requested_at DESC
+LIMIT 1;
+
+-- name: GetFilingAttempt :one
+-- tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, screenshot_keys
+FROM filing_attempt
+WHERE tenant_id = $1 AND id = $2;
+
+-- name: MarkFilingProtocolando :exec
+-- Transição ENFILEIRADO → PROTOCOLANDO. Guarda status pra não dar replay.
+UPDATE filing_attempt SET status = 'PROTOCOLANDO', started_at = now()
+WHERE id = $1 AND status = 'ENFILEIRADO';
+
+-- name: MarkFilingProtocolado :one
+UPDATE filing_attempt
+SET status = 'PROTOCOLADO', finished_at = now(), petition_id = $2, filing_number = $3, screenshot_keys = $4
+WHERE id = $1
+RETURNING id, status, finished_at, filing_number;
+
+-- name: MarkFilingFailed :exec
+UPDATE filing_attempt
+SET status = 'FALHOU', finished_at = now(), failure_reason = $2
+WHERE id = $1;

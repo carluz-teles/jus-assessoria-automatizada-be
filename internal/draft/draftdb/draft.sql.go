@@ -47,6 +47,84 @@ func (q *Queries) DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) 
 	return err
 }
 
+const getActiveEsajCredential = `-- name: GetActiveEsajCredential :one
+SELECT id, tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref, terms_version
+FROM esaj_credential
+WHERE tenant_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL
+`
+
+type GetActiveEsajCredentialParams struct {
+	TenantID    uuid.UUID `json:"tenant_id"`
+	OwnerUserID uuid.UUID `json:"owner_user_id"`
+}
+
+type GetActiveEsajCredentialRow struct {
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	OwnerUserID  uuid.UUID `json:"owner_user_id"`
+	Login        string    `json:"login"`
+	Ciphertext   []byte    `json:"ciphertext"`
+	Nonce        []byte    `json:"nonce"`
+	WrappedDek   []byte    `json:"wrapped_dek"`
+	KekRef       string    `json:"kek_ref"`
+	TermsVersion string    `json:"terms_version"`
+}
+
+// Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
+// pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
+func (q *Queries) GetActiveEsajCredential(ctx context.Context, arg GetActiveEsajCredentialParams) (GetActiveEsajCredentialRow, error) {
+	row := q.db.QueryRow(ctx, getActiveEsajCredential, arg.TenantID, arg.OwnerUserID)
+	var i GetActiveEsajCredentialRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.OwnerUserID,
+		&i.Login,
+		&i.Ciphertext,
+		&i.Nonce,
+		&i.WrappedDek,
+		&i.KekRef,
+		&i.TermsVersion,
+	)
+	return i, err
+}
+
+const getActiveFilingAttempt = `-- name: GetActiveFilingAttempt :one
+SELECT id, draft_id, status, pdf_storage_key, pdf_sha256
+FROM filing_attempt
+WHERE tenant_id = $1 AND draft_id = $2 AND status IN ('ENFILEIRADO', 'PROTOCOLANDO')
+ORDER BY requested_at DESC
+LIMIT 1
+`
+
+type GetActiveFilingAttemptParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	DraftID  uuid.UUID `json:"draft_id"`
+}
+
+type GetActiveFilingAttemptRow struct {
+	ID            uuid.UUID `json:"id"`
+	DraftID       uuid.UUID `json:"draft_id"`
+	Status        string    `json:"status"`
+	PdfStorageKey string    `json:"pdf_storage_key"`
+	PdfSha256     string    `json:"pdf_sha256"`
+}
+
+// Tentativa ativa (ENFILEIRADO/PROTOCOLANDO) p/ o clique ser idempotente.
+// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+func (q *Queries) GetActiveFilingAttempt(ctx context.Context, arg GetActiveFilingAttemptParams) (GetActiveFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, getActiveFilingAttempt, arg.TenantID, arg.DraftID)
+	var i GetActiveFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Status,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
+	)
+	return i, err
+}
+
 const getAttachmentForUpdate = `-- name: GetAttachmentForUpdate :one
 SELECT id, tenant_id, draft_id, document_id, category, position, created_at
 FROM draft_attachment
@@ -512,6 +590,54 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 	return i, err
 }
 
+const getFilingAttempt = `-- name: GetFilingAttempt :one
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, screenshot_keys
+FROM filing_attempt
+WHERE tenant_id = $1 AND id = $2
+`
+
+type GetFilingAttemptParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+}
+
+type GetFilingAttemptRow struct {
+	ID             uuid.UUID          `json:"id"`
+	DraftID        uuid.UUID          `json:"draft_id"`
+	PetitionID     pgtype.UUID        `json:"petition_id"`
+	Status         string             `json:"status"`
+	PdfStorageKey  string             `json:"pdf_storage_key"`
+	PdfSha256      string             `json:"pdf_sha256"`
+	RequestedBy    uuid.UUID          `json:"requested_by"`
+	RequestedAt    pgtype.Timestamptz `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	FinishedAt     pgtype.Timestamptz `json:"finished_at"`
+	FailureReason  *string            `json:"failure_reason"`
+	ScreenshotKeys []string           `json:"screenshot_keys"`
+}
+
+// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+func (q *Queries) GetFilingAttempt(ctx context.Context, arg GetFilingAttemptParams) (GetFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, getFilingAttempt, arg.TenantID, arg.ID)
+	var i GetFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.PetitionID,
+		&i.Status,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
+		&i.RequestedBy,
+		&i.RequestedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.FailureReason,
+		&i.ScreenshotKeys,
+	)
+	return i, err
+}
+
 const getIntimationForDraft = `-- name: GetIntimationForDraft :one
 SELECT
     i.id                AS intimation_id,
@@ -578,6 +704,54 @@ func (q *Queries) GetIntimationForDraft(ctx context.Context, arg GetIntimationFo
 		&i.Subject,
 		&i.JudgingBody,
 		&i.DeadlineEndDate,
+	)
+	return i, err
+}
+
+const getLatestFilingAttempt = `-- name: GetLatestFilingAttempt :one
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, filing_number, screenshot_keys
+FROM filing_attempt
+WHERE draft_id = $1
+ORDER BY requested_at DESC
+LIMIT 1
+`
+
+type GetLatestFilingAttemptRow struct {
+	ID             uuid.UUID          `json:"id"`
+	DraftID        uuid.UUID          `json:"draft_id"`
+	PetitionID     pgtype.UUID        `json:"petition_id"`
+	Status         string             `json:"status"`
+	PdfStorageKey  string             `json:"pdf_storage_key"`
+	PdfSha256      string             `json:"pdf_sha256"`
+	RequestedBy    uuid.UUID          `json:"requested_by"`
+	RequestedAt    pgtype.Timestamptz `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	FinishedAt     pgtype.Timestamptz `json:"finished_at"`
+	FailureReason  *string            `json:"failure_reason"`
+	FilingNumber   *string            `json:"filing_number"`
+	ScreenshotKeys []string           `json:"screenshot_keys"`
+}
+
+// Última tentativa do draft (qualquer status, inclusive PROTOCOLADO/FALHOU) —
+// usada pelo endpoint de status, que deve refletir o estado terminal.
+func (q *Queries) GetLatestFilingAttempt(ctx context.Context, draftID uuid.UUID) (GetLatestFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, getLatestFilingAttempt, draftID)
+	var i GetLatestFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.PetitionID,
+		&i.Status,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
+		&i.RequestedBy,
+		&i.RequestedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.FailureReason,
+		&i.FilingNumber,
+		&i.ScreenshotKeys,
 	)
 	return i, err
 }
@@ -947,6 +1121,121 @@ func (q *Queries) InsertDraftAttachment(ctx context.Context, arg InsertDraftAtta
 	return i, err
 }
 
+const insertEsajCredential = `-- name: InsertEsajCredential :one
+
+INSERT INTO esaj_credential (
+  tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref,
+  terms_version, terms_accepted_at, terms_accepted_by
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at
+`
+
+type InsertEsajCredentialParams struct {
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	Nonce           []byte             `json:"nonce"`
+	WrappedDek      []byte             `json:"wrapped_dek"`
+	KekRef          string             `json:"kek_ref"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+}
+
+type InsertEsajCredentialRow struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+}
+
+// ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
+// Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA
+// persiste em claro. O consentimento dos termos é registrado por auditoria.
+func (q *Queries) InsertEsajCredential(ctx context.Context, arg InsertEsajCredentialParams) (InsertEsajCredentialRow, error) {
+	row := q.db.QueryRow(ctx, insertEsajCredential,
+		arg.TenantID,
+		arg.OwnerUserID,
+		arg.Login,
+		arg.Ciphertext,
+		arg.Nonce,
+		arg.WrappedDek,
+		arg.KekRef,
+		arg.TermsVersion,
+		arg.TermsAcceptedAt,
+		arg.TermsAcceptedBy,
+	)
+	var i InsertEsajCredentialRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.OwnerUserID,
+		&i.Login,
+		&i.TermsVersion,
+		&i.TermsAcceptedAt,
+		&i.TermsAcceptedBy,
+		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const insertFilingAttempt = `-- name: InsertFilingAttempt :one
+
+INSERT INTO filing_attempt (tenant_id, draft_id, pdf_storage_key, pdf_sha256, requested_by, status)
+VALUES ($1, $2, $3, $4, $5, 'ENFILEIRADO')
+RETURNING id, draft_id, status, requested_by, requested_at, pdf_storage_key, pdf_sha256
+`
+
+type InsertFilingAttemptParams struct {
+	TenantID      uuid.UUID `json:"tenant_id"`
+	DraftID       uuid.UUID `json:"draft_id"`
+	PdfStorageKey string    `json:"pdf_storage_key"`
+	PdfSha256     string    `json:"pdf_sha256"`
+	RequestedBy   uuid.UUID `json:"requested_by"`
+}
+
+type InsertFilingAttemptRow struct {
+	ID            uuid.UUID          `json:"id"`
+	DraftID       uuid.UUID          `json:"draft_id"`
+	Status        string             `json:"status"`
+	RequestedBy   uuid.UUID          `json:"requested_by"`
+	RequestedAt   pgtype.Timestamptz `json:"requested_at"`
+	PdfStorageKey string             `json:"pdf_storage_key"`
+	PdfSha256     string             `json:"pdf_sha256"`
+}
+
+// ── filing_attempt (Fatia 1 — peticionamento automático) ──────────────────────
+// Snapshot do PDF congelado no clique. O unique parcial (draft_id WHERE ativo)
+// impede 2ª tentativa ativa — barreira de idempotência contra duplo-clique.
+// tenant_id é explícito (RLS + coluna NOT NULL); o UoW já seta app.tenant_id.
+func (q *Queries) InsertFilingAttempt(ctx context.Context, arg InsertFilingAttemptParams) (InsertFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, insertFilingAttempt,
+		arg.TenantID,
+		arg.DraftID,
+		arg.PdfStorageKey,
+		arg.PdfSha256,
+		arg.RequestedBy,
+	)
+	var i InsertFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Status,
+		&i.RequestedBy,
+		&i.RequestedAt,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
+	)
+	return i, err
+}
+
 const insertPetition = `-- name: InsertPetition :one
 INSERT INTO petition (draft_id, court_record_id, filed_at, receipt)
 VALUES ($1, $2, $3, $4)
@@ -1261,6 +1550,56 @@ func (q *Queries) ListDraftsByProcess(ctx context.Context, arg ListDraftsByProce
 	return items, nil
 }
 
+const listEsajCredentials = `-- name: ListEsajCredentials :many
+SELECT id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at
+FROM esaj_credential
+WHERE tenant_id = $1 AND revoked_at IS NULL
+ORDER BY created_at DESC
+`
+
+type ListEsajCredentialsRow struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+}
+
+// Metadados públicos (sem o envelope) das credenciais ATIVAS do tenant.
+func (q *Queries) ListEsajCredentials(ctx context.Context, tenantID uuid.UUID) ([]ListEsajCredentialsRow, error) {
+	rows, err := q.db.Query(ctx, listEsajCredentials, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEsajCredentialsRow
+	for rows.Next() {
+		var i ListEsajCredentialsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.OwnerUserID,
+			&i.Login,
+			&i.TermsVersion,
+			&i.TermsAcceptedAt,
+			&i.TermsAcceptedBy,
+			&i.CreatedAt,
+			&i.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markFiled = `-- name: MarkFiled :one
 UPDATE draft
 SET filed_at       = COALESCE($3::timestamptz, now()),
@@ -1302,6 +1641,71 @@ func (q *Queries) MarkFiled(ctx context.Context, arg MarkFiledParams) (MarkFiled
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const markFilingFailed = `-- name: MarkFilingFailed :exec
+UPDATE filing_attempt
+SET status = 'FALHOU', finished_at = now(), failure_reason = $2
+WHERE id = $1
+`
+
+type MarkFilingFailedParams struct {
+	ID            uuid.UUID `json:"id"`
+	FailureReason *string   `json:"failure_reason"`
+}
+
+func (q *Queries) MarkFilingFailed(ctx context.Context, arg MarkFilingFailedParams) error {
+	_, err := q.db.Exec(ctx, markFilingFailed, arg.ID, arg.FailureReason)
+	return err
+}
+
+const markFilingProtocolado = `-- name: MarkFilingProtocolado :one
+UPDATE filing_attempt
+SET status = 'PROTOCOLADO', finished_at = now(), petition_id = $2, filing_number = $3, screenshot_keys = $4
+WHERE id = $1
+RETURNING id, status, finished_at, filing_number
+`
+
+type MarkFilingProtocoladoParams struct {
+	ID             uuid.UUID   `json:"id"`
+	PetitionID     pgtype.UUID `json:"petition_id"`
+	FilingNumber   *string     `json:"filing_number"`
+	ScreenshotKeys []string    `json:"screenshot_keys"`
+}
+
+type MarkFilingProtocoladoRow struct {
+	ID           uuid.UUID          `json:"id"`
+	Status       string             `json:"status"`
+	FinishedAt   pgtype.Timestamptz `json:"finished_at"`
+	FilingNumber *string            `json:"filing_number"`
+}
+
+func (q *Queries) MarkFilingProtocolado(ctx context.Context, arg MarkFilingProtocoladoParams) (MarkFilingProtocoladoRow, error) {
+	row := q.db.QueryRow(ctx, markFilingProtocolado,
+		arg.ID,
+		arg.PetitionID,
+		arg.FilingNumber,
+		arg.ScreenshotKeys,
+	)
+	var i MarkFilingProtocoladoRow
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.FinishedAt,
+		&i.FilingNumber,
+	)
+	return i, err
+}
+
+const markFilingProtocolando = `-- name: MarkFilingProtocolando :exec
+UPDATE filing_attempt SET status = 'PROTOCOLANDO', started_at = now()
+WHERE id = $1 AND status = 'ENFILEIRADO'
+`
+
+// Transição ENFILEIRADO → PROTOCOLANDO. Guarda status pra não dar replay.
+func (q *Queries) MarkFilingProtocolando(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markFilingProtocolando, id)
+	return err
 }
 
 const markSentToSigning = `-- name: MarkSentToSigning :one
@@ -1362,6 +1766,22 @@ func (q *Queries) RevertToConstruction(ctx context.Context, arg RevertToConstruc
 	var i RevertToConstructionRow
 	err := row.Scan(&i.ID, &i.UpdatedAt)
 	return i, err
+}
+
+const revokeEsajCredential = `-- name: RevokeEsajCredential :exec
+UPDATE esaj_credential SET revoked_at = now()
+WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeEsajCredentialParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Soft-delete idempotente: só marca revoked_at quando ainda ativa.
+func (q *Queries) RevokeEsajCredential(ctx context.Context, arg RevokeEsajCredentialParams) error {
+	_, err := q.db.Exec(ctx, revokeEsajCredential, arg.ID, arg.TenantID)
+	return err
 }
 
 const setGenerationParams = `-- name: SetGenerationParams :exec

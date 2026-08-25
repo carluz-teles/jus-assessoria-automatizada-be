@@ -302,6 +302,16 @@ func queueFor(typ string) string {
 	if typ == "draft.generation_requested" {
 		return "ai"
 	}
+	// filing.enqueued → "filing": consumido pelo worker-filing (RPA e-SAJ).
+	// String literal evita import cycle com internal/draft. filing.succeeded/
+	// filing.failed são consumidos pelo listener de notificações (mesma fila
+	// do resto das notificações).
+	if typ == "filing.enqueued" {
+		return "filing"
+	}
+	if typ == "filing.succeeded" || typ == "filing.failed" {
+		return "notifications"
+	}
 	// review.completed has no active consumer today. Route to "ingestao" (archived as
 	// handler-not-found — the worker drains that queue) rather than "default" (which no
 	// worker drains — silently building up in Redis). Mirrors the orphan deadline.*

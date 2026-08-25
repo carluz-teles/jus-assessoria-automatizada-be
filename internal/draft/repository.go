@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -196,6 +197,42 @@ type Repository interface {
 	// GetCourtRecordIDByIntimation returns the court_record_id for an intimation,
 	// or empty string if the intimation has no linked court record.
 	GetCourtRecordIDByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (string, error)
+
+	// ── e-SAJ credential methods (Fatia 1 — peticionamento automático) ──────
+
+	// InsertEsajCredential persiste login + envelope KMS + consentimento. A miss é
+	// apperr (infra); o unique parcial já-ativa vira ErrEsajCredentialConflict.
+	InsertEsajCredential(ctx context.Context, tx database.Tx, tenantID, ownerUserID, login string, env *Envelope, termsVersion, termsAcceptedAt, termsAcceptedBy string) (*EsajCredential, error)
+	// ListEsajCredentials devolve a metadata pública das credenciais ativas do tenant.
+	ListEsajCredentials(ctx context.Context, tx database.Tx, tenantID string) ([]EsajCredential, error)
+	// GetActiveEsajCredential carrega a credencial ativa do usuário INCLUINDO o
+	// envelope (pra decifrar a senha no worker). Miss → pgx.ErrNoRows.
+	GetActiveEsajCredential(ctx context.Context, tx database.Tx, tenantID, ownerUserID string) (*EsajCredentialEnvelope, error)
+	// RevokeEsajCredential faz soft-delete idempotente (só marca revoked_at quando ativa).
+	RevokeEsajCredential(ctx context.Context, tx database.Tx, tenantID, id string) error
+
+	// ── filing_attempt methods (Fatia 1 — peticionamento automático) ────────
+
+	// InsertFilingAttempt congela o snapshot do PDF (key + sha256) e cria a
+	// tentativa ENFILEIRADO. O unique parcial (draft_id ativo) é a barreira de
+	// idempotência contra duplo-clique.
+	InsertFilingAttempt(ctx context.Context, tx database.Tx, tenantID, draftID, pdfStorageKey, pdfSha256, requestedBy string) (*FilingAttempt, error)
+	// GetActiveFilingAttempt devolve a tentativa ativa (ENFILEIRADO/PROTOCOLANDO)
+	// do draft, ou nil se não houver.
+	GetActiveFilingAttempt(ctx context.Context, tx database.Tx, tenantID, draftID string) (*FilingAttempt, error)
+	// GetLatestFilingAttempt devolve a ÚLTIMA tentativa do draft (qualquer status,
+	// inclusive PROTOCOLADO/FALHOU) — usada pelo endpoint de status para refletir
+	// o estado terminal. Miss (sem nenhuma) → apperr not-found.
+	GetLatestFilingAttempt(ctx context.Context, tx database.Tx, draftID string) (*FilingAttempt, error)
+	// GetFilingAttempt devolve a tentativa por id. Miss → apperr not-found.
+	GetFilingAttempt(ctx context.Context, tx database.Tx, tenantID, id string) (*FilingAttempt, error)
+	// MarkFilingProtocolando transiciona ENFILEIRADO→PROTOCOLANDO. Guarda status:
+	// 0 linhas afetadas = outro worker já ganhou (idempotência de retry).
+	MarkFilingProtocolando(ctx context.Context, tx database.Tx, id string) error
+	// MarkFilingProtocolado finaliza com sucesso (petition_id + filing_number + screenshots).
+	MarkFilingProtocolado(ctx context.Context, tx database.Tx, id, petitionID, filingNumber string, screenshotKeys []string) (*FilingAttempt, error)
+	// MarkFilingFailed finaliza com falha (reason).
+	MarkFilingFailed(ctx context.Context, tx database.Tx, id, reason string) error
 }
 
 // ErrDraftAlreadyExists is a sentinel the repository returns when InsertDraft hits
@@ -859,18 +896,18 @@ func (r *pgRepository) SignDraftWithPDF(ctx context.Context, tx database.Tx, dra
 // signRowFromSignWithPDF adapta SignDraftWithPDFRow → SignDraftRow (mesmo shape).
 func signRowFromSignWithPDF(r draftdb.SignDraftWithPDFRow) draftdb.SignDraftRow {
 	return draftdb.SignDraftRow{
-		ID:            r.ID,
-		TenantID:      r.TenantID,
-		CaseID:        r.CaseID,
-		IntimationID:  r.IntimationID,
-		PieceType:     r.PieceType,
-		Title:         r.Title,
-		Content:       r.Content,
-		Status:        r.Status,
-		SagaState:     r.SagaState,
-		CreatedAt:     r.CreatedAt,
-		UpdatedAt:     r.UpdatedAt,
-		SignedAt:      r.SignedAt,
+		ID:           r.ID,
+		TenantID:     r.TenantID,
+		CaseID:       r.CaseID,
+		IntimationID: r.IntimationID,
+		PieceType:    r.PieceType,
+		Title:        r.Title,
+		Content:      r.Content,
+		Status:       r.Status,
+		SagaState:    r.SagaState,
+		CreatedAt:    r.CreatedAt,
+		UpdatedAt:    r.UpdatedAt,
+		SignedAt:     r.SignedAt,
 	}
 }
 
@@ -960,10 +997,10 @@ func (r *pgRepository) MarkFiled(ctx context.Context, tx database.Tx, draftID, t
 		fn = &filingNumber
 	}
 	_, err = draftdb.New(tx).MarkFiled(ctx, draftdb.MarkFiledParams{
-		ID:            did,
-		TenantID:      tid,
-		FilingNumber:  fn,
-		FiledAt:       pgtype.Timestamptz{}, // NULL → COALESCE(now())
+		ID:           did,
+		TenantID:     tid,
+		FilingNumber: fn,
+		FiledAt:      pgtype.Timestamptz{}, // NULL → COALESCE(now())
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrDraftNotFound
@@ -1189,4 +1226,335 @@ func parseCursorTime(s string) (time.Time, error) {
 		return time.Time{}, apperr.NewInvalid("invalid cursor timestamp: " + s)
 	}
 	return t, nil
+}
+
+// ── e-SAJ credential (Fatia 1 — peticionamento automático) ───────────────────
+
+func (r *pgRepository) InsertEsajCredential(ctx context.Context, tx database.Tx, tenantID, ownerUserID, login string, env *Envelope, termsVersion, termsAcceptedAt, termsAcceptedBy string) (*EsajCredential, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	oid, err := parseUUID(ownerUserID)
+	if err != nil {
+		return nil, err
+	}
+	aid, err := parseUUID(termsAcceptedBy)
+	if err != nil {
+		return nil, err
+	}
+	acceptedAt, err := time.Parse(time.RFC3339, termsAcceptedAt)
+	if err != nil {
+		// caller validates; tolera empty caindo em now().
+		acceptedAt = time.Now()
+	}
+	row, err := draftdb.New(tx).InsertEsajCredential(ctx, draftdb.InsertEsajCredentialParams{
+		TenantID:        tid,
+		OwnerUserID:     oid,
+		Login:           login,
+		Ciphertext:      env.Ciphertext,
+		Nonce:           env.Nonce,
+		WrappedDek:      env.WrappedDEK,
+		KekRef:          env.KEKRef,
+		TermsVersion:    termsVersion,
+		TermsAcceptedAt: pgtype.Timestamptz{Time: acceptedAt, Valid: true},
+		TermsAcceptedBy: aid,
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrEsajCredentialConflict
+		}
+		return nil, database.WrapInfra(err)
+	}
+	return &EsajCredential{
+		ID:              row.ID.String(),
+		TenantID:        row.TenantID.String(),
+		OwnerUserID:     row.OwnerUserID.String(),
+		Login:           row.Login,
+		TermsVersion:    row.TermsVersion,
+		TermsAcceptedAt: row.TermsAcceptedAt.Time,
+		CreatedAt:       row.CreatedAt.Time,
+	}, nil
+}
+
+func (r *pgRepository) ListEsajCredentials(ctx context.Context, tx database.Tx, tenantID string) ([]EsajCredential, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := draftdb.New(tx).ListEsajCredentials(ctx, tid)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]EsajCredential, 0, len(rows))
+	for i := range rows {
+		out = append(out, EsajCredential{
+			ID:              rows[i].ID.String(),
+			TenantID:        rows[i].TenantID.String(),
+			OwnerUserID:     rows[i].OwnerUserID.String(),
+			Login:           rows[i].Login,
+			TermsVersion:    rows[i].TermsVersion,
+			TermsAcceptedAt: rows[i].TermsAcceptedAt.Time,
+			CreatedAt:       rows[i].CreatedAt.Time,
+		})
+	}
+	return out, nil
+}
+
+func (r *pgRepository) GetActiveEsajCredential(ctx context.Context, tx database.Tx, tenantID, ownerUserID string) (*EsajCredentialEnvelope, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	oid, err := parseUUID(ownerUserID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).GetActiveEsajCredential(ctx, draftdb.GetActiveEsajCredentialParams{
+		TenantID:    tid,
+		OwnerUserID: oid,
+	})
+	if err != nil {
+		return nil, err // pgx.ErrNoRows propagado p/ o use case mapear
+	}
+	return &EsajCredentialEnvelope{
+		ID:         row.ID.String(),
+		Login:      row.Login,
+		Ciphertext: row.Ciphertext,
+		Nonce:      row.Nonce,
+		WrappedDEK: row.WrappedDek,
+		KEKRef:     row.KekRef,
+	}, nil
+}
+
+func (r *pgRepository) RevokeEsajCredential(ctx context.Context, tx database.Tx, tenantID, id string) error {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	iid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).RevokeEsajCredential(ctx, draftdb.RevokeEsajCredentialParams{
+		ID:       iid,
+		TenantID: tid,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// ── filing_attempt (Fatia 1 — peticionamento automático) ─────────────────────
+
+func (r *pgRepository) InsertFilingAttempt(ctx context.Context, tx database.Tx, tenantID, draftID, pdfStorageKey, pdfSha256, requestedBy string) (*FilingAttempt, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	rid, err := parseUUID(requestedBy)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).InsertFilingAttempt(ctx, draftdb.InsertFilingAttemptParams{
+		TenantID:      tid,
+		DraftID:       did,
+		PdfStorageKey: pdfStorageKey,
+		PdfSha256:     pdfSha256,
+		RequestedBy:   rid,
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrFilingAttemptConflict
+		}
+		return nil, database.WrapInfra(err)
+	}
+	return &FilingAttempt{
+		ID:            row.ID.String(),
+		DraftID:       row.DraftID.String(),
+		Status:        row.Status,
+		RequestedBy:   row.RequestedBy.String(),
+		RequestedAt:   row.RequestedAt.Time,
+		PdfStorageKey: row.PdfStorageKey,
+		PdfSha256:     row.PdfSha256,
+	}, nil
+}
+
+func (r *pgRepository) GetActiveFilingAttempt(ctx context.Context, tx database.Tx, tenantID, draftID string) (*FilingAttempt, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).GetActiveFilingAttempt(ctx, draftdb.GetActiveFilingAttemptParams{TenantID: tid, DraftID: did})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return &FilingAttempt{
+		ID:            row.ID.String(),
+		DraftID:       row.DraftID.String(),
+		Status:        row.Status,
+		PdfStorageKey: row.PdfStorageKey,
+		PdfSha256:     row.PdfSha256,
+	}, nil
+}
+
+func (r *pgRepository) GetLatestFilingAttempt(ctx context.Context, tx database.Tx, draftID string) (*FilingAttempt, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).GetLatestFilingAttempt(ctx, did)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrFilingAttemptNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return filingAttemptFromLatestRow(row), nil
+}
+
+func (r *pgRepository) GetFilingAttempt(ctx context.Context, tx database.Tx, tenantID, id string) (*FilingAttempt, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	iid, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).GetFilingAttempt(ctx, draftdb.GetFilingAttemptParams{TenantID: tid, ID: iid})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrFilingAttemptNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return filingAttemptFromRow(row), nil
+}
+
+func (r *pgRepository) MarkFilingProtocolando(ctx context.Context, tx database.Tx, id string) error {
+	iid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).MarkFilingProtocolando(ctx, iid); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func (r *pgRepository) MarkFilingProtocolado(ctx context.Context, tx database.Tx, id, petitionID, filingNumber string, screenshotKeys []string) (*FilingAttempt, error) {
+	iid, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+	pid, err := parseUUID(petitionID)
+	if err != nil {
+		return nil, err
+	}
+	if screenshotKeys == nil {
+		screenshotKeys = []string{}
+	}
+	row, err := draftdb.New(tx).MarkFilingProtocolado(ctx, draftdb.MarkFilingProtocoladoParams{
+		ID:             iid,
+		PetitionID:     pgtype.UUID{Bytes: pid, Valid: true},
+		FilingNumber:   &filingNumber,
+		ScreenshotKeys: screenshotKeys,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	fin := &FilingAttempt{ID: row.ID.String(), Status: row.Status, FinishedAt: row.FinishedAt.Time}
+	if row.FilingNumber != nil {
+		fin.FilingNumber = *row.FilingNumber
+	}
+	return fin, nil
+}
+
+func (r *pgRepository) MarkFilingFailed(ctx context.Context, tx database.Tx, id, reason string) error {
+	iid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).MarkFilingFailed(ctx, draftdb.MarkFilingFailedParams{ID: iid, FailureReason: &reason}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func filingAttemptFromRow(row draftdb.GetFilingAttemptRow) *FilingAttempt {
+	petitionID := ""
+	if row.PetitionID.Valid {
+		petitionID = uuid.UUID(row.PetitionID.Bytes).String()
+	}
+	failure := ""
+	if row.FailureReason != nil {
+		failure = *row.FailureReason
+	}
+	keys := row.ScreenshotKeys
+	if keys == nil {
+		keys = []string{}
+	}
+	return &FilingAttempt{
+		ID:             row.ID.String(),
+		DraftID:        row.DraftID.String(),
+		PetitionID:     petitionID,
+		Status:         row.Status,
+		PdfStorageKey:  row.PdfStorageKey,
+		PdfSha256:      row.PdfSha256,
+		RequestedBy:    row.RequestedBy.String(),
+		RequestedAt:    row.RequestedAt.Time,
+		StartedAt:      timestamptzToTime(row.StartedAt),
+		FinishedAt:     timestamptzToTime(row.FinishedAt),
+		FailureReason:  failure,
+		ScreenshotKeys: keys,
+	}
+}
+
+// filingAttemptFromLatestRow mapeia a linha da GetLatestFilingAttempt (todos os
+// status, inclusive terminal) — espelha filingAttemptFromRow mas para o row type
+// retornado por aquela query.
+func filingAttemptFromLatestRow(row draftdb.GetLatestFilingAttemptRow) *FilingAttempt {
+	petitionID := ""
+	if row.PetitionID.Valid {
+		petitionID = uuid.UUID(row.PetitionID.Bytes).String()
+	}
+	failure := ""
+	if row.FailureReason != nil {
+		failure = *row.FailureReason
+	}
+	filingNumber := ""
+	if row.FilingNumber != nil {
+		filingNumber = *row.FilingNumber
+	}
+	keys := row.ScreenshotKeys
+	if keys == nil {
+		keys = []string{}
+	}
+	return &FilingAttempt{
+		ID:             row.ID.String(),
+		DraftID:        row.DraftID.String(),
+		PetitionID:     petitionID,
+		Status:         row.Status,
+		PdfStorageKey:  row.PdfStorageKey,
+		PdfSha256:      row.PdfSha256,
+		RequestedBy:    row.RequestedBy.String(),
+		RequestedAt:    row.RequestedAt.Time,
+		StartedAt:      timestamptzToTime(row.StartedAt),
+		FinishedAt:     timestamptzToTime(row.FinishedAt),
+		FailureReason:  failure,
+		FilingNumber:   filingNumber,
+		ScreenshotKeys: keys,
+	}
 }

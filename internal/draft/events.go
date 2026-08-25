@@ -126,3 +126,108 @@ func newPetitionFiled(p *Petition, tenantID string) PetitionFiled {
 		TenantID:   tenantID,
 	}
 }
+
+// ── Fatia 1 — peticionamento automático (e-SAJ RPA) ───────────────────────────
+
+// TypeFilingEnqueued is published inside the approve tx (POST /v1/pecas/:id/filing/approve)
+// right after the filing_attempt is inserted as ENFILEIRADO. worker-filing consumes it
+// on the "filing" queue (concurrency 1) and runs the e-SAJ RPA.
+const TypeFilingEnqueued = "filing.enqueued"
+
+// FilingEnqueued carries the ids the worker needs: the frozen PDF (via
+// filing_attempt, acessado por FilingAttemptID) e o draft. A credencial e-SAJ
+// NÃO viaja no evento — o worker re-busca a ativa por (tenant_id, owner) dentro
+// da tx, evitando stale credential e respeitando o isolamento de tenant. EventID
+// é determinístico por attempt ("filing:<draftID>:<attemptID>") pra que um
+// double-enqueue da MESMA tentativa seja dedupado na camada asynq, enquanto uma
+// re-tentativa após FALHOU ganha novo attempt id → novo EventID → reprocessado
+// (critério 4). Também é a chave de dedup do consumer em processed_event.
+type FilingEnqueued struct {
+	events.Base
+	DraftID         string `json:"draft_id"`
+	TenantID        string `json:"tenant_id"`
+	FilingAttemptID string `json:"filing_attempt_id"`
+}
+
+var _ events.Event = FilingEnqueued{}
+
+func (FilingEnqueued) Type() string          { return TypeFilingEnqueued }
+func (FilingEnqueued) AggregateType() string { return aggregateTypeDraft }
+
+func newFilingEnqueued(draftID, tenantID, attemptID string) FilingEnqueued {
+	return FilingEnqueued{
+		Base: events.Base{
+			EventID:   "filing:" + draftID + ":" + attemptID,
+			Aggregate: draftID,
+		},
+		DraftID:         draftID,
+		TenantID:        tenantID,
+		FilingAttemptID: attemptID,
+	}
+}
+
+// TypeFilingSucceeded is published by worker-filing after a successful e-SAJ protocol.
+// notifications consumes it → in-app aviso via SSE.
+const TypeFilingSucceeded = "filing.succeeded"
+
+// FilingSucceeded announces a successful automated protocol, carrying the tribunal's
+// protocol number (filing_number) and the created petition id.
+type FilingSucceeded struct {
+	events.Base
+	DraftID         string `json:"draft_id"`
+	TenantID        string `json:"tenant_id"`
+	FilingAttemptID string `json:"filing_attempt_id"`
+	PetitionID      string `json:"petition_id"`
+	FilingNumber    string `json:"filing_number"`
+}
+
+var _ events.Event = FilingSucceeded{}
+
+func (FilingSucceeded) Type() string          { return TypeFilingSucceeded }
+func (FilingSucceeded) AggregateType() string { return aggregateTypeDraft }
+
+func newFilingSucceeded(draftID, tenantID, attemptID, petitionID, filingNumber string) FilingSucceeded {
+	return FilingSucceeded{
+		Base: events.Base{
+			EventID:   uuid.Must(uuid.NewV7()).String(),
+			Aggregate: draftID,
+		},
+		DraftID:         draftID,
+		TenantID:        tenantID,
+		FilingAttemptID: attemptID,
+		PetitionID:      petitionID,
+		FilingNumber:    filingNumber,
+	}
+}
+
+// TypeFilingFailed is published by worker-filing when the e-SAJ RPA fails. The
+// filing_attempt is marked FALHOU with the reason; the manual fallback remains available.
+const TypeFilingFailed = "filing.failed"
+
+// FilingFailed announces a failed automated protocol so the user can retry or fall back
+// to the manual "Marcar como protocolada" flow.
+type FilingFailed struct {
+	events.Base
+	DraftID         string `json:"draft_id"`
+	TenantID        string `json:"tenant_id"`
+	FilingAttemptID string `json:"filing_attempt_id"`
+	FailureReason   string `json:"failure_reason"`
+}
+
+var _ events.Event = FilingFailed{}
+
+func (FilingFailed) Type() string          { return TypeFilingFailed }
+func (FilingFailed) AggregateType() string { return aggregateTypeDraft }
+
+func newFilingFailed(draftID, tenantID, attemptID, reason string) FilingFailed {
+	return FilingFailed{
+		Base: events.Base{
+			EventID:   uuid.Must(uuid.NewV7()).String(),
+			Aggregate: draftID,
+		},
+		DraftID:         draftID,
+		TenantID:        tenantID,
+		FilingAttemptID: attemptID,
+		FailureReason:   reason,
+	}
+}
