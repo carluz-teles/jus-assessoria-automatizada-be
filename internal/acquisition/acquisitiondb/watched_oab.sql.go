@@ -9,47 +9,94 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const deleteWatchedOABsByIntegration = `-- name: DeleteWatchedOABsByIntegration :exec
-
-DELETE FROM watched_oab WHERE integration_id = $1
+const clearWatchedOABCatchUp = `-- name: ClearWatchedOABCatchUp :exec
+UPDATE watched_oab
+   SET catch_up_since = NULL
+ WHERE integration_id = $1 AND oab_key = $2 AND catch_up_since = $3
 `
 
-// watched_oab queries (acquisition slice). The per-tenant index of watched OABs the
-// national match joins against. Populated from the integration_activated event: the
-// use case replaces an integration's set (delete + insert) so a scope change is
-// reflected. Writes run per-tenant (RLS by app.tenant_id); the match reads system-wide.
-// Clear an integration's watched OABs before re-populating, so a removed OAB stops
-// matching. Scoped to the integration (the tenant is implied by the RLS tx).
-func (q *Queries) DeleteWatchedOABsByIntegration(ctx context.Context, integrationID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, deleteWatchedOABsByIntegration, integrationID)
+type ClearWatchedOABCatchUpParams struct {
+	IntegrationID uuid.UUID          `json:"integration_id"`
+	OabKey        string             `json:"oab_key"`
+	CatchUpSince  pgtype.Timestamptz `json:"catch_up_since"`
+}
+
+// Compare-and-clear: only wipes catch_up_since when it still equals the value the
+// caller dispatched the catch-up sync with. This guards against a LATE sync_completed
+// (from a stale, already-superseded catch-up) clobbering a NEWER catch_up_since set by
+// a subsequent disable/re-enable cycle.
+func (q *Queries) ClearWatchedOABCatchUp(ctx context.Context, arg ClearWatchedOABCatchUpParams) error {
+	_, err := q.db.Exec(ctx, clearWatchedOABCatchUp, arg.IntegrationID, arg.OabKey, arg.CatchUpSince)
 	return err
 }
 
-const insertWatchedOAB = `-- name: InsertWatchedOAB :exec
-INSERT INTO watched_oab (tenant_id, integration_id, oab_key)
-VALUES ($1, $2, $3)
-ON CONFLICT (integration_id, oab_key) DO NOTHING
+const disableWatchedOAB = `-- name: DisableWatchedOAB :one
+UPDATE watched_oab
+   SET enabled = false, disabled_at = now()
+ WHERE integration_id = $1 AND oab_key = $2 AND enabled = true
+RETURNING id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since
 `
 
-type InsertWatchedOABParams struct {
-	TenantID      uuid.UUID `json:"tenant_id"`
+type DisableWatchedOABParams struct {
 	IntegrationID uuid.UUID `json:"integration_id"`
 	OabKey        string    `json:"oab_key"`
 }
 
-// Add one watched OAB for an integration, idempotent on (integration_id, oab_key):
-// a re-activation with the same scope is a no-op. oab_key is the normalized "NUMBER|UF".
-func (q *Queries) InsertWatchedOAB(ctx context.Context, arg InsertWatchedOABParams) error {
-	_, err := q.db.Exec(ctx, insertWatchedOAB, arg.TenantID, arg.IntegrationID, arg.OabKey)
-	return err
+// Turns capture OFF for one watched OAB, stamping disabled_at (the catch-up horizon
+// a later re-enable will resume from). Guarded to the enabled->disabled transition so
+// a repeat disable is a no-op (0 rows) rather than clobbering an earlier disabled_at;
+// the repo treats a miss by re-reading the current row (SELECT), never an error.
+func (q *Queries) DisableWatchedOAB(ctx context.Context, arg DisableWatchedOABParams) (WatchedOab, error) {
+	row := q.db.QueryRow(ctx, disableWatchedOAB, arg.IntegrationID, arg.OabKey)
+	var i WatchedOab
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.IntegrationID,
+		&i.OabKey,
+		&i.CreatedAt,
+		&i.Enabled,
+		&i.DisabledAt,
+		&i.CatchUpSince,
+	)
+	return i, err
+}
+
+const getWatchedOAB = `-- name: GetWatchedOAB :one
+SELECT id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since FROM watched_oab WHERE integration_id = $1 AND oab_key = $2
+`
+
+type GetWatchedOABParams struct {
+	IntegrationID uuid.UUID `json:"integration_id"`
+	OabKey        string    `json:"oab_key"`
+}
+
+// Reads the current row for (integration, oab_key) — used by DisableWatchedOAB's
+// no-op path (already-disabled) and by ToggleWatchedOAB's 404 guard (never existed).
+func (q *Queries) GetWatchedOAB(ctx context.Context, arg GetWatchedOABParams) (WatchedOab, error) {
+	row := q.db.QueryRow(ctx, getWatchedOAB, arg.IntegrationID, arg.OabKey)
+	var i WatchedOab
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.IntegrationID,
+		&i.OabKey,
+		&i.CreatedAt,
+		&i.Enabled,
+		&i.DisabledAt,
+		&i.CatchUpSince,
+	)
+	return i, err
 }
 
 const listWatchedOABsWithName = `-- name: ListWatchedOABsWithName :many
 SELECT
     (split_part(w.oab_key, '|', 2) || split_part(w.oab_key, '|', 1))::text AS oab,
-    COALESCE(mode() WITHIN GROUP (ORDER BY pc.name), '')::text AS name
+    COALESCE(mode() WITHIN GROUP (ORDER BY pc.name), '')::text AS name,
+    bool_and(w.enabled)::bool AS enabled
 FROM watched_oab w
 JOIN integration i ON i.id = w.integration_id AND i.source = 'DJEN'
 LEFT JOIN party_counsel pc
@@ -62,18 +109,21 @@ ORDER BY w.oab_key
 `
 
 type ListWatchedOABsWithNameRow struct {
-	Oab  string `json:"oab"`
-	Name string `json:"name"`
+	Oab     string `json:"oab"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
 }
 
 // Termos monitorados com nome derivado: as OABs monitoradas pelo tenant via DJEN,
-// cada uma com o nome mais frequente encontrado em party_counsel (mode() within group).
-// oab_key é "NUMBER|UF"; devolvemos "UFNUMBER" (canônico do FE) via uf||split_part.
-// O LEFT JOIN garante que OABs novas (sem captura ainda) casam zero linhas de
-// party_counsel; mode() sobre um grupo todo NULL também devolve NULL — o COALESCE
-// pra ” evita isso (sqlc infere a coluna como NOT NULL pelo ::text, e o scan do pgx
-// falha contra um NULL de verdade; repository.go já trata "" como "sem nome").
-// Ordenado por oab_key para estabilidade (sem offset, lista pequena).
+// cada uma com o nome mais frequente encontrado em party_counsel (mode() within group)
+// e o estado enabled (liga/desliga do card na tela de Termos). oab_key é "NUMBER|UF";
+// devolvemos "UFNUMBER" (canônico do FE) via uf||split_part. O LEFT JOIN garante que
+// OABs novas (sem captura ainda) casam zero linhas de party_counsel; mode() sobre um
+// grupo todo NULL também devolve NULL — o COALESCE pra ” evita isso (sqlc infere a
+// coluna como NOT NULL pelo ::text, e o scan do pgx falha contra um NULL de verdade;
+// repository.go já trata "" como "sem nome"). bool_and(w.enabled) é seguro porque o
+// GROUP BY é por oab_key e (integration_id, oab_key) é UNIQUE — sempre uma única linha
+// por grupo. Ordenado por oab_key para estabilidade (sem offset, lista pequena).
 func (q *Queries) ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUID) ([]ListWatchedOABsWithNameRow, error) {
 	rows, err := q.db.Query(ctx, listWatchedOABsWithName, tenantID)
 	if err != nil {
@@ -83,7 +133,7 @@ func (q *Queries) ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUI
 	var items []ListWatchedOABsWithNameRow
 	for rows.Next() {
 		var i ListWatchedOABsWithNameRow
-		if err := rows.Scan(&i.Oab, &i.Name); err != nil {
+		if err := rows.Scan(&i.Oab, &i.Name, &i.Enabled); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -92,4 +142,81 @@ func (q *Queries) ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUI
 		return nil, err
 	}
 	return items, nil
+}
+
+const upsertWatchedOAB = `-- name: UpsertWatchedOAB :one
+
+WITH prior_row AS (
+    SELECT wo.enabled
+    FROM watched_oab wo
+    WHERE wo.integration_id = $2 AND wo.oab_key = $3
+), upsert AS (
+    INSERT INTO watched_oab (tenant_id, integration_id, oab_key, enabled)
+    VALUES ($1, $2, $3, true)
+    ON CONFLICT (integration_id, oab_key) DO UPDATE
+       SET enabled        = true,
+           catch_up_since = COALESCE(watched_oab.catch_up_since, watched_oab.disabled_at)
+    RETURNING id, tenant_id, integration_id, oab_key, created_at, enabled, disabled_at, catch_up_since
+)
+SELECT upsert.id, upsert.tenant_id, upsert.integration_id, upsert.oab_key, upsert.created_at, upsert.enabled, upsert.disabled_at, upsert.catch_up_since, prior_row.enabled AS was_enabled
+FROM upsert
+LEFT JOIN prior_row ON true
+`
+
+type UpsertWatchedOABParams struct {
+	TenantID      uuid.UUID `json:"tenant_id"`
+	IntegrationID uuid.UUID `json:"integration_id"`
+	OabKey        string    `json:"oab_key"`
+}
+
+type UpsertWatchedOABRow struct {
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	IntegrationID uuid.UUID          `json:"integration_id"`
+	OabKey        string             `json:"oab_key"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	Enabled       bool               `json:"enabled"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	CatchUpSince  pgtype.Timestamptz `json:"catch_up_since"`
+	WasEnabled    *bool              `json:"was_enabled"`
+}
+
+// watched_oab queries (acquisition slice). The per-tenant index of watched OABs the
+// national match joins against. Populated from the integration_activated event (a
+// fresh activation or a NEW OAB added to an already-active scope) and from the
+// Termos toggle (disable/re-enable one OAB without touching the rest). Writes run
+// per-tenant (RLS by app.tenant_id); the match reads system-wide.
+// Adds (or re-enables) one watched OAB for an integration, and reports the PRIOR
+// state via was_enabled so the caller (backfill.go) can distinguish the three cases
+// a re-activation/toggle-on can land in:
+//
+//	was_enabled IS NULL  -> the row did not exist yet (brand-new OAB)   -> needs HISTORY
+//	was_enabled = false  -> it existed but was disabled (a real re-enable) -> needs CATCH-UP
+//	was_enabled = true   -> it already existed enabled (idempotent replay) -> no-op
+//
+// The "prior_row" CTE reads the pre-upsert row (or no row) BEFORE the INSERT ... ON CONFLICT
+// mutates it. It is joined in (rather than a correlated scalar subquery in the RETURNING
+// list) so sqlc infers was_enabled as NULLABLE — a plain subquery-in-RETURNING is typed
+// NOT NULL by sqlc's analyzer (it only looks at the source column's constraint, not the
+// subquery's cardinality), which would panic scanning a real NULL on the insert path.
+// catch_up_since is preserved (COALESCEd) rather than overwritten so a second re-enable
+// before the pending catch-up is cleared does not lose the earlier disabled_at. The "wo"
+// alias (rather than an unqualified watched_oab reference) works around a sqlc analyzer
+// limitation: with a sibling writable CTE also touching watched_oab, an unqualified
+// column here is reported as ambiguous even though plain Postgres parses it fine.
+func (q *Queries) UpsertWatchedOAB(ctx context.Context, arg UpsertWatchedOABParams) (UpsertWatchedOABRow, error) {
+	row := q.db.QueryRow(ctx, upsertWatchedOAB, arg.TenantID, arg.IntegrationID, arg.OabKey)
+	var i UpsertWatchedOABRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.IntegrationID,
+		&i.OabKey,
+		&i.CreatedAt,
+		&i.Enabled,
+		&i.DisabledAt,
+		&i.CatchUpSince,
+		&i.WasEnabled,
+	)
+	return i, err
 }

@@ -973,6 +973,8 @@ func newSyncCompleted(ev SyncRequested, syncRunID string, itemsNew, itemsDeduped
 		SliceIndex:    ev.SliceIndex,
 		ItemsNew:      itemsNew,
 		ItemsDeduped:  itemsDeduped,
+		CatchUpOABKey: ev.CatchUpOABKey,
+		CatchUpSince:  ev.CatchUpSince,
 	}
 }
 
@@ -985,5 +987,7 @@ func newSyncFailed(ev SyncRequested, syncRunID, reason string) SyncFailed {
 		BackfillJobID: ev.BackfillJobID,
 		SliceIndex:    ev.SliceIndex,
 		Reason:        reason,
+		CatchUpOABKey: ev.CatchUpOABKey,
+		CatchUpSince:  ev.CatchUpSince,
 	}
 }

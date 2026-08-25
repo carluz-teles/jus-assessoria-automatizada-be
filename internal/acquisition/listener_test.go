@@ -15,18 +15,26 @@ import (
 // error, so the test can assert the decode+dispatch wiring in isolation. It
 // covers all three backfill consumers (activated, sync_completed, sync_failed).
 type spyListenerUC struct {
-	got          IntegrationActivated
-	call         int
-	completed    SyncCompleted
-	completeCall int
-	failed       SyncFailed
-	failCall     int
-	err          error
+	got           IntegrationActivated
+	call          int
+	completed     SyncCompleted
+	completeCall  int
+	failed        SyncFailed
+	failCall      int
+	reenabled     WatchedOABReenabled
+	reenabledCall int
+	err           error
 }
 
 func (s *spyListenerUC) OnIntegrationActivated(_ context.Context, ev IntegrationActivated) error {
 	s.call++
 	s.got = ev
+	return s.err
+}
+
+func (s *spyListenerUC) OnWatchedOABReenabled(_ context.Context, ev WatchedOABReenabled) error {
+	s.reenabledCall++
+	s.reenabled = ev
 	return s.err
 }
 
@@ -239,6 +247,59 @@ func TestListener_HandleSyncFailed_Dispatches(t *testing.T) {
 	}
 	if spy.failed.BackfillJobID != "job-1" || spy.failed.SliceIndex != 5 {
 		t.Fatalf("dispatched event = %+v, payload lost", spy.failed)
+	}
+}
+
+// A well-formed watched_oab_reenabled task is decoded and dispatched to the
+// backfill use case's catch-up path with its payload intact.
+func TestListener_HandleWatchedOABReenabled_Dispatches(t *testing.T) {
+	t.Parallel()
+
+	ev := WatchedOABReenabled{
+		Base:          events.Base{EventID: "evt-reenable-1"},
+		TenantID:      "tenant-1",
+		IntegrationID: "integ-1",
+		Source:        SourceDJEN,
+		OABKey:        "347019|SP",
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+
+	spy := &spyListenerUC{}
+	l := NewListener(spy, nil, nil, nil, nil)
+	task := asynq.NewTask(TypeWatchedOABReenabled, payload)
+
+	if err := l.handleWatchedOABReenabled(context.Background(), task); err != nil {
+		t.Fatalf("handleWatchedOABReenabled() error = %v", err)
+	}
+	if spy.reenabledCall != 1 {
+		t.Fatalf("use case calls = %d, want 1", spy.reenabledCall)
+	}
+	if spy.reenabled.OABKey != "347019|SP" || spy.reenabled.TenantID != "tenant-1" {
+		t.Fatalf("dispatched event = %+v, payload lost", spy.reenabled)
+	}
+}
+
+// A malformed watched_oab_reenabled payload wraps asynq.SkipRetry and never
+// reaches the use case.
+func TestListener_HandleWatchedOABReenabled_BadPayloadSkipsRetry(t *testing.T) {
+	t.Parallel()
+
+	spy := &spyListenerUC{}
+	l := NewListener(spy, nil, nil, nil, nil)
+	task := asynq.NewTask(TypeWatchedOABReenabled, []byte("{not json"))
+
+	err := l.handleWatchedOABReenabled(context.Background(), task)
+	if err == nil {
+		t.Fatal("handleWatchedOABReenabled() error = nil, want decode failure")
+	}
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("error = %v, want it to wrap asynq.SkipRetry", err)
+	}
+	if spy.reenabledCall != 0 {
+		t.Fatalf("use case reached %d times on a bad payload, want 0", spy.reenabledCall)
 	}
 }
 

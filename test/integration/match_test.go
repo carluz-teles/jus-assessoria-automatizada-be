@@ -41,7 +41,8 @@ func TestMatchPublicationsByDay(t *testing.T) {
 	watch := func(tenantID, integID, key string) {
 		t.Helper()
 		if err := uow.Do(ctx, tenantID, func(tx database.Tx) error {
-			return repo.ReplaceWatchedOABs(ctx, tx, tenantID, integID, []string{key})
+			_, _, _, err := repo.AddOrEnableWatchedOAB(ctx, tx, tenantID, integID, key)
+			return err
 		}); err != nil {
 			t.Fatalf("watch %s: %v", key, err)
 		}

@@ -622,4 +622,7 @@ type WatchedOab struct {
 	IntegrationID uuid.UUID          `json:"integration_id"`
 	OabKey        string             `json:"oab_key"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	Enabled       bool               `json:"enabled"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	CatchUpSince  pgtype.Timestamptz `json:"catch_up_since"`
 }

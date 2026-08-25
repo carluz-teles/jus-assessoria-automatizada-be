@@ -592,9 +592,12 @@ const reconciliationRunsLimit = 60
 // WatchedOABView is one monitored OAB returned by the "Termos" settings screen:
 // the canonical FE key ("UFNUMBER", e.g. "SP347019") plus the lawyer's most
 // frequent name derived from party_counsel — null when no capture exists yet.
+// Enabled backs the liga/desliga toggle: false means capture is paused for this OAB
+// while everything already captured stays fully visible.
 type WatchedOABView struct {
-	OAB  string  `json:"oab"`
-	Name *string `json:"name"`
+	OAB     string  `json:"oab"`
+	Name    *string `json:"name"`
+	Enabled bool    `json:"enabled"`
 }
 
 // readRepo is the narrow read port the ReadUseCase drives — the keyset list reads

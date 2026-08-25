@@ -114,6 +114,119 @@ func (uc *UseCase) ListIntegrations(ctx context.Context, tenantID string) ([]*In
 	return uc.repo.List(ctx, tenantID)
 }
 
+// AddWatchedOAB adds one OAB to the tenant's DJEN watch: it resolves-or-creates the
+// integration (reusing ActivateIntegration's upsert-and-publish path so a tenant with
+// no DJEN integration yet gets one, same entitlement gate) and appends the OAB to its
+// scope, deduped. The actual watched_oab row (and, for a brand-new OAB, its onboarding
+// backfill) is populated ASYNCHRONOUSLY by the backfill listener reacting to the
+// integration_activated event this publishes — same as a full ActivateIntegration call,
+// just for a single-OAB delta. The returned WatchedOAB is therefore a synthetic
+// just-added view (Name unknown — no capture has run yet), not a re-read of the row.
+func (uc *UseCase) AddWatchedOAB(ctx context.Context, tenantID string, oab OABEntry) (*WatchedOAB, error) {
+	if err := uc.checkEntitlement(ctx, tenantID); err != nil {
+		return nil, err
+	}
+
+	canonical := oab.UF + oab.Number
+	var added *WatchedOAB
+
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		before, err := uc.currentIntegration(ctx, tx, tenantID, SourceDJEN)
+		if err != nil {
+			return err
+		}
+
+		var scope Scope
+		if before != nil {
+			scope = before.Scope
+		}
+		if !slices.Contains(scope.OAB, canonical) {
+			scope.OAB = append(scope.OAB, canonical)
+		}
+
+		after, err := uc.repo.Upsert(ctx, tx, tenantID, SourceDJEN, scope)
+		if err != nil {
+			return err
+		}
+
+		if activationChanged(before, after) {
+			if err := uc.outbox.Publish(ctx, tx, newIntegrationActivated(after)); err != nil {
+				return err
+			}
+		}
+
+		added = &WatchedOAB{
+			OAB:           canonical,
+			OABKey:        oabKey(oab.Number, oab.UF),
+			IntegrationID: after.ID,
+			Enabled:       true,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+// ToggleWatchedOAB flips the Termos liga/desliga switch for one already-watched OAB.
+// enabled=false disables capture directly (no event — the removal itself needs no
+// downstream reaction). enabled=true re-enables via AddOrEnableWatchedOAB; when that
+// reports needsCatchUp (the OAB WAS disabled), it publishes WatchedOABReenabled in the
+// SAME tx so the backfill listener fires a catch-up scoped to the downtime, never the
+// full historical horizon. Toggling an OAB that was never added is ErrWatchedOABNotFound
+// (→ 404) — this endpoint only flips an existing watch; AddWatchedOAB creates one.
+func (uc *UseCase) ToggleWatchedOAB(ctx context.Context, tenantID, oab string, enabled bool) (*WatchedOAB, error) {
+	entry, err := parseOAB(oab)
+	if err != nil {
+		return nil, err
+	}
+	key := oabKey(entry.Number, entry.UF)
+
+	var result *WatchedOAB
+	err = uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		integ, err := uc.repo.GetBySource(ctx, tx, tenantID, SourceDJEN)
+		if errors.Is(err, ErrIntegrationNotFound) {
+			return ErrWatchedOABNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		if !enabled {
+			row, err := uc.repo.DisableWatchedOAB(ctx, tx, tenantID, integ.ID, key)
+			if err != nil {
+				return err
+			}
+			result = &row
+			return nil
+		}
+
+		row, needsHistory, needsCatchUp, err := uc.repo.AddOrEnableWatchedOAB(ctx, tx, tenantID, integ.ID, key)
+		if err != nil {
+			return err
+		}
+		if needsHistory {
+			// The row did not exist — AddOrEnableWatchedOAB just inserted it, but this
+			// endpoint only TOGGLES an existing watch (AddWatchedOAB is the creator).
+			// Returning the error rolls back the tx (uow.Do), undoing that insert.
+			return ErrWatchedOABNotFound
+		}
+		if needsCatchUp && row.CatchUpSince != nil {
+			ev := newWatchedOABReenabled(tenantID, integ.ID, integ.Source, key, *row.CatchUpSince)
+			if err := uc.outbox.Publish(ctx, tx, ev); err != nil {
+				return err
+			}
+		}
+		result = &row
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // AssignResponsible sets (or clears, when assignedUserID is nil) the responsável on the
 // court_case behind a court_record, in ONE transaction (UoW → SET LOCAL app.tenant_id, so
 // RLS is a second barrier under the explicit tenant filters). The FE addresses the process

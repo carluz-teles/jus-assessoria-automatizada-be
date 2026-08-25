@@ -76,7 +76,7 @@ func TestEmbeddedSource(t *testing.T) {
 	// seed); the DJEN connector adds 14 (intimation DJEN fields + court_record
 	// judging_body); the DATAJUD enrichment adds 15 (court_record.filed_at); the
 	// re-poll scheduler adds 16 (court_record RLS system escape hatch).
-	// (chain continues below; 69 is the last — nothing follows it.)
+	// (chain continues below; 70 is the last — nothing follows it.)
 	if next, err := src.Next(1); err != nil || next != 2 {
 		t.Fatalf("Next(1) = (%d, %v), want (2, nil)", next, err)
 	}
@@ -286,8 +286,11 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(68); err != nil || next != 69 {
 		t.Fatalf("Next(68) = (%d, %v), want (69, nil)", next, err)
 	}
-	if _, err := src.Next(69); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(69) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(69); err != nil || next != 70 {
+		t.Fatalf("Next(69) = (%d, %v), want (70, nil)", next, err)
+	}
+	if _, err := src.Next(70); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(70) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

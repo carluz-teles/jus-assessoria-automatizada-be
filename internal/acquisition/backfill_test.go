@@ -139,16 +139,29 @@ func (u *stubBackfillUoW) DoSystem(_ context.Context, fn func(database.Tx) error
 	return fn(u.tx)
 }
 
-// stubBackfillRepo answers the guard from a preset flag and records the insert.
-// For the completion-counter tests it also holds a mutable job state: each
-// increment bumps a counter and returns the post-bump tallies (mirroring the
-// real UPDATE ... RETURNING), or ErrBackfillJobNotFound when notFound is set.
+// watchedOABState is one stubBackfillRepo-tracked watched_oab row: enabled +
+// the catch_up_since a disable/re-enable cycle carries, mirroring the real
+// UpsertWatchedOAB's COALESCE(catch_up_since, disabled_at) semantics closely
+// enough to drive AddOrEnableWatchedOAB's needsHistory/needsCatchUp branches.
+type watchedOABState struct {
+	enabled      bool
+	catchUpSince *time.Time
+}
+
+// stubBackfillRepo tracks a per-oabKey watched state and records the insert. For
+// the completion-counter tests it also holds a mutable job state: each increment
+// bumps a counter and returns the post-bump tallies (mirroring the real
+// UPDATE ... RETURNING), or ErrBackfillJobNotFound when notFound is set.
 type stubBackfillRepo struct {
-	exists      bool
-	existsCalls int
+	watched     map[string]*watchedOABState
+	addCalls    int
+	calledKeys  []string // oabKeys handed to AddOrEnableWatchedOAB, in call order
 	insertCalls int
 	lastInsert  BackfillJobParams
-	watchedKeys []string // keys handed to ReplaceWatchedOABs on activation
+
+	clearCalls     int
+	lastClearKey   string
+	lastClearSince time.Time
 
 	// counter path
 	counters       BackfillCounters // current job tallies; increments mutate & return
@@ -159,20 +172,57 @@ type stubBackfillRepo struct {
 	finalizeStatus string
 }
 
-func (s *stubBackfillRepo) BackfillJobExistsByIntegration(context.Context, database.Tx, string) (bool, error) {
-	s.existsCalls++
-	return s.exists, nil
+// preEnable seeds oabKey as already watched and enabled — the "re-post of an
+// existing OAB" starting state.
+func (s *stubBackfillRepo) preEnable(oabKey string) {
+	if s.watched == nil {
+		s.watched = map[string]*watchedOABState{}
+	}
+	s.watched[oabKey] = &watchedOABState{enabled: true}
+}
+
+// preDisable seeds oabKey as watched but disabled, with catch_up_since already
+// pending since `since` — the "toggled off, not yet re-enabled" starting state.
+func (s *stubBackfillRepo) preDisable(oabKey string, since time.Time) {
+	if s.watched == nil {
+		s.watched = map[string]*watchedOABState{}
+	}
+	s.watched[oabKey] = &watchedOABState{enabled: false, catchUpSince: &since}
+}
+
+func (s *stubBackfillRepo) AddOrEnableWatchedOAB(_ context.Context, _ database.Tx, _, integrationID, oabKey string) (WatchedOAB, bool, bool, error) {
+	s.addCalls++
+	s.calledKeys = append(s.calledKeys, oabKey)
+	if s.watched == nil {
+		s.watched = map[string]*watchedOABState{}
+	}
+	st, existed := s.watched[oabKey]
+	if !existed {
+		s.watched[oabKey] = &watchedOABState{enabled: true}
+		return WatchedOAB{OABKey: oabKey, IntegrationID: integrationID, Enabled: true}, true, false, nil
+	}
+	if !st.enabled {
+		st.enabled = true
+		row := WatchedOAB{OABKey: oabKey, IntegrationID: integrationID, Enabled: true, CatchUpSince: st.catchUpSince}
+		return row, false, true, nil
+	}
+	return WatchedOAB{OABKey: oabKey, IntegrationID: integrationID, Enabled: true}, false, false, nil
+}
+
+func (s *stubBackfillRepo) ClearWatchedOABCatchUp(_ context.Context, _ database.Tx, _, _, oabKey string, since time.Time) error {
+	s.clearCalls++
+	s.lastClearKey = oabKey
+	s.lastClearSince = since
+	if st, ok := s.watched[oabKey]; ok && st.catchUpSince != nil && st.catchUpSince.Equal(since) {
+		st.catchUpSince = nil
+	}
+	return nil
 }
 
 func (s *stubBackfillRepo) InsertBackfillJob(_ context.Context, _ database.Tx, p BackfillJobParams) (string, error) {
 	s.insertCalls++
 	s.lastInsert = p
 	return "job-1", nil
-}
-
-func (s *stubBackfillRepo) ReplaceWatchedOABs(_ context.Context, _ database.Tx, _, _ string, keys []string) error {
-	s.watchedKeys = keys
-	return nil
 }
 
 func (s *stubBackfillRepo) IncrementBackfillSlicesOK(context.Context, database.Tx, string, string) (BackfillCounters, error) {
@@ -236,7 +286,7 @@ func (m *stubHistoryMatcher) MatchTenantSince(_ context.Context, tenantID string
 func TestBackfillUseCase_CutoverMatchesHistory(t *testing.T) {
 	t.Parallel()
 
-	repo := &stubBackfillRepo{exists: false}
+	repo := &stubBackfillRepo{}
 	outbox := &fakeOutbox{}
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	history := &stubHistoryMatcher{}
@@ -255,8 +305,8 @@ func TestBackfillUseCase_CutoverMatchesHistory(t *testing.T) {
 	if outbox.calls != 0 {
 		t.Errorf("sync_requested emitted = %d, want 0 (no per-OAB slices)", outbox.calls)
 	}
-	if len(repo.watchedKeys) != 2 {
-		t.Errorf("watched keys = %v, want 2 (still populated on cutover)", repo.watchedKeys)
+	if len(repo.calledKeys) != 2 {
+		t.Errorf("watched OABs upserted = %v, want 2 (still populated on cutover)", repo.calledKeys)
 	}
 	if history.calls != 1 || history.tenant != testTenant {
 		t.Errorf("history catch-up = {calls:%d tenant:%q}, want {1 %q}", history.calls, history.tenant, testTenant)
@@ -274,7 +324,7 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 
 	wantSlices := calculateSlices(BackfillHorizonDays, BackfillWindowDays)
 
-	repo := &stubBackfillRepo{exists: false}
+	repo := &stubBackfillRepo{}
 	outbox := &fakeOutbox{}
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	uc := NewBackfillUseCase(repo, outbox, uow)
@@ -292,9 +342,10 @@ func TestBackfillUseCase_FirstActivation(t *testing.T) {
 	if repo.insertCalls != 1 {
 		t.Fatalf("inserts = %d, want 1", repo.insertCalls)
 	}
-	// Activation populates the national-match index from the scope (normalized keys).
-	if got := repo.watchedKeys; len(got) != 2 || got[0] != "347019|SP" || got[1] != "198988|MG" {
-		t.Fatalf("watched keys = %v, want [347019|SP 198988|MG]", got)
+	// Activation populates the national-match index from the scope (normalized keys),
+	// both brand-new (needsHistory) on a first activation.
+	if got := repo.calledKeys; len(got) != 2 || got[0] != "347019|SP" || got[1] != "198988|MG" {
+		t.Fatalf("watched OABs upserted = %v, want [347019|SP 198988|MG]", got)
 	}
 	if repo.lastInsert.TotalSlices != wantSlices || repo.lastInsert.Status != BackfillStatusRunning {
 		t.Fatalf("job = {slices:%d status:%q}, want {%d RUNNING}", repo.lastInsert.TotalSlices, repo.lastInsert.Status, wantSlices)
@@ -339,20 +390,23 @@ func TestBackfillUseCase_DuplicateEventNoOps(t *testing.T) {
 	if err := uc.OnIntegrationActivated(context.Background(), activatedEvent()); err != nil {
 		t.Fatalf("OnIntegrationActivated() error = %v", err)
 	}
-	if repo.existsCalls != 0 {
-		t.Fatalf("guard consulted %d times on a seen event, want 0", repo.existsCalls)
+	if repo.addCalls != 0 {
+		t.Fatalf("watched_oab upserts on a seen event = %d, want 0", repo.addCalls)
 	}
 	if repo.insertCalls != 0 || outbox.calls != 0 {
 		t.Fatalf("seen event caused writes: inserts=%d publishes=%d", repo.insertCalls, outbox.calls)
 	}
 }
 
-// A re-activation (a job already exists for the integration) is guarded: the
-// event is marked processed but no second job or slice is produced.
-func TestBackfillUseCase_ReactivationGuarded(t *testing.T) {
+// An identical re-post of an already-fully-watched scope (every OAB already enabled)
+// is a no-op: the event is marked processed but no job or slice is produced. This is
+// the idempotent-replay case AddOrEnableWatchedOAB's was_enabled=true branch reports.
+func TestBackfillUseCase_IdempotentRepostNoOps(t *testing.T) {
 	t.Parallel()
 
-	repo := &stubBackfillRepo{exists: true}
+	repo := &stubBackfillRepo{}
+	repo.preEnable("347019|SP")
+	repo.preEnable("198988|MG")
 	outbox := &fakeOutbox{}
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	uc := NewBackfillUseCase(repo, outbox, uow)
@@ -360,11 +414,51 @@ func TestBackfillUseCase_ReactivationGuarded(t *testing.T) {
 	if err := uc.OnIntegrationActivated(context.Background(), activatedEvent()); err != nil {
 		t.Fatalf("OnIntegrationActivated() error = %v", err)
 	}
-	if repo.existsCalls != 1 {
-		t.Fatalf("guard consulted %d times, want 1", repo.existsCalls)
+	if repo.addCalls != 2 {
+		t.Fatalf("watched_oab upserts consulted = %d, want 2", repo.addCalls)
 	}
 	if repo.insertCalls != 0 || outbox.calls != 0 {
-		t.Fatalf("guarded re-activation caused writes: inserts=%d publishes=%d", repo.insertCalls, outbox.calls)
+		t.Fatalf("idempotent re-post caused writes: inserts=%d publishes=%d", repo.insertCalls, outbox.calls)
+	}
+}
+
+// THE BUG FIX (acceptance criterion): integration_activated re-delivered with a scope
+// that adds a NEW OAB to an already-active integration must backfill ONLY that new
+// OAB's history — not the whole scope again (duplicate work), and not nothing (the
+// original bug: only the very first activation ever fired the backfill). SP347019 is
+// already watched+enabled; MG198988 is new.
+func TestBackfillUseCase_NewOABAddedToActiveIntegration_BackfillsOnlyDelta(t *testing.T) {
+	t.Parallel()
+
+	wantSlices := calculateSlices(BackfillHorizonDays, BackfillWindowDays)
+
+	repo := &stubBackfillRepo{}
+	repo.preEnable("347019|SP") // already watched — must NOT be re-scanned
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnIntegrationActivated(context.Background(), activatedEvent()); err != nil {
+		t.Fatalf("OnIntegrationActivated() error = %v", err)
+	}
+
+	if repo.addCalls != 2 {
+		t.Fatalf("watched_oab upserts = %d, want 2 (both OABs in the scope)", repo.addCalls)
+	}
+	if repo.insertCalls != 1 {
+		t.Fatalf("backfill job inserts = %d, want 1 (one delta job for the new OAB)", repo.insertCalls)
+	}
+	if outbox.calls != wantSlices {
+		t.Fatalf("published = %d, want %d (one delta backfill's slices)", outbox.calls, wantSlices)
+	}
+	for _, ev := range outbox.published {
+		req, ok := ev.(SyncRequested)
+		if !ok {
+			t.Fatalf("published event type = %T, want SyncRequested", ev)
+		}
+		if len(req.Scope.OAB) != 1 || req.Scope.OAB[0] != "MG198988" {
+			t.Fatalf("slice scope = %v, want exactly [MG198988] (the delta) — SP347019 must not be re-scanned", req.Scope.OAB)
+		}
 	}
 }
 
@@ -372,7 +466,7 @@ func TestBackfillUseCase_ReactivationGuarded(t *testing.T) {
 func TestBackfillUseCase_ZeroSlicesCompletesImmediately(t *testing.T) {
 	t.Parallel()
 
-	repo := &stubBackfillRepo{exists: false}
+	repo := &stubBackfillRepo{}
 	outbox := &fakeOutbox{}
 	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
 	uc := NewBackfillUseCase(repo, outbox, uow, withHorizon(0, BackfillWindowDays))
@@ -618,5 +712,163 @@ func TestBackfillUseCase_SyncCompleted_UoWScopedToTenant(t *testing.T) {
 	}
 	if uow.tenantID != testTenant {
 		t.Fatalf("uow tenantID = %q, want %q", uow.tenantID, testTenant)
+	}
+}
+
+// --- watched_oab re-enable catch-up (OnWatchedOABReenabled) -------------------
+
+func reenabledEvent(since time.Time) WatchedOABReenabled {
+	return WatchedOABReenabled{
+		Base:          events.Base{EventID: "evt-reenable-1"},
+		TenantID:      testTenant,
+		IntegrationID: "integ-1",
+		Source:        SourceDJEN,
+		OABKey:        "347019|SP",
+		CatchUpSince:  since,
+	}
+}
+
+// Legacy path (no history matcher): a re-enable fires exactly one standalone
+// catch-up sync scoped to [since, today] for just that OAB — no backfill_job.
+func TestBackfillUseCase_OnWatchedOABReenabled_Legacy_FiresCatchUpSync(t *testing.T) {
+	t.Parallel()
+
+	since := time.Now().AddDate(0, 0, -3)
+	repo := &stubBackfillRepo{}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnWatchedOABReenabled(context.Background(), reenabledEvent(since)); err != nil {
+		t.Fatalf("OnWatchedOABReenabled() error = %v", err)
+	}
+	if repo.insertCalls != 0 {
+		t.Fatalf("backfill job inserts = %d, want 0 (catch-up is standalone)", repo.insertCalls)
+	}
+	if outbox.calls != 1 {
+		t.Fatalf("published = %d, want 1", outbox.calls)
+	}
+	req, ok := outbox.published[0].(SyncRequested)
+	if !ok {
+		t.Fatalf("published type = %T, want SyncRequested", outbox.published[0])
+	}
+	if req.BackfillJobID != "" {
+		t.Fatalf("catch-up sync backfill_job_id = %q, want empty (standalone)", req.BackfillJobID)
+	}
+	if req.CatchUpOABKey != "347019|SP" || req.CatchUpSince != since.Format(time.RFC3339) {
+		t.Fatalf("catch-up identity = {key:%q since:%q}, want {347019|SP %q}", req.CatchUpOABKey, req.CatchUpSince, since.Format(time.RFC3339))
+	}
+	if len(req.Scope.OAB) != 1 || req.Scope.OAB[0] != "SP347019" {
+		t.Fatalf("catch-up scope = %v, want exactly [SP347019]", req.Scope.OAB)
+	}
+}
+
+// Cutover path (history matcher wired): a re-enable matches the tenant from the
+// stored firehose since the OAB's disabled_at — no per-OAB DJEN call.
+func TestBackfillUseCase_OnWatchedOABReenabled_Cutover_MatchesHistory(t *testing.T) {
+	t.Parallel()
+
+	since := time.Now().AddDate(0, 0, -3)
+	repo := &stubBackfillRepo{}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	history := &stubHistoryMatcher{}
+	uc := NewBackfillUseCase(repo, outbox, uow, WithHistoryMatcher(history, 30))
+
+	if err := uc.OnWatchedOABReenabled(context.Background(), reenabledEvent(since)); err != nil {
+		t.Fatalf("OnWatchedOABReenabled() error = %v", err)
+	}
+	if outbox.calls != 0 {
+		t.Fatalf("published = %d, want 0 (cutover skips the per-OAB sync)", outbox.calls)
+	}
+	if history.calls != 1 || history.tenant != testTenant {
+		t.Fatalf("history catch-up = {calls:%d tenant:%q}, want {1 %q}", history.calls, history.tenant, testTenant)
+	}
+}
+
+// A duplicate delivery is a no-op under its OWN consumer dedup space (distinct from
+// consumerBackfill) — no publish, no error.
+func TestBackfillUseCase_OnWatchedOABReenabled_DuplicateNoOps(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubBackfillRepo{}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 0}} // 0 rows affected = already seen
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	if err := uc.OnWatchedOABReenabled(context.Background(), reenabledEvent(time.Now())); err != nil {
+		t.Fatalf("OnWatchedOABReenabled() error = %v", err)
+	}
+	if outbox.calls != 0 {
+		t.Fatalf("seen event caused a publish: %d", outbox.calls)
+	}
+}
+
+// --- catch-up clearing on the closing sync (OnSyncCompleted/OnSyncFailed) -----
+
+// A SUCCESSFUL catch-up sync (CatchUpOABKey set, no backfill job) clears the OAB's
+// pending catch_up_since via the compare-and-clear.
+func TestBackfillUseCase_SyncCompleted_ClearsCatchUp(t *testing.T) {
+	t.Parallel()
+
+	// RFC3339 (the wire format CatchUpSince travels as) is second precision, so the
+	// expectation must be truncated the same way the parse-and-compare roundtrip
+	// naturally does — a sub-second discrepancy would otherwise be a false failure.
+	since, _ := time.Parse(time.RFC3339, time.Now().AddDate(0, 0, -3).Format(time.RFC3339))
+	repo := &stubBackfillRepo{}
+	repo.preDisable("347019|SP", since)
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	ev := SyncCompleted{
+		Base:          events.Base{EventID: "evt-catchup-1"},
+		TenantID:      testTenant,
+		SyncRunID:     "run-catchup-1",
+		IntegrationID: "integ-1",
+		CatchUpOABKey: "347019|SP",
+		CatchUpSince:  since.Format(time.RFC3339),
+	}
+	if err := uc.OnSyncCompleted(context.Background(), ev); err != nil {
+		t.Fatalf("OnSyncCompleted() error = %v", err)
+	}
+	if repo.clearCalls != 1 {
+		t.Fatalf("catch-up clears = %d, want 1", repo.clearCalls)
+	}
+	if repo.lastClearKey != "347019|SP" || !repo.lastClearSince.Equal(since) {
+		t.Fatalf("clear args = {key:%q since:%s}, want {347019|SP %s}", repo.lastClearKey, repo.lastClearSince, since)
+	}
+	// No backfill job attached — the counter path must stay untouched.
+	if repo.incOKCalls != 0 || repo.finalizeCalls != 0 {
+		t.Fatalf("counter path touched by a job-less catch-up: inc=%d finalize=%d", repo.incOKCalls, repo.finalizeCalls)
+	}
+}
+
+// A FAILED catch-up sync deliberately does NOT clear catch_up_since — the gap stays
+// marked so the next toggle retries it.
+func TestBackfillUseCase_SyncFailed_DoesNotClearCatchUp(t *testing.T) {
+	t.Parallel()
+
+	since := time.Now().AddDate(0, 0, -3)
+	repo := &stubBackfillRepo{}
+	repo.preDisable("347019|SP", since)
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	uc := NewBackfillUseCase(repo, outbox, uow)
+
+	ev := SyncFailed{
+		Base:          events.Base{EventID: "evt-catchup-fail-1"},
+		TenantID:      testTenant,
+		SyncRunID:     "run-catchup-2",
+		IntegrationID: "integ-1",
+		CatchUpOABKey: "347019|SP",
+		CatchUpSince:  since.Format(time.RFC3339),
+		Reason:        "fetch timeout",
+	}
+	if err := uc.OnSyncFailed(context.Background(), ev); err != nil {
+		t.Fatalf("OnSyncFailed() error = %v", err)
+	}
+	if repo.clearCalls != 0 {
+		t.Fatalf("catch-up clears on a FAILED sync = %d, want 0", repo.clearCalls)
 	}
 }

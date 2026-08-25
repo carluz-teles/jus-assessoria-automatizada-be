@@ -1,17 +1,11 @@
 -- backfill_job queries (acquisition slice).
--- The backfill listener reacts to integration_activated: on the FIRST activation
--- of an integration it creates one backfill_job and emits the sync slices. These
--- two queries are the job's first-activation guard (exists) and its insert; the
--- counters/completion (slices_ok, slices_error, final status) belong to the sync
--- slice, not here.
-
--- name: BackfillJobExistsByIntegration :one
--- True when a backfill_job already exists for this integration (any status). The
--- listener uses it as the first-activation guard: a re-activation must not
--- re-dispatch a backfill.
-SELECT EXISTS (
-    SELECT 1 FROM backfill_job WHERE integration_id = $1
-) AS job_exists;
+-- The backfill listener reacts to integration_activated: it opens one backfill_job
+-- PER DELTA — the scope's newly-watched OABs (needsHistory from AddOrEnableWatchedOAB,
+-- see watched_oab.sql) — and emits their sync slices. There is no longer a whole-
+-- integration first-activation guard: adding an OAB to an already-active integration
+-- now backfills that OAB's own history instead of being silently swallowed (the bug
+-- this replaced). The counters/completion (slices_ok, slices_error, final status)
+-- belong to the sync slice, not here.
 
 -- name: InsertBackfillJob :one
 -- Create the onboarding backfill job. total_slices is precomputed by the use

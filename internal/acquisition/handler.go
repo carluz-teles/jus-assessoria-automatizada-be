@@ -50,6 +50,11 @@ type handlerUC interface {
 	// BulkAssignIntimacoes atribui o responsável a várias intimações (por ids ou toda a
 	// faixa via All+filtros). Devolve a contagem afetada.
 	BulkAssignIntimacoes(ctx context.Context, tenantID string, all bool, q IntimacoesQuery, ids []string, assigneeUserID *string) (int64, error)
+	// AddWatchedOAB adds one OAB to the tenant's DJEN watch (creating the integration
+	// if it does not exist yet). ToggleWatchedOAB flips liga/desliga for an existing
+	// watch — a 404 (ErrWatchedOABNotFound) if it was never added.
+	AddWatchedOAB(ctx context.Context, tenantID string, oab OABEntry) (*WatchedOAB, error)
+	ToggleWatchedOAB(ctx context.Context, tenantID, oab string, enabled bool) (*WatchedOAB, error)
 }
 
 // reader is the narrow port the Handler uses from the read use case — the
@@ -130,6 +135,8 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/acquisition/captures", h.captures)
 	r.Get("/acquisition/captures/:id", h.captureDetail)
 	r.Get("/acquisition/watched-oabs", h.watchedOABs)
+	r.Post("/acquisition/watched-oabs", middleware.RequireRole(roleAdmin), h.addWatchedOAB)
+	r.Patch("/acquisition/watched-oabs/:oab", middleware.RequireRole(roleAdmin), h.toggleWatchedOAB)
 	r.Get("/processos", h.listProcessos)
 	// summary before :id so the static "/summary" segment is never shadowed by the param.
 	r.Get("/processos/summary", h.processosSummary)
@@ -399,10 +406,13 @@ func (h *Handler) captureDetail(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(view)
 }
 
-// watchedOABView is the per-item response shape of GET /v1/acquisition/watched-oabs.
+// watchedOABView is the per-item response shape of GET /v1/acquisition/watched-oabs,
+// and also what POST/PATCH answer with (Name omitted — those two never know it, no
+// capture may have happened yet). Enabled backs the Termos liga/desliga toggle.
 type watchedOABView struct {
-	OAB  string  `json:"oab"`
-	Name *string `json:"name"`
+	OAB     string  `json:"oab"`
+	Name    *string `json:"name,omitempty"`
+	Enabled bool    `json:"enabled"`
 }
 
 // watchedOABsEnvelope wraps the list in {data:[...]}.
@@ -422,9 +432,58 @@ func (h *Handler) watchedOABs(c *fiber.Ctx) error {
 	}
 	items := make([]watchedOABView, 0, len(views))
 	for _, v := range views {
-		items = append(items, watchedOABView{OAB: v.OAB, Name: v.Name})
+		items = append(items, watchedOABView{OAB: v.OAB, Name: v.Name, Enabled: v.Enabled})
 	}
 	return c.Status(fiber.StatusOK).JSON(watchedOABsEnvelope{Data: items})
+}
+
+// addWatchedOAB handles POST /v1/acquisition/watched-oabs: adds one OAB to the
+// tenant's DJEN watch (creating the integration if this is the tenant's first OAB).
+// tenant_id comes from the principal, never the body.
+func (h *Handler) addWatchedOAB(c *fiber.Ctx) error {
+	var req AddWatchedOABRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	oab, err := parseOAB(req.OAB)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	added, err := h.uc.AddWatchedOAB(c.UserContext(), tenantID, oab)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(watchedOABView{OAB: added.OAB, Enabled: added.Enabled})
+}
+
+// toggleWatchedOAB handles PATCH /v1/acquisition/watched-oabs/:oab: the Termos
+// liga/desliga switch — {enabled:false} pauses future capture for this OAB while
+// keeping everything already captured visible; {enabled:true} resumes it and, if it
+// was actually disabled, triggers a catch-up sync scoped to the downtime. A miss
+// (never added) is the typed 404. tenant_id comes from the principal.
+func (h *Handler) toggleWatchedOAB(c *fiber.Ctx) error {
+	oab := c.Params("oab")
+	if !oabRegex.MatchString(oab) {
+		return httpx.WriteError(c, apperr.NewInvalid("oab must be UF (2 letters) + 1-6 digits, e.g. SP123456"))
+	}
+
+	var req ToggleWatchedOABRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	updated, err := h.uc.ToggleWatchedOAB(c.UserContext(), tenantID, oab, req.Enabled)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(watchedOABView{OAB: updated.OAB, Enabled: updated.Enabled})
 }
 
 // syncRunItems handles GET /v1/acquisition/sync-runs/:syncRunId/items: the collapse
