@@ -220,18 +220,22 @@ type Document struct {
 }
 
 type Draft struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       pgtype.UUID        `json:"case_id"`
-	PieceType    string             `json:"piece_type"`
-	Status       string             `json:"status"`
-	SagaState    string             `json:"saga_state"`
-	StorageKey   *string            `json:"storage_key"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	IntimationID pgtype.UUID        `json:"intimation_id"`
-	Title        string             `json:"title"`
-	Content      *string            `json:"content"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	CaseID         pgtype.UUID        `json:"case_id"`
+	PieceType      string             `json:"piece_type"`
+	Status         string             `json:"status"`
+	SagaState      string             `json:"saga_state"`
+	StorageKey     *string            `json:"storage_key"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	IntimationID   pgtype.UUID        `json:"intimation_id"`
+	Title          string             `json:"title"`
+	Content        *string            `json:"content"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	SignedAt       pgtype.Timestamptz `json:"signed_at"`
+	Tone           string             `json:"tone"`
+	Instructions   *string            `json:"instructions"`
+	SelectedTheses []string           `json:"selected_theses"`
 }
 
 type DraftAttachment struct {

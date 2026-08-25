@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -72,6 +73,56 @@ type fakeRepo struct {
 	// Recorded calls.
 	insertCalls       int
 	lastInsertedDraft *Draft
+
+	// ── Fatia 4 stubs ────────────────────────────────────────────────────────
+
+	// SignDraft
+	signDraftResult *Draft
+	signDraftErr    error
+
+	// InsertPetition
+	insertPetitionResult *Petition
+	insertPetitionErr    error
+
+	// GetPetitionByDraftID
+	getPetitionResult *Petition
+	getPetitionErr    error
+
+	// UpdateObservedResult
+	updateResultPetition *Petition
+	updateResultErr      error
+
+	// ListDraftsByProcess
+	listByProcessResult []DraftListItem
+	listByProcessErr    error
+
+	// ListDraftsAll
+	listAllResult []DraftListItem
+	listAllErr    error
+
+	// GetCourtRecordIDByIntimation
+	courtRecordIDResult string
+	courtRecordIDErr    error
+
+	// ── Fatia 5 stubs (SetGenerationParams) ──────────────────────────────────
+	// setGenParamsErr lets tests force a failure from SetGenerationParams.
+	setGenParamsErr error
+	// setGenParamsCalls records every SetGenerationParams invocation (captured
+	// args) so tests can assert what TriggerGeneration persisted.
+	setGenParamsCalls []setGenerationParamsCall
+	// callOrder records, in order, which of {SetGenerationParams,
+	// UpdateSagaState} ran — so tests can assert both happened inside the same
+	// tx and in the documented order (SetGenerationParams before the saga flip).
+	callOrder []string
+}
+
+// setGenerationParamsCall captures one SetGenerationParams invocation.
+type setGenerationParamsCall struct {
+	draftID      string
+	tenantID     string
+	tone         string
+	instructions string
+	theses       []string
 }
 
 func (r *fakeRepo) InsertDraft(_ context.Context, _ database.Tx, d *Draft) (*Draft, error) {
@@ -132,7 +183,23 @@ func (r *fakeRepo) GetLatestReview(_ context.Context, _ database.Tx, _ string) (
 }
 
 func (r *fakeRepo) UpdateSagaState(_ context.Context, _ database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error) {
+	r.callOrder = append(r.callOrder, "UpdateSagaState")
 	return r.getByIDResult, nil
+}
+
+// SetGenerationParams captures every call (draftID/tenantID/tone/instructions/theses)
+// so TriggerUseCase tests can assert exactly what was persisted, in addition to
+// satisfying the Repository interface for the rest of the package's tests.
+func (r *fakeRepo) SetGenerationParams(_ context.Context, _ database.Tx, draftID, tenantID, tone, instructions string, theses []string) error {
+	r.callOrder = append(r.callOrder, "SetGenerationParams")
+	r.setGenParamsCalls = append(r.setGenParamsCalls, setGenerationParamsCall{
+		draftID:      draftID,
+		tenantID:     tenantID,
+		tone:         tone,
+		instructions: instructions,
+		theses:       theses,
+	})
+	return r.setGenParamsErr
 }
 
 func (r *fakeRepo) InsertReview(_ context.Context, _ database.Tx, rev *Review) (*Review, error) {
@@ -161,6 +228,63 @@ func (r *fakeRepo) InsertChatMessage(_ context.Context, _ database.Tx, m *ChatMe
 
 func (r *fakeRepo) GetChatThread(_ context.Context, _ database.Tx, _ string) ([]ChatMessage, error) {
 	return []ChatMessage{}, nil
+}
+
+// ── Fatia 4 stubs (Sign, File, Result, Export, List) ─────────────────────────
+// These stubs satisfy the Repository interface. Tests for Fatia 4 use cases
+// will override these via the extended fakeRepo fields.
+
+func (r *fakeRepo) SignDraft(_ context.Context, _ database.Tx, draftID, tenantID string) (*Draft, error) {
+	if r.signDraftErr != nil {
+		return nil, r.signDraftErr
+	}
+	if r.signDraftResult != nil {
+		return r.signDraftResult, nil
+	}
+	return &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned}, nil
+}
+
+func (r *fakeRepo) InsertPetition(_ context.Context, _ database.Tx, p *Petition) (*Petition, error) {
+	if r.insertPetitionErr != nil {
+		return nil, r.insertPetitionErr
+	}
+	if p.ID == "" {
+		p.ID = "stub-petition-id"
+	}
+	return p, nil
+}
+
+func (r *fakeRepo) GetPetitionByDraftID(_ context.Context, _ database.Tx, _, _ string) (*Petition, error) {
+	return r.getPetitionResult, r.getPetitionErr
+}
+
+func (r *fakeRepo) UpdateObservedResult(_ context.Context, _ database.Tx, _, _, result string) (*Petition, error) {
+	if r.updateResultErr != nil {
+		return nil, r.updateResultErr
+	}
+	return &Petition{ID: "stub-petition-id", ObservedResult: result}, nil
+}
+
+func (r *fakeRepo) UpdateSagaStateAndSignedAt(_ context.Context, _ database.Tx, draftID, tenantID, sagaState string) (*Draft, error) {
+	return &Draft{ID: draftID, TenantID: tenantID, SagaState: sagaState}, nil
+}
+
+func (r *fakeRepo) ListDraftsByProcess(_ context.Context, _ database.Tx, _, _, _, _ string, _ int) ([]DraftListItem, error) {
+	if r.listByProcessErr != nil {
+		return nil, r.listByProcessErr
+	}
+	return r.listByProcessResult, nil
+}
+
+func (r *fakeRepo) ListDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _ string, _ int) ([]DraftListItem, error) {
+	if r.listAllErr != nil {
+		return nil, r.listAllErr
+	}
+	return r.listAllResult, nil
+}
+
+func (r *fakeRepo) GetCourtRecordIDByIntimation(_ context.Context, _ database.Tx, _, _ string) (string, error) {
+	return r.courtRecordIDResult, r.courtRecordIDErr
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -754,6 +878,537 @@ func TestUseCase_RemoveAttachment(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("RemoveAttachment() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// ── Sign tests ──────────────────────────────────────────────────────────────
+
+func TestUseCase_Sign(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+
+	tests := []struct {
+		name      string
+		cmd       SignCommand
+		repo      *fakeRepo
+		wantErr   bool
+		errTarget error
+		wantIdemp bool
+		wantSt    string
+	}{
+		{
+			name: "signs DRAFT draft → SIGNED",
+			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
+			repo: &fakeRepo{
+				getByIDResult:   &Draft{ID: draftID, TenantID: tenantID, Status: StatusDraft},
+				signDraftResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
+			},
+			wantSt: StatusSigned,
+		},
+		{
+			name: "signs REVIEWED draft → SIGNED",
+			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
+			repo: &fakeRepo{
+				getByIDResult:   &Draft{ID: draftID, TenantID: tenantID, Status: StatusReviewed},
+				signDraftResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
+			},
+			wantSt: StatusSigned,
+		},
+		{
+			name: "idempotent: already SIGNED → returns 200 with current data",
+			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
+			repo: &fakeRepo{
+				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
+			},
+			wantIdemp: true,
+			wantSt:    StatusSigned,
+		},
+		{
+			name: "EXTRACTING status → ErrInvalidStatusForSign",
+			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
+			repo: &fakeRepo{
+				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: "EXTRACTING"},
+			},
+			wantErr:   true,
+			errTarget: ErrInvalidStatusForSign,
+		},
+		{
+			name: "FAILED status → ErrInvalidStatusForSign",
+			cmd:  SignCommand{TenantID: tenantID, DraftID: draftID},
+			repo: &fakeRepo{
+				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: "FAILED"},
+			},
+			wantErr:   true,
+			errTarget: ErrInvalidStatusForSign,
+		},
+		{
+			name:      "draft not found → ErrDraftNotFound",
+			cmd:       SignCommand{TenantID: tenantID, DraftID: draftID},
+			repo:      &fakeRepo{getByIDErr: ErrDraftNotFound},
+			wantErr:   true,
+			errTarget: ErrDraftNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			result, err := uc.Sign(context.Background(), tt.cmd)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Sign() error = nil, want non-nil")
+				}
+				if tt.errTarget != nil && !errors.Is(err, tt.errTarget) {
+					t.Errorf("Sign() error = %v, want %v", err, tt.errTarget)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Sign() unexpected error: %v", err)
+			}
+			if result == nil {
+				t.Fatal("Sign() result is nil")
+			}
+			if result.IsIdempot != tt.wantIdemp {
+				t.Errorf("Sign() IsIdempot = %v, want %v", result.IsIdempot, tt.wantIdemp)
+			}
+			if result.Status != tt.wantSt {
+				t.Errorf("Sign() Status = %q, want %q", result.Status, tt.wantSt)
+			}
+			if len(uow.scopes) == 0 || uow.scopes[0] != tenantID {
+				t.Errorf("Sign() RLS scope = %v, want tenantID %q", uow.scopes, tenantID)
+			}
+		})
+	}
+}
+
+// ── File tests ──────────────────────────────────────────────────────────────
+
+func TestUseCase_File(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+	courtRecordID := uuid.New().String()
+	intimID := newIntimID()
+	receipt := map[string]any{"protocolo": "12345", "orgao": "TJSP"}
+
+	tests := []struct {
+		name      string
+		cmd       FileCommand
+		repo      *fakeRepo
+		wantErr   bool
+		errTarget error
+		wantIdemp bool
+	}{
+		{
+			name: "files SIGNED draft with court_record_id override",
+			cmd: FileCommand{
+				TenantID:      tenantID,
+				DraftID:       draftID,
+				Receipt:       receipt,
+				CourtRecordID: courtRecordID,
+			},
+			repo: &fakeRepo{
+				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
+			},
+		},
+		{
+			name: "files SIGNED draft with intimation court_record resolution",
+			cmd: FileCommand{
+				TenantID: tenantID,
+				DraftID:  draftID,
+				Receipt:  receipt,
+			},
+			repo: &fakeRepo{
+				getByIDResult:       &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned, IntimationID: intimID},
+				courtRecordIDResult: courtRecordID,
+			},
+		},
+		{
+			name: "no court_record and no intimation → ErrCourtRecordRequired",
+			cmd: FileCommand{
+				TenantID: tenantID,
+				DraftID:  draftID,
+				Receipt:  receipt,
+			},
+			repo: &fakeRepo{
+				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
+			},
+			wantErr:   true,
+			errTarget: ErrCourtRecordRequired,
+		},
+		{
+			name: "DRAFT status → ErrDraftNotSigned",
+			cmd: FileCommand{
+				TenantID:      tenantID,
+				DraftID:       draftID,
+				Receipt:       receipt,
+				CourtRecordID: courtRecordID,
+			},
+			repo: &fakeRepo{
+				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusDraft},
+			},
+			wantErr:   true,
+			errTarget: ErrDraftNotSigned,
+		},
+		{
+			name: "idempotent: petition already exists → returns 200",
+			cmd: FileCommand{
+				TenantID:      tenantID,
+				DraftID:       draftID,
+				Receipt:       receipt,
+				CourtRecordID: courtRecordID,
+			},
+			repo: &fakeRepo{
+				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Status: StatusSigned},
+				getPetitionResult: &Petition{
+					ID: "existing-petition", DraftID: draftID, CourtRecordID: courtRecordID,
+				},
+			},
+			wantIdemp: true,
+		},
+		{
+			name: "draft not found → ErrDraftNotFound",
+			cmd: FileCommand{
+				TenantID:      tenantID,
+				DraftID:       draftID,
+				Receipt:       receipt,
+				CourtRecordID: courtRecordID,
+			},
+			repo:      &fakeRepo{getByIDErr: ErrDraftNotFound},
+			wantErr:   true,
+			errTarget: ErrDraftNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			result, err := uc.File(context.Background(), tt.cmd)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("File() error = nil, want non-nil")
+				}
+				if tt.errTarget != nil && !errors.Is(err, tt.errTarget) {
+					t.Errorf("File() error = %v, want %v", err, tt.errTarget)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("File() unexpected error: %v", err)
+			}
+			if result == nil {
+				t.Fatal("File() result is nil")
+			}
+			if result.IsIdempotent != tt.wantIdemp {
+				t.Errorf("File() IsIdempotent = %v, want %v", result.IsIdempotent, tt.wantIdemp)
+			}
+			if result.DraftID != draftID {
+				t.Errorf("File() DraftID = %q, want %q", result.DraftID, draftID)
+			}
+		})
+	}
+}
+
+// ── Result tests ────────────────────────────────────────────────────────────
+
+func TestUseCase_Result(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+
+	tests := []struct {
+		name      string
+		cmd       ResultCommand
+		repo      *fakeRepo
+		wantErr   bool
+		errTarget error
+		wantOR    string
+	}{
+		{
+			name:   "sets OK result",
+			cmd:    ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultOK},
+			repo:   &fakeRepo{},
+			wantOR: ObservedResultOK,
+		},
+		{
+			name:   "sets AMENDMENT result",
+			cmd:    ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultAmendment},
+			repo:   &fakeRepo{},
+			wantOR: ObservedResultAmendment,
+		},
+		{
+			name:      "petition not found → ErrPetitionNotFound",
+			cmd:       ResultCommand{TenantID: tenantID, DraftID: draftID, ObservedResult: ObservedResultOK},
+			repo:      &fakeRepo{updateResultErr: ErrPetitionNotFound},
+			wantErr:   true,
+			errTarget: ErrPetitionNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			result, err := uc.Result(context.Background(), tt.cmd)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Result() error = nil, want non-nil")
+				}
+				if tt.errTarget != nil && !errors.Is(err, tt.errTarget) {
+					t.Errorf("Result() error = %v, want %v", err, tt.errTarget)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Result() unexpected error: %v", err)
+			}
+			if result == nil {
+				t.Fatal("Result() result is nil")
+			}
+			if result.ObservedResult != tt.wantOR {
+				t.Errorf("Result() ObservedResult = %q, want %q", result.ObservedResult, tt.wantOR)
+			}
+		})
+	}
+}
+
+// ── Export tests ────────────────────────────────────────────────────────────
+
+type fakeStorage struct {
+	url string
+	err error
+}
+
+func (s *fakeStorage) PresignedGet(_ context.Context, _ string, _ time.Duration) (string, error) {
+	return s.url, s.err
+}
+
+func TestUseCase_Export(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+	presignedURL := "https://storage.example.com/signed-download"
+
+	tests := []struct {
+		name      string
+		cmd       ExportCommand
+		repo      *fakeRepo
+		storage   *fakeStorage
+		wantErr   bool
+		errTarget error
+		wantURL   string
+	}{
+		{
+			name:    "exports draft content as presigned URL",
+			cmd:     ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
+			repo:    &fakeRepo{getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Content: "conteudo da peca"}},
+			storage: &fakeStorage{url: presignedURL},
+			wantURL: presignedURL,
+		},
+		{
+			name:      "empty content → ErrDraftNoContent",
+			cmd:       ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
+			repo:      &fakeRepo{getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Content: ""}},
+			storage:   &fakeStorage{url: presignedURL},
+			wantErr:   true,
+			errTarget: ErrDraftNoContent,
+		},
+		{
+			name:      "draft not found → ErrDraftNotFound",
+			cmd:       ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
+			repo:      &fakeRepo{getByIDErr: ErrDraftNotFound},
+			storage:   &fakeStorage{url: presignedURL},
+			wantErr:   true,
+			errTarget: ErrDraftNotFound,
+		},
+		{
+			name:      "nil storage → ErrExportFormatInvalid",
+			cmd:       ExportCommand{TenantID: tenantID, DraftID: draftID, Format: "pdf"},
+			repo:      &fakeRepo{getByIDResult: &Draft{ID: draftID, TenantID: tenantID, Content: "x"}},
+			storage:   nil,
+			wantErr:   true,
+			errTarget: ErrExportFormatInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			opts := []Option{}
+			if tt.storage != nil {
+				opts = append(opts, WithStorage(tt.storage))
+			}
+			uc := NewUseCase(uow, tt.repo, opts...)
+
+			result, err := uc.Export(context.Background(), tt.cmd)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Export() error = nil, want non-nil")
+				}
+				if tt.errTarget != nil && !errors.Is(err, tt.errTarget) {
+					t.Errorf("Export() error = %v, want %v", err, tt.errTarget)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Export() unexpected error: %v", err)
+			}
+			if result == nil {
+				t.Fatal("Export() result is nil")
+			}
+			if result.URL != tt.wantURL {
+				t.Errorf("Export() URL = %q, want %q", result.URL, tt.wantURL)
+			}
+			if result.ExpiresIn <= 0 {
+				t.Errorf("Export() ExpiresIn = %d, want > 0", result.ExpiresIn)
+			}
+		})
+	}
+}
+
+// ── ListByProcess tests ─────────────────────────────────────────────────────
+
+func TestUseCase_ListByProcess(t *testing.T) {
+	tenantID := newTenantID()
+	caseID := uuid.New().String()
+
+	now := time.Now()
+	items := []DraftListItem{
+		{ID: newDraftID(), PieceType: PieceTypeDefense, Title: "Contestação", Status: StatusDraft, SagaState: "REVIEWED", CreatedAt: now},
+		{ID: newDraftID(), PieceType: PieceTypeAppeal, Title: "Apelação", Status: StatusSigned, SagaState: SagaStateFiled, CreatedAt: now.Add(-time.Hour)},
+	}
+
+	tests := []struct {
+		name      string
+		query     ListByProcessQuery
+		repo      *fakeRepo
+		wantErr   bool
+		wantCount int
+		wantMore  bool
+	}{
+		{
+			name:      "returns items with hasMore=false when exact page",
+			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listByProcessResult: items},
+			wantCount: 2,
+		},
+		{
+			name:      "returns hasMore=true when overfetch",
+			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 1},
+			repo:      &fakeRepo{listByProcessResult: items},
+			wantCount: 1,
+			wantMore:  true,
+		},
+		{
+			name:      "empty result → empty list, no error",
+			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listByProcessResult: []DraftListItem{}},
+			wantCount: 0,
+		},
+		{
+			name:    "repo error → propagated",
+			query:   ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:    &fakeRepo{listByProcessErr: errors.New("db error")},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			result, err := uc.ListByProcess(context.Background(), tt.query)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ListByProcess() error = nil, want non-nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ListByProcess() unexpected error: %v", err)
+			}
+			if len(result.Items) != tt.wantCount {
+				t.Errorf("ListByProcess() Items len = %d, want %d", len(result.Items), tt.wantCount)
+			}
+			if result.HasMore != tt.wantMore {
+				t.Errorf("ListByProcess() HasMore = %v, want %v", result.HasMore, tt.wantMore)
+			}
+		})
+	}
+}
+
+// ── ListAll tests ───────────────────────────────────────────────────────────
+
+func TestUseCase_ListAll(t *testing.T) {
+	tenantID := newTenantID()
+
+	now := time.Now()
+	items := []DraftListItem{
+		{ID: newDraftID(), PieceType: PieceTypeDefense, Status: StatusDraft, CreatedAt: now},
+	}
+
+	tests := []struct {
+		name      string
+		query     ListAllQuery
+		repo      *fakeRepo
+		wantErr   bool
+		wantCount int
+	}{
+		{
+			name:      "returns items",
+			query:     ListAllQuery{TenantID: tenantID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listAllResult: items},
+			wantCount: 1,
+		},
+		{
+			name:      "with piece_type filter",
+			query:     ListAllQuery{TenantID: tenantID, PieceType: PieceTypeDefense, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listAllResult: items},
+			wantCount: 1,
+		},
+		{
+			name:      "with status filter",
+			query:     ListAllQuery{TenantID: tenantID, Status: StatusDraft, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:      &fakeRepo{listAllResult: items},
+			wantCount: 1,
+		},
+		{
+			name:    "repo error → propagated",
+			query:   ListAllQuery{TenantID: tenantID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:    &fakeRepo{listAllErr: errors.New("db error")},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uow := &fakeUOW{}
+			uc := NewUseCase(uow, tt.repo)
+
+			result, err := uc.ListAll(context.Background(), tt.query)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ListAll() error = nil, want non-nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ListAll() unexpected error: %v", err)
+			}
+			if len(result.Items) != tt.wantCount {
+				t.Errorf("ListAll() Items len = %d, want %d", len(result.Items), tt.wantCount)
 			}
 		})
 	}

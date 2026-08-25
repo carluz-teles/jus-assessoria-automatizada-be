@@ -44,11 +44,15 @@ WHERE tenant_id = $1 AND intimation_id = $2;
 
 -- name: GetDraftByID :one
 -- Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
--- foreign-tenant id yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+-- foreign-tenant id yields pgx.ErrNoRows → ErrDraftNotFound (→ 404). Includes the
+-- Gerar-time generation params (tone/instructions/selected_theses, Fatia 5) so
+-- OnGenerationRequested (the async worker, which reloads the draft) has them
+-- without the event payload carrying them.
 SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
-       created_at, updated_at
+       created_at, updated_at,
+       tone, instructions, selected_theses
 FROM draft
 WHERE id = $1 AND tenant_id = $2;
 
@@ -232,6 +236,23 @@ ORDER BY p.role, p.name;
 -- ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
 -- These are the three new queries the async generation saga needs.
 
+-- name: SetGenerationParams :exec
+-- Persist the Gerar-time generation params (tone/instructions/selected_theses,
+-- Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
+-- the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event
+-- payload does NOT carry these — the async worker rereads the draft row instead.
+-- Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. The caller already
+-- tenant-guarded (id, tenant_id) via GetDraftByID earlier in the same tx, so a
+-- no-match here is not expected in practice; the repo does not re-check
+-- RowsAffected (mirrors DeleteReviewsForDraft's :exec, which is also fire-and-forget
+-- within an already-guarded tx).
+UPDATE draft
+SET tone            = $3,
+    instructions    = $4,
+    selected_theses = $5,
+    updated_at      = now()
+WHERE id = $1 AND tenant_id = $2;
+
 -- name: UpdateSagaState :one
 -- Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 -- on success, FAILED on LLM error). Also updates content when the generator returns new
@@ -302,3 +323,114 @@ FROM (
     LIMIT 50
 ) sub
 ORDER BY created_at ASC;
+
+-- ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+
+-- name: SignDraft :one
+-- Transition draft.status to SIGNED and set signed_at = now(). Scoped to
+-- (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+UPDATE draft
+SET status     = 'SIGNED',
+    signed_at  = now(),
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at, signed_at;
+
+-- name: InsertPetition :one
+-- Persist a filed petition (immutable). No tenant_id on petition — isolation
+-- is via the draft FK (JOIN draft.tenant_id). Returns all columns.
+INSERT INTO petition (draft_id, court_record_id, filed_at, receipt)
+VALUES ($1, $2, $3, $4)
+RETURNING id, draft_id, court_record_id, filed_at, receipt, observed_result;
+
+-- name: GetPetitionByDraftID :one
+-- Load the existing petition for a draft, scoped to tenant via JOIN. Returns
+-- pgx.ErrNoRows when no petition exists (the caller treats nil as "not filed").
+SELECT p.id, p.draft_id, p.court_record_id, p.filed_at, p.receipt, p.observed_result
+FROM petition p
+JOIN draft d ON d.id = p.draft_id
+WHERE p.draft_id = $1 AND d.tenant_id = $2;
+
+-- name: UpdateObservedResult :one
+-- Patch the observed_result on a petition, scoped to tenant via JOIN. A miss
+-- (no petition or wrong tenant) → pgx.ErrNoRows → ErrPetitionNotFound.
+UPDATE petition
+SET observed_result = $3
+FROM draft d
+WHERE petition.draft_id = $1
+  AND d.id = petition.draft_id
+  AND d.tenant_id = $2
+RETURNING petition.id, petition.draft_id, petition.observed_result;
+
+-- name: GetCourtRecordIDByIntimation :one
+-- Resolve the court_record_id for an intimation, scoped to tenant via
+-- court_record.tenant_id. Returns pgx.ErrNoRows when the intimation has no
+-- linked court record (the caller treats empty string as "not found").
+SELECT cr.id AS court_record_id
+FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
+WHERE i.id = $1 AND cr.tenant_id = $2;
+
+-- name: ListDraftsByProcess :many
+-- Paginated list of peças for a given court_record_id, ordered by (created_at DESC,
+-- id DESC). The :id param is court_record.id; we resolve case_id via JOIN.
+-- Coverage summary is resolved from the latest review via LEFT JOIN LATERAL.
+-- Over-fetch by 1 for hasMore detection.
+SELECT
+    d.id,
+    d.piece_type,
+    d.title,
+    d.status,
+    d.saga_state,
+    d.created_at,
+    p.filed_at,
+    p.observed_result,
+    r.coverage AS review_coverage
+FROM draft d
+JOIN court_record cr ON cr.case_id = d.case_id AND cr.tenant_id = d.tenant_id
+LEFT JOIN petition p ON p.draft_id = d.id
+LEFT JOIN LATERAL (
+    SELECT rv.coverage
+    FROM review rv
+    WHERE rv.draft_id = d.id
+    ORDER BY rv.generated_at DESC
+    LIMIT 1
+) r ON true
+WHERE d.tenant_id = $1
+  AND cr.id = $2
+  AND (d.created_at, d.id) < ($3::timestamptz, $4::uuid)
+ORDER BY d.created_at DESC, d.id DESC
+LIMIT $5;
+
+-- name: ListDraftsAll :many
+-- Paginated list of all peças for a tenant, ordered by (created_at DESC,
+-- id DESC). Optional piece_type and status filters. Coverage summary from
+-- latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+SELECT
+    d.id,
+    d.piece_type,
+    d.title,
+    d.status,
+    d.saga_state,
+    d.created_at,
+    p.filed_at,
+    p.observed_result,
+    r.coverage AS review_coverage
+FROM draft d
+LEFT JOIN petition p ON p.draft_id = d.id
+LEFT JOIN LATERAL (
+    SELECT rv.coverage
+    FROM review rv
+    WHERE rv.draft_id = d.id
+    ORDER BY rv.generated_at DESC
+    LIMIT 1
+) r ON true
+WHERE d.tenant_id = $1
+  AND ($2::text = '' OR d.piece_type = $2)
+  AND ($3::text = '' OR d.status = $3)
+  AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
+ORDER BY d.created_at DESC, d.id DESC
+LIMIT $6;

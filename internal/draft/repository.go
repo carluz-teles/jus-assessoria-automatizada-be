@@ -3,10 +3,12 @@ package draft
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/jusassessoria/platform/internal/draft/draftdb"
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 )
 
@@ -68,6 +70,13 @@ type Repository interface {
 
 	// ── AI generation methods (Fatia 3) ──────────────────────────────────────
 
+	// SetGenerationParams persists the Gerar-time generation params
+	// (tone/instructions/selected_theses, Fatia 5) chosen on
+	// POST /v1/pecas/:id/generate. Called in the SAME tx as UpdateSagaState by
+	// TriggerGeneration; the draft.generation_requested event payload does not
+	// carry these — OnGenerationRequested rereads the draft row instead.
+	SetGenerationParams(ctx context.Context, tx database.Tx, draftID, tenantID, tone, instructions string, theses []string) error
+
 	// UpdateSagaState transitions the draft's saga_state column and optionally
 	// overwrites content (when updateContent=true). Scoped to (draftID, tenantID).
 	// A miss is ErrDraftNotFound.
@@ -98,6 +107,41 @@ type Repository interface {
 	// (oldest first). No tenant guard in the query — the caller tenant-guards via the
 	// draft load. An empty thread returns an empty slice, never nil.
 	GetChatThread(ctx context.Context, tx database.Tx, draftID string) ([]ChatMessage, error)
+
+	// ── Peticionamento methods (Fatia 4) ────────────────────────────────────
+
+	// SignDraft transitions draft.status to SIGNED and sets signed_at. Guarded by
+	// the caller to status ∈ {DRAFT, REVIEWED}. Idempotent: if already SIGNED,
+	// returns the current row (no error). A miss is ErrDraftNotFound.
+	SignDraft(ctx context.Context, tx database.Tx, draftID, tenantID string) (*Draft, error)
+
+	// InsertPetition persists the filed petition. Returns the persisted entity.
+	InsertPetition(ctx context.Context, tx database.Tx, p *Petition) (*Petition, error)
+
+	// GetPetitionByDraftID returns the existing petition for a draft, or nil if none.
+	// No error when nil — the caller checks for double-filing.
+	GetPetitionByDraftID(ctx context.Context, tx database.Tx, tenantID, draftID string) (*Petition, error)
+
+	// UpdateObservedResult patches the observed_result on a petition. A miss
+	// (wrong id or foreign tenant) is ErrPetitionNotFound.
+	UpdateObservedResult(ctx context.Context, tx database.Tx, tenantID, draftID, result string) (*Petition, error)
+
+	// UpdateSagaStateAndSignedAt transitions saga_state AND sets signed_at in one
+	// call. Used by the File use case to set FILED + signed_at atomically.
+	UpdateSagaStateAndSignedAt(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string) (*Draft, error)
+
+	// ListDraftsByProcess returns draft list items for a given case_id, keyset
+	// paginated (created_at DESC, id DESC). Over-fetches by 1 for hasMore.
+	ListDraftsByProcess(ctx context.Context, tx database.Tx, tenantID, caseID string, lastCreated string, lastID string, limit int) ([]DraftListItem, error)
+
+	// ListDraftsAll returns draft list items across all processes for a tenant,
+	// keyset paginated (created_at DESC, id DESC). Optional filters for
+	// piece_type and status. Over-fetches by 1 for hasMore.
+	ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, lastCreated, lastID string, limit int) ([]DraftListItem, error)
+
+	// GetCourtRecordIDByIntimation returns the court_record_id for an intimation,
+	// or empty string if the intimation has no linked court record.
+	GetCourtRecordIDByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (string, error)
 }
 
 // ErrDraftAlreadyExists is a sentinel the repository returns when InsertDraft hits
@@ -456,6 +500,31 @@ func (r *pgRepository) GetDraftAttachments(ctx context.Context, tx database.Tx, 
 
 // ── AI generation repository methods (Fatia 3) ───────────────────────────────
 
+func (r *pgRepository) SetGenerationParams(ctx context.Context, tx database.Tx, draftID, tenantID, tone, instructions string, theses []string) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	if theses == nil {
+		theses = []string{}
+	}
+
+	if err := draftdb.New(tx).SetGenerationParams(ctx, draftdb.SetGenerationParamsParams{
+		ID:             did,
+		TenantID:       tid,
+		Tone:           tone,
+		Instructions:   textToNull(instructions),
+		SelectedTheses: theses,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
 func (r *pgRepository) UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error) {
 	did, err := parseUUID(draftID)
 	if err != nil {
@@ -587,4 +656,222 @@ func (r *pgRepository) GetChatThread(ctx context.Context, tx database.Tx, draftI
 		return nil, database.WrapInfra(err)
 	}
 	return chatMessagesFromRows(rows), nil
+}
+
+// ── Peticionamento repository methods (Fatia 4) ─────────────────────────────
+
+func (r *pgRepository) SignDraft(ctx context.Context, tx database.Tx, draftID, tenantID string) (*Draft, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).SignDraft(ctx, draftdb.SignDraftParams{
+		ID:       did,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDraftNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return draftFromSignRow(row), nil
+}
+
+func (r *pgRepository) InsertPetition(ctx context.Context, tx database.Tx, p *Petition) (*Petition, error) {
+	did, err := parseUUID(p.DraftID)
+	if err != nil {
+		return nil, err
+	}
+	crid, err := parseUUID(p.CourtRecordID)
+	if err != nil {
+		return nil, err
+	}
+
+	receiptJSON, err := marshalJSON(p.Receipt)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).InsertPetition(ctx, draftdb.InsertPetitionParams{
+		DraftID:       did,
+		CourtRecordID: crid,
+		FiledAt:       timeToTimestamptz(p.FiledAt),
+		Receipt:       receiptJSON,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return petitionFromRow(row), nil
+}
+
+func (r *pgRepository) GetPetitionByDraftID(ctx context.Context, tx database.Tx, tenantID, draftID string) (*Petition, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).GetPetitionByDraftID(ctx, draftdb.GetPetitionByDraftIDParams{
+		DraftID:  did,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil // no petition yet — not an error
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	p := petitionFromRow(row)
+	return p, nil
+}
+
+func (r *pgRepository) UpdateObservedResult(ctx context.Context, tx database.Tx, tenantID, draftID, result string) (*Petition, error) {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).UpdateObservedResult(ctx, draftdb.UpdateObservedResultParams{
+		DraftID:        did,
+		TenantID:       tid,
+		ObservedResult: &result,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrPetitionNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return &Petition{
+		ID:             row.ID.String(),
+		DraftID:        row.DraftID.String(),
+		ObservedResult: derefString(row.ObservedResult),
+	}, nil
+}
+
+func (r *pgRepository) UpdateSagaStateAndSignedAt(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string) (*Draft, error) {
+	// For now, reuse UpdateSagaState (signed_at is set by SignDraft).
+	// This method exists for the File use case to update saga_state atomically.
+	return r.UpdateSagaState(ctx, tx, draftID, tenantID, sagaState, false, "")
+}
+
+func (r *pgRepository) ListDraftsByProcess(ctx context.Context, tx database.Tx, tenantID, caseID, lastCreated, lastID string, limit int) ([]DraftListItem, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	cid, err := parseUUID(caseID)
+	if err != nil {
+		return nil, err
+	}
+
+	created, err := parseCursorTime(lastCreated)
+	if err != nil {
+		return nil, err
+	}
+	lid, err := parseUUID(lastID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := draftdb.New(tx).ListDraftsByProcess(ctx, draftdb.ListDraftsByProcessParams{
+		TenantID: tid,
+		ID:       cid,
+		Column3:  timeToTimestamptz(created),
+		Column4:  lid,
+		Limit:    int32(limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	items := make([]DraftListItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, draftListItemFromProcessRow(row))
+	}
+	return items, nil
+}
+
+func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, lastCreated, lastID string, limit int) ([]DraftListItem, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	created, err := parseCursorTime(lastCreated)
+	if err != nil {
+		return nil, err
+	}
+	lid, err := parseUUID(lastID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := draftdb.New(tx).ListDraftsAll(ctx, draftdb.ListDraftsAllParams{
+		TenantID: tid,
+		Column2:  pieceType,
+		Column3:  status,
+		Column4:  timeToTimestamptz(created),
+		Column5:  lid,
+		Limit:    int32(limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	items := make([]DraftListItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, draftListItemFromAllRow(row))
+	}
+	return items, nil
+}
+
+func (r *pgRepository) GetCourtRecordIDByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (string, error) {
+	iid, err := parseUUID(intimationID)
+	if err != nil {
+		return "", err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	row, err := draftdb.New(tx).GetCourtRecordIDByIntimation(ctx, draftdb.GetCourtRecordIDByIntimationParams{
+		ID:       iid,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil // no court record linked — not an error
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return row.String(), nil
+}
+
+// parseCursorTime parses the RFC3339Nano sort value from the cursor. The max
+// sentinel ("9999-12-31T23:59:59.999999Z") is valid RFC3339.
+func parseCursorTime(s string) (time.Time, error) {
+	if s == "" || s == maxCreatedAt {
+		// max sentinel or empty → use max time for the first page.
+		return time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC), nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, apperr.NewInvalid("invalid cursor timestamp: " + s)
+	}
+	return t, nil
 }

@@ -74,3 +74,55 @@ func newReviewCompleted(draftID, reviewID, status string) ReviewCompleted {
 		Status:   status,
 	}
 }
+
+// ── Fatia 4 — peticionamento events ─────────────────────────────────────────
+
+// TypeDraftSigned is published after the draft status transitions to SIGNED.
+const TypeDraftSigned = "draft.signed"
+
+// DraftSigned announces that a peça has been signed. Downstream consumers
+// (notifications, read-model invalidation) subscribe here.
+type DraftSigned struct {
+	events.Base
+	DraftID  string `json:"draft_id"`
+	TenantID string `json:"tenant_id"`
+}
+
+var _ events.Event = DraftSigned{}
+
+func (DraftSigned) Type() string          { return TypeDraftSigned }
+func (DraftSigned) AggregateType() string { return aggregateTypeDraft }
+
+func newDraftSigned(d *Draft) DraftSigned {
+	return DraftSigned{
+		Base:     events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: d.ID},
+		DraftID:  d.ID,
+		TenantID: d.TenantID,
+	}
+}
+
+// TypePetitionFiled is published after a petition is created (peça filed).
+const TypePetitionFiled = "petition.filed"
+
+// PetitionFiled announces that a signed peça has been filed. The consumer
+// (notifications, read-model) uses it to update the draft's saga_state display.
+type PetitionFiled struct {
+	events.Base
+	PetitionID string `json:"petition_id"`
+	DraftID    string `json:"draft_id"`
+	TenantID   string `json:"tenant_id"`
+}
+
+var _ events.Event = PetitionFiled{}
+
+func (PetitionFiled) Type() string          { return TypePetitionFiled }
+func (PetitionFiled) AggregateType() string { return aggregateTypeDraft }
+
+func newPetitionFiled(p *Petition, tenantID string) PetitionFiled {
+	return PetitionFiled{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: p.DraftID},
+		PetitionID: p.ID,
+		DraftID:    p.DraftID,
+		TenantID:   tenantID,
+	}
+}

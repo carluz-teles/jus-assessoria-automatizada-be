@@ -40,4 +40,41 @@ var (
 	// that resolves to no row in the tenant (no intimation, or wrong tenant). Typed
 	// not-found (→ 404), never (nil, nil).
 	ErrIntimationNotFound = apperr.NewNotFound("intimation not found")
+
+	// ── Fatia 4 — peticionamento errors ─────────────────────────────────────
+
+	// ErrInvalidStatusForSign — POST /v1/pecas/:id/sign called when draft.status is
+	// not DRAFT or REVIEWED (e.g. CREATED, EXTRACTING, FAILED, or already SIGNED).
+	// INVALID (→ 422).
+	ErrInvalidStatusForSign = apperr.NewInvalid("draft status does not allow signing: must be DRAFT or REVIEWED")
+
+	// ErrAlreadySigned — POST /v1/pecas/:id/sign called on an already SIGNED draft.
+	// Idempotent: returns 200 with current data (not an error in the handler path),
+	// but the use case returns this sentinel so the handler can distinguish the
+	// idempotent path from the fresh-sign path.
+	ErrAlreadySigned = apperr.NewConflict("draft is already signed")
+
+	// ErrAlreadyFiled — POST /v1/pecas/:id/file called when a petition already exists
+	// for this draft. CONFLICT (→ 409).
+	ErrAlreadyFiled = apperr.NewConflict("petition already exists for this draft")
+
+	// ErrPetitionNotFound — PATCH /v1/pecas/:id/result called when no petition exists
+	// for the draft. NOT_FOUND (→ 404).
+	ErrPetitionNotFound = apperr.NewNotFound("petition not found: draft has not been filed yet")
+
+	// ErrCourtRecordRequired — POST /v1/pecas/:id/file could not resolve a
+	// court_record_id (no intimation and no override in the body). INVALID (→ 422).
+	ErrCourtRecordRequired = apperr.NewInvalid("court_record_id is required: no intimation linked and none provided in the request")
+
+	// ErrExportFormatInvalid — GET /v1/pecas/:id/export with an unsupported format.
+	// INVALID (→ 422).
+	ErrExportFormatInvalid = apperr.NewInvalid("export format must be 'docx' or 'pdf'")
+
+	// ErrDraftNoContent — GET /v1/pecas/:id/export on a draft with empty content.
+	// INVALID (→ 422).
+	ErrDraftNoContent = apperr.NewInvalid("draft has no content to export")
+
+	// ErrDraftNotSigned — POST /v1/pecas/:id/file called when draft.status is not
+	// SIGNED. The piece must be signed before filing. INVALID (→ 422).
+	ErrDraftNotSigned = apperr.NewInvalid("draft must be signed before filing")
 )

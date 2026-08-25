@@ -102,18 +102,31 @@ func draftFromInsertRow(r draftdb.InsertDraftRow) *Draft {
 // draftFromGetByIDRow maps the GetDraftByID row to a *Draft entity.
 func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
 	return &Draft{
-		ID:           r.ID.String(),
-		TenantID:     r.TenantID.String(),
-		CaseID:       pgUUIDToString(r.CaseID),
-		IntimationID: pgUUIDToString(r.IntimationID),
-		PieceType:    r.PieceType,
-		Title:        r.Title,
-		Content:      derefString(r.Content),
-		Status:       r.Status,
-		SagaState:    r.SagaState,
-		CreatedAt:    timestamptzToTime(r.CreatedAt),
-		UpdatedAt:    timestamptzToTime(r.UpdatedAt),
+		ID:             r.ID.String(),
+		TenantID:       r.TenantID.String(),
+		CaseID:         pgUUIDToString(r.CaseID),
+		IntimationID:   pgUUIDToString(r.IntimationID),
+		PieceType:      r.PieceType,
+		Title:          r.Title,
+		Content:        derefString(r.Content),
+		Status:         r.Status,
+		SagaState:      r.SagaState,
+		CreatedAt:      timestamptzToTime(r.CreatedAt),
+		UpdatedAt:      timestamptzToTime(r.UpdatedAt),
+		Tone:           r.Tone,
+		Instructions:   derefString(r.Instructions),
+		SelectedTheses: derefStringSlice(r.SelectedTheses),
 	}
+}
+
+// derefStringSlice normalizes a possibly-nil string slice to a non-nil empty
+// slice — a text[] NOT NULL DEFAULT '{}' column scans as [] in practice, but
+// this keeps the entity's invariant (never nil) explicit at the boundary.
+func derefStringSlice(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // ── Attachment mappers (Fatia 2) ─────────────────────────────────────────────
@@ -273,6 +286,18 @@ func unmarshalCoverage(b []byte) Coverage {
 	return out
 }
 
+// unmarshalCoverageSummary decodes jsonb bytes into a CoverageSummary. The review
+// coverage jsonb has more fields than the trimmed summary exposed in list endpoints;
+// this extracts only the three fields the client needs. A decode fault returns nil.
+func unmarshalCoverageSummary(b []byte) *CoverageSummary {
+	c := unmarshalCoverage(b)
+	return &CoverageSummary{
+		Grounded:         c.Grounded,
+		ChunksUsed:       c.ChunksUsed,
+		SuggestionsTotal: c.SuggestionsTotal,
+	}
+}
+
 // timeToTimestamptz converts a time.Time to a pgtype.Timestamptz.
 func timeToTimestamptz(t time.Time) pgtype.Timestamptz {
 	if t.IsZero() {
@@ -401,4 +426,103 @@ func unmarshalCitations(b []byte) []Citation {
 		return []Citation{}
 	}
 	return out
+}
+
+// ── Fatia 4 mappers ────────────────────────────────────────────────────────
+
+// draftFromSignRow maps a SignDraft RETURNING row to a *Draft entity.
+func draftFromSignRow(r draftdb.SignDraftRow) *Draft {
+	return &Draft{
+		ID:           r.ID.String(),
+		TenantID:     r.TenantID.String(),
+		CaseID:       pgUUIDToString(r.CaseID),
+		IntimationID: pgUUIDToString(r.IntimationID),
+		PieceType:    r.PieceType,
+		Title:        r.Title,
+		Content:      derefString(r.Content),
+		Status:       r.Status,
+		SagaState:    r.SagaState,
+		CreatedAt:    timestamptzToTime(r.CreatedAt),
+		UpdatedAt:    timestamptzToTime(r.UpdatedAt),
+	}
+}
+
+// petitionFromRow maps a Petition db row to a *Petition entity.
+func petitionFromRow(r draftdb.Petition) *Petition {
+	var result *Petition
+	if r.ObservedResult != nil {
+		result = &Petition{ObservedResult: *r.ObservedResult}
+	}
+	p := &Petition{
+		ID:            r.ID.String(),
+		DraftID:       r.DraftID.String(),
+		CourtRecordID: r.CourtRecordID.String(),
+		FiledAt:       timestamptzToTime(r.FiledAt),
+		Receipt:       unmarshalReceipt(r.Receipt),
+	}
+	if result != nil {
+		p.ObservedResult = result.ObservedResult
+	}
+	return p
+}
+
+// unmarshalReceipt decodes jsonb bytes into map[string]any.
+func unmarshalReceipt(b []byte) map[string]any {
+	var out map[string]any
+	if len(b) == 0 {
+		return map[string]any{}
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return map[string]any{}
+	}
+	if out == nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+// draftListItemFromProcessRow maps a ListDraftsByProcessRow to a DraftListItem.
+func draftListItemFromProcessRow(r draftdb.ListDraftsByProcessRow) DraftListItem {
+	item := DraftListItem{
+		ID:        r.ID.String(),
+		PieceType: r.PieceType,
+		Title:     r.Title,
+		Status:    r.Status,
+		SagaState: r.SagaState,
+		CreatedAt: timestamptzToTime(r.CreatedAt),
+	}
+	if r.FiledAt.Valid {
+		t := timestamptzToTime(r.FiledAt)
+		item.FiledAt = &t
+	}
+	if r.ObservedResult != nil {
+		item.ObservedResult = r.ObservedResult
+	}
+	if len(r.ReviewCoverage) > 0 {
+		item.CoverageSummary = unmarshalCoverageSummary(r.ReviewCoverage)
+	}
+	return item
+}
+
+// draftListItemFromAllRow maps a ListDraftsAllRow to a DraftListItem.
+func draftListItemFromAllRow(r draftdb.ListDraftsAllRow) DraftListItem {
+	item := DraftListItem{
+		ID:        r.ID.String(),
+		PieceType: r.PieceType,
+		Title:     r.Title,
+		Status:    r.Status,
+		SagaState: r.SagaState,
+		CreatedAt: timestamptzToTime(r.CreatedAt),
+	}
+	if r.FiledAt.Valid {
+		t := timestamptzToTime(r.FiledAt)
+		item.FiledAt = &t
+	}
+	if r.ObservedResult != nil {
+		item.ObservedResult = r.ObservedResult
+	}
+	if len(r.ReviewCoverage) > 0 {
+		item.CoverageSummary = unmarshalCoverageSummary(r.ReviewCoverage)
+	}
+	return item
 }

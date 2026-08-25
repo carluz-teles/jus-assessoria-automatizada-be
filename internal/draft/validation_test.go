@@ -136,6 +136,75 @@ func TestChatRequest_Validate(t *testing.T) {
 	}
 }
 
+func TestGenerateRequest_Validate(t *testing.T) {
+	tests := []struct {
+		name            string
+		req             GenerateRequest
+		wantErr         bool
+		wantInstruction string // expected Instructions value after Validate (trimmed)
+	}{
+		{
+			name:    "empty body is valid (backward-compat with pre-Fatia-5 empty POST)",
+			req:     GenerateRequest{},
+			wantErr: false,
+		},
+		{
+			name:    "tone tecnico-formal is accepted",
+			req:     GenerateRequest{Tone: ToneTecnicoFormal},
+			wantErr: false,
+		},
+		{
+			name:    "tone direto-assertivo is accepted",
+			req:     GenerateRequest{Tone: ToneDiretoAssertivo},
+			wantErr: false,
+		},
+		{
+			name:    "tone conciliador-institucional is accepted",
+			req:     GenerateRequest{Tone: ToneConciliadorInstitucional},
+			wantErr: false,
+		},
+		{
+			name:    "tone outside the closed set is rejected",
+			req:     GenerateRequest{Tone: "agressivo"},
+			wantErr: true,
+		},
+		{
+			name:            "instructions is trimmed and accepted",
+			req:             GenerateRequest{Instructions: "  Enfatizar a boa-fé.  "},
+			wantErr:         false,
+			wantInstruction: "Enfatizar a boa-fé.",
+		},
+		{
+			name:    "instructions exceeding 2000 runes is rejected (never truncated)",
+			req:     GenerateRequest{Instructions: string(make([]rune, 2001))},
+			wantErr: true,
+		},
+		{
+			name:            "instructions of exactly 2000 runes is accepted",
+			req:             GenerateRequest{Instructions: string(make([]rune, 2000))},
+			wantErr:         false,
+			wantInstruction: string(make([]rune, 2000)),
+		},
+		{
+			name:    "theses with entries is valid (no length rule on the slice)",
+			req:     GenerateRequest{Theses: []string{"Prescrição intercorrente", "Excesso de execução"}},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.req.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && tt.req.Instructions != tt.wantInstruction {
+				t.Errorf("Validate() Instructions = %q, want %q", tt.req.Instructions, tt.wantInstruction)
+			}
+		})
+	}
+}
+
 func TestInferPieceType(t *testing.T) {
 	tests := []struct {
 		name string

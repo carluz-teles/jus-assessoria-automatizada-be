@@ -638,6 +638,133 @@ func TestBuildDraftContext_WithIntimation(t *testing.T) {
 	}
 }
 
+// TestBuildDraftContext_TonePropagation verifies that Draft.Tone/.Instructions/
+// .SelectedTheses (the Fatia 5 generation params persisted by TriggerGeneration
+// on the draft row — see generate_trigger.go) are copied into the composed
+// advisory.DraftContext by buildDraftContext, which is what OnGenerationRequested
+// calls after rereading the draft (generate.go:266). This closes the gap where no
+// test proved the reread → DraftContext copy actually happens.
+func TestBuildDraftContext_TonePropagation(t *testing.T) {
+	tests := []struct {
+		name             string
+		draft            *Draft
+		wantTone         string
+		wantInstructions string
+		wantTheses       []string
+	}{
+		{
+			name: "tone/instructions/theses set on the draft propagate to DraftContext",
+			draft: &Draft{
+				PieceType:      PieceTypeDefense,
+				Tone:           "coloquial",
+				Instructions:   "cite jurisprudência recente do STJ",
+				SelectedTheses: []string{"tese-prescricao", "tese-decadencia"},
+			},
+			wantTone:         "coloquial",
+			wantInstructions: "cite jurisprudência recente do STJ",
+			wantTheses:       []string{"tese-prescricao", "tese-decadencia"},
+		},
+		{
+			name: "server-side default tone (tecnico-formal) propagates like any other value",
+			draft: &Draft{
+				PieceType: PieceTypeDefense,
+				Tone:      ToneTecnicoFormal,
+			},
+			wantTone: ToneTecnicoFormal,
+		},
+		{
+			name:  "zero-value draft: empty tone/instructions/nil theses propagate as empty",
+			draft: &Draft{PieceType: PieceTypeDefense},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dc := buildDraftContext(tt.draft, nil, nil, nil)
+
+			if dc.Tone != tt.wantTone {
+				t.Errorf("DraftContext.Tone = %q, want %q", dc.Tone, tt.wantTone)
+			}
+			if dc.Instructions != tt.wantInstructions {
+				t.Errorf("DraftContext.Instructions = %q, want %q", dc.Instructions, tt.wantInstructions)
+			}
+			if len(dc.SelectedTheses) != len(tt.wantTheses) {
+				t.Fatalf("DraftContext.SelectedTheses = %v, want %v", dc.SelectedTheses, tt.wantTheses)
+			}
+			for i, th := range tt.wantTheses {
+				if dc.SelectedTheses[i] != th {
+					t.Errorf("DraftContext.SelectedTheses[%d] = %q, want %q", i, dc.SelectedTheses[i], th)
+				}
+			}
+		})
+	}
+}
+
+// TestGenerateUseCase_OnGenerationRequested_ToneReachesComposer verifies the
+// end-to-end reread path: OnGenerationRequested reloads the draft (which now
+// carries Tone/Instructions/SelectedTheses persisted by TriggerGeneration) and
+// the composed prompt is built from a DraftContext that includes them. It uses a
+// spy PromptComposer to capture the DraftContext actually passed to ComposeDraft,
+// proving the propagation happens on the real async path, not just in the pure
+// buildDraftContext unit test above.
+func TestGenerateUseCase_OnGenerationRequested_ToneReachesComposer(t *testing.T) {
+	d := makeDraft()
+	d.Tone = "coloquial"
+	d.Instructions = "cite jurisprudência recente do STJ"
+	d.SelectedTheses = []string{"tese-prescricao"}
+
+	w := &fakeWriter{returnedDraft: d}
+	ob := &fakeOutbox{}
+	gen := &fakeGen{out: []byte(cannedJSON)}
+	spy := newSpyComposer()
+
+	uc := NewGenerateUseCase(GenerateUseCaseParams{
+		UoW:      fakeUoW{},
+		Reader:   fakeReader{draft: d},
+		Writer:   w,
+		Outbox:   ob,
+		Dedup:    fakeDedup{},
+		Gen:      gen,
+		Emb:      nil,
+		Search:   indexing.SearchDeps{Pool: nil},
+		Composer: spy,
+		Now:      func() time.Time { return time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC) },
+	})
+
+	if err := uc.OnGenerationRequested(context.Background(), ev()); err != nil {
+		t.Fatalf("want nil err, got %v", err)
+	}
+
+	if spy.gotCtx.Tone != "coloquial" {
+		t.Errorf("composer got Tone = %q, want coloquial", spy.gotCtx.Tone)
+	}
+	if spy.gotCtx.Instructions != "cite jurisprudência recente do STJ" {
+		t.Errorf("composer got Instructions = %q, want the persisted instructions", spy.gotCtx.Instructions)
+	}
+	if len(spy.gotCtx.SelectedTheses) != 1 || spy.gotCtx.SelectedTheses[0] != "tese-prescricao" {
+		t.Errorf("composer got SelectedTheses = %v, want [tese-prescricao]", spy.gotCtx.SelectedTheses)
+	}
+}
+
+// spyComposer records the DraftContext it was called with (ComposeDraft is the
+// only method OnGenerationRequested calls) and delegates every method to the
+// real template composer so the rest of the pipeline (System/User prompt text)
+// stays realistic. It embeds advisory.PromptComposer so it satisfies the
+// interface without repeating the other four methods verbatim.
+type spyComposer struct {
+	advisory.PromptComposer
+	gotCtx advisory.DraftContext
+}
+
+func newSpyComposer() *spyComposer {
+	return &spyComposer{PromptComposer: advisory.NewTemplateComposer()}
+}
+
+func (s *spyComposer) ComposeDraft(agent string, dc advisory.DraftContext) (advisory.Composed, error) {
+	s.gotCtx = dc
+	return s.PromptComposer.ComposeDraft(agent, dc)
+}
+
 // TestBuildDraftContext_NilIntimation verifies that buildDraftContext with a nil
 // IntimationContext leaves the intimation fields empty (blank/processo draft path).
 func TestBuildDraftContext_NilIntimation(t *testing.T) {

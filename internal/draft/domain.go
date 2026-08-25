@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/events"
 )
 
 // UseCase owns the domain logic for the peticionamento Fatia 1 write path.
@@ -17,9 +18,21 @@ import (
 // no worker drains the "default" queue — events would accumulate silently.
 // TODO(F2): emit draft.created once a listener is registered on the correct queue.
 type UseCase struct {
-	repo database.UnitOfWork
-	rw   Repository
-	now  func() time.Time
+	repo    database.UnitOfWork
+	rw      Repository
+	now     func() time.Time
+	outbox  OutboxPublisher
+	storage StoragePresigner
+}
+
+// OutboxPublisher is the narrow port for event publishing within a tx.
+type OutboxPublisher interface {
+	Publish(ctx context.Context, tx database.Tx, ev events.Event) error
+}
+
+// StoragePresigner is the narrow port for presigned URL generation.
+type StoragePresigner interface {
+	PresignedGet(ctx context.Context, key string, ttl time.Duration) (string, error)
 }
 
 // NewUseCase wires the use case to its dependencies. uow owns the transaction
@@ -40,6 +53,16 @@ type Option func(*UseCase)
 // tests pin it for deterministic assertions.
 func WithClock(now func() time.Time) Option {
 	return func(uc *UseCase) { uc.now = now }
+}
+
+// WithOutbox attaches the outbox publisher. Called by cmd/api composition.
+func WithOutbox(ob OutboxPublisher) Option {
+	return func(uc *UseCase) { uc.outbox = ob }
+}
+
+// WithStorage attaches the presigned URL generator. Called by cmd/api composition.
+func WithStorage(s StoragePresigner) Option {
+	return func(uc *UseCase) { uc.storage = s }
 }
 
 // CreateCommand is the input the handler builds from the request + the verified
@@ -302,4 +325,340 @@ func (uc *UseCase) RemoveAttachment(ctx context.Context, cmd RemoveAttachmentCom
 	return uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
 		return uc.rw.DeleteAttachment(ctx, tx, cmd.TenantID, cmd.DraftID, cmd.AttachmentID)
 	})
+}
+
+// ── Peticionamento use cases (Fatia 4) ──────────────────────────────────────
+
+// SignCommand is the input for POST /v1/pecas/:id/sign.
+type SignCommand struct {
+	TenantID string
+	DraftID  string
+}
+
+// SignResult carries the response for a successful sign.
+type SignResult struct {
+	ID        string
+	Status    string
+	SignedAt  time.Time
+	IsIdempot bool // true when the draft was already SIGNED (200, not fresh)
+}
+
+// Sign implements POST /v1/pecas/:id/sign. In ONE tenant-scoped tx:
+//  1. GetDraftByID (tenant guard → 404 if not found).
+//  2. Guard: status must be DRAFT or REVIEWED → ErrInvalidStatusForSign.
+//  3. If already SIGNED → return current data (idempotent, no error).
+//  4. SignDraft → status=SIGNED, signed_at=now().
+//  5. outbox.Publish(draft.signed) — same tx.
+//  6. Return {id, status, signed_at}.
+func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, error) {
+	var result *SignResult
+
+	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		d, err := uc.rw.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
+		if err != nil {
+			return err
+		}
+
+		// Idempotent: already signed → return current data.
+		if d.Status == StatusSigned {
+			result = &SignResult{
+				ID:        d.ID,
+				Status:    d.Status,
+				SignedAt:  d.UpdatedAt, // best approximation without signed_at on entity
+				IsIdempot: true,
+			}
+			return nil
+		}
+
+		// Guard: must be DRAFT or REVIEWED.
+		if d.Status != StatusDraft && d.Status != StatusReviewed {
+			return ErrInvalidStatusForSign
+		}
+
+		signed, err := uc.rw.SignDraft(ctx, tx, cmd.DraftID, cmd.TenantID)
+		if err != nil {
+			return err
+		}
+
+		// Emit draft.signed event (outbox).
+		if uc.outbox != nil {
+			ev := newDraftSigned(signed)
+			if err := uc.outbox.Publish(ctx, tx, ev); err != nil {
+				return err
+			}
+		}
+
+		result = &SignResult{
+			ID:        signed.ID,
+			Status:    signed.Status,
+			SignedAt:  signed.UpdatedAt, // mapper sets updated_at = now() on sign
+			IsIdempot: false,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// FileCommand is the input for POST /v1/pecas/:id/file.
+type FileCommand struct {
+	TenantID      string
+	DraftID       string
+	Receipt       map[string]any
+	CourtRecordID string // optional override
+	FiledAt       *time.Time
+}
+
+// FileResult carries the response for a successful file.
+type FileResult struct {
+	PetitionID   string
+	DraftID      string
+	FiledAt      time.Time
+	Receipt      map[string]any
+	IsIdempotent bool // true when petition already existed (200, not 201)
+}
+
+// File implements POST /v1/pecas/:id/file. In ONE tenant-scoped tx:
+//  1. GetDraftByID (tenant guard → 404).
+//  2. Guard: status must be SIGNED.
+//  3. Check for existing petition → idempotent (return 200).
+//  4. Resolve court_record_id: body override > intimation → ErrCourtRecordRequired.
+//  5. InsertPetition + UpdateSagaStateAndSignedAt(saga_state=FILED).
+//  6. outbox.Publish(petition.filed) — same tx.
+func (uc *UseCase) File(ctx context.Context, cmd FileCommand) (*FileResult, error) {
+	var result *FileResult
+
+	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		d, err := uc.rw.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
+		if err != nil {
+			return err
+		}
+
+		// Guard: must be SIGNED.
+		if d.Status != StatusSigned {
+			return ErrDraftNotSigned
+		}
+
+		// Check for existing petition (idempotent).
+		existing, err := uc.rw.GetPetitionByDraftID(ctx, tx, cmd.TenantID, cmd.DraftID)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			result = &FileResult{
+				PetitionID:   existing.ID,
+				DraftID:      existing.DraftID,
+				FiledAt:      existing.FiledAt,
+				Receipt:      existing.Receipt,
+				IsIdempotent: true,
+			}
+			return nil
+		}
+
+		// Resolve court_record_id.
+		courtRecordID := cmd.CourtRecordID
+		if courtRecordID == "" && d.IntimationID != "" {
+			crid, crErr := uc.rw.GetCourtRecordIDByIntimation(ctx, tx, cmd.TenantID, d.IntimationID)
+			if crErr != nil {
+				return crErr
+			}
+			courtRecordID = crid
+		}
+		if courtRecordID == "" {
+			return ErrCourtRecordRequired
+		}
+
+		filedAt := uc.now()
+		if cmd.FiledAt != nil {
+			filedAt = *cmd.FiledAt
+		}
+
+		petition, err := uc.rw.InsertPetition(ctx, tx, &Petition{
+			DraftID:       cmd.DraftID,
+			CourtRecordID: courtRecordID,
+			FiledAt:       filedAt,
+			Receipt:       cmd.Receipt,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Flip saga_state to FILED.
+		if _, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateFiled, false, ""); err != nil {
+			return err
+		}
+
+		// Emit petition.filed event (outbox).
+		if uc.outbox != nil {
+			ev := newPetitionFiled(petition, cmd.TenantID)
+			if err := uc.outbox.Publish(ctx, tx, ev); err != nil {
+				return err
+			}
+		}
+
+		result = &FileResult{
+			PetitionID: petition.ID,
+			DraftID:    petition.DraftID,
+			FiledAt:    petition.FiledAt,
+			Receipt:    petition.Receipt,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ResultCommand is the input for PATCH /v1/pecas/:id/result.
+type ResultCommand struct {
+	TenantID       string
+	DraftID        string
+	ObservedResult string
+}
+
+// ResultResult carries the response for a successful result update.
+type ResultResult struct {
+	PetitionID     string
+	ObservedResult string
+}
+
+// Result implements PATCH /v1/pecas/:id/result. In ONE tenant-scoped tx:
+//  1. Guard: petition must exist for this draft → ErrPetitionNotFound.
+//  2. UpdateObservedResult.
+func (uc *UseCase) Result(ctx context.Context, cmd ResultCommand) (*ResultResult, error) {
+	var result *ResultResult
+
+	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		p, err := uc.rw.UpdateObservedResult(ctx, tx, cmd.TenantID, cmd.DraftID, cmd.ObservedResult)
+		if err != nil {
+			return err
+		}
+		result = &ResultResult{
+			PetitionID:     p.ID,
+			ObservedResult: p.ObservedResult,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ExportCommand is the input for GET /v1/pecas/:id/export.
+type ExportCommand struct {
+	TenantID string
+	DraftID  string
+	Format   string // "docx" or "pdf"
+}
+
+// ExportResult carries the presigned URL for download.
+type ExportResult struct {
+	URL       string
+	ExpiresIn int // seconds
+}
+
+// Export implements GET /v1/pecas/:id/export. It runs in a read-only tx to fetch
+// the draft content, then generates a presigned GET URL. In v0, content is served
+// as text/plain.
+func (uc *UseCase) Export(ctx context.Context, cmd ExportCommand) (*ExportResult, error) {
+	if uc.storage == nil {
+		return nil, ErrExportFormatInvalid
+	}
+
+	var result *ExportResult
+	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		d, err := uc.rw.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
+		if err != nil {
+			return err
+		}
+
+		if d.Content == "" {
+			return ErrDraftNoContent
+		}
+
+		// v0: presign the draft content as text/plain. The storage key is derived
+		// from the tenant + draft id. In production, content would be in S3 and
+		// the key would come from the draft row; for v0 we use the content column.
+		key := cmd.TenantID + "/drafts/" + d.ID + "/content.txt"
+		ttl := 15 * time.Minute
+		url, err := uc.storage.PresignedGet(ctx, key, ttl)
+		if err != nil {
+			return err
+		}
+
+		result = &ExportResult{
+			URL:       url,
+			ExpiresIn: int(ttl.Seconds()),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ListByProcessQuery is the input for GET /v1/processos/:id/pecas.
+type ListByProcessQuery struct {
+	TenantID    string
+	CaseID      string
+	LastCreated string // RFC3339 sort value; max sentinel for first page
+	LastID      string
+	Limit       int
+}
+
+// ListAllQuery is the input for GET /v1/pecas (tenant library).
+type ListAllQuery struct {
+	TenantID    string
+	PieceType   string // optional filter
+	Status      string // optional filter
+	LastCreated string
+	LastID      string
+	Limit       int
+}
+
+// ListByProcess implements GET /v1/processos/:id/pecas. Runs in a read-only tx.
+func (uc *UseCase) ListByProcess(ctx context.Context, q ListByProcessQuery) (DraftListResult, error) {
+	var result DraftListResult
+	err := uc.repo.Do(ctx, q.TenantID, func(tx database.Tx) error {
+		rows, err := uc.rw.ListDraftsByProcess(ctx, tx, q.TenantID, q.CaseID, q.LastCreated, q.LastID, q.Limit+1)
+		if err != nil {
+			return err
+		}
+		hasMore := false
+		if len(rows) > q.Limit {
+			rows, hasMore = rows[:q.Limit], true
+		}
+		result = DraftListResult{Items: rows, HasMore: hasMore}
+		return nil
+	})
+	if err != nil {
+		return DraftListResult{}, err
+	}
+	return result, nil
+}
+
+// ListAll implements GET /v1/pecas (tenant library). Runs in a read-only tx.
+func (uc *UseCase) ListAll(ctx context.Context, q ListAllQuery) (DraftListResult, error) {
+	var result DraftListResult
+	err := uc.repo.Do(ctx, q.TenantID, func(tx database.Tx) error {
+		rows, err := uc.rw.ListDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.LastCreated, q.LastID, q.Limit+1)
+		if err != nil {
+			return err
+		}
+		hasMore := false
+		if len(rows) > q.Limit {
+			rows, hasMore = rows[:q.Limit], true
+		}
+		result = DraftListResult{Items: rows, HasMore: hasMore}
+		return nil
+	})
+	if err != nil {
+		return DraftListResult{}, err
+	}
+	return result, nil
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
 )
 
@@ -23,6 +24,9 @@ type writer interface {
 	AttachDocument(ctx context.Context, cmd AttachDocumentCommand) (*Attachment, error)
 	UpdateAttachmentCategory(ctx context.Context, cmd UpdateAttachmentCategoryCommand) (*Attachment, error)
 	RemoveAttachment(ctx context.Context, cmd RemoveAttachmentCommand) error
+	Sign(ctx context.Context, cmd SignCommand) (*SignResult, error)
+	File(ctx context.Context, cmd FileCommand) (*FileResult, error)
+	Result(ctx context.Context, cmd ResultCommand) (*ResultResult, error)
 }
 
 // generator is the narrow port for the POST /v1/pecas/:id/generate trigger. It is a
@@ -45,13 +49,33 @@ type reviewer interface {
 	ReviewDraft(ctx context.Context, cmd ReviewDraftCommand) (*ReviewResult, error)
 }
 
+// thesisSuggester is the narrow port for POST /v1/pecas/:id/theses (Sugerir Teses
+// síncrono, Fatia 5). Composed independently — it is stateless (no writer).
+type thesisSuggester interface {
+	SuggestTheses(ctx context.Context, cmd SuggestThesesCommand) (*SuggestThesesResult, error)
+}
+
+// lister is the narrow port for the paginated list endpoints.
+type lister interface {
+	ListByProcess(ctx context.Context, q ListByProcessQuery) (DraftListResult, error)
+	ListAll(ctx context.Context, q ListAllQuery) (DraftListResult, error)
+}
+
+// presigner is the narrow port for presigned URL generation (export endpoint).
+type presigner interface {
+	Export(ctx context.Context, cmd ExportCommand) (*ExportResult, error)
+}
+
 // Handler is the draft HTTP surface. It owns its routing; cmd/api composes via
 // RegisterV1.
 type Handler struct {
 	uc     writer
-	gen    generator // nil when the generation use case is not wired (no AI key)
-	chat   chatter   // nil when the chat use case is not wired
-	review reviewer  // nil when the review use case is not wired
+	gen    generator       // nil when the generation use case is not wired (no AI key)
+	chat   chatter         // nil when the chat use case is not wired
+	review reviewer        // nil when the review use case is not wired
+	theses thesisSuggester // nil when the theses use case is not wired (no AI key)
+	lister lister          // nil when the list use case is not wired
+	export presigner       // nil when the export use case is not wired
 }
 
 // NewHandler wires the handler to the use case.
@@ -80,20 +104,52 @@ func (h *Handler) WithReviewer(rev reviewer) *Handler {
 	return h
 }
 
+// WithTheses attaches the thesis-suggestion use case to the handler. Called by
+// cmd/api composition when the theses use case is available (requires AI config).
+func (h *Handler) WithTheses(t thesisSuggester) *Handler {
+	h.theses = t
+	return h
+}
+
+// WithLister attaches the list use case to the handler.
+func (h *Handler) WithLister(l lister) *Handler {
+	h.lister = l
+	return h
+}
+
+// WithExport attaches the export use case to the handler.
+func (h *Handler) WithExport(e presigner) *Handler {
+	h.export = e
+	return h
+}
+
 // RegisterV1 mounts the peças routes on the /v1 group. The static-vs-param ordering
 // matters: /pecas/:id/anexos must be declared before /pecas/:id so Fiber routes them
 // correctly. Fiber's router is declaration-order-sensitive for sub-resources under a
 // param segment.
 func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/pecas", h.createPeca)
+	r.Get("/pecas", h.listPecas)
 	r.Get("/pecas/:id", h.getPeca)
 	r.Patch("/pecas/:id", h.patchPeca)
+
+	// Peticionamento (Fatia 4).
+	r.Post("/pecas/:id/sign", h.signPeca)
+	r.Post("/pecas/:id/file", h.filePeca)
+	r.Patch("/pecas/:id/result", h.resultPeca)
+	r.Get("/pecas/:id/export", h.exportPeca)
+
+	// Process-scoped list.
+	r.Get("/processos/:id/pecas", h.listPecasByProcess)
 
 	// AI generation trigger (Fatia 3).
 	r.Post("/pecas/:id/generate", h.generatePeca)
 
 	// AI review trigger (Fatia 3 — Revisar síncrono).
 	r.Post("/pecas/:id/review", h.reviewPeca)
+
+	// AI thesis suggestion (Fatia 5 — Sugerir Teses síncrono).
+	r.Post("/pecas/:id/theses", h.thesesPeca)
 
 	// Grounded chat (Fatia 3b).
 	r.Post("/pecas/:id/chat", h.postChat)
@@ -396,6 +452,10 @@ func reviewToResponse(r *Review) *reviewResponse {
 // generatePeca handles POST /v1/pecas/:id/generate (Fatia 3). Guards saga_state,
 // flips to EXTRACTING, publishes draft.generation_requested in the same tx.
 // Returns 202 with {data:{id, saga_state:"EXTRACTING"}}.
+//
+// The body is entirely OPTIONAL (Fatia 5 — tone/instructions/theses): an empty
+// body, or no body at all, is valid and behaves exactly as before Fatia 5
+// (backward-compat). A malformed JSON body still fails BodyParser as before.
 func (h *Handler) generatePeca(c *fiber.Ctx) error {
 	if h.gen == nil {
 		// The generation use case was not wired (no AI config). Return 202 with FAILED
@@ -408,9 +468,24 @@ func (h *Handler) generatePeca(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	draftID := c.Params("id")
 
+	var req GenerateRequest
+	// An empty/absent body is valid (BodyParser leaves req at its zero value on
+	// EOF for the JSON content type); only a malformed body errors.
+	if len(c.Body()) > 0 {
+		if err := c.BodyParser(&req); err != nil {
+			return httpx.WriteError(c, err)
+		}
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
 	draft, err := h.gen.TriggerGeneration(c.UserContext(), TriggerGenerationCommand{
-		TenantID: tenantID,
-		DraftID:  draftID,
+		TenantID:     tenantID,
+		DraftID:      draftID,
+		Tone:         req.Tone,
+		Instructions: req.Instructions,
+		Theses:       req.Theses,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -449,6 +524,55 @@ func (h *Handler) reviewPeca(c *fiber.Ctx) error {
 			"saga_state": result.SagaState,
 		},
 	})
+}
+
+// ─── POST /v1/pecas/:id/theses ────────────────────────────────────────────────
+
+// thesesPeca handles POST /v1/pecas/:id/theses (Sugerir Teses síncrono, Fatia 5).
+// Guards thesisSuggester nil, tenant, and draftID. Body is intentionally empty (no
+// input needed — same shape as /review). STATELESS: no saga_state is ever touched,
+// even on LLM failure. Returns 200 {data:{theses:[...]}}.
+func (h *Handler) thesesPeca(c *fiber.Ctx) error {
+	if h.theses == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	result, err := h.theses.SuggestTheses(c.UserContext(), SuggestThesesCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"data": fiber.Map{
+			"theses": thesesToResponse(result.Theses),
+		},
+	})
+}
+
+// thesisResponse is one item in the /theses response.
+type thesisResponse struct {
+	Label      string `json:"label"`
+	Confidence string `json:"confidence"`
+	Reference  string `json:"reference"`
+	Foundation string `json:"foundation"`
+}
+
+func thesesToResponse(theses []Thesis) []thesisResponse {
+	out := make([]thesisResponse, 0, len(theses))
+	for _, t := range theses {
+		out = append(out, thesisResponse{
+			Label:      t.Label,
+			Confidence: t.Confidence,
+			Reference:  t.Reference,
+			Foundation: t.Foundation,
+		})
+	}
+	return out
 }
 
 // ── Chat handlers (Fatia 3b) ──────────────────────────────────────────────────
@@ -695,4 +819,298 @@ func daysLeftFromNow(endDate time.Time) int {
 		return 0
 	}
 	return days
+}
+
+// ── Fatia 4 — peticionamento handlers ───────────────────────────────────────
+
+// maxCreatedAt is the descending keyset's first-page cursor: a created_at above
+// every real row, so the newest-first scan starts at the top.
+const maxCreatedAt = "9999-12-31T23:59:59.999999Z"
+
+// maxUUID is the descending keyset's first-page id sentinel: the highest possible
+// UUID, so the scan starts at the top.
+const maxUUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+// signPeca handles POST /v1/pecas/:id/sign. Body is intentionally empty (the
+// signing happens server-side). Returns 200 {data:{id, status, signed_at}}.
+func (h *Handler) signPeca(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	result, err := h.uc.Sign(c.UserContext(), SignCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"data": signResponse{
+			ID:       result.ID,
+			Status:   result.Status,
+			SignedAt: result.SignedAt.Format(time.RFC3339),
+		},
+	})
+}
+
+// filePeca handles POST /v1/pecas/:id/file. Validates the body, resolves
+// court_record_id, creates the petition, and returns 201 {data:{...}}.
+func (h *Handler) filePeca(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	var req FileRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	var filedAt *time.Time
+	if req.FiledAt != "" {
+		t, err := time.Parse(time.RFC3339, req.FiledAt)
+		if err != nil {
+			return httpx.WriteError(c, apperr.NewInvalid("invalid filed_at timestamp"))
+		}
+		filedAt = &t
+	}
+
+	result, err := h.uc.File(c.UserContext(), FileCommand{
+		TenantID:      tenantID,
+		DraftID:       draftID,
+		Receipt:       req.Receipt,
+		CourtRecordID: req.CourtRecordID,
+		FiledAt:       filedAt,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
+	status := fiber.StatusCreated
+	if result.IsIdempotent {
+		status = fiber.StatusOK
+	}
+	return c.Status(status).JSON(fiber.Map{
+		"data": fileResponse{
+			PetitionID: result.PetitionID,
+			DraftID:    result.DraftID,
+			FiledAt:    result.FiledAt.Format(time.RFC3339),
+			Receipt:    result.Receipt,
+		},
+	})
+}
+
+// resultPeca handles PATCH /v1/pecas/:id/result. Validates the body and updates
+// the petition's observed_result. Returns 200 {data:{petition_id, observed_result}}.
+func (h *Handler) resultPeca(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	var req ResultRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	result, err := h.uc.Result(c.UserContext(), ResultCommand{
+		TenantID:       tenantID,
+		DraftID:        draftID,
+		ObservedResult: req.ObservedResult,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"data": resultResponse{
+			PetitionID:     result.PetitionID,
+			ObservedResult: result.ObservedResult,
+		},
+	})
+}
+
+// exportPeca handles GET /v1/pecas/:id/export?format=docx|pdf. Returns 200
+// {data:{url, expires_in}} with a presigned download URL.
+func (h *Handler) exportPeca(c *fiber.Ctx) error {
+	if h.export == nil {
+		return httpx.WriteError(c, apperr.NewInvalid("export not configured"))
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	format := c.Query("format")
+
+	if format != "docx" && format != "pdf" {
+		return httpx.WriteError(c, ErrExportFormatInvalid)
+	}
+
+	result, err := h.export.Export(c.UserContext(), ExportCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+		Format:   format,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"data": exportResponse{
+			URL:       result.URL,
+			ExpiresIn: result.ExpiresIn,
+		},
+	})
+}
+
+// listPecasByProcess handles GET /v1/processos/:id/pecas. Returns a paginated
+// list of peças for a given process (case_id).
+func (h *Handler) listPecasByProcess(c *fiber.Ctx) error {
+	if h.lister == nil {
+		return httpx.WriteError(c, apperr.NewInvalid("list not configured"))
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	caseID := c.Params("id")
+	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	lastCreated, lastID := maxCreatedAt, maxUUID
+	if tok := c.Query("cursor"); tok != "" {
+		cur, err := httpx.DecodeCursor(tok)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		lastCreated, lastID = cur.LastSortValue, cur.LastID
+	}
+
+	res, err := h.lister.ListByProcess(c.UserContext(), ListByProcessQuery{
+		TenantID:    tenantID,
+		CaseID:      caseID,
+		LastCreated: lastCreated,
+		LastID:      lastID,
+		Limit:       limit,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newDraftListPage(res, limit))
+}
+
+// listPecas handles GET /v1/pecas (tenant library). Returns a paginated list of
+// all peças for the tenant, with optional filters.
+func (h *Handler) listPecas(c *fiber.Ctx) error {
+	if h.lister == nil {
+		return httpx.WriteError(c, apperr.NewInvalid("list not configured"))
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+	pieceType := c.Query("piece_type")
+	status := c.Query("status")
+
+	lastCreated, lastID := maxCreatedAt, maxUUID
+	if tok := c.Query("cursor"); tok != "" {
+		cur, err := httpx.DecodeCursor(tok)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		lastCreated, lastID = cur.LastSortValue, cur.LastID
+	}
+
+	res, err := h.lister.ListAll(c.UserContext(), ListAllQuery{
+		TenantID:    tenantID,
+		PieceType:   pieceType,
+		Status:      status,
+		LastCreated: lastCreated,
+		LastID:      lastID,
+		Limit:       limit,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newDraftListPage(res, limit))
+}
+
+// ── Fatia 4 response shapes ────────────────────────────────────────────────
+
+type signResponse struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	SignedAt string `json:"signed_at"`
+}
+
+type fileResponse struct {
+	PetitionID string         `json:"petition_id"`
+	DraftID    string         `json:"draft_id"`
+	FiledAt    string         `json:"filed_at"`
+	Receipt    map[string]any `json:"receipt"`
+}
+
+type resultResponse struct {
+	PetitionID     string `json:"petition_id"`
+	ObservedResult string `json:"observed_result"`
+}
+
+type exportResponse struct {
+	URL       string `json:"url"`
+	ExpiresIn int    `json:"expires_in"`
+}
+
+// draftListItemResponse is the per-item shape in paginated peça lists.
+type draftListItemResponse struct {
+	ID              string            `json:"id"`
+	PieceType       string            `json:"piece_type"`
+	Title           string            `json:"title"`
+	Status          string            `json:"status"`
+	SagaState       string            `json:"saga_state"`
+	CoverageSummary *coverageSummaryR `json:"coverage_summary,omitempty"`
+	FiledAt         *string           `json:"filed_at,omitempty"`
+	ObservedResult  *string           `json:"observed_result,omitempty"`
+	CreatedAt       string            `json:"created_at"`
+}
+
+type coverageSummaryR struct {
+	Grounded         bool `json:"grounded"`
+	ChunksUsed       int  `json:"chunks_used"`
+	SuggestionsTotal int  `json:"suggestions_total"`
+}
+
+// newDraftListPage wraps the list read model in the cursor envelope.
+func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemResponse] {
+	items := make([]draftListItemResponse, 0, len(res.Items))
+	for _, it := range res.Items {
+		resp := draftListItemResponse{
+			ID:        it.ID,
+			PieceType: it.PieceType,
+			Title:     it.Title,
+			Status:    it.Status,
+			SagaState: it.SagaState,
+			CreatedAt: it.CreatedAt.Format(time.RFC3339),
+		}
+		if it.CoverageSummary != nil {
+			resp.CoverageSummary = &coverageSummaryR{
+				Grounded:         it.CoverageSummary.Grounded,
+				ChunksUsed:       it.CoverageSummary.ChunksUsed,
+				SuggestionsTotal: it.CoverageSummary.SuggestionsTotal,
+			}
+		}
+		if it.FiledAt != nil {
+			s := it.FiledAt.Format(time.RFC3339)
+			resp.FiledAt = &s
+		}
+		if it.ObservedResult != nil {
+			resp.ObservedResult = it.ObservedResult
+		}
+		items = append(items, resp)
+	}
+
+	meta := httpx.PageMeta{Limit: limit}
+	if res.HasMore && len(items) > 0 {
+		last := res.Items[len(items)-1]
+		tok := httpx.EncodeCursor(httpx.Cursor{
+			LastID:        last.ID,
+			LastSortValue: last.CreatedAt.UTC().Format(time.RFC3339Nano),
+		})
+		meta.NextCursor = &tok
+	}
+	return httpx.Page[draftListItemResponse]{Data: items, Page: meta}
 }
