@@ -110,6 +110,26 @@ func (s Scope) Validate() error {
 	)
 }
 
+// AddWatchedOABRequest is the POST /v1/acquisition/watched-oabs body: one OAB
+// registration ("UFNUMBER", e.g. "SP123456") to add to the tenant's DJEN watch.
+type AddWatchedOABRequest struct {
+	OAB string `json:"oab"`
+}
+
+// Validate enforces the boundary rule: OAB must be present and a well-formed
+// registration (reuses oabRegex — the same shape ActivateIntegrationRequest checks).
+func (r AddWatchedOABRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.OAB, validation.Required, validation.Match(oabRegex)),
+	)
+}
+
+// ToggleWatchedOABRequest is the PATCH /v1/acquisition/watched-oabs/:oab body: the
+// Termos liga/desliga switch. No further shape validation — a bool is always valid.
+type ToggleWatchedOABRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
 // parseOAB validates a combined "UFNÚMERO" registration (e.g. "SP123456") and
 // splits it into the OABEntry the DJEN connector queries by. A bad format is a
 // typed Invalid error (→ 400) raised before any network call — same shape as

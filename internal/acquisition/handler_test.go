@@ -57,6 +57,16 @@ type fakeHandlerUC struct {
 	gotTriageID     string
 	gotTriageVerb   string
 	triageErr       error
+
+	// watched_oab lifecycle (AddWatchedOAB/ToggleWatchedOAB): what the handler
+	// forwarded, canned responses/errors to drive both branches.
+	addWatchedOABResp    *WatchedOAB
+	addWatchedOABErr     error
+	gotAddWatchedOAB     OABEntry
+	toggleWatchedOABResp *WatchedOAB
+	toggleWatchedOABErr  error
+	gotToggleOAB         string
+	gotToggleEnabled     bool
 }
 
 func (f *fakeHandlerUC) ActivateIntegration(_ context.Context, tenantID string, scope Scope) (*Integration, error) {
@@ -99,6 +109,17 @@ func (f *fakeHandlerUC) AssignIntimacaoAssignee(_ context.Context, _, _ string, 
 
 func (f *fakeHandlerUC) BulkAssignIntimacoes(_ context.Context, _ string, _ bool, _ IntimacoesQuery, ids []string, _ *string) (int64, error) {
 	return int64(len(ids)), nil
+}
+
+func (f *fakeHandlerUC) AddWatchedOAB(_ context.Context, _ string, oab OABEntry) (*WatchedOAB, error) {
+	f.gotAddWatchedOAB = oab
+	return f.addWatchedOABResp, f.addWatchedOABErr
+}
+
+func (f *fakeHandlerUC) ToggleWatchedOAB(_ context.Context, _, oab string, enabled bool) (*WatchedOAB, error) {
+	f.gotToggleOAB = oab
+	f.gotToggleEnabled = enabled
+	return f.toggleWatchedOABResp, f.toggleWatchedOABErr
 }
 
 // fakeReader is a no-op read port for the write-path handler tests (the read

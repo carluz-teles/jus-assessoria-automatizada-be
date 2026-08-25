@@ -62,6 +62,12 @@ type SyncRunParams struct {
 	// "guarda-chuva"), so the reconciliations read can group windows by job. Empty
 	// for a continuous/scheduler sync (stored NULL).
 	BackfillJobID string
+	// TriggerReason/TriggerOAB attribute a standalone catch-up run (BackfillJobID
+	// empty) to the OAB re-enable that caused it — see newCatchUpSyncRequested's
+	// CatchUpOABKey. Empty for every other run (daily, backfill-windowed,
+	// scheduler), which have no single OAB to attribute.
+	TriggerReason string
+	TriggerOAB    string
 }
 
 // SyncRunOutcome closes a run. Error is empty on OK (the repo writes NULL) and
@@ -412,6 +418,12 @@ func (uc *SyncUseCase) startRun(ctx context.Context, ev SyncRequested, connector
 			WindowFrom:       ev.WindowFrom,
 			WindowTo:         ev.WindowTo,
 			BackfillJobID:    ev.BackfillJobID,
+			TriggerReason:    catchUpTriggerReason(ev.CatchUpOABKey),
+			// canonicalOAB: ev.CatchUpOABKey is the internal "NUMBER|UF" index key;
+			// trigger_oab is user-facing (Capturas screen), so store the canonical
+			// "UFNUMBER" form — same as backfill_job.trigger_oabs (scope.OAB).
+			// canonicalOAB("") returns "" (no separator match), safe for an ordinary sync.
+			TriggerOAB: canonicalOAB(ev.CatchUpOABKey),
 		})
 		if ierr != nil {
 			return ierr
@@ -973,6 +985,8 @@ func newSyncCompleted(ev SyncRequested, syncRunID string, itemsNew, itemsDeduped
 		SliceIndex:    ev.SliceIndex,
 		ItemsNew:      itemsNew,
 		ItemsDeduped:  itemsDeduped,
+		CatchUpOABKey: ev.CatchUpOABKey,
+		CatchUpSince:  ev.CatchUpSince,
 	}
 }
 
@@ -985,5 +999,7 @@ func newSyncFailed(ev SyncRequested, syncRunID, reason string) SyncFailed {
 		BackfillJobID: ev.BackfillJobID,
 		SliceIndex:    ev.SliceIndex,
 		Reason:        reason,
+		CatchUpOABKey: ev.CatchUpOABKey,
+		CatchUpSince:  ev.CatchUpSince,
 	}
 }

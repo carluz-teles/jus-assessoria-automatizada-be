@@ -10,7 +10,7 @@
 -- the raw DJEN item, re-parsed per matched tenant to create its court_record/intimação.
 SELECT w.tenant_id, w.oab_key, p.payload
 FROM publication p
-JOIN watched_oab w ON w.oab_key = ANY (p.recipient_oabs)
+JOIN watched_oab w ON w.oab_key = ANY (p.recipient_oabs) AND w.enabled = true
 WHERE p.made_available_at = $1;
 
 -- name: MatchPublicationsForTenantSince :many
@@ -21,5 +21,5 @@ WHERE p.made_available_at = $1;
 -- everything from tomorrow on.
 SELECT w.oab_key, p.payload
 FROM publication p
-JOIN watched_oab w ON w.oab_key = ANY (p.recipient_oabs)
+JOIN watched_oab w ON w.oab_key = ANY (p.recipient_oabs) AND w.enabled = true
 WHERE w.tenant_id = $1 AND p.made_available_at >= $2;

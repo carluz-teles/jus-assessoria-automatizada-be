@@ -610,8 +610,8 @@ func (q *Queries) InsertIntimation(ctx context.Context, arg InsertIntimationPara
 const insertSyncRun = `-- name: InsertSyncRun :one
 
 INSERT INTO sync_run
-    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to, backfill_job_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    (tenant_id, integration_id, connector_id, connector_version, started_at, status, event_id, window_from, window_to, backfill_job_id, trigger_reason, trigger_oab)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING id
 `
 
@@ -626,6 +626,8 @@ type InsertSyncRunParams struct {
 	WindowFrom       pgtype.Date        `json:"window_from"`
 	WindowTo         pgtype.Date        `json:"window_to"`
 	BackfillJobID    pgtype.UUID        `json:"backfill_job_id"`
+	TriggerReason    *string            `json:"trigger_reason"`
+	TriggerOab       *string            `json:"trigger_oab"`
 }
 
 // sync cycle queries (acquisition slice).
@@ -641,6 +643,9 @@ type InsertSyncRunParams struct {
 // records the sync_requested event that opened it, so a re-delivery can find and
 // resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
 // slice's date window so the reconciliations read can show it (NULL when absent).
+// trigger_reason/trigger_oab are set only on a standalone catch-up sync (the OAB
+// toggle re-enable path — see SyncRequested.CatchUpOABKey); NULL for every other
+// run (daily, backfill-windowed, scheduler), which have no single OAB to attribute.
 func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertSyncRun,
 		arg.TenantID,
@@ -653,6 +658,8 @@ func (q *Queries) InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (u
 		arg.WindowFrom,
 		arg.WindowTo,
 		arg.BackfillJobID,
+		arg.TriggerReason,
+		arg.TriggerOab,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)

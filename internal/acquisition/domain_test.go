@@ -56,6 +56,61 @@ type mockRepo struct {
 	setUserStatusErr    error
 	gotUserStatusIntiID string
 	gotUserStatusValue  string
+
+	// watched_oab lifecycle (AddWatchedOAB/ToggleWatchedOAB): watchedOAB seeds the
+	// pre-existing rows by oab_key (absent → GetWatchedOAB/DisableWatchedOAB miss);
+	// the rest capture what AddOrEnableWatchedOAB/DisableWatchedOAB were called with.
+	watchedOAB        map[string]*WatchedOAB
+	addOrEnableCalls  int
+	disableCalls      int
+	gotAddOrEnableKey string
+	gotDisableKey     string
+	clearCatchUpCalls int
+}
+
+func (m *mockRepo) AddOrEnableWatchedOAB(_ context.Context, _ database.Tx, _, integrationID, oabKey string) (WatchedOAB, bool, bool, error) {
+	m.addOrEnableCalls++
+	m.gotAddOrEnableKey = oabKey
+	if m.watchedOAB == nil {
+		m.watchedOAB = map[string]*WatchedOAB{}
+	}
+	st, existed := m.watchedOAB[oabKey]
+	if !existed {
+		row := WatchedOAB{OABKey: oabKey, IntegrationID: integrationID, Enabled: true}
+		m.watchedOAB[oabKey] = &row
+		return row, true, false, nil
+	}
+	if !st.Enabled {
+		st.Enabled = true
+		return *st, false, true, nil
+	}
+	return *st, false, false, nil
+}
+
+func (m *mockRepo) DisableWatchedOAB(_ context.Context, _ database.Tx, _, _, oabKey string) (WatchedOAB, error) {
+	m.disableCalls++
+	m.gotDisableKey = oabKey
+	if m.watchedOAB == nil {
+		m.watchedOAB = map[string]*WatchedOAB{}
+	}
+	st, existed := m.watchedOAB[oabKey]
+	if !existed {
+		return WatchedOAB{}, ErrWatchedOABNotFound
+	}
+	st.Enabled = false
+	return *st, nil
+}
+
+func (m *mockRepo) GetWatchedOAB(_ context.Context, _ database.Tx, _, _, oabKey string) (WatchedOAB, error) {
+	if st, ok := m.watchedOAB[oabKey]; ok {
+		return *st, nil
+	}
+	return WatchedOAB{}, ErrWatchedOABNotFound
+}
+
+func (m *mockRepo) ClearWatchedOABCatchUp(_ context.Context, _ database.Tx, _, _, _ string, _ time.Time) error {
+	m.clearCatchUpCalls++
+	return nil
 }
 
 func (m *mockRepo) GetBySource(_ context.Context, _ database.Tx, _, source string) (*Integration, error) {
@@ -169,10 +224,6 @@ func (m *mockRepo) GetReconciliationTotals(_ context.Context, _ string) (Reconci
 // The backfill methods satisfy the widened Repository interface; the activation
 // use case under test here never calls them (they are exercised by the backfill
 // use case's own stub in backfill_test.go).
-func (m *mockRepo) BackfillJobExistsByIntegration(_ context.Context, _ database.Tx, _ string) (bool, error) {
-	return false, nil
-}
-
 func (m *mockRepo) InsertBackfillJob(_ context.Context, _ database.Tx, _ BackfillJobParams) (string, error) {
 	return "", nil
 }
@@ -234,10 +285,6 @@ func (m *mockRepo) ListPartesByProcesso(_ context.Context, _, _ string) ([]Party
 
 func (m *mockRepo) InsertPublications(_ context.Context, _ database.Tx, _ []PublicationParams) (int, error) {
 	return 0, nil
-}
-
-func (m *mockRepo) ReplaceWatchedOABs(_ context.Context, _ database.Tx, _, _ string, _ []string) error {
-	return nil
 }
 
 func (m *mockRepo) MatchPublicationsByDay(_ context.Context, _ database.Tx, _ time.Time) ([]PublicationMatch, error) {

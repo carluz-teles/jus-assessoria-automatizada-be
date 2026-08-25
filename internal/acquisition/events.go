@@ -115,6 +115,12 @@ type SyncRequested struct {
 	// so the sync consumer builds the connector's discovery FetchRequest without
 	// reading back the integration row.
 	Scope Scope `json:"scope"`
+	// CatchUpOABKey/CatchUpSince mark this slice as a re-enable catch-up sync (one
+	// watched_oab, not a backfill): when set, the closing sync_completed/sync_failed
+	// (below) carries them back so OnSyncCompleted can compare-and-clear the OAB's
+	// pending catch_up_since. Empty for a normal backfill/scheduled slice.
+	CatchUpOABKey string `json:"catch_up_oab_key,omitempty"`
+	CatchUpSince  string `json:"catch_up_since,omitempty"`
 }
 
 var _ events.Event = SyncRequested{}
@@ -246,6 +252,12 @@ type SyncCompleted struct {
 	SliceIndex    int    `json:"slice_index"`
 	ItemsNew      int    `json:"items_new"`
 	ItemsDeduped  int    `json:"items_deduped"`
+	// CatchUpOABKey/CatchUpSince are carried through from the closing SyncRequested
+	// (empty for a normal backfill/scheduled slice) when this run closed a re-enable
+	// catch-up sync — see SyncRequested. OnSyncCompleted uses them to compare-and-clear
+	// the OAB's pending catch_up_since.
+	CatchUpOABKey string `json:"catch_up_oab_key,omitempty"`
+	CatchUpSince  string `json:"catch_up_since,omitempty"`
 }
 
 var _ events.Event = SyncCompleted{}
@@ -265,6 +277,11 @@ type SyncFailed struct {
 	BackfillJobID string `json:"backfill_job_id"`
 	SliceIndex    int    `json:"slice_index"`
 	Reason        string `json:"reason"`
+	// CatchUpOABKey/CatchUpSince mirror SyncCompleted's — carried through so a FAILED
+	// catch-up sync is identifiable, though OnSyncFailed deliberately does NOT clear
+	// catch_up_since (the gap stays marked so the next toggle retries it).
+	CatchUpOABKey string `json:"catch_up_oab_key,omitempty"`
+	CatchUpSince  string `json:"catch_up_since,omitempty"`
 }
 
 var _ events.Event = SyncFailed{}
@@ -293,6 +310,57 @@ var _ events.Event = BackfillFinished{}
 
 func (BackfillFinished) Type() string          { return TypeBackfillFinished }
 func (BackfillFinished) AggregateType() string { return aggregateTypeBackfillJob }
+
+// TypeWatchedOABReenabled is the dotted id of the event ToggleWatchedOAB publishes when
+// turning capture back ON for an OAB that was disabled: it asks the backfill use case to
+// catch the OAB up over the downtime window (disabled_at..now), never the full historical
+// horizon. Produced by domain.go's ToggleWatchedOAB, consumed by backfill.go.
+const TypeWatchedOABReenabled = "acquisition.watched_oab_reenabled"
+
+const aggregateTypeWatchedOAB = "watched_oab"
+
+// watchedOABNamespace namespaces the aggregate id v5 of watched_oab_reenabled (the outbox
+// requires aggregate_id uuid NOT NULL, and (tenant|integration|oab_key) is not a uuid) —
+// same pattern as enrichmentBatchNamespace, a distinct namespace constant per event family.
+var watchedOABNamespace = uuid.MustParse("f1c7a9d3-4b2e-4a8f-9c6d-2e5b8a3f7c19")
+
+// WatchedOABReenabled is emitted, in the same tx as the enable write, when the Termos
+// toggle turns capture back ON for a previously-disabled OAB (a REAL re-enable — see
+// AddOrEnableWatchedOAB's was_enabled branch). CatchUpSince is the OAB's disabled_at
+// (the gap the catch-up sync must cover). Aggregate id is a stable v5 of
+// (tenant|integration|oab_key).
+type WatchedOABReenabled struct {
+	events.Base
+	TenantID      string    `json:"tenant_id"`
+	IntegrationID string    `json:"integration_id"`
+	Source        string    `json:"source"`
+	OABKey        string    `json:"oab_key"`
+	CatchUpSince  time.Time `json:"catch_up_since"`
+}
+
+var _ events.Event = WatchedOABReenabled{}
+
+func (WatchedOABReenabled) Type() string          { return TypeWatchedOABReenabled }
+func (WatchedOABReenabled) AggregateType() string { return aggregateTypeWatchedOAB }
+
+// newWatchedOABReenabled builds the event, minting a fresh v7 event id (the consumer's
+// dedup key) and deriving the stable v5 aggregate from (tenant|integration|oab_key) via
+// the same namespaced-uuid pattern enrichmentBatchAggregate uses.
+func newWatchedOABReenabled(tenantID, integrationID, source, oabKey string, catchUpSince time.Time) WatchedOABReenabled {
+	return WatchedOABReenabled{
+		Base:          events.Base{EventID: newEventID(), Aggregate: watchedOABAggregate(tenantID, integrationID, oabKey)},
+		TenantID:      tenantID,
+		IntegrationID: integrationID,
+		Source:        source,
+		OABKey:        oabKey,
+		CatchUpSince:  catchUpSince,
+	}
+}
+
+// watchedOABAggregate derives the stable v5 aggregate uuid from (tenant|integration|oab_key).
+func watchedOABAggregate(tenantID, integrationID, oabKey string) string {
+	return uuid.NewSHA1(watchedOABNamespace, []byte(tenantID+"|"+integrationID+"|"+oabKey)).String()
+}
 
 // enrichmentBatchDelay is the carência between os passos de um enriquecimento em lote: o
 // job se re-agenda com ProcessAt=now+delay pra dar tempo do lote anterior (grade+supersede)

@@ -48,12 +48,17 @@ func seedIntegration(t *testing.T, pool *pgxpool.Pool, tenantID, source string) 
 }
 
 // activatedEvent builds a valid integration_activated event with a fresh event id.
+// Scope carries "SP1" — the same OAB seedIntegration seeds on the integration row —
+// so OnIntegrationActivated's per-OAB AddOrEnableWatchedOAB actually has an OAB to
+// upsert (an empty scope now means "no OABs to backfill", not "backfill nothing but
+// still fire", since the per-OAB delta drives the whole flow post-fix).
 func activatedEvent(tenantID, integrationID string) acquisition.IntegrationActivated {
 	return acquisition.IntegrationActivated{
 		Base:          events.Base{EventID: uuid.NewString(), Aggregate: integrationID},
 		IntegrationID: integrationID,
 		TenantID:      tenantID,
 		Source:        acquisition.SourceDJEN,
+		Scope:         acquisition.Scope{OAB: []string{"SP1"}},
 	}
 }
 

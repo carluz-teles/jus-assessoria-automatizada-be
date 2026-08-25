@@ -2,6 +2,7 @@ package acquisition
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -58,6 +59,56 @@ func syncRunToEntity(r acquisitiondb.FindSyncRunByEventIDRow) *SyncRun {
 		run.CourtRecordID = uuid.UUID(r.CourtRecordID.Bytes).String()
 	}
 	return run
+}
+
+// watchedOABToEntity decodes a plain watched_oab row (GetWatchedOAB, DisableWatchedOAB)
+// into the entity. OAB (the canonical "UFNUMBER") is derived from the storage key via
+// canonicalOAB.
+func watchedOABToEntity(r acquisitiondb.WatchedOab) WatchedOAB {
+	return WatchedOAB{
+		OAB:           canonicalOAB(r.OabKey),
+		OABKey:        r.OabKey,
+		IntegrationID: r.IntegrationID.String(),
+		Enabled:       r.Enabled,
+		DisabledAt:    timestampPtr(r.DisabledAt),
+		CatchUpSince:  timestampPtr(r.CatchUpSince),
+	}
+}
+
+// upsertWatchedOABToEntity decodes UpsertWatchedOAB's row (the same columns plus the
+// prior-state was_enabled, consumed separately by the repo — see AddOrEnableWatchedOAB).
+func upsertWatchedOABToEntity(r acquisitiondb.UpsertWatchedOABRow) WatchedOAB {
+	return WatchedOAB{
+		OAB:           canonicalOAB(r.OabKey),
+		OABKey:        r.OabKey,
+		IntegrationID: r.IntegrationID.String(),
+		Enabled:       r.Enabled,
+		DisabledAt:    timestampPtr(r.DisabledAt),
+		CatchUpSince:  timestampPtr(r.CatchUpSince),
+	}
+}
+
+// canonicalOAB reverses the "NUMBER|UF" storage key into the FE/API-facing "UFNUMBER"
+// form (e.g. "123456|SP" -> "SP123456") — the Go-side counterpart of the SQL
+// split_part(...)||split_part(...) projection in ListWatchedOABsWithName. A malformed
+// key (no separator) is returned as-is rather than panicking; it should never occur
+// since every write goes through oabKey().
+func canonicalOAB(oabKey string) string {
+	number, uf, ok := strings.Cut(oabKey, "|")
+	if !ok {
+		return oabKey
+	}
+	return uf + number
+}
+
+// canonicalOABs maps a batch of storage keys to their canonical "UFNUMBER" form —
+// canonicalOAB applied over a slice, used to build a delta Scope for the backfill.
+func canonicalOABs(oabKeys []string) []string {
+	out := make([]string, 0, len(oabKeys))
+	for _, k := range oabKeys {
+		out = append(out, canonicalOAB(k))
+	}
+	return out
 }
 
 // decodeScope unmarshals the jsonb scope column. An empty/NULL blob yields the

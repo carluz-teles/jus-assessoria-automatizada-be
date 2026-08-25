@@ -83,6 +83,22 @@ const (
 	LifecycleSuperseded = "SUPERSEDED"
 )
 
+// WatchedOAB is one OAB a tenant's DJEN integration monitors — the row backing the
+// national match (watched_oab table). OAB is the canonical "UFNUMBER" (the FE/API
+// shape); OABKey is the normalized "NUMBER|UF" storage key used by the match join.
+// Enabled is the Termos toggle: false pauses future capture for this OAB while
+// keeping everything already captured visible. DisabledAt/CatchUpSince are the
+// toggle-off/pending-catch-up timestamps a re-enable consumes to scope the catch-up
+// sync to the downtime only.
+type WatchedOAB struct {
+	OAB           string
+	OABKey        string
+	IntegrationID string
+	Enabled       bool
+	DisabledAt    *time.Time
+	CatchUpSince  *time.Time
+}
+
 // SyncRun is the auditable record of one sync execution: which connector ran,
 // under which integration, and its outcome. It lands RUNNING at the start of the
 // cycle and transitions to OK (with the item counters) or FAILED (with the

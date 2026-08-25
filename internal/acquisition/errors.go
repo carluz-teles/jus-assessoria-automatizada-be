@@ -89,4 +89,10 @@ var (
 	// mostly discard anyway. A tenant with no subscription resolves to limit 0
 	// upstream (fail-closed), so its very first activation is blocked.
 	ErrActivationBlocked = apperr.NewForbidden("tenant already at active process limit; upgrade the plan before activating a new source")
+
+	// ErrWatchedOABNotFound — no watched_oab row matches the (integration, oab_key)
+	// a PATCH /v1/acquisition/watched-oabs/:oab toggle targets: the OAB was never added
+	// to this tenant's DJEN integration. The repo returns it instead of (nil, nil), so
+	// the handler answers a typed 404 rather than silently no-op'ing a toggle on nothing.
+	ErrWatchedOABNotFound = apperr.NewNotFound("oab monitorada não encontrada")
 )

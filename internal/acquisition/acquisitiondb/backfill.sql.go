@@ -12,29 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const backfillJobExistsByIntegration = `-- name: BackfillJobExistsByIntegration :one
-
-SELECT EXISTS (
-    SELECT 1 FROM backfill_job WHERE integration_id = $1
-) AS job_exists
-`
-
-// backfill_job queries (acquisition slice).
-// The backfill listener reacts to integration_activated: on the FIRST activation
-// of an integration it creates one backfill_job and emits the sync slices. These
-// two queries are the job's first-activation guard (exists) and its insert; the
-// counters/completion (slices_ok, slices_error, final status) belong to the sync
-// slice, not here.
-// True when a backfill_job already exists for this integration (any status). The
-// listener uses it as the first-activation guard: a re-activation must not
-// re-dispatch a backfill.
-func (q *Queries) BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error) {
-	row := q.db.QueryRow(ctx, backfillJobExistsByIntegration, integrationID)
-	var job_exists bool
-	err := row.Scan(&job_exists)
-	return job_exists, err
-}
-
 const finalizeBackfillJob = `-- name: FinalizeBackfillJob :exec
 UPDATE backfill_job
 SET status = $3
@@ -156,9 +133,10 @@ func (q *Queries) IncrementBackfillSlicesOK(ctx context.Context, arg IncrementBa
 }
 
 const insertBackfillJob = `-- name: InsertBackfillJob :one
+
 INSERT INTO backfill_job
-    (tenant_id, integration_id, window_from, window_to, total_slices, status)
-VALUES ($1, $2, $3, $4, $5, $6)
+    (tenant_id, integration_id, window_from, window_to, total_slices, status, trigger_reason, trigger_oabs)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id
 `
 
@@ -169,11 +147,25 @@ type InsertBackfillJobParams struct {
 	WindowTo      pgtype.Date `json:"window_to"`
 	TotalSlices   int32       `json:"total_slices"`
 	Status        string      `json:"status"`
+	TriggerReason *string     `json:"trigger_reason"`
+	TriggerOabs   []string    `json:"trigger_oabs"`
 }
 
+// backfill_job queries (acquisition slice).
+// The backfill listener reacts to integration_activated: it opens one backfill_job
+// PER DELTA — the scope's newly-watched OABs (needsHistory from AddOrEnableWatchedOAB,
+// see watched_oab.sql) — and emits their sync slices. There is no longer a whole-
+// integration first-activation guard: adding an OAB to an already-active integration
+// now backfills that OAB's own history instead of being silently swallowed (the bug
+// this replaced). The counters/completion (slices_ok, slices_error, final status)
+// belong to the sync slice, not here.
 // Create the onboarding backfill job. total_slices is precomputed by the use
 // case; the counters default to zero and status is passed explicitly so a
-// zero-slice horizon can land COMPLETED instead of RUNNING.
+// zero-slice horizon can land COMPLETED instead of RUNNING. trigger_reason/
+// trigger_oabs attribute the job to the OAB(s) that caused it (always
+// 'OAB_ADDED' today — see backfill.go's createBackfillForScope), so the
+// Capturas screen can show "OAB adicionada — SP347019" instead of an anonymous
+// "carga inicial".
 func (q *Queries) InsertBackfillJob(ctx context.Context, arg InsertBackfillJobParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertBackfillJob,
 		arg.TenantID,
@@ -182,6 +174,8 @@ func (q *Queries) InsertBackfillJob(ctx context.Context, arg InsertBackfillJobPa
 		arg.WindowTo,
 		arg.TotalSlices,
 		arg.Status,
+		arg.TriggerReason,
+		arg.TriggerOabs,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)

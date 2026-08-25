@@ -23,6 +23,10 @@ type backfillListenerUC interface {
 	OnIntegrationActivated(ctx context.Context, ev IntegrationActivated) error
 	OnSyncCompleted(ctx context.Context, ev SyncCompleted) error
 	OnSyncFailed(ctx context.Context, ev SyncFailed) error
+	// OnWatchedOABReenabled reacts to the Termos re-enable toggle (ToggleWatchedOAB):
+	// it fires a catch-up scoped to just the downtime of the ONE OAB that was
+	// switched back on — see backfill.go.
+	OnWatchedOABReenabled(ctx context.Context, ev WatchedOABReenabled) error
 }
 
 // syncListenerUC is the port for the sync_requested consumer.
@@ -80,6 +84,7 @@ func NewListener(backfill backfillListenerUC, sync syncListenerUC, enrichment en
 // Register call in the worker's composition root.
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntegrationActivated, l.handleIntegrationActivated)
+	mux.HandleFunc(TypeWatchedOABReenabled, l.handleWatchedOABReenabled)
 	mux.HandleFunc(TypeSyncRequested, l.handleSyncRequested)
 	mux.HandleFunc(TypeCourtRecordObserved, l.handleCourtRecordObserved)
 
@@ -118,6 +123,18 @@ func (l *Listener) handleIntegrationActivated(ctx context.Context, t *asynq.Task
 		return err
 	}
 	return l.backfill.OnIntegrationActivated(ctx, ev)
+}
+
+// handleWatchedOABReenabled is the asynq.HandlerFunc for
+// acquisition.watched_oab_reenabled. It decodes the payload and hands off to the
+// backfill use case's catch-up path. A decode fault is SkipRetry; an infra error
+// from the use case stays retryable.
+func (l *Listener) handleWatchedOABReenabled(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[WatchedOABReenabled](t)
+	if err != nil {
+		return err
+	}
+	return l.backfill.OnWatchedOABReenabled(ctx, ev)
 }
 
 // handleSyncRequested is the asynq.HandlerFunc for acquisition.sync_requested. It

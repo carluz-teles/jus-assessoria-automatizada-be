@@ -32,6 +32,8 @@ type BackfillJob struct {
 	SlicesError   int32              `json:"slices_error"`
 	Status        string             `json:"status"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	TriggerReason *string            `json:"trigger_reason"`
+	TriggerOabs   []string           `json:"trigger_oabs"`
 }
 
 type CaptureRun struct {
@@ -518,6 +520,8 @@ type SyncRun struct {
 	CourtRecordsNew     int32              `json:"court_records_new"`
 	IntimationsNew      int32              `json:"intimations_new"`
 	CourtRecordsUpdated int32              `json:"court_records_updated"`
+	TriggerReason       *string            `json:"trigger_reason"`
+	TriggerOab          *string            `json:"trigger_oab"`
 }
 
 type Task struct {
@@ -622,4 +626,9 @@ type WatchedOab struct {
 	IntegrationID uuid.UUID          `json:"integration_id"`
 	OabKey        string             `json:"oab_key"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	Enabled       bool               `json:"enabled"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	CatchUpSince  pgtype.Timestamptz `json:"catch_up_since"`
+	LastAction    *string            `json:"last_action"`
+	LastActionAt  pgtype.Timestamptz `json:"last_action_at"`
 }

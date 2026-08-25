@@ -38,16 +38,6 @@ type Querier interface {
 	// id or foreign tenant's row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound
 	// (→ 404). Idempotent: re-assigning the same user re-writes the same value.
 	AssignIntimationAssignee(ctx context.Context, arg AssignIntimationAssigneeParams) (uuid.UUID, error)
-	// backfill_job queries (acquisition slice).
-	// The backfill listener reacts to integration_activated: on the FIRST activation
-	// of an integration it creates one backfill_job and emits the sync slices. These
-	// two queries are the job's first-activation guard (exists) and its insert; the
-	// counters/completion (slices_ok, slices_error, final status) belong to the sync
-	// slice, not here.
-	// True when a backfill_job already exists for this integration (any status). The
-	// listener uses it as the first-activation guard: a re-activation must not
-	// re-dispatch a backfill.
-	BackfillJobExistsByIntegration(ctx context.Context, integrationID uuid.UUID) (bool, error)
 	// Create N fresh lides in one round-trip (v0: one case per new record). Returns the
 	// N new ids; the caller pairs each with a new court_record.
 	BatchInsertCourtCases(ctx context.Context, arg BatchInsertCourtCasesParams) ([]uuid.UUID, error)
@@ -123,6 +113,11 @@ type Querier interface {
 	// does not re-enqueue it; if the resync never lands, it falls due again after the
 	// interval (at-least-once).
 	ClaimCourtRecordResync(ctx context.Context, arg ClaimCourtRecordResyncParams) error
+	// Compare-and-clear: only wipes catch_up_since when it still equals the value the
+	// caller dispatched the catch-up sync with. This guards against a LATE sync_completed
+	// (from a stale, already-superseded catch-up) clobbering a NEWER catch_up_since set by
+	// a subsequent disable/re-enable cycle.
+	ClearWatchedOABCatchUp(ctx context.Context, arg ClearWatchedOABCatchUpParams) error
 	// Fecho por ETA da linha ENRICHMENT de uma importação: carimba o status terminal
 	// (@status = OK quando a cobertura foi atingida, PARTIAL senão) e finished_at = @at. Roda
 	// no listener do EnrichmentRunCloseScheduled, agendado no fim do backfill + carência. Só
@@ -210,13 +205,11 @@ type Querier interface {
 	// race (our InsertCourtRecord hit ON CONFLICT DO NOTHING) — keeps cases 1:1 with
 	// records (v0 has no consolidation).
 	DeleteCourtCase(ctx context.Context, id uuid.UUID) error
-	// watched_oab queries (acquisition slice). The per-tenant index of watched OABs the
-	// national match joins against. Populated from the integration_activated event: the
-	// use case replaces an integration's set (delete + insert) so a scope change is
-	// reflected. Writes run per-tenant (RLS by app.tenant_id); the match reads system-wide.
-	// Clear an integration's watched OABs before re-populating, so a removed OAB stops
-	// matching. Scoped to the integration (the tenant is implied by the RLS tx).
-	DeleteWatchedOABsByIntegration(ctx context.Context, integrationID uuid.UUID) error
+	// Turns capture OFF for one watched OAB, stamping disabled_at (the catch-up horizon
+	// a later re-enable will resume from). Guarded to the enabled->disabled transition so
+	// a repeat disable is a no-op (0 rows) rather than clobbering an earlier disabled_at;
+	// the repo treats a miss by re-reading the current row (SELECT), never an error.
+	DisableWatchedOAB(ctx context.Context, arg DisableWatchedOABParams) (WatchedOab, error)
 	// scheduler (re-poll) queries (acquisition slice).
 	// The re-poll scheduler runs system-scoped (DoSystem sets app.system='on', so the
 	// court_record RLS system escape hatch from migration 0016 exposes every tenant's
@@ -342,6 +335,9 @@ type Querier interface {
 	// suggestion awaiting F2 confirmation, still relevant to the summary). days_left is
 	// computed as calendar days to end_date, mirroring the prazos screen read. tenant-scoped.
 	GetResumoOpenDeadlines(ctx context.Context, arg GetResumoOpenDeadlinesParams) ([]GetResumoOpenDeadlinesRow, error)
+	// Reads the current row for (integration, oab_key) — used by DisableWatchedOAB's
+	// no-op path (already-disabled) and by ToggleWatchedOAB's 404 guard (never existed).
+	GetWatchedOAB(ctx context.Context, arg GetWatchedOABParams) (WatchedOab, error)
 	// Count one failed slice; same atomic lock-and-read-back contract as
 	// IncrementBackfillSlicesOK. A job with any failed slice finalizes PARTIAL.
 	IncrementBackfillSlicesError(ctx context.Context, arg IncrementBackfillSlicesErrorParams) (IncrementBackfillSlicesErrorRow, error)
@@ -372,9 +368,21 @@ type Querier interface {
 	// unique conflict target as the +1 variant. The caller skips this when delta==0 AND errs==0
 	// (a no-op upsert would mint a spurious RUNNING row).
 	IncrementImportEnrichmentRunBy(ctx context.Context, arg IncrementImportEnrichmentRunByParams) error
+	// backfill_job queries (acquisition slice).
+	// The backfill listener reacts to integration_activated: it opens one backfill_job
+	// PER DELTA — the scope's newly-watched OABs (needsHistory from AddOrEnableWatchedOAB,
+	// see watched_oab.sql) — and emits their sync slices. There is no longer a whole-
+	// integration first-activation guard: adding an OAB to an already-active integration
+	// now backfills that OAB's own history instead of being silently swallowed (the bug
+	// this replaced). The counters/completion (slices_ok, slices_error, final status)
+	// belong to the sync slice, not here.
 	// Create the onboarding backfill job. total_slices is precomputed by the use
 	// case; the counters default to zero and status is passed explicitly so a
-	// zero-slice horizon can land COMPLETED instead of RUNNING.
+	// zero-slice horizon can land COMPLETED instead of RUNNING. trigger_reason/
+	// trigger_oabs attribute the job to the OAB(s) that caused it (always
+	// 'OAB_ADDED' today — see backfill.go's createBackfillForScope), so the
+	// Capturas screen can show "OAB adicionada — SP347019" instead of an anonymous
+	// "carga inicial".
 	InsertBackfillJob(ctx context.Context, arg InsertBackfillJobParams) (uuid.UUID, error)
 	// Create the lide a first-seen court record hangs on. v0 has no consolidation
 	// yet, so every new record gets its own case; merging is a later slice.
@@ -437,10 +445,10 @@ type Querier interface {
 	// records the sync_requested event that opened it, so a re-delivery can find and
 	// resume a run that never closed (FindSyncRunByEventID). window_from/to stamp the
 	// slice's date window so the reconciliations read can show it (NULL when absent).
+	// trigger_reason/trigger_oab are set only on a standalone catch-up sync (the OAB
+	// toggle re-enable path — see SyncRequested.CatchUpOABKey); NULL for every other
+	// run (daily, backfill-windowed, scheduler), which have no single OAB to attribute.
 	InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error)
-	// Add one watched OAB for an integration, idempotent on (integration_id, oab_key):
-	// a re-activation with the same scope is a no-op. oab_key is the normalized "NUMBER|UF".
-	InsertWatchedOAB(ctx context.Context, arg InsertWatchedOABParams) error
 	// The tenant's ACTIVE firm members (internal app_user id + name) — the assignable responsáveis
 	// the analyze_intimation prompt lists so the IA suggests a real assignee. Same join as identity's
 	// ListOrgMembers (membership status ACTIVE), projected to just id+name; ordered by name for a
@@ -460,15 +468,21 @@ type Querier interface {
 	// capture_run é escrito na MESMA tx dos writes que já existem (writeForTenant /
 	// applyEnrichment); backfill_job/sync_run continuam do fluxo de reconciliação. A
 	// lista faz UNION ALL das duas fontes; o read model deriva o rótulo/DisplayStatus.
-	// As capturas do tenant, mais recentes primeiro. UNION ALL de capture_run (DAILY_
-	// CAPTURE, 1 linha por dia; ENRICHMENT, 1 linha por importação) com backfill_job
-	// (INITIAL_LOAD, uma linha por importação agregando as janelas sync_run). Os tallies do
-	// INITIAL_LOAD somam as colunas dedicadas das janelas (court_records_new/intimations_new/
-	// court_records_updated) e os errors vêm de slices_error. A linha ENRICHMENT não tem
-	// janela própria (window_from/to NULL): ela DERIVA a janela da importação via LEFT JOIN
-	// backfill_job por capture_run.backfill_job_id (COALESCE cai na coluna própria da linha
-	// quando não há import — DAILY_CAPTURE). window/started/finished normalizados para o
-	// mesmo shape das duas fontes. Bounded por $2 (sem paginação v0).
+	// As capturas do tenant, mais recentes primeiro. UNION ALL de TRÊS fontes:
+	// capture_run (DAILY_CAPTURE, 1 linha por dia; ENRICHMENT, 1 linha por importação),
+	// backfill_job (INITIAL_LOAD, uma linha por importação agregando as janelas sync_run)
+	// e sync_run avulso (CATCH_UP, uma linha por religada de OAB — backfill_job_id NULL
+	// + trigger_reason preenchido, ver newCatchUpSyncRequested/InsertSyncRun). Os tallies
+	// do INITIAL_LOAD somam as colunas dedicadas das janelas (court_records_new/
+	// intimations_new/court_records_updated) e os errors vêm de slices_error. A linha
+	// ENRICHMENT não tem janela própria (window_from/to NULL): ela DERIVA a janela da
+	// importação via LEFT JOIN backfill_job por capture_run.backfill_job_id (COALESCE cai
+	// na coluna própria da linha quando não há import — DAILY_CAPTURE). window/started/
+	// finished normalizados para o mesmo shape das três fontes. trigger_reason/
+	// trigger_oabs atribuem a linha a uma OAB (INITIAL_LOAD sempre 'OAB_ADDED'; CATCH_UP
+	// sempre 'OAB_REENABLED', envolto num array de 1 pra bater o tipo com trigger_oabs);
+	// DAILY_CAPTURE/ENRICHMENT nunca têm uma OAB única a atribuir (NULL). Bounded por $2
+	// (sem paginação v0).
 	ListCaptureRuns(ctx context.Context, arg ListCaptureRunsParams) ([]ListCaptureRunsRow, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
@@ -557,13 +571,15 @@ type Querier interface {
 	// the collapse (each row's id feeds ListProcessos/IntimacoesBySyncRun).
 	ListSyncRunsByJob(ctx context.Context, arg ListSyncRunsByJobParams) ([]ListSyncRunsByJobRow, error)
 	// Termos monitorados com nome derivado: as OABs monitoradas pelo tenant via DJEN,
-	// cada uma com o nome mais frequente encontrado em party_counsel (mode() within group).
-	// oab_key é "NUMBER|UF"; devolvemos "UFNUMBER" (canônico do FE) via uf||split_part.
-	// O LEFT JOIN garante que OABs novas (sem captura ainda) casam zero linhas de
-	// party_counsel; mode() sobre um grupo todo NULL também devolve NULL — o COALESCE
-	// pra '' evita isso (sqlc infere a coluna como NOT NULL pelo ::text, e o scan do pgx
-	// falha contra um NULL de verdade; repository.go já trata "" como "sem nome").
-	// Ordenado por oab_key para estabilidade (sem offset, lista pequena).
+	// cada uma com o nome mais frequente encontrado em party_counsel (mode() within group)
+	// e o estado enabled (liga/desliga do card na tela de Termos). oab_key é "NUMBER|UF";
+	// devolvemos "UFNUMBER" (canônico do FE) via uf||split_part. O LEFT JOIN garante que
+	// OABs novas (sem captura ainda) casam zero linhas de party_counsel; mode() sobre um
+	// grupo todo NULL também devolve NULL — o COALESCE pra '' evita isso (sqlc infere a
+	// coluna como NOT NULL pelo ::text, e o scan do pgx falha contra um NULL de verdade;
+	// repository.go já trata "" como "sem nome"). bool_and(w.enabled) é seguro porque o
+	// GROUP BY é por oab_key e (integration_id, oab_key) é UNIQUE — sempre uma única linha
+	// por grupo. Ordenado por oab_key para estabilidade (sem offset, lista pequena).
 	ListWatchedOABsWithName(ctx context.Context, tenantID uuid.UUID) ([]ListWatchedOABsWithNameRow, error)
 	// Record that a sync touched this court record: refresh its completeness and
 	// schedule the next sweep (next_sync_at drives the scheduler slice later).
@@ -700,6 +716,33 @@ type Querier interface {
 	// Activate (or re-activate) a tenant's subscription to a data source. On
 	// conflict only scope/status/updated_at change — credential_ref is left intact.
 	UpsertIntegration(ctx context.Context, arg UpsertIntegrationParams) (Integration, error)
+	// watched_oab queries (acquisition slice). The per-tenant index of watched OABs the
+	// national match joins against. Populated from the integration_activated event (a
+	// fresh activation or a NEW OAB added to an already-active scope) and from the
+	// Termos toggle (disable/re-enable one OAB without touching the rest). Writes run
+	// per-tenant (RLS by app.tenant_id); the match reads system-wide.
+	// Adds (or re-enables) one watched OAB for an integration, and reports the PRIOR
+	// state via was_enabled so the caller (backfill.go) can distinguish the three cases
+	// a re-activation/toggle-on can land in:
+	//   was_enabled IS NULL  -> the row did not exist yet (brand-new OAB)   -> needs HISTORY
+	//   was_enabled = false  -> it existed but was disabled (a real re-enable) -> needs CATCH-UP
+	//   was_enabled = true   -> it already existed enabled (idempotent replay) -> no-op
+	// The "prior_row" CTE reads the pre-upsert row (or no row) BEFORE the INSERT ... ON CONFLICT
+	// mutates it. It is joined in (rather than a correlated scalar subquery in the RETURNING
+	// list) so sqlc infers was_enabled as NULLABLE — a plain subquery-in-RETURNING is typed
+	// NOT NULL by sqlc's analyzer (it only looks at the source column's constraint, not the
+	// subquery's cardinality), which would panic scanning a real NULL on the insert path.
+	// catch_up_since is preserved (COALESCEd) rather than overwritten so a second re-enable
+	// before the pending catch-up is cleared does not lose the earlier disabled_at. The "wo"
+	// alias (rather than an unqualified watched_oab reference) works around a sqlc analyzer
+	// limitation: with a sibling writable CTE also touching watched_oab, an unqualified
+	// column here is reported as ambiguous even though plain Postgres parses it fine.
+	// last_action/last_action_at feed the Termos "última ação" label. The INSERT branch
+	// (brand-new row) always stamps ADDED. The DO UPDATE branch only stamps REENABLED
+	// when the row was actually disabled before (watched_oab.enabled, like
+	// catch_up_since above, reads the PRE-update row inside DO UPDATE) — an idempotent
+	// replay of an already-enabled row leaves the prior action/timestamp untouched.
+	UpsertWatchedOAB(ctx context.Context, arg UpsertWatchedOABParams) (UpsertWatchedOABRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

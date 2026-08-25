@@ -483,6 +483,12 @@ type CaptureRunView struct {
 	Errors              int        `json:"errors"`
 	DurationSec         *int       `json:"duration_sec"`
 	OABCount            int        `json:"oab_count"`
+	// TriggerReason/TriggerOABs attribute the capture to the watched-OAB action
+	// that caused it (OAB_ADDED|OAB_REENABLED) — nil/empty for DAILY_CAPTURE and
+	// ENRICHMENT, which are never OAB-triggered. Raw, like Kind: the FE derives
+	// the label ("OAB adicionada — SP347019").
+	TriggerReason *string  `json:"trigger_reason"`
+	TriggerOABs   []string `json:"trigger_oabs"`
 }
 
 // CaptureSummaryView is the KPI header of the "Capturas" screen: the last successful
@@ -549,6 +555,8 @@ type CaptureRunRow struct {
 	IntimationsNew      int
 	CourtRecordsUpdated int
 	Errors              int
+	TriggerReason       *string
+	TriggerOABs         []string
 }
 
 // CaptureSummaryRow is the KPI aggregate as the repo returns it — the two capture_run
@@ -592,9 +600,18 @@ const reconciliationRunsLimit = 60
 // WatchedOABView is one monitored OAB returned by the "Termos" settings screen:
 // the canonical FE key ("UFNUMBER", e.g. "SP347019") plus the lawyer's most
 // frequent name derived from party_counsel — null when no capture exists yet.
+// Enabled backs the liga/desliga toggle: false means capture is paused for this OAB
+// while everything already captured stays fully visible.
 type WatchedOABView struct {
-	OAB  string  `json:"oab"`
-	Name *string `json:"name"`
+	OAB     string  `json:"oab"`
+	Name    *string `json:"name"`
+	Enabled bool    `json:"enabled"`
+	// LastAction is the raw enum (ADDED|DISABLED|REENABLED) of the most recent
+	// toggle/add on this OAB — nil for a row written before this column existed.
+	// The FE derives the human label ("Adicionada em ...") from it, same pattern
+	// as CaptureRunView.Kind.
+	LastAction   *string    `json:"last_action"`
+	LastActionAt *time.Time `json:"last_action_at"`
 }
 
 // readRepo is the narrow read port the ReadUseCase drives — the keyset list reads
@@ -911,6 +928,8 @@ func (uc *ReadUseCase) captureRunView(ctx context.Context, tenantID string, row 
 		CourtRecordsUpdated: row.CourtRecordsUpdated,
 		Errors:              row.Errors,
 		OABCount:            oabCount,
+		TriggerReason:       row.TriggerReason,
+		TriggerOABs:         row.TriggerOABs,
 	}
 	// Só uma captura TERMINAL (OK/COMPLETED/PARTIAL/FAILED) concluiu: uma run "Em andamento"
 	// não apresenta finished_at, duração nem contagens finais — mesmo que a linha ENRICHMENT

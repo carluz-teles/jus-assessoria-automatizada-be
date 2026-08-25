@@ -27,11 +27,10 @@ type Repository interface {
 	Upsert(ctx context.Context, tx database.Tx, tenantID, source string, scope Scope) (*Integration, error)
 	List(ctx context.Context, tenantID string) ([]*Integration, error)
 
-	// Backfill onboarding — the listener's first-activation guard and job insert,
-	// plus the completion counter's atomic increment/finalize. Grouped here as the
-	// slice's single persistence port; the backfill use case depends on the narrow
+	// Backfill onboarding — the job insert (one per delta of newly-watched OABs) plus
+	// the completion counter's atomic increment/finalize. Grouped here as the slice's
+	// single persistence port; the backfill use case depends on the narrow
 	// backfillRepo view of these methods.
-	BackfillJobExistsByIntegration(ctx context.Context, tx database.Tx, integrationID string) (bool, error)
 	InsertBackfillJob(ctx context.Context, tx database.Tx, params BackfillJobParams) (id string, err error)
 	IncrementBackfillSlicesOK(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (BackfillCounters, error)
 	IncrementBackfillSlicesError(ctx context.Context, tx database.Tx, tenantID, backfillJobID string) (BackfillCounters, error)
@@ -172,9 +171,17 @@ type Repository interface {
 	// ingestion use case depends on the narrow ingestRepo view of this.
 	InsertPublications(ctx context.Context, tx database.Tx, params []PublicationParams) (newCount int, err error)
 
-	// watched_oab — replace an integration's watched OAB set (populate on activation),
-	// the per-tenant index the national match joins against.
-	ReplaceWatchedOABs(ctx context.Context, tx database.Tx, tenantID, integrationID string, oabKeys []string) error
+	// watched_oab lifecycle — the per-tenant index the national match joins against.
+	// AddOrEnableWatchedOAB adds a new watch or turns capture back on for an existing
+	// one, reporting needsHistory (brand-new row: fire the full onboarding backfill)
+	// and needsCatchUp (was disabled: fire a catch-up sync scoped to the downtime) so
+	// the caller (backfill.go) can branch without a second read. DisableWatchedOAB
+	// turns capture off (a no-op, re-reading the current row, if already disabled).
+	// ClearWatchedOABCatchUp compare-and-clears a resolved catch-up gap.
+	AddOrEnableWatchedOAB(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string) (row WatchedOAB, needsHistory, needsCatchUp bool, err error)
+	DisableWatchedOAB(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string) (WatchedOAB, error)
+	GetWatchedOAB(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string) (WatchedOAB, error)
+	ClearWatchedOABCatchUp(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string, dispatchedSince time.Time) error
 
 	// Match — the national join (publication.recipient_oabs ∩ watched_oab), read
 	// system-wide (uow.DoSystem). Drives the per-tenant fan-out to intimações.
@@ -490,6 +497,8 @@ func (r *pgRepository) ListCaptureRuns(ctx context.Context, tenantID string, lim
 			IntimationsNew:      int(row.IntimationsNew),
 			CourtRecordsUpdated: int(row.CourtRecordsUpdated),
 			Errors:              int(row.Errors),
+			TriggerReason:       row.TriggerReason,
+			TriggerOABs:         row.TriggerOabs,
 		})
 	}
 	return out, nil
@@ -530,6 +539,8 @@ func (r *pgRepository) GetCaptureRun(ctx context.Context, tenantID, id string) (
 		IntimationsNew:      int(row.IntimationsNew),
 		CourtRecordsUpdated: int(row.CourtRecordsUpdated),
 		Errors:              int(row.Errors),
+		TriggerReason:       row.TriggerReason,
+		TriggerOABs:         row.TriggerOabs,
 	}, nil
 }
 
@@ -625,9 +636,12 @@ func (r *pgRepository) ListWatchedOABsWithName(ctx context.Context, tenantID str
 	}
 	views := make([]WatchedOABView, 0, len(rows))
 	for _, row := range rows {
-		view := WatchedOABView{OAB: row.Oab}
+		view := WatchedOABView{OAB: row.Oab, Enabled: row.Enabled, LastActionAt: timestampPtr(row.LastActionAt)}
 		if row.Name != "" {
 			view.Name = &row.Name
+		}
+		if row.LastAction != "" {
+			view.LastAction = &row.LastAction
 		}
 		views = append(views, view)
 	}
@@ -656,21 +670,6 @@ func (r *pgRepository) GetReconciliationTotals(ctx context.Context, tenantID str
 	}, nil
 }
 
-// BackfillJobExistsByIntegration reports whether any backfill_job already exists
-// for the integration, inside the caller's tx. It is the listener's
-// first-activation guard: true means a re-activation, so no new backfill.
-func (r *pgRepository) BackfillJobExistsByIntegration(ctx context.Context, tx database.Tx, integrationID string) (bool, error) {
-	iid, err := uuid.Parse(integrationID)
-	if err != nil {
-		return false, database.WrapInfra(err)
-	}
-	exists, err := acquisitiondb.New(tx).BackfillJobExistsByIntegration(ctx, iid)
-	if err != nil {
-		return false, database.WrapInfra(err)
-	}
-	return exists, nil
-}
-
 // InsertBackfillJob creates the backfill_job inside the caller's tx and returns
 // its new id. The date-only window bounds are lifted to pgtype.Date here (this
 // is a write param, so the conversion lives with the query, not the mapper).
@@ -690,6 +689,8 @@ func (r *pgRepository) InsertBackfillJob(ctx context.Context, tx database.Tx, pa
 		WindowTo:      pgtype.Date{Time: params.WindowTo, Valid: true},
 		TotalSlices:   int32(params.TotalSlices),
 		Status:        params.Status,
+		TriggerReason: nullString(params.TriggerReason),
+		TriggerOabs:   params.TriggerOABs,
 	})
 	if err != nil {
 		return "", database.WrapInfra(err)
@@ -802,6 +803,8 @@ func (r *pgRepository) InsertSyncRun(ctx context.Context, tx database.Tx, params
 		WindowFrom:       wireDateOrNull(params.WindowFrom),
 		WindowTo:         wireDateOrNull(params.WindowTo),
 		BackfillJobID:    nullUUID(params.BackfillJobID),
+		TriggerReason:    nullString(params.TriggerReason),
+		TriggerOab:       nullString(params.TriggerOAB),
 	})
 	if err != nil {
 		return "", database.WrapInfra(err)
@@ -1290,10 +1293,6 @@ func (r *pgRepository) InsertPublications(ctx context.Context, tx database.Tx, p
 	return newCount, nil
 }
 
-// ReplaceWatchedOABs sets an integration's watched OAB set inside the caller's tx by
-// clearing it and re-inserting the given normalized keys — so a scope change (a
-// removed OAB) stops matching. Idempotent per key. Runs in the tenant's tx (RLS by
-// app.tenant_id), driven by the integration_activated event.
 // MatchPublicationsByDay returns every (tenant, matched OAB, payload) for a day's
 // publications, joining the firehose against watched_oab. Runs inside a system tx
 // (uow.DoSystem) so the watched_oab RLS opens across tenants.
@@ -1336,27 +1335,101 @@ func (r *pgRepository) MatchPublicationsForTenantSince(ctx context.Context, tx d
 	return out, nil
 }
 
-func (r *pgRepository) ReplaceWatchedOABs(ctx context.Context, tx database.Tx, tenantID, integrationID string, oabKeys []string) error {
-	tid, err := uuid.Parse(tenantID)
+// AddOrEnableWatchedOAB adds a new watch or re-enables a disabled one, inside the
+// caller's tx. The generated row carries WasEnabled (the pre-upsert state, read by
+// the query's "old" CTE): NULL means the row did not exist (needsHistory=true, a
+// brand-new OAB), false means it existed but was disabled (needsCatchUp=true, a real
+// re-enable), true means it was already enabled (both false — an idempotent replay).
+func (r *pgRepository) AddOrEnableWatchedOAB(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string) (WatchedOAB, bool, bool, error) {
+	tid, iid, err := parseTenantIntegration(tenantID, integrationID)
 	if err != nil {
-		return database.WrapInfra(err)
+		return WatchedOAB{}, false, false, err
 	}
-	iid, err := uuid.Parse(integrationID)
+	row, err := acquisitiondb.New(tx).UpsertWatchedOAB(ctx, acquisitiondb.UpsertWatchedOABParams{
+		TenantID:      tid,
+		IntegrationID: iid,
+		OabKey:        oabKey,
+	})
 	if err != nil {
-		return database.WrapInfra(err)
+		return WatchedOAB{}, false, false, database.WrapInfra(err)
 	}
-	q := acquisitiondb.New(tx)
-	if err := q.DeleteWatchedOABsByIntegration(ctx, iid); err != nil {
-		return database.WrapInfra(err)
+	needsHistory := row.WasEnabled == nil
+	needsCatchUp := row.WasEnabled != nil && !*row.WasEnabled
+	return upsertWatchedOABToEntity(row), needsHistory, needsCatchUp, nil
+}
+
+// DisableWatchedOAB turns capture off for one watched OAB inside the caller's tx. A
+// zero-row result (already disabled — the query's WHERE enabled=true guard) is not an
+// error: the repo re-reads the current row so the caller (ToggleWatchedOAB) still
+// answers with the up-to-date state, idempotently.
+func (r *pgRepository) DisableWatchedOAB(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string) (WatchedOAB, error) {
+	_, iid, err := parseTenantIntegration(tenantID, integrationID)
+	if err != nil {
+		return WatchedOAB{}, err
 	}
-	for _, key := range oabKeys {
-		if err := q.InsertWatchedOAB(ctx, acquisitiondb.InsertWatchedOABParams{
-			TenantID: tid, IntegrationID: iid, OabKey: key,
-		}); err != nil {
-			return database.WrapInfra(err)
-		}
+	row, err := acquisitiondb.New(tx).DisableWatchedOAB(ctx, acquisitiondb.DisableWatchedOABParams{
+		IntegrationID: iid,
+		OabKey:        oabKey,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r.GetWatchedOAB(ctx, tx, tenantID, integrationID, oabKey)
 	}
-	return nil
+	if err != nil {
+		return WatchedOAB{}, database.WrapInfra(err)
+	}
+	return watchedOABToEntity(row), nil
+}
+
+// GetWatchedOAB reads the current row for (integration, oab_key) inside the caller's
+// tx. A miss is the typed ErrWatchedOABNotFound — never (nil, nil) — so the domain use
+// case can answer 404 on a toggle of an OAB that was never added.
+func (r *pgRepository) GetWatchedOAB(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string) (WatchedOAB, error) {
+	_, iid, err := parseTenantIntegration(tenantID, integrationID)
+	if err != nil {
+		return WatchedOAB{}, err
+	}
+	row, err := acquisitiondb.New(tx).GetWatchedOAB(ctx, acquisitiondb.GetWatchedOABParams{
+		IntegrationID: iid,
+		OabKey:        oabKey,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WatchedOAB{}, ErrWatchedOABNotFound
+	}
+	if err != nil {
+		return WatchedOAB{}, database.WrapInfra(err)
+	}
+	return watchedOABToEntity(row), nil
+}
+
+// ClearWatchedOABCatchUp compare-and-clears a resolved catch-up gap inside the
+// caller's tx: the WHERE catch_up_since=$3 guard means a stale/late closing sync never
+// wipes a NEWER pending catch-up set by a later disable/re-enable cycle. A miss (already
+// cleared, or superseded) is a silent no-op — never an error.
+func (r *pgRepository) ClearWatchedOABCatchUp(ctx context.Context, tx database.Tx, tenantID, integrationID, oabKey string, dispatchedSince time.Time) error {
+	_, iid, err := parseTenantIntegration(tenantID, integrationID)
+	if err != nil {
+		return err
+	}
+	err = acquisitiondb.New(tx).ClearWatchedOABCatchUp(ctx, acquisitiondb.ClearWatchedOABCatchUpParams{
+		IntegrationID: iid,
+		OabKey:        oabKey,
+		CatchUpSince:  pgtype.Timestamptz{Time: dispatchedSince, Valid: true},
+	})
+	return database.WrapInfra(err)
+}
+
+// parseTenantIntegration parses the tenant and integration ids shared by the
+// watched_oab lifecycle writes, wrapping a bad uuid as a typed infra error.
+func parseTenantIntegration(tenantID, integrationID string) (tid, iid uuid.UUID, err error) {
+	tid, err = uuid.Parse(tenantID)
+	if err != nil {
+		return uuid.UUID{}, uuid.UUID{}, database.WrapInfra(err)
+	}
+	iid, err = uuid.Parse(integrationID)
+	if err != nil {
+		return uuid.UUID{}, uuid.UUID{}, database.WrapInfra(err)
+	}
+	return tid, iid, nil
 }
 
 // UpsertIntimations is the SET-BASED bulk upsert — see repository_batch.go.
