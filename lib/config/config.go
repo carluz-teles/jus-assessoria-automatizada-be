@@ -219,6 +219,17 @@ type Config struct {
 	CertKEK       string `env:"CERT_KEK"`
 	AWSKMSKeyID   string `env:"AWS_KMS_KEY_ID"`
 	CertKMSRegion string `env:"CERT_KMS_REGION"`
+
+	// VaultKEK is the base64-encoded 32-byte Key Encryption Key lib/vault uses to
+	// wrap every secret's per-row DEK (docs/erd-execucao-judicial-tjsp.md §9 —
+	// court_connection.credential_ref is the first secret it protects). Optional in
+	// the aggregate for the same reason S3/Resend/Stripe are: only the api (where
+	// the court credential endpoints live) needs it, and keeping it optional here
+	// preserves the boot of every binary that doesn't touch the vault. The slice's
+	// own wiring in cmd/api validates presence at the point of use (vault.New
+	// returns vault.ErrInvalidKEK) and fails fast there, not mid-request — same
+	// convention as storage.New/S3Enabled.
+	VaultKEK string `env:"VAULT_KEK_BASE64"`
 }
 
 // Load lê o ambiente para uma Config. Devolve o erro (não faz panic): o boot do

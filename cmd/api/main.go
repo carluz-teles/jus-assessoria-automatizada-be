@@ -428,6 +428,22 @@ func run(logger *slog.Logger) error {
 		logger.Info("certificate slice disabled", "reason", "no CERT_KEK or AWS_KMS_KEY_ID")
 	}
 
+	// Vault is optional: only instantiated when VAULT_KEK_BASE64 is present. When
+	// absent the court-credential slice stays unmounted (S2) — same optional-adapter
+	// convention as document/S3. vault.New validates the KEK eagerly so a malformed
+	// key fails at boot, not mid-request.
+	var vlt *vault.Vault
+	if cfg.VaultKEK != "" {
+		v, err := vault.New(cfg.VaultKEK)
+		if err != nil {
+			return fmt.Errorf("init vault: %w", err)
+		}
+		vlt = v
+		logger.Info("vault configured")
+	} else {
+		logger.Warn("VAULT_KEK_BASE64 unset — court credential endpoints will be disabled")
+	}
+
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,
@@ -446,6 +462,7 @@ func run(logger *slog.Logger) error {
 		draft:                draftHandler,
 		lookup:               lookupHandler,
 		certificate:          certificateHandler,
+		vault:                vlt,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext

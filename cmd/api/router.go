@@ -17,6 +17,7 @@ import (
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
+	"github.com/jusassessoria/platform/lib/vault"
 )
 
 // lookupPrefix is the onboarding subtree that authenticates WITHOUT a tenant
@@ -50,6 +51,11 @@ type routerDeps struct {
 	draft                *draft.Handler
 	lookup               *lookup.Handler
 	certificate          *certificate.Handler
+	// vault is the optional envelope-encryption adapter (lib/vault). It is nil
+	// when VAULT_KEK_BASE64 is unset. S1 carries it here so S2 (court_connection
+	// credential wiring) can extend routerDeps without touching main.go's boot
+	// sequence — the router nil-guards the consumer handler exactly like document.
+	vault                *vault.Vault
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two

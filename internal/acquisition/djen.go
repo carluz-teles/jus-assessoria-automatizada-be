@@ -1,25 +1,22 @@
 package acquisition
 
 import (
-	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/obs"
+	"github.com/jusassessoria/platform/lib/transport"
 )
 
 // djen.go is the REAL DJEN connector: it discovers a tenant's communications on
@@ -173,121 +170,12 @@ func NewDJENConnector(opts ...DJENOption) *DJENConnector {
 	// client was injected (WithDJENHTTPClient, e.g. an httptest client), so tests keep
 	// their transport.
 	if c.httpClient.Transport == nil {
-		c.httpClient.Transport = newDJENTransport(c.proxyURL)
+		c.httpClient.Transport = transport.ChromeTransport(c.proxyURL)
 	}
 	return c
 }
 
 var _ Connector = (*DJENConnector)(nil)
-
-// djenChromeHello is the uTLS ClientHello preset the connector presents — a Chrome
-// fingerprint, so the WAF's per-JA3 rate limiter gives us a browser budget, not the
-// bot-sized one Go's default handshake earns.
-var djenChromeHello = utls.HelloChrome_120
-
-// newDJENTransport builds the HTTP transport whose TLS layer presents the Chrome
-// fingerprint via uTLS, optionally tunneling through an HTTP CONNECT proxy. The proxy is
-// handled INSIDE DialTLSContext (not Transport.Proxy) because the uTLS handshake must run
-// over the tunneled conn — the Proxy field would run the stdlib's own TLS instead.
-func newDJENTransport(proxyURL *url.URL) *http.Transport {
-	return &http.Transport{
-		ForceAttemptHTTP2: false, // the uTLS hello pins ALPN to http/1.1
-		MaxIdleConns:      10,
-		IdleConnTimeout:   90 * time.Second,
-		DialTLSContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-			return dialDJENChromeTLS(ctx, proxyURL, addr)
-		},
-	}
-}
-
-// dialDJENChromeTLS opens the TCP conn (direct or via the proxy's CONNECT tunnel) and
-// completes a uTLS handshake presenting the Chrome ClientHello, with ALPN pinned to
-// http/1.1 so net/http speaks HTTP/1.1 over it (the cipher/extension fingerprint the WAF
-// keys on is preserved).
-func dialDJENChromeTLS(ctx context.Context, proxyURL *url.URL, addr string) (net.Conn, error) {
-	dialer := &net.Dialer{Timeout: 15 * time.Second}
-	var raw net.Conn
-	var err error
-	if proxyURL != nil {
-		raw, err = proxyConnect(ctx, dialer, proxyURL, addr)
-	} else {
-		raw, err = dialer.DialContext(ctx, "tcp", addr)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		_ = raw.Close()
-		return nil, err
-	}
-	spec, err := utls.UTLSIdToSpec(djenChromeHello)
-	if err != nil {
-		_ = raw.Close()
-		return nil, err
-	}
-	for _, ext := range spec.Extensions {
-		if a, ok := ext.(*utls.ALPNExtension); ok {
-			a.AlpnProtocols = []string{"http/1.1"}
-		}
-	}
-	u := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloCustom)
-	if err := u.ApplyPreset(&spec); err != nil {
-		_ = raw.Close()
-		return nil, err
-	}
-	if err := u.HandshakeContext(ctx); err != nil {
-		_ = raw.Close()
-		return nil, err
-	}
-	return u, nil
-}
-
-// proxyConnect dials the proxy and opens an HTTP CONNECT tunnel to target, returning the
-// tunneled conn for the caller to run TLS over. Basic auth from the proxy URL userinfo is
-// sent when present.
-func proxyConnect(ctx context.Context, dialer *net.Dialer, proxyURL *url.URL, target string) (net.Conn, error) {
-	conn, err := dialer.DialContext(ctx, "tcp", proxyHostPort(proxyURL))
-	if err != nil {
-		return nil, fmt.Errorf("dial proxy: %w", err)
-	}
-	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-	if proxyURL.User != nil {
-		user := proxyURL.User.Username()
-		pass, _ := proxyURL.User.Password()
-		cred := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
-		req += "Proxy-Authorization: Basic " + cred + "\r\n"
-	}
-	req += "\r\n"
-	if _, err := conn.Write([]byte(req)); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT write: %w", err)
-	}
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT read: %w", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		_ = conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT %s: status %s", target, resp.Status)
-	}
-	return conn, nil
-}
-
-// proxyHostPort returns the proxy's host:port, defaulting the port by scheme when omitted.
-func proxyHostPort(u *url.URL) string {
-	if u.Port() != "" {
-		return u.Host
-	}
-	if u.Scheme == "https" {
-		return u.Hostname() + ":443"
-	}
-	return u.Hostname() + ":80"
-}
 
 func (c *DJENConnector) ID() string                 { return djenConnectorID }
 func (c *DJENConnector) Version() string            { return djenConnectorVersion }
