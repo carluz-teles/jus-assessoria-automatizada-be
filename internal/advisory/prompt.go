@@ -155,9 +155,9 @@ type DraftContext struct {
 
 	// ── Fatia 5 — teses/tom/instruções (Gerar-time generation params) ─────────
 
-	// Tone is the closed-set writing register: "tecnico-formal" (default),
-	// "direto-assertivo", or "conciliador-institucional". Empty behaves exactly
-	// like "tecnico-formal" — the historical prompt wording (backward-compat).
+	// Tone is the closed-set writing register: "tecnico" (default), "objetivo",
+	// or "enfatico". Empty behaves exactly like "tecnico" — the historical
+	// prompt wording (backward-compat). Migração 0055 encurtou os rótulos.
 	Tone string
 	// Instructions is free-text advogado guidance for this generation. Empty →
 	// no extra section injected.
@@ -189,6 +189,61 @@ type ChatTurn struct {
 	Content string
 }
 
+// IterateSection is one Roman-numbered section of the peça as seen by the
+// iterate composer — mirrors the draft.StructuredContent shape without
+// importing the slice (advisory has no downward dependency).
+type IterateSection struct {
+	ID         string
+	Roman      string
+	Title      string
+	Paragraphs []string
+}
+
+// IterateScope tells the composer whether the advogado is asking for a
+// reescrita of the whole peça ("whole") or of a single section ("section",
+// with SectionID matching one of the IterateSection.ID entries).
+type IterateScope struct {
+	Kind      string // "whole" | "section"
+	SectionID string // present only when Kind == "section"
+}
+
+// IterateContext is the per-iteration signal the draft_iterate composer uses.
+// It carries the CURRENT structured draft (so the LLM sees exactly what the
+// advogado is looking at), the case context (for legal register + grounding),
+// the RAG chunks, and the iteration params (scope + kind/instruction).
+type IterateContext struct {
+	PieceType   string // DEFENSE|COMPLAINT|APPEAL|MOTION|OTHER
+	Court       string
+	Degree      string
+	Class       string
+	Subject     string
+	CNJNumber   string
+	JudgingBody string
+
+	// Preamble is the pre-section block of the current draft (endereçamento
+	// + qualificação) — read only, the composer never asks the LLM to
+	// rewrite the preamble (it's mechanical + risky).
+	Preamble []string
+	// Sections is the current list of Roman-numbered sections — the LLM
+	// picks which to rewrite based on Scope + Kind/Instruction.
+	Sections []IterateSection
+
+	// Scope tells the LLM whether to rewrite one section or all of them.
+	Scope IterateScope
+	// Kind is the "quick adjust" hint (empty when the advogado wrote a free
+	// instruction). Closed set — mirrors QuickAdjustKind in the FE.
+	Kind string
+	// Instruction is the advogado's free-text ask, empty when a Kind was
+	// clicked instead.
+	Instruction string
+
+	// Parties + Chunks for grounding (same shape as DraftContext).
+	Parties []PartyCtx
+	Chunks  []string
+
+	Playbook string
+}
+
 // ChatContext is the per-question signal the chat_grounding composer uses. It carries the
 // draft's current content (so the assistant can refer to the peça), the RAG chunks retrieved
 // for the question (empty → ungrounded path), the conversation history (up to 50 turns), and
@@ -216,6 +271,12 @@ type PromptComposer interface {
 	// (same case signal draft_minuta uses) since the theses suggestion needs the
 	// same grounding.
 	ComposeTheses(agent string, c DraftContext) (Composed, error)
+	// ComposeIterate builds the (system, user, version) for the draft_iterate
+	// agent (POST /v1/pecas/:id/iterate — Peça v2, synchronous). Takes the
+	// current structured draft + iteration params and instructs the LLM to
+	// return 1..N SectionChange objects with category + explanation +
+	// new_paragraphs.
+	ComposeIterate(agent string, c IterateContext) (Composed, error)
 }
 
 // Agent identifiers — one per specialized advisory task (erd-ai-advisory.md §4). Each maps to a
@@ -228,6 +289,11 @@ const (
 	AgentChatGrounding     = "chat_grounding"
 	AgentReviewMinuta      = "review_minuta"
 	AgentSuggestTheses     = "suggest_theses"
+	// AgentDraftIterate is the iteration/rewrite agent (Peça v2 — POST
+	// /v1/pecas/:id/iterate). Given the current structured draft + an
+	// escopo + kind/instruction, returns 1..N SectionChange objects with
+	// category + explanation + new_paragraphs. Synchronous LLM call.
+	AgentDraftIterate = "draft_iterate"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
@@ -251,14 +317,30 @@ const summarizeProcessVersion = "process_summary/v1"
 // recipient) no prompt, eliminando os placeholders [Nome do Advogado]/OAB nº [número] e os nomes
 // de parte adivinhados do teor. Quando fornecidos, devem ser usados diretamente; marcadores só
 // quando genuinamente ausentes.
-// Bumped to v5: injeta TOM (diretiva de registro/tom quando != tecnico-formal — o default produz
+// Bumped to v5: injeta TOM (diretiva de registro/tom quando != tecnico — o default produz
 // wording IDÊNTICA ao v4, backward-compat), INSTRUÇÕES (texto livre do advogado) e TESES
 // SELECIONADAS (rótulos escolhidos em /theses) no prompt.
-const draftMinutaVersion = "draft_minuta/v5"
+// Bumped to v6: removeu o ADVOGADO SIGNATÁRIO do prompt e do fecho. O bloco de assinatura
+// (nome + OAB do titular do CERTIFICADO) é adicionado no PDF pelo pdfgen no momento do Sign
+// — não pela IA. Isso desacopla a intimação (que traz o advogado do recipient) da assinatura
+// (que é do cert usado). O fecho agora termina em "Local, [data]." e para.
+// Bumped to v7: output agora é `draft_html` (HTML rico do Tiptap) em vez de `draft_content`
+// (texto puro). Formatação inline (<strong>, <em>, <blockquote>, <table>, <ol>) sai direto
+// da IA e chega intacta ao editor e ao PDF final (chromedp). Elimina o passo de conversão
+// structured_content → HTML no FE e prepara o pipeline pra streaming (cada chunk cai
+// diretamente no editor sem parser incremental).
+// Bumped to v8: output agora é `draft_markdown` em vez de `draft_html`. Motivo: streaming
+// char-a-char do LLM corta tags HTML no meio (`<h2>` chega como `<`, `h`, `2>`) e o
+// ProseMirror escapa fragmentos incompletos como texto (`&lt;`). Markdown é robusto ao
+// streaming (não tem tags pareadas pra corromper) e é o padrão da indústria (ChatGPT
+// Canvas, Claude Artifacts, Cursor). O BE converte markdown → HTML via goldmark antes
+// de persistir em content_html; o FE usa tiptap-markdown pra renderizar incrementalmente
+// no editor via streamContent().
+const draftMinutaVersion = "draft_minuta/v9"
 
 // suggestThesesVersion is the pinned version of the suggest_theses template (POST
 // /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
-const suggestThesesVersion = "suggest_theses/v1"
+const suggestThesesVersion = "suggest_theses/v2"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -267,6 +349,11 @@ const chatGroundingVersion = "chat_grounding/v1"
 // reviewMinutaVersion is the pinned version of the review_minuta template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
 const reviewMinutaVersion = "review_minuta/v1"
+
+// draftIterateVersion is the pinned version of the draft_iterate template
+// (POST /v1/pecas/:id/iterate — Peça v2). BUMP IT whenever the template text
+// changes so the feedback delta of the OLD prompt stays attributable.
+const draftIterateVersion = "draft_iterate/v1"
 
 // TemplateComposer is the deterministic v0 composer: templates + context injection, no LLM. It is
 // stateless.
@@ -418,6 +505,18 @@ func (*TemplateComposer) ComposeTheses(agent string, c DraftContext) (Composed, 
 	}
 }
 
+// ComposeIterate builds the (system, user, version) for the draft_iterate agent
+// from the iterate context. An unknown agent is a programmer error surfaced
+// as a typed invalid. (Peça v2 — synchronous LLM iteration.)
+func (*TemplateComposer) ComposeIterate(agent string, c IterateContext) (Composed, error) {
+	switch agent {
+	case AgentDraftIterate:
+		return composeDraftIterate(c), nil
+	default:
+		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
+	}
+}
+
 // composeDraftMinuta renders the draft_minuta instruction-set (v4). The system message describes
 // the legal writing role with the canonical structure and the gold rule (use real data, no
 // placeholders for provided fields, including structured parties and signing-lawyer OAB). The user
@@ -430,22 +529,19 @@ func composeDraftMinuta(c DraftContext) Composed {
 	var sys strings.Builder
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro que redige a MINUTA COMPLETA de uma peça processual, " +
-			"pronta para revisão do advogado. Produza SOMENTE o campo `draft_content`: o texto integral " +
-			"da minuta em formato jurídico brasileiro.\n\n" +
+			"pronta para revisão do advogado no editor rico. Produza SOMENTE o campo `draft_markdown`: " +
+			"o texto da minuta em MARKDOWN (CommonMark + GFM tables), sem front-matter e sem code fences " +
+			"envolvendo o output.\n\n" +
 
 			"REGRA DE OURO (a mais importante): USE OS DADOS REAIS fornecidos no contexto. NUNCA deixe " +
 			"placeholder (___, [assim], \"NOME DA PARTE\") para um dado que foi fornecido. Só use " +
 			"marcador [entre colchetes] quando o dado for genuinamente DESCONHECIDO (não fornecido no " +
 			"contexto). Se o tribunal, a vara (órgão julgador), o número do processo, a classe e o " +
 			"assunto foram dados, escreva-os.\n" +
-			"As PARTES do processo (autor/réu) e o ADVOGADO SIGNATÁRIO são fornecidos ESTRUTURADOS no " +
-			"contexto — USE-OS: os nomes das partes na qualificação/endereçamento conforme o papel " +
-			"(PLAINTIFF = autor/exequente/requerente; DEFENDANT = réu/executado/requerido); o advogado " +
-			"signatário (nome + OAB/UF fornecidos) no FECHO, substituindo os marcadores " +
-			"[Nome do Advogado]/[número]. Só use os marcadores se o advogado NÃO for fornecido. " +
-			"Prefira SEMPRE a parte estruturada ao que você extrairia do teor da intimação. " +
-			"Escreva os nomes das partes e do advogado EXATAMENTE como fornecidos (verbatim) — NUNCA " +
-			"corrija, abrevie, traduza, complete ou altere um nome próprio.\n\n" +
+			"As PARTES do processo (autor/réu) são fornecidas ESTRUTURADAS no " +
+			"contexto — USE-AS na qualificação/endereçamento conforme o papel " +
+			"(PLAINTIFF = autor/exequente/requerente; DEFENDANT = réu/executado/requerido). " +
+			"Prefira SEMPRE a parte estruturada ao que você extrairia do teor da intimação.\n\n" +
 
 			"ESTRUTURA CANÔNICA (nesta ordem, blocos separados por linha em branco):\n" +
 			"1) ENDEREÇAMENTO em CAIXA ALTA, adaptado ao foro: Vara Cível comum → " +
@@ -468,13 +564,14 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"7) \"III – DOS PEDIDOS\" (CAIXA ALTA): \"Ante o exposto, requer a Vossa Excelência:\" + " +
 			"alíneas a), b), c) (pedido certo e determinado, art. 322/324 CPC; inclua produção de provas " +
 			"e sucumbência quando cabível).\n" +
-			"8) FECHO: \"Nestes termos,\\nPede deferimento.\" + \"[Comarca]/[UF], [data].\" + assinatura " +
-			"do advogado. Quando o advogado signatário for fornecido no contexto, use exatamente: " +
-			"\"<Nome>\\nOAB/<UF> nº <oab>\". Quando não fornecido, use os marcadores literais " +
-			"\"[Nome do Advogado]\\nOAB/[UF] nº [número]\". JAMAIS invente, preencha ou deduza um número " +
-			"de OAB ausente. A COMARCA você preenche do contexto, mas a DATA do fecho é SEMPRE o marcador " +
-			"literal [data] — a data de protocolo é definida pelo advogado ao assinar; NUNCA infira, " +
-			"calcule ou copie uma data do teor/prazo para o fecho.\n\n" +
+			"8) FECHO: escreva EXATAMENTE \"Nestes termos,\\nPede deferimento.\" e PARE AÍ. NÃO " +
+			"escreva NADA depois disso. Especificamente PROIBIDO: cidade, UF, comarca, data, dia/mês/" +
+			"ano por extenso, marcador [data], marcador [local], nome do advogado, OAB, assinatura, " +
+			"linha em branco extra para assinatura, traços/underscores simulando linha de assinatura. " +
+			"O bloco COMPLETO de fechamento (cidade do foro, data por extenso e nome+OAB do titular " +
+			"do certificado) é adicionado AUTOMATICAMENTE pelo sistema no momento da geração do PDF, " +
+			"a partir do court_record e do certificado digital. Qualquer coisa que você escreva após " +
+			"\"Pede deferimento.\" vai aparecer duplicado no PDF final.\n\n" +
 
 			"REQUISITOS LEGAIS POR TIPO DE PEÇA:\n" +
 			"- PETIÇÃO INICIAL (COMPLAINT): art. 319 CPC (juízo, partes, causa de pedir, pedido, valor " +
@@ -487,17 +584,34 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"- RECURSO (APPEAL): síntese do decidido + razões de reforma + pedido de provimento. No JE, " +
 			"recurso inominado (art. 41 Lei 9.099/95).\n\n" +
 
-			"FORMATAÇÃO: títulos de seção em CAIXA ALTA com romanos; parágrafos em arábico; pedidos em " +
-			"alíneas; negrito com **markdown** para ênfase pontual (nome da peça, valores, nº do processo). " +
-			"Se faltar dado essencial, escreva a melhor minuta possível com marcador claro no que faltar — " +
-			"NUNCA invente fatos, valores, súmulas, datas ou nºs de processo que não constem do contexto.",
+			"FORMATAÇÃO MARKDOWN (CommonMark + GFM tables — nada de HTML, nada de code fences):\n" +
+			"- Endereçamento (linha inteira em negrito): `**EXCELENTÍSSIMO SENHOR DOUTOR JUIZ...**`\n" +
+			"- Referência do processo: `Processo nº [CNJ] — [Classe] ([Assunto])` (parágrafo simples)\n" +
+			"- Qualificação/exórdio: parágrafos simples separados por linha em branco\n" +
+			"- Cabeçalho de seção: `## I — DOS FATOS`  ·  `## II — DO DIREITO`  ·  `## III — DOS PEDIDOS`\n" +
+			"- Parágrafos numerados dos fatos/direito: escreva o número no início do texto, sem lista: " +
+			"`1. Trata-se de ...` em parágrafo próprio; próxima linha em branco; `2. ...`\n" +
+			"- Pedidos com alíneas: lista ordenada markdown `1. ...\\n2. ...` (o renderer converte para a), b), c) — " +
+			"não use asteriscos nem letras manualmente)\n" +
+			"- Ênfase pontual (nome da peça, valores, nº do processo, artigos citados): `**texto**`\n" +
+			"- Termos técnicos em latim/estrangeiro: `*texto*`\n" +
+			"- Citações longas (>3 linhas de lei/jurisprudência): `> ...` (blockquote, uma linha por linha citada)\n" +
+			"- Tabelas de cálculo (impugnação de valor): tabela GFM `| Coluna | Valor |\\n|---|---|\\n| ... | ... |`\n" +
+			"- Fecho: EXATAMENTE `Nestes termos,\\nPede deferimento.` em um parágrafo e PARE. Sem " +
+			"nova linha, sem cidade/data/nome/OAB, sem espaços em branco para assinatura. O PDF " +
+			"final injeta o bloco de assinatura completo (cidade do foro + data + nome + OAB do " +
+			"certificado) automaticamente — sua saída termina em \"deferimento.\".\n" +
+			"NUNCA escreva tags HTML (`<p>`, `<strong>`, `<h2>`, etc). NUNCA envolva o output em ```markdown``` " +
+			"ou qualquer code fence. Devolva apenas o markdown puro. Se faltar dado essencial, escreva a melhor " +
+			"minuta possível com marcador entre colchetes no que faltar — NUNCA invente fatos, valores, súmulas, " +
+			"datas ou nºs de processo que não constem do contexto.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
 		sys.WriteString(pb)
 	}
-	// Tone directive (Fatia 5): empty or "tecnico-formal" adds NOTHING — the base
-	// system prompt above already IS the tecnico-formal register, so the wording
+	// Tone directive (Fatia 5): empty or "tecnico" adds NOTHING — the base
+	// system prompt above already IS the técnico register, so the wording
 	// stays byte-identical to v4 for the default/omitted case (backward-compat).
 	if td := toneDirective(c.Tone); td != "" {
 		sys.WriteString("\n\n")
@@ -530,14 +644,11 @@ func composeDraftMinuta(c DraftContext) Composed {
 		add(label, value)
 	}
 
-	// Inject signing lawyer when resolved from the matched OAB recipient.
-	if name := strings.TrimSpace(c.SigningLawyerName); name != "" || strings.TrimSpace(c.SigningLawyerOAB) != "" {
-		uf := c.SigningLawyerUF
-		if uf == "" {
-			uf = "??"
-		}
-		lines = append(lines, "Advogado signatário: "+c.SigningLawyerName+", OAB/"+uf+" nº "+c.SigningLawyerOAB)
-	}
+	// Advogado signatário: não injetado no prompt. O bloco de assinatura vem
+	// do TITULAR DO CERTIFICADO usado na hora do Sign (pdfgen.Signer), não do
+	// recipient da intimação — o cert pode pertencer a um sócio diferente do
+	// que foi intimado. Campos SigningLawyer* na struct mantidos para compat
+	// com testes/callers antigos; ficam ignorados aqui.
 
 	add("TEOR DA INTIMAÇÃO", c.IntimationText)
 
@@ -576,22 +687,22 @@ func composeDraftMinuta(c DraftContext) Composed {
 }
 
 // toneDirective returns the tone-specific system directive to append for the
-// draft_minuta prompt (Fatia 5). "" and "tecnico-formal" both return "" — the
-// base system prompt above IS already the tecnico-formal register, so omitting
-// the directive for the default/empty case keeps the prompt byte-identical to
-// the pre-Fatia-5 (v4) wording, the backward-compat contract. The literal string
+// draft_minuta prompt (Fatia 5). "" and "tecnico" both return "" — the base
+// system prompt above IS already the técnico register, so omitting the
+// directive for the default/empty case keeps the prompt byte-identical to the
+// pre-Fatia-5 (v4) wording, the backward-compat contract. The literal string
 // values mirror the closed set in internal/draft/entity.go (Tone*) without
 // importing that package (advisory has no downward dependency on any slice).
 func toneDirective(tone string) string {
 	switch tone {
-	case "direto-assertivo":
-		return "TOM: adote um registro DIRETO E ASSERTIVO — frases curtas e objetivas, " +
+	case "objetivo":
+		return "TOM: adote um registro OBJETIVO — frases curtas e diretas, " +
 			"argumentação incisiva, sem rodeios ou hedging (evite \"salvo melhor juízo\", " +
 			"\"data venia\" em excesso); mantenha o rigor técnico-jurídico."
-	case "conciliador-institucional":
-		return "TOM: adote um registro CONCILIADOR E INSTITUCIONAL — cortês, ponderado, " +
-			"que preserva a relação processual e abre espaço para composição/acordo quando " +
-			"cabível, sem abrir mão do mérito técnico da tese."
+	case "enfatico":
+		return "TOM: adote um registro ENFÁTICO — vigoroso e assertivo, sublinhando " +
+			"a força dos argumentos e a gravidade das consequências, sem abrir mão do " +
+			"rigor técnico nem escorregar em adjetivação vazia."
 	default:
 		return ""
 	}
@@ -611,20 +722,21 @@ func composeSuggestTheses(c DraftContext) Composed {
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro especializado em teses de defesa/ataque. " +
 			"A partir do contexto do caso (teor da intimação, partes, trechos dos autos), sugira " +
-			"TESES JURÍDICAS candidatas que o advogado pode desenvolver na peça. Cada tese tem: " +
-			"`label` (nome curto da tese, ex.: \"Prescrição intercorrente\"), `confidence` (um de: " +
-			"alta, media, baixa — a força da tese neste caso concreto), `reference` (a jurisprudência " +
-			"ou o dispositivo legal que fundamenta a tese, em texto livre, ex.: \"art. 206, §5º, I, " +
-			"CC\" ou \"STJ, REsp 1.234.567/SP\"), `foundation` (explicação curta de por que a tese " +
-			"se aplica a este caso).\n\n" +
+			"TESES JURÍDICAS candidatas que o advogado pode desenvolver na peça. Cada tese tem:\n" +
+			"- `label`: nome curto da tese (ex.: \"Prescrição intercorrente\").\n" +
+			"- `confidence`: um de alta|media|baixa — CLASSIFIQUE COM RIGOR conforme os critérios abaixo.\n" +
+			"- `reference`: jurisprudência ou dispositivo legal, texto livre (ex.: \"art. 206, §5º, I, CC\" ou \"STJ, REsp 1.234.567/SP\"). NÃO invente números de processo.\n" +
+			"- `foundation`: explicação CURTA (1-2 frases) de por que a tese se aplica a este caso.\n" +
+			"- `evidence`: ARRAY de trechos LITERAIS extraídos do TEOR DA INTIMAÇÃO ou dos Trechos relevantes dos autos que sustentam a tese. Cada item é um recorte curto (10-40 palavras), copiado sem alterar. NÃO parafraseie. NÃO invente. Se não houver trecho literal, deixe o array vazio — e nesse caso confidence DEVE ser baixa.\n\n" +
+			"CRITÉRIOS DE CONFIDENCE (siga à risca):\n" +
+			"- alta: ao menos 2 trechos literais do contexto (evidence.length ≥ 2) apoiam DIRETAMENTE a tese, e o dispositivo/precedente citado é claramente aplicável ao caso concreto.\n" +
+			"- media: 1 trecho literal apoia (evidence.length == 1), OU 2+ trechos apoiam de forma indireta (contexto sugere mas não afirma o fato-chave).\n" +
+			"- baixa: nenhum trecho literal (evidence.length == 0), OU a tese é aplicável só em tese/doutrina sem amarração ao caso. Prefira retornar tese baixa a inventar evidência.\n\n" +
 			"REGRAS OBRIGATÓRIAS:\n" +
-			"- NÃO invente fatos que não estejam no contexto; a tese deve ser aplicável ao caso " +
-			"descrito, não genérica.\n" +
-			"- `reference` é texto livre (não um trecho literal dos autos) — cite a norma ou o " +
-			"precedente pelo nome/número usual, sem inventar números de processo.\n" +
-			"- Máximo 8 teses, ordenadas da mais forte (confidence=alta) para a mais fraca.\n" +
-			"- Se o contexto for insuficiente para qualquer tese com fundamento real, retorne uma " +
-			"lista vazia em vez de supor.",
+			"- NÃO invente fatos que não estejam no contexto; a tese deve ser aplicável ao caso descrito, não genérica.\n" +
+			"- Todo item de `evidence` deve ser cópia literal do TEOR DA INTIMAÇÃO ou de um dos Trechos relevantes dos autos. Não parafraseie, não resuma. Copiar exato o recorte que sustenta.\n" +
+			"- Máximo 8 teses, ordenadas da mais forte (alta) para a mais fraca (baixa).\n" +
+			"- Se o contexto for insuficiente para qualquer tese com fundamento real, retorne uma lista vazia em vez de supor.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
@@ -985,4 +1097,169 @@ func composeSummarizeProcess(c ProcessContext) Composed {
 	usr.WriteString("\n\nProduza o resumo estruturado do processo (JSON).")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: summarizeProcessVersion}
+}
+
+// composeDraftIterate renders the draft_iterate instruction-set (Peça v2 —
+// POST /v1/pecas/:id/iterate). Given the CURRENT structured draft + an escopo
+// (whole ou uma seção específica) + kind ("quick adjust") ou instruction (livre),
+// instrui o LLM a devolver 1..N mudanças por seção, cada uma com categoria e
+// explicação curta do porquê. O JSON schema fica no caller (IterateUseCase).
+//
+// Regras-chave do prompt:
+//   - NUNCA reescrever o preâmbulo (endereçamento + qualificação são mecânicos).
+//   - Devolver mudanças SOMENTE nas seções afetadas pelo escopo.
+//   - Cada mudança traz section_id (do array fornecido), category (enum fechado),
+//     explanation curta e new_paragraphs (o texto novo, em ordem).
+//   - Sem placeholders inventados; se contexto insuficiente, devolver changes vazio.
+func composeDraftIterate(c IterateContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um assistente jurídico brasileiro especializado em reescrita cirúrgica " +
+			"de peças processuais. O advogado tem uma peça JÁ redigida e quer ajustar " +
+			"trecho(s) dela — nunca redigir de novo, nunca tocar no preâmbulo (endereçamento " +
+			"+ qualificação são mecânicos). Sua resposta é um JSON com o campo `changes` — " +
+			"um array de mudanças, uma por SEÇÃO afetada. Cada mudança tem:\n" +
+			"1. `section_id` (string): o id da seção alterada, EXATAMENTE como aparece na " +
+			"lista de seções fornecida no contexto (\"fatos\", \"direito\", \"pedidos\"…).\n" +
+			"2. `category` (string): a categoria da mudança, um dos valores exatos: " +
+			"CLAREZA, CONCISÃO, ÊNFASE, FUNDAMENTAÇÃO, COMPLETUDE, COERÊNCIA, AJUSTE. " +
+			"Use AJUSTE quando nenhuma outra couber.\n" +
+			"3. `explanation` (string): 1 frase (até 140 chars) explicando POR QUÊ da " +
+			"mudança, do ponto de vista do advogado (o que melhora).\n" +
+			"4. `new_paragraphs` (array de strings): o novo conteúdo COMPLETO da seção, " +
+			"parágrafo a parágrafo. Substitui os parágrafos atuais dessa seção.\n\n" +
+			"REGRAS OBRIGATÓRIAS:\n" +
+			"- Respeite o ESCOPO fornecido:\n" +
+			"  · scope=whole → considere reescrever qualquer seção que possa melhorar; " +
+			"NÃO se obrigue a mexer em todas (só onde a mudança agrega).\n" +
+			"  · scope=section (com section_id) → devolva NO MÁXIMO 1 mudança, para essa " +
+			"seção específica. Ignore outras.\n" +
+			"- NÃO reescreva o preâmbulo (endereçamento + qualificação). Nunca inclua uma " +
+			"mudança para \"preambulo\" / \"preâmbulo\".\n" +
+			"- Se nada melhora com o pedido, devolva `changes: []` (não force reescritas).\n" +
+			"- NÃO invente fatos, valores, súmulas, datas ou nºs de processo que não " +
+			"constem do contexto.\n" +
+			"- Preserve tom técnico-jurídico brasileiro, artigos de lei no formato " +
+			"\"art. XXX, inciso, da Lei nº .../CPC\".",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório:\n")
+		sys.WriteString(pb)
+	}
+
+	// Kind-specific system directive (concise, emphatic, etc.) — appended
+	// AFTER the base rules so the model still respects the JSON schema.
+	if kd := kindDirective(c.Kind); kd != "" {
+		sys.WriteString("\n\n")
+		sys.WriteString(kd)
+	}
+
+	var usr strings.Builder
+
+	// ── Case context (grounding) ─────────────────────────────────────────────
+	lines := make([]string, 0, 12)
+	add := func(label, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			lines = append(lines, label+": "+v)
+		}
+	}
+	add("Tipo da peça", c.PieceType)
+	add("Tribunal", c.Court)
+	add("Órgão julgador/Vara", c.JudgingBody)
+	add("Nº do processo", c.CNJNumber)
+	add("Classe/rito", c.Class)
+	add("Assunto", c.Subject)
+	add("Grau", c.Degree)
+	for _, p := range c.Parties {
+		add(roleLabel(p.Role), p.Name)
+	}
+	if len(c.Chunks) > 0 {
+		lines = append(lines, "Trechos relevantes dos autos:")
+		for i, ch := range c.Chunks {
+			if i >= 8 {
+				break
+			}
+			lines = append(lines, strconv.Itoa(i+1)+". "+ch)
+		}
+	}
+	if len(lines) > 0 {
+		usr.WriteString("Contexto do caso:\n")
+		usr.WriteString(strings.Join(lines, "\n"))
+		usr.WriteString("\n\n")
+	}
+
+	// ── Current draft (preamble + sections) ──────────────────────────────────
+	if len(c.Preamble) > 0 {
+		usr.WriteString("Preâmbulo atual (NÃO reescreva — só leitura):\n")
+		for _, p := range c.Preamble {
+			usr.WriteString(p)
+			usr.WriteString("\n")
+		}
+		usr.WriteString("\n")
+	}
+	if len(c.Sections) > 0 {
+		usr.WriteString("Seções atuais:\n")
+		for _, s := range c.Sections {
+			usr.WriteString("• section_id=\"" + s.ID + "\" — " + s.Roman + " — " + s.Title + "\n")
+			for _, p := range s.Paragraphs {
+				usr.WriteString("  " + p + "\n")
+			}
+		}
+		usr.WriteString("\n")
+	}
+
+	// ── Iteration params ─────────────────────────────────────────────────────
+	usr.WriteString("Escopo do pedido: ")
+	if c.Scope.Kind == "section" && c.Scope.SectionID != "" {
+		usr.WriteString("APENAS a seção com section_id=\"" + c.Scope.SectionID + "\".\n")
+	} else {
+		usr.WriteString("A peça toda (qualquer seção pode ser reescrita).\n")
+	}
+	if instr := strings.TrimSpace(c.Instruction); instr != "" {
+		usr.WriteString("Instrução do advogado: " + instr + "\n")
+	} else if kl := kindLabel(c.Kind); kl != "" {
+		usr.WriteString("Tipo de ajuste (quick): " + kl + "\n")
+	}
+	usr.WriteString("\nProduza as mudanças (JSON) conforme as regras.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftIterateVersion}
+}
+
+// kindDirective returns the extra system directive for a "quick adjust" kind.
+// Empty when kind is empty (free instruction) or unknown.
+func kindDirective(kind string) string {
+	switch kind {
+	case "concise":
+		return "DIRETIVA CONCISÃO: corte redundâncias e repetições; mantenha o essencial. " +
+			"Frases curtas, sem \"data venia\", \"salvo melhor juízo\" em excesso."
+	case "emphatic":
+		return "DIRETIVA ÊNFASE: reforce a força retórica sem perder rigor técnico. " +
+			"Argumentos sublinhados, verbos assertivos; evite adjetivação vazia."
+	case "reinforce_thesis":
+		return "DIRETIVA REFORÇAR A TESE PRINCIPAL: identifique o eixo argumentativo " +
+			"central e traga-o de volta em cada seção; elimine desvios que enfraquecem a tese."
+	case "add_grounds":
+		return "DIRETIVA ADICIONAR FUNDAMENTO: ancore a argumentação em base legal ou " +
+			"precedente citando o inciso específico do artigo e, quando cabível, " +
+			"jurisprudência do STJ/STF ou súmula. Nunca invente números de processo."
+	default:
+		return ""
+	}
+}
+
+// kindLabel is the human-readable label of a kind, for injection in the user
+// prompt when there's no free-text instruction. Returns "" for empty/unknown.
+func kindLabel(kind string) string {
+	switch kind {
+	case "concise":
+		return "Mais conciso"
+	case "emphatic":
+		return "Mais enfático"
+	case "reinforce_thesis":
+		return "Reforçar a tese principal"
+	case "add_grounds":
+		return "Adicionar fundamento"
+	default:
+		return ""
+	}
 }

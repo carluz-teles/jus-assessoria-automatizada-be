@@ -56,6 +56,7 @@ type routerDeps struct {
 	// credential wiring) can extend routerDeps without touching main.go's boot
 	// sequence — the router nil-guards the consumer handler exactly like document.
 	vault                *vault.Vault
+	streamTokenStore     draft.StreamTokenStore
 }
 
 // newRouter builds the api's Fiber app: the global middleware chain, the two
@@ -132,6 +133,13 @@ func newRouter(deps routerDeps) *fiber.App {
 		if strings.HasPrefix(c.Path(), lookupPrefix) || c.Path() == identityMePath {
 			return userAuth(c)
 		}
+		// SSE da geração aceita stream_token opaco (2min) via query. Se
+		// vier stream_token válido → popula principal e segue; senão cai
+		// pro tenantAuth normal (que falha porque EventSource não manda
+		// Bearer, mas mantém o gate).
+		if deps.streamTokenStore != nil && strings.HasSuffix(c.Path(), "/generation-stream") {
+			return draft.StreamTokenAuth(deps.streamTokenStore, tenantAuth)(c)
+		}
 		return tenantAuth(c)
 	})
 
@@ -178,6 +186,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	// without a use case, like the other slices.
 	if deps.draft != nil {
 		deps.draft.RegisterV1(v1)
+	}
+
+	// certificate owns /v1/certificates (upload/preview/list/revoke/sign). Nil-guarded
+	// como os demais — sem storage + CERT_MASTER_KEY, o slice não sobe e as rotas
+	// simplesmente não existem (o FE cai em 404 e mostra a lista vazia).
+	if deps.certificate != nil {
+		deps.certificate.RegisterV1(v1)
 	}
 
 	// notifications owns its authenticated /v1 in-app inbox routes (list/badge/

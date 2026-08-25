@@ -10,8 +10,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -142,4 +144,56 @@ func (c *Client) Exists(ctx context.Context, key string) (bool, error) {
 // key unguessable and collision-free.
 func NewKey(tenantID, prefix string) string {
 	return tenantID + "/" + prefix + "/" + uuid.NewString()
+}
+
+// PutBytes uploads bytes DIRECTLY through the backend — used when the object
+// MUST be inspected/transformed server-side before persisting (ex.: certificate
+// upload: parse PKCS#12, extract metadata, encrypt with master key, then store).
+// For user-facing file uploads keep using PresignedPut so bytes never transit
+// the API.
+func (c *Client) PutBytes(ctx context.Context, key, contentType string, data []byte) error {
+	_, err := c.api.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      &c.bucket,
+		Key:         &key,
+		ContentType: &contentType,
+		Body:        bytes.NewReader(data),
+	})
+	if err != nil {
+		return apperr.NewInfra("storage: put object", err)
+	}
+	return nil
+}
+
+// GetBytes downloads an object server-side (bypasses presigned GET). Same
+// rationale as PutBytes: used only when the API MUST touch the bytes (ex.:
+// decrypt + open a certificate PKCS#12 to sign). NotFound surfaces as a
+// tenant-agnostic infra error — the caller layered the tenant guard already.
+func (c *Client) GetBytes(ctx context.Context, key string) ([]byte, error) {
+	out, err := c.api.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &c.bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return nil, apperr.NewInfra("storage: get object", err)
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, apperr.NewInfra("storage: read object body", err)
+	}
+	return data, nil
+}
+
+// Delete removes an object. Idempotent from the caller's perspective — a
+// missing key still returns nil (S3 semantics). Used when a certificate is
+// hard-removed (fatia 2), NOT for the soft-delete revoke path.
+func (c *Client) Delete(ctx context.Context, key string) error {
+	_, err := c.api.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &c.bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return apperr.NewInfra("storage: delete object", err)
+	}
+	return nil
 }

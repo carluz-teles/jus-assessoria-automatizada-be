@@ -2,36 +2,29 @@ package certificate
 
 import "github.com/jusassessoria/platform/lib/apperr"
 
-// Typed, HTTP-agnostic errors for the slice (lib/apperr). "Not exists" is always
-// a typed ENTITY_NOT_FOUND, never (nil, nil). The parse/validation failures are
-// KindInvalid so the edge maps them to 4xx — a wrong password or an expired cert
-// is a client mistake, not a server fault. None of these carry the password or
-// key material.
-var (
-	// ErrCertificateNotFound — no certificate for that id in the tenant.
-	ErrCertificateNotFound = apperr.NewNotFound("certificate not found")
+// Sentinel errors — kept typed via apperr so the httpx boundary maps them to
+// HTTP status without the domain caring about the wire format.
 
-	// ErrInvalidPassword — the .pfx password did not decrypt the file. Message is
-	// deliberately generic; it never echoes the attempted password.
-	ErrInvalidPassword = apperr.NewInvalid("certificate password is incorrect")
+// ErrCertificateNotFound: no active certificate for (tenant, id).
+var ErrCertificateNotFound = apperr.NewNotFound("certificado não encontrado")
 
-	// ErrMalformedPFX — the upload is not a decodable PKCS#12 file.
-	ErrMalformedPFX = apperr.NewInvalid("uploaded file is not a valid .pfx/.p12 certificate")
+// ErrPKCS12BadPassword: password could not open the .pfx. This is a user
+// input error, not infra — the FE surfaces it as a form validation.
+var ErrPKCS12BadPassword = apperr.NewInvalid("senha do certificado incorreta")
 
-	// ErrCertificateExpired — the certificate's validity window has already passed.
-	ErrCertificateExpired = apperr.NewInvalid("certificate is expired")
+// ErrPKCS12Parse: the .pfx is unreadable (corrupt, wrong format). Distinguished
+// from BadPassword so the FE can advise "arquivo inválido" vs "senha incorreta".
+var ErrPKCS12Parse = apperr.NewInvalid("arquivo do certificado inválido")
 
-	// ErrEmptyFile — the multipart file part was empty.
-	ErrEmptyFile = apperr.NewInvalid("certificate file is required")
+// ErrCertificateAlreadyExists: dedup — mesmo fingerprint já cadastrado ativo
+// para o tenant. O FE mostra "este certificado já está cadastrado".
+var ErrCertificateAlreadyExists = apperr.NewConflict("este certificado já está cadastrado")
 
-	// ErrPasswordRequired — the password field was empty.
-	ErrPasswordRequired = apperr.NewInvalid("certificate password is required")
+// ErrCertificateExpired: NotAfter no passado — bloqueia upload (não faz
+// sentido cadastrar um cert que não pode assinar nada).
+var ErrCertificateExpired = apperr.NewInvalid("certificado expirado")
 
-	// ErrInvalidDigest — the digest to sign is not a 32-byte SHA-256 sum. We only
-	// sign a bare hash the caller computed, never arbitrary/structured bytes.
-	ErrInvalidDigest = apperr.NewInvalid("digest must be a 32-byte SHA-256 hash")
-
-	// ErrCertificateRevoked — the certificate has been revoked and can no longer
-	// sign. A revoked key is refused before any decryption is attempted.
-	ErrCertificateRevoked = apperr.NewInvalid("certificate is revoked")
-)
+// ErrStorageNotConfigured: o slice sobe mas o storage.Client é nil (dev sem
+// MinIO ou prod sem R2). O handler responde 503 pra o FE mostrar "serviço
+// indisponível" em vez de crashar.
+var ErrStorageNotConfigured = apperr.NewInfra("storage de certificados não configurado", nil)

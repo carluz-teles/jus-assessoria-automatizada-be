@@ -34,6 +34,16 @@ func (f *fakeChatGen) GenerateJSON(_ context.Context, _ llm.Request) ([]byte, er
 	return f.out, f.err
 }
 
+func (f *fakeChatGen) GenerateJSONStream(_ context.Context, _ llm.Request, onChunk func(string) error) ([]byte, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		_ = onChunk(string(f.out))
+	}
+	return f.out, nil
+}
+
 // fakeChatEmb is a fake embedder for chat tests. Satisfies the package-level
 // embedder interface (same as fakeEmbedder in generate_test.go, but kept separate
 // so each test file controls its own fake independently).
@@ -126,6 +136,10 @@ func (fakeChatComposer) ComposeReview(_ string, _ advisory.ReviewContext) (advis
 
 func (fakeChatComposer) ComposeTheses(_ string, _ advisory.DraftContext) (advisory.Composed, error) {
 	panic("unexpected ComposeTheses call in chat test")
+}
+
+func (fakeChatComposer) ComposeIterate(_ string, _ advisory.IterateContext) (advisory.Composed, error) {
+	panic("unexpected ComposeIterate call in chat test")
 }
 
 // newChatUCForTest builds a ChatUseCase with the given fakes. Uses fakeUoW from
@@ -462,6 +476,9 @@ func (c *capturingChatComposer) ComposeReview(_ string, _ advisory.ReviewContext
 }
 func (c *capturingChatComposer) ComposeTheses(_ string, _ advisory.DraftContext) (advisory.Composed, error) {
 	panic("unexpected ComposeTheses in chat test")
+}
+func (c *capturingChatComposer) ComposeIterate(_ string, _ advisory.IterateContext) (advisory.Composed, error) {
+	panic("unexpected ComposeIterate in chat test")
 }
 
 // ── validateChatCitations unit tests ─────────────────────────────────────────

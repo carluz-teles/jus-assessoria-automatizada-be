@@ -1,9 +1,9 @@
 package certificate
 
 import (
-	"context"
 	"encoding/base64"
 	"io"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -11,250 +11,215 @@ import (
 	"github.com/jusassessoria/platform/lib/httpx"
 )
 
-// handler.go is the certificate slice's HTTP surface (the A1 milestone): the
-// secure upload (POST /v1/certificates, multipart), the list (GET /v1/certificates,
-// metadata only), and the revoke (DELETE /v1/certificates/:id). The slice owns its
-// routing; cmd/api only composes by calling Register. tenant_id AND owner_user_id
-// come from the verified principal, never the body/path.
-//
-// SECURITY: the password arrives in a multipart field, is handed straight to the
-// use case, and is never logged. The list/create responses are CertificateView —
-// metadata only, no key material.
+// Limite duro no upload: um .pfx sério raramente passa 100KB. 2MB é margem
+// generosa; acima disso é abuso/erro do cliente.
+const maxPFXSize = 2 * 1024 * 1024
 
-// maxUploadBytes caps the .pfx upload. An A1 file is a few KB; 1 MB is generous and
-// bounds the bytes we buffer + encrypt in memory.
-const maxUploadBytes = int64(1 << 20)
-
-// uc is the narrow port the Handler uses from the use case — exactly the endpoint
-// methods.
-type uc interface {
-	Create(ctx context.Context, cmd CreateCommand) (CertificateView, error)
-	Preview(ctx context.Context, cmd PreviewCommand) (PreviewResult, error)
-	Sign(ctx context.Context, cmd SignCommand) (SignResult, error)
-	List(ctx context.Context, tenantID string) ([]CertificateView, error)
-	Revoke(ctx context.Context, tenantID, id string) error
-}
-
-// Handler is the certificate HTTP surface. It owns its routing; the api only
-// composes by calling Register.
+// Handler expõe as 5 rotas do slice. O owner de todo cert cadastrado é o
+// user_id do principal — ninguém cadastra em nome de outro.
 type Handler struct {
-	uc uc
+	uc *UseCase
 }
 
-// NewHandler wires the handler to the use case (injected as a narrow port so tests
-// substitute a fake).
-func NewHandler(uc uc) *Handler {
+// New constrói o handler. Recebe o use case pronto (com storage + cipher).
+func New(uc *UseCase) *Handler {
 	return &Handler{uc: uc}
 }
 
-// Register mounts the certificate routes on the /v1 group. The api only composes.
-// The static /certificates/preview is declared before /certificates/:id so Fiber
-// never captures "preview" as an :id (it is only on the DELETE verb, but keeping
-// the ordering explicit is defensive).
-func (h *Handler) Register(r fiber.Router) {
+// RegisterV1 monta as rotas sob /v1. Chame de cmd/api/main.go.
+func (h *Handler) RegisterV1(r fiber.Router) {
+	r.Post("/certificates", h.upload)
 	r.Post("/certificates/preview", h.preview)
-	r.Post("/certificates", h.create)
-	r.Post("/certificates/:id/sign", h.sign)
 	r.Get("/certificates", h.list)
 	r.Delete("/certificates/:id", h.revoke)
+	r.Post("/certificates/:id/sign", h.sign)
 }
 
-// readPFXUpload reads and bounds the multipart {file, password} both create and
-// preview consume. It returns the raw .pfx bytes + the password, or a typed 4xx.
-// The password is returned to the caller and NEVER logged here.
-func readPFXUpload(c *fiber.Ctx) (pfxData []byte, password string, err error) {
-	password = c.FormValue("password")
-	if password == "" {
-		return nil, "", ErrPasswordRequired
-	}
-
-	fileHeader, err := c.FormFile("file")
-	if err != nil || fileHeader == nil {
-		return nil, "", ErrEmptyFile
-	}
-	if fileHeader.Size == 0 {
-		return nil, "", ErrEmptyFile
-	}
-	if fileHeader.Size > maxUploadBytes {
-		return nil, "", apperr.NewInvalid("certificate file is too large")
-	}
-
-	f, err := fileHeader.Open()
-	if err != nil {
-		return nil, "", apperr.NewInvalid("could not read the uploaded file")
-	}
-	defer f.Close()
-
-	// Bound the read to maxUploadBytes+1 so a lying Content-Length cannot make us
-	// buffer an unbounded body.
-	pfxData, err = io.ReadAll(io.LimitReader(f, maxUploadBytes+1))
-	if err != nil {
-		return nil, "", apperr.NewInvalid("could not read the uploaded file")
-	}
-	if int64(len(pfxData)) > maxUploadBytes {
-		return nil, "", apperr.NewInvalid("certificate file is too large")
-	}
-	if len(pfxData) == 0 {
-		return nil, "", ErrEmptyFile
-	}
-	return pfxData, password, nil
-}
-
-// create handles POST /v1/certificates: multipart {file, password}. It reads the
-// file part (≤ maxUploadBytes) and the password, then parses + envelope-encrypts +
-// stores. tenant_id + owner_user_id come from the verified principal. A wrong
-// password / expired / malformed file is a typed 4xx via the {kind,message,details}
-// envelope; success is 201 + CertificateView.
-func (h *Handler) create(c *fiber.Ctx) error {
-	principal, ok := httpx.PrincipalFromCtx(c)
-	if !ok {
-		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
-	}
-
-	pfxData, password, err := readPFXUpload(c)
-	if err != nil {
-		return httpx.WriteError(c, err)
-	}
-
-	view, err := h.uc.Create(c.UserContext(), CreateCommand{
-		TenantID:    principal.TenantID,
-		OwnerUserID: principal.UserID,
-		PFXData:     pfxData,
-		Password:    password,
-	})
-	if err != nil {
-		return httpx.WriteError(c, err)
-	}
-
-	return c.Status(fiber.StatusCreated).JSON(view)
-}
-
-// preview handles POST /v1/certificates/preview: multipart {file, password}. It
-// parses + validates the .pfx and returns the metadata + checks, storing NOTHING
-// (the wizard's read-only "Validação" step). A wrong password / malformed file is a
-// typed 4xx; a successful parse is 200 + PreviewResult even when a check is false.
-// tenant scoping is unnecessary (nothing is persisted), but the route is still
-// behind the authenticated /v1 group.
+// preview: POST /v1/certificates/preview (multipart: file, password) →
+// CertificadoPreviewResult (bate com o FE 1:1). Nada persistido.
 func (h *Handler) preview(c *fiber.Ctx) error {
-	pfxData, password, err := readPFXUpload(c)
+	pfx, password, err := readMultipartPFX(c)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-
-	result, err := h.uc.Preview(c.UserContext(), PreviewCommand{
-		PFXData:  pfxData,
-		Password: password,
-	})
+	res, err := h.uc.Preview(c.UserContext(), pfx, password)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-
-	return c.Status(fiber.StatusOK).JSON(result)
+	return c.Status(fiber.StatusOK).JSON(previewToResponse(res))
 }
 
-// signRequest is the POST /v1/certificates/:id/sign body. Password is the session
-// password used ONLY to decrypt the .pfx server-side (never persisted, never
-// logged); DigestSHA256 is the base64 of the raw 32-byte SHA-256 the caller already
-// computed over its document. The certificate id comes from the path, tenant +
-// signer from the principal — never the body.
-type signRequest struct {
-	Password     string `json:"password"`
-	DigestSHA256 string `json:"digest_sha256"`
-}
-
-// Validate enforces the shape before the use case runs (ozzo-style, but the body is
-// tiny so an explicit check is clearer than a rule set): a password is required and
-// the digest must be present. The 32-byte length is enforced after base64 decoding.
-func (r signRequest) Validate() error {
-	if r.Password == "" {
-		return ErrPasswordRequired
+// upload: POST /v1/certificates (multipart: file, password) → CertificateView.
+// A senha é usada só pra abrir o PKCS#12 e é DESCARTADA (não persiste).
+func (h *Handler) upload(c *fiber.Ctx) error {
+	pfx, password, err := readMultipartPFX(c)
+	if err != nil {
+		return httpx.WriteError(c, err)
 	}
-	if r.DigestSHA256 == "" {
-		return ErrInvalidDigest
-	}
-	return nil
-}
-
-// signResponse is the sign result: the signature and the DER cert chain (leaf
-// first), both base64. No key material — the signature is public by nature.
-type signResponse struct {
-	Signature string   `json:"signature"`
-	CertChain []string `json:"cert_chain"`
-}
-
-// sign handles POST /v1/certificates/:id/sign: JSON {password, digest_sha256}. It
-// decodes the digest, then decrypts the stored .pfx with the session password and
-// signs the digest with the certificate's RSA private key server-side. tenant +
-// signer come from the principal, the certificate id from the path. A wrong
-// password / bad digest → typed 4xx; a missing cert → 404; success → 200 +
-// {signature, cert_chain} (base64). The password is never logged.
-func (h *Handler) sign(c *fiber.Ctx) error {
-	principal, ok := httpx.PrincipalFromCtx(c)
+	tenantID := httpx.TenantFromCtx(c)
+	p, ok := httpx.PrincipalFromCtx(c)
 	if !ok {
 		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
 	}
-
-	var req signRequest
-	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, apperr.NewInvalid("invalid request body"))
-	}
-	if err := req.Validate(); err != nil {
-		return httpx.WriteError(c, err)
-	}
-
-	digest, err := base64.StdEncoding.DecodeString(req.DigestSHA256)
-	if err != nil {
-		return httpx.WriteError(c, ErrInvalidDigest)
-	}
-
-	res, err := h.uc.Sign(c.UserContext(), SignCommand{
-		TenantID:      principal.TenantID,
-		SignerUserID:  principal.UserID,
-		CertificateID: c.Params("id"),
-		Password:      req.Password,
-		Digest:        digest,
-	})
+	cert, err := h.uc.Upload(c.UserContext(), tenantID, p.UserID, pfx, password)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-
-	chain := make([]string, 0, len(res.ChainDER))
-	for _, der := range res.ChainDER {
-		chain = append(chain, base64.StdEncoding.EncodeToString(der))
-	}
-	return c.Status(fiber.StatusOK).JSON(signResponse{
-		Signature: base64.StdEncoding.EncodeToString(res.Signature),
-		CertChain: chain,
-	})
+	return c.Status(fiber.StatusCreated).JSON(certificateToView(cert, ""))
 }
 
-// certificatesEnvelope is the {data:[...]} response for the list. The set per
-// tenant is small (a handful of lawyers), so it is returned whole — no cursor.
-type certificatesEnvelope struct {
-	Data []CertificateView `json:"data"`
-}
-
-// list handles GET /v1/certificates: the tenant's certificates (metadata only),
-// wrapped in {data:[...]}. tenant_id comes from the principal.
+// list: GET /v1/certificates → { data: CertificateView[] }.
 func (h *Handler) list(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
-	views, err := h.uc.List(c.UserContext(), tenantID)
+	items, err := h.uc.List(c.UserContext(), tenantID)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	if views == nil {
-		views = []CertificateView{}
+	views := make([]certificateView, 0, len(items))
+	for i := range items {
+		views = append(views, certificateToView(&items[i].Certificate, items[i].OwnerUserName))
 	}
-	return c.Status(fiber.StatusOK).JSON(certificatesEnvelope{Data: views})
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"data": views})
 }
 
-// revoke handles DELETE /v1/certificates/:id: soft-revoke. tenant_id comes from
-// the principal, the id from the path. A miss/foreign/already-revoked id is
-// ErrCertificateNotFound → 404; success is 204 No Content.
+// revoke: DELETE /v1/certificates/:id → 204. Soft-delete.
 func (h *Handler) revoke(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
-	if err := h.uc.Revoke(c.UserContext(), tenantID, c.Params("id")); err != nil {
+	id := c.Params("id")
+	if err := h.uc.Revoke(c.UserContext(), tenantID, id); err != nil {
 		return httpx.WriteError(c, err)
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// sign: POST /v1/certificates/:id/sign body { password, digest_sha256 } →
+// { signature (base64), cert_chain (base64[]) }. Senha da sessão, nunca
+// persistida.
+func (h *Handler) sign(c *fiber.Ctx) error {
+	var req SignRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+	digest, err := base64.StdEncoding.DecodeString(req.DigestSHA256B64)
+	if err != nil || len(digest) != 32 {
+		return httpx.WriteError(c, apperr.NewInvalid("digest_sha256 deve ser SHA-256 base64 (32 bytes)"))
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	res, err := h.uc.Sign(c.UserContext(), tenantID, id, req.Password, digest)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	chainB64 := make([]string, 0, len(res.Chain))
+	for _, der := range res.Chain {
+		chainB64 = append(chainB64, base64.StdEncoding.EncodeToString(der))
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"signature":  base64.StdEncoding.EncodeToString(res.Signature),
+		"cert_chain": chainB64,
+	})
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+// readMultipartPFX lê o campo `file` + `password` de um multipart. Valida
+// tamanho e forma. Devolve apperr tipado em caso de erro de borda.
+func readMultipartPFX(c *fiber.Ctx) ([]byte, string, error) {
+	fileHdr, err := c.FormFile("file")
+	if err != nil {
+		return nil, "", apperr.NewInvalid("campo 'file' ausente ou inválido")
+	}
+	if fileHdr.Size > maxPFXSize {
+		return nil, "", apperr.NewInvalid("arquivo maior que o limite permitido")
+	}
+	f, err := fileHdr.Open()
+	if err != nil {
+		return nil, "", apperr.NewInvalid("não foi possível abrir o arquivo")
+	}
+	defer f.Close()
+	pfx, err := io.ReadAll(f)
+	if err != nil {
+		return nil, "", apperr.NewInvalid("erro lendo o arquivo")
+	}
+	password := c.FormValue("password")
+	if password == "" {
+		return nil, "", apperr.NewInvalid("campo 'password' ausente")
+	}
+	return pfx, password, nil
+}
+
+// ── response DTOs (bate com o FE certificado.ts) ─────────────────────────────
+
+type certificateView struct {
+	ID            string  `json:"id"`
+	SubjectCN     string  `json:"subject_cn"`
+	OAB           string  `json:"oab"`
+	Issuer        string  `json:"issuer"`
+	Serial        string  `json:"serial"`
+	NotBefore     string  `json:"not_before"`
+	NotAfter      string  `json:"not_after"`
+	Fingerprint   string  `json:"fingerprint"`
+	OwnerUserID   string  `json:"owner_user_id"`
+	OwnerUserName string  `json:"owner_user_name,omitempty"`
+	CreatedAt     string  `json:"created_at"`
+	RevokedAt     *string `json:"revoked_at"`
+}
+
+func certificateToView(c *Certificate, ownerName string) certificateView {
+	var revoked *string
+	if c.RevokedAt != nil {
+		s := c.RevokedAt.Format(time.RFC3339)
+		revoked = &s
+	}
+	return certificateView{
+		ID:            c.ID,
+		SubjectCN:     c.SubjectCN,
+		OAB:           c.OAB,
+		Issuer:        c.Issuer,
+		Serial:        c.Serial,
+		NotBefore:     c.NotBefore.Format(time.RFC3339),
+		NotAfter:      c.NotAfter.Format(time.RFC3339),
+		Fingerprint:   c.Fingerprint,
+		OwnerUserID:   c.OwnerUserID,
+		OwnerUserName: ownerName,
+		CreatedAt:     c.CreatedAt.Format(time.RFC3339),
+		RevokedAt:     revoked,
+	}
+}
+
+type previewChecksResponse struct {
+	NaoExpirado    bool `json:"nao_expirado"`
+	CadeiaOk       bool `json:"cadeia_ok"`
+	TitularConfere bool `json:"titular_confere"`
+}
+
+type previewResponse struct {
+	SubjectCN   string                `json:"subject_cn"`
+	OAB         string                `json:"oab"`
+	Issuer      string                `json:"issuer"`
+	Serial      string                `json:"serial"`
+	NotBefore   string                `json:"not_before"`
+	NotAfter    string                `json:"not_after"`
+	Fingerprint string                `json:"fingerprint"`
+	Checks      previewChecksResponse `json:"checks"`
+}
+
+func previewToResponse(p *PreviewResult) previewResponse {
+	return previewResponse{
+		SubjectCN:   p.Meta.SubjectCN,
+		OAB:         p.Meta.OAB,
+		Issuer:      p.Meta.Issuer,
+		Serial:      p.Meta.Serial,
+		NotBefore:   p.Meta.NotBefore.Format(time.RFC3339),
+		NotAfter:    p.Meta.NotAfter.Format(time.RFC3339),
+		Fingerprint: p.Meta.Fingerprint,
+		Checks: previewChecksResponse{
+			NaoExpirado:    p.Checks.NaoExpirado,
+			CadeiaOk:       p.Checks.CadeiaOk,
+			TitularConfere: p.Checks.TitularConfere,
+		},
+	}
 }

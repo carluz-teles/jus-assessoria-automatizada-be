@@ -2,6 +2,7 @@ package draft
 
 import (
 	"context"
+	"errors"
 	"math"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
+	"github.com/jusassessoria/platform/lib/pubsub"
 )
 
 // handler.go is the draft slice's HTTP surface — POST /v1/pecas, GET /v1/pecas/:id,
@@ -27,6 +29,20 @@ type writer interface {
 	Sign(ctx context.Context, cmd SignCommand) (*SignResult, error)
 	File(ctx context.Context, cmd FileCommand) (*FileResult, error)
 	Result(ctx context.Context, cmd ResultCommand) (*ResultResult, error)
+	// Workflow steps (Fatia 2a) — apenas gestos, sem lógica de LLM/outbox.
+	SendToSigning(ctx context.Context, tenantID, draftID string) error
+	RevertToConstruction(ctx context.Context, tenantID, draftID string) error
+	// SaveContentHtml (Fase B do editor rico) grava o HTML do Tiptap.
+	SaveContentHtml(ctx context.Context, tenantID, draftID, html string) error
+	// AssumeAuthorship (Peça v2) is exposed via the main UseCase — no separate
+	// wiring needed since it's a single UPDATE (no LLM, outbox).
+	AssumeAuthorship(ctx context.Context, tenantID, draftID string) (*Draft, error)
+	// ── Peticionamento automático (Fatia 1 — e-SAJ) ──
+	ApproveFiling(ctx context.Context, cmd ApproveFilingCommand) (*ApproveFilingResult, error)
+	GetFilingStatus(ctx context.Context, tenantID, draftID string) (*FilingAttempt, error)
+	UploadEsajCredential(ctx context.Context, cmd UploadEsajCredentialCommand) (*EsajCredential, error)
+	ListEsajCredentials(ctx context.Context, tenantID string) ([]EsajCredential, error)
+	RevokeEsajCredential(ctx context.Context, tenantID, id string) error
 }
 
 // generator is the narrow port for the POST /v1/pecas/:id/generate trigger. It is a
@@ -55,6 +71,12 @@ type thesisSuggester interface {
 	SuggestTheses(ctx context.Context, cmd SuggestThesesCommand) (*SuggestThesesResult, error)
 }
 
+// iterator is the narrow port for POST /v1/pecas/:id/iterate (Peça v2). Composed
+// independently — it is stateless (no writer; the FE applies changes via PATCH).
+type iterator interface {
+	Iterate(ctx context.Context, cmd IterateCommand) (*IterateResult, error)
+}
+
 // lister is the narrow port for the paginated list endpoints.
 type lister interface {
 	ListByProcess(ctx context.Context, q ListByProcessQuery) (DraftListResult, error)
@@ -69,14 +91,30 @@ type presigner interface {
 // Handler is the draft HTTP surface. It owns its routing; cmd/api composes via
 // RegisterV1.
 type Handler struct {
-	uc     writer
-	gen    generator       // nil when the generation use case is not wired (no AI key)
-	chat   chatter         // nil when the chat use case is not wired
-	review reviewer        // nil when the review use case is not wired
-	theses thesisSuggester // nil when the theses use case is not wired (no AI key)
-	lister lister          // nil when the list use case is not wired
-	export presigner       // nil when the export use case is not wired
+	uc           writer
+	gen          generator        // nil when the generation use case is not wired (no AI key)
+	chat         chatter          // nil when the chat use case is not wired
+	review       reviewer         // nil when the review use case is not wired
+	theses       thesisSuggester  // nil when the theses use case is not wired (no AI key)
+	lister       lister           // nil when the list use case is not wired
+	export       presigner        // nil when the export use case is not wired
+	iter         iterator         // nil when the iterate use case is not wired
+	storage      StoragePresigner // nil quando storage não configurado — download do PDF fica indisponível
+	chunkSub     chunkSubscriber  // nil → SSE stream não montado
+	getSaga      getSagaFn        // reader minimal pra saga_state
+	streamTokens StreamTokenStore // nil → issuer de stream-token não habilitado
 }
+
+// chunkSubscriber é a porta narrow que o SSE precisa pra ler entries do
+// Redis Stream do draft. lastID vazio = replay do começo; ID do último
+// entry conhecido = retoma dali. Satisfeita por lib/pubsub.StreamSubscriber.
+type chunkSubscriber interface {
+	XSubscribe(ctx context.Context, streamKey string, lastID string) (<-chan pubsub.StreamMessage, error)
+}
+
+// getSagaFn devolve o saga_state atual pra o SSE poder terminar quando a
+// geração já concluiu (evita stream infinito depois do DRAFTED/FAILED).
+type getSagaFn func(ctx context.Context, tenantID, draftID string) (string, error)
 
 // NewHandler wires the handler to the use case.
 func NewHandler(uc writer) *Handler {
@@ -87,6 +125,15 @@ func NewHandler(uc writer) *Handler {
 // cmd/api composition when the generation use case is available.
 func (h *Handler) WithGenerator(gen generator) *Handler {
 	h.gen = gen
+	return h
+}
+
+// WithGenerationStream ativa o endpoint SSE de streaming da geração. Requer
+// tanto o Subscriber (pra ler chunks do canal Redis) quanto o getSaga
+// (pra saber quando fechar). Ambos vêm do api composition.
+func (h *Handler) WithGenerationStream(sub chunkSubscriber, getSaga getSagaFn) *Handler {
+	h.chunkSub = sub
+	h.getSaga = getSaga
 	return h
 }
 
@@ -117,9 +164,23 @@ func (h *Handler) WithLister(l lister) *Handler {
 	return h
 }
 
+// WithStorage anexa o presigner do object storage. Necessário pra gerar
+// signed_pdf_url no read model (Fatia 2b). Sem storage, o campo fica null.
+func (h *Handler) WithStorage(s StoragePresigner) *Handler {
+	h.storage = s
+	return h
+}
+
 // WithExport attaches the export use case to the handler.
 func (h *Handler) WithExport(e presigner) *Handler {
 	h.export = e
+	return h
+}
+
+// WithIterator attaches the iterate use case (Peça v2). Called by cmd/api when
+// the LLM is configured.
+func (h *Handler) WithIterator(i iterator) *Handler {
+	h.iter = i
 	return h
 }
 
@@ -139,6 +200,29 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Patch("/pecas/:id/result", h.resultPeca)
 	r.Get("/pecas/:id/export", h.exportPeca)
 
+	// Peticionamento automático (Fatia 1 — e-SAJ RPA).
+	r.Post("/pecas/:id/filing/approve", h.approveFiling)
+	r.Get("/pecas/:id/filing", h.getFilingStatus)
+	r.Post("/esaj-credentials", h.uploadEsajCredential)
+	r.Get("/esaj-credentials", h.listEsajCredentials)
+	r.Delete("/esaj-credentials/:id", h.revokeEsajCredential)
+
+	// Workflow steps (Fatia 2a — persistir "onde parei" do peticionamento).
+	// sent_to_signing_at é o gesto de avançar Construção → Assinatura;
+	// revert nulla o mesmo (só permite se ainda não assinado).
+	r.Post("/pecas/:id/enviar-para-assinatura", h.sendToSigning)
+	r.Post("/pecas/:id/voltar-para-construcao", h.revertToConstruction)
+
+	// Editor rico (Fase B) — autosave do HTML do Tiptap.
+	r.Put("/pecas/:id/content-html", h.saveContentHtml)
+
+	// Streaming da geração (Fatia 2 do streaming). SSE: cliente conecta
+	// durante EXTRACTING e recebe chunks do LLM em tempo real. Fecha
+	// quando saga_state=DRAFTED/FAILED. Auth alternativa via
+	// ?stream_token=xxx (curto, opaco, gerado pelo POST /stream-token).
+	r.Post("/pecas/:id/stream-token", h.issueStreamToken)
+	r.Get("/pecas/:id/generation-stream", h.generationStream)
+
 	// Process-scoped list.
 	r.Get("/processos/:id/pecas", h.listPecasByProcess)
 
@@ -150,6 +234,13 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 	// AI thesis suggestion (Fatia 5 — Sugerir Teses síncrono).
 	r.Post("/pecas/:id/theses", h.thesesPeca)
+	// Variante pre-criação: sugere teses direto da intimação, sem draft ainda
+	// (tela /pecas/nova no FE — evita criar draft zumbi a cada clique).
+	r.Post("/theses", h.thesesFromIntimation)
+
+	// Iteração + assumir autoria (Peça v2).
+	r.Post("/pecas/:id/iterate", h.iteratePeca)
+	r.Post("/pecas/:id/assume-authorship", h.assumeAuthorship)
 
 	// Grounded chat (Fatia 3b).
 	r.Post("/pecas/:id/chat", h.postChat)
@@ -167,6 +258,13 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 // idempotent (same tenant+intimation_id already has a draft).
 func (h *Handler) createPeca(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
+	// UserID vem do principal — usado como created_by da peça pra o read model
+	// da lista mostrar o autor. Pode ser vazio se a rota estiver sob AuthUser
+	// (não é o caso hoje pra /pecas, mas o repo tolera vazio → NULL).
+	var createdBy string
+	if p, ok := httpx.PrincipalFromCtx(c); ok {
+		createdBy = p.UserID
+	}
 
 	var req CreateRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -178,6 +276,7 @@ func (h *Handler) createPeca(c *fiber.Ctx) error {
 
 	result, err := h.uc.Create(c.UserContext(), CreateCommand{
 		TenantID:     tenantID,
+		CreatedBy:    createdBy,
 		Source:       req.Source,
 		IntimationID: req.IntimationID,
 		CaseID:       req.CaseID,
@@ -206,7 +305,66 @@ func (h *Handler) getPeca(c *fiber.Ctx) error {
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	return c.JSON(fiber.Map{"data": detailToResponse(view)})
+	resp := detailToResponse(view)
+	// Fatia 2b: se a peça já foi assinada e temos storage, gera presigned URL
+	// do PDF. TTL curto (15 min). Erro no presign é degradação silenciosa
+	// (deixa nil e o FE mostra "Baixar indisponível").
+	if view.SignedPDFKey != "" && h.storage != nil {
+		if u, err := h.storage.PresignedGet(c.UserContext(), view.SignedPDFKey, 15*time.Minute); err == nil {
+			resp.SignedPDFURL = &u
+		}
+	}
+	return c.JSON(fiber.Map{"data": resp})
+}
+
+// ─── POST /v1/pecas/:id/iterate (Peça v2) ───────────────────────────────────
+
+// iteratePeca dispatches the synchronous iteration to the LLM. Body carries
+// scope + kind/instruction; response carries the SectionChange list.
+func (h *Handler) iteratePeca(c *fiber.Ctx) error {
+	if h.iter == nil {
+		return httpx.WriteError(c, apperr.NewInvalid("Iteração pela IA não está configurada."))
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	var req IterateRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	result, err := h.iter.Iterate(c.UserContext(), IterateCommand{
+		TenantID:    tenantID,
+		DraftID:     draftID,
+		Scope:       IterateScope{Kind: req.Scope.Kind, SectionID: req.Scope.SectionID},
+		Kind:        req.Kind,
+		Instruction: req.Instruction,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": result})
+}
+
+// ─── POST /v1/pecas/:id/assume-authorship (Peça v2) ─────────────────────────
+
+// assumeAuthorship flips the peça to human_taken. Idempotent — a repeat call
+// returns the same shape.
+func (h *Handler) assumeAuthorship(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	d, err := h.uc.AssumeAuthorship(c.UserContext(), tenantID, draftID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": fiber.Map{
+		"authorship": d.Authorship,
+		"updated_at": d.UpdatedAt.Format(time.RFC3339),
+	}})
 }
 
 // ─── PATCH /v1/pecas/:id ─────────────────────────────────────────────────────
@@ -225,10 +383,11 @@ func (h *Handler) patchPeca(c *fiber.Ctx) error {
 	}
 
 	result, err := h.uc.Patch(c.UserContext(), PatchCommand{
-		TenantID: tenantID,
-		DraftID:  draftID,
-		Content:  req.Content,
-		Title:    req.Title,
+		TenantID:          tenantID,
+		DraftID:           draftID,
+		Content:           req.Content,
+		Title:             req.Title,
+		StructuredContent: req.StructuredContent,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -301,10 +460,33 @@ type detailResponse struct {
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 
+	// Peça v2 (migration 0056) — structured_content is the source of truth for
+	// the FE; content stays for legacy/export. authorship drives which panel
+	// tab (Iterar vs Revisão) the FE shows.
+	StructuredContent *StructuredContent `json:"structured_content"`
+	// ContentHTML (Fase B do editor rico) — HTML do Tiptap. null pra peças
+	// legacy ou geradas pela IA antes do 1º save do editor humano.
+	ContentHTML *string `json:"content_html"`
+	Authorship  string  `json:"authorship"`
+
 	Intimation  *intimationResponse  `json:"intimation,omitempty"`
 	Process     *processResponse     `json:"process,omitempty"`
 	Deadline    *deadlineResponse    `json:"deadline,omitempty"`
 	Attachments []attachmentResponse `json:"attachments"`
+	Providences []Providence         `json:"providences"`
+	Parties     []partyResponse      `json:"parties"`
+
+	// Workflow steps (Fatia 2a — 0060). Cada timestamp é um fato datado; o FE
+	// deriva o step atual (Construção/Assinatura/Protocolo/Concluído). Todos
+	// nullable: null = "ainda não aconteceu".
+	SentToSigningAt *string `json:"sent_to_signing_at"`
+	SignedAt        *string `json:"signed_at"`
+	FiledAt         *string `json:"filed_at"`
+	FilingNumber    string  `json:"filing_number"`
+	// Presigned GET URL do PDF assinado (Fatia 2b). null antes de assinar OU
+	// quando o storage não está configurado. TTL curto (15 min) — se o link
+	// expirar, o FE faz GET /pecas/:id de novo pra pegar um novo.
+	SignedPDFURL *string `json:"signed_pdf_url"`
 
 	// Review is the latest AI review, or null when no generation has been run.
 	Review *reviewResponse `json:"review"`
@@ -365,16 +547,39 @@ type deadlineResponse struct {
 	Status   string `json:"status"`
 }
 
+// partyResponse is one party in GET /v1/pecas/:id. role is the raw DB enum
+// (PLAINTIFF | DEFENDANT | THIRD_PARTY) — the FE maps to autor/reu/procurador.
+// counsels is always an array (empty when the party has no advogado registered).
+type partyResponse struct {
+	Role     string            `json:"role"`
+	Name     string            `json:"name"`
+	Counsels []counselResponse `json:"counsels"`
+}
+
+// counselResponse is one advogado aggregated under a party.
+type counselResponse struct {
+	Name string `json:"name"`
+	OAB  string `json:"oab"`
+	UF   string `json:"uf"`
+}
+
 func detailToResponse(v *DraftDetailView) detailResponse {
 	resp := detailResponse{
-		ID:        v.ID,
-		PieceType: v.PieceType,
-		Title:     v.Title,
-		Content:   v.Content,
-		Status:    v.Status,
-		SagaState: v.SagaState,
-		CreatedAt: v.CreatedAt.Format(time.RFC3339),
-		UpdatedAt: v.UpdatedAt.Format(time.RFC3339),
+		ID:                v.ID,
+		PieceType:         v.PieceType,
+		Title:             v.Title,
+		Content:           v.Content,
+		Status:            v.Status,
+		SagaState:         v.SagaState,
+		CreatedAt:         v.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:         v.UpdatedAt.Format(time.RFC3339),
+		StructuredContent: v.StructuredContent,
+		ContentHTML:       v.ContentHtml,
+		Authorship:        v.Authorship,
+		SentToSigningAt:   timePtrToRFC3339(v.SentToSigningAt),
+		SignedAt:          timePtrToRFC3339(v.SignedAt),
+		FiledAt:           timePtrToRFC3339(v.FiledAt),
+		FilingNumber:      v.FilingNumber,
 	}
 
 	if v.Intimation != nil {
@@ -415,6 +620,17 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 
 	// Attachments: always an array (empty when none), never omitted.
 	resp.Attachments = attachmentsToResponse(v.Attachments)
+
+	// Providences: always an array (empty when none — drafts without an intimation,
+	// or with no tasks yet). Peça v2 FE renders the sidebar bullet list.
+	resp.Providences = v.Providences
+	if resp.Providences == nil {
+		resp.Providences = []Providence{}
+	}
+
+	// Parties: always an array (empty when the draft has no process, or the
+	// case genuinely has no party materialized). Peça v2 FE renders bloco PARTES.
+	resp.Parties = partiesToResponse(v.Parties)
 
 	// Review: nil when no generation has run yet, otherwise the latest review.
 	if v.Review != nil {
@@ -560,22 +776,81 @@ func (h *Handler) thesesPeca(c *fiber.Ctx) error {
 	})
 }
 
+// ─── POST /v1/theses ──────────────────────────────────────────────────────────
+
+// thesesFromIntimationRequest is the body of POST /v1/theses. piece_type é
+// obrigatório porque o use case usa como parte do query text da RAG e como
+// PieceType no DraftContext do prompt.
+//
+// ModelOverride é debug-only: se != "", ignora o cfg.OpenRouterModel e usa
+// esse slug pra esta chamada. Serve pra bateria de A/B de modelos direto do
+// FE sem re-deploy (ex: `{"model":"google/gemini-2.5-flash"}`). Remover
+// depois que o modelo default for escolhido em prod.
+type thesesFromIntimationRequest struct {
+	IntimationID  string `json:"intimation_id"`
+	PieceType     string `json:"piece_type"`
+	ModelOverride string `json:"model,omitempty"`
+}
+
+// thesesFromIntimation handles POST /v1/theses — variante sem draft do fluxo de
+// Sugerir Teses. Usado pela tela /pecas/nova, que difere a criação do draft
+// até o commit (Gerar/Manual). Guarda thesisSuggester nil + campos obrigatórios.
+// Retorna 200 {data:{theses:[...]}}.
+func (h *Handler) thesesFromIntimation(c *fiber.Ctx) error {
+	if h.theses == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+	tenantID := httpx.TenantFromCtx(c)
+
+	var req thesesFromIntimationRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	if req.IntimationID == "" {
+		return httpx.WriteError(c, apperr.NewInvalid("intimation_id é obrigatório"))
+	}
+	if req.PieceType == "" {
+		return httpx.WriteError(c, apperr.NewInvalid("piece_type é obrigatório"))
+	}
+
+	result, err := h.theses.SuggestTheses(c.UserContext(), SuggestThesesCommand{
+		TenantID:      tenantID,
+		IntimationID:  req.IntimationID,
+		PieceType:     req.PieceType,
+		ModelOverride: req.ModelOverride,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"data": fiber.Map{
+			"theses": thesesToResponse(result.Theses),
+		},
+	})
+}
+
 // thesisResponse is one item in the /theses response.
 type thesisResponse struct {
-	Label      string `json:"label"`
-	Confidence string `json:"confidence"`
-	Reference  string `json:"reference"`
-	Foundation string `json:"foundation"`
+	Label      string   `json:"label"`
+	Confidence string   `json:"confidence"`
+	Reference  string   `json:"reference"`
+	Foundation string   `json:"foundation"`
+	Evidence   []string `json:"evidence"`
 }
 
 func thesesToResponse(theses []Thesis) []thesisResponse {
 	out := make([]thesisResponse, 0, len(theses))
 	for _, t := range theses {
+		ev := t.Evidence
+		if ev == nil {
+			ev = []string{} // wire: nunca null (JSON contract)
+		}
 		out = append(out, thesisResponse{
 			Label:      t.Label,
 			Confidence: t.Confidence,
 			Reference:  t.Reference,
 			Foundation: t.Foundation,
+			Evidence:   ev,
 		})
 	}
 	return out
@@ -725,6 +1000,25 @@ func attachmentToResponse(a *Attachment) attachmentResponse {
 	}
 }
 
+// partiesToResponse maps []PartyInfo to the wire representation, preserving
+// role as-is (FE handles the PLAINTIFF→autor / DEFENDANT→reu mapping). counsels
+// is always an array (never nil), so the FE can iterate safely.
+func partiesToResponse(parties []PartyInfo) []partyResponse {
+	out := make([]partyResponse, 0, len(parties))
+	for i := range parties {
+		counsels := make([]counselResponse, 0, len(parties[i].Counsels))
+		for _, c := range parties[i].Counsels {
+			counsels = append(counsels, counselResponse{Name: c.Name, OAB: c.OAB, UF: c.UF})
+		}
+		out = append(out, partyResponse{
+			Role:     parties[i].Role,
+			Name:     parties[i].Name,
+			Counsels: counsels,
+		})
+	}
+	return out
+}
+
 func attachmentsToResponse(atts []Attachment) []attachmentResponse {
 	out := make([]attachmentResponse, 0, len(atts))
 	for i := range atts {
@@ -837,15 +1131,24 @@ const maxCreatedAt = "9999-12-31T23:59:59.999999Z"
 // UUID, so the scan starts at the top.
 const maxUUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
-// signPeca handles POST /v1/pecas/:id/sign. Body is intentionally empty (the
-// signing happens server-side). Returns 200 {data:{id, status, signed_at}}.
+// signPeca handles POST /v1/pecas/:id/sign. Fatia 2b: recebe body
+// {certificate_id} pra escolher qual cert do tenant vai assinar. Retorna
+// 200 {data:{id, status, signed_at}}.
 func (h *Handler) signPeca(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	draftID := c.Params("id")
 
+	var req struct {
+		CertificateID string `json:"certificate_id"`
+	}
+	// Body opcional só pra idempotência (draft já SIGNED continua funcionando
+	// mesmo sem cert_id); o UseCase valida cert_id quando for necessário.
+	_ = c.BodyParser(&req)
+
 	result, err := h.uc.Sign(c.UserContext(), SignCommand{
-		TenantID: tenantID,
-		DraftID:  draftID,
+		TenantID:      tenantID,
+		DraftID:       draftID,
+		CertificateID: req.CertificateID,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -888,6 +1191,7 @@ func (h *Handler) filePeca(c *fiber.Ctx) error {
 		Receipt:       req.Receipt,
 		CourtRecordID: req.CourtRecordID,
 		FiledAt:       filedAt,
+		FilingNumber:  req.FilingNumber,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -935,6 +1239,172 @@ func (h *Handler) resultPeca(c *fiber.Ctx) error {
 			ObservedResult: result.ObservedResult,
 		},
 	})
+}
+
+// ─── Peticionamento automático (Fatia 1 — e-SAJ) ─────────────────────────────
+
+// approveFiling handles POST /v1/pecas/:id/filing/approve. NUNCA auto-file sem
+// este clique. Guarda SIGNED + credencial ativa (consentimento), congela o PDF
+// assinado (snapshot) e enfileira filing.enqueued. Duplo-clique → 200 idempotente
+// (mesma tentativa). Retorna 201 na 1ª vez, 200 se já estava enfileirado.
+func (h *Handler) approveFiling(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	userID := ""
+	if p, ok := httpx.PrincipalFromCtx(c); ok {
+		userID = p.UserID
+	}
+
+	result, err := h.uc.ApproveFiling(c.UserContext(), ApproveFilingCommand{
+		TenantID: tenantID,
+		DraftID:  draftID,
+		UserID:   userID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	status := fiber.StatusCreated
+	if result.IsIdempotent {
+		status = fiber.StatusOK
+	}
+	return c.Status(status).JSON(fiber.Map{
+		"data": filingApproveResponse{
+			FilingAttemptID: result.FilingAttemptID,
+			Status:          result.Status,
+			IsIdempotent:    result.IsIdempotent,
+		},
+	})
+}
+
+// getFilingStatus handles GET /v1/pecas/:id/filing. Devolve a tentativa ativa de
+// protocolo (ou 200 {data:null} se ainda não iniciado).
+func (h *Handler) getFilingStatus(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+
+	attempt, err := h.uc.GetFilingStatus(c.UserContext(), tenantID, draftID)
+	if err != nil {
+		if errors.Is(err, ErrFilingAttemptNotFound) {
+			return c.JSON(fiber.Map{"data": nil})
+		}
+		return httpx.WriteError(c, err)
+	}
+	var finishedAt *time.Time
+	if !attempt.FinishedAt.IsZero() {
+		finishedAt = &attempt.FinishedAt
+	}
+	return c.JSON(fiber.Map{"data": filingStatusResponse{
+		ID:            attempt.ID,
+		DraftID:       attempt.DraftID,
+		Status:        attempt.Status,
+		RequestedAt:   attempt.RequestedAt,
+		FinishedAt:    finishedAt,
+		FailureReason: attempt.FailureReason,
+		FilingNumber:  attempt.FilingNumber,
+	}})
+}
+
+// uploadEsajCredential handles POST /v1/esaj-credentials. Cadastra login + senha
+// (cifrada no envelope KMS) + consentimento dos termos. Owner = principal.
+func (h *Handler) uploadEsajCredential(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	userID := ""
+	userName := ""
+	if p, ok := httpx.PrincipalFromCtx(c); ok {
+		userID = p.UserID
+		userName = p.UserID // usado só p/ log; o nome real vem do join no list
+	}
+	_ = userName
+
+	var req struct {
+		Login        string `json:"login"`
+		Password     string `json:"password"`
+		TermsVersion string `json:"terms_version"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if req.Login == "" || req.Password == "" || req.TermsVersion == "" {
+		return httpx.WriteError(c, apperr.NewInvalid("login, password e terms_version são obrigatórios"))
+	}
+
+	cred, err := h.uc.UploadEsajCredential(c.UserContext(), UploadEsajCredentialCommand{
+		TenantID:        tenantID,
+		OwnerUserID:     userID,
+		Login:           req.Login,
+		Password:        req.Password,
+		TermsVersion:    req.TermsVersion,
+		TermsAcceptedAt: time.Now(),
+		TermsAcceptedBy: userID,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"data": esajCredentialResponse(cred),
+	})
+}
+
+// listEsajCredentials handles GET /v1/esaj-credentials → {data: [...]}.
+func (h *Handler) listEsajCredentials(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	items, err := h.uc.ListEsajCredentials(c.UserContext(), tenantID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	views := make([]esajCredentialView, 0, len(items))
+	for i := range items {
+		views = append(views, esajCredentialResponse(&items[i]))
+	}
+	return c.JSON(fiber.Map{"data": views})
+}
+
+// revokeEsajCredential handles DELETE /v1/esaj-credentials/:id → 204.
+func (h *Handler) revokeEsajCredential(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	if err := h.uc.RevokeEsajCredential(c.UserContext(), tenantID, id); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// ── response DTOs (e-SAJ + filing) ───────────────────────────────────────────
+
+type filingApproveResponse struct {
+	FilingAttemptID string `json:"filing_attempt_id"`
+	Status          string `json:"status"`
+	IsIdempotent    bool   `json:"is_idempotent"`
+}
+
+type filingStatusResponse struct {
+	ID            string     `json:"id"`
+	DraftID       string     `json:"draft_id"`
+	Status        string     `json:"status"`
+	RequestedAt   time.Time  `json:"requested_at"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	FilingNumber  string     `json:"filing_number,omitempty"`
+}
+
+type esajCredentialView struct {
+	ID              string `json:"id"`
+	OwnerUserID     string `json:"owner_user_id"`
+	Login           string `json:"login"`
+	TermsVersion    string `json:"terms_version"`
+	TermsAcceptedAt string `json:"terms_accepted_at"`
+	CreatedAt       string `json:"created_at"`
+}
+
+func esajCredentialResponse(c *EsajCredential) esajCredentialView {
+	return esajCredentialView{
+		ID:              c.ID,
+		OwnerUserID:     c.OwnerUserID,
+		Login:           c.Login,
+		TermsVersion:    c.TermsVersion,
+		TermsAcceptedAt: c.TermsAcceptedAt.Format(time.RFC3339),
+		CreatedAt:       c.CreatedAt.Format(time.RFC3339),
+	}
 }
 
 // exportPeca handles GET /v1/pecas/:id/export?format=docx|pdf. Returns 200
@@ -1012,6 +1482,10 @@ func (h *Handler) listPecas(c *fiber.Ctx) error {
 	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
 	pieceType := c.Query("piece_type")
 	status := c.Query("status")
+	// workflow_state: chip "Aguardando assinatura"/"Aguardando protocolo"
+	// urgencia: chip "Prazo em atraso"/"Prazo hoje" (contra deadline da intimation)
+	workflowState := c.Query("workflow_state")
+	urgencia := c.Query("urgencia")
 
 	lastCreated, lastID := maxCreatedAt, maxUUID
 	if tok := c.Query("cursor"); tok != "" {
@@ -1023,12 +1497,14 @@ func (h *Handler) listPecas(c *fiber.Ctx) error {
 	}
 
 	res, err := h.lister.ListAll(c.UserContext(), ListAllQuery{
-		TenantID:    tenantID,
-		PieceType:   pieceType,
-		Status:      status,
-		LastCreated: lastCreated,
-		LastID:      lastID,
-		Limit:       limit,
+		TenantID:      tenantID,
+		PieceType:     pieceType,
+		Status:        status,
+		WorkflowState: workflowState,
+		Urgencia:      urgencia,
+		LastCreated:   lastCreated,
+		LastID:        lastID,
+		Limit:         limit,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -1069,9 +1545,19 @@ type draftListItemResponse struct {
 	Status          string            `json:"status"`
 	SagaState       string            `json:"saga_state"`
 	CoverageSummary *coverageSummaryR `json:"coverage_summary,omitempty"`
+	SentToSigningAt *string           `json:"sent_to_signing_at,omitempty"`
+	SignedAt        *string           `json:"signed_at,omitempty"`
 	FiledAt         *string           `json:"filed_at,omitempty"`
 	ObservedResult  *string           `json:"observed_result,omitempty"`
 	CreatedAt       string            `json:"created_at"`
+	// Contexto do processo pra card sem 2ª chamada.
+	CNJNumber string `json:"cnj_number,omitempty"`
+	// Nome do autor da peça — vazio quando o draft não tem created_by
+	// (peça pré-0063 ou usuário removido do escritório).
+	ResponsibleName string `json:"responsible_name,omitempty"`
+	// Prazo da intimação de origem — nil quando não há deadline derivado.
+	DeadlineEndDate  *string `json:"deadline_end_date,omitempty"`
+	DeadlineDaysLeft *int32  `json:"deadline_days_left,omitempty"`
 }
 
 type coverageSummaryR struct {
@@ -1085,12 +1571,14 @@ func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemRe
 	items := make([]draftListItemResponse, 0, len(res.Items))
 	for _, it := range res.Items {
 		resp := draftListItemResponse{
-			ID:        it.ID,
-			PieceType: it.PieceType,
-			Title:     it.Title,
-			Status:    it.Status,
-			SagaState: it.SagaState,
-			CreatedAt: it.CreatedAt.Format(time.RFC3339),
+			ID:              it.ID,
+			PieceType:       it.PieceType,
+			Title:           it.Title,
+			Status:          it.Status,
+			SagaState:       it.SagaState,
+			CreatedAt:       it.CreatedAt.Format(time.RFC3339),
+			CNJNumber:       it.CNJNumber,
+			ResponsibleName: it.ResponsibleName,
 		}
 		if it.CoverageSummary != nil {
 			resp.CoverageSummary = &coverageSummaryR{
@@ -1099,9 +1587,22 @@ func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemRe
 				SuggestionsTotal: it.CoverageSummary.SuggestionsTotal,
 			}
 		}
+		if it.SentToSigningAt != nil {
+			s := it.SentToSigningAt.Format(time.RFC3339)
+			resp.SentToSigningAt = &s
+		}
+		if it.SignedAt != nil {
+			s := it.SignedAt.Format(time.RFC3339)
+			resp.SignedAt = &s
+		}
 		if it.FiledAt != nil {
 			s := it.FiledAt.Format(time.RFC3339)
 			resp.FiledAt = &s
+		}
+		if it.DeadlineEndDate != nil {
+			s := it.DeadlineEndDate.Format("2006-01-02")
+			resp.DeadlineEndDate = &s
+			resp.DeadlineDaysLeft = it.DeadlineDaysLeft
 		}
 		if it.ObservedResult != nil {
 			resp.ObservedResult = it.ObservedResult
@@ -1119,4 +1620,58 @@ func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemRe
 		meta.NextCursor = &tok
 	}
 	return httpx.Page[draftListItemResponse]{Data: items, Page: meta}
+}
+
+// timePtrToRFC3339 formats a *time.Time as *string in RFC3339. nil in → nil out.
+func timePtrToRFC3339(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.Format(time.RFC3339)
+	return &s
+}
+
+// sendToSigning handles POST /v1/pecas/:id/enviar-para-assinatura. Marca o
+// gesto "usuário terminou Construção e passou pra Assinatura". Idempotente:
+// já enviado devolve 200. Body vazio.
+func (h *Handler) sendToSigning(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	if err := h.uc.SendToSigning(c.UserContext(), tenantID, draftID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// saveContentHtml handles PUT /v1/pecas/:id/content-html. Autosave do editor
+// rico (Fase B). Body: {"content_html": "<p>..."}. 200 vazio quando ok.
+// Limite defensivo: 500 KB de HTML — peças jurídicas raramente ultrapassam.
+func (h *Handler) saveContentHtml(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	var req struct {
+		ContentHTML string `json:"content_html"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
+	}
+	if len(req.ContentHTML) > 500_000 {
+		return httpx.WriteError(c, apperr.NewInvalid("content_html excede 500 KB"))
+	}
+	if err := h.uc.SaveContentHtml(c.UserContext(), tenantID, draftID, req.ContentHTML); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// revertToConstruction handles POST /v1/pecas/:id/voltar-para-construcao.
+// Nulla sent_to_signing_at. Só permite quando ainda NÃO assinado — se já
+// signed, devolve 404 (a UI trata como "não posso reverter" e refetch).
+func (h *Handler) revertToConstruction(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	if err := h.uc.RevertToConstruction(c.UserContext(), tenantID, draftID); err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }

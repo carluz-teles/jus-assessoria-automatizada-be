@@ -12,42 +12,35 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const assignIntimationResponsaveis = `-- name: AssignIntimationResponsaveis :one
+const assignIntimationAssignee = `-- name: AssignIntimationAssignee :one
 UPDATE intimation
-   SET conductor_user_id = $3::uuid,
-       reviewer_user_id  = $4::uuid
+   SET assignee_user_id = $3::uuid
  WHERE id = $1 AND tenant_id = $2
 RETURNING id
 `
 
-type AssignIntimationResponsaveisParams struct {
-	ID              uuid.UUID   `json:"id"`
-	TenantID        uuid.UUID   `json:"tenant_id"`
-	ConductorUserID pgtype.UUID `json:"conductor_user_id"`
-	ReviewerUserID  pgtype.UUID `json:"reviewer_user_id"`
+type AssignIntimationAssigneeParams struct {
+	ID             uuid.UUID   `json:"id"`
+	TenantID       uuid.UUID   `json:"tenant_id"`
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
 }
 
-// Set (or clear, via NULL) the conductor_user_id and reviewer_user_id on one intimation,
-// tenant-scoped (barrier 1, RLS barrier 2). Both are nullable: passing NULL desatribui
-// the role. The use case pre-validates membership (AppUserExistsInTenant) before calling
-// this, so the FK is always satisfied when non-null. A zero-row result (unknown id or
-// foreign tenant's row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
-// Idempotent: re-assigning the same user re-writes the same value.
-func (q *Queries) AssignIntimationResponsaveis(ctx context.Context, arg AssignIntimationResponsaveisParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, assignIntimationResponsaveis,
-		arg.ID,
-		arg.TenantID,
-		arg.ConductorUserID,
-		arg.ReviewerUserID,
-	)
+// Set (or clear, via NULL) the single assignee_user_id on one intimation,
+// tenant-scoped (barrier 1, RLS barrier 2). Nullable: passing NULL desatribui.
+// The use case pre-validates membership (AppUserExistsInTenant) before calling
+// this, so the FK is always satisfied when non-null. A zero-row result (unknown
+// id or foreign tenant's row) surfaces as pgx.ErrNoRows → ErrIntimationNotFound
+// (→ 404). Idempotent: re-assigning the same user re-writes the same value.
+func (q *Queries) AssignIntimationAssignee(ctx context.Context, arg AssignIntimationAssigneeParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, assignIntimationAssignee, arg.ID, arg.TenantID, arg.AssigneeUserID)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
 }
 
-const bulkAssignConductorByFilter = `-- name: BulkAssignConductorByFilter :execrows
+const bulkAssignIntimacoesByFilter = `-- name: BulkAssignIntimacoesByFilter :execrows
 UPDATE intimation
-   SET conductor_user_id = $1::uuid
+   SET assignee_user_id = $1::uuid
  WHERE tenant_id = $2::uuid
    AND id IN (
      SELECT i.id
@@ -66,47 +59,49 @@ UPDATE intimation
        AND ($6::text = '' OR cr.court = $6::text)
        AND (
          $7::uuid IS NULL
-         OR i.conductor_user_id = $7::uuid
-         OR i.reviewer_user_id = $7::uuid
+         OR i.assignee_user_id = $7::uuid
        )
-       AND (
-         $8::text = ''
-         OR ($8::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
-         OR ($8::text = 'nao_confirmado'     AND d.status = 'PENDING')
-         OR ($8::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-       )
-   )
+        AND (
+          $8::text = ''
+          OR ($8::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+          OR ($8::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+        )
+        AND ($9::bool = false OR d.status = 'PENDING')
+    )
 `
 
-type BulkAssignConductorByFilterParams struct {
-	ConductorUserID pgtype.UUID `json:"conductor_user_id"`
-	TenantID        uuid.UUID   `json:"tenant_id"`
-	Search          string      `json:"search"`
-	Type            string      `json:"type"`
-	UserStatus      string      `json:"user_status"`
-	Court           string      `json:"court"`
-	AssigneeID      pgtype.UUID `json:"assignee_id"`
-	Urgencia        string      `json:"urgencia"`
+type BulkAssignIntimacoesByFilterParams struct {
+	AssigneeUserID   pgtype.UUID `json:"assignee_user_id"`
+	TenantID         uuid.UUID   `json:"tenant_id"`
+	Search           string      `json:"search"`
+	Type             string      `json:"type"`
+	UserStatus       string      `json:"user_status"`
+	Court            string      `json:"court"`
+	FilterAssigneeID pgtype.UUID `json:"filter_assignee_id"`
+	Urgencia         string      `json:"urgencia"`
+	NaoConfirmado    bool        `json:"nao_confirmado"`
 }
 
-// Atribuição em massa do condutor para TODA a faixa/filtro atual (modo "todos" da UI —
-// inclui as linhas ainda não paginadas). Reusa EXATAMENTE a cláusula de filtro do
-// ListIntimacoes (search/type/user_status/court/assignee/urgencia) via subquery. SÓ toca
-// conductor_user_id (preserva o revisor). tenant-scoped (barrier 1, RLS barrier 2).
-func (q *Queries) BulkAssignConductorByFilter(ctx context.Context, arg BulkAssignConductorByFilterParams) (int64, error) {
-	result, err := q.db.Exec(ctx, bulkAssignConductorByFilter,
-		arg.ConductorUserID,
+// Atribuição em massa do responsável para TODA a faixa/filtro atual (modo
+// "todos" da UI — inclui linhas ainda não paginadas). Reusa EXATAMENTE a
+// cláusula de filtro do ListIntimacoes (search/type/user_status/court/assignee/
+// urgencia) via subquery. tenant-scoped (barrier 1, RLS barrier 2).
+func (q *Queries) BulkAssignIntimacoesByFilter(ctx context.Context, arg BulkAssignIntimacoesByFilterParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bulkAssignIntimacoesByFilter,
+		arg.AssigneeUserID,
 		arg.TenantID,
 		arg.Search,
 		arg.Type,
 		arg.UserStatus,
 		arg.Court,
-		arg.AssigneeID,
+		arg.FilterAssigneeID,
 		arg.Urgencia,
+		arg.NaoConfirmado,
 	)
 	if err != nil {
 		return 0, err
@@ -114,23 +109,23 @@ func (q *Queries) BulkAssignConductorByFilter(ctx context.Context, arg BulkAssig
 	return result.RowsAffected(), nil
 }
 
-const bulkAssignConductorByIDs = `-- name: BulkAssignConductorByIDs :execrows
+const bulkAssignIntimacoesByIDs = `-- name: BulkAssignIntimacoesByIDs :execrows
 UPDATE intimation
-   SET conductor_user_id = $1::uuid
+   SET assignee_user_id = $1::uuid
  WHERE tenant_id = $2::uuid
    AND id = ANY($3::uuid[])
 `
 
-type BulkAssignConductorByIDsParams struct {
-	ConductorUserID pgtype.UUID `json:"conductor_user_id"`
-	TenantID        uuid.UUID   `json:"tenant_id"`
-	Ids             []uuid.UUID `json:"ids"`
+type BulkAssignIntimacoesByIDsParams struct {
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+	TenantID       uuid.UUID   `json:"tenant_id"`
+	Ids            []uuid.UUID `json:"ids"`
 }
 
-// Atribuição em massa do condutor (SÓ conductor_user_id — preserva o revisor) para
-// uma lista explícita de ids, tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
-func (q *Queries) BulkAssignConductorByIDs(ctx context.Context, arg BulkAssignConductorByIDsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, bulkAssignConductorByIDs, arg.ConductorUserID, arg.TenantID, arg.Ids)
+// Atribuição em massa do responsável para uma lista explícita de ids,
+// tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
+func (q *Queries) BulkAssignIntimacoesByIDs(ctx context.Context, arg BulkAssignIntimacoesByIDsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bulkAssignIntimacoesByIDs, arg.AssigneeUserID, arg.TenantID, arg.Ids)
 	if err != nil {
 		return 0, err
 	}

@@ -67,6 +67,16 @@ locals {
       VOYAGE_API_KEY   = var.voyage_api_key
       VOYAGE_MODEL     = "voyage-4-lite"
       VOYAGE_EMBED_DIM = "1024"
+      # GCP KMS (envelope encryption dos certificados A1 — slice `certificate`).
+      # Sem ambas as vars o slice não sobe, o api segue normal. GOOGLE_APPLICATION_
+      # CREDENTIALS NÃO é setada aqui: o adapter `materializeGCPCredentials` no boot
+      # decodifica o JSON base64 e escreve /tmp/gcp-kms.json, então injeta essa var
+      # canônica no processo (padrão PaaS onde não dá pra montar arquivo).
+      GCP_KMS_KEY_NAME         = var.gcp_kms_key_name
+      GCP_KMS_CREDENTIALS_JSON = var.gcp_kms_credentials_json
+      # TSA (PAdES-T). Default = digicert público (grátis). Retry+backoff no
+      # signPDFPAdES; se rate limit persistir nos logs → migrar pra TSA paga.
+      TSA_URL = var.tsa_url
     })
     # worker-ingestao: roda o listener de notifications (e-mail via Resend) e o
     # backfill/sync DJEN por-OAB (on-demand no onboarding). Todo egress DJEN sai pelo

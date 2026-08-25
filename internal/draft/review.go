@@ -50,7 +50,7 @@ type reviewDepsReader interface {
 // reviewWriter is the narrow write port the ReviewUseCase needs.
 type reviewWriter interface {
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
-	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error)
+	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error)
 }
 
 // reviewSchema is the JSON Schema constraining the LLM's output for Revisar (strict mode).
@@ -103,6 +103,7 @@ type ReviewUseCase struct {
 	gen      llm.Generator // nil → apperr Invalid "IA não configurada"
 	emb      embedder      // nil → degraded (no RAG grounding)
 	search   indexing.SearchDeps
+	ragCache *RAGCache // nil → sem cache
 	composer advisory.PromptComposer
 	model    string
 }
@@ -115,6 +116,7 @@ type ReviewUseCaseParams struct {
 	Gen      llm.Generator
 	Emb      embedder
 	Search   indexing.SearchDeps
+	RAGCache *RAGCache
 	Composer advisory.PromptComposer
 	Model    string // OpenRouter model slug; empty → generationModel fallback
 }
@@ -132,6 +134,7 @@ func NewReviewUseCase(p ReviewUseCaseParams) *ReviewUseCase {
 		gen:      p.Gen,
 		emb:      p.Emb,
 		search:   p.Search,
+		ragCache: p.RAGCache,
 		composer: p.Composer,
 		model:    model,
 	}
@@ -188,7 +191,7 @@ func (uc *ReviewUseCase) ReviewDraft(ctx context.Context, cmd ReviewDraftCommand
 	// ── Phase 2: LLM (NO tx — connection released) ───────────────────────────
 
 	// 2a. RAG: embed draft content → search chunks scoped to intimation's court_record.
-	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, cmd.TenantID, crid, d.Content, 8)
+	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, d.Content, 8)
 
 	// 2b. Compose review prompt.
 	reviewCtx := advisory.ReviewContext{
@@ -240,7 +243,7 @@ func (uc *ReviewUseCase) ReviewDraft(ctx context.Context, cmd ReviewDraftCommand
 			return fmt.Errorf("review: insert review: %w", e)
 		}
 
-		updated, e := uc.writer.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateReviewed, false, "")
+		updated, e := uc.writer.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateReviewed, false, "", nil)
 		if e != nil {
 			return fmt.Errorf("review: update saga state: %w", e)
 		}

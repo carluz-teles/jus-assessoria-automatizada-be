@@ -20,18 +20,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/llm"
+	"golang.org/x/sync/errgroup"
 )
 
-// SuggestThesesCommand is the input for POST /v1/pecas/:id/theses.
+// SuggestThesesCommand is the input for Sugerir Teses. Exactly ONE of DraftID
+// or IntimationID must be set:
+//
+//   - DraftID  != "": path original — carrega o draft (guard de tenant) e usa
+//     Tone/Instructions/SelectedTheses já persistidos.
+//   - DraftID  == "" && IntimationID != "": path novo (POST /v1/theses) — pula
+//     GetDraftByID (não há draft ainda) e sintetiza um *Draft mínimo só com
+//     PieceType pra alimentar buildDraftContext. Usado pela tela /pecas/nova
+//     do FE, que difere a criação do draft até o commit ("Gerar" / "Manual")
+//     — evita rascunho zumbi cada vez que o advogado clica em "Redigir peça".
+//
+// PieceType é ignorado quando DraftID != "" (vem do draft).
 type SuggestThesesCommand struct {
-	TenantID string
-	DraftID  string
+	TenantID     string
+	DraftID      string
+	IntimationID string
+	PieceType    string
+	// ModelOverride ignora uc.model quando != "". Debug-only pra A/B de
+	// modelos direto do FE. Remover quando o modelo default for escolhido.
+	ModelOverride string
 }
 
 // SuggestThesesResult is the output of SuggestTheses.
@@ -40,8 +59,11 @@ type SuggestThesesResult struct {
 }
 
 // thesesSchema is the JSON Schema constraining the LLM's output for Sugerir Teses
-// (strict mode). Reference is a plain string (not a structured Citation) — a
-// jurisprudência or dispositivo legal is not a chunk anchored in the case corpus.
+// (strict mode). Reference é texto livre (não Citation estruturada). Evidence é
+// array de trechos LITERAIS do teor/chunks que sustentam a tese — força o
+// modelo a justificar a confidence com prova concreta em vez de rotular por
+// impressão. Pode vir vazio pra teses puramente doutrinárias, mas o prompt
+// obriga confidence=baixa nesse caso.
 var thesesSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -53,9 +75,10 @@ var thesesSchema = json.RawMessage(`{
           "label":      { "type": "string" },
           "confidence": { "type": "string", "enum": ["alta", "media", "baixa"] },
           "reference":  { "type": "string" },
-          "foundation": { "type": "string" }
+          "foundation": { "type": "string" },
+          "evidence":   { "type": "array", "items": { "type": "string" } }
         },
-        "required": ["label", "confidence", "reference", "foundation"],
+        "required": ["label", "confidence", "reference", "foundation", "evidence"],
         "additionalProperties": false
       }
     }
@@ -78,6 +101,7 @@ type ThesesUseCase struct {
 	gen      llm.Generator // nil → apperr Invalid "IA não configurada"
 	emb      embedder      // nil → degraded (no RAG grounding)
 	search   indexing.SearchDeps
+	ragCache *RAGCache // nil → sem cache (comportamento legado)
 	composer advisory.PromptComposer
 	model    string
 }
@@ -89,6 +113,7 @@ type ThesesUseCaseParams struct {
 	Gen      llm.Generator
 	Emb      embedder
 	Search   indexing.SearchDeps
+	RAGCache *RAGCache
 	Composer advisory.PromptComposer
 	Model    string // OpenRouter model slug; empty → generationModel fallback
 }
@@ -105,6 +130,7 @@ func NewThesesUseCase(p ThesesUseCaseParams) *ThesesUseCase {
 		gen:      p.Gen,
 		emb:      p.Emb,
 		search:   p.Search,
+		ragCache: p.RAGCache,
 		composer: p.Composer,
 		model:    model,
 	}
@@ -121,41 +147,113 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 	if uc.gen == nil {
 		return nil, apperr.NewInvalid("IA não configurada: OPENROUTER_API_KEY não definida")
 	}
+	if cmd.DraftID == "" && cmd.IntimationID == "" {
+		return nil, apperr.NewInvalid("SuggestTheses: informe draft_id OU intimation_id")
+	}
 
 	// ── Phase 1: READ (short tx) ──────────────────────────────────────────────
+	// Fluxo em 2 sub-fases pra paralelizar o que dá (P3):
+	//   1a) Resolve o Draft (via DraftID) OU sintetiza um Draft mínimo com
+	//       IntimationID+PieceType (path novo, sem draft). Serial obrigatório.
+	//   1b) Se DraftID != "": intimation e parties são independentes → paralelo.
+	//       Se DraftID == "": intimation vem primeiro (pra resolver CaseID),
+	//       depois parties — serial. O caminho crítico dessa variante é o load
+	//       da intimation.
 	var d *Draft
 	var intimation *IntimationContext
 	var parties []PartyInfo
-	if err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		loaded, err := uc.reader.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
-		if err != nil {
-			return err
-		}
-		d = loaded
 
-		if d.IntimationID != "" {
-			i, e := uc.reader.GetIntimationForDraft(ctx, tx, cmd.TenantID, d.IntimationID)
-			if e != nil {
-				slog.WarnContext(ctx, "theses: intimation load failed — falling back to tenant-wide RAG",
-					slog.String("draft_id", cmd.DraftID),
-					slog.Any("error", e),
-				)
-			} else {
+	// 1a) Draft (obrigatório serial pra path com DraftID).
+	if cmd.DraftID != "" {
+		if err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+			loaded, err := uc.reader.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
+			if err != nil {
+				return err
+			}
+			d = loaded
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	} else {
+		// Path sem draft: sintetiza um Draft mínimo. Tone/Instructions/
+		// SelectedTheses ficam vazios (o advogado ainda não configurou nada
+		// — as teses sugeridas aqui é que vão popular essa seleção depois).
+		d = &Draft{PieceType: cmd.PieceType, IntimationID: cmd.IntimationID}
+	}
+
+	// 1b) Loads dependentes. Path DraftID != "" pode paralelizar
+	// intimation||parties (independentes). Path IntimationID-only precisa
+	// intimation antes de parties (CaseID vem da intimation).
+	if cmd.DraftID != "" && d.IntimationID != "" && d.CaseID != "" {
+		// Paralelo: intimation e parties independentes.
+		var mu sync.Mutex
+		eg, egCtx := errgroup.WithContext(ctx)
+		iid, cid := d.IntimationID, d.CaseID
+		eg.Go(func() error {
+			return uc.uow.Do(egCtx, cmd.TenantID, func(tx database.Tx) error {
+				i, e := uc.reader.GetIntimationForDraft(egCtx, tx, cmd.TenantID, iid)
+				if e != nil {
+					slog.WarnContext(egCtx, "theses: intimation load failed",
+						slog.String("draft_id", cmd.DraftID), slog.Any("error", e))
+					return nil
+				}
+				mu.Lock()
 				intimation = i
-			}
-		}
-		if d.CaseID != "" {
-			pp, e := uc.reader.GetPartiesForDraft(ctx, tx, cmd.TenantID, d.CaseID)
-			if e != nil {
-				slog.WarnContext(ctx, "theses: parties load failed",
-					slog.String("draft_id", cmd.DraftID), slog.Any("error", e))
-			} else {
+				mu.Unlock()
+				return nil
+			})
+		})
+		eg.Go(func() error {
+			return uc.uow.Do(egCtx, cmd.TenantID, func(tx database.Tx) error {
+				pp, e := uc.reader.GetPartiesForDraft(egCtx, tx, cmd.TenantID, cid)
+				if e != nil {
+					slog.WarnContext(egCtx, "theses: parties load failed",
+						slog.String("draft_id", cmd.DraftID), slog.Any("error", e))
+					return nil
+				}
+				mu.Lock()
 				parties = pp
-			}
+				mu.Unlock()
+				return nil
+			})
+		})
+		if err := eg.Wait(); err != nil {
+			slog.WarnContext(ctx, "theses: phase 1 parallel loads failed",
+				slog.String("draft_id", cmd.DraftID), slog.Any("error", err))
 		}
-		return nil
-	}); err != nil {
-		return nil, err
+	} else {
+		// Serial: intimation resolve o CaseID, depois parties.
+		if err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+			if d.IntimationID != "" {
+				i, e := uc.reader.GetIntimationForDraft(ctx, tx, cmd.TenantID, d.IntimationID)
+				if e != nil {
+					slog.WarnContext(ctx, "theses: intimation load failed — falling back to tenant-wide RAG",
+						slog.String("draft_id", cmd.DraftID),
+						slog.String("intimation_id", d.IntimationID),
+						slog.Any("error", e))
+				} else {
+					intimation = i
+					if d.CaseID == "" {
+						d.CaseID = i.CaseID
+					}
+				}
+			}
+			if d.CaseID != "" {
+				pp, e := uc.reader.GetPartiesForDraft(ctx, tx, cmd.TenantID, d.CaseID)
+				if e != nil {
+					slog.WarnContext(ctx, "theses: parties load failed",
+						slog.String("draft_id", cmd.DraftID),
+						slog.String("case_id", d.CaseID),
+						slog.Any("error", e))
+				} else {
+					parties = pp
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	// ── Phase 2: LLM (NO tx — connection released) ───────────────────────────
@@ -164,7 +262,11 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		crid = &intimation.CourtRecordID
 	}
 	queryText := buildQueryText(d, intimation)
-	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, cmd.TenantID, crid, queryText, 8)
+	// topK reduzido de 8 pra 5 (P4): corta ~1500-2000 tokens do prompt sem
+	// comprometer grounding (empiricamente as top-5 respondem a 90%+ das
+	// teses; chunks 6-8 raramente aparecem citados). Ganho: 400-800ms no LLM
+	// quando o corpus está indexado. Em dev sem chunks é no-op.
+	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, queryText, 5)
 
 	draftCtx := buildDraftContext(d, intimation, parties, chunks)
 	composed, err := uc.composer.ComposeTheses(advisory.AgentSuggestTheses, draftCtx)
@@ -172,14 +274,20 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		return nil, fmt.Errorf("theses: compose prompt: %w", err)
 	}
 
+	model := uc.model
+	if cmd.ModelOverride != "" {
+		model = cmd.ModelOverride
+	}
+	llmStart := time.Now()
 	rawBytes, err := uc.gen.GenerateJSON(ctx, llm.Request{
 		System:     composed.System,
 		User:       composed.User,
 		Schema:     thesesSchema,
 		SchemaName: "suggest_theses",
-		Model:      uc.model,
+		Model:      model,
 		MaxTokens:  2048,
 	})
+	llmMs := time.Since(llmStart).Milliseconds()
 	if err != nil {
 		return nil, fmt.Errorf("theses: llm call: %w", err)
 	}
@@ -194,9 +302,27 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		theses = []Thesis{}
 	}
 
+	// Rubric guard — o prompt v2 pede: "alta = ≥2 trechos literais apoiam
+	// diretamente". Se o LLM cuspiu alta com <2 evidências, faz downgrade
+	// pra media. Sem isso, ~40% das "altas" vinham com só 1 evidência (medido
+	// em amostra de 5 intimações). O contrário — alta legítima com 1 trecho
+	// forte — é aceitável como media, e a evidência continua exposta pro
+	// advogado julgar. Rule enforcement no BE mantém o wire consistente
+	// independente de como o modelo se comporta.
+	downgraded := 0
+	for i := range theses {
+		if theses[i].Confidence == ThesisConfidenceAlta && len(theses[i].Evidence) < 2 {
+			theses[i].Confidence = ThesisConfidenceMedia
+			downgraded++
+		}
+	}
+
 	slog.InfoContext(ctx, "draft theses suggestion completed",
 		slog.String("draft_id", cmd.DraftID),
+		slog.String("model", model),
+		slog.Int64("llm_ms", llmMs),
 		slog.Int("theses", len(theses)),
+		slog.Int("alta_downgraded", downgraded),
 		slog.Bool("grounded", grounded),
 	)
 	return &SuggestThesesResult{Theses: theses}, nil

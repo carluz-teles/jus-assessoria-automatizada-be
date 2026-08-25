@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -22,6 +23,7 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
 	"github.com/jusassessoria/platform/lib/llm"
+	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
 )
@@ -131,6 +133,20 @@ func run(logger *slog.Logger) error {
 			logger.Warn("VOYAGE_API_KEY unset — AI generation will run without RAG grounding")
 		}
 
+		// Publisher pub/sub Redis pro streaming da geração — cada chunk cai
+		// no canal draft:<id>:stream e o endpoint SSE do api encaminha ao FE.
+		// Parseia direto de cfg.RedisURL (asynq.RedisConnOpt é opaco).
+		redisRawOpt, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			return fmt.Errorf("parse redis url pra pubsub: %w", err)
+		}
+		redisClient := redis.NewClient(redisRawOpt)
+		chunkPub := pubsub.NewRedisPubSub(redisClient)
+		// RAG cache — mesmo Redis client, mesma TTL do api. Se advogado
+		// gerou teses e depois pediu Generate na mesma sessão, o cache do
+		// api pré-aqueceu a chave; aqui é hit direto (poupa Voyage+pgvector).
+		ragCache := draft.NewRAGCache(redisClient, 5*time.Minute)
+
 		generateUC := draft.NewGenerateUseCase(draft.GenerateUseCaseParams{
 			UoW:      uow,
 			Reader:   repo,
@@ -140,8 +156,12 @@ func run(logger *slog.Logger) error {
 			Gen:      gen,
 			Emb:      emb,
 			Search:   searchDeps,
+			RAGCache: ragCache,
 			Composer: advisory.NewTemplateComposer(),
-			Model:    cfg.OpenRouterModel,
+			ChunkPub: chunkPub,
+			// QUALITY: gerar minuta é a peça final que o advogado revisa/assina.
+			// Qualidade > velocidade (streaming mascara a latência).
+			Model: cfg.OpenRouterModelQuality,
 		})
 
 		listener := draft.NewListener(generateUC)

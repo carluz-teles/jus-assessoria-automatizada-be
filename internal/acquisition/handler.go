@@ -44,12 +44,12 @@ type handlerUC interface {
 	ResolveIntimacao(ctx context.Context, tenantID, intimationID string) error
 	IgnoreIntimacao(ctx context.Context, tenantID, intimationID string) error
 	ReopenIntimacao(ctx context.Context, tenantID, intimationID string) error
-	// AssignIntimacaoResponsaveis sets/clears the conductor and reviewer on one intimação in
-	// one tx. The handler re-reads the detail view afterwards so the FE reidrates the aside.
-	AssignIntimacaoResponsaveis(ctx context.Context, tenantID, intimationID string, conductorUserID, reviewerUserID *string) error
-	// BulkAssignConductor atribui o condutor a várias intimações (por ids ou toda a faixa
-	// via All+filtros). Devolve a contagem afetada.
-	BulkAssignConductor(ctx context.Context, tenantID string, all bool, q IntimacoesQuery, ids []string, conductorUserID *string) (int64, error)
+	// AssignIntimacaoAssignee sets/clears the single responsável de uma intimação em
+	// uma tx. O handler re-lê o detail view depois pra reidratar o aside da FE.
+	AssignIntimacaoAssignee(ctx context.Context, tenantID, intimationID string, assigneeUserID *string) error
+	// BulkAssignIntimacoes atribui o responsável a várias intimações (por ids ou toda a
+	// faixa via All+filtros). Devolve a contagem afetada.
+	BulkAssignIntimacoes(ctx context.Context, tenantID string, all bool, q IntimacoesQuery, ids []string, assigneeUserID *string) (int64, error)
 }
 
 // reader is the narrow port the Handler uses from the read use case — the
@@ -148,8 +148,8 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/intimacoes/:id/analise", h.analisarIntimacao)
 	r.Post("/intimacoes/:id/providencias/:idx/aprovar", h.aprovarProvidencia)
 	r.Post("/intimacoes/:id/providencias/:idx/descartar", h.descartarProvidencia)
-	r.Put("/intimacoes/:id/responsaveis", h.assignIntimacaoResponsaveis)
-	r.Post("/intimacoes/bulk/responsaveis", h.bulkAssignIntimacaoResponsaveis)
+	r.Put("/intimacoes/:id/responsavel", h.assignIntimacaoResponsavel)
+	r.Post("/intimacoes/bulk/responsavel", h.bulkAssignIntimacaoResponsavel)
 }
 
 // Keyset sentinels for a first page (no cursor): the ascending processos scan
@@ -171,7 +171,7 @@ const (
 // documented mechanisms; body/other params never read query strings.
 var (
 	processosListParams  = paramSet("limit", "cursor", "search", "court", "lifecycle", "degree", "assignee")
-	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia", "assignee")
+	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia", "nao_confirmado", "assignee")
 )
 
 // paramSet builds the route allowlist used by httpx.RejectUnknownParams.
@@ -240,11 +240,16 @@ func resolveIntimacaoAssignee(assignee, principalUserID string) (string, error) 
 }
 
 // isKnownUrgencia accepts only the closed urgência set the filter exposes — the
-// handler is the app-level CHECK on the ?urgencia param.
+// handler is the app-level CHECK on the ?urgencia param. UrgenciaSemProvidencia is
+// retained here as a DEPRECATED alias (redesign v1): it is no longer a real bucket,
+// so the caller demotes it to "no filter" rather than rejecting — legacy deep-links
+// degrade gracefully instead of 400-ing. UrgenciaNaoConfirmado is intentionally NOT
+// here: it graduated to the separate ?nao_confirmado triage toggle.
 func isKnownUrgencia(v string) bool {
 	switch v {
-	case UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana, UrgenciaMaisAdiante,
-		UrgenciaNaoConfirmado, UrgenciaSemProvidencia:
+	case UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana,
+		UrgenciaEsteMes, UrgenciaMaisAdiante, UrgenciaSemDataDefinida,
+		UrgenciaSemProvidencia:
 		return true
 	default:
 		return false
@@ -504,6 +509,12 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	if urgencia != "" && !isKnownUrgencia(urgencia) {
 		return httpx.WriteError(c, apperr.NewInvalid("invalid urgencia filter"))
 	}
+	// Deprecated alias: demote "sem_providencia" to "no filter" so legacy deep-links
+	// keep working instead of erroring out.
+	if urgencia == UrgenciaSemProvidencia {
+		urgencia = ""
+	}
+	naoConfirmado := c.Query("nao_confirmado") == "true" || c.Query("nao_confirmado") == "1"
 	p, ok := httpx.PrincipalFromCtx(c)
 	if !ok {
 		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
@@ -524,12 +535,13 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 
 	res, err := h.reader.Intimacoes(c.UserContext(), IntimacoesQuery{
 		TenantID: tenantID, LastMadeAvailable: lastMade, LastID: lastID, Limit: limit,
-		Search:     c.Query("search"),
-		Type:       typ,
-		UserStatus: userStatus,
-		Court:      c.Query("court"),
-		Urgencia:   urgencia,
-		Assignee:   assignee,
+		Search:        c.Query("search"),
+		Type:          typ,
+		UserStatus:    userStatus,
+		Court:         c.Query("court"),
+		Urgencia:      urgencia,
+		NaoConfirmado: naoConfirmado,
+		Assignee:      assignee,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -585,13 +597,13 @@ func (h *Handler) triageIntimacao(c *fiber.Ctx, action func(ctx context.Context,
 	return c.Status(fiber.StatusOK).JSON(view)
 }
 
-// assignIntimacaoResponsaveis handles PUT /v1/intimacoes/:id/responsaveis: set (or clear,
-// with null) the condutor do prazo and the revisor/assinador for one intimação. The write
-// runs in one tx (membership guard, then write); then the handler re-reads the detail view
-// through the read port and answers 200 with it, so the FE reidrates the aside cards from
-// the fresh row. tenant_id comes from the principal, never the body.
-func (h *Handler) assignIntimacaoResponsaveis(c *fiber.Ctx) error {
-	var req AssignIntimacaoResponsaveisRequest
+// assignIntimacaoResponsavel handles PUT /v1/intimacoes/:id/responsavel: set (or clear,
+// with null) o responsável único da intimação (0057, ex-conductor/reviewer). O write
+// roda em uma tx (guard de membership, então write); depois o handler re-lê o detail view
+// pra que a FE reidrate o aside a partir da linha fresca. tenant_id vem do principal,
+// nunca do body.
+func (h *Handler) assignIntimacaoResponsavel(c *fiber.Ctx) error {
+	var req AssignIntimacaoResponsavelRequest
 	if err := c.BodyParser(&req); err != nil {
 		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
 	}
@@ -601,7 +613,7 @@ func (h *Handler) assignIntimacaoResponsaveis(c *fiber.Ctx) error {
 
 	tenantID := httpx.TenantFromCtx(c)
 	id := c.Params("id")
-	if err := h.uc.AssignIntimacaoResponsaveis(c.UserContext(), tenantID, id, req.ConductorUserID, req.ReviewerUserID); err != nil {
+	if err := h.uc.AssignIntimacaoAssignee(c.UserContext(), tenantID, id, req.AssigneeUserID); err != nil {
 		return httpx.WriteError(c, err)
 	}
 
@@ -612,12 +624,12 @@ func (h *Handler) assignIntimacaoResponsaveis(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(view)
 }
 
-// bulkAssignIntimacaoResponsaveis handles POST /v1/intimacoes/bulk/responsaveis: atribui
-// o condutor a várias intimações. All=true aplica a TODA a faixa/filtro atual (inclui os
-// não paginados) reusando os filtros do GET /intimacoes; senão aplica aos ids. Só toca o
-// condutor (preserva o revisor). tenant_id vem do principal, nunca do body.
-func (h *Handler) bulkAssignIntimacaoResponsaveis(c *fiber.Ctx) error {
-	var req BulkAssignResponsaveisRequest
+// bulkAssignIntimacaoResponsavel handles POST /v1/intimacoes/bulk/responsavel: atribui
+// o responsável a várias intimações. All=true aplica a TODA a faixa/filtro atual (inclui
+// os não paginados) reusando os filtros do GET /intimacoes; senão aplica aos ids.
+// tenant_id vem do principal, nunca do body.
+func (h *Handler) bulkAssignIntimacaoResponsavel(c *fiber.Ctx) error {
+	var req BulkAssignResponsavelRequest
 	if err := c.BodyParser(&req); err != nil {
 		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
 	}
@@ -626,6 +638,10 @@ func (h *Handler) bulkAssignIntimacaoResponsaveis(c *fiber.Ctx) error {
 	}
 	if req.All && req.Urgencia != "" && !isKnownUrgencia(req.Urgencia) {
 		return httpx.WriteError(c, apperr.NewInvalid("invalid urgencia filter"))
+	}
+	// Deprecated alias: demote "sem_providencia" to "no filter" for legacy deep-links.
+	if req.Urgencia == UrgenciaSemProvidencia {
+		req.Urgencia = ""
 	}
 
 	tenantID := httpx.TenantFromCtx(c)
@@ -639,15 +655,16 @@ func (h *Handler) bulkAssignIntimacaoResponsaveis(c *fiber.Ctx) error {
 	}
 
 	q := IntimacoesQuery{
-		TenantID:   tenantID,
-		Search:     req.Search,
-		Type:       req.Type,
-		UserStatus: req.UserStatus,
-		Court:      req.Court,
-		Urgencia:   req.Urgencia,
-		Assignee:   assignee,
+		TenantID:      tenantID,
+		Search:        req.Search,
+		Type:          req.Type,
+		UserStatus:    req.UserStatus,
+		Court:         req.Court,
+		Urgencia:      req.Urgencia,
+		NaoConfirmado: req.NaoConfirmado,
+		Assignee:      assignee,
 	}
-	n, err := h.uc.BulkAssignConductor(c.UserContext(), tenantID, req.All, q, req.IDs, req.ConductorUserID)
+	n, err := h.uc.BulkAssignIntimacoes(c.UserContext(), tenantID, req.All, q, req.IDs, req.AssigneeUserID)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}

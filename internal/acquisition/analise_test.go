@@ -35,6 +35,18 @@ func (f *fakeAnaliseGen) GenerateJSON(_ context.Context, req llm.Request) ([]byt
 	return f.out, f.err
 }
 
+func (f *fakeAnaliseGen) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(string) error) ([]byte, error) {
+	f.calls++
+	f.gotReq = req
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		_ = onChunk(string(f.out))
+	}
+	return f.out, nil
+}
+
 // fakeAnaliseStore records the persisted analysis and can be told to fail.
 type fakeAnaliseStore struct {
 	calls       int
@@ -73,7 +85,7 @@ func TestAnalisar_HappyPath_ParsesAndPersists(t *testing.T) {
 
 	gen := &fakeAnaliseGen{out: []byte(`{"summary":"A ré foi intimada para contestar em 15 dias.","providencias":[{"title":"Protocolar contestação","description":"Elaborar e protocolar a contestação dentro do prazo legal."}]}`)}
 	store := &fakeAnaliseStore{}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -117,7 +129,7 @@ func TestAnalisar_NilGenerator_PersistsDegraded(t *testing.T) {
 	t.Parallel()
 
 	store := &fakeAnaliseStore{}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), nil, store)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), nil, store, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -153,7 +165,7 @@ func TestAnalisar_LLMFault_Degrades(t *testing.T) {
 
 	gen := &fakeAnaliseGen{err: errors.New("openrouter 500")}
 	store := &fakeAnaliseStore{}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -173,7 +185,7 @@ func TestAnalisar_MalformedJSON_Degrades(t *testing.T) {
 
 	gen := &fakeAnaliseGen{out: []byte(`not json`)}
 	store := &fakeAnaliseStore{}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -198,7 +210,7 @@ func TestAnalisar_CapsProvidencias(t *testing.T) {
 	}{Summary: "s", Providencias: items})
 
 	gen := &fakeAnaliseGen{out: payload}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, nil)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, nil, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -215,7 +227,7 @@ func TestAnalisar_StoreFault_KeepsFreshAnswer(t *testing.T) {
 
 	gen := &fakeAnaliseGen{out: []byte(`{"summary":"ok","providencias":[]}`)}
 	store := &fakeAnaliseStore{err: errors.New("db down")}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -239,7 +251,7 @@ func TestAnalisar_EnrichesProvidencias(t *testing.T) {
 	gen := &fakeAnaliseGen{out: []byte(`{"summary":"s","providencias":[
 		{"title":"Redigir defesa (art. 919, CPC)","description":"d","suggested_assignee_user_id":"u-ana","due_date":"2026-08-25"}
 	]}`)}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: ctx}, advisory.NewTemplateComposer(), gen, nil)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: ctx}, advisory.NewTemplateComposer(), gen, nil, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -272,7 +284,7 @@ func TestAnalisar_RejectsBadAssigneeAndLateDueDate(t *testing.T) {
 	gen := &fakeAnaliseGen{out: []byte(`{"summary":"s","providencias":[
 		{"title":"t","description":"d","suggested_assignee_user_id":"u-ghost","due_date":"2026-09-15"}
 	]}`)}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: ctx}, advisory.NewTemplateComposer(), gen, nil)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: ctx}, advisory.NewTemplateComposer(), gen, nil, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
 	if err != nil {
@@ -296,7 +308,7 @@ func TestAnalisar_ReaderError_Propagates(t *testing.T) {
 
 	gen := &fakeAnaliseGen{}
 	store := &fakeAnaliseStore{}
-	uc := NewAnaliseUseCase(fakeAnaliseReader{err: ErrIntimationNotFound}, advisory.NewTemplateComposer(), gen, store)
+	uc := NewAnaliseUseCase(fakeAnaliseReader{err: ErrIntimationNotFound}, advisory.NewTemplateComposer(), gen, store, "")
 
 	_, err := uc.Analisar(context.Background(), "t", "i")
 	if !errors.Is(err, ErrIntimationNotFound) {

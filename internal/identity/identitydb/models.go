@@ -77,12 +77,12 @@ type Certificate struct {
 	NotBefore   pgtype.Timestamptz `json:"not_before"`
 	NotAfter    pgtype.Timestamptz `json:"not_after"`
 	Fingerprint string             `json:"fingerprint"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
 	Ciphertext  []byte             `json:"ciphertext"`
 	Nonce       []byte             `json:"nonce"`
 	WrappedDek  []byte             `json:"wrapped_dek"`
 	KekRef      string             `json:"kek_ref"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
 }
 
 type ChatMessage struct {
@@ -220,22 +220,31 @@ type Document struct {
 }
 
 type Draft struct {
-	ID             uuid.UUID          `json:"id"`
-	TenantID       uuid.UUID          `json:"tenant_id"`
-	CaseID         pgtype.UUID        `json:"case_id"`
-	PieceType      string             `json:"piece_type"`
-	Status         string             `json:"status"`
-	SagaState      string             `json:"saga_state"`
-	StorageKey     *string            `json:"storage_key"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	IntimationID   pgtype.UUID        `json:"intimation_id"`
-	Title          string             `json:"title"`
-	Content        *string            `json:"content"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	SignedAt       pgtype.Timestamptz `json:"signed_at"`
-	Tone           string             `json:"tone"`
-	Instructions   *string            `json:"instructions"`
-	SelectedTheses []string           `json:"selected_theses"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	PieceType         string             `json:"piece_type"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	StorageKey        *string            `json:"storage_key"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	SignedAt          pgtype.Timestamptz `json:"signed_at"`
+	Tone              string             `json:"tone"`
+	Instructions      *string            `json:"instructions"`
+	SelectedTheses    []string           `json:"selected_theses"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
+	SentToSigningAt   pgtype.Timestamptz `json:"sent_to_signing_at"`
+	FilingNumber      *string            `json:"filing_number"`
+	FiledAt           pgtype.Timestamptz `json:"filed_at"`
+	SignedPdfKey      *string            `json:"signed_pdf_key"`
+	// HTML rico do editor Tiptap. NULL = usar structured_content como fonte.
+	ContentHtml *string     `json:"content_html"`
+	CreatedBy   pgtype.UUID `json:"created_by"`
 }
 
 type DraftAttachment struct {
@@ -246,6 +255,39 @@ type DraftAttachment struct {
 	Category   string             `json:"category"`
 	Position   int32              `json:"position"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+type EsajCredential struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	Nonce           []byte             `json:"nonce"`
+	WrappedDek      []byte             `json:"wrapped_dek"`
+	KekRef          string             `json:"kek_ref"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type FilingAttempt struct {
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	DraftID        uuid.UUID          `json:"draft_id"`
+	PetitionID     pgtype.UUID        `json:"petition_id"`
+	Status         string             `json:"status"`
+	PdfStorageKey  string             `json:"pdf_storage_key"`
+	PdfSha256      string             `json:"pdf_sha256"`
+	RequestedBy    uuid.UUID          `json:"requested_by"`
+	RequestedAt    pgtype.Timestamptz `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	FinishedAt     pgtype.Timestamptz `json:"finished_at"`
+	FailureReason  *string            `json:"failure_reason"`
+	FilingNumber   *string            `json:"filing_number"`
+	ScreenshotKeys []string           `json:"screenshot_keys"`
 }
 
 type Holiday struct {
@@ -286,8 +328,7 @@ type Intimation struct {
 	CancelReason    *string            `json:"cancel_reason"`
 	SyncRunID       pgtype.UUID        `json:"sync_run_id"`
 	UserStatus      string             `json:"user_status"`
-	ConductorUserID pgtype.UUID        `json:"conductor_user_id"`
-	ReviewerUserID  pgtype.UUID        `json:"reviewer_user_id"`
+	AssigneeUserID  pgtype.UUID        `json:"assignee_user_id"`
 	AiSummary       *string            `json:"ai_summary"`
 	AiProvidencias  []byte             `json:"ai_providencias"`
 	AiAnalyzedAt    pgtype.Timestamptz `json:"ai_analyzed_at"`
@@ -431,15 +472,6 @@ type Review struct {
 	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
 }
 
-type SigningEvent struct {
-	ID            uuid.UUID          `json:"id"`
-	TenantID      uuid.UUID          `json:"tenant_id"`
-	CertificateID uuid.UUID          `json:"certificate_id"`
-	SignerUserID  uuid.UUID          `json:"signer_user_id"`
-	DigestSha256  []byte             `json:"digest_sha256"`
-	SignedAt      pgtype.Timestamptz `json:"signed_at"`
-}
-
 type Subscription struct {
 	ID                         uuid.UUID          `json:"id"`
 	TenantID                   uuid.UUID          `json:"tenant_id"`
@@ -495,27 +527,6 @@ type Task struct {
 	CreatedBy      pgtype.UUID        `json:"created_by"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
-	Priority       *string            `json:"priority"`
-}
-
-type TaskActivity struct {
-	ID          uuid.UUID          `json:"id"`
-	TenantID    uuid.UUID          `json:"tenant_id"`
-	TaskID      uuid.UUID          `json:"task_id"`
-	ActorUserID uuid.UUID          `json:"actor_user_id"`
-	EventType   string             `json:"event_type"`
-	FromValue   *string            `json:"from_value"`
-	ToValue     *string            `json:"to_value"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-}
-
-type TaskComment struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	TaskID       uuid.UUID          `json:"task_id"`
-	AuthorUserID uuid.UUID          `json:"author_user_id"`
-	Body         string             `json:"body"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
 type TaskItem struct {

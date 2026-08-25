@@ -47,6 +47,12 @@ type spyInAppUC struct {
 	missedErr      error
 	trialEndErr    error
 	paymentFailErr error
+	filingSucc     FilingSucceeded
+	filingFail     FilingFailed
+	filingSuccN    int
+	filingFailN    int
+	filingSuccErr  error
+	filingFailErr  error
 }
 
 func (s *spyInAppUC) OnBackfillFinished(_ context.Context, ev BackfillFinished) error {
@@ -83,6 +89,18 @@ func (s *spyInAppUC) OnPaymentFailed(_ context.Context, ev PaymentFailed) error 
 	s.paymentFailN++
 	s.paymentFail = ev
 	return s.paymentFailErr
+}
+
+func (s *spyInAppUC) OnFilingSucceeded(_ context.Context, ev FilingSucceeded) error {
+	s.filingSuccN++
+	s.filingSucc = ev
+	return s.filingSuccErr
+}
+
+func (s *spyInAppUC) OnFilingFailed(_ context.Context, ev FilingFailed) error {
+	s.filingFailN++
+	s.filingFail = ev
+	return s.filingFailErr
 }
 
 // A well-formed notification.requested task is decoded and dispatched to the use case

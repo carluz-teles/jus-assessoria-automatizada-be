@@ -109,15 +109,15 @@ WHERE cr.id = $1 AND cr.tenant_id = $2;
 -- ('9999-12-31', max-uuid). Optional filters — @court (free text from the DISTINCT
 -- options), @type / @user_status (closed sets), @urgencia (deadline-proximity /
 -- providência bucket, closed set), @search (cnj_number/class/judging_body ILIKE),
--- @assignee_id (condutor OR revisor, the "Minhas" toggle) — are additive ANDs. The
--- LEFT JOIN deadline exposes the derived prazo (1:1 per notification_id, UNIQUE);
--- NULL when no prazo exists yet. ai_analyzed_at + conductor_user_id/name mirror
--- GetIntimacao's projection (same LEFT JOIN app_user pattern) so the inbox row can
--- render the "não analisada" badge and the condutor label without a deep-link.
+-- @assignee_id (the "Minhas" toggle) — are additive ANDs. The LEFT JOIN deadline
+-- exposes the derived prazo (1:1 per notification_id, UNIQUE); NULL when no prazo
+-- exists yet. ai_analyzed_at + assignee_user_id/name mirror GetIntimacao's
+-- projection (same LEFT JOIN app_user pattern) so the inbox row can render the
+-- "não analisada" badge and the responsável label without a deep-link.
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id,
-       i.ai_analyzed_at, i.conductor_user_id, uc.name AS conductor_user_name, i.reviewer_user_id,
+       i.ai_analyzed_at, i.assignee_user_id, ua.name AS assignee_user_name,
        -- prazo derivado (nullable — nem toda intimação tem prazo ainda). CASE WHEN
        -- garante que todas as expressões derivadas sejam NULL quando não há prazo
        -- (LEFT JOIN miss), forçando o sqlc a inferir os tipos como nullable (*T).
@@ -129,7 +129,7 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
-LEFT JOIN app_user uc ON uc.id = i.conductor_user_id
+LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
 WHERE i.tenant_id = $1
   AND (
     @search::text = ''
@@ -142,19 +142,22 @@ WHERE i.tenant_id = $1
   AND (@court::text = '' OR cr.court = @court::text)
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
-    OR i.conductor_user_id = sqlc.narg('assignee_id')::uuid
-    OR i.reviewer_user_id = sqlc.narg('assignee_id')::uuid
+    OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
   )
   AND (
     @urgencia::text = ''
-    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'nao_confirmado'     AND d.status = 'PENDING')
-    OR (@urgencia::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
   )
+  -- "Não confirmadas" triage toggle (?nao_confirmado): server-side, combines with any
+  -- temporal tab. Reuses the former nao_confirmado predicate — a suggested (not yet
+  -- human-confirmed) deadline has d.status = 'PENDING'. When off, no extra filter.
+  AND (@nao_confirmado::bool = false OR d.status = 'PENDING')
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
@@ -168,8 +171,7 @@ LIMIT $2;
 --   • judging_body           — the court record's órgão julgador (court_record.judging_body);
 --   • recipients             — the addressee jsonb list (every destinatário + matched-OAB flag);
 --   • user_status            — the triagem state (PENDING|RESOLVED|IGNORED);
---   • conductor_user_id/name — condutor do prazo (nullable, LEFT JOIN app_user);
---   • reviewer_user_id/name  — revisão e assinatura (nullable, LEFT JOIN app_user);
+--   • assignee_user_id/name  — responsável pela intimação (nullable, LEFT JOIN app_user);
 --   • deadline.confirmed_at  — when the deadline was confirmed (for history derivation);
 --   • deadline.confirmed_by_name — confirmer's name (for history label; nullable);
 --   • deadline.status (already present) — for history label (OPEN/NO_DEADLINE branch).
@@ -180,11 +182,6 @@ LIMIT $2;
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        i.recipients, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id, cr.judging_body,
-       -- partes + valor da causa (0060+): alimentam o preview da intimação (autor/réu/
-       -- valor da causa). claim_value é nullable no schema; parties agregadas por polo
-       -- via correlated subquery sobre party (mesma case_id + tenant do court_record).
-       -- Cast ::text[] p/ o sqlc inferir []string; NULL (sem partes) vira nil slice,
-       -- normalizado no mapper. Ordenado por name p/ determinismo.
        cr.claim_value,
        (SELECT array_agg(p.name ORDER BY p.name)
           FROM party p
@@ -196,13 +193,15 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
          WHERE p.case_id = cr.case_id
            AND p.tenant_id = cr.tenant_id
            AND p.role = 'DEFENDANT')::text[]                                        AS defendants,
+       -- data de distribuição/ajuizamento (nullable — DJEN não carrega, só o
+       -- enriquecimento DATAJUD preenche via migration 0015). Exposto no
+       -- detail pra alimentar a linha "Distribuição" da barra rica.
+       cr.filed_at AS distribution_date,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
        i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
-       -- responsáveis (0050): nullable pairs — id + name via LEFT JOIN app_user.
-       i.conductor_user_id,
-       uc.name                                                                     AS conductor_user_name,
-       i.reviewer_user_id,
-       ur.name                                                                     AS reviewer_user_name,
+       -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
+       i.assignee_user_id,
+       ua.name                                                                     AS assignee_user_name,
        -- prazo derivado (nullable — nem toda intimação tem prazo ainda). CASE WHEN
        -- garante que todas as expressões derivadas sejam NULL quando não há prazo
        -- (LEFT JOIN miss), forçando o sqlc a inferir os tipos como nullable (*T).
@@ -217,8 +216,7 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
-LEFT JOIN app_user uc  ON uc.id = i.conductor_user_id
-LEFT JOIN app_user ur  ON ur.id = i.reviewer_user_id
+LEFT JOIN app_user ua  ON ua.id = i.assignee_user_id
 LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
 WHERE i.id = $1 AND i.tenant_id = $2;
 
@@ -268,19 +266,19 @@ WHERE i.tenant_id = $1
   AND (@court::text = '' OR cr.court = @court::text)
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
-    OR i.conductor_user_id = sqlc.narg('assignee_id')::uuid
-    OR i.reviewer_user_id = sqlc.narg('assignee_id')::uuid
+    OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
   )
   AND (
     @urgencia::text = ''
-    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'mais_adiante'       AND (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))
-    OR (@urgencia::text = 'nao_confirmado'     AND d.status = 'PENDING')
-    OR (@urgencia::text = 'sem_providencia'    AND i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-  );
+    OR (@urgencia::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (@urgencia::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+  )
+  AND (@nao_confirmado::bool = false OR d.status = 'PENDING');
 
 -- ── filter options (the envelope's selectable sets) ──────────────────────────
 -- Distinct-value reads that back the list envelopes' filter chips. Each is
@@ -510,24 +508,24 @@ WHERE i.tenant_id = $1;
 -- name: CountIntimacoesBuckets :one
 -- Bucket counts for the list envelope's `buckets` object, derived in the same
 -- request as ListIntimacoes (no N+1). Mirrors the urgência buckets of the list's
--- WHERE clause but expressed as FILTER aggregates over the SAME non-urgencia
+-- WHERE clause but expressed as FILTER aggregates over the SAME non-urgência
 -- filters (type, user_status, court, search — assignee is deliberately NOT
 -- applied here, mirroring how the processes screen's other chips don't gate its
 -- own filter options) — so the header badges agree with what the list would show
--- when the user picks that bucket. `sem_providencia` counts intimações not yet
--- AI-analyzed AND not yet resolved/ignored (user still needs to act, independent
--- of whether a deadline was derived). The four deadline buckets restrict to
--- status IN (PENDING, OPEN): MISSED/MET deadlines belong to closed intimations
--- and are not counted as actionable. `mais_adiante`/`nao_confirmado` stay in the
--- projection (not removed) though the FE renders only the five tabs above.
+-- when the user picks that bucket. The seven buckets are mutually disjoint and
+-- all exclude user_status RESOLVED/IGNORED. The four+ temporal buckets restrict
+-- to status IN (PENDING, OPEN): MISSED/MET deadlines belong to closed intimations
+-- and are not counted as actionable. `sem_data_definida` counts intimations with
+-- no derived deadline (deadline LEFT JOIN miss). The buckets do NOT apply the
+-- `nao_confirmado` triage toggle (it is a per-list filter, independent of tabs).
 SELECT
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) < 0   AND d.status IN ('PENDING', 'OPEN'))::bigint AS atraso,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) = 0   AND d.status IN ('PENDING', 'OPEN'))::bigint AS hoje,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN'))::bigint AS proximos_dois_dias,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN'))::bigint AS esta_semana,
-    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) > 7   AND d.status IN ('PENDING', 'OPEN'))::bigint AS mais_adiante,
-    count(*) FILTER (WHERE d.status = 'PENDING')::bigint AS nao_confirmado,
-    count(*) FILTER (WHERE i.ai_analyzed_at IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS sem_providencia
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) < 0   AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS atraso,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) = 0   AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS hoje,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS proximos_dois_dias,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS esta_semana,
+    count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS este_mes,
+    count(*) FILTER (WHERE d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS mais_adiante,
+    count(*) FILTER (WHERE d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint AS sem_data_definida
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id

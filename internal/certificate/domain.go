@@ -2,133 +2,80 @@ package certificate
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
-	"github.com/jusassessoria/platform/lib/events"
-	"github.com/jusassessoria/platform/lib/vault"
 )
 
-// publisher is the narrow outbox port — the producer half of the transactional
-// outbox. *events.Outbox satisfies it structurally.
-type publisher interface {
-	Publish(ctx context.Context, tx database.Tx, ev events.Event) error
-}
-
-// UseCase carries the certificate use cases: storing an A1 certificate securely
-// (parse → validate → envelope-encrypt → persist + outbox, all in one tx), listing
-// a tenant's certificates (metadata only), and revoking one. It depends only on the
-// Repository, the SecretVault, the outbox publisher and the UnitOfWork interfaces —
-// never a concrete implementation.
-//
-// SECURITY: the vault wraps the per-record DEK; the plaintext .pfx password reaches
-// only Create's parse step and is dropped there — it is never stored on the use
-// case, never logged, never passed to the repo.
+// UseCase orquestra os fluxos: preview, upload, list, revoke, sign. NÃO owns tx
+// (usa UoW). tenantID + userID sempre vêm do principal verificado, nunca do body.
+// Storage foi eliminado do fluxo — o binário .pfx cifrado vive in-row via
+// envelope (Cipher.Seal grava; Cipher.Open decifra no Sign).
 type UseCase struct {
 	repo   Repository
-	vault  vault.SecretVault
-	outbox publisher
 	uow    database.UnitOfWork
-	now    func() time.Time
+	cipher Cipher
 }
 
-// Option configures a UseCase at construction (clock seam for deterministic tests).
-type Option func(*UseCase)
-
-// WithClock overrides the reference clock used for the expiry check and the
-// revoked_at stamp. Production leaves the default (time.Now).
-func WithClock(now func() time.Time) Option {
-	return func(uc *UseCase) { uc.now = now }
+// NewUseCase constrói o caso de uso. cipher é exigido — o wire no api só chama
+// isso quando o GCP KMS tá configurado (senão o slice não sobe).
+func NewUseCase(repo Repository, uow database.UnitOfWork, c Cipher) *UseCase {
+	return &UseCase{repo: repo, uow: uow, cipher: c}
 }
 
-// NewUseCase wires the use case to its repository, vault, outbox publisher and unit
-// of work. opts is variadic so the binary's positional call stays source-compatible.
-func NewUseCase(repo Repository, v vault.SecretVault, outbox publisher, uow database.UnitOfWork, opts ...Option) *UseCase {
-	uc := &UseCase{repo: repo, vault: v, outbox: outbox, uow: uow, now: time.Now}
-	for _, opt := range opts {
-		opt(uc)
-	}
-	return uc
-}
-
-// CreateCommand is the POST /v1/certificates input the handler builds from the
-// multipart request + the verified principal. TenantID/OwnerUserID come from the
-// principal, NEVER the body. PFXData is the raw uploaded bytes; Password is used
-// only to parse and is discarded after Create returns (the struct is not retained).
-type CreateCommand struct {
-	TenantID    string
-	OwnerUserID string
-	PFXData     []byte
-	Password    string
-}
-
-// Create stores a certificate securely (docs: the A1 milestone). Steps:
-//  1. parse + validate the .pfx with the password (wrong password / expired /
-//     malformed → typed KindInvalid); the private key is decoded only to prove the
-//     password and is dropped — never stored.
-//  2. envelope-encrypt the RAW .pfx bytes (fresh DEK, AES-256-GCM, DEK wrapped by
-//     the vault).
-//  3. in ONE tenant-scoped tx: persist the metadata + envelope and publish
-//     certificate.added — the row and the event commit together (transactional
-//     outbox).
-//
-// The password is NEVER persisted or logged; it lives only in the CreateCommand the
-// handler discards after this call. Returns the created certificate as a view
-// (metadata only).
-func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CertificateView, error) {
-	meta, err := parsePFX(cmd.PFXData, cmd.Password, uc.now())
+// Preview parseia o .pfx com a senha, devolve metadata + checks. NADA é
+// persistido. Erros típicos: senha errada, arquivo corrupto.
+func (uc *UseCase) Preview(_ context.Context, pfx []byte, password string) (*PreviewResult, error) {
+	p, err := parsePFX(pfx, password)
 	if err != nil {
-		return CertificateView{}, err
+		return nil, err
 	}
+	meta := toMetadata(p)
+	return &PreviewResult{Meta: meta, Checks: checkPFX(meta)}, nil
+}
 
-	env, err := seal(ctx, uc.vault, cmd.PFXData)
+// Upload parseia, valida (não expirado), cifra com envelope (DEK local + KMS wrap)
+// e persiste a metadata + envelope numa tx. Retorna o Certificate cadastrado.
+// Idempotência: mesmo fingerprint duplicado no tenant ativo devolve
+// ErrCertificateAlreadyExists.
+func (uc *UseCase) Upload(ctx context.Context, tenantID, ownerUserID string, pfx []byte, password string) (*Certificate, error) {
+	p, err := parsePFX(pfx, password)
 	if err != nil {
-		return CertificateView{}, err
+		return nil, err
+	}
+	meta := toMetadata(p)
+
+	// Validação de domínio: cert expirado NÃO cadastra (proteção UX).
+	if time.Now().UTC().After(meta.NotAfter) {
+		return nil, ErrCertificateExpired
 	}
 
-	var created *Certificate
-	err = uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		saved, err := uc.repo.Insert(ctx, tx, InsertParams{
-			TenantID:    cmd.TenantID,
-			OwnerUserID: cmd.OwnerUserID,
-			Meta:        meta,
-			Envelope:    env,
-		})
-		if err != nil {
-			return err
-		}
-		created = saved
-		return uc.outbox.Publish(ctx, tx, newCertificateAdded(saved))
+	// Envelope: cifra {pfx, password} juntos como blob JSON. Trade-off consciente
+	// (Fatia 2b, ver commit): armazenar a senha permite assinar sem re-digitação
+	// por parte do advogado — 1 clique. Perda: se o api for comprometido, o
+	// atacante consegue assinar sem prova de posse humana. Mitigação prevista:
+	// audit log por assinatura + rate limit. Prior art: DocuSign REST usa mesma
+	// abordagem quando o usuário opta por "remember password".
+	blob, err := json.Marshal(vaultBlob{
+		PFXBase64: base64.StdEncoding.EncodeToString(pfx),
+		Password:  password,
 	})
 	if err != nil {
-		return CertificateView{}, err
+		return nil, err
 	}
-
-	return viewFromEntity(created), nil
-}
-
-// PreviewCommand is the POST /v1/certificates/preview input. It carries only the
-// bytes + password — no tenant/owner, because preview stores nothing. The password
-// is used only to parse and is discarded when this call returns.
-type PreviewCommand struct {
-	PFXData  []byte
-	Password string
-}
-
-// Preview parses + validates a .pfx WITHOUT storing anything (the wizard's
-// "Validação" step). It decodes the file (wrong password / malformed → typed 4xx),
-// then REPORTS the metadata + the BE-owned checks — an expired cert still previews
-// successfully with nao_expirado=false, so the FE can warn rather than block. This
-// is idempotent and read-only: no tx, no outbox, no persistence. The private key
-// and the password never leave this call.
-func (uc *UseCase) Preview(_ context.Context, cmd PreviewCommand) (PreviewResult, error) {
-	meta, hasChain, err := decodePFX(cmd.PFXData, cmd.Password)
+	env, err := uc.cipher.Seal(ctx, blob)
 	if err != nil {
-		return PreviewResult{}, err
+		return nil, err
 	}
 
-	now := uc.now()
-	return PreviewResult{
+	cert := &Certificate{
+		TenantID:    tenantID,
+		OwnerUserID: ownerUserID,
 		SubjectCN:   meta.SubjectCN,
 		OAB:         meta.OAB,
 		Issuer:      meta.Issuer,
@@ -136,110 +83,149 @@ func (uc *UseCase) Preview(_ context.Context, cmd PreviewCommand) (PreviewResult
 		NotBefore:   meta.NotBefore,
 		NotAfter:    meta.NotAfter,
 		Fingerprint: meta.Fingerprint,
-		Checks: PreviewChecks{
-			NaoExpirado:    !now.After(meta.NotAfter) && !now.Before(meta.NotBefore),
-			CadeiaOk:       hasChain,
-			TitularConfere: meta.SubjectCN != "",
-		},
-	}, nil
-}
-
-// SignCommand is the POST /v1/certificates/:id/sign input the handler builds from
-// the JSON body + the verified principal. TenantID/SignerUserID come from the
-// principal, CertificateID from the path — NEVER the body. Password is the session
-// password used ONLY to decrypt the .pfx and is discarded when Sign returns.
-// Digest is the raw 32-byte SHA-256 the caller already computed over its document.
-type SignCommand struct {
-	TenantID      string
-	SignerUserID  string
-	CertificateID string
-	Password      string
-	Digest        []byte
-}
-
-// SignResult is the Sign output: the signature over the digest plus the DER cert
-// chain (leaf first). Both are the client's to embed/verify; neither is secret.
-type SignResult struct {
-	Signature []byte
-	ChainDER  [][]byte
-}
-
-// Sign produces a server-side RSA signature over a caller-supplied SHA-256 digest,
-// using the private key inside the stored .pfx (the server-side-signing fatia the
-// envelope's open() half was built for). Steps, all in ONE tenant-scoped tx so RLS
-// applies to both the read and the audit write:
-//  1. load the certificate's envelope (missing/foreign id → 404).
-//  2. refuse a revoked or expired certificate (typed KindInvalid) BEFORE touching
-//     the key — a dead cert must never sign.
-//  3. decrypt the .pfx (vault Unwrap + AES-GCM open), extract the private key, and
-//     sign the digest with RSA-PKCS1v15/SHA-256 (wrong password → 400).
-//  4. append a signing_event audit row in the same tx.
-//
-// SECURITY: the password lives only in the command and reaches only signDigest's
-// decrypt step; it is never stored or logged. The private key and the decrypted
-// .pfx are zeroed/dropped inside signDigest — nothing key-bearing survives this
-// call. The signature and chain are returned to the caller; the digest (a hash,
-// not the document) is the only thing persisted, for audit.
-func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (SignResult, error) {
-	if len(cmd.Digest) != len(([32]byte{})) {
-		return SignResult{}, ErrInvalidDigest
+		Envelope:    *env,
 	}
 
-	var res signResult
-	err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		cert, err := uc.repo.LoadEnvelope(ctx, tx, cmd.TenantID, cmd.CertificateID)
-		if err != nil {
-			return err
+	err = uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		id, createdAt, ierr := uc.repo.Insert(ctx, tx, cert)
+		if ierr != nil {
+			return ierr
 		}
-		if cert.RevokedAt != nil {
-			return ErrCertificateRevoked
-		}
-		if uc.now().After(cert.NotAfter) {
-			return ErrCertificateExpired
-		}
-
-		res, err = signDigest(ctx, uc.vault, cert.Envelope, cmd.Password, cmd.Digest)
-		if err != nil {
-			return err
-		}
-		return uc.repo.RecordSigning(ctx, tx, cmd.TenantID, cmd.CertificateID, cmd.SignerUserID, cmd.Digest)
-	})
-	if err != nil {
-		return SignResult{}, err
-	}
-
-	return SignResult{Signature: res.Signature, ChainDER: res.ChainDER}, nil
-}
-
-// List returns a tenant's certificates (metadata only), newest first. It runs in a
-// tenant-scoped tx so RLS applies to the read (barrier 2) on top of the explicit
-// tenant filter (barrier 1). An empty tenant yields an empty slice, never an error.
-func (uc *UseCase) List(ctx context.Context, tenantID string) ([]CertificateView, error) {
-	var views []CertificateView
-	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
-		v, err := uc.repo.List(ctx, tx, tenantID)
-		if err != nil {
-			return err
-		}
-		views = v
+		cert.ID = id
+		cert.CreatedAt = createdAt
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return views, nil
+	return cert, nil
 }
 
-// Revoke soft-revokes a certificate (DELETE /v1/certificates/:id): in ONE
-// tenant-scoped tx it stamps revoked_at (a missing/foreign/already-revoked id →
-// ErrCertificateNotFound → 404) and publishes certificate.revoked — the flip and
-// the event commit together. tenant_id comes from the principal, the id from the
-// path.
+// List devolve os certificados ATIVOS do tenant, com nome do owner. O envelope
+// NÃO viaja aqui — só metadata pública.
+func (uc *UseCase) List(ctx context.Context, tenantID string) ([]CertificateWithOwner, error) {
+	var out []CertificateWithOwner
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		v, e := uc.repo.ListActive(ctx, tx, tenantID)
+		if e == nil {
+			out = v
+		}
+		return e
+	})
+	return out, err
+}
+
+// Revoke soft-deleta (marca revoked_at=now()). Idempotente: revogar de novo
+// devolve ErrCertificateNotFound (já não está ativo).
 func (uc *UseCase) Revoke(ctx context.Context, tenantID, id string) error {
 	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
-		if err := uc.repo.Revoke(ctx, tx, tenantID, id, uc.now()); err != nil {
-			return err
-		}
-		return uc.outbox.Publish(ctx, tx, newCertificateRevoked(tenantID, id))
+		return uc.repo.Revoke(ctx, tx, tenantID, id)
 	})
+}
+
+// vaultBlob é o payload interno cifrado pelo envelope: {pfx, password} juntos
+// como JSON. NUNCA vaza pra fora do pacote — só o Sign/openVault manipulam.
+type vaultBlob struct {
+	PFXBase64 string `json:"pfx"`      // .pfx bytes em base64
+	Password  string `json:"password"` // senha do PKCS#12 (protegida por KMS at-rest)
+}
+
+// openVault decodifica o envelope e devolve o parsedPFX pronto pra assinar.
+// Centraliza pra Sign e o KMSBackedSigner reusar a mesma lógica.
+func (uc *UseCase) openVault(ctx context.Context, cert *Certificate) (*parsedPFX, error) {
+	blob, err := uc.cipher.Open(ctx, &cert.Envelope)
+	if err != nil {
+		return nil, err
+	}
+	var v vaultBlob
+	if err := json.Unmarshal(blob, &v); err != nil {
+		return nil, err
+	}
+	pfx, err := base64.StdEncoding.DecodeString(v.PFXBase64)
+	if err != nil {
+		return nil, err
+	}
+	return parsePFX(pfx, v.Password)
+}
+
+// Sign assina um digest SHA-256 com a chave do certificado. Fluxo: busca cert
+// (metadata + envelope); openVault (KMS.Decrypt → JSON → parsePFX com senha
+// armazenada); assina digest. O parâmetro `password` fica aqui por compat
+// com o handler antigo — quando presente, é IGNORADO (senha vem do vault).
+func (uc *UseCase) Sign(ctx context.Context, tenantID, id, _ string, digest []byte) (*SignResult, error) {
+	var cert *Certificate
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		c, e := uc.repo.GetByID(ctx, tx, tenantID, id)
+		if e != nil {
+			return e
+		}
+		if c.RevokedAt != nil {
+			return ErrCertificateNotFound
+		}
+		cert = c
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	p, err := uc.openVault(ctx, cert)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := signSHA256(p, digest)
+	if err != nil {
+		return nil, err
+	}
+	chain := make([][]byte, 0, len(p.Chain))
+	for _, cc := range p.Chain {
+		chain = append(chain, cc.Raw)
+	}
+	return &SignResult{Signature: sig, Chain: chain}, nil
+}
+
+// SignerInfo carrega metadados legíveis do titular do certificado, além do
+// que sai do x509 leaf. Serve pra montar bloco de assinatura no PDF sem
+// query extra (OAB fica na nossa tabela, não é parte parseável do cert).
+type SignerInfo struct {
+	OAB       string // "347019/SP" — como salvo em certificate.oab
+	SubjectCN string // "CARLOS TELES TESTE" — redundante com leaf.Subject.CommonName mas explícito
+}
+
+// NewSigner devolve um crypto.Signer que assina digests SHA-256 usando este
+// certificado (KMS-backed). Usado por libs externas como digitorus/pdfsign
+// que exigem crypto.Signer pra montar a assinatura CMS/PAdES.
+//
+// A leaf certificate + chain acompanham o retorno pra o chamador passar pra
+// pdfsign junto com o signer. O SignerInfo carrega OAB (que só está na nossa
+// tabela) pra o chamador montar bloco de assinatura no PDF sem query extra.
+func (uc *UseCase) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, SignerInfo, error) {
+	var cert *Certificate
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		c, e := uc.repo.GetByID(ctx, tx, tenantID, id)
+		if e != nil {
+			return e
+		}
+		if c.RevokedAt != nil {
+			return ErrCertificateNotFound
+		}
+		cert = c
+		return nil
+	})
+	if err != nil {
+		return nil, nil, nil, SignerInfo{}, err
+	}
+	p, err := uc.openVault(ctx, cert)
+	if err != nil {
+		return nil, nil, nil, SignerInfo{}, err
+	}
+	var intermediates []*x509.Certificate
+	if len(p.Chain) > 1 {
+		intermediates = p.Chain[1:]
+	}
+	rsaKey, ok := p.Key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, nil, nil, SignerInfo{}, ErrPKCS12Parse
+	}
+	info := SignerInfo{OAB: cert.OAB, SubjectCN: cert.SubjectCN}
+	return rsaKey, p.Leaf, intermediates, info, nil
 }

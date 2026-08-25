@@ -32,7 +32,7 @@ func (f *fakeReviewWriter) InsertReview(_ context.Context, _ database.Tx, r *Rev
 	return r, f.writeErr
 }
 
-func (f *fakeReviewWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, _ bool, _ string) (*Draft, error) {
+func (f *fakeReviewWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, _ bool, _ string, _ *StructuredContent) (*Draft, error) {
 	f.updatedSagaState = sagaState
 	if f.returnedDraft != nil {
 		return f.returnedDraft, f.writeErr
@@ -401,4 +401,20 @@ func (f *fakeGenTracked) GenerateJSON(_ context.Context, req llm.Request) ([]byt
 		f.onCall()
 	}
 	return f.out, f.err
+}
+
+func (f *fakeGenTracked) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(string) error) ([]byte, error) {
+	f.gotReq = req
+	if f.onCall != nil {
+		f.onCall()
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		if err := onChunk(string(f.out)); err != nil {
+			return f.out, err
+		}
+	}
+	return f.out, nil
 }

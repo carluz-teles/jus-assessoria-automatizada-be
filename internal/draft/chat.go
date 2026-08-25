@@ -90,6 +90,7 @@ type ChatUseCase struct {
 	gen      llm.Generator // nil → typed error "IA não configurada"
 	emb      embedder      // nil → degraded (no RAG grounding)
 	search   indexing.SearchDeps
+	ragCache *RAGCache // nil → sem cache
 	composer advisory.PromptComposer
 	model    string
 }
@@ -101,6 +102,7 @@ type ChatUseCaseParams struct {
 	Gen      llm.Generator
 	Emb      embedder
 	Search   indexing.SearchDeps
+	RAGCache *RAGCache
 	Composer advisory.PromptComposer
 	Model    string // OpenRouter model slug; empty → chatModel fallback
 }
@@ -117,6 +119,7 @@ func NewChatUseCase(p ChatUseCaseParams) *ChatUseCase {
 		gen:      p.Gen,
 		emb:      p.Emb,
 		search:   p.Search,
+		ragCache: p.RAGCache,
 		composer: p.Composer,
 		model:    model,
 	}
@@ -179,7 +182,7 @@ func (uc *ChatUseCase) AnswerQuestion(ctx context.Context, cmd AnswerQuestionCom
 	// ── Phase 2: LLM (NO tx — connection released) ───────────────────────────
 
 	// 2a. RAG: embed question → search chunks (scoped to intimation's court_record when available).
-	chunks, chunkHits, _ := runRAG(ctx, uc.emb, uc.search, cmd.TenantID, crid, cmd.Question, 8)
+	chunks, chunkHits, _ := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, cmd.Question, 8)
 
 	// 2b. Compose prompt.
 	chatCtx := buildChatContext(d, history, chunks, cmd.Question)

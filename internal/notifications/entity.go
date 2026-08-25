@@ -90,6 +90,13 @@ const (
 	// flipped to past_due (billing.payment_failed, fatia 6b). This is the aviso's
 	// `type` column, distinct from the dotted EVENT id TypePaymentFailed in events.go.
 	TypePaymentFailedAviso = "payment_failed"
+	// TypeFilingSucceededAviso — a peça foi protocolada automaticamente no e-SAJ
+	// (filing.succeeded). Aviso `type` column, distinto do dotted EVENT id
+	// TypeFilingSucceeded em events.go.
+	TypeFilingSucceededAviso = "filing_succeeded"
+	// TypeFilingFailedAviso — a tentativa de protocolo automático no e-SAJ falhou
+	// (filing.failed); o usuário deve protocolar manualmente.
+	TypeFilingFailedAviso = "filing_failed"
 	// TypeMemberJoinedAviso — a user joined the escritório (identity.member_joined),
 	// delivered through the generic notification.requested/EMAIL path (NotifyUseCase),
 	// not the in-app record() path the other Type*Aviso consts above go through. Named
@@ -113,6 +120,8 @@ var validNotificationTypes = map[string]bool{
 	TypeTrialEndingSoonAviso: true,
 	TypePaymentFailedAviso:   true,
 	TypeMemberJoinedAviso:    true,
+	TypeFilingSucceededAviso: true,
+	TypeFilingFailedAviso:    true,
 }
 
 // ValidNotificationType reports whether t is a known aviso type. The empty string

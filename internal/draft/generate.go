@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jusassessoria/platform/internal/advisory"
@@ -14,6 +15,7 @@ import (
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/llm"
+	"golang.org/x/sync/errgroup"
 )
 
 // outboxPublisher is the narrow port the generation use case needs from the outbox.
@@ -69,7 +71,8 @@ type generationDepsReader interface {
 // generationWriter is the narrow write port the generation use case needs. A separate
 // interface (not the full Repository) keeps the fake in tests minimal.
 type generationWriter interface {
-	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string) (*Draft, error)
+	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error)
+	UpdateDraftContentHtml(ctx context.Context, tx database.Tx, draftID, tenantID, html string) error
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
 	DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error
 }
@@ -87,6 +90,20 @@ type VoyageEmbedder = embedder
 // GenerateUseCase is the async handler for draft.generation_requested events. It holds
 // all its ports as interfaces so tests inject fakes — the real LLM/embedder APIs are
 // NEVER called under test.
+// chunkPublisher é a porta narrow que o worker usa pra empurrar chunks do
+// LLM num Redis Stream (XADD com MAXLEN + EXPIRE). Cada chunk vira um entry
+// com ID sequencial — o SSE handler pode retomar via Last-Event-ID quando o
+// cliente reconecta, sem perder chunks. Satisfeita por lib/pubsub.StreamPublisher.
+// Injetada como Option (nil → geração roda em modo batch, sem streaming).
+type chunkPublisher interface {
+	XPublish(ctx context.Context, streamKey string, payload []byte) (string, error)
+	XReset(ctx context.Context, streamKey string) error
+}
+
+// chunkChannel monta o nome do stream Redis pra um draft — usado pelo
+// worker (produtor) e pelo endpoint SSE (consumidor) sem depender um do outro.
+func chunkChannel(draftID string) string { return "draft:" + draftID + ":stream" }
+
 type GenerateUseCase struct {
 	uow      database.UnitOfWork
 	reader   generationDepsReader
@@ -96,8 +113,10 @@ type GenerateUseCase struct {
 	gen      llm.Generator       // nil → FAILED "IA não configurada"
 	emb      embedder            // nil → degraded (no grounding)
 	search   indexing.SearchDeps // Pool may be nil → degraded
+	ragCache *RAGCache           // nil → sem cache
 	composer advisory.PromptComposer
-	model    string // OpenRouter model slug (from config); falls back to generationModel
+	chunkPub chunkPublisher // nil → geração em modo batch (não streama)
+	model    string         // OpenRouter model slug (from config); falls back to generationModel
 	now      func() time.Time
 }
 
@@ -112,7 +131,9 @@ type GenerateUseCaseParams struct {
 	Gen      llm.Generator
 	Emb      embedder
 	Search   indexing.SearchDeps
+	RAGCache *RAGCache
 	Composer advisory.PromptComposer
+	ChunkPub chunkPublisher   // nil → sem streaming
 	Model    string           // OpenRouter model slug; empty → generationModel fallback
 	Now      func() time.Time // defaults to time.Now
 }
@@ -135,16 +156,20 @@ func NewGenerateUseCase(p GenerateUseCaseParams) *GenerateUseCase {
 		gen:      p.Gen,
 		emb:      p.Emb,
 		search:   p.Search,
+		ragCache: p.RAGCache,
 		composer: p.Composer,
+		chunkPub: p.ChunkPub,
 		model:    p.Model,
 		now:      p.Now,
 	}
 }
 
 // generatedOutput is the LLM's structured response for one generation call.
-// Gerar now produces ONLY draft_content — suggestions are produced by Revisar.
+// v8: DraftMarkdown carrega markdown (CommonMark + GFM tables). O worker
+// converte pra HTML via goldmark antes de persistir em content_html —
+// markdown streama char-a-char sem corromper (padrão da indústria pra LLM).
 type generatedOutput struct {
-	DraftContent string `json:"draft_content"`
+	DraftMarkdown string `json:"draft_markdown"`
 }
 
 // rawSuggestion is one LLM-suggested improvement before validation.
@@ -165,14 +190,16 @@ type rawCitation struct {
 }
 
 // generateSchema is the JSON Schema constraining the LLM's output via
-// structured output (strict). Gerar now produces ONLY draft_content — suggestions
-// are a separate concern handled by Revisar (review.go).
+// structured output (strict). v8: draft_markdown é o markdown da peça
+// (CommonMark + GFM tables). O worker converte pra HTML via goldmark antes
+// de persistir. Streaming char-a-char funciona porque markdown não tem
+// tags pareadas que se corrompam ao serem cortadas no meio.
 var generateSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "draft_content": { "type": "string" }
+    "draft_markdown": { "type": "string" }
   },
-  "required": ["draft_content"],
+  "required": ["draft_markdown"],
   "additionalProperties": false
 }`)
 
@@ -205,9 +232,13 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	// is only wasted on a genuine concurrent in-flight duplicate (rare).
 
 	// ── 3. Read draft + guard saga_state == EXTRACTING ────────────────────────
+	// Phase 1 rodada em 2 etapas pra paralelizar o que dá (P3):
+	//   3a) GetDraftByID + guard saga (obrigatório serial — precisa saber
+	//       IntimationID/CaseID antes das outras loads).
+	//   3b) GetIntimationForDraft e GetPartiesForDraft rodam em PARALELO
+	//       via errgroup, cada uma em tx própria (short reads, safe).
+	//       Reads são independentes entre si; ganho: ~15-25ms em prod.
 	var draft *Draft
-	var intimation *IntimationContext
-	var parties []PartyInfo
 	if err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		d, e := uc.reader.GetDraftByID(ctx, tx, ev.TenantID, ev.DraftID)
 		if e != nil {
@@ -219,35 +250,59 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			// Treat as SkipRetry by returning a sentinel; the listener wraps it.
 			return errObsoleteSaga
 		}
-		// Load intimation context for prompt composition (optional — blank/processo drafts have none).
-		if d.IntimationID != "" {
-			i, e2 := uc.reader.GetIntimationForDraft(ctx, tx, ev.TenantID, d.IntimationID)
-			if e2 != nil {
-				// Non-fatal: compose without intimation context (degraded).
-				slog.WarnContext(ctx, "draft generate: intimation load failed",
-					slog.String("draft_id", ev.DraftID), slog.Any("error", e2))
-			} else {
-				intimation = i
-			}
-		}
-		// Load structured parties from the party table (non-fatal: an empty case or
-		// a process with no seeded parties degrades gracefully — the LLM uses the
-		// teor da intimação as a fallback for party names, as in previous versions).
-		if d.CaseID != "" {
-			pp, e3 := uc.reader.GetPartiesForDraft(ctx, tx, ev.TenantID, d.CaseID)
-			if e3 != nil {
-				slog.WarnContext(ctx, "draft generate: parties load failed",
-					slog.String("draft_id", ev.DraftID), slog.Any("error", e3))
-			} else {
-				parties = pp
-			}
-		}
 		return nil
 	}); err != nil {
 		if isErrObsoleteSaga(err) {
 			return fmt.Errorf("%w: %w", err, errSkipRetry)
 		}
 		return fmt.Errorf("draft generate: load draft: %w", err)
+	}
+
+	// 3b) Loads paralelos — cada goroutine tem tx própria (uow.Do pega conn
+	// do pool). Ambos non-fatal: warn + segue ungrounded/sem-partes.
+	var intimation *IntimationContext
+	var parties []PartyInfo
+	var mu sync.Mutex // protege intimation/parties (paranoia; errgroup já ordena)
+	eg, egCtx := errgroup.WithContext(ctx)
+	if draft.IntimationID != "" {
+		iid := draft.IntimationID
+		eg.Go(func() error {
+			return uc.uow.Do(egCtx, ev.TenantID, func(tx database.Tx) error {
+				i, e := uc.reader.GetIntimationForDraft(egCtx, tx, ev.TenantID, iid)
+				if e != nil {
+					slog.WarnContext(egCtx, "draft generate: intimation load failed",
+						slog.String("draft_id", ev.DraftID), slog.Any("error", e))
+					return nil // non-fatal
+				}
+				mu.Lock()
+				intimation = i
+				mu.Unlock()
+				return nil
+			})
+		})
+	}
+	if draft.CaseID != "" {
+		cid := draft.CaseID
+		eg.Go(func() error {
+			return uc.uow.Do(egCtx, ev.TenantID, func(tx database.Tx) error {
+				pp, e := uc.reader.GetPartiesForDraft(egCtx, tx, ev.TenantID, cid)
+				if e != nil {
+					slog.WarnContext(egCtx, "draft generate: parties load failed",
+						slog.String("draft_id", ev.DraftID), slog.Any("error", e))
+					return nil // non-fatal
+				}
+				mu.Lock()
+				parties = pp
+				mu.Unlock()
+				return nil
+			})
+		})
+	}
+	// Erros aqui só acontecem se uow.Do falhar (conexão morta) — as queries
+	// individuais degradam via warn + nil. Ignore-safe.
+	if err := eg.Wait(); err != nil {
+		slog.WarnContext(ctx, "draft generate: phase 1 parallel loads failed",
+			slog.String("draft_id", ev.DraftID), slog.Any("error", err))
 	}
 
 	// ── 4. RAG: embed + search chunks ─────────────────────────────────────────
@@ -260,7 +315,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		crid = &intimation.CourtRecordID
 	}
 	queryText := buildQueryText(draft, intimation)
-	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, ev.TenantID, crid, queryText, 8)
+	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, uc.ragCache, ev.TenantID, crid, queryText, 8)
 
 	// ── 5. Compose prompt and call LLM ────────────────────────────────────────
 	draftCtx := buildDraftContext(draft, intimation, parties, chunks)
@@ -269,14 +324,52 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("compose prompt: %v", err2))
 	}
 
-	rawBytes, err3 := uc.gen.GenerateJSON(ctx, llm.Request{
-		System:     composed.System,
-		User:       composed.User,
-		Schema:     generateSchema,
-		SchemaName: "draft_minuta",
-		Model:      uc.model,
-		MaxTokens:  4096,
-	})
+	// STREAMING — publica cada chunk bruto no canal pub/sub `draft:<id>:stream`
+	// pra o SSE do api encaminhar ao FE. Ao final, `rawBytes` carrega a
+	// resposta completa (idêntica ao modo batch) pra fazer json.Unmarshal.
+	// Se o Publisher não foi wireado (uc.chunkPub == nil), degrada pra batch
+	// mode (mesmo comportamento anterior).
+	var rawBytes []byte
+	var err3 error
+	if uc.chunkPub != nil {
+		channel := chunkChannel(ev.DraftID)
+		// Reset do stream antes de começar a publicar — sem isso, um cliente
+		// SSE que abre a conexão logo em seguida receberia replay dos chunks
+		// da geração ANTERIOR (o TTL do stream é 10min, insuficiente pra
+		// gerações consecutivas). Ignora erro: DEL não-existente é no-op.
+		if resetErr := uc.chunkPub.XReset(ctx, channel); resetErr != nil {
+			slog.WarnContext(ctx, "draft chunk stream reset failed",
+				slog.String("draft_id", ev.DraftID),
+				slog.String("err", resetErr.Error()))
+		}
+		rawBytes, err3 = uc.gen.GenerateJSONStream(ctx, llm.Request{
+			System:     composed.System,
+			User:       composed.User,
+			Schema:     generateSchema,
+			SchemaName: "draft_minuta",
+			Model:      uc.model,
+			MaxTokens:  4096,
+		}, func(chunk string) error {
+			// Best-effort: erro no XADD não aborta geração. Cliente que
+			// reconecta usa Last-Event-ID pra retomar; se o key expirou,
+			// faz refetch do content_html quando saga_state=DRAFTED.
+			if _, pubErr := uc.chunkPub.XPublish(ctx, channel, []byte(chunk)); pubErr != nil {
+				slog.WarnContext(ctx, "draft chunk publish failed",
+					slog.String("draft_id", ev.DraftID),
+					slog.String("err", pubErr.Error()))
+			}
+			return nil
+		})
+	} else {
+		rawBytes, err3 = uc.gen.GenerateJSON(ctx, llm.Request{
+			System:     composed.System,
+			User:       composed.User,
+			Schema:     generateSchema,
+			SchemaName: "draft_minuta",
+			Model:      uc.model,
+			MaxTokens:  4096,
+		})
+	}
 	if err3 != nil {
 		// Transient LLM errors stay retryable; terminal (bad key / parse) become FAILED.
 		if isTerminalGenErr(err3) {
@@ -307,7 +400,20 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		if e := uc.writer.DeleteReviewsForDraft(ctx, tx, ev.DraftID); e != nil {
 			return fmt.Errorf("delete prior reviews: %w", e)
 		}
-		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, out.DraftContent); e != nil {
+		// v8 (streaming markdown): o LLM gera markdown; convertemos aqui pra HTML
+		// via goldmark antes de persistir. Streaming char-a-char do markdown
+		// funciona porque não há tags pareadas — o FE consome os deltas com
+		// tiptap-markdown/streamContent sem corromper.
+		htmlOut, mdErr := markdownToHTML(out.DraftMarkdown)
+		if mdErr != nil {
+			return fmt.Errorf("convert markdown to html: %w", mdErr)
+		}
+		plainText := stripHTMLTagsForSearch(htmlOut)
+		structured := parseHTMLToStructured(htmlOut)
+		if e := uc.writer.UpdateDraftContentHtml(ctx, tx, ev.DraftID, ev.TenantID, htmlOut); e != nil {
+			return fmt.Errorf("update content_html: %w", e)
+		}
+		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, plainText, structured); e != nil {
 			return fmt.Errorf("update saga state: %w", e)
 		}
 		return nil
@@ -336,7 +442,7 @@ func (uc *GenerateUseCase) persistFailure(ctx context.Context, tenantID, draftID
 				return nil
 			}
 		}
-		if _, e := uc.writer.UpdateSagaState(ctx, tx, draftID, tenantID, SagaStateFailed, false, ""); e != nil {
+		if _, e := uc.writer.UpdateSagaState(ctx, tx, draftID, tenantID, SagaStateFailed, false, "", nil); e != nil {
 			return e
 		}
 		_, e := uc.writer.InsertReview(ctx, tx, &Review{

@@ -19,6 +19,19 @@ type Generator interface {
 	// (OpenRouter response_format=json_schema + provider.require_parameters). The caller
 	// unmarshals the bytes into its own type.
 	GenerateJSON(ctx context.Context, req Request) ([]byte, error)
+
+	// GenerateJSONStream é a variante streaming (SSE). Chama onChunk pra cada
+	// delta do modelo (texto UTF-8 parcial). No fim, devolve os bytes COMPLETOS
+	// da resposta (idênticos aos que GenerateJSON devolveria) pro caller fazer
+	// unmarshal do JSON estruturado. onChunk pode retornar erro pra abortar
+	// a stream cedo — o erro do onChunk é propagado como retorno da fn.
+	//
+	// Nota: chunks são parcelas do CONTENT — pra structured output, o content
+	// é um único JSON string, então o consumidor pode escolher stream do
+	// próprio value se souber a shape (ex.: draft_html é um único campo
+	// string, então basicamente todo o content APÓS abertura `{"draft_html":"`
+	// é a peça sendo digitada).
+	GenerateJSONStream(ctx context.Context, req Request, onChunk func(chunk string) error) ([]byte, error)
 }
 
 // Request is one generation call: the system + user prompts, the JSON Schema to constrain the

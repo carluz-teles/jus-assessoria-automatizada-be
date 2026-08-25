@@ -65,12 +65,16 @@ type fakeWriter struct {
 	deleteReviewsDraftID string
 }
 
-func (f *fakeWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, updateContent bool, content string) (*Draft, error) {
+func (f *fakeWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, updateContent bool, content string, _ *StructuredContent) (*Draft, error) {
 	f.updatedSagaState = sagaState
 	if updateContent {
 		f.updatedContent = content
 	}
 	return f.returnedDraft, f.writeErr
+}
+
+func (f *fakeWriter) UpdateDraftContentHtml(_ context.Context, _ database.Tx, _, _, _ string) error {
+	return nil
 }
 
 func (f *fakeWriter) InsertReview(_ context.Context, _ database.Tx, r *Review) (*Review, error) {
@@ -124,6 +128,21 @@ func (f *fakeGen) GenerateJSON(_ context.Context, req llm.Request) ([]byte, erro
 	return f.out, f.err
 }
 
+// GenerateJSONStream: pra testes, entrega o output inteiro num único chunk
+// e depois retorna. Basta pra validar o worker sem SSE real.
+func (f *fakeGen) GenerateJSONStream(_ context.Context, req llm.Request, onChunk func(chunk string) error) ([]byte, error) {
+	f.gotReq = req
+	if f.err != nil {
+		return nil, f.err
+	}
+	if onChunk != nil {
+		if err := onChunk(string(f.out)); err != nil {
+			return f.out, err
+		}
+	}
+	return f.out, nil
+}
+
 // fakeEmbedder returns preset vectors.
 type fakeEmbedder struct {
 	vecs [][]float32
@@ -159,7 +178,7 @@ func ev() GenerationRequested {
 // cannedJSON is the JSON the fake generator returns on the happy path.
 // Gerar now produces ONLY draft_content — no suggestions.
 const cannedJSON = `{
-  "draft_content": "Revised draft content here for substring tests. Argumento claro."
+  "draft_markdown": "<p>Revised draft content here for substring tests. Argumento claro.</p>"
 }`
 
 // buildUC assembles the GenerateUseCase with the given overridable parts.
@@ -285,7 +304,7 @@ func TestGenerateUseCase_DegradedNoChunks(t *testing.T) {
 	d := makeDraft()
 	w := &fakeWriter{returnedDraft: d}
 	ob := &fakeOutbox{}
-	gen := &fakeGen{out: []byte(`{"draft_content":"text here"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_markdown":"text here"}`)}
 
 	// No embedder (nil) → degraded path.
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, ob, fakeDedup{}, gen, nil)
@@ -328,7 +347,7 @@ func TestGenerateUseCase_GeneratorError_FAILED(t *testing.T) {
 func TestGenerateUseCase_Idempotency_SeenEvent(t *testing.T) {
 	d := makeDraft()
 	w := &fakeWriter{returnedDraft: d}
-	gen := &fakeGen{out: []byte(`{"draft_content":"x"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_markdown":"x"}`)}
 
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, &fakeOutbox{}, fakeDedup{seen: true}, gen, nil)
 
@@ -350,7 +369,7 @@ func TestGenerateUseCase_ObsoleteSaga_SkipRetry(t *testing.T) {
 	d.SagaState = SagaStateReviewed
 
 	w := &fakeWriter{returnedDraft: d}
-	gen := &fakeGen{out: []byte(`{"draft_content":"x"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_markdown":"x"}`)}
 
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, &fakeOutbox{}, fakeDedup{}, gen, nil)
 
@@ -527,7 +546,7 @@ func TestGenerateUseCase_WithIntimation_CRIDPropagated(t *testing.T) {
 	}
 	w := &fakeWriter{returnedDraft: d}
 	ob := &fakeOutbox{}
-	gen := &fakeGen{out: []byte(`{"draft_content":"text","suggestions":[]}`)}
+	gen := &fakeGen{out: []byte(`{"draft_markdown":"text","suggestions":[]}`)}
 
 	// Embedder non-nil but pool nil → runRAG degrades after the embed step is skipped
 	// by the pool gate (degraded, grounded=false). This still exercises the crid resolution
@@ -555,7 +574,7 @@ func TestGenerateUseCase_WithoutIntimation_WholeTenantSearch(t *testing.T) {
 	d.IntimationID = ""
 	w := &fakeWriter{returnedDraft: d}
 	ob := &fakeOutbox{}
-	gen := &fakeGen{out: []byte(`{"draft_content":"text"}`)}
+	gen := &fakeGen{out: []byte(`{"draft_markdown":"text"}`)}
 
 	uc := buildUC(fakeUoW{}, fakeReader{draft: d}, w, ob, fakeDedup{}, gen, nil)
 
@@ -665,12 +684,12 @@ func TestBuildDraftContext_TonePropagation(t *testing.T) {
 			wantTheses:       []string{"tese-prescricao", "tese-decadencia"},
 		},
 		{
-			name: "server-side default tone (tecnico-formal) propagates like any other value",
+			name: "server-side default tone (tecnico) propagates like any other value",
 			draft: &Draft{
 				PieceType: PieceTypeDefense,
-				Tone:      ToneTecnicoFormal,
+				Tone:      ToneTecnico,
 			},
-			wantTone: ToneTecnicoFormal,
+			wantTone: ToneTecnico,
 		},
 		{
 			name:  "zero-value draft: empty tone/instructions/nil theses propagate as empty",

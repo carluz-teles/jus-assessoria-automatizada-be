@@ -244,17 +244,38 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(54); err != nil || next != 55 {
 		t.Fatalf("Next(54) = (%d, %v), want (55, nil)", next, err)
 	}
-	// 0056–0059 are skipped: the certificate slice jumped to 0060 to avoid
-	// colliding with the task slice's 0053–0055. golang-migrate sorts numerically.
-	if next, err := src.Next(55); err != nil || next != 60 {
-		t.Fatalf("Next(55) = (%d, %v), want (60, nil)", next, err)
+	if next, err := src.Next(55); err != nil || next != 56 {
+		t.Fatalf("Next(55) = (%d, %v), want (56, nil)", next, err)
 	}
-	// 0061 is the signing_event audit table (server-side signing fatia).
+	if next, err := src.Next(56); err != nil || next != 57 {
+		t.Fatalf("Next(56) = (%d, %v), want (57, nil)", next, err)
+	}
+	if next, err := src.Next(57); err != nil || next != 58 {
+		t.Fatalf("Next(57) = (%d, %v), want (58, nil)", next, err)
+	}
+	if next, err := src.Next(58); err != nil || next != 59 {
+		t.Fatalf("Next(58) = (%d, %v), want (59, nil)", next, err)
+	}
+	if next, err := src.Next(59); err != nil || next != 60 {
+		t.Fatalf("Next(59) = (%d, %v), want (60, nil)", next, err)
+	}
 	if next, err := src.Next(60); err != nil || next != 61 {
 		t.Fatalf("Next(60) = (%d, %v), want (61, nil)", next, err)
 	}
-	if _, err := src.Next(61); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(61) error = %v, want fs.ErrNotExist", err)
+	if next, err := src.Next(61); err != nil || next != 62 {
+		t.Fatalf("Next(61) = (%d, %v), want (62, nil)", next, err)
+	}
+	if next, err := src.Next(62); err != nil || next != 63 {
+		t.Fatalf("Next(62) = (%d, %v), want (63, nil)", next, err)
+	}
+	if next, err := src.Next(63); err != nil || next != 64 {
+		t.Fatalf("Next(63) = (%d, %v), want (64, nil)", next, err)
+	}
+	if next, err := src.Next(64); err != nil || next != 65 {
+		t.Fatalf("Next(64) = (%d, %v), want (65, nil)", next, err)
+	}
+	if _, err := src.Next(65); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(65) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

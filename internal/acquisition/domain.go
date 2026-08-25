@@ -150,27 +150,24 @@ func (uc *UseCase) AssignResponsible(ctx context.Context, tenantID, courtRecordI
 	})
 }
 
-// AssignIntimacaoResponsaveis sets (or clears, when nil) the conductor and reviewer on one
+// AssignIntimacaoAssignee sets (or clears, when nil) the single responsável of one
 // intimação, in ONE transaction (UoW → SET LOCAL app.tenant_id, RLS as a second barrier
-// under the explicit tenant filter). For each non-nil assignee, the use case guards that the
-// target user is an app_user of the same tenant (reuses AppUserInTenant, same guard as
-// AssignResponsible for processos). A nil clears the role ("desatribuir"). A miss or a
-// foreign tenant's row is ErrIntimationNotFound (→ 404).
+// under the explicit tenant filter). When non-nil, the use case guards that the target
+// user is an app_user of the same tenant (reuses AppUserInTenant, same guard as
+// AssignResponsible for processos). A nil clears the assignment ("desatribuir"). A miss
+// or a foreign tenant's row is ErrIntimationNotFound (→ 404).
 //
 // No outbox event here: there is no consumer of an assignment fact yet — auditoria/evento
 // is a future slice. When that lands, the event publishes in THIS same tx.
 // tenantID comes from the verified principal, never the body.
-func (uc *UseCase) AssignIntimacaoResponsaveis(
+func (uc *UseCase) AssignIntimacaoAssignee(
 	ctx context.Context,
 	tenantID, intimationID string,
-	conductorUserID, reviewerUserID *string,
+	assigneeUserID *string,
 ) error {
 	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
-		for _, uid := range []*string{conductorUserID, reviewerUserID} {
-			if uid == nil {
-				continue
-			}
-			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *uid)
+		if assigneeUserID != nil {
+			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *assigneeUserID)
 			if err != nil {
 				return err
 			}
@@ -178,27 +175,27 @@ func (uc *UseCase) AssignIntimacaoResponsaveis(
 				return ErrResponsibleNotMember
 			}
 		}
-		return uc.repo.AssignIntimacaoResponsaveis(ctx, tx, tenantID, intimationID, conductorUserID, reviewerUserID)
+		return uc.repo.AssignIntimacaoAssignee(ctx, tx, tenantID, intimationID, assigneeUserID)
 	})
 }
 
-// BulkAssignConductor atribui o condutor a várias intimações de uma vez. Dois modos
+// BulkAssignIntimacoes atribui o responsável a várias intimações de uma vez. Dois modos
 // (mutuamente exclusivos): All=true aplica a TODA a faixa/filtro atual (q — mesmos
 // filtros do ListIntimacoes; inclui os não paginados); senão aplica à lista ids.
-// Valida a pertinência do condutor (quando não-nil) antes do write, numa única tx
+// Valida a pertinência do assignee (quando não-nil) antes do write, numa única tx
 // (UoW + RLS). Devolve quantas linhas foram afetadas.
-func (uc *UseCase) BulkAssignConductor(
+func (uc *UseCase) BulkAssignIntimacoes(
 	ctx context.Context,
 	tenantID string,
 	all bool,
 	q IntimacoesQuery,
 	ids []string,
-	conductorUserID *string,
+	assigneeUserID *string,
 ) (int64, error) {
 	var n int64
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
-		if conductorUserID != nil {
-			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *conductorUserID)
+		if assigneeUserID != nil {
+			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *assigneeUserID)
 			if err != nil {
 				return err
 			}
@@ -208,9 +205,9 @@ func (uc *UseCase) BulkAssignConductor(
 		}
 		var err error
 		if all {
-			n, err = uc.repo.BulkAssignConductorByFilter(ctx, tx, q, conductorUserID)
+			n, err = uc.repo.BulkAssignIntimacoesByFilter(ctx, tx, q, assigneeUserID)
 		} else {
-			n, err = uc.repo.BulkAssignConductorByIDs(ctx, tx, tenantID, ids, conductorUserID)
+			n, err = uc.repo.BulkAssignIntimacoesByIDs(ctx, tx, tenantID, ids, assigneeUserID)
 		}
 		return err
 	})

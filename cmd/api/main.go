@@ -7,6 +7,9 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -196,7 +199,8 @@ func run(logger *slog.Logger) error {
 		acquisition.NewResumoStore(uow),
 		resumeEmbedder,
 		indexing.SearchDeps{Pool: pool},
-		cfg.OpenRouterModel,
+		// QUALITY: resumo executivo do processo é referência decisória — precisa fidelidade.
+		cfg.OpenRouterModelQuality,
 	)
 	// Intimation analysis (AI) — POST /v1/intimacoes/:id/analise ("Analisar esta intimação").
 	// Same pattern as resumoUC: the read use case + the shared meta-prompt composer + the SAME
@@ -208,6 +212,8 @@ func run(logger *slog.Logger) error {
 		advisory.NewTemplateComposer(),
 		taskGenerator,
 		acquisition.NewAnaliseStore(uow),
+		// QUALITY: providências viram tasks reais no calendário — falso positivo custa.
+		cfg.OpenRouterModelQuality,
 	)
 	// Providência actions (aprovar/descartar) on the analysis card — flip one suggested
 	// providência's status by index over the unit of work. The real task is created by the FE
@@ -261,7 +267,9 @@ func run(logger *slog.Logger) error {
 	// time a prazo is summarized, so later opens serve the cache instead of asking the LLM again.
 	deadlineSuggestUC := deadline.NewSuggestUseCase(
 		deadlineReadUC, advisory.NewTemplateComposer(), taskGenerator,
-		deadline.NewSuggestionStore(uow), deadline.NewAISummaryStore(uow), cfg.OpenRouterModel,
+		deadline.NewSuggestionStore(uow), deadline.NewAISummaryStore(uow),
+		// FAST: sugestão de tasks é background/on-demand curta — rápido melhor.
+		cfg.OpenRouterModelFast,
 	)
 	deadlineHandler := deadline.NewHandler(
 		deadlineReadUC,
@@ -324,11 +332,12 @@ func run(logger *slog.Logger) error {
 	if cfg.S3Enabled() {
 		var err error
 		storageClient, err = storage.New(ctx, storage.Options{
-			Endpoint:  cfg.S3Endpoint,
-			Region:    cfg.S3Region,
-			Bucket:    cfg.S3Bucket,
-			AccessKey: cfg.S3AccessKey,
-			SecretKey: cfg.S3SecretKey,
+			Endpoint:     cfg.S3Endpoint,
+			Region:       cfg.S3Region,
+			Bucket:       cfg.S3Bucket,
+			AccessKey:    cfg.S3AccessKey,
+			SecretKey:    cfg.S3SecretKey,
+			UsePathStyle: cfg.S3UsePathStyle,
 		})
 		if err != nil {
 			return fmt.Errorf("init storage: %w", err)
@@ -347,6 +356,31 @@ func run(logger *slog.Logger) error {
 		)
 	}
 
+	// Certificate (Assinatura Fatia 1): cadastro do .pfx A1 ICP-Brasil.
+	// Envelope encryption: DEK aleatória (AES-256-GCM local) por cert, wrapped
+	// pelo GCP KMS. Sem GCP_KMS_KEY_NAME o slice fica desmontado; o api segue.
+	// Credenciais GCP: em PaaS (Railway/Fly/Render) recebemos o JSON como env
+	// base64 (GCP_KMS_CREDENTIALS_JSON) e materializamos em disco antes de
+	// instanciar o SDK — o ADC lê de GOOGLE_APPLICATION_CREDENTIALS. Em dev
+	// local (Docker Compose) já vem via volume mount, então a var já aponta
+	// pro path certo e este ramo é no-op.
+	var certificateHandler *certificate.Handler
+	var certCipher certificate.Cipher
+	var certUC *certificate.UseCase // exposto pra outros slices (ex.: draft.Sign)
+	if cfg.GCPKMSKeyName != "" {
+		if err := materializeGCPCredentials(cfg.GCPKMSCredentialsJSON); err != nil {
+			return fmt.Errorf("materialize gcp creds: %w", err)
+		}
+		cipher, err := certificate.NewEnvelopeCipher(ctx, cfg.GCPKMSKeyName)
+		if err != nil {
+			return fmt.Errorf("init cert envelope cipher: %w", err)
+		}
+		certCipher = cipher
+		certUC = certificate.NewUseCase(certificate.NewRepository(), uow, cipher)
+		certificateHandler = certificate.New(certUC)
+		logger.Info("certificate slice ready", "kms_key", cfg.GCPKMSKeyName)
+	}
+
 	// Draft (Peticionamento Fatias 1–3b): the peça create/read/autosave surface +
 	// the AI generation trigger (Fatia 3) + grounded chat (Fatia 3b). Pool-backed
 	// read (GetDetail) + transactional writes via the shared UoW. No storage required
@@ -360,6 +394,25 @@ func run(logger *slog.Logger) error {
 	draftOpts := []draft.Option{draft.WithOutbox(events.NewOutbox())}
 	if storageClient != nil {
 		draftOpts = append(draftOpts, draft.WithStorage(storageClient))
+		// Fatia 2b: PDF assinado passa pelo BE (server-side PutBytes). Reusa
+		// o mesmo storage.Client — Put/Get direto (bypass presigned).
+		draftOpts = append(draftOpts, draft.WithPDFStorage(storageClient))
+	}
+	if certUC != nil {
+		// certUC.NewSigner satisfaz o port draft.CertSigner via adapter direto —
+		// mesma assinatura, só encaminha a chamada. Isolamento cross-slice.
+		draftOpts = append(draftOpts, draft.WithCertSigner(certSignerFunc(certUC.NewSigner)))
+		// certCipher (KMS envelope) satisfaz o port draft.SecretVault para
+		// cifrar login/senha e-SAJ. Structural typing — o adapter converte
+		// certificate.Envelope ↔ draft.Envelope (campos idênticos).
+		draftOpts = append(draftOpts, draft.WithSecretVault(secretVaultAdapter{certCipher}))
+	}
+	if cfg.TSAURL != "" {
+		// PAdES-T: carimbo de tempo RFC 3161 embutido na assinatura. Sem esta
+		// var, o Sign gera PAdES-BASIC (data da assinatura = clock do assinante,
+		// não confiável). Provedor típico: http://freetsa.org/tsr (dev).
+		draftOpts = append(draftOpts, draft.WithTSAURL(cfg.TSAURL))
+		logger.Info("PAdES-T habilitado", "tsa_url", cfg.TSAURL)
 	}
 	draftUC := draft.NewUseCase(uow, draftRepo, draftOpts...)
 	draftTrigger := draft.NewTriggerUseCase(uow, draftRepo, events.NewOutbox())
@@ -367,6 +420,27 @@ func run(logger *slog.Logger) error {
 		WithGenerator(draftTrigger).
 		WithLister(draftUC).
 		WithExport(draftUC)
+	if storageClient != nil {
+		draftHandler = draftHandler.WithStorage(storageClient)
+	}
+
+	// Streaming da geração (Fatia 2 do streaming). Subscriber compartilha o
+	// mesmo Redis do resto da app; getSaga consulta o read model do próprio
+	// slice pra saber quando fechar a stream (DRAFTED/FAILED).
+	draftHandler = draftHandler.WithGenerationStream(
+		pubsub.NewRedisPubSub(pubsubClient),
+		func(ctx context.Context, tenantID, draftID string) (string, error) {
+			view, err := draftUC.GetDetail(ctx, tenantID, draftID)
+			if err != nil {
+				return "", err
+			}
+			return view.SagaState, nil
+		},
+	)
+	// Stream token store — usado pelo issuer (POST /stream-token) e pelo
+	// middleware específico da rota SSE (fluxo alternativo ao Bearer).
+	streamTokenStore := draft.NewRedisStreamTokenStore(pubsubClient)
+	draftHandler = draftHandler.WithStreamTokenStore(streamTokenStore)
 
 	// Chat use case (Fatia 3b): reuses taskGenerator + resumeEmbedder + advisory
 	// composer already instantiated above. nil generator / nil embedder → degraded
@@ -375,14 +449,21 @@ func run(logger *slog.Logger) error {
 	if resumeEmbedder != nil {
 		chatEmbedder = resumeEmbedder
 	}
+	// RAG cache: reduz p95 de teses/chat/review/iterate quando o mesmo query
+	// text é chamado várias vezes em janela de 5min (troca de tipo na Partida,
+	// teses→generate na mesma sessão). Nil-safe: se pubsubClient falha, o cache
+	// vira nil e as use cases seguem como antes (Voyage + pgvector direto).
+	ragCache := draft.NewRAGCache(pubsubClient, 5*time.Minute)
 	chatUC := draft.NewChatUseCase(draft.ChatUseCaseParams{
 		UoW:      uow,
 		Repo:     draftRepo,
 		Gen:      taskGenerator,
 		Emb:      chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
 		Composer: advisory.NewTemplateComposer(),
-		Model:    cfg.OpenRouterModel,
+		// FAST: chat é loop de pergunta/resposta — UX exige rapidez.
+		Model: cfg.OpenRouterModelFast,
 	})
 	draftHandler = draftHandler.WithChat(chatUC)
 
@@ -397,8 +478,10 @@ func run(logger *slog.Logger) error {
 		Gen:      taskGenerator,
 		Emb:      chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
 		Composer: advisory.NewTemplateComposer(),
-		Model:    cfg.OpenRouterModel,
+		// QUALITY: findings viram edits no texto — precisão importa.
+		Model: cfg.OpenRouterModelQuality,
 	})
 	draftHandler = draftHandler.WithReviewer(reviewUC)
 
@@ -411,45 +494,12 @@ func run(logger *slog.Logger) error {
 		Gen:      taskGenerator,
 		Emb:      chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
 		Composer: advisory.NewTemplateComposer(),
-		Model:    cfg.OpenRouterModel,
+		// FAST: teses re-disparam a cada troca de tipo no dropdown — velocidade > exaustividade.
+		Model: cfg.OpenRouterModelFast,
 	})
 	draftHandler = draftHandler.WithTheses(thesesUC)
-
-	// Certificate (Frente D — certificado digital A1): the secure vault + CRUD for
-	// a tenant's .pfx/.p12. The vault is selected LAZILY here (never a global
-	// `required`, so the other binaries boot unaffected): AWS_KMS_KEY_ID → KMS
-	// (prod); else CERT_KEK → local (dev); else the slice stays unmounted
-	// (certificateHandler nil → the router nil-guard skips it), exactly like S3.
-	// A misconfigured vault (bad KEK, missing KMS region) fails fast at boot.
-	var certificateHandler *certificate.Handler
-	switch cfg.CertificateVaultMode() {
-	case config.CertVaultKMS:
-		certVault, err := vault.NewKMSVault(vault.KMSOptions{
-			KeyID:     cfg.AWSKMSKeyID,
-			Region:    cfg.CertificateKMSRegion(),
-			AccessKey: cfg.S3AccessKey,
-			SecretKey: cfg.S3SecretKey,
-		})
-		if err != nil {
-			return fmt.Errorf("init certificate kms vault: %w", err)
-		}
-		logger.Info("certificate vault configured", "mode", config.CertVaultKMS)
-		certificateHandler = certificate.NewHandler(
-			certificate.NewUseCase(certificate.NewRepository(), certVault, events.NewOutbox(), uow),
-		)
-	case config.CertVaultLocal:
-		certVault, err := vault.NewLocalVault(cfg.CertKEK)
-		if err != nil {
-			return fmt.Errorf("init certificate local vault: %w", err)
-		}
-		logger.Info("certificate vault configured", "mode", config.CertVaultLocal)
-		certificateHandler = certificate.NewHandler(
-			certificate.NewUseCase(certificate.NewRepository(), certVault, events.NewOutbox(), uow),
-		)
-	default:
-		logger.Info("certificate slice disabled", "reason", "no CERT_KEK or AWS_KMS_KEY_ID")
-	}
 
 	// Vault is optional: only instantiated when VAULT_KEK_BASE64 is present. When
 	// absent the court-credential slice stays unmounted (S2) — same optional-adapter
@@ -466,6 +516,23 @@ func run(logger *slog.Logger) error {
 	} else {
 		logger.Warn("VAULT_KEK_BASE64 unset — court credential endpoints will be disabled")
 	}
+
+	// Iterate use case (Peça v2 — POST /v1/pecas/:id/iterate síncrono). Reusa
+	// o mesmo generator + embedder + composer das outras fatias de IA. nil
+	// generator → 422 em runtime; nunca falha de boot. Stateless (no writer —
+	// FE aplica cada change via PATCH /v1/pecas/:id).
+	iterateUC := draft.NewIterateUseCase(draft.IterateParams{
+		UoW:      uow,
+		Reader:   draftRepo,
+		Composer: advisory.NewTemplateComposer(),
+		Gen:      taskGenerator,
+		// QUALITY: cada iteração edita texto real que vai no PDF — erro custa caro.
+		Model:    cfg.OpenRouterModelQuality,
+		Embedder: chatEmbedder,
+		Search:   indexing.SearchDeps{Pool: pool},
+		RAGCache: ragCache,
+	})
+	draftHandler = draftHandler.WithIterator(iterateUC)
 
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
@@ -486,6 +553,7 @@ func run(logger *slog.Logger) error {
 		lookup:               lookupHandler,
 		certificate:          certificateHandler,
 		vault:                vlt,
+		streamTokenStore:     streamTokenStore,
 	})
 
 	// 6. Serve with graceful shutdown. Listen blocks until ShutdownWithContext
@@ -514,10 +582,84 @@ func run(logger *slog.Logger) error {
 			if err := telemetryShutdown(shutdownCtx); err != nil {
 				errs = append(errs, fmt.Errorf("shutdown telemetry: %w", err))
 			}
+			if certCipher != nil {
+				if err := certCipher.Close(); err != nil {
+					errs = append(errs, fmt.Errorf("close cert cipher: %w", err))
+				}
+			}
 			return errors.Join(errs...)
 		},
 	)
 
+	return nil
+}
+
+// certSignerFunc adapta a assinatura de certificate.UseCase.NewSigner ao port
+// draft.CertSigner. O UC devolve certificate.SignerInfo, que é convertido pro
+// draft.SignerInfo local — evita import cíclico (draft não conhece certificate).
+type certSignerFunc func(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, certificate.SignerInfo, error)
+
+func (f certSignerFunc) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, draft.SignerInfo, error) {
+	signer, leaf, chain, info, err := f(ctx, tenantID, id)
+	return signer, leaf, chain, draft.SignerInfo{OAB: info.OAB, SubjectCN: info.SubjectCN}, err
+}
+
+// secretVaultAdapter adapta certificate.Cipher (KMS envelope: Seal/Open/Close)
+// ao port draft.SecretVault. Os Envelopes têm campos idênticos; o adapter só
+// converte os tipos nomeados para evitar import cíclico.
+type secretVaultAdapter struct {
+	cipher certificate.Cipher
+}
+
+func (a secretVaultAdapter) Seal(ctx context.Context, plaintext []byte) (*draft.Envelope, error) {
+	env, err := a.cipher.Seal(ctx, plaintext)
+	if err != nil {
+		return nil, err
+	}
+	return &draft.Envelope{
+		Ciphertext: env.Ciphertext,
+		Nonce:      env.Nonce,
+		WrappedDEK: env.WrappedDEK,
+		KEKRef:     env.KEKRef,
+	}, nil
+}
+
+func (a secretVaultAdapter) Open(ctx context.Context, env *draft.Envelope) ([]byte, error) {
+	return a.cipher.Open(ctx, &certificate.Envelope{
+		Ciphertext: env.Ciphertext,
+		Nonce:      env.Nonce,
+		WrappedDEK: env.WrappedDEK,
+		KEKRef:     env.KEKRef,
+	})
+}
+
+func (a secretVaultAdapter) Close() error {
+	return a.cipher.Close()
+}
+
+// materializeGCPCredentials adapts PaaS-style env-only credentials into the
+// disk-file shape the GCP SDK expects. When GCP_KMS_CREDENTIALS_JSON is set
+// (base64 of the service-account JSON), decode it, write to /tmp/gcp-kms.json
+// and overwrite GOOGLE_APPLICATION_CREDENTIALS to point there. When it is
+// empty, do nothing — the caller relies on GOOGLE_APPLICATION_CREDENTIALS
+// already pointing to a mounted file (dev via Docker volume). This is the
+// standard "env-only" workaround for Railway/Fly/Render which do not allow
+// mounting arbitrary files.
+func materializeGCPCredentials(b64 string) error {
+	if b64 == "" {
+		return nil // caller relies on the mounted file path already in env
+	}
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return fmt.Errorf("decode GCP_KMS_CREDENTIALS_JSON base64: %w", err)
+	}
+	path := "/tmp/gcp-kms.json"
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write GCP creds to %s: %w", path, err)
+	}
+	if err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path); err != nil {
+		return fmt.Errorf("set GOOGLE_APPLICATION_CREDENTIALS: %w", err)
+	}
 	return nil
 }
 

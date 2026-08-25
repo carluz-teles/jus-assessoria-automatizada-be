@@ -51,3 +51,13 @@ export TF_VAR_s3_access_key="$S3_ACCESS_KEY"
 export TF_VAR_s3_secret_key="$S3_SECRET_KEY"
 export TF_VAR_voyage_api_key="${VOYAGE_API_KEY:-}"         # opcional: vazio = worker-documents sem indexação
 export TF_VAR_openrouter_api_key="${OPENROUTER_API_KEY:-}" # opcional: vazio = api sem sugestão por LLM
+
+# GCP Cloud KMS (envelope encryption dos certificados A1). Ambos opcionais: vazios =
+# slice `certificate` não sobe no api, restante segue. Em CI, GCP_KMS_CREDENTIALS_JSON
+# é o BASE64 do JSON da service account (guardado como secret do GH Actions).
+export TF_VAR_gcp_kms_key_name="${GCP_KMS_KEY_NAME:-}"
+export TF_VAR_gcp_kms_credentials_json="${GCP_KMS_CREDENTIALS_JSON:-}"
+
+# TSA (RFC 3161 — PAdES-T). Vazio = default do variables.tf (digicert público).
+# Sobrescrever só quando migrarmos pra TSA paga (LSITEC, digicert enterprise, etc).
+export TF_VAR_tsa_url="${TSA_URL:-}"

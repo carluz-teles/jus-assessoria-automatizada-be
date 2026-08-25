@@ -72,14 +72,16 @@ type AnaliseUseCase struct {
 	composer advisory.PromptComposer
 	gen      llm.Generator // optional: nil when the LLM is unconfigured (degraded mode)
 	store    analiseStore  // optional: nil skips persistence
+	model    string        // OpenRouter slug; "" cai no default do generator
 }
 
 // NewAnaliseUseCase wires the intimation analyzer. gen may be nil (no LLM configured) —
 // Analisar then persists+returns the degraded DTO (summary="", providencias=[]) instead of
 // failing, so the FE still transitions to the pós-análise state. store may be nil (no
 // persistence), in which case the analysis is computed but not written through.
-func NewAnaliseUseCase(reader analiseReader, composer advisory.PromptComposer, gen llm.Generator, store analiseStore) *AnaliseUseCase {
-	return &AnaliseUseCase{reader: reader, composer: composer, gen: gen, store: store}
+// model = "" mantém o modelo default do generator (cfg.OpenRouterModel legado).
+func NewAnaliseUseCase(reader analiseReader, composer advisory.PromptComposer, gen llm.Generator, store analiseStore, model string) *AnaliseUseCase {
+	return &AnaliseUseCase{reader: reader, composer: composer, gen: gen, store: store, model: model}
 }
 
 // intimationAnalysisSchema constrains the model's output to {summary, providencias:[{title,
@@ -173,6 +175,7 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctx
 		User:       composed.User,
 		Schema:     intimationAnalysisSchema,
 		SchemaName: "intimation_analysis",
+		Model:      uc.model, // "" = cai no default do generator
 		MaxTokens:  1500,
 	})
 	if err != nil {

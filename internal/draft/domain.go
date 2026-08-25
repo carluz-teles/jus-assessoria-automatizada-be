@@ -1,12 +1,25 @@
 package draft
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/x509"
 	"errors"
+	"fmt"
+	"log/slog"
+	"regexp"
+	"strings"
 	"time"
 
+	pdfreader "github.com/digitorus/pdf"
+	pdfsign "github.com/digitorus/pdfsign/sign"
+
+	"github.com/jusassessoria/platform/internal/draft/pdfgen"
+	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
+	"github.com/jusassessoria/platform/lib/storage"
 )
 
 // UseCase owns the domain logic for the peticionamento Fatia 1 write path.
@@ -18,11 +31,20 @@ import (
 // no worker drains the "default" queue — events would accumulate silently.
 // TODO(F2): emit draft.created once a listener is registered on the correct queue.
 type UseCase struct {
-	repo    database.UnitOfWork
-	rw      Repository
-	now     func() time.Time
-	outbox  OutboxPublisher
-	storage StoragePresigner
+	repo       database.UnitOfWork
+	rw         Repository
+	now        func() time.Time
+	outbox     OutboxPublisher
+	storage    StoragePresigner
+	pdfStorage PDFStorage
+	certSigner CertSigner
+	// secretVault é a porta KMS (envelope) que cifra/decifra a senha do e-SAJ.
+	// Reusa o MESMO envelope do certificate (structural typing — veja cmd/api).
+	// Exigido para o CRUD de credenciais eSAJ e o peticionamento automático.
+	secretVault SecretVault
+	// tsaURL: endpoint RFC 3161 pra carimbo de tempo (PAdES-T). Vazio =
+	// PAdES-BASIC (sem carimbo). Injetado por WithTSAURL. Ver docs/erd-pecas.md.
+	tsaURL string
 }
 
 // OutboxPublisher is the narrow port for event publishing within a tx.
@@ -33,6 +55,28 @@ type OutboxPublisher interface {
 // StoragePresigner is the narrow port for presigned URL generation.
 type StoragePresigner interface {
 	PresignedGet(ctx context.Context, key string, ttl time.Duration) (string, error)
+}
+
+// PDFStorage é a porta que o Sign usa pra subir o PDF assinado direto pelo
+// server (bypass presigned — o binário passa pelo api porque a assinatura
+// é montada aqui). Implementado por lib/storage.Client (PutBytes/GetBytes).
+type PDFStorage interface {
+	PutBytes(ctx context.Context, key, contentType string, data []byte) error
+	GetBytes(ctx context.Context, key string) ([]byte, error)
+}
+
+// CertSigner é a porta que o Sign usa pra pegar um crypto.Signer KMS-backed
+// pra um certificado do tenant. Implementado pelo internal/certificate.
+// A leaf + chain acompanham (pdfsign precisa delas pra montar o CMS PAdES).
+// SignerInfo carrega metadados (OAB, subject_cn) que não estão no x509 leaf
+// — usado pra montar bloco de assinatura no PDF sem query extra.
+type SignerInfo struct {
+	OAB       string
+	SubjectCN string
+}
+
+type CertSigner interface {
+	NewSigner(ctx context.Context, tenantID, certificateID string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, SignerInfo, error)
 }
 
 // NewUseCase wires the use case to its dependencies. uow owns the transaction
@@ -65,10 +109,40 @@ func WithStorage(s StoragePresigner) Option {
 	return func(uc *UseCase) { uc.storage = s }
 }
 
+// WithPDFStorage attaches the server-side blob storage (put/get). Required
+// for Sign (Fatia 2b): the signed PDF is uploaded here and its key persisted
+// on draft.signed_pdf_key. Without this option, Sign returns ErrPDFStorageUnavailable.
+func WithPDFStorage(s PDFStorage) Option {
+	return func(uc *UseCase) { uc.pdfStorage = s }
+}
+
+// WithCertSigner attaches the certificate signer port. Required for Sign
+// (Fatia 2b). Without this option, Sign returns ErrCertSignerUnavailable.
+func WithCertSigner(c CertSigner) Option {
+	return func(uc *UseCase) { uc.certSigner = c }
+}
+
+// WithSecretVault anexa a porta KMS (envelope) para cifrar/decifrar a senha do
+// e-SAJ. Exigido para o CRUD de credenciais (Fatia 1 — peticionamento automático).
+// Sem esta option, UploadEsajCredential retorna ErrSecretVaultUnavailable.
+func WithSecretVault(v SecretVault) Option {
+	return func(uc *UseCase) { uc.secretVault = v }
+}
+
+// WithTSAURL habilita PAdES-T (carimbo de tempo RFC 3161) na assinatura.
+// URL vazia = PAdES-BASIC (comportamento default). Provedores conhecidos:
+// http://freetsa.org/tsr (grátis, dev), http://timestamp.digicert.com (prod).
+// Sem esta option, assinatura sai sem carimbo — verificadores mostram "data
+// da assinatura: relógio do assinante" (não confiável).
+func WithTSAURL(url string) Option {
+	return func(uc *UseCase) { uc.tsaURL = url }
+}
+
 // CreateCommand is the input the handler builds from the request + the verified
-// principal. TenantID comes from the principal, never the body.
+// principal. TenantID e CreatedBy vêm do principal, nunca do body.
 type CreateCommand struct {
 	TenantID     string
+	CreatedBy    string // app_user.id do autor (do principal, nunca do body)
 	Source       string
 	IntimationID string
 	CaseID       string
@@ -97,6 +171,7 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
 		d := &Draft{
 			TenantID:  cmd.TenantID,
+			CreatedBy: cmd.CreatedBy,
 			PieceType: cmd.PieceType,
 			Title:     cmd.Title,
 		}
@@ -124,6 +199,14 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 			if d.PieceType == "" {
 				d.PieceType = PieceTypeOther
 			}
+		}
+
+		// Título default: se o caller não passou nada, monta "<Tipo> · <CNJ>"
+		// ou só "<Tipo>" quando o CNJ ainda não é conhecido. Evita cards com
+		// "—" na lista de peças e dá ao advogado um handle legível pra
+		// renomear depois. Nunca sobrescreve título vindo do body.
+		if d.Title == "" {
+			d.Title = defaultDraftTitle(d.PieceType, "")
 		}
 
 		created, err := uc.rw.InsertDraft(ctx, tx, d)
@@ -161,6 +244,11 @@ type PatchCommand struct {
 	DraftID  string
 	Content  string
 	Title    *string
+	// StructuredContent is Peça v2's block-structured version. Non-nil means
+	// dual-write: the plain-text `Content` is persisted alongside the JSONB
+	// StructuredContent (source of truth for the FE). Nil leaves the
+	// structured_content column untouched — the legacy PATCH path (pre-Fatia B).
+	StructuredContent *StructuredContent
 }
 
 // Patch implements PATCH /v1/pecas/:id (autosave). Runs in a single tenant-scoped tx:
@@ -171,7 +259,7 @@ func (uc *UseCase) Patch(ctx context.Context, cmd PatchCommand) (*PatchResult, e
 	var result *PatchResult
 
 	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		r, err := uc.rw.UpdateDraftContent(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.Content, cmd.Title)
+		r, err := uc.rw.UpdateDraftContent(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.Content, cmd.Title, cmd.StructuredContent)
 		if err != nil {
 			return err
 		}
@@ -210,6 +298,44 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 		}
 		v.Review = rev
 
+		// Providences: tasks linked to the intimation, shown on the FE sidebar
+		// (Peça v2). Empty for drafts without an intimation. Non-fatal on error
+		// (a task read failure shouldn't break the peça detail).
+		if v.Intimation != nil {
+			provs, e := uc.rw.GetProvidencesForIntimation(ctx, tx, tenantID, v.Intimation.ID)
+			if e == nil {
+				v.Providences = provs
+			}
+		}
+
+		// Parties: autor/réu/terceiros of the peça's case, shown on the FE
+		// sidebar (Peça v2 — bloco PARTES). Empty for drafts without a process
+		// (blank drafts). Non-fatal on error (same rationale as providences).
+		if v.Process != nil {
+			parties, e := uc.rw.GetPartiesForDraft(ctx, tx, tenantID, v.Process.CaseID)
+			if e == nil {
+				v.Parties = parties
+			}
+		}
+
+		// Peça v2 (migration 0056): lazy backfill of structured_content for
+		// drafts that were persisted before the Fatia B pipeline (or by a
+		// legacy PATCH path). When the column is NULL but there IS content,
+		// parse it here and write back best-effort — subsequent reads skip the
+		// parser. When both are empty the peça is truly empty (never
+		// generated) and we leave nil so the FE renders the empty state.
+		if v.StructuredContent == nil && v.Content != "" {
+			parsed := ParseStructured(v.Content)
+			if parsed != nil {
+				v.StructuredContent = parsed
+				// Fire-and-forget: WHERE structured_content IS NULL guards
+				// against a race with a concurrent writer. An infra error
+				// here does NOT fail the read — the FE already got the
+				// parsed shape in this response.
+				_ = uc.rw.WriteBackStructuredContent(ctx, tx, v.ID, tenantID, parsed)
+			}
+		}
+
 		view = v
 		return nil
 	})
@@ -217,6 +343,25 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 		return nil, err
 	}
 	return view, nil
+}
+
+// AssumeAuthorship flips draft.authorship to "human_taken" (Peça v2). The
+// advogado clicked "Assumir autoria"; from now on the FE hides the Iterar tab
+// and shows Revisão. Idempotent — a repeat call is a harmless UPDATE.
+func (uc *UseCase) AssumeAuthorship(ctx context.Context, tenantID, draftID string) (*Draft, error) {
+	var draft *Draft
+	err := uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		d, err := uc.rw.UpdateAuthorship(ctx, tx, draftID, tenantID, AuthorshipHumanTaken)
+		if err != nil {
+			return err
+		}
+		draft = d
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return draft, nil
 }
 
 // ── Attachment use cases (Fatia 2) ────────────────────────────────────────────
@@ -331,68 +476,169 @@ func (uc *UseCase) RemoveAttachment(ctx context.Context, cmd RemoveAttachmentCom
 
 // SignCommand is the input for POST /v1/pecas/:id/sign.
 type SignCommand struct {
-	TenantID string
-	DraftID  string
+	TenantID      string
+	DraftID       string
+	CertificateID string // Fatia 2b — cert usado pra assinar (obrigatório)
 }
 
 // SignResult carries the response for a successful sign.
 type SignResult struct {
-	ID        string
-	Status    string
-	SignedAt  time.Time
-	IsIdempot bool // true when the draft was already SIGNED (200, not fresh)
+	ID           string
+	Status       string
+	SignedAt     time.Time
+	SignedPDFKey string // storage key do PDF assinado (Fatia 2b)
+	IsIdempot    bool   // true when the draft was already SIGNED (200, not fresh)
 }
 
-// Sign implements POST /v1/pecas/:id/sign. In ONE tenant-scoped tx:
-//  1. GetDraftByID (tenant guard → 404 if not found).
-//  2. Guard: status must be DRAFT or REVIEWED → ErrInvalidStatusForSign.
-//  3. If already SIGNED → return current data (idempotent, no error).
-//  4. SignDraft → status=SIGNED, signed_at=now().
-//  5. outbox.Publish(draft.signed) — same tx.
-//  6. Return {id, status, signed_at}.
+// ErrPDFStorageUnavailable / ErrCertSignerUnavailable — Fatia 2b só sobe se
+// wire trouxe as duas deps. Sem elas o handler cai em 503.
+var (
+	ErrPDFStorageUnavailable = apperr.NewInfra("PDF storage não configurado", nil)
+	ErrCertSignerUnavailable = apperr.NewInfra("cert signer não configurado", nil)
+)
+
+// Sign implements POST /v1/pecas/:id/sign (Fatia 2b — assinatura real). Fluxo:
+//  1. Tenta idempotência (draft já SIGNED → 200 com dados atuais);
+//  2. Guarda status ∈ {DRAFT, REVIEWED};
+//  3. Renderiza PDF via pdfgen a partir do structured_content;
+//  4. Cria crypto.Signer KMS-backed via certSigner.NewSigner(cert_id);
+//  5. Aplica PAdES via digitorus/pdfsign (signer + leaf + chain no SignData);
+//  6. Upload do PDF assinado no storage em {tenant}/pecas/{draft_id}/signed.pdf;
+//  7. UPDATE draft: status=SIGNED, signed_at=now(), signed_pdf_key=<key>.
+//  8. Emite draft.signed no outbox.
+//
+// Roda tudo na mesma tx da tabela draft — se o KMS ou o upload falhar, nada é
+// persistido. O único efeito colateral externo é o PutBytes no storage antes do
+// commit da tx; num rollback, o blob fica órfão (aceitável — GC eventual).
 func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, error) {
+	if uc.pdfStorage == nil {
+		return nil, ErrPDFStorageUnavailable
+	}
+	if uc.certSigner == nil {
+		return nil, ErrCertSignerUnavailable
+	}
+	if cmd.CertificateID == "" {
+		return nil, apperr.NewInvalid("certificate_id é obrigatório")
+	}
+
+	// 1) Fetch draft + structured_content via read model (evita novo query).
+	var view *DraftDetailView
+	if err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		v, e := uc.rw.GetDraftDetail(ctx, tx, cmd.TenantID, cmd.DraftID)
+		if e != nil {
+			return e
+		}
+		view = v
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	// Idempotente: só devolve early quando o par (Status=SIGNED, SignedAt!=nil)
+	// está coerente. Se o status é SIGNED mas SignedAt está NULL, temos um
+	// estado inconsistente (crash entre o UPDATE do status e o UPDATE do
+	// signed_at, ou reset SQL parcial no dev) — cair na re-assinatura corrige
+	// sozinho em vez de devolver timestamp zero pro FE, que confundia o
+	// deriveStep (mostrava peça como assinada sem data válida).
+	if view.Status == StatusSigned && view.SignedAt != nil {
+		return &SignResult{
+			ID:        view.ID,
+			Status:    view.Status,
+			SignedAt:  *view.SignedAt,
+			IsIdempot: true,
+		}, nil
+	}
+	// Status inválido pra assinar. StatusSigned sem SignedAt cai aqui e é
+	// tratado como recuperável (o Sign completo grava o par coerente).
+	if view.Status != StatusDraft && view.Status != StatusReviewed && view.Status != StatusSigned {
+		return nil, ErrInvalidStatusForSign
+	}
+	// Aceita content_html (Fase B: editor rico) OU structured_content (legacy).
+	// content_html tem prioridade quando disponível — foi editado pelo humano.
+	hasHTML := view.ContentHtml != nil && *view.ContentHtml != ""
+	if !hasHTML && view.StructuredContent == nil {
+		return nil, apperr.NewInvalid("peça sem conteúdo — não é possível gerar PDF")
+	}
+
+	cnj := ""
+	if view.Process != nil {
+		cnj = view.Process.CNJNumber
+	}
+	signedAt := uc.now()
+
+	// 3) crypto.Signer KMS-backed (antes do render pra saber Signer.Name+OAB).
+	signer, leaf, intermediates, signerInfo, err := uc.certSigner.NewSigner(ctx, cmd.TenantID, cmd.CertificateID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4) Render PDF — HTML path (Fase C) quando content_html presente,
+	// legacy maroto path quando só structured_content existe.
+	var pdfBytes []byte
+	if hasHTML {
+		place := ""
+		if view.Process != nil {
+			place = parseCityFromJudgingBody(view.Process.JudgingBody)
+		}
+		pdfBytes, err = pdfgen.RenderHTML(ctx, pdfgen.RenderHTMLInput{
+			HTML: *view.ContentHtml,
+			Signer: pdfgen.Signer{
+				Name:  signerInfo.SubjectCN,
+				OAB:   signerInfo.OAB,
+				Place: place,
+			},
+			SignedAt: signedAt,
+		})
+		if err != nil {
+			return nil, apperr.NewInfra("render pdf (html)", err)
+		}
+	} else {
+		pdfBytes, err = pdfgen.Render(pdfgen.Draft{
+			Title:    view.Title,
+			CNJ:      cnj,
+			Preamble: fillPlaceholders(view.StructuredContent.Preamble.Paragraphs, signedAt),
+			Sections: sectionsToPDF(view.StructuredContent.Sections, signedAt),
+			Signer: pdfgen.Signer{
+				Name: signerInfo.SubjectCN,
+				OAB:  signerInfo.OAB,
+			},
+		})
+		if err != nil {
+			return nil, apperr.NewInfra("render pdf (structured)", err)
+		}
+	}
+
+	// 4) PAdES via digitorus/pdfsign (+TSA se tsaURL configurada = PAdES-T).
+	signedPDF, err := signPDFPAdES(ctx, pdfBytes, signer, leaf, intermediates, uc.tsaURL)
+	if err != nil {
+		return nil, apperr.NewInfra("sign pdf", err)
+	}
+
+	// 5) Upload no storage (server-side put — o binário passa por aqui).
+	key := storage.NewKey(cmd.TenantID, fmt.Sprintf("pecas/%s", cmd.DraftID))
+	if err := uc.pdfStorage.PutBytes(ctx, key, "application/pdf", signedPDF); err != nil {
+		return nil, err
+	}
+
+	// 6) UPDATE draft + outbox na mesma tx (as duas coisas são atômicas —
+	// o blob no storage pode ficar órfão em rollback, aceitável).
 	var result *SignResult
-
-	err := uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		d, err := uc.rw.GetDraftByID(ctx, tx, cmd.TenantID, cmd.DraftID)
-		if err != nil {
-			return err
+	err = uc.repo.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
+		signed, e := uc.rw.SignDraftWithPDF(ctx, tx, cmd.DraftID, cmd.TenantID, key)
+		if e != nil {
+			return e
 		}
-
-		// Idempotent: already signed → return current data.
-		if d.Status == StatusSigned {
-			result = &SignResult{
-				ID:        d.ID,
-				Status:    d.Status,
-				SignedAt:  d.UpdatedAt, // best approximation without signed_at on entity
-				IsIdempot: true,
-			}
-			return nil
-		}
-
-		// Guard: must be DRAFT or REVIEWED.
-		if d.Status != StatusDraft && d.Status != StatusReviewed {
-			return ErrInvalidStatusForSign
-		}
-
-		signed, err := uc.rw.SignDraft(ctx, tx, cmd.DraftID, cmd.TenantID)
-		if err != nil {
-			return err
-		}
-
-		// Emit draft.signed event (outbox).
 		if uc.outbox != nil {
 			ev := newDraftSigned(signed)
-			if err := uc.outbox.Publish(ctx, tx, ev); err != nil {
-				return err
+			if e := uc.outbox.Publish(ctx, tx, ev); e != nil {
+				return e
 			}
 		}
-
 		result = &SignResult{
-			ID:        signed.ID,
-			Status:    signed.Status,
-			SignedAt:  signed.UpdatedAt, // mapper sets updated_at = now() on sign
-			IsIdempot: false,
+			ID:           signed.ID,
+			Status:       signed.Status,
+			SignedAt:     signed.UpdatedAt,
+			SignedPDFKey: key,
+			IsIdempot:    false,
 		}
 		return nil
 	})
@@ -402,6 +648,282 @@ func (uc *UseCase) Sign(ctx context.Context, cmd SignCommand) (*SignResult, erro
 	return result, nil
 }
 
+// sectionsToPDF converte []StructuredSection (do read model) em []pdfgen.Section
+// e substitui placeholders textuais (ex.: [data]) pela data da assinatura.
+// A última seção passa por stripSignatureBlock — remove bloco de assinatura
+// deixado pela IA (defensivo; o bloco real vem via pdfgen.Signer do cert).
+func sectionsToPDF(in []StructuredSection, signedAt time.Time) []pdfgen.Section {
+	out := make([]pdfgen.Section, 0, len(in))
+	for i, s := range in {
+		paragraphs := s.Paragraphs
+		if i == len(in)-1 {
+			paragraphs = stripSignatureBlock(paragraphs)
+		}
+		out = append(out, pdfgen.Section{
+			Roman:      s.Roman,
+			Title:      s.Title,
+			Paragraphs: fillPlaceholders(paragraphs, signedAt),
+		})
+	}
+	return out
+}
+
+// signPDFPAdES aplica PAdES ao PDF. Se tsaURL for vazia, gera PAdES-BASIC
+// (só a assinatura CMS embedded); se preenchida, chama a TSA RFC 3161 e embute
+// o TimeStampToken → PAdES-T. Detalhes:
+//   - DigestAlgorithm = SHA-256 (padrão ICP-Brasil AD-RB/AD-RT);
+//   - CertType = ApprovalSignature (não é certificação — permite assinaturas
+//     adicionais e edição limitada);
+//   - TSA sem auth (Username/Password vazios): serve pra freetsa.org / digicert.
+//     Provedor com Basic Auth exigiria expor TSA_USER/TSA_PASS.
+//
+// Retry: só se a TSA estiver configurada. TSAs públicas gratuitas (digicert)
+// aplicam rate limit; a digitorus/pdfsign propaga a resposta HTTP como
+// "non success response (429): ...". Detectamos 429/502/503/504 + timeout
+// como transitório e retentamos com backoff exponencial. Erros não-transitórios
+// (chave inválida, cert expirado, PDF malformado) falham imediatamente.
+// Cada tentativa loga estruturado — grep tsa_url + attempt no NR pra decidir
+// migrar pra TSA paga (LSITEC, digicert enterprise, etc.).
+// signatureBlockRe reconhece parágrafos que parecem bloco de assinatura
+// deixado pela IA no fim da peça (mesmo com o prompt v6 dizendo pra não
+// gerar). Padrão típico: "NOME EM CAIXA\nOAB/UF nº 123456" — captura via
+// menção de "OAB" seguido de UF e número. Case-insensitive.
+var signatureBlockRe = regexp.MustCompile(`(?i)OAB\s*/?\s*[A-Z]{2}[^\n]{0,20}\d{3,}`)
+
+// stripSignatureBlock remove os últimos parágrafos que pareçam bloco de
+// assinatura (nome + OAB) — a assinatura visual real é injetada no PDF via
+// pdfgen.Signer com dados do CERTIFICADO usado. Preserva "Nestes termos,
+// pede deferimento" e "Local, [data]" (que ficam antes do bloco).
+func stripSignatureBlock(paragraphs []string) []string {
+	// itera do fim pra o começo e corta enquanto encontrar bloco de assinatura.
+	end := len(paragraphs)
+	for end > 0 && signatureBlockRe.MatchString(paragraphs[end-1]) {
+		end--
+	}
+	return paragraphs[:end]
+}
+
+// placeholderMonthsPT são os meses em português — RFC de peças jurídicas usa
+// "dia de mês por extenso de ano". time.Format não tem locale, então usamos
+// tabela fixa (não vamos internacionalizar isso tão cedo).
+var placeholderMonthsPT = [...]string{
+	"janeiro", "fevereiro", "março", "abril", "maio", "junho",
+	"julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+}
+
+// placeholderDateRe captura [data] com espaços opcionais dentro dos colchetes.
+// A IA às vezes gera "[ data ]" ou "[DATA]" — pega tudo. Case-insensitive.
+var placeholderDateRe = regexp.MustCompile(`(?i)\[\s*data\s*\]`)
+
+// judgingBodyComarcaRe extrai a cidade do órgão julgador — o campo vem no
+// formato "Juízo Titular I - Vara do Juizado Especial Cível da Comarca de
+// Franca" e queremos só "Franca". A regex casa qualquer variação de "Comarca
+// de X" / "Comarca do X" / "Foro de X"; a cidade é o restante do texto.
+// Case-insensitive; usa (?s) pra deixar . casar quebras (defensivo).
+var judgingBodyComarcaRe = regexp.MustCompile(
+	`(?i)(?:comarca|foro|subseção judiciária|seção judiciária)\s+d[aeo]\s+(.+?)\s*$`,
+)
+
+// parseCityFromJudgingBody extrai a cidade do foro do texto do órgão julgador.
+// Usado pra popular pdfgen.Signer.Place ("[Cidade], [data]." no rodapé fixo
+// do PDF). Retorna "" quando não consegue parsear — o renderer degrada pra
+// apenas a data (sem cidade), o que ainda é válido processualmente.
+//
+// Formatos suportados (case-insensitive):
+//
+//   - "... Comarca de Franca"                → "Franca"
+//   - "... Comarca do Rio de Janeiro"        → "Rio de Janeiro"
+//   - "... Foro de São Paulo"                → "São Paulo"
+//   - "... Subseção Judiciária de Campinas"  → "Campinas"
+func parseCityFromJudgingBody(jb string) string {
+	jb = strings.TrimSpace(jb)
+	if jb == "" {
+		return ""
+	}
+	m := judgingBodyComarcaRe.FindStringSubmatch(jb)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// fillPlaceholders substitui os placeholders textuais que a IA deixa na minuta
+// pelos valores conhecidos no momento da assinatura. Hoje só [data] (data de
+// assinatura em pt-BR); ampliar quando aparecer novo placeholder (ex.: [local]).
+func fillPlaceholders(paragraphs []string, signedAt time.Time) []string {
+	dateStr := fmt.Sprintf("%d de %s de %d",
+		signedAt.Day(), placeholderMonthsPT[signedAt.Month()-1], signedAt.Year())
+	out := make([]string, len(paragraphs))
+	for i, p := range paragraphs {
+		out[i] = placeholderDateRe.ReplaceAllString(p, dateStr)
+	}
+	return out
+}
+
+// signAttemptTimeout limita cada tentativa de assinatura. Cobre PDF render,
+// KMS Sign remoto e TSA round-trip. 15s é folgado pro caminho feliz (~500ms
+// digicert, ~1s freetsa) e curto o bastante pra falhar rápido se a TSA travar
+// (a digitorus/pdfsign usa http.Client sem timeout — a única forma de garantir
+// wallclock bound é wrapar em goroutine + select).
+const signAttemptTimeout = 15 * time.Second
+
+func signPDFPAdES(ctx context.Context, pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
+	if tsaURL == "" {
+		return signOnceBounded(ctx, pdfBytes, signer, cert, intermediates, "")
+	}
+	const maxAttempts = 3
+	backoff := []time.Duration{0, 500 * time.Millisecond, 2 * time.Second}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff[attempt-1]):
+			}
+		}
+		signed, err := signOnceBounded(ctx, pdfBytes, signer, cert, intermediates, tsaURL)
+		if err == nil {
+			if attempt > 1 {
+				slog.WarnContext(ctx, "TSA recuperada após retry",
+					slog.String("tsa_url", tsaURL),
+					slog.Int("attempt", attempt))
+			}
+			return signed, nil
+		}
+		lastErr = err
+		if !isTSATransient(err) {
+			return nil, err
+		}
+		slog.WarnContext(ctx, "TSA erro transitório — retentando",
+			slog.String("tsa_url", tsaURL),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", maxAttempts),
+			slog.String("err", err.Error()))
+	}
+	slog.ErrorContext(ctx, "TSA falhou após retries — considere provedor pago (rate limit persistente = migrar)",
+		slog.String("tsa_url", tsaURL),
+		slog.Int("attempts", maxAttempts),
+		slog.String("err", lastErr.Error()))
+	return nil, fmt.Errorf("TSA %s falhou após %d tentativas: %w", tsaURL, maxAttempts, lastErr)
+}
+
+// signOnceBounded envolve signOnce em wallclock timeout. A goroutine "leaked"
+// no timeout é bounded (max 1 por request) e limpa sozinha quando o TCP da TSA
+// finalmente falha (OS timeout ~2-3min); seu output vai pro GC (bytes.Buffer
+// local). Sem side effect no storage (upload é feito só depois de sign OK).
+func signOnceBounded(ctx context.Context, pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
+	type result struct {
+		pdf []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		pdf, err := signOnce(pdfBytes, signer, cert, intermediates, tsaURL)
+		ch <- result{pdf, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.pdf, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(signAttemptTimeout):
+		return nil, fmt.Errorf("sign timeout após %v (tsa_url=%q)", signAttemptTimeout, tsaURL)
+	}
+}
+
+func signOnce(pdfBytes []byte, signer crypto.Signer, cert *x509.Certificate, intermediates []*x509.Certificate, tsaURL string) ([]byte, error) {
+	reader := bytes.NewReader(pdfBytes)
+	pdfDoc, err := pdfreader.NewReader(reader, int64(len(pdfBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("pdf reader: %w", err)
+	}
+	if _, err := reader.Seek(0, 0); err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	chain := append([]*x509.Certificate{cert}, intermediates...)
+	signData := pdfsign.SignData{
+		Signer:            signer,
+		DigestAlgorithm:   crypto.SHA256,
+		Certificate:       cert,
+		CertificateChains: [][]*x509.Certificate{chain},
+		Signature: pdfsign.SignDataSignature{
+			CertType:   pdfsign.ApprovalSignature,
+			DocMDPPerm: pdfsign.AllowFillingExistingFormFieldsAndSignaturesPerms,
+			Info: pdfsign.SignDataSignatureInfo{
+				Name:   cert.Subject.CommonName,
+				Reason: "Assinatura da peça",
+				Date:   time.Now(),
+			},
+		},
+	}
+	if tsaURL != "" {
+		signData.TSA = pdfsign.TSA{URL: tsaURL}
+	}
+	if err := pdfsign.Sign(reader, &out, pdfDoc, int64(len(pdfBytes)), signData); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// isTSATransient classifica erros vindos do GetTSA da digitorus/pdfsign como
+// transitórios. Base: pdfsignature.go:415-421 formata como
+// `non success response (<code>): <body>` e propaga erros de rede como-são.
+func isTSATransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	transientMarkers := []string{
+		"non success response (429",
+		"non success response (502",
+		"non success response (503",
+		"non success response (504",
+		"context deadline exceeded",
+		"i/o timeout",
+		"connection reset",
+		"connection refused",
+		"no such host",
+		"EOF",
+		"sign timeout após",
+	}
+	for _, m := range transientMarkers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// SaveContentHtml (Fase B do editor rico) persiste o HTML do Tiptap na coluna
+// draft.content_html. Após o primeiro save, content_html vira source-of-truth
+// pro renderer PDF (Fase C, via chromedp); structured_content fica congelado.
+// tenantID vem do principal, nunca do body. Chamado pelo autosave do FE.
+func (uc *UseCase) SaveContentHtml(ctx context.Context, tenantID, draftID, html string) error {
+	return uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.rw.UpdateDraftContentHtml(ctx, tx, draftID, tenantID, html)
+	})
+}
+
+// SendToSigning marca sent_to_signing_at=now() no draft. Sinaliza que o
+// usuário terminou a Construção e passou pra tela de Assinatura. Idempotente.
+// tenantID vem do principal, nunca do body.
+func (uc *UseCase) SendToSigning(ctx context.Context, tenantID, draftID string) error {
+	return uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.rw.MarkSentToSigning(ctx, tx, draftID, tenantID)
+	})
+}
+
+// RevertToConstruction nulla sent_to_signing_at (usuário voltou pra Construção).
+// Só permite quando a peça ainda NÃO foi assinada (a query trata a guarda).
+// Se já assinada, devolve ErrDraftNotFound — a UI trata como "não é possível".
+func (uc *UseCase) RevertToConstruction(ctx context.Context, tenantID, draftID string) error {
+	return uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.rw.RevertToConstruction(ctx, tx, draftID, tenantID)
+	})
+}
+
 // FileCommand is the input for POST /v1/pecas/:id/file.
 type FileCommand struct {
 	TenantID      string
@@ -409,6 +931,7 @@ type FileCommand struct {
 	Receipt       map[string]any
 	CourtRecordID string // optional override
 	FiledAt       *time.Time
+	FilingNumber  string // opcional — número/protocolo do tribunal (Fatia 2a v0)
 }
 
 // FileResult carries the response for a successful file.
@@ -447,6 +970,19 @@ func (uc *UseCase) File(ctx context.Context, cmd FileCommand) (*FileResult, erro
 			return err
 		}
 		if existing != nil {
+			// Idempotente: petition já existe. Mas se o advogado esqueceu de
+			// digitar o número na 1ª vez (ou digitou errado) e agora está
+			// mandando um valor, precisamos permitir a correção. Regra
+			// conservadora: só atualiza quando (a) chegou um valor NÃO-vazio E
+			// (b) o draft ainda não tem número persistido. Nunca sobrescreve
+			// um número já gravado — pra não zerar por engano com "".
+			// UpdateFilingNumber :exec — no-op silencioso quando já tem valor
+			// (guard SQL `filing_number IS NULL`), então extra defesa.
+			if cmd.FilingNumber != "" && d.FilingNumber == "" {
+				if err := uc.rw.UpdateFilingNumber(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.FilingNumber); err != nil {
+					return err
+				}
+			}
 			result = &FileResult{
 				PetitionID:   existing.ID,
 				DraftID:      existing.DraftID,
@@ -486,7 +1022,13 @@ func (uc *UseCase) File(ctx context.Context, cmd FileCommand) (*FileResult, erro
 		}
 
 		// Flip saga_state to FILED.
-		if _, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateFiled, false, ""); err != nil {
+		if _, err := uc.rw.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateFiled, false, "", nil); err != nil {
+			return err
+		}
+
+		// Persiste filed_at + filing_number no draft (0060). Espelho conveniente
+		// pra a UI derivar o step sem precisar fazer JOIN com petition.
+		if err := uc.rw.MarkFiled(ctx, tx, cmd.DraftID, cmd.TenantID, cmd.FilingNumber); err != nil {
 			return err
 		}
 
@@ -613,12 +1155,14 @@ type ListByProcessQuery struct {
 
 // ListAllQuery is the input for GET /v1/pecas (tenant library).
 type ListAllQuery struct {
-	TenantID    string
-	PieceType   string // optional filter
-	Status      string // optional filter
-	LastCreated string
-	LastID      string
-	Limit       int
+	TenantID      string
+	PieceType     string // optional filter
+	Status        string // optional filter
+	WorkflowState string // "aguardando_assinatura" | "aguardando_protocolo" | ""
+	Urgencia      string // "atraso" | "hoje" | "" (contra deadline.end_date da intimation)
+	LastCreated   string
+	LastID        string
+	Limit         int
 }
 
 // ListByProcess implements GET /v1/processos/:id/pecas. Runs in a read-only tx.
@@ -646,7 +1190,7 @@ func (uc *UseCase) ListByProcess(ctx context.Context, q ListByProcessQuery) (Dra
 func (uc *UseCase) ListAll(ctx context.Context, q ListAllQuery) (DraftListResult, error) {
 	var result DraftListResult
 	err := uc.repo.Do(ctx, q.TenantID, func(tx database.Tx) error {
-		rows, err := uc.rw.ListDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.LastCreated, q.LastID, q.Limit+1)
+		rows, err := uc.rw.ListDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.WorkflowState, q.Urgencia, q.LastCreated, q.LastID, q.Limit+1)
 		if err != nil {
 			return err
 		}

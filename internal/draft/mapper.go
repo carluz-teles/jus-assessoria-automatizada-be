@@ -2,16 +2,34 @@ package draft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jusassessoria/platform/internal/draft/draftdb"
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
 )
+
+// isNoRows reports whether err is pgx.ErrNoRows (the repo's not-found sentinel).
+func isNoRows(err error) bool {
+	return errors.Is(err, pgx.ErrNoRows)
+}
+
+// isUniqueViolation reports whether err is a Postgres 23505 (unique/partial
+// unique violation) — used to map to a typed conflict AppError.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
 
 // mapper.go is the boundary where driver types die (docs §4b.3): uuid.UUID,
 // pgtype.* are absorbed here so the entity, use case and read models stay pure Go.
@@ -74,6 +92,18 @@ func timestamptzToTime(ts pgtype.Timestamptz) time.Time {
 	return ts.Time
 }
 
+// pgTimestamptzPtr converts a pgtype.Timestamptz to *time.Time — nil on NULL,
+// *time.Time on non-NULL. Used pra timestamps opcionais (workflow steps 0060:
+// sent_to_signing_at, signed_at, filed_at) — a UI distingue "não aconteceu" (nil)
+// de "aconteceu em X" (non-nil).
+func pgTimestamptzPtr(ts pgtype.Timestamptz) *time.Time {
+	if !ts.Valid {
+		return nil
+	}
+	t := ts.Time.UTC()
+	return &t
+}
+
 // pgDateToTime converts a pgtype.Date to time.Time, zero on NULL.
 func pgDateToTime(d pgtype.Date) time.Time {
 	if !d.Valid {
@@ -112,38 +142,87 @@ func nonNilStrings(s []string) []string {
 // draftFromInsertRow maps the InsertDraft RETURNING row to a *Draft entity.
 func draftFromInsertRow(r draftdb.InsertDraftRow) *Draft {
 	return &Draft{
-		ID:           r.ID.String(),
-		TenantID:     r.TenantID.String(),
-		CaseID:       pgUUIDToString(r.CaseID),
-		IntimationID: pgUUIDToString(r.IntimationID),
-		PieceType:    r.PieceType,
-		Title:        r.Title,
-		Content:      derefString(r.Content),
-		Status:       r.Status,
-		SagaState:    r.SagaState,
-		CreatedAt:    timestamptzToTime(r.CreatedAt),
-		UpdatedAt:    timestamptzToTime(r.UpdatedAt),
+		ID:                r.ID.String(),
+		TenantID:          r.TenantID.String(),
+		CaseID:            pgUUIDToString(r.CaseID),
+		IntimationID:      pgUUIDToString(r.IntimationID),
+		PieceType:         r.PieceType,
+		Title:             r.Title,
+		Content:           derefString(r.Content),
+		Status:            r.Status,
+		SagaState:         r.SagaState,
+		CreatedAt:         timestamptzToTime(r.CreatedAt),
+		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
+		StructuredContent: structuredContentFromJSON(r.StructuredContent),
+		Authorship:        r.Authorship,
 	}
 }
 
 // draftFromGetByIDRow maps the GetDraftByID row to a *Draft entity.
 func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
 	return &Draft{
-		ID:             r.ID.String(),
-		TenantID:       r.TenantID.String(),
-		CaseID:         pgUUIDToString(r.CaseID),
-		IntimationID:   pgUUIDToString(r.IntimationID),
-		PieceType:      r.PieceType,
-		Title:          r.Title,
-		Content:        derefString(r.Content),
-		Status:         r.Status,
-		SagaState:      r.SagaState,
-		CreatedAt:      timestamptzToTime(r.CreatedAt),
-		UpdatedAt:      timestamptzToTime(r.UpdatedAt),
-		Tone:           r.Tone,
-		Instructions:   derefString(r.Instructions),
-		SelectedTheses: derefStringSlice(r.SelectedTheses),
+		ID:                r.ID.String(),
+		TenantID:          r.TenantID.String(),
+		CaseID:            pgUUIDToString(r.CaseID),
+		IntimationID:      pgUUIDToString(r.IntimationID),
+		PieceType:         r.PieceType,
+		Title:             r.Title,
+		Content:           derefString(r.Content),
+		Status:            r.Status,
+		SagaState:         r.SagaState,
+		CreatedAt:         timestamptzToTime(r.CreatedAt),
+		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
+		Tone:              r.Tone,
+		Instructions:      derefString(r.Instructions),
+		SelectedTheses:    derefStringSlice(r.SelectedTheses),
+		StructuredContent: structuredContentFromJSON(r.StructuredContent),
+		Authorship:        r.Authorship,
+		FilingNumber:      derefString(r.FilingNumber),
 	}
+}
+
+// structuredContentFromJSON decodes the draft.structured_content jsonb column
+// into a *StructuredContent. Returns nil when the column is NULL/empty (drafts
+// pre-migration 0056 or that haven't been generated yet); the read model falls
+// back to the plain-text parser on the fly. A decode fault also returns nil
+// (best-effort — a corrupt row should not crash the read model).
+func structuredContentFromJSON(raw []byte) *StructuredContent {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out StructuredContent
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	// Normalize nil slices to empty so JSON output stays [] (not null) — the FE
+	// depends on the shape.
+	if out.Sections == nil {
+		out.Sections = []StructuredSection{}
+	}
+	if out.Preamble.Paragraphs == nil {
+		out.Preamble.Paragraphs = []string{}
+	}
+	for i := range out.Sections {
+		if out.Sections[i].Paragraphs == nil {
+			out.Sections[i].Paragraphs = []string{}
+		}
+	}
+	return &out
+}
+
+// structuredContentToJSON marshals a *StructuredContent to jsonb bytes for
+// persistence. Returns nil for a nil pointer (writing SQL NULL). An encoding
+// error is a programmer fault — logged & swallowed to nil to keep the caller
+// path resilient (a caller with a bad struct shouldn't crash the whole write).
+func structuredContentToJSON(sc *StructuredContent) []byte {
+	if sc == nil {
+		return nil
+	}
+	b, err := json.Marshal(sc)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // derefStringSlice normalizes a possibly-nil string slice to a non-nil empty
@@ -209,17 +288,38 @@ func derefInt64(v *int64) int64 {
 // draftFromGetByIntimationRow maps the GetDraftByIntimationID row to a *Draft entity.
 func draftFromGetByIntimationRow(r draftdb.GetDraftByIntimationIDRow) *Draft {
 	return &Draft{
-		ID:           r.ID.String(),
-		TenantID:     r.TenantID.String(),
-		CaseID:       pgUUIDToString(r.CaseID),
-		IntimationID: pgUUIDToString(r.IntimationID),
-		PieceType:    r.PieceType,
-		Title:        r.Title,
-		Content:      derefString(r.Content),
-		Status:       r.Status,
-		SagaState:    r.SagaState,
-		CreatedAt:    timestamptzToTime(r.CreatedAt),
-		UpdatedAt:    timestamptzToTime(r.UpdatedAt),
+		ID:                r.ID.String(),
+		TenantID:          r.TenantID.String(),
+		CaseID:            pgUUIDToString(r.CaseID),
+		IntimationID:      pgUUIDToString(r.IntimationID),
+		PieceType:         r.PieceType,
+		Title:             r.Title,
+		Content:           derefString(r.Content),
+		Status:            r.Status,
+		SagaState:         r.SagaState,
+		CreatedAt:         timestamptzToTime(r.CreatedAt),
+		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
+		StructuredContent: structuredContentFromJSON(r.StructuredContent),
+		Authorship:        r.Authorship,
+	}
+}
+
+// draftFromAuthorshipRow maps the UpdateDraftAuthorship RETURNING row to a *Draft.
+func draftFromAuthorshipRow(r draftdb.UpdateDraftAuthorshipRow) *Draft {
+	return &Draft{
+		ID:                r.ID.String(),
+		TenantID:          r.TenantID.String(),
+		CaseID:            pgUUIDToString(r.CaseID),
+		IntimationID:      pgUUIDToString(r.IntimationID),
+		PieceType:         r.PieceType,
+		Title:             r.Title,
+		Content:           derefString(r.Content),
+		Status:            r.Status,
+		SagaState:         r.SagaState,
+		CreatedAt:         timestamptzToTime(r.CreatedAt),
+		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
+		StructuredContent: structuredContentFromJSON(r.StructuredContent),
+		Authorship:        r.Authorship,
 	}
 }
 
@@ -377,28 +477,42 @@ type counselInfoRaw struct {
 func partiesFromRows(rows []draftdb.GetPartiesForDraftRow) []PartyInfo {
 	out := make([]PartyInfo, 0, len(rows))
 	for _, r := range rows {
-		counsel := firstCounselLabel(r.Counsels)
+		counsels := decodeCounsels(r.Counsels)
 		out = append(out, PartyInfo{
-			Role:    r.Role,
-			Name:    r.Name,
-			Counsel: counsel,
+			Role:     r.Role,
+			Name:     r.Name,
+			Counsel:  firstCounselLabelFrom(counsels),
+			Counsels: counsels,
 		})
 	}
 	return out
 }
 
-// firstCounselLabel returns a short label for the first (alphabetically) advogado
-// aggregated under a party, formatted as "Name (OAB/UF nº oab)". Returns "" when
-// the counsels array is empty or cannot be decoded.
-func firstCounselLabel(counselsText string) string {
+// decodeCounsels parses the jsonb_agg-as-text produced by GetPartiesForDraft.
+// A decode failure returns an empty slice (best-effort — a corrupt row should
+// not crash the peça pipeline). Never returns nil.
+func decodeCounsels(counselsText string) []PartyCounselInfo {
 	if counselsText == "" || counselsText == "[]" {
-		return ""
+		return []PartyCounselInfo{}
 	}
 	var recs []counselInfoRaw
-	if err := json.Unmarshal([]byte(counselsText), &recs); err != nil || len(recs) == 0 {
+	if err := json.Unmarshal([]byte(counselsText), &recs); err != nil {
+		return []PartyCounselInfo{}
+	}
+	out := make([]PartyCounselInfo, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, PartyCounselInfo{Name: r.Name, OAB: r.OAB, UF: r.UF})
+	}
+	return out
+}
+
+// firstCounselLabelFrom formats the first counsel as "Name (OAB/UF nº oab)".
+// Returns "" when the slice is empty or the first entry has no name/OAB.
+func firstCounselLabelFrom(counsels []PartyCounselInfo) string {
+	if len(counsels) == 0 {
 		return ""
 	}
-	c := recs[0]
+	c := counsels[0]
 	if c.Name == "" && c.OAB == "" {
 		return ""
 	}
@@ -534,16 +648,41 @@ func draftListItemFromProcessRow(r draftdb.ListDraftsByProcessRow) DraftListItem
 // draftListItemFromAllRow maps a ListDraftsAllRow to a DraftListItem.
 func draftListItemFromAllRow(r draftdb.ListDraftsAllRow) DraftListItem {
 	item := DraftListItem{
-		ID:        r.ID.String(),
-		PieceType: r.PieceType,
-		Title:     r.Title,
-		Status:    r.Status,
-		SagaState: r.SagaState,
-		CreatedAt: timestamptzToTime(r.CreatedAt),
+		ID:              r.ID.String(),
+		PieceType:       r.PieceType,
+		Title:           r.Title,
+		Status:          r.Status,
+		SagaState:       r.SagaState,
+		CreatedAt:       timestamptzToTime(r.CreatedAt),
+		CNJNumber:       r.CnjNumber,
+		ResponsibleName: r.ResponsibleName,
 	}
-	if r.FiledAt.Valid {
+	if r.SentToSigningAt.Valid {
+		t := timestamptzToTime(r.SentToSigningAt)
+		item.SentToSigningAt = &t
+	}
+	if r.SignedAt.Valid {
+		t := timestamptzToTime(r.SignedAt)
+		item.SignedAt = &t
+	}
+	// filed_at pode vir do draft (novo) OU do petition (legacy). O primeiro
+	// que estiver preenchido ganha.
+	if r.DraftFiledAt.Valid {
+		t := timestamptzToTime(r.DraftFiledAt)
+		item.FiledAt = &t
+	} else if r.FiledAt.Valid {
 		t := timestamptzToTime(r.FiledAt)
 		item.FiledAt = &t
+	}
+	if r.DeadlineEndDate.Valid {
+		t := r.DeadlineEndDate.Time
+		item.DeadlineEndDate = &t
+		// days_left calculado no Go pra evitar o CASE...NULL::int no SQL
+		// (sqlc infere non-null e o scan quebra pra rows sem deadline).
+		today := time.Now().UTC().Truncate(24 * time.Hour)
+		end := t.UTC().Truncate(24 * time.Hour)
+		days := int32(end.Sub(today) / (24 * time.Hour))
+		item.DeadlineDaysLeft = &days
 	}
 	if r.ObservedResult != nil {
 		item.ObservedResult = r.ObservedResult

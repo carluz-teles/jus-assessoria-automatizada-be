@@ -182,8 +182,8 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
 
-	if out.PromptVersion != "draft_minuta/v5" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v5", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v9" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v9", out.PromptVersion)
 	}
 
 	// System must contain the gold rule (v4: parties + signing lawyer instruction).
@@ -192,7 +192,6 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		"NUNCA deixe",
 		"placeholder",
 		"PARTES do processo",
-		"ADVOGADO SIGNATÁRIO",
 		"PLAINTIFF",
 		"DEFENDANT",
 		"ESTRUTURA CANÔNICA",
@@ -223,8 +222,6 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		"Fica o réu citado a contestar",
 		"AUTOR LTDA",
 		"RÉU SA",
-		"Dr. João Silva",
-		"OAB/SP nº 12345",
 		"Trechos relevantes dos autos:",
 		"trecho 1",
 	} {
@@ -239,23 +236,31 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 	}
 }
 
-// TestTemplateComposer_ComposeDraft_v4_NoSigningLawyer verifies that when no signing
-// lawyer is provided the system instructs using the literal marker [Nome do Advogado].
-func TestTemplateComposer_ComposeDraft_v4_NoSigningLawyer(t *testing.T) {
+// TestTemplateComposer_ComposeDraft_v6_NoSigningBlock verifies that v6 nunca
+// injeta linha de "Advogado signatário" no user prompt e nunca instrui o LLM
+// a colocar nome/OAB no fecho — o bloco de assinatura é adicionado no PDF
+// pelo pdfgen no momento do Sign.
+func TestTemplateComposer_ComposeDraft_v6_NoSigningBlock(t *testing.T) {
 	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
-		PieceType: "DEFENSE",
-		// SigningLawyer fields all empty — should NOT appear in user message.
+		PieceType:         "DEFENSE",
+		SigningLawyerName: "Dr. João Silva",
+		SigningLawyerOAB:  "12345",
+		SigningLawyerUF:   "SP",
 	})
 	if err != nil {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
-	// User must NOT inject a signing-lawyer line when fields are empty.
 	if strings.Contains(out.User, "Advogado signatário:") {
-		t.Errorf("user prompt should omit 'Advogado signatário:' when fields empty\n---\n%s", out.User)
+		t.Errorf("v6 user prompt must not inject 'Advogado signatário:' line\n---\n%s", out.User)
 	}
-	// System must still instruct fallback to markers.
-	if !strings.Contains(out.System, "[Nome do Advogado]") {
-		t.Errorf("system must mention fallback marker [Nome do Advogado] when lawyer absent\n---\n%s", out.System)
+	if strings.Contains(out.User, "Dr. João Silva") {
+		t.Errorf("v6 user prompt must not leak SigningLawyerName\n---\n%s", out.User)
+	}
+	if strings.Contains(out.System, "[Nome do Advogado]") {
+		t.Errorf("v6 system prompt must not mention [Nome do Advogado] fallback\n---\n%s", out.System)
+	}
+	if !strings.Contains(out.System, "PARE AÍ") {
+		t.Errorf("v6 system must instruct to STOP after [data].\n---\n%s", out.System)
 	}
 }
 
@@ -269,8 +274,8 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
 	if !strings.Contains(out.User, "sem contexto adicional") {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
-	if out.PromptVersion != "draft_minuta/v5" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v5", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v9" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v9", out.PromptVersion)
 	}
 }
 
@@ -356,7 +361,7 @@ func TestTemplateComposer_ComposeDraft_ToneEmpty_BackwardCompat(t *testing.T) {
 	}
 
 	withDefault := base
-	withDefault.Tone = "tecnico-formal"
+	withDefault.Tone = "tecnico"
 	explicit, err := c.ComposeDraft(AgentDraftMinuta, withDefault)
 	if err != nil {
 		t.Fatalf("ComposeDraft(tone=tecnico-formal) error = %v", err)
@@ -383,7 +388,7 @@ func TestTemplateComposer_ComposeDraft_ToneDirectives(t *testing.T) {
 	c := NewTemplateComposer()
 	base := DraftContext{PieceType: "DEFENSE"}
 
-	tones := []string{"direto-assertivo", "conciliador-institucional"}
+	tones := []string{"objetivo", "enfatico"}
 	seen := make(map[string]bool, len(tones))
 	for _, tone := range tones {
 		ctx := base
@@ -473,15 +478,21 @@ func TestTemplateComposer_ComposeTheses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComposeTheses() error = %v", err)
 	}
-	if out.PromptVersion != "suggest_theses/v1" {
-		t.Errorf("PromptVersion = %q, want suggest_theses/v1", out.PromptVersion)
+	if out.PromptVersion != "suggest_theses/v2" {
+		t.Errorf("PromptVersion = %q, want suggest_theses/v2", out.PromptVersion)
 	}
 	if strings.TrimSpace(out.System) == "" || strings.TrimSpace(out.User) == "" {
 		t.Fatalf("empty system/user: system=%q user=%q", out.System, out.User)
 	}
-	for _, want := range []string{"label", "confidence", "reference", "foundation"} {
+	// v2: campo `evidence` obrigatório + critérios objetivos por confidence.
+	for _, want := range []string{"label", "confidence", "reference", "foundation", "evidence"} {
 		if !strings.Contains(out.System, want) {
 			t.Errorf("system prompt missing %q output field\n---\n%s", want, out.System)
+		}
+	}
+	for _, want := range []string{"CRITÉRIOS DE CONFIDENCE", "evidence.length"} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("system prompt missing v2 rubric %q\n---\n%s", want, out.System)
 		}
 	}
 	for _, want := range []string{"TJSP", "Fica o réu citado a contestar", "RÉU SA"} {

@@ -98,11 +98,38 @@ type Config struct {
 
 	// Object storage S3-compatível (S3/R2/MinIO). Opcional: o api só monta o
 	// storage.Client quando S3Enabled() — ver o método abaixo.
-	S3Endpoint  string `env:"S3_ENDPOINT"`
-	S3Region    string `env:"S3_REGION"`
-	S3Bucket    string `env:"S3_BUCKET"`
-	S3AccessKey string `env:"S3_ACCESS_KEY"`
-	S3SecretKey string `env:"S3_SECRET_KEY"`
+	S3Endpoint     string `env:"S3_ENDPOINT"`
+	S3Region       string `env:"S3_REGION"`
+	S3Bucket       string `env:"S3_BUCKET"`
+	S3AccessKey    string `env:"S3_ACCESS_KEY"`
+	S3SecretKey    string `env:"S3_SECRET_KEY"`
+	S3UsePathStyle bool   `env:"S3_USE_PATH_STYLE"` // MinIO exige path-style; R2/S3 default false
+
+	// GCP Cloud KMS key name (formato completo:
+	// projects/<PROJECT_ID>/locations/<REGION>/keyRings/<KEYRING>/cryptoKeys/<KEY>)
+	// usada como KEK do envelope encryption dos certificados A1. O api gera uma
+	// DEK aleatória por cert, cifra o .pfx localmente com ela, e chama KMS.Encrypt
+	// UMA vez por cert pra "wrappar" a DEK — sem essa key, sem forma de decifrar
+	// o binário armazenado. Requer também GOOGLE_APPLICATION_CREDENTIALS
+	// apontando pro JSON da service account (Application Default Credentials).
+	// Opcional no agregado — sem ela o slice certificate não sobe; api segue.
+	GCPKMSKeyName string `env:"GCP_KMS_KEY_NAME"`
+
+	// TSAURL: endpoint RFC 3161 (TimeStamp Protocol) usado pelo PAdES-T na
+	// assinatura de peças. Opcional: vazio = PAdES-BASIC (sem carimbo);
+	// preenchido = draft.Sign chama a TSA e embute o TimeStampToken no PDF.
+	// Provedores comuns: http://freetsa.org/tsr (grátis, sem auth, uptime
+	// razoável pra dev); http://timestamp.digicert.com (comercial estável).
+	TSAURL string `env:"TSA_URL"`
+
+	// GCPKMSCredentialsJSON: JSON da service account em BASE64. Padrão para PaaS
+	// (Railway, Fly, Render) onde não dá pra montar arquivo — só passar env var.
+	// O boot decodifica e escreve em /tmp/gcp-kms.json, então seta
+	// GOOGLE_APPLICATION_CREDENTIALS internamente e o SDK GCP acha via ADC.
+	// Em dev local (Docker Compose), usar GOOGLE_APPLICATION_CREDENTIALS direto
+	// (com o volume montando o JSON) — este campo fica vazio. Mutuamente
+	// exclusivos: se ambos setados, este vence.
+	GCPKMSCredentialsJSON string `env:"GCP_KMS_CREDENTIALS_JSON"`
 
 	// Voyage — provedor de embeddings da fatia de indexação/retrieval de documentos
 	// (só o worker-documents, onde roda o listener de indexing, os consome). O
@@ -131,9 +158,18 @@ type Config struct {
 	// BASE_URL têm default sensato, trocáveis por env sem redeploy (o tiering do §7: light aqui,
 	// strong pra peça). Opcional no agregado — o adapter valida a chave no ponto de uso (Generate
 	// devolve Invalid) e o binário que não gera não morre por falta dela.
-	OpenRouterAPIKey  string `env:"OPENROUTER_API_KEY"`
-	OpenRouterModel   string `env:"OPENROUTER_MODEL" envDefault:"openai/gpt-4o-mini"`
-	OpenRouterBaseURL string `env:"OPENROUTER_BASE_URL" envDefault:"https://openrouter.ai/api/v1"`
+	OpenRouterAPIKey string `env:"OPENROUTER_API_KEY"`
+	// OpenRouterModel é o modelo LEGADO (usado quando FAST/QUALITY vazios) e
+	// também o baseline global. Kept as fallback pra migração suave.
+	OpenRouterModel string `env:"OPENROUTER_MODEL" envDefault:"openai/gpt-4o-mini"`
+	// Modelos por tier (tiering do §7 do ERD): FAST pra loops iterativos
+	// curtos (teses, chat, sugerir tasks) onde velocidade > exaustividade;
+	// QUALITY pra escritas críticas (gerar minuta, iterar peça, revisar,
+	// analisar intimação, resumir processo). Cada campo vazio cai no
+	// OpenRouterModel legado — permite ligar tier a tier sem breaking.
+	OpenRouterModelFast    string `env:"OPENROUTER_MODEL_FAST"    envDefault:"google/gemini-2.5-flash-lite"`
+	OpenRouterModelQuality string `env:"OPENROUTER_MODEL_QUALITY" envDefault:"google/gemini-2.5-flash"`
+	OpenRouterBaseURL      string `env:"OPENROUTER_BASE_URL" envDefault:"https://openrouter.ai/api/v1"`
 
 	// Calendário de prazos.
 	// HolidaySeedYearsAhead — quantos anos ALÉM do corrente o seeder nacional de

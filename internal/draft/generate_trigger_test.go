@@ -51,7 +51,7 @@ func TestTriggerUseCase_TriggerGeneration(t *testing.T) {
 		wantTheses       []string
 	}{
 		{
-			name: "empty tone defaults to tecnico-formal server-side before persisting",
+			name: "empty tone defaults to tecnico server-side before persisting",
 			cmd: TriggerGenerationCommand{
 				TenantID: tenantID,
 				DraftID:  draftID,
@@ -59,7 +59,7 @@ func TestTriggerUseCase_TriggerGeneration(t *testing.T) {
 			repo: &fakeRepo{
 				getByIDResult: &Draft{ID: draftID, TenantID: tenantID, SagaState: "CREATED"},
 			},
-			wantTone: ToneTecnicoFormal,
+			wantTone: ToneTecnico,
 		},
 		{
 			name: "non-empty tone/instructions/theses pass through unchanged",

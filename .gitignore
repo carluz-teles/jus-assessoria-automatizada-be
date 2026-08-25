@@ -31,3 +31,7 @@ go.work.sum
 *.swp
 
 CODE_REVIEW.md
+tmp/
+
+# arquivos de teste manual (PDFs de amostra usados em QA local)
+procuracao-teste.pdf

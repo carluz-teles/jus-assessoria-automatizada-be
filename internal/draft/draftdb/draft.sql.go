@@ -47,6 +47,84 @@ func (q *Queries) DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) 
 	return err
 }
 
+const getActiveEsajCredential = `-- name: GetActiveEsajCredential :one
+SELECT id, tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref, terms_version
+FROM esaj_credential
+WHERE tenant_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL
+`
+
+type GetActiveEsajCredentialParams struct {
+	TenantID    uuid.UUID `json:"tenant_id"`
+	OwnerUserID uuid.UUID `json:"owner_user_id"`
+}
+
+type GetActiveEsajCredentialRow struct {
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	OwnerUserID  uuid.UUID `json:"owner_user_id"`
+	Login        string    `json:"login"`
+	Ciphertext   []byte    `json:"ciphertext"`
+	Nonce        []byte    `json:"nonce"`
+	WrappedDek   []byte    `json:"wrapped_dek"`
+	KekRef       string    `json:"kek_ref"`
+	TermsVersion string    `json:"terms_version"`
+}
+
+// Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
+// pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
+func (q *Queries) GetActiveEsajCredential(ctx context.Context, arg GetActiveEsajCredentialParams) (GetActiveEsajCredentialRow, error) {
+	row := q.db.QueryRow(ctx, getActiveEsajCredential, arg.TenantID, arg.OwnerUserID)
+	var i GetActiveEsajCredentialRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.OwnerUserID,
+		&i.Login,
+		&i.Ciphertext,
+		&i.Nonce,
+		&i.WrappedDek,
+		&i.KekRef,
+		&i.TermsVersion,
+	)
+	return i, err
+}
+
+const getActiveFilingAttempt = `-- name: GetActiveFilingAttempt :one
+SELECT id, draft_id, status, pdf_storage_key, pdf_sha256
+FROM filing_attempt
+WHERE tenant_id = $1 AND draft_id = $2 AND status IN ('ENFILEIRADO', 'PROTOCOLANDO')
+ORDER BY requested_at DESC
+LIMIT 1
+`
+
+type GetActiveFilingAttemptParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	DraftID  uuid.UUID `json:"draft_id"`
+}
+
+type GetActiveFilingAttemptRow struct {
+	ID            uuid.UUID `json:"id"`
+	DraftID       uuid.UUID `json:"draft_id"`
+	Status        string    `json:"status"`
+	PdfStorageKey string    `json:"pdf_storage_key"`
+	PdfSha256     string    `json:"pdf_sha256"`
+}
+
+// Tentativa ativa (ENFILEIRADO/PROTOCOLANDO) p/ o clique ser idempotente.
+// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+func (q *Queries) GetActiveFilingAttempt(ctx context.Context, arg GetActiveFilingAttemptParams) (GetActiveFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, getActiveFilingAttempt, arg.TenantID, arg.DraftID)
+	var i GetActiveFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Status,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
+	)
+	return i, err
+}
+
 const getAttachmentForUpdate = `-- name: GetAttachmentForUpdate :one
 SELECT id, tenant_id, draft_id, document_id, category, position, created_at
 FROM draft_attachment
@@ -258,7 +336,9 @@ SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
        created_at, updated_at,
-       tone, instructions, selected_theses
+       tone, instructions, selected_theses,
+       structured_content, authorship,
+       filing_number
 FROM draft
 WHERE id = $1 AND tenant_id = $2
 `
@@ -269,20 +349,23 @@ type GetDraftByIDParams struct {
 }
 
 type GetDraftByIDRow struct {
-	ID             uuid.UUID          `json:"id"`
-	TenantID       uuid.UUID          `json:"tenant_id"`
-	CaseID         pgtype.UUID        `json:"case_id"`
-	IntimationID   pgtype.UUID        `json:"intimation_id"`
-	PieceType      string             `json:"piece_type"`
-	Title          string             `json:"title"`
-	Content        *string            `json:"content"`
-	Status         string             `json:"status"`
-	SagaState      string             `json:"saga_state"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	Tone           string             `json:"tone"`
-	Instructions   *string            `json:"instructions"`
-	SelectedTheses []string           `json:"selected_theses"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	Tone              string             `json:"tone"`
+	Instructions      *string            `json:"instructions"`
+	SelectedTheses    []string           `json:"selected_theses"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
+	FilingNumber      *string            `json:"filing_number"`
 }
 
 // Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
@@ -308,6 +391,9 @@ func (q *Queries) GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (Get
 		&i.Tone,
 		&i.Instructions,
 		&i.SelectedTheses,
+		&i.StructuredContent,
+		&i.Authorship,
+		&i.FilingNumber,
 	)
 	return i, err
 }
@@ -316,7 +402,8 @@ const getDraftByIntimationID = `-- name: GetDraftByIntimationID :one
 SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
-       created_at, updated_at
+       created_at, updated_at,
+       structured_content, authorship
 FROM draft
 WHERE tenant_id = $1 AND intimation_id = $2
 `
@@ -327,17 +414,19 @@ type GetDraftByIntimationIDParams struct {
 }
 
 type GetDraftByIntimationIDRow struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       pgtype.UUID        `json:"case_id"`
-	IntimationID pgtype.UUID        `json:"intimation_id"`
-	PieceType    string             `json:"piece_type"`
-	Title        string             `json:"title"`
-	Content      *string            `json:"content"`
-	Status       string             `json:"status"`
-	SagaState    string             `json:"saga_state"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
 }
 
 // Fetch the draft that already exists for the (tenant_id, intimation_id) pair —
@@ -358,6 +447,8 @@ func (q *Queries) GetDraftByIntimationID(ctx context.Context, arg GetDraftByInti
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
 	)
 	return i, err
 }
@@ -372,6 +463,18 @@ SELECT
     d.saga_state,
     d.created_at,
     d.updated_at,
+    d.structured_content,
+    d.content_html,
+    d.authorship,
+
+    -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.
+    d.sent_to_signing_at,
+    d.signed_at,
+    d.filed_at,
+    d.filing_number,
+    -- storage key do PDF assinado (Fatia 2b — 0061). NULL antes de assinar.
+    -- O handler transforma em presigned URL antes de devolver ao cliente.
+    d.signed_pdf_key,
 
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
@@ -431,6 +534,14 @@ type GetDraftDetailRow struct {
 	SagaState                 string             `json:"saga_state"`
 	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent         []byte             `json:"structured_content"`
+	ContentHtml               *string            `json:"content_html"`
+	Authorship                string             `json:"authorship"`
+	SentToSigningAt           pgtype.Timestamptz `json:"sent_to_signing_at"`
+	SignedAt                  pgtype.Timestamptz `json:"signed_at"`
+	FiledAt                   pgtype.Timestamptz `json:"filed_at"`
+	FilingNumber              *string            `json:"filing_number"`
+	SignedPdfKey              *string            `json:"signed_pdf_key"`
 	IntimationID              pgtype.UUID        `json:"intimation_id"`
 	IntimationType            *string            `json:"intimation_type"`
 	IntimationContent         *string            `json:"intimation_content"`
@@ -470,6 +581,14 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.ContentHtml,
+		&i.Authorship,
+		&i.SentToSigningAt,
+		&i.SignedAt,
+		&i.FiledAt,
+		&i.FilingNumber,
+		&i.SignedPdfKey,
 		&i.IntimationID,
 		&i.IntimationType,
 		&i.IntimationContent,
@@ -489,6 +608,54 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.DeadlineID,
 		&i.DeadlineEndDate,
 		&i.DeadlineStatus,
+	)
+	return i, err
+}
+
+const getFilingAttempt = `-- name: GetFilingAttempt :one
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, screenshot_keys
+FROM filing_attempt
+WHERE tenant_id = $1 AND id = $2
+`
+
+type GetFilingAttemptParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+}
+
+type GetFilingAttemptRow struct {
+	ID             uuid.UUID          `json:"id"`
+	DraftID        uuid.UUID          `json:"draft_id"`
+	PetitionID     pgtype.UUID        `json:"petition_id"`
+	Status         string             `json:"status"`
+	PdfStorageKey  string             `json:"pdf_storage_key"`
+	PdfSha256      string             `json:"pdf_sha256"`
+	RequestedBy    uuid.UUID          `json:"requested_by"`
+	RequestedAt    pgtype.Timestamptz `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	FinishedAt     pgtype.Timestamptz `json:"finished_at"`
+	FailureReason  *string            `json:"failure_reason"`
+	ScreenshotKeys []string           `json:"screenshot_keys"`
+}
+
+// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+func (q *Queries) GetFilingAttempt(ctx context.Context, arg GetFilingAttemptParams) (GetFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, getFilingAttempt, arg.TenantID, arg.ID)
+	var i GetFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.PetitionID,
+		&i.Status,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
+		&i.RequestedBy,
+		&i.RequestedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.FailureReason,
+		&i.ScreenshotKeys,
 	)
 	return i, err
 }
@@ -559,6 +726,54 @@ func (q *Queries) GetIntimationForDraft(ctx context.Context, arg GetIntimationFo
 		&i.Subject,
 		&i.JudgingBody,
 		&i.DeadlineEndDate,
+	)
+	return i, err
+}
+
+const getLatestFilingAttempt = `-- name: GetLatestFilingAttempt :one
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, filing_number, screenshot_keys
+FROM filing_attempt
+WHERE draft_id = $1
+ORDER BY requested_at DESC
+LIMIT 1
+`
+
+type GetLatestFilingAttemptRow struct {
+	ID             uuid.UUID          `json:"id"`
+	DraftID        uuid.UUID          `json:"draft_id"`
+	PetitionID     pgtype.UUID        `json:"petition_id"`
+	Status         string             `json:"status"`
+	PdfStorageKey  string             `json:"pdf_storage_key"`
+	PdfSha256      string             `json:"pdf_sha256"`
+	RequestedBy    uuid.UUID          `json:"requested_by"`
+	RequestedAt    pgtype.Timestamptz `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	FinishedAt     pgtype.Timestamptz `json:"finished_at"`
+	FailureReason  *string            `json:"failure_reason"`
+	FilingNumber   *string            `json:"filing_number"`
+	ScreenshotKeys []string           `json:"screenshot_keys"`
+}
+
+// Última tentativa do draft (qualquer status, inclusive PROTOCOLADO/FALHOU) —
+// usada pelo endpoint de status, que deve refletir o estado terminal.
+func (q *Queries) GetLatestFilingAttempt(ctx context.Context, draftID uuid.UUID) (GetLatestFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, getLatestFilingAttempt, draftID)
+	var i GetLatestFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.PetitionID,
+		&i.Status,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
+		&i.RequestedBy,
+		&i.RequestedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.FailureReason,
+		&i.FilingNumber,
+		&i.ScreenshotKeys,
 	)
 	return i, err
 }
@@ -691,6 +906,62 @@ func (q *Queries) GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDra
 	return i, err
 }
 
+const getProvidencesForIntimation = `-- name: GetProvidencesForIntimation :many
+SELECT id, title, kind, source, status
+FROM task
+WHERE tenant_id = $1 AND intimation_id = $2 AND status IN ('OPEN', 'DONE')
+ORDER BY
+    CASE status WHEN 'OPEN' THEN 0 WHEN 'DONE' THEN 1 ELSE 2 END,
+    created_at ASC
+`
+
+type GetProvidencesForIntimationParams struct {
+	TenantID     uuid.UUID   `json:"tenant_id"`
+	IntimationID pgtype.UUID `json:"intimation_id"`
+}
+
+type GetProvidencesForIntimationRow struct {
+	ID     uuid.UUID `json:"id"`
+	Title  string    `json:"title"`
+	Kind   *string   `json:"kind"`
+	Source string    `json:"source"`
+	Status string    `json:"status"`
+}
+
+// Read model helper (Peça v2): providences shown on the FE sidebar are the
+// tasks linked to the draft's intimation. Tenant-scoped (barrier 1), OPEN +
+// DONE only (DISMISSED tasks disappear from the peça sidebar — the advogado
+// discarded them). Ordered by (status ASC — OPEN first, DONE below, then
+// created_at ASC for stable display).
+//
+// Read cross-slice directly (same pattern as GetDraftDetail reading court_record
+// and party without importing acquisition — see docs §5b.2).
+func (q *Queries) GetProvidencesForIntimation(ctx context.Context, arg GetProvidencesForIntimationParams) ([]GetProvidencesForIntimationRow, error) {
+	rows, err := q.db.Query(ctx, getProvidencesForIntimation, arg.TenantID, arg.IntimationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetProvidencesForIntimationRow
+	for rows.Next() {
+		var i GetProvidencesForIntimationRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.Kind,
+			&i.Source,
+			&i.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertChatMessage = `-- name: InsertChatMessage :one
 
 INSERT INTO chat_message (draft_id, role, content, citations, grounded, model_version)
@@ -742,18 +1013,21 @@ INSERT INTO draft (
     tenant_id, case_id, intimation_id,
     piece_type, title, content,
     status, saga_state,
+    created_by,
     created_at, updated_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     'DRAFT', 'CREATED',
+    NULLIF($7, '00000000-0000-0000-0000-000000000000'::uuid),
     now(), now()
 )
 ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHING
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
-          created_at, updated_at
+          created_at, updated_at,
+          structured_content, authorship
 `
 
 type InsertDraftParams struct {
@@ -763,20 +1037,23 @@ type InsertDraftParams struct {
 	PieceType    string      `json:"piece_type"`
 	Title        string      `json:"title"`
 	Content      *string     `json:"content"`
+	Column7      interface{} `json:"column_7"`
 }
 
 type InsertDraftRow struct {
-	ID           uuid.UUID          `json:"id"`
-	TenantID     uuid.UUID          `json:"tenant_id"`
-	CaseID       pgtype.UUID        `json:"case_id"`
-	IntimationID pgtype.UUID        `json:"intimation_id"`
-	PieceType    string             `json:"piece_type"`
-	Title        string             `json:"title"`
-	Content      *string            `json:"content"`
-	Status       string             `json:"status"`
-	SagaState    string             `json:"saga_state"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
 }
 
 // draft slice queries (peticionamento Fatia 1). Every write runs inside the use
@@ -801,6 +1078,7 @@ func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (Inser
 		arg.PieceType,
 		arg.Title,
 		arg.Content,
+		arg.Column7,
 	)
 	var i InsertDraftRow
 	err := row.Scan(
@@ -815,6 +1093,8 @@ func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (Inser
 		&i.SagaState,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
 	)
 	return i, err
 }
@@ -859,6 +1139,121 @@ func (q *Queries) InsertDraftAttachment(ctx context.Context, arg InsertDraftAtta
 		&i.Category,
 		&i.Position,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertEsajCredential = `-- name: InsertEsajCredential :one
+
+INSERT INTO esaj_credential (
+  tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref,
+  terms_version, terms_accepted_at, terms_accepted_by
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at
+`
+
+type InsertEsajCredentialParams struct {
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	Nonce           []byte             `json:"nonce"`
+	WrappedDek      []byte             `json:"wrapped_dek"`
+	KekRef          string             `json:"kek_ref"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+}
+
+type InsertEsajCredentialRow struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+}
+
+// ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
+// Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA
+// persiste em claro. O consentimento dos termos é registrado por auditoria.
+func (q *Queries) InsertEsajCredential(ctx context.Context, arg InsertEsajCredentialParams) (InsertEsajCredentialRow, error) {
+	row := q.db.QueryRow(ctx, insertEsajCredential,
+		arg.TenantID,
+		arg.OwnerUserID,
+		arg.Login,
+		arg.Ciphertext,
+		arg.Nonce,
+		arg.WrappedDek,
+		arg.KekRef,
+		arg.TermsVersion,
+		arg.TermsAcceptedAt,
+		arg.TermsAcceptedBy,
+	)
+	var i InsertEsajCredentialRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.OwnerUserID,
+		&i.Login,
+		&i.TermsVersion,
+		&i.TermsAcceptedAt,
+		&i.TermsAcceptedBy,
+		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const insertFilingAttempt = `-- name: InsertFilingAttempt :one
+
+INSERT INTO filing_attempt (tenant_id, draft_id, pdf_storage_key, pdf_sha256, requested_by, status)
+VALUES ($1, $2, $3, $4, $5, 'ENFILEIRADO')
+RETURNING id, draft_id, status, requested_by, requested_at, pdf_storage_key, pdf_sha256
+`
+
+type InsertFilingAttemptParams struct {
+	TenantID      uuid.UUID `json:"tenant_id"`
+	DraftID       uuid.UUID `json:"draft_id"`
+	PdfStorageKey string    `json:"pdf_storage_key"`
+	PdfSha256     string    `json:"pdf_sha256"`
+	RequestedBy   uuid.UUID `json:"requested_by"`
+}
+
+type InsertFilingAttemptRow struct {
+	ID            uuid.UUID          `json:"id"`
+	DraftID       uuid.UUID          `json:"draft_id"`
+	Status        string             `json:"status"`
+	RequestedBy   uuid.UUID          `json:"requested_by"`
+	RequestedAt   pgtype.Timestamptz `json:"requested_at"`
+	PdfStorageKey string             `json:"pdf_storage_key"`
+	PdfSha256     string             `json:"pdf_sha256"`
+}
+
+// ── filing_attempt (Fatia 1 — peticionamento automático) ──────────────────────
+// Snapshot do PDF congelado no clique. O unique parcial (draft_id WHERE ativo)
+// impede 2ª tentativa ativa — barreira de idempotência contra duplo-clique.
+// tenant_id é explícito (RLS + coluna NOT NULL); o UoW já seta app.tenant_id.
+func (q *Queries) InsertFilingAttempt(ctx context.Context, arg InsertFilingAttemptParams) (InsertFilingAttemptRow, error) {
+	row := q.db.QueryRow(ctx, insertFilingAttempt,
+		arg.TenantID,
+		arg.DraftID,
+		arg.PdfStorageKey,
+		arg.PdfSha256,
+		arg.RequestedBy,
+	)
+	var i InsertFilingAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Status,
+		&i.RequestedBy,
+		&i.RequestedAt,
+		&i.PdfStorageKey,
+		&i.PdfSha256,
 	)
 	return i, err
 }
@@ -962,10 +1357,18 @@ SELECT
     d.status,
     d.saga_state,
     d.created_at,
+    d.sent_to_signing_at,
+    d.signed_at,
+    d.filed_at AS draft_filed_at,
     p.filed_at,
     p.observed_result,
-    r.coverage AS review_coverage
+    r.coverage AS review_coverage,
+    COALESCE(cr.cnj_number, '')                AS cnj_number,
+    dl.end_date                                AS deadline_end_date,
+    COALESCE(au.name, '')                      AS responsible_name
 FROM draft d
+LEFT JOIN court_record cr ON cr.case_id = d.case_id AND cr.tenant_id = d.tenant_id
+LEFT JOIN app_user au ON au.id = d.created_by AND au.tenant_id = d.tenant_id
 LEFT JOIN petition p ON p.draft_id = d.id
 LEFT JOIN LATERAL (
     SELECT rv.coverage
@@ -974,12 +1377,32 @@ LEFT JOIN LATERAL (
     ORDER BY rv.generated_at DESC
     LIMIT 1
 ) r ON true
+LEFT JOIN LATERAL (
+    SELECT dln.end_date
+    FROM deadline dln
+    WHERE dln.notification_id = d.intimation_id
+      AND dln.tenant_id = d.tenant_id
+    ORDER BY dln.end_date ASC
+    LIMIT 1
+) dl ON true
 WHERE d.tenant_id = $1
   AND ($2::text = '' OR d.piece_type = $2)
   AND ($3::text = '' OR d.status = $3)
+  -- workflow_state: 'aguardando_assinatura' | 'aguardando_protocolo' | ''
+  AND (
+    $6::text = ''
+    OR ($6::text = 'aguardando_assinatura' AND d.sent_to_signing_at IS NOT NULL AND d.signed_at IS NULL)
+    OR ($6::text = 'aguardando_protocolo'  AND d.signed_at IS NOT NULL AND d.filed_at IS NULL AND p.filed_at IS NULL)
+  )
+  -- urgencia: 'atraso' | 'hoje' | ''
+  AND (
+    $7::text = ''
+    OR ($7::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
+    OR ($7::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
+  )
   AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
-LIMIT $6
+LIMIT $8
 `
 
 type ListDraftsAllParams struct {
@@ -988,24 +1411,34 @@ type ListDraftsAllParams struct {
 	Column3  string             `json:"column_3"`
 	Column4  pgtype.Timestamptz `json:"column_4"`
 	Column5  uuid.UUID          `json:"column_5"`
+	Column6  string             `json:"column_6"`
+	Column7  string             `json:"column_7"`
 	Limit    int32              `json:"limit"`
 }
 
 type ListDraftsAllRow struct {
-	ID             uuid.UUID          `json:"id"`
-	PieceType      string             `json:"piece_type"`
-	Title          string             `json:"title"`
-	Status         string             `json:"status"`
-	SagaState      string             `json:"saga_state"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	FiledAt        pgtype.Timestamptz `json:"filed_at"`
-	ObservedResult *string            `json:"observed_result"`
-	ReviewCoverage []byte             `json:"review_coverage"`
+	ID              uuid.UUID          `json:"id"`
+	PieceType       string             `json:"piece_type"`
+	Title           string             `json:"title"`
+	Status          string             `json:"status"`
+	SagaState       string             `json:"saga_state"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	SentToSigningAt pgtype.Timestamptz `json:"sent_to_signing_at"`
+	SignedAt        pgtype.Timestamptz `json:"signed_at"`
+	DraftFiledAt    pgtype.Timestamptz `json:"draft_filed_at"`
+	FiledAt         pgtype.Timestamptz `json:"filed_at"`
+	ObservedResult  *string            `json:"observed_result"`
+	ReviewCoverage  []byte             `json:"review_coverage"`
+	CnjNumber       string             `json:"cnj_number"`
+	DeadlineEndDate pgtype.Date        `json:"deadline_end_date"`
+	ResponsibleName string             `json:"responsible_name"`
 }
 
 // Paginated list of all peças for a tenant, ordered by (created_at DESC,
-// id DESC). Optional piece_type and status filters. Coverage summary from
-// latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+// id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
+// urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+// da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
+// Over-fetch por 1 pra hasMore.
 func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error) {
 	rows, err := q.db.Query(ctx, listDraftsAll,
 		arg.TenantID,
@@ -1013,6 +1446,8 @@ func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([
 		arg.Column3,
 		arg.Column4,
 		arg.Column5,
+		arg.Column6,
+		arg.Column7,
 		arg.Limit,
 	)
 	if err != nil {
@@ -1029,9 +1464,15 @@ func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([
 			&i.Status,
 			&i.SagaState,
 			&i.CreatedAt,
+			&i.SentToSigningAt,
+			&i.SignedAt,
+			&i.DraftFiledAt,
 			&i.FiledAt,
 			&i.ObservedResult,
 			&i.ReviewCoverage,
+			&i.CnjNumber,
+			&i.DeadlineEndDate,
+			&i.ResponsibleName,
 		); err != nil {
 			return nil, err
 		}
@@ -1131,8 +1572,241 @@ func (q *Queries) ListDraftsByProcess(ctx context.Context, arg ListDraftsByProce
 	return items, nil
 }
 
-const setGenerationParams = `-- name: SetGenerationParams :exec
+const listEsajCredentials = `-- name: ListEsajCredentials :many
+SELECT id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at
+FROM esaj_credential
+WHERE tenant_id = $1 AND revoked_at IS NULL
+ORDER BY created_at DESC
+`
 
+type ListEsajCredentialsRow struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Login           string             `json:"login"`
+	TermsVersion    string             `json:"terms_version"`
+	TermsAcceptedAt pgtype.Timestamptz `json:"terms_accepted_at"`
+	TermsAcceptedBy uuid.UUID          `json:"terms_accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+}
+
+// Metadados públicos (sem o envelope) das credenciais ATIVAS do tenant.
+func (q *Queries) ListEsajCredentials(ctx context.Context, tenantID uuid.UUID) ([]ListEsajCredentialsRow, error) {
+	rows, err := q.db.Query(ctx, listEsajCredentials, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEsajCredentialsRow
+	for rows.Next() {
+		var i ListEsajCredentialsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.OwnerUserID,
+			&i.Login,
+			&i.TermsVersion,
+			&i.TermsAcceptedAt,
+			&i.TermsAcceptedBy,
+			&i.CreatedAt,
+			&i.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markFiled = `-- name: MarkFiled :one
+UPDATE draft
+SET filed_at       = COALESCE($3::timestamptz, now()),
+    filing_number  = $4::text,
+    updated_at     = now()
+WHERE id = $1 AND tenant_id = $2 AND status = 'SIGNED' AND filed_at IS NULL
+RETURNING id, filed_at, filing_number, updated_at
+`
+
+type MarkFiledParams struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	FiledAt      pgtype.Timestamptz `json:"filed_at"`
+	FilingNumber *string            `json:"filing_number"`
+}
+
+type MarkFiledRow struct {
+	ID           uuid.UUID          `json:"id"`
+	FiledAt      pgtype.Timestamptz `json:"filed_at"`
+	FilingNumber *string            `json:"filing_number"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
+// opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
+// (número do protocolo no tribunal — string livre). Requer status=SIGNED.
+func (q *Queries) MarkFiled(ctx context.Context, arg MarkFiledParams) (MarkFiledRow, error) {
+	row := q.db.QueryRow(ctx, markFiled,
+		arg.ID,
+		arg.TenantID,
+		arg.FiledAt,
+		arg.FilingNumber,
+	)
+	var i MarkFiledRow
+	err := row.Scan(
+		&i.ID,
+		&i.FiledAt,
+		&i.FilingNumber,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const markFilingFailed = `-- name: MarkFilingFailed :exec
+UPDATE filing_attempt
+SET status = 'FALHOU', finished_at = now(), failure_reason = $2
+WHERE id = $1
+`
+
+type MarkFilingFailedParams struct {
+	ID            uuid.UUID `json:"id"`
+	FailureReason *string   `json:"failure_reason"`
+}
+
+func (q *Queries) MarkFilingFailed(ctx context.Context, arg MarkFilingFailedParams) error {
+	_, err := q.db.Exec(ctx, markFilingFailed, arg.ID, arg.FailureReason)
+	return err
+}
+
+const markFilingProtocolado = `-- name: MarkFilingProtocolado :one
+UPDATE filing_attempt
+SET status = 'PROTOCOLADO', finished_at = now(), petition_id = $2, filing_number = $3, screenshot_keys = $4
+WHERE id = $1
+RETURNING id, status, finished_at, filing_number
+`
+
+type MarkFilingProtocoladoParams struct {
+	ID             uuid.UUID   `json:"id"`
+	PetitionID     pgtype.UUID `json:"petition_id"`
+	FilingNumber   *string     `json:"filing_number"`
+	ScreenshotKeys []string    `json:"screenshot_keys"`
+}
+
+type MarkFilingProtocoladoRow struct {
+	ID           uuid.UUID          `json:"id"`
+	Status       string             `json:"status"`
+	FinishedAt   pgtype.Timestamptz `json:"finished_at"`
+	FilingNumber *string            `json:"filing_number"`
+}
+
+func (q *Queries) MarkFilingProtocolado(ctx context.Context, arg MarkFilingProtocoladoParams) (MarkFilingProtocoladoRow, error) {
+	row := q.db.QueryRow(ctx, markFilingProtocolado,
+		arg.ID,
+		arg.PetitionID,
+		arg.FilingNumber,
+		arg.ScreenshotKeys,
+	)
+	var i MarkFilingProtocoladoRow
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.FinishedAt,
+		&i.FilingNumber,
+	)
+	return i, err
+}
+
+const markFilingProtocolando = `-- name: MarkFilingProtocolando :exec
+UPDATE filing_attempt SET status = 'PROTOCOLANDO', started_at = now()
+WHERE id = $1 AND status = 'ENFILEIRADO'
+`
+
+// Transição ENFILEIRADO → PROTOCOLANDO. Guarda status pra não dar replay.
+func (q *Queries) MarkFilingProtocolando(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markFilingProtocolando, id)
+	return err
+}
+
+const markSentToSigning = `-- name: MarkSentToSigning :one
+
+UPDATE draft
+SET sent_to_signing_at = now(),
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND sent_to_signing_at IS NULL
+RETURNING id, sent_to_signing_at, updated_at
+`
+
+type MarkSentToSigningParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type MarkSentToSigningRow struct {
+	ID              uuid.UUID          `json:"id"`
+	SentToSigningAt pgtype.Timestamptz `json:"sent_to_signing_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+// Marca o gesto "usuário clicou Enviar para assinatura" (0060). Só setta se
+// ainda não foi setado (idempotente sem sobrescrever timestamp original).
+// Zero linhas afetadas quando (a) draft não existe, (b) tenant errado, OU
+// (c) já estava setado — o caso (c) surface na app como "no-op" (não erro).
+func (q *Queries) MarkSentToSigning(ctx context.Context, arg MarkSentToSigningParams) (MarkSentToSigningRow, error) {
+	row := q.db.QueryRow(ctx, markSentToSigning, arg.ID, arg.TenantID)
+	var i MarkSentToSigningRow
+	err := row.Scan(&i.ID, &i.SentToSigningAt, &i.UpdatedAt)
+	return i, err
+}
+
+const revertToConstruction = `-- name: RevertToConstruction :one
+UPDATE draft
+SET sent_to_signing_at = NULL,
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND signed_at IS NULL
+RETURNING id, updated_at
+`
+
+type RevertToConstructionParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type RevertToConstructionRow struct {
+	ID        uuid.UUID          `json:"id"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Nulla sent_to_signing_at (usuário voltou pra Construção). Só permite quando
+// a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
+// workflow não volta pra atrás sem invalidar a assinatura.
+func (q *Queries) RevertToConstruction(ctx context.Context, arg RevertToConstructionParams) (RevertToConstructionRow, error) {
+	row := q.db.QueryRow(ctx, revertToConstruction, arg.ID, arg.TenantID)
+	var i RevertToConstructionRow
+	err := row.Scan(&i.ID, &i.UpdatedAt)
+	return i, err
+}
+
+const revokeEsajCredential = `-- name: RevokeEsajCredential :exec
+UPDATE esaj_credential SET revoked_at = now()
+WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeEsajCredentialParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Soft-delete idempotente: só marca revoked_at quando ainda ativa.
+func (q *Queries) RevokeEsajCredential(ctx context.Context, arg RevokeEsajCredentialParams) error {
+	_, err := q.db.Exec(ctx, revokeEsajCredential, arg.ID, arg.TenantID)
+	return err
+}
+
+const setGenerationParams = `-- name: SetGenerationParams :exec
 UPDATE draft
 SET tone            = $3,
     instructions    = $4,
@@ -1149,8 +1823,6 @@ type SetGenerationParamsParams struct {
 	SelectedTheses []string  `json:"selected_theses"`
 }
 
-// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
-// These are the three new queries the async generation saga needs.
 // Persist the Gerar-time generation params (tone/instructions/selected_theses,
 // Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
 // the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event
@@ -1172,7 +1844,6 @@ func (q *Queries) SetGenerationParams(ctx context.Context, arg SetGenerationPara
 }
 
 const signDraft = `-- name: SignDraft :one
-
 UPDATE draft
 SET status     = 'SIGNED',
     signed_at  = now(),
@@ -1204,12 +1875,68 @@ type SignDraftRow struct {
 	SignedAt     pgtype.Timestamptz `json:"signed_at"`
 }
 
-// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
 // Transition draft.status to SIGNED and set signed_at = now(). Scoped to
 // (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
 func (q *Queries) SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error) {
 	row := q.db.QueryRow(ctx, signDraft, arg.ID, arg.TenantID)
 	var i SignDraftRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CaseID,
+		&i.IntimationID,
+		&i.PieceType,
+		&i.Title,
+		&i.Content,
+		&i.Status,
+		&i.SagaState,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.SignedAt,
+	)
+	return i, err
+}
+
+const signDraftWithPDF = `-- name: SignDraftWithPDF :one
+UPDATE draft
+SET status         = 'SIGNED',
+    signed_at      = now(),
+    signed_pdf_key = $3,
+    updated_at     = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at, signed_at
+`
+
+type SignDraftWithPDFParams struct {
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	SignedPdfKey *string   `json:"signed_pdf_key"`
+}
+
+type SignDraftWithPDFRow struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CaseID       pgtype.UUID        `json:"case_id"`
+	IntimationID pgtype.UUID        `json:"intimation_id"`
+	PieceType    string             `json:"piece_type"`
+	Title        string             `json:"title"`
+	Content      *string            `json:"content"`
+	Status       string             `json:"status"`
+	SagaState    string             `json:"saga_state"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	SignedAt     pgtype.Timestamptz `json:"signed_at"`
+}
+
+// Fatia 2b: assina + grava a chave do PDF assinado no storage. Difere de
+// SignDraft porque também popula signed_pdf_key. Idempotente: re-assinar
+// devolve nil (a UI trata via Idempot flag).
+func (q *Queries) SignDraftWithPDF(ctx context.Context, arg SignDraftWithPDFParams) (SignDraftWithPDFRow, error) {
+	row := q.db.QueryRow(ctx, signDraftWithPDF, arg.ID, arg.TenantID, arg.SignedPdfKey)
+	var i SignDraftWithPDFRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -1264,21 +1991,83 @@ func (q *Queries) UpdateAttachmentCategory(ctx context.Context, arg UpdateAttach
 	return i, err
 }
 
+const updateDraftAuthorship = `-- name: UpdateDraftAuthorship :one
+UPDATE draft
+SET authorship = $3,
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at,
+          structured_content, authorship
+`
+
+type UpdateDraftAuthorshipParams struct {
+	ID         uuid.UUID `json:"id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	Authorship string    `json:"authorship"`
+}
+
+type UpdateDraftAuthorshipRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
+}
+
+// Flip the peça's authorship marker. Called by POST /v1/pecas/:id/assume-authorship
+// when the advogado clicks "Assumir autoria" — from that moment the FE hides the
+// Iterar tab and shows Revisão. Idempotent: a repeat call is a no-op at the DB level
+// (same UPDATE). Scoped to (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+func (q *Queries) UpdateDraftAuthorship(ctx context.Context, arg UpdateDraftAuthorshipParams) (UpdateDraftAuthorshipRow, error) {
+	row := q.db.QueryRow(ctx, updateDraftAuthorship, arg.ID, arg.TenantID, arg.Authorship)
+	var i UpdateDraftAuthorshipRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CaseID,
+		&i.IntimationID,
+		&i.PieceType,
+		&i.Title,
+		&i.Content,
+		&i.Status,
+		&i.SagaState,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
+	)
+	return i, err
+}
+
 const updateDraftContent = `-- name: UpdateDraftContent :one
 UPDATE draft
-SET content    = $3,
-    title      = CASE WHEN $4::boolean THEN $5 ELSE title END,
-    updated_at = now()
+SET content            = $3,
+    title              = CASE WHEN $4::boolean THEN $5 ELSE title END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, title, updated_at
 `
 
 type UpdateDraftContentParams struct {
-	ID       uuid.UUID `json:"id"`
-	TenantID uuid.UUID `json:"tenant_id"`
-	Content  *string   `json:"content"`
-	Column4  bool      `json:"column_4"`
-	Title    string    `json:"title"`
+	ID                uuid.UUID `json:"id"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	Content           *string   `json:"content"`
+	Column4           bool      `json:"column_4"`
+	Title             string    `json:"title"`
+	Column6           bool      `json:"column_6"`
+	StructuredContent []byte    `json:"structured_content"`
 }
 
 type UpdateDraftContentRow struct {
@@ -1287,9 +2076,13 @@ type UpdateDraftContentRow struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Autosave: update content (and optionally title) + bump updated_at, scoped to
-// (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
-// or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+// Autosave: update content (and optionally title + structured_content) + bump
+// updated_at, scoped to (id, tenant_id). Returns the minimal patch response fields.
+// A no-match (wrong id or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound.
+//
+// structured_content is dual-written: when $6::boolean is true, $7 (jsonb) is
+// persisted; otherwise the existing structured_content is left untouched. The FE
+// always sends both (Peça v2), older PATCH callers can send just content.
 func (q *Queries) UpdateDraftContent(ctx context.Context, arg UpdateDraftContentParams) (UpdateDraftContentRow, error) {
 	row := q.db.QueryRow(ctx, updateDraftContent,
 		arg.ID,
@@ -1297,10 +2090,71 @@ func (q *Queries) UpdateDraftContent(ctx context.Context, arg UpdateDraftContent
 		arg.Content,
 		arg.Column4,
 		arg.Title,
+		arg.Column6,
+		arg.StructuredContent,
 	)
 	var i UpdateDraftContentRow
 	err := row.Scan(&i.ID, &i.Title, &i.UpdatedAt)
 	return i, err
+}
+
+const updateDraftContentHtml = `-- name: UpdateDraftContentHtml :one
+UPDATE draft
+SET content_html = $3,
+    updated_at   = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, updated_at
+`
+
+type UpdateDraftContentHtmlParams struct {
+	ID          uuid.UUID `json:"id"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	ContentHtml *string   `json:"content_html"`
+}
+
+type UpdateDraftContentHtmlRow struct {
+	ID        uuid.UUID          `json:"id"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Autosave do editor rico (Fase B): grava o HTML do Tiptap direto na coluna
+// content_html. A partir deste save, content_html é source-of-truth pro
+// renderer PDF (pdfgen HTML→PDF via chromedp, Fase C); structured_content
+// fica congelado (a IA continua gerando pra novas gerações, mas edição
+// humana só toca em content_html). Escopo (id, tenant_id); no-match →
+// ErrDraftNotFound. Retorna id + updated_at.
+func (q *Queries) UpdateDraftContentHtml(ctx context.Context, arg UpdateDraftContentHtmlParams) (UpdateDraftContentHtmlRow, error) {
+	row := q.db.QueryRow(ctx, updateDraftContentHtml, arg.ID, arg.TenantID, arg.ContentHtml)
+	var i UpdateDraftContentHtmlRow
+	err := row.Scan(&i.ID, &i.UpdatedAt)
+	return i, err
+}
+
+const updateFilingNumber = `-- name: UpdateFilingNumber :exec
+
+UPDATE draft
+SET filing_number = $3,
+    updated_at    = now()
+WHERE id = $1 AND tenant_id = $2 AND filing_number IS NULL
+`
+
+type UpdateFilingNumberParams struct {
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	FilingNumber *string   `json:"filing_number"`
+}
+
+// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+// These are the three new queries the async generation saga needs.
+// Atualiza APENAS o filing_number de uma peça já protocolada. Diferente do
+// MarkFiled (que só grava no INSERT do filing, `filed_at IS NULL`), este roda
+// no branch idempotente do File quando o advogado esqueceu de digitar o
+// número na primeira vez OU digitou errado e agora está corrigindo. Guard:
+// só sobrescreve quando o valor atual é NULL (nunca zera um número já
+// gravado). Scoped (id, tenant_id).
+func (q *Queries) UpdateFilingNumber(ctx context.Context, arg UpdateFilingNumberParams) error {
+	_, err := q.db.Exec(ctx, updateFilingNumber, arg.ID, arg.TenantID, arg.FilingNumber)
+	return err
 }
 
 const updateObservedResult = `-- name: UpdateObservedResult :one
@@ -1336,9 +2190,10 @@ func (q *Queries) UpdateObservedResult(ctx context.Context, arg UpdateObservedRe
 
 const updateSagaState = `-- name: UpdateSagaState :one
 UPDATE draft
-SET saga_state = $3,
-    content    = CASE WHEN $4::boolean THEN $5 ELSE content END,
-    updated_at = now()
+SET saga_state         = $3,
+    content            = CASE WHEN $4::boolean THEN $5 ELSE content END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
@@ -1347,11 +2202,13 @@ RETURNING id, tenant_id, case_id, intimation_id,
 `
 
 type UpdateSagaStateParams struct {
-	ID        uuid.UUID `json:"id"`
-	TenantID  uuid.UUID `json:"tenant_id"`
-	SagaState string    `json:"saga_state"`
-	Column4   bool      `json:"column_4"`
-	Content   *string   `json:"content"`
+	ID                uuid.UUID `json:"id"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	SagaState         string    `json:"saga_state"`
+	Column4           bool      `json:"column_4"`
+	Content           *string   `json:"content"`
+	Column6           bool      `json:"column_6"`
+	StructuredContent []byte    `json:"structured_content"`
 }
 
 type UpdateSagaStateRow struct {
@@ -1370,9 +2227,10 @@ type UpdateSagaStateRow struct {
 
 // Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 // on success, FAILED on LLM error). Also updates content when the generator returns new
-// text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
-// which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
-// A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+// text ($4=true → $5 overwrites; false → leaves content unchanged — used for the FAILED
+// path). Same for structured_content ($6=true → $7 jsonb overwrites) — the DRAFTED path
+// writes BOTH content + structured_content in one tx (dual write for Peça v2).
+// Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. No-match → ErrDraftNotFound.
 func (q *Queries) UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams) (UpdateSagaStateRow, error) {
 	row := q.db.QueryRow(ctx, updateSagaState,
 		arg.ID,
@@ -1380,6 +2238,8 @@ func (q *Queries) UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams
 		arg.SagaState,
 		arg.Column4,
 		arg.Content,
+		arg.Column6,
+		arg.StructuredContent,
 	)
 	var i UpdateSagaStateRow
 	err := row.Scan(
@@ -1396,4 +2256,28 @@ func (q *Queries) UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const writeBackStructuredContent = `-- name: WriteBackStructuredContent :exec
+UPDATE draft
+SET structured_content = $3
+WHERE id = $1 AND tenant_id = $2
+  AND structured_content IS NULL
+`
+
+type WriteBackStructuredContentParams struct {
+	ID                uuid.UUID `json:"id"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	StructuredContent []byte    `json:"structured_content"`
+}
+
+// Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
+// into a StructuredContent on the fly (structured_content IS NULL for drafts
+// created before migration 0056 / Fatia B), this UPDATE persists the parsed shape
+// so subsequent reads skip the parser. Fire-and-forget within the same tx — the
+// caller does NOT check RowsAffected (a race where another writer already
+// populated it is harmless — the last writer wins). Scoped to (id, tenant_id).
+func (q *Queries) WriteBackStructuredContent(ctx context.Context, arg WriteBackStructuredContentParams) error {
+	_, err := q.db.Exec(ctx, writeBackStructuredContent, arg.ID, arg.TenantID, arg.StructuredContent)
+	return err
 }

@@ -164,14 +164,28 @@ const (
 // intimações inbox (?urgencia query param). The handler validates against this set;
 // the SQL predicate maps each value to a deadline subquery.
 const (
-	UrgenciaAtraso           = "atraso"             // prazo vencido (days_left < 0, status PENDING|OPEN)
-	UrgenciaHoje             = "hoje"               // vence hoje (days_left = 0, status PENDING|OPEN)
-	UrgenciaProximosDoisDias = "proximos_dois_dias" // vence em 1-2 dias (status PENDING|OPEN)
-	UrgenciaSemana           = "semana"             // vence em 3-7 dias (status PENDING|OPEN)
-	UrgenciaMaisAdiante      = "mais_adiante"       // vence em mais de 7 dias (days_left > 7, status PENDING|OPEN)
-	UrgenciaNaoConfirmado    = "nao_confirmado"     // sugerido, ainda não confirmado (status = PENDING)
-	// UrgenciaSemProvidencia backs the "sem providência" tab of the master-detail inbox: not
-	// yet AI-analyzed and still actionable, independent of whether a deadline was derived.
+	UrgenciaAtraso           = "atraso"             // prazo vencido (days_left < 0, status PENDING|OPEN, user_status != RESOLVED|IGNORED)
+	UrgenciaHoje             = "hoje"               // vence hoje (days_left = 0, status PENDING|OPEN, user_status != RESOLVED|IGNORED)
+	UrgenciaProximosDoisDias = "proximos_dois_dias" // vence em 1-2 dias (status PENDING|OPEN, user_status != RESOLVED|IGNORED)
+	UrgenciaSemana           = "semana"             // vence em 3-7 dias (status PENDING|OPEN, user_status != RESOLVED|IGNORED)
+	// UrgenciaEsteMes — prazo no mês corrente: days_left > 7 E end_date <= último dia do
+	// mês corrente (status PENDING|OPEN, user_status != RESOLVED|IGNORED). Disjunto de
+	// semana (>7 corta o overlap) e de mais_adiante (teto no fim do mês).
+	UrgenciaEsteMes = "este_mes"
+	// UrgenciaMaisAdiante — prazo estritamente além do mês corrente: end_date > último dia
+	// do mês corrente (status PENDING|OPEN, user_status != RESOLVED|IGNORED).
+	UrgenciaMaisAdiante = "mais_adiante"
+	// UrgenciaSemDataDefinida — intimação sem prazo derivado (deadline IS NULL, user_status
+	// != RESOLVED|IGNORED). Disjunto de todos os buckets temporais (que exigem deadline).
+	UrgenciaSemDataDefinida = "sem_data_definida"
+	// UrgenciaNaoConfirmado is NO LONGER a urgência bucket — it became the server-side
+	// "Não confirmadas" triage toggle (separate ?nao_confirmado param, predicate
+	// d.status = 'PENDING'). Kept as a documented alias of the chip predicate, not part of
+	// the urgência closed set.
+	UrgenciaNaoConfirmado = "nao_confirmado"
+	// UrgenciaSemProvidencia is REMOVED from the urgência closed set (redesign v1). Kept
+	// ONLY as a deprecated alias so legacy deep-links (?urgencia=sem_providencia) degrade to
+	// "no filter" instead of a hard 400. It is not offered as a tab and has no SQL bucket.
 	UrgenciaSemProvidencia = "sem_providencia"
 )
 

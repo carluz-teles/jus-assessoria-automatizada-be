@@ -23,6 +23,12 @@ type Querier interface {
 	// tenant via GetDraftByID(tenantID, draftID) earlier in the same tx. Do NOT "fix"
 	// this with a JOIN — the app-layer barrier is intentional (see 0044_review_status).
 	DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error
+	// Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
+	// pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
+	GetActiveEsajCredential(ctx context.Context, arg GetActiveEsajCredentialParams) (GetActiveEsajCredentialRow, error)
+	// Tentativa ativa (ENFILEIRADO/PROTOCOLANDO) p/ o clique ser idempotente.
+	// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+	GetActiveFilingAttempt(ctx context.Context, arg GetActiveFilingAttemptParams) (GetActiveFilingAttemptRow, error)
 	// Load an attachment for update/delete guard: resolves (id, draft_id, tenant_id) to
 	// confirm it belongs to the right draft and tenant. A miss → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).
@@ -64,6 +70,8 @@ type Querier interface {
 	// (barrier 1); RLS on draft is barrier 2. The court_record columns are read here
 	// without importing the acquisition slice (decisão: read the table directly).
 	GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) (GetDraftDetailRow, error)
+	// tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+	GetFilingAttempt(ctx context.Context, arg GetFilingAttemptParams) (GetFilingAttemptRow, error)
 	// Load the intimation context needed to build a draft from source=intimation:
 	// the case_id (via court_record), the court_record_id, the type (for piece_type
 	// inference), the rich context fields (content, process metadata, deadline)
@@ -72,6 +80,9 @@ type Querier interface {
 	// by intimation.id and tenant_id (barrier 1 via court_record).
 	// A miss → pgx.ErrNoRows → ErrIntimationNotFound (→ 404).
 	GetIntimationForDraft(ctx context.Context, arg GetIntimationForDraftParams) (GetIntimationForDraftRow, error)
+	// Última tentativa do draft (qualquer status, inclusive PROTOCOLADO/FALHOU) —
+	// usada pelo endpoint de status, que deve refletir o estado terminal.
+	GetLatestFilingAttempt(ctx context.Context, draftID uuid.UUID) (GetLatestFilingAttemptRow, error)
 	// Read model: the most recent review for a draft, ordered by generated_at DESC LIMIT 1.
 	// Used by GET /v1/pecas/:id to surface the latest AI result alongside the draft content.
 	// A draft with no reviews → pgx.ErrNoRows (the read model maps this to nil, not an error).
@@ -87,6 +98,15 @@ type Querier interface {
 	// Load the existing petition for a draft, scoped to tenant via JOIN. Returns
 	// pgx.ErrNoRows when no petition exists (the caller treats nil as "not filed").
 	GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDraftIDParams) (Petition, error)
+	// Read model helper (Peça v2): providences shown on the FE sidebar are the
+	// tasks linked to the draft's intimation. Tenant-scoped (barrier 1), OPEN +
+	// DONE only (DISMISSED tasks disappear from the peça sidebar — the advogado
+	// discarded them). Ordered by (status ASC — OPEN first, DONE below, then
+	// created_at ASC for stable display).
+	//
+	// Read cross-slice directly (same pattern as GetDraftDetail reading court_record
+	// and party without importing acquisition — see docs §5b.2).
+	GetProvidencesForIntimation(ctx context.Context, arg GetProvidencesForIntimationParams) ([]GetProvidencesForIntimationRow, error)
 	// ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
 	// Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
 	// first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).
@@ -117,6 +137,15 @@ type Querier interface {
 	// NOTHING maps it to pgx.ErrNoRows so the repo can return ErrAttachmentAlreadyLinked
 	// without a 23505 transaction abort.
 	InsertDraftAttachment(ctx context.Context, arg InsertDraftAttachmentParams) (DraftAttachment, error)
+	// ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
+	// Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA
+	// persiste em claro. O consentimento dos termos é registrado por auditoria.
+	InsertEsajCredential(ctx context.Context, arg InsertEsajCredentialParams) (InsertEsajCredentialRow, error)
+	// ── filing_attempt (Fatia 1 — peticionamento automático) ──────────────────────
+	// Snapshot do PDF congelado no clique. O unique parcial (draft_id WHERE ativo)
+	// impede 2ª tentativa ativa — barreira de idempotência contra duplo-clique.
+	// tenant_id é explícito (RLS + coluna NOT NULL); o UoW já seta app.tenant_id.
+	InsertFilingAttempt(ctx context.Context, arg InsertFilingAttemptParams) (InsertFilingAttemptRow, error)
 	// Persist a filed petition (immutable). No tenant_id on petition — isolation
 	// is via the draft FK (JOIN draft.tenant_id). Returns all columns.
 	InsertPetition(ctx context.Context, arg InsertPetitionParams) (Petition, error)
@@ -126,16 +155,38 @@ type Querier interface {
 	// (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
 	InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error)
 	// Paginated list of all peças for a tenant, ordered by (created_at DESC,
-	// id DESC). Optional piece_type and status filters. Coverage summary from
-	// latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+	// id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
+	// urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+	// da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
+	// Over-fetch por 1 pra hasMore.
 	ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error)
 	// Paginated list of peças for a given court_record_id, ordered by (created_at DESC,
 	// id DESC). The :id param is court_record.id; we resolve case_id via JOIN.
 	// Coverage summary is resolved from the latest review via LEFT JOIN LATERAL.
 	// Over-fetch by 1 for hasMore detection.
 	ListDraftsByProcess(ctx context.Context, arg ListDraftsByProcessParams) ([]ListDraftsByProcessRow, error)
-	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
-	// These are the three new queries the async generation saga needs.
+	// Metadados públicos (sem o envelope) das credenciais ATIVAS do tenant.
+	ListEsajCredentials(ctx context.Context, tenantID uuid.UUID) ([]ListEsajCredentialsRow, error)
+	// Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
+	// opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
+	// (número do protocolo no tribunal — string livre). Requer status=SIGNED.
+	MarkFiled(ctx context.Context, arg MarkFiledParams) (MarkFiledRow, error)
+	MarkFilingFailed(ctx context.Context, arg MarkFilingFailedParams) error
+	MarkFilingProtocolado(ctx context.Context, arg MarkFilingProtocoladoParams) (MarkFilingProtocoladoRow, error)
+	// Transição ENFILEIRADO → PROTOCOLANDO. Guarda status pra não dar replay.
+	MarkFilingProtocolando(ctx context.Context, id uuid.UUID) error
+	// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+	// Marca o gesto "usuário clicou Enviar para assinatura" (0060). Só setta se
+	// ainda não foi setado (idempotente sem sobrescrever timestamp original).
+	// Zero linhas afetadas quando (a) draft não existe, (b) tenant errado, OU
+	// (c) já estava setado — o caso (c) surface na app como "no-op" (não erro).
+	MarkSentToSigning(ctx context.Context, arg MarkSentToSigningParams) (MarkSentToSigningRow, error)
+	// Nulla sent_to_signing_at (usuário voltou pra Construção). Só permite quando
+	// a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
+	// workflow não volta pra atrás sem invalidar a assinatura.
+	RevertToConstruction(ctx context.Context, arg RevertToConstructionParams) (RevertToConstructionRow, error)
+	// Soft-delete idempotente: só marca revoked_at quando ainda ativa.
+	RevokeEsajCredential(ctx context.Context, arg RevokeEsajCredentialParams) error
 	// Persist the Gerar-time generation params (tone/instructions/selected_theses,
 	// Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
 	// the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event
@@ -146,27 +197,63 @@ type Querier interface {
 	// RowsAffected (mirrors DeleteReviewsForDraft's :exec, which is also fire-and-forget
 	// within an already-guarded tx).
 	SetGenerationParams(ctx context.Context, arg SetGenerationParamsParams) error
-	// ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
 	// Transition draft.status to SIGNED and set signed_at = now(). Scoped to
 	// (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
 	SignDraft(ctx context.Context, arg SignDraftParams) (SignDraftRow, error)
+	// Fatia 2b: assina + grava a chave do PDF assinado no storage. Difere de
+	// SignDraft porque também popula signed_pdf_key. Idempotente: re-assinar
+	// devolve nil (a UI trata via Idempot flag).
+	SignDraftWithPDF(ctx context.Context, arg SignDraftWithPDFParams) (SignDraftWithPDFRow, error)
 	// Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
 	// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).
 	UpdateAttachmentCategory(ctx context.Context, arg UpdateAttachmentCategoryParams) (DraftAttachment, error)
-	// Autosave: update content (and optionally title) + bump updated_at, scoped to
-	// (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
-	// or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+	// Flip the peça's authorship marker. Called by POST /v1/pecas/:id/assume-authorship
+	// when the advogado clicks "Assumir autoria" — from that moment the FE hides the
+	// Iterar tab and shows Revisão. Idempotent: a repeat call is a no-op at the DB level
+	// (same UPDATE). Scoped to (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+	UpdateDraftAuthorship(ctx context.Context, arg UpdateDraftAuthorshipParams) (UpdateDraftAuthorshipRow, error)
+	// Autosave: update content (and optionally title + structured_content) + bump
+	// updated_at, scoped to (id, tenant_id). Returns the minimal patch response fields.
+	// A no-match (wrong id or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound.
+	//
+	// structured_content is dual-written: when $6::boolean is true, $7 (jsonb) is
+	// persisted; otherwise the existing structured_content is left untouched. The FE
+	// always sends both (Peça v2), older PATCH callers can send just content.
 	UpdateDraftContent(ctx context.Context, arg UpdateDraftContentParams) (UpdateDraftContentRow, error)
+	// Autosave do editor rico (Fase B): grava o HTML do Tiptap direto na coluna
+	// content_html. A partir deste save, content_html é source-of-truth pro
+	// renderer PDF (pdfgen HTML→PDF via chromedp, Fase C); structured_content
+	// fica congelado (a IA continua gerando pra novas gerações, mas edição
+	// humana só toca em content_html). Escopo (id, tenant_id); no-match →
+	// ErrDraftNotFound. Retorna id + updated_at.
+	UpdateDraftContentHtml(ctx context.Context, arg UpdateDraftContentHtmlParams) (UpdateDraftContentHtmlRow, error)
+	// ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
+	// These are the three new queries the async generation saga needs.
+	// Atualiza APENAS o filing_number de uma peça já protocolada. Diferente do
+	// MarkFiled (que só grava no INSERT do filing, `filed_at IS NULL`), este roda
+	// no branch idempotente do File quando o advogado esqueceu de digitar o
+	// número na primeira vez OU digitou errado e agora está corrigindo. Guard:
+	// só sobrescreve quando o valor atual é NULL (nunca zera um número já
+	// gravado). Scoped (id, tenant_id).
+	UpdateFilingNumber(ctx context.Context, arg UpdateFilingNumberParams) error
 	// Patch the observed_result on a petition, scoped to tenant via JOIN. A miss
 	// (no petition or wrong tenant) → pgx.ErrNoRows → ErrPetitionNotFound.
 	UpdateObservedResult(ctx context.Context, arg UpdateObservedResultParams) (UpdateObservedResultRow, error)
 	// Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 	// on success, FAILED on LLM error). Also updates content when the generator returns new
-	// text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
-	// which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
-	// A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+	// text ($4=true → $5 overwrites; false → leaves content unchanged — used for the FAILED
+	// path). Same for structured_content ($6=true → $7 jsonb overwrites) — the DRAFTED path
+	// writes BOTH content + structured_content in one tx (dual write for Peça v2).
+	// Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. No-match → ErrDraftNotFound.
 	UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams) (UpdateSagaStateRow, error)
+	// Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
+	// into a StructuredContent on the fly (structured_content IS NULL for drafts
+	// created before migration 0056 / Fatia B), this UPDATE persists the parsed shape
+	// so subsequent reads skip the parser. Fire-and-forget within the same tx — the
+	// caller does NOT check RowsAffected (a race where another writer already
+	// populated it is harmless — the last writer wins). Scoped to (id, tenant_id).
+	WriteBackStructuredContent(ctx context.Context, arg WriteBackStructuredContentParams) error
 }
 
 var _ Querier = (*Queries)(nil)

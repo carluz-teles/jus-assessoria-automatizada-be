@@ -18,18 +18,21 @@ INSERT INTO draft (
     tenant_id, case_id, intimation_id,
     piece_type, title, content,
     status, saga_state,
+    created_by,
     created_at, updated_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     'DRAFT', 'CREATED',
+    NULLIF($7, '00000000-0000-0000-0000-000000000000'::uuid),
     now(), now()
 )
 ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHING
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
-          created_at, updated_at;
+          created_at, updated_at,
+          structured_content, authorship;
 
 -- name: GetDraftByIntimationID :one
 -- Fetch the draft that already exists for the (tenant_id, intimation_id) pair —
@@ -38,7 +41,8 @@ RETURNING id, tenant_id, case_id, intimation_id,
 SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
-       created_at, updated_at
+       created_at, updated_at,
+       structured_content, authorship
 FROM draft
 WHERE tenant_id = $1 AND intimation_id = $2;
 
@@ -52,20 +56,40 @@ SELECT id, tenant_id, case_id, intimation_id,
        piece_type, title, content,
        status, saga_state,
        created_at, updated_at,
-       tone, instructions, selected_theses
+       tone, instructions, selected_theses,
+       structured_content, authorship,
+       filing_number
 FROM draft
 WHERE id = $1 AND tenant_id = $2;
 
 -- name: UpdateDraftContent :one
--- Autosave: update content (and optionally title) + bump updated_at, scoped to
--- (id, tenant_id). Returns the minimal patch response fields. A no-match (wrong id
--- or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound (→ 404).
+-- Autosave: update content (and optionally title + structured_content) + bump
+-- updated_at, scoped to (id, tenant_id). Returns the minimal patch response fields.
+-- A no-match (wrong id or foreign tenant) yields pgx.ErrNoRows → ErrDraftNotFound.
+--
+-- structured_content is dual-written: when $6::boolean is true, $7 (jsonb) is
+-- persisted; otherwise the existing structured_content is left untouched. The FE
+-- always sends both (Peça v2), older PATCH callers can send just content.
 UPDATE draft
-SET content    = $3,
-    title      = CASE WHEN $4::boolean THEN $5 ELSE title END,
-    updated_at = now()
+SET content            = $3,
+    title              = CASE WHEN $4::boolean THEN $5 ELSE title END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, title, updated_at;
+
+-- name: UpdateDraftContentHtml :one
+-- Autosave do editor rico (Fase B): grava o HTML do Tiptap direto na coluna
+-- content_html. A partir deste save, content_html é source-of-truth pro
+-- renderer PDF (pdfgen HTML→PDF via chromedp, Fase C); structured_content
+-- fica congelado (a IA continua gerando pra novas gerações, mas edição
+-- humana só toca em content_html). Escopo (id, tenant_id); no-match →
+-- ErrDraftNotFound. Retorna id + updated_at.
+UPDATE draft
+SET content_html = $3,
+    updated_at   = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, updated_at;
 
 -- name: GetDraftDetail :one
 -- Read model for GET /v1/pecas/:id: a JOIN over draft, intimation (optional),
@@ -83,6 +107,18 @@ SELECT
     d.saga_state,
     d.created_at,
     d.updated_at,
+    d.structured_content,
+    d.content_html,
+    d.authorship,
+
+    -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.
+    d.sent_to_signing_at,
+    d.signed_at,
+    d.filed_at,
+    d.filing_number,
+    -- storage key do PDF assinado (Fatia 2b — 0061). NULL antes de assinar.
+    -- O handler transforma em presigned URL antes de devolver ao cliente.
+    d.signed_pdf_key,
 
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
@@ -227,6 +263,22 @@ JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline dl ON dl.notification_id = i.id
 WHERE i.id = $1 AND cr.tenant_id = $2;
 
+-- name: GetProvidencesForIntimation :many
+-- Read model helper (Peça v2): providences shown on the FE sidebar are the
+-- tasks linked to the draft's intimation. Tenant-scoped (barrier 1), OPEN +
+-- DONE only (DISMISSED tasks disappear from the peça sidebar — the advogado
+-- discarded them). Ordered by (status ASC — OPEN first, DONE below, then
+-- created_at ASC for stable display).
+--
+-- Read cross-slice directly (same pattern as GetDraftDetail reading court_record
+-- and party without importing acquisition — see docs §5b.2).
+SELECT id, title, kind, source, status
+FROM task
+WHERE tenant_id = $1 AND intimation_id = $2 AND status IN ('OPEN', 'DONE')
+ORDER BY
+    CASE status WHEN 'OPEN' THEN 0 WHEN 'DONE' THEN 1 ELSE 2 END,
+    created_at ASC;
+
 -- name: GetPartiesForDraft :many
 -- Load the parties (autor/réu/terceiro) and their advogados for a given case,
 -- tenant-scoped (barrier 1). Used by the draft generation pipeline to inject
@@ -252,6 +304,18 @@ ORDER BY p.role, p.name;
 -- ── AI generation queries (Peticionamento Fatia 3) ───────────────────────────
 -- These are the three new queries the async generation saga needs.
 
+-- name: UpdateFilingNumber :exec
+-- Atualiza APENAS o filing_number de uma peça já protocolada. Diferente do
+-- MarkFiled (que só grava no INSERT do filing, `filed_at IS NULL`), este roda
+-- no branch idempotente do File quando o advogado esqueceu de digitar o
+-- número na primeira vez OU digitou errado e agora está corrigindo. Guard:
+-- só sobrescreve quando o valor atual é NULL (nunca zera um número já
+-- gravado). Scoped (id, tenant_id).
+UPDATE draft
+SET filing_number = $3,
+    updated_at    = now()
+WHERE id = $1 AND tenant_id = $2 AND filing_number IS NULL;
+
 -- name: SetGenerationParams :exec
 -- Persist the Gerar-time generation params (tone/instructions/selected_theses,
 -- Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
@@ -272,18 +336,47 @@ WHERE id = $1 AND tenant_id = $2;
 -- name: UpdateSagaState :one
 -- Transition the draft's saga_state (EXTRACTING when generation is triggered, REVIEWED
 -- on success, FAILED on LLM error). Also updates content when the generator returns new
--- text ($3 non-NULL overwrites; NULL leaves content unchanged — used for the FAILED path
--- which does NOT touch content). Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2.
--- A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+-- text ($4=true → $5 overwrites; false → leaves content unchanged — used for the FAILED
+-- path). Same for structured_content ($6=true → $7 jsonb overwrites) — the DRAFTED path
+-- writes BOTH content + structured_content in one tx (dual write for Peça v2).
+-- Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. No-match → ErrDraftNotFound.
 UPDATE draft
-SET saga_state = $3,
-    content    = CASE WHEN $4::boolean THEN $5 ELSE content END,
-    updated_at = now()
+SET saga_state         = $3,
+    content            = CASE WHEN $4::boolean THEN $5 ELSE content END,
+    structured_content = CASE WHEN $6::boolean THEN $7 ELSE structured_content END,
+    updated_at         = now()
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
           created_at, updated_at;
+
+-- name: UpdateDraftAuthorship :one
+-- Flip the peça's authorship marker. Called by POST /v1/pecas/:id/assume-authorship
+-- when the advogado clicks "Assumir autoria" — from that moment the FE hides the
+-- Iterar tab and shows Revisão. Idempotent: a repeat call is a no-op at the DB level
+-- (same UPDATE). Scoped to (id, tenant_id). A no-match → pgx.ErrNoRows → ErrDraftNotFound.
+UPDATE draft
+SET authorship = $3,
+    updated_at = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at,
+          structured_content, authorship;
+
+-- name: WriteBackStructuredContent :exec
+-- Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
+-- into a StructuredContent on the fly (structured_content IS NULL for drafts
+-- created before migration 0056 / Fatia B), this UPDATE persists the parsed shape
+-- so subsequent reads skip the parser. Fire-and-forget within the same tx — the
+-- caller does NOT check RowsAffected (a race where another writer already
+-- populated it is harmless — the last writer wins). Scoped to (id, tenant_id).
+UPDATE draft
+SET structured_content = $3
+WHERE id = $1 AND tenant_id = $2
+  AND structured_content IS NULL;
 
 -- name: InsertReview :one
 -- Persist one AI review (findings + coverage as jsonb, model_version, rules_version,
@@ -341,6 +434,53 @@ FROM (
 ORDER BY created_at ASC;
 
 -- ── Peticionamento queries (Fatia 4) ────────────────────────────────────────
+
+-- name: MarkSentToSigning :one
+-- Marca o gesto "usuário clicou Enviar para assinatura" (0060). Só setta se
+-- ainda não foi setado (idempotente sem sobrescrever timestamp original).
+-- Zero linhas afetadas quando (a) draft não existe, (b) tenant errado, OU
+-- (c) já estava setado — o caso (c) surface na app como "no-op" (não erro).
+UPDATE draft
+SET sent_to_signing_at = now(),
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND sent_to_signing_at IS NULL
+RETURNING id, sent_to_signing_at, updated_at;
+
+-- name: RevertToConstruction :one
+-- Nulla sent_to_signing_at (usuário voltou pra Construção). Só permite quando
+-- a peça AINDA não foi assinada (signed_at IS NULL) — depois de assinada, o
+-- workflow não volta pra atrás sem invalidar a assinatura.
+UPDATE draft
+SET sent_to_signing_at = NULL,
+    updated_at         = now()
+WHERE id = $1 AND tenant_id = $2 AND signed_at IS NULL
+RETURNING id, updated_at;
+
+-- name: MarkFiled :one
+-- Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
+-- opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
+-- (número do protocolo no tribunal — string livre). Requer status=SIGNED.
+UPDATE draft
+SET filed_at       = COALESCE(sqlc.narg('filed_at')::timestamptz, now()),
+    filing_number  = sqlc.narg('filing_number')::text,
+    updated_at     = now()
+WHERE id = $1 AND tenant_id = $2 AND status = 'SIGNED' AND filed_at IS NULL
+RETURNING id, filed_at, filing_number, updated_at;
+
+-- name: SignDraftWithPDF :one
+-- Fatia 2b: assina + grava a chave do PDF assinado no storage. Difere de
+-- SignDraft porque também popula signed_pdf_key. Idempotente: re-assinar
+-- devolve nil (a UI trata via Idempot flag).
+UPDATE draft
+SET status         = 'SIGNED',
+    signed_at      = now(),
+    signed_pdf_key = $3,
+    updated_at     = now()
+WHERE id = $1 AND tenant_id = $2
+RETURNING id, tenant_id, case_id, intimation_id,
+          piece_type, title, content,
+          status, saga_state,
+          created_at, updated_at, signed_at;
 
 -- name: SignDraft :one
 -- Transition draft.status to SIGNED and set signed_at = now(). Scoped to
@@ -423,8 +563,10 @@ LIMIT $5;
 
 -- name: ListDraftsAll :many
 -- Paginated list of all peças for a tenant, ordered by (created_at DESC,
--- id DESC). Optional piece_type and status filters. Coverage summary from
--- latest review via LEFT JOIN LATERAL. Over-fetch by 1 for hasMore detection.
+-- id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
+-- urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+-- da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
+-- Over-fetch por 1 pra hasMore.
 SELECT
     d.id,
     d.piece_type,
@@ -432,10 +574,18 @@ SELECT
     d.status,
     d.saga_state,
     d.created_at,
+    d.sent_to_signing_at,
+    d.signed_at,
+    d.filed_at AS draft_filed_at,
     p.filed_at,
     p.observed_result,
-    r.coverage AS review_coverage
+    r.coverage AS review_coverage,
+    COALESCE(cr.cnj_number, '')                AS cnj_number,
+    dl.end_date                                AS deadline_end_date,
+    COALESCE(au.name, '')                      AS responsible_name
 FROM draft d
+LEFT JOIN court_record cr ON cr.case_id = d.case_id AND cr.tenant_id = d.tenant_id
+LEFT JOIN app_user au ON au.id = d.created_by AND au.tenant_id = d.tenant_id
 LEFT JOIN petition p ON p.draft_id = d.id
 LEFT JOIN LATERAL (
     SELECT rv.coverage
@@ -444,9 +594,111 @@ LEFT JOIN LATERAL (
     ORDER BY rv.generated_at DESC
     LIMIT 1
 ) r ON true
+LEFT JOIN LATERAL (
+    SELECT dln.end_date
+    FROM deadline dln
+    WHERE dln.notification_id = d.intimation_id
+      AND dln.tenant_id = d.tenant_id
+    ORDER BY dln.end_date ASC
+    LIMIT 1
+) dl ON true
 WHERE d.tenant_id = $1
   AND ($2::text = '' OR d.piece_type = $2)
   AND ($3::text = '' OR d.status = $3)
+  -- workflow_state: 'aguardando_assinatura' | 'aguardando_protocolo' | ''
+  AND (
+    $6::text = ''
+    OR ($6::text = 'aguardando_assinatura' AND d.sent_to_signing_at IS NOT NULL AND d.signed_at IS NULL)
+    OR ($6::text = 'aguardando_protocolo'  AND d.signed_at IS NOT NULL AND d.filed_at IS NULL AND p.filed_at IS NULL)
+  )
+  -- urgencia: 'atraso' | 'hoje' | ''
+  AND (
+    $7::text = ''
+    OR ($7::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
+    OR ($7::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
+  )
   AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
-LIMIT $6;
+LIMIT $8;
+
+-- ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
+-- Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA
+-- persiste em claro. O consentimento dos termos é registrado por auditoria.
+
+-- name: InsertEsajCredential :one
+INSERT INTO esaj_credential (
+  tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref,
+  terms_version, terms_accepted_at, terms_accepted_by
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at;
+
+-- name: ListEsajCredentials :many
+-- Metadados públicos (sem o envelope) das credenciais ATIVAS do tenant.
+SELECT id, tenant_id, owner_user_id, login, terms_version, terms_accepted_at, terms_accepted_by, created_at, revoked_at
+FROM esaj_credential
+WHERE tenant_id = $1 AND revoked_at IS NULL
+ORDER BY created_at DESC;
+
+-- name: GetActiveEsajCredential :one
+-- Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
+-- pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
+SELECT id, tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref, terms_version
+FROM esaj_credential
+WHERE tenant_id = $1 AND owner_user_id = $2 AND revoked_at IS NULL;
+
+-- name: RevokeEsajCredential :exec
+-- Soft-delete idempotente: só marca revoked_at quando ainda ativa.
+UPDATE esaj_credential SET revoked_at = now()
+WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL;
+
+-- ── filing_attempt (Fatia 1 — peticionamento automático) ──────────────────────
+
+-- name: InsertFilingAttempt :one
+-- Snapshot do PDF congelado no clique. O unique parcial (draft_id WHERE ativo)
+-- impede 2ª tentativa ativa — barreira de idempotência contra duplo-clique.
+-- tenant_id é explícito (RLS + coluna NOT NULL); o UoW já seta app.tenant_id.
+INSERT INTO filing_attempt (tenant_id, draft_id, pdf_storage_key, pdf_sha256, requested_by, status)
+VALUES ($1, $2, $3, $4, $5, 'ENFILEIRADO')
+RETURNING id, draft_id, status, requested_by, requested_at, pdf_storage_key, pdf_sha256;
+
+-- name: GetActiveFilingAttempt :one
+-- Tentativa ativa (ENFILEIRADO/PROTOCOLANDO) p/ o clique ser idempotente.
+-- tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+SELECT id, draft_id, status, pdf_storage_key, pdf_sha256
+FROM filing_attempt
+WHERE tenant_id = $1 AND draft_id = $2 AND status IN ('ENFILEIRADO', 'PROTOCOLANDO')
+ORDER BY requested_at DESC
+LIMIT 1;
+
+-- name: GetLatestFilingAttempt :one
+-- Última tentativa do draft (qualquer status, inclusive PROTOCOLADO/FALHOU) —
+-- usada pelo endpoint de status, que deve refletir o estado terminal.
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, filing_number, screenshot_keys
+FROM filing_attempt
+WHERE draft_id = $1
+ORDER BY requested_at DESC
+LIMIT 1;
+
+-- name: GetFilingAttempt :one
+-- tenant_id filtrado explicitamente (além da RLS) — defesa em profundidade.
+SELECT id, draft_id, petition_id, status, pdf_storage_key, pdf_sha256,
+       requested_by, requested_at, started_at, finished_at, failure_reason, screenshot_keys
+FROM filing_attempt
+WHERE tenant_id = $1 AND id = $2;
+
+-- name: MarkFilingProtocolando :exec
+-- Transição ENFILEIRADO → PROTOCOLANDO. Guarda status pra não dar replay.
+UPDATE filing_attempt SET status = 'PROTOCOLANDO', started_at = now()
+WHERE id = $1 AND status = 'ENFILEIRADO';
+
+-- name: MarkFilingProtocolado :one
+UPDATE filing_attempt
+SET status = 'PROTOCOLADO', finished_at = now(), petition_id = $2, filing_number = $3, screenshot_keys = $4
+WHERE id = $1
+RETURNING id, status, finished_at, filing_number;
+
+-- name: MarkFilingFailed :exec
+UPDATE filing_attempt
+SET status = 'FALHOU', finished_at = now(), failure_reason = $2
+WHERE id = $1;

@@ -107,6 +107,7 @@ type chatRequest struct {
 	Provider       providerConfig `json:"provider"`
 	ResponseFormat responseFormat `json:"response_format"`
 	MaxTokens      int            `json:"max_tokens"`
+	Stream         bool           `json:"stream,omitempty"`
 }
 
 // chatResponse is the parsed reply. choices[0].message.content is a STRING containing the JSON
@@ -123,6 +124,157 @@ type chatResponse struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+// GenerateJSONStream é a variante SSE do GenerateJSON. Faz o POST com
+// `stream=true`, parseia o corpo text/event-stream do OpenAI-compat, invoca
+// onChunk(delta) pra cada pedaço de conteúdo do modelo, e no fim retorna o
+// content completo (idêntico ao que GenerateJSON devolveria). Retries seguem
+// a mesma lógica do GenerateJSON — porém, uma vez que a stream começou a
+// enviar chunks, uma queda no meio devolve o content parcial + erro.
+func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Request, onChunk func(chunk string) error) ([]byte, error) {
+	model := req.Model
+	if model == "" {
+		model = g.defaultModel
+	}
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = defaultMaxTokens
+	}
+	body, err := json.Marshal(chatRequest{
+		Model: model,
+		Messages: []chatMessage{
+			{Role: "system", Content: req.System},
+			{Role: "user", Content: req.User},
+		},
+		Provider: providerConfig{RequireParameters: true},
+		ResponseFormat: responseFormat{
+			Type: "json_schema",
+			JSONSchema: jsonSchemaSpec{
+				Name:   req.SchemaName,
+				Strict: true,
+				Schema: req.Schema,
+			},
+		},
+		MaxTokens: maxTokens,
+		Stream:    true,
+	})
+	if err != nil {
+		return nil, apperr.NewInfra("openrouter: marshal stream request", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+completionsPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, apperr.NewInfra("openrouter: build stream request", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+g.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	resp, err := g.client.Do(httpReq)
+	if err != nil {
+		return nil, apperr.NewInfra("openrouter: stream request failed", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, apperr.NewInfra("openrouter: stream non-2xx",
+			fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody)))
+	}
+
+	// Parse SSE inline. Cada evento é `data: {json}\n` seguido de linha em
+	// branco. `data: [DONE]\n` fecha o stream. Cada json tem
+	// choices[0].delta.content — o delta parcial que juntamos.
+	var full strings.Builder
+	reader := &sseReader{buf: make([]byte, 0, 4096), src: resp.Body}
+	for {
+		event, err := reader.next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return []byte(full.String()), apperr.NewInfra("openrouter: stream read", err)
+		}
+		if event == "" || event == "[DONE]" {
+			if event == "[DONE]" {
+				break
+			}
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(event), &chunk); err != nil {
+			// Alguns providers mandam eventos comentários (`: ping`) ou não-JSON — ignora.
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta.Content
+		if delta == "" {
+			continue
+		}
+		full.WriteString(delta)
+		if onChunk != nil {
+			if err := onChunk(delta); err != nil {
+				return []byte(full.String()), err
+			}
+		}
+	}
+	return []byte(full.String()), nil
+}
+
+// sseReader lê blocos "data: X\n\n" do body. Usado internamente pra parsear
+// text/event-stream sem pull de dep externa.
+type sseReader struct {
+	buf []byte
+	src io.Reader
+	eof bool
+}
+
+// next devolve o payload do próximo `data:` (sem prefixo, sem newline). "" se
+// heartbeat/comentário. io.EOF quando body fecha.
+func (r *sseReader) next(ctx context.Context) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		// procura por "\n\n" no buffer (fim de um evento SSE)
+		if idx := bytes.Index(r.buf, []byte("\n\n")); idx >= 0 {
+			raw := r.buf[:idx]
+			r.buf = r.buf[idx+2:]
+			// concatena linhas `data: X` do evento
+			var payload strings.Builder
+			for _, line := range bytes.Split(raw, []byte("\n")) {
+				line = bytes.TrimRight(line, "\r")
+				if bytes.HasPrefix(line, []byte("data:")) {
+					payload.Write(bytes.TrimSpace(line[5:]))
+				}
+			}
+			return payload.String(), nil
+		}
+		if r.eof {
+			return "", io.EOF
+		}
+		// lê mais bytes
+		tmp := make([]byte, 4096)
+		n, err := r.src.Read(tmp)
+		if n > 0 {
+			r.buf = append(r.buf, tmp[:n]...)
+		}
+		if err == io.EOF {
+			r.eof = true
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+	}
 }
 
 // GenerateJSON POSTs the prompt + schema to OpenRouter and returns the model's JSON content bytes.

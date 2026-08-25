@@ -39,6 +39,7 @@ func TestRunRAG_NilEmbedder(t *testing.T) {
 		context.Background(),
 		nil, // emb nil
 		indexing.SearchDeps{Pool: nil},
+		nil, // ragCache (P1+P2): nil = comportamento legado
 		"tenant-1",
 		nil,
 		"query text",
@@ -63,6 +64,7 @@ func TestRunRAG_NilPool(t *testing.T) {
 		context.Background(),
 		emb,
 		indexing.SearchDeps{Pool: nil}, // pool nil
+		nil,                             // ragCache
 		"tenant-1",
 		nil,
 		"query text",
@@ -84,6 +86,7 @@ func TestRunRAG_EmbedError(t *testing.T) {
 		context.Background(),
 		emb,
 		indexing.SearchDeps{Pool: nil},
+		nil, // ragCache (P1+P2): nil = comportamento legado
 		"tenant-1",
 		nil,
 		"query text",
@@ -112,6 +115,7 @@ func TestRunRAG_EmptyEmbedResult_NotGrounded(t *testing.T) {
 		context.Background(),
 		emb,
 		indexing.SearchDeps{Pool: nil},
+		nil, // ragCache (P1+P2): nil = comportamento legado
 		"tenant-1",
 		nil,
 		"query text",
@@ -145,6 +149,7 @@ func TestRunRAG_CourtRecordID_GatesFire(t *testing.T) {
 				context.Background(),
 				emb,
 				indexing.SearchDeps{Pool: nil},
+				nil, // ragCache
 				"tenant-1",
 				tt.crid,
 				"query text",
