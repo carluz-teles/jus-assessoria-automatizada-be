@@ -48,6 +48,35 @@ func NewDJENParser(cal businessCalendar) *DJENParser {
 	return &DJENParser{calendar: cal}
 }
 
+// DJEN communication kinds (tipoComunicacao) as the Comunica API spells them,
+// mapped to the app's intimation type constants. Anything else is a generic
+// COMUNICACAO — an unknown kind is never an error.
+const (
+	djenTipoIntimacao = "Intimação"
+	djenTipoCitacao   = "Citação"
+)
+
+// tribunalUF maps a DJEN siglaTribunal to the two-letter UF whose STATE holiday
+// calendar governs that court's deadlines. State courts (TJxx) map to their UF;
+// the superior courts map to "" (only the NATIONAL calendar applies to them).
+// A sigla ABSENT from this map is unknown: the parser falls back to uf "" (still
+// honouring national holidays + the forensic recess) and logs a warning, never
+// aborting. Federal/labour regionals (TRFx/TRTx) span multiple UFs and are
+// intentionally omitted — they resolve to the national calendar until a court-
+// scoped holiday feed is seeded per tribunal.
+var tribunalUF = map[string]string{
+	"TJAC": "AC", "TJAL": "AL", "TJAP": "AP", "TJAM": "AM",
+	"TJBA": "BA", "TJCE": "CE", "TJDFT": "DF", "TJES": "ES",
+	"TJGO": "GO", "TJMA": "MA", "TJMT": "MT", "TJMS": "MS",
+	"TJMG": "MG", "TJPA": "PA", "TJPB": "PB", "TJPR": "PR",
+	"TJPE": "PE", "TJPI": "PI", "TJRJ": "RJ", "TJRN": "RN",
+	"TJRS": "RS", "TJRO": "RO", "TJRR": "RR", "TJSC": "SC",
+	"TJSP": "SP", "TJSE": "SE", "TJTO": "TO",
+	// Superior courts: national calendar only, so no UF — present with "" so a
+	// legitimate superior-court sigla does NOT trip the unknown-sigla warning.
+	"STF": "", "STJ": "", "TST": "", "TSE": "", "STM": "",
+}
+
 var _ Parser = (*DJENParser)(nil)
 
 // djenComunicacao is the subset of a Comunica API item the parser maps. The
@@ -98,6 +127,24 @@ type djenRecipient struct {
 	OABUF     string `json:"oab_uf"`
 	Matched   bool   `json:"matched"`
 }
+
+// djenRecipientFlat is one flattened addressee in the recipients jsonb. Polo is set
+// for parties; OABNumber/OABUF for lawyers; Matched is true only for a lawyer
+// whose OAB the tenant's scope queried.
+type djenRecipientFlat struct {
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Polo      string `json:"polo,omitempty"`
+	OABNumber string `json:"oabNumber,omitempty"`
+	OABUF     string `json:"oabUf,omitempty"`
+	Matched   bool   `json:"matched"`
+}
+
+// Recipient kinds written into the recipients jsonb.
+const (
+	recipientKindParty  = "PARTY"
+	recipientKindLawyer = "LAWYER"
+)
 
 // CanParse claims any DJEN payload (matched by source, not connector id, so a
 // real and a replayed DJEN payload both route here).
@@ -472,6 +519,32 @@ func djenType(tipo string) string {
 	}
 }
 
+// mapIntimationType maps the DJEN tipoComunicacao to an intimation type. An
+// unrecognised kind is a generic COMUNICACAO, never an error.
+func mapIntimationType(tipo string) string {
+	switch tipo {
+	case djenTipoIntimacao:
+		return IntimationTypeIntimacao
+	case djenTipoCitacao:
+		return IntimationTypeCitacao
+	default:
+		return IntimationTypeComunicacao
+	}
+}
+
+// courtUF resolves the UF whose state calendar applies to a DJEN sigla. An
+// unknown sigla is not fatal: it falls back to "" (national calendar only) and
+// warns so the missing mapping surfaces without breaking the sync.
+func courtUF(ctx context.Context, sigla string) string {
+	uf, ok := tribunalUF[sigla]
+	if !ok {
+		slog.WarnContext(ctx, "djen parser: unknown court sigla, using national calendar only",
+			"sigla", sigla)
+		return ""
+	}
+	return uf
+}
+
 // parseDJENDate parses an optional ISO date, returning the zero time when it is
 // absent or malformed (a cancellation date we cannot read is dropped, not fatal —
 // the status still reflects the cancellation).
@@ -492,4 +565,72 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// oabKeyEntry is the (number, UF) identity a scope match keys on — the pair, not a
+// combined string, mirroring how a fetch queries the DJEN per (number, UF).
+type oabKeyEntry struct {
+	number string
+	uf     string
+}
+
+// oabSet is the tenant's queried OAB registrations, for O(1) matched lookups.
+type oabSet map[oabKeyEntry]bool
+
+// newOABSet indexes the envelope's scope OABs for matching.
+func newOABSet(entries []djenOABEntry) oabSet {
+	set := make(oabSet, len(entries))
+	for _, e := range entries {
+		set[oabKeyEntry{number: e.Number, uf: e.UF}] = true
+	}
+	return set
+}
+
+// has reports whether (number, uf) is in the scope.
+func (s oabSet) has(number, uf string) bool {
+	return s[oabKeyEntry{number: number, uf: uf}]
+}
+
+// djenEnvelope is the aggregated payload the DJENConnector produces: every
+// comunicação fetched for the tenant's OABs, plus the scope those OABs form so
+// the parser can flag matched lawyers. Its json tags are the wire contract
+// between the connector (sub-slice B) and this parser.
+type djenEnvelope struct {
+	Scope djenScopeEntry  `json:"scope"`
+	Items []djenItemEntry `json:"items"`
+}
+
+// djenScopeEntry carries the OAB registrations the fetch queried.
+type djenScopeEntry struct {
+	OABs []djenOABEntry `json:"oabs"`
+}
+
+// djenOABEntry is one queried OAB registration (bare number + UF seccional).
+type djenOABEntry struct {
+	Number string `json:"number"`
+	UF     string `json:"uf"`
+}
+
+// djenItemEntry is one comunicação as the CNJ Comunica API reports it. numero_processo
+// arrives already without the CNJ mask.
+type djenItemEntry struct {
+	Hash                  string                     `json:"hash"`
+	NumeroProcesso        string                     `json:"numero_processo"`
+	SiglaTribunal         string                     `json:"siglaTribunal"`
+	NomeClasse            string                     `json:"nomeClasse"`
+	NomeOrgao             string                     `json:"nomeOrgao"`
+	TipoComunicacao       string                     `json:"tipoComunicacao"`
+	Texto                 string                     `json:"texto"`
+	Link                  string                     `json:"link"`
+	DataDisponibilizacao  string                     `json:"data_disponibilizacao"`
+	DataCancelamento      *string                    `json:"data_cancelamento"`
+	MotivoCancelamento    *string                    `json:"motivo_cancelamento"`
+	Destinatarios         []djenDestinatario         `json:"destinatarios"`
+	DestinatarioAdvogados []djenDestinatarioAdvogado `json:"destinatarioadvogados"`
+}
+
+// djenDestinatarioAdvogado wraps the lawyer addressee, matching the Comunica
+// API's nesting of the advogado object.
+type djenDestinatarioAdvogado struct {
+	Advogado djenAdvogado `json:"advogado"`
 }

@@ -475,3 +475,71 @@ func TestPartyRoleFromPoloUnknown(t *testing.T) {
 		})
 	}
 }
+
+// TestMapIntimationType verifies the mapIntimationType function.
+func TestMapIntimationType(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"Intimação", IntimationTypeIntimacao},
+		{"Citação", IntimationTypeCitacao},
+		{"Edital", IntimationTypeComunicacao},
+		{"", IntimationTypeComunicacao},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			t.Parallel()
+			if got := mapIntimationType(tt.in); got != tt.want {
+				t.Errorf("mapIntimationType(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCourtUF verifies the courtUF function against the tribunalUF map.
+func TestCourtUF(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		sigla string
+		want  string
+	}{
+		{"TJSP", "SP"},
+		{"TJRJ", "RJ"},
+		{"STF", ""},
+		{"STJ", ""},
+		{"TJZZ", ""}, // unknown falls back to ""
+	}
+	for _, tt := range tests {
+		t.Run(tt.sigla, func(t *testing.T) {
+			t.Parallel()
+			got := courtUF(context.Background(), tt.sigla)
+			if got != tt.want {
+				t.Errorf("courtUF(%q) = %q, want %q", tt.sigla, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOabSetHas verifies the oabSet.has method.
+func TestOabSetHas(t *testing.T) {
+	t.Parallel()
+
+	set := newOABSet([]djenOABEntry{
+		{Number: "12345", UF: "SP"},
+		{Number: "67890", UF: "RJ"},
+	})
+
+	if !set.has("12345", "SP") {
+		t.Error("has(12345, SP) = false, want true")
+	}
+	if set.has("12345", "RJ") {
+		t.Error("has(12345, RJ) = true, want false")
+	}
+	if set.has("99999", "SP") {
+		t.Error("has(99999, SP) = true, want false")
+	}
+}
