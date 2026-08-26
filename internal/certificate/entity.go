@@ -18,19 +18,43 @@ import "time"
 // AES-GCM local + DEK wrapped pelo GCP KMS). Sem KMS master key, sem forma de
 // decifrar — nem a service account do api sozinha basta, precisa da KMS role.
 type Certificate struct {
-	ID          string
-	TenantID    string
-	OwnerUserID string
-	SubjectCN   string    // Common Name do titular ("LUAN GOMES")
-	OAB         string    // "347019/SP" quando o cert traz; "" quando não
-	Issuer      string    // AC emissora (ex.: "AC Certisign RFB G5")
-	Serial      string    // número de série do X.509
-	NotBefore   time.Time // início de validade
-	NotAfter    time.Time // fim de validade
-	Fingerprint string    // SHA-256 do DER do cert, hex sem separador
-	Envelope    Envelope  // ciphertext + nonce + wrapped_dek + kek_ref
-	CreatedAt   time.Time
-	RevokedAt   *time.Time // nil = ativo; non-nil = soft-deleted
+	ID             string
+	TenantID       string
+	OwnerUserID    string
+	SubjectCN      string    // Common Name do titular ("LUAN GOMES")
+	OAB            string    // "347019/SP" quando o cert traz; "" quando não
+	Issuer         string    // AC emissora (ex.: "AC Certisign RFB G5")
+	Serial         string    // número de série do X.509
+	NotBefore      time.Time // início de validade
+	NotAfter       time.Time // fim de validade
+	Fingerprint    string    // SHA-256 do DER do cert, hex sem separador
+	Envelope       Envelope  // ciphertext + nonce + wrapped_dek + kek_ref
+	CreatedAt      time.Time
+	RevokedAt      *time.Time     // nil = ativo; non-nil = soft-deleted
+	PasswordPolicy PasswordPolicy // quando o Sign exige comparar a senha do request com o vault
+}
+
+// PasswordPolicy controla se POST /certificates/:id/sign exige que a senha do
+// request bata com a senha guardada no vault (comparação em tempo constante,
+// ver Sign em domain.go). "session" existe pro contrato — o BE trata igual a
+// "always"; o cache de 30min mencionado no design é UX pura do FE (ele decide
+// se re-pergunta a senha ou reusa a última validada).
+type PasswordPolicy string
+
+const (
+	PasswordPolicyAlways  PasswordPolicy = "always"  // sempre exige e compara a senha
+	PasswordPolicySession PasswordPolicy = "session" // BE trata igual a "always"
+	PasswordPolicyNever   PasswordPolicy = "never"   // nunca exige/compara (assinatura automática)
+)
+
+// Valid reports whether p é um dos três valores aceitos pela CHECK constraint
+// da coluna certificate.password_policy.
+func (p PasswordPolicy) Valid() bool {
+	switch p {
+	case PasswordPolicyAlways, PasswordPolicySession, PasswordPolicyNever:
+		return true
+	}
+	return false
 }
 
 // CertMetadata is the shape returned by pkcs12 parse (preview or upload). It

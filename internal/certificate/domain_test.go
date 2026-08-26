@@ -67,6 +67,13 @@ type fakeRepo struct {
 	recordedCID  string
 	recordedTID  string
 	recordedUser string
+
+	updateRes         *Certificate
+	updateErr         error
+	updatedID         string
+	updatedTID        string
+	updatedPolicy     PasswordPolicy
+	updatePolicyCalls int
 }
 
 func (r *fakeRepo) Insert(_ context.Context, _ database.Tx, c *Certificate) (string, time.Time, error) {
@@ -94,6 +101,15 @@ func (r *fakeRepo) RecordSigning(_ context.Context, _ database.Tx, tenantID, cer
 	r.recordedTID, r.recordedCID, r.recordedUser = tenantID, certificateID, signerUserID
 	r.recordedDig = digest
 	return r.recordErr
+}
+
+func (r *fakeRepo) UpdatePasswordPolicy(_ context.Context, _ database.Tx, tenantID, id string, policy PasswordPolicy) (*Certificate, error) {
+	r.updatePolicyCalls++
+	r.updatedTID, r.updatedID, r.updatedPolicy = tenantID, id, policy
+	if r.updateErr != nil {
+		return nil, r.updateErr
+	}
+	return r.updateRes, nil
 }
 
 // --- Upload -------------------------------------------------------------------
@@ -300,6 +316,118 @@ func TestSign_RoundTrip_RecordsAudit(t *testing.T) {
 	is.Equal("user-1", repo.recordedUser)
 }
 
+// --- Sign / password policy matrix ------------------------------------------
+//
+// Regression coverage for the bug fixed here: Sign() used to discard the
+// request password entirely (`_ string`), so ANY password — including empty —
+// "worked" because it was never compared with the vault. These tests pin the
+// comparison for every PasswordPolicy value.
+
+func TestSign_PolicyAlways_WrongPassword_RejectedWithoutSigning(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV", "right-pw", time.Hour)
+	require.Equal(t, PasswordPolicyAlways, cert.PasswordPolicy, "Upload defaults to 'always'")
+	repo.getRes = cert
+
+	sum := sha256.Sum256([]byte("doc"))
+	res, err := uc.Sign(context.Background(), "tenant-x", "cert-1", "user-1", "wrong-pw", sum[:])
+	is.Nil(res)
+	is.ErrorIs(err, ErrInvalidPassword)
+	is.Nil(repo.recordedDig, "signing must never proceed past a rejected password")
+}
+
+func TestSign_PolicyAlways_EmptyPassword_Rejected(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV", "right-pw", time.Hour)
+	repo.getRes = cert
+
+	sum := sha256.Sum256([]byte("doc"))
+	res, err := uc.Sign(context.Background(), "tenant-x", "cert-1", "user-1", "", sum[:])
+	is.Nil(res)
+	is.ErrorIs(err, ErrInvalidPassword)
+	is.Nil(repo.recordedDig)
+}
+
+func TestSign_PolicyNever_EmptyPassword_Signs(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV", "right-pw", time.Hour)
+	cert.PasswordPolicy = PasswordPolicyNever
+	repo.getRes = cert
+
+	sum := sha256.Sum256([]byte("doc"))
+	res, err := uc.Sign(context.Background(), "tenant-x", "cert-1", "user-1", "", sum[:])
+	require.NoError(t, err)
+	is.NotEmpty(res.Signature)
+	is.Equal(sum[:], repo.recordedDig)
+}
+
+func TestSign_PolicyNever_WrongPasswordSentAnyway_StillSigns(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV", "right-pw", time.Hour)
+	cert.PasswordPolicy = PasswordPolicyNever
+	repo.getRes = cert
+
+	sum := sha256.Sum256([]byte("doc"))
+	// The policy governs the outcome, not the caller's input — a wrong password
+	// sent under policy=never is simply ignored.
+	res, err := uc.Sign(context.Background(), "tenant-x", "cert-1", "user-1", "totally-wrong", sum[:])
+	require.NoError(t, err)
+	is.NotEmpty(res.Signature)
+}
+
+func TestSign_PolicySession_BehavesLikeAlways(t *testing.T) {
+	t.Parallel()
+
+	t.Run("correct password signs", func(t *testing.T) {
+		t.Parallel()
+		is := assert.New(t)
+
+		repo := &fakeRepo{}
+		uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+		cert := sealedCertificate(t, uc, repo, "ADV", "right-pw", time.Hour)
+		cert.PasswordPolicy = PasswordPolicySession
+		repo.getRes = cert
+
+		sum := sha256.Sum256([]byte("doc"))
+		res, err := uc.Sign(context.Background(), "tenant-x", "cert-1", "user-1", "right-pw", sum[:])
+		require.NoError(t, err)
+		is.NotEmpty(res.Signature)
+	})
+
+	t.Run("wrong password rejected", func(t *testing.T) {
+		t.Parallel()
+		is := assert.New(t)
+
+		repo := &fakeRepo{}
+		uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+		cert := sealedCertificate(t, uc, repo, "ADV", "right-pw", time.Hour)
+		cert.PasswordPolicy = PasswordPolicySession
+		repo.getRes = cert
+
+		sum := sha256.Sum256([]byte("doc"))
+		res, err := uc.Sign(context.Background(), "tenant-x", "cert-1", "user-1", "wrong-pw", sum[:])
+		is.Nil(res)
+		is.ErrorIs(err, ErrInvalidPassword)
+		is.Nil(repo.recordedDig)
+	})
+}
+
 func TestSign_Revoked_Rejected(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
@@ -341,4 +469,52 @@ func TestSign_RecordSigningError_Propagates(t *testing.T) {
 	sum := sha256.Sum256([]byte("x"))
 	_, err := uc.Sign(context.Background(), "t", "c", "u", "pw", sum[:])
 	is.Error(err)
+}
+
+// --- UpdatePasswordPolicy -----------------------------------------------------
+
+func TestUpdatePasswordPolicy_Valid_UpdatesViaRepo(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	updated := &Certificate{ID: "cert-1", PasswordPolicy: PasswordPolicyNever}
+	repo := &fakeRepo{updateRes: updated}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, uow, newFakeCipher(t), &fakeOutbox{})
+
+	got, err := uc.UpdatePasswordPolicy(context.Background(), "tenant-x", "cert-1", PasswordPolicyNever)
+	require.NoError(t, err)
+	is.Same(updated, got)
+	is.Equal(1, repo.updatePolicyCalls)
+	is.Equal("tenant-x", repo.updatedTID)
+	is.Equal("cert-1", repo.updatedID)
+	is.Equal(PasswordPolicyNever, repo.updatedPolicy)
+	is.Equal([]string{"tenant-x"}, uow.scopes)
+}
+
+func TestUpdatePasswordPolicy_InvalidValue_RejectedWithoutTouchingRepo(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, uow, newFakeCipher(t), &fakeOutbox{})
+
+	got, err := uc.UpdatePasswordPolicy(context.Background(), "tenant-x", "cert-1", PasswordPolicy("bogus"))
+	is.Nil(got)
+	is.ErrorIs(err, ErrInvalidPasswordPolicy)
+	is.Zero(repo.updatePolicyCalls, "an invalid enum value must never reach the repository")
+	is.Empty(uow.scopes, "an invalid enum value must never open a tx")
+}
+
+func TestUpdatePasswordPolicy_Revoked_NotFound(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{updateErr: ErrCertificateNotFound}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+
+	got, err := uc.UpdatePasswordPolicy(context.Background(), "tenant-x", "cert-1", PasswordPolicyAlways)
+	is.Nil(got)
+	is.ErrorIs(err, ErrCertificateNotFound)
 }

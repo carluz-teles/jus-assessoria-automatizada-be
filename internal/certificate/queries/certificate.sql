@@ -14,14 +14,14 @@
 INSERT INTO certificate (
     tenant_id, owner_user_id,
     subject_cn, oab, issuer, serial, not_before, not_after, fingerprint,
-    ciphertext, nonce, wrapped_dek, kek_ref
+    ciphertext, nonce, wrapped_dek, kek_ref, password_policy
 ) VALUES (
     $1, $2,
     $3, $4, $5, $6, $7, $8, $9,
-    $10, $11, $12, $13
+    $10, $11, $12, $13, $14
 )
 RETURNING id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
-          not_before, not_after, fingerprint, created_at, revoked_at;
+          not_before, not_after, fingerprint, created_at, revoked_at, password_policy;
 
 -- name: InsertSigningEvent :one
 -- Record that a certificate signed a digest (audit trail, committed in the SAME tx
@@ -42,7 +42,7 @@ UPDATE certificate
 SET revoked_at = $3
 WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
 RETURNING id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
-          not_before, not_after, fingerprint, created_at, revoked_at;
+          not_before, not_after, fingerprint, created_at, revoked_at, password_policy;
 
 -- name: GetCertificateByID :one
 -- Um certificado por id, tenant-scoped. Inclui o envelope (uso interno pra o
@@ -51,7 +51,7 @@ SELECT id, tenant_id, owner_user_id,
        subject_cn, oab, issuer, serial,
        not_before, not_after, fingerprint,
        ciphertext, nonce, wrapped_dek, kek_ref,
-       created_at, revoked_at
+       created_at, revoked_at, password_policy
 FROM certificate
 WHERE id = $1 AND tenant_id = $2;
 
@@ -61,10 +61,21 @@ WHERE id = $1 AND tenant_id = $2;
 SELECT c.id, c.tenant_id, c.owner_user_id,
        c.subject_cn, c.oab, c.issuer, c.serial,
        c.not_before, c.not_after, c.fingerprint,
-       c.created_at, c.revoked_at,
+       c.created_at, c.revoked_at, c.password_policy,
        u.name AS owner_user_name
 FROM certificate c
 LEFT JOIN app_user u ON u.id = c.owner_user_id
 WHERE c.tenant_id = $1
   AND c.revoked_at IS NULL
 ORDER BY c.created_at DESC;
+
+-- name: UpdateCertificatePasswordPolicy :one
+-- Troca a política de exigência de senha do Sign (PATCH
+-- /v1/certificates/:id/password-policy). Só afeta certificado ATIVO
+-- (revoked_at IS NULL) — revogado não recebe mais writes de configuração. $1 =
+-- id, $2 = tenant_id, $3 = password_policy.
+UPDATE certificate
+SET password_policy = $3
+WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+RETURNING id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
+          not_before, not_after, fingerprint, created_at, revoked_at, password_policy;

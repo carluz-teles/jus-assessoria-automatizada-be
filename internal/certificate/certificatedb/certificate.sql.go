@@ -17,7 +17,7 @@ SELECT id, tenant_id, owner_user_id,
        subject_cn, oab, issuer, serial,
        not_before, not_after, fingerprint,
        ciphertext, nonce, wrapped_dek, kek_ref,
-       created_at, revoked_at
+       created_at, revoked_at, password_policy
 FROM certificate
 WHERE id = $1 AND tenant_id = $2
 `
@@ -49,6 +49,7 @@ func (q *Queries) GetCertificateByID(ctx context.Context, arg GetCertificateByID
 		&i.KekRef,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.PasswordPolicy,
 	)
 	return i, err
 }
@@ -58,45 +59,47 @@ const insertCertificate = `-- name: InsertCertificate :one
 INSERT INTO certificate (
     tenant_id, owner_user_id,
     subject_cn, oab, issuer, serial, not_before, not_after, fingerprint,
-    ciphertext, nonce, wrapped_dek, kek_ref
+    ciphertext, nonce, wrapped_dek, kek_ref, password_policy
 ) VALUES (
     $1, $2,
     $3, $4, $5, $6, $7, $8, $9,
-    $10, $11, $12, $13
+    $10, $11, $12, $13, $14
 )
 RETURNING id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
-          not_before, not_after, fingerprint, created_at, revoked_at
+          not_before, not_after, fingerprint, created_at, revoked_at, password_policy
 `
 
 type InsertCertificateParams struct {
-	TenantID    uuid.UUID          `json:"tenant_id"`
-	OwnerUserID uuid.UUID          `json:"owner_user_id"`
-	SubjectCn   string             `json:"subject_cn"`
-	Oab         *string            `json:"oab"`
-	Issuer      string             `json:"issuer"`
-	Serial      string             `json:"serial"`
-	NotBefore   pgtype.Timestamptz `json:"not_before"`
-	NotAfter    pgtype.Timestamptz `json:"not_after"`
-	Fingerprint string             `json:"fingerprint"`
-	Ciphertext  []byte             `json:"ciphertext"`
-	Nonce       []byte             `json:"nonce"`
-	WrappedDek  []byte             `json:"wrapped_dek"`
-	KekRef      string             `json:"kek_ref"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	OwnerUserID    uuid.UUID          `json:"owner_user_id"`
+	SubjectCn      string             `json:"subject_cn"`
+	Oab            *string            `json:"oab"`
+	Issuer         string             `json:"issuer"`
+	Serial         string             `json:"serial"`
+	NotBefore      pgtype.Timestamptz `json:"not_before"`
+	NotAfter       pgtype.Timestamptz `json:"not_after"`
+	Fingerprint    string             `json:"fingerprint"`
+	Ciphertext     []byte             `json:"ciphertext"`
+	Nonce          []byte             `json:"nonce"`
+	WrappedDek     []byte             `json:"wrapped_dek"`
+	KekRef         string             `json:"kek_ref"`
+	PasswordPolicy string             `json:"password_policy"`
 }
 
 type InsertCertificateRow struct {
-	ID          uuid.UUID          `json:"id"`
-	TenantID    uuid.UUID          `json:"tenant_id"`
-	OwnerUserID uuid.UUID          `json:"owner_user_id"`
-	SubjectCn   string             `json:"subject_cn"`
-	Oab         *string            `json:"oab"`
-	Issuer      string             `json:"issuer"`
-	Serial      string             `json:"serial"`
-	NotBefore   pgtype.Timestamptz `json:"not_before"`
-	NotAfter    pgtype.Timestamptz `json:"not_after"`
-	Fingerprint string             `json:"fingerprint"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	OwnerUserID    uuid.UUID          `json:"owner_user_id"`
+	SubjectCn      string             `json:"subject_cn"`
+	Oab            *string            `json:"oab"`
+	Issuer         string             `json:"issuer"`
+	Serial         string             `json:"serial"`
+	NotBefore      pgtype.Timestamptz `json:"not_before"`
+	NotAfter       pgtype.Timestamptz `json:"not_after"`
+	Fingerprint    string             `json:"fingerprint"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+	PasswordPolicy string             `json:"password_policy"`
 }
 
 // certificate slice queries. Every statement runs inside the use case's tx so RLS
@@ -125,6 +128,7 @@ func (q *Queries) InsertCertificate(ctx context.Context, arg InsertCertificatePa
 		arg.Nonce,
 		arg.WrappedDek,
 		arg.KekRef,
+		arg.PasswordPolicy,
 	)
 	var i InsertCertificateRow
 	err := row.Scan(
@@ -140,6 +144,7 @@ func (q *Queries) InsertCertificate(ctx context.Context, arg InsertCertificatePa
 		&i.Fingerprint,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.PasswordPolicy,
 	)
 	return i, err
 }
@@ -183,7 +188,7 @@ const listCertificatesByTenant = `-- name: ListCertificatesByTenant :many
 SELECT c.id, c.tenant_id, c.owner_user_id,
        c.subject_cn, c.oab, c.issuer, c.serial,
        c.not_before, c.not_after, c.fingerprint,
-       c.created_at, c.revoked_at,
+       c.created_at, c.revoked_at, c.password_policy,
        u.name AS owner_user_name
 FROM certificate c
 LEFT JOIN app_user u ON u.id = c.owner_user_id
@@ -193,19 +198,20 @@ ORDER BY c.created_at DESC
 `
 
 type ListCertificatesByTenantRow struct {
-	ID            uuid.UUID          `json:"id"`
-	TenantID      uuid.UUID          `json:"tenant_id"`
-	OwnerUserID   uuid.UUID          `json:"owner_user_id"`
-	SubjectCn     string             `json:"subject_cn"`
-	Oab           *string            `json:"oab"`
-	Issuer        string             `json:"issuer"`
-	Serial        string             `json:"serial"`
-	NotBefore     pgtype.Timestamptz `json:"not_before"`
-	NotAfter      pgtype.Timestamptz `json:"not_after"`
-	Fingerprint   string             `json:"fingerprint"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	RevokedAt     pgtype.Timestamptz `json:"revoked_at"`
-	OwnerUserName *string            `json:"owner_user_name"`
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	OwnerUserID    uuid.UUID          `json:"owner_user_id"`
+	SubjectCn      string             `json:"subject_cn"`
+	Oab            *string            `json:"oab"`
+	Issuer         string             `json:"issuer"`
+	Serial         string             `json:"serial"`
+	NotBefore      pgtype.Timestamptz `json:"not_before"`
+	NotAfter       pgtype.Timestamptz `json:"not_after"`
+	Fingerprint    string             `json:"fingerprint"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+	PasswordPolicy string             `json:"password_policy"`
+	OwnerUserName  *string            `json:"owner_user_name"`
 }
 
 // Lista os ATIVOS do tenant (revoked_at IS NULL), ordenados por criação DESC.
@@ -232,6 +238,7 @@ func (q *Queries) ListCertificatesByTenant(ctx context.Context, tenantID uuid.UU
 			&i.Fingerprint,
 			&i.CreatedAt,
 			&i.RevokedAt,
+			&i.PasswordPolicy,
 			&i.OwnerUserName,
 		); err != nil {
 			return nil, err
@@ -249,7 +256,7 @@ UPDATE certificate
 SET revoked_at = $3
 WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
 RETURNING id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
-          not_before, not_after, fingerprint, created_at, revoked_at
+          not_before, not_after, fingerprint, created_at, revoked_at, password_policy
 `
 
 type RevokeCertificateParams struct {
@@ -259,18 +266,19 @@ type RevokeCertificateParams struct {
 }
 
 type RevokeCertificateRow struct {
-	ID          uuid.UUID          `json:"id"`
-	TenantID    uuid.UUID          `json:"tenant_id"`
-	OwnerUserID uuid.UUID          `json:"owner_user_id"`
-	SubjectCn   string             `json:"subject_cn"`
-	Oab         *string            `json:"oab"`
-	Issuer      string             `json:"issuer"`
-	Serial      string             `json:"serial"`
-	NotBefore   pgtype.Timestamptz `json:"not_before"`
-	NotAfter    pgtype.Timestamptz `json:"not_after"`
-	Fingerprint string             `json:"fingerprint"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	OwnerUserID    uuid.UUID          `json:"owner_user_id"`
+	SubjectCn      string             `json:"subject_cn"`
+	Oab            *string            `json:"oab"`
+	Issuer         string             `json:"issuer"`
+	Serial         string             `json:"serial"`
+	NotBefore      pgtype.Timestamptz `json:"not_before"`
+	NotAfter       pgtype.Timestamptz `json:"not_after"`
+	Fingerprint    string             `json:"fingerprint"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+	PasswordPolicy string             `json:"password_policy"`
 }
 
 // Soft-revoke a certificate (DELETE /v1/certificates/:id): stamp revoked_at = $3
@@ -293,6 +301,62 @@ func (q *Queries) RevokeCertificate(ctx context.Context, arg RevokeCertificatePa
 		&i.Fingerprint,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.PasswordPolicy,
+	)
+	return i, err
+}
+
+const updateCertificatePasswordPolicy = `-- name: UpdateCertificatePasswordPolicy :one
+UPDATE certificate
+SET password_policy = $3
+WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+RETURNING id, tenant_id, owner_user_id, subject_cn, oab, issuer, serial,
+          not_before, not_after, fingerprint, created_at, revoked_at, password_policy
+`
+
+type UpdateCertificatePasswordPolicyParams struct {
+	ID             uuid.UUID `json:"id"`
+	TenantID       uuid.UUID `json:"tenant_id"`
+	PasswordPolicy string    `json:"password_policy"`
+}
+
+type UpdateCertificatePasswordPolicyRow struct {
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	OwnerUserID    uuid.UUID          `json:"owner_user_id"`
+	SubjectCn      string             `json:"subject_cn"`
+	Oab            *string            `json:"oab"`
+	Issuer         string             `json:"issuer"`
+	Serial         string             `json:"serial"`
+	NotBefore      pgtype.Timestamptz `json:"not_before"`
+	NotAfter       pgtype.Timestamptz `json:"not_after"`
+	Fingerprint    string             `json:"fingerprint"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+	PasswordPolicy string             `json:"password_policy"`
+}
+
+// Troca a política de exigência de senha do Sign (PATCH
+// /v1/certificates/:id/password-policy). Só afeta certificado ATIVO
+// (revoked_at IS NULL) — revogado não recebe mais writes de configuração. $1 =
+// id, $2 = tenant_id, $3 = password_policy.
+func (q *Queries) UpdateCertificatePasswordPolicy(ctx context.Context, arg UpdateCertificatePasswordPolicyParams) (UpdateCertificatePasswordPolicyRow, error) {
+	row := q.db.QueryRow(ctx, updateCertificatePasswordPolicy, arg.ID, arg.TenantID, arg.PasswordPolicy)
+	var i UpdateCertificatePasswordPolicyRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.OwnerUserID,
+		&i.SubjectCn,
+		&i.Oab,
+		&i.Issuer,
+		&i.Serial,
+		&i.NotBefore,
+		&i.NotAfter,
+		&i.Fingerprint,
+		&i.CreatedAt,
+		&i.RevokedAt,
+		&i.PasswordPolicy,
 	)
 	return i, err
 }
