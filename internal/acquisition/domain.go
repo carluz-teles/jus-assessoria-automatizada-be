@@ -59,7 +59,10 @@ func NewUseCase(repo Repository, outbox publisher, uow database.UnitOfWork, opts
 // ActivateIntegration activates the tenant's DJEN watch under the given scope,
 // atomically: the integration row is upserted and an integration_activated event
 // is written to the outbox in the SAME transaction. DJEN is the only activatable
-// source (see ActivateIntegrationRequest) — there is no source selector.
+// source — there is no source selector. Not reachable over HTTP anymore (the
+// full-replace POST /v1/acquisition/integrations was removed — AddWatchedOAB/
+// ToggleWatchedOAB fully replaced it); kept as the seam AddWatchedOAB reuses to
+// resolve-or-create the integration, and as test scaffolding.
 //
 // The event fires only when activation changed something: a first activation, a
 // changed scope, or a re-activation of a source that was not ACTIVE. Re-posting

@@ -40,11 +40,8 @@ func (r stubResolver) Resolve(context.Context, string, string) (httpx.Principal,
 
 // fakeHandlerUC records what the handler passed and returns canned results.
 type fakeHandlerUC struct {
-	activateResp   *Integration
-	listResp       []*Integration
-	gotTenantID    string
-	gotScope       Scope
-	activateCalled bool
+	listResp    []*Integration
+	gotTenantID string
 	// Responsável write path (AssignResponsible): what the handler forwarded, and an
 	// optional canned error to drive the failure branches.
 	gotAssignTenant string
@@ -67,13 +64,6 @@ type fakeHandlerUC struct {
 	toggleWatchedOABErr  error
 	gotToggleOAB         string
 	gotToggleEnabled     bool
-}
-
-func (f *fakeHandlerUC) ActivateIntegration(_ context.Context, tenantID string, scope Scope) (*Integration, error) {
-	f.gotTenantID = tenantID
-	f.gotScope = scope
-	f.activateCalled = true
-	return f.activateResp, nil
 }
 
 func (f *fakeHandlerUC) ListIntegrations(_ context.Context, tenantID string) ([]*Integration, error) {
@@ -231,88 +221,6 @@ func do(t *testing.T, app *fiber.App, method, path, body, bearer string) (int, s
 		t.Fatalf("read body: %v", err)
 	}
 	return resp.StatusCode, string(raw)
-}
-
-const validBody = `{"scope":{"oab":["SP123456"]}}`
-
-// --- tests -------------------------------------------------------------------
-
-// AC6: no bearer token → 401 at the auth boundary, handler never runs.
-func TestHandler_Activate_NoToken_401(t *testing.T) {
-	t.Parallel()
-
-	app := newApp(&fakeHandlerUC{}, roleAdmin, "tenant-1")
-	status, _ := do(t, app, http.MethodPost, "/v1/acquisition/integrations", validBody, "")
-	if status != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", status)
-	}
-}
-
-// AC7: an authenticated LAWYER → 403 (activation is ADMIN-only).
-func TestHandler_Activate_Lawyer_403(t *testing.T) {
-	t.Parallel()
-
-	app := newApp(&fakeHandlerUC{}, "LAWYER", "tenant-1")
-	status, _ := do(t, app, http.MethodPost, "/v1/acquisition/integrations", validBody, "jwt")
-	if status != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", status)
-	}
-}
-
-// AC1 (handler): an ADMIN with a valid body → 201, tenant taken from the
-// principal (not the body), and the response carries no credential_ref (AC10).
-func TestHandler_Activate_Admin_201(t *testing.T) {
-	t.Parallel()
-
-	uc := &fakeHandlerUC{activateResp: &Integration{
-		ID: "i1", Source: SourceDJEN, Scope: Scope{OAB: []string{"SP123456"}}, Status: StatusActive,
-	}}
-	app := newApp(uc, roleAdmin, "tenant-42")
-
-	status, body := do(t, app, http.MethodPost, "/v1/acquisition/integrations", validBody, "jwt")
-	if status != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body=%s", status, body)
-	}
-	if uc.gotTenantID != "tenant-42" {
-		t.Fatalf("tenant passed to uc = %q, want tenant-42 (from principal)", uc.gotTenantID)
-	}
-	if len(uc.gotScope.OAB) != 1 || uc.gotScope.OAB[0] != "SP123456" {
-		t.Fatalf("scope passed = %+v, want oab [SP123456]", uc.gotScope)
-	}
-	// AC10: credential_ref must never surface in the response.
-	if strings.Contains(body, "credential_ref") {
-		t.Fatalf("response leaked credential_ref: %s", body)
-	}
-}
-
-// AC2/AC3/AC4 (via HTTP): a validation failure is a 400, even for an ADMIN. The
-// use case is never called.
-func TestHandler_Activate_InvalidBody_400(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		body string
-	}{
-		{name: "AC2 empty oab", body: `{"scope":{"oab":[]}}`},
-		{name: "AC3 malformed oab", body: `{"scope":{"oab":["bad"]}}`},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			uc := &fakeHandlerUC{}
-			app := newApp(uc, roleAdmin, "tenant-1")
-			status, body := do(t, app, http.MethodPost, "/v1/acquisition/integrations", tt.body, "jwt")
-			if status != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400; body=%s", status, body)
-			}
-			if uc.activateCalled {
-				t.Fatalf("use case was called on invalid input (scope=%+v)", uc.gotScope)
-			}
-		})
-	}
 }
 
 // AC9: GET returns the tenant's integrations, scoped by the principal's tenant.

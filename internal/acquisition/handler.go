@@ -32,7 +32,6 @@ const roleAdmin = "ADMIN"
 // handlerUC is the narrow port the Handler uses from the acquisition write use
 // case — the integration activation/list methods.
 type handlerUC interface {
-	ActivateIntegration(ctx context.Context, tenantID string, scope Scope) (*Integration, error)
 	ListIntegrations(ctx context.Context, tenantID string) ([]*Integration, error)
 	// AssignResponsible sets/clears the responsável on the process behind a court_record
 	// :id, in one tx. It returns only an error; the handler re-reads the ProcessoView
@@ -125,7 +124,6 @@ func NewHandler(uc handlerUC, reader reader, resumer resumer, analyzer analyzer,
 // write route is guarded by RequireRole(ADMIN); the reads are open to any
 // authenticated principal of the tenant (scoped to its own rows).
 func (h *Handler) RegisterV1(r fiber.Router) {
-	r.Post("/acquisition/integrations", middleware.RequireRole(roleAdmin), h.activate)
 	r.Get("/acquisition/integrations", h.list)
 	r.Get("/acquisition/oab-lookup", h.oabLookup)
 	r.Get("/acquisition/import-status", h.importStatus)
@@ -279,28 +277,6 @@ type integrationView struct {
 // whole — no cursor pagination.
 type listEnvelope struct {
 	Data []integrationView `json:"data"`
-}
-
-// activate handles POST /v1/acquisition/integrations: validates the body,
-// activates the tenant's DJEN watch under the given scope (row + event in one
-// tx), and returns 201 with the activated integration. tenant_id comes from the
-// verified principal, never the body.
-func (h *Handler) activate(c *fiber.Ctx) error {
-	var req ActivateIntegrationRequest
-	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
-	}
-	if err := req.Validate(); err != nil {
-		return httpx.WriteValidationError(c, err)
-	}
-
-	tenantID := httpx.TenantFromCtx(c)
-	integration, err := h.uc.ActivateIntegration(c.UserContext(), tenantID, req.Scope)
-	if err != nil {
-		return httpx.WriteError(c, err)
-	}
-
-	return c.Status(fiber.StatusCreated).JSON(newListEnvelope([]*Integration{integration}))
 }
 
 // list handles GET /v1/acquisition/integrations: returns the tenant's

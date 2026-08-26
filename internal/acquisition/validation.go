@@ -14,25 +14,6 @@ import (
 // and allocates).
 var oabRegex = regexp.MustCompile(`^[A-Z]{2}\d{1,6}$`)
 
-// ActivateIntegrationRequest is the POST /v1/acquisition/integrations body: the
-// scope to watch. tenant_id is NOT here — it comes from the verified principal.
-// credential_ref is NOT here either — it is never accepted from the client (v0
-// leaves it NULL). There is no source selector: DJEN is the only activatable
-// source (the sole one that DISCOVERS a process nationally, by OAB) and every
-// activation targets it — DATAJUD only ENRICHES an already-discovered process
-// (by number), triggered by court_record_observed, never by this endpoint.
-type ActivateIntegrationRequest struct {
-	Scope Scope `json:"scope"`
-}
-
-// Validate enforces the boundary rule via ozzo (method-based, not struct tags):
-// the scope must be valid. A failure is a 400 at the edge (KindInvalid).
-func (r ActivateIntegrationRequest) Validate() error {
-	return validation.ValidateStruct(&r,
-		validation.Field(&r.Scope),
-	)
-}
-
 // AssignResponsibleRequest is the PUT /v1/processos/:id/responsavel body: the user to
 // make responsável for the process, or null to desatribuir. UserID is a *string so the
 // caller can send an explicit null (unset the responsável) distinctly from omitting it.
@@ -117,7 +98,7 @@ type AddWatchedOABRequest struct {
 }
 
 // Validate enforces the boundary rule: OAB must be present and a well-formed
-// registration (reuses oabRegex — the same shape ActivateIntegrationRequest checks).
+// registration (reuses oabRegex — the same shape Scope.Validate checks).
 func (r AddWatchedOABRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.OAB, validation.Required, validation.Match(oabRegex)),
