@@ -49,20 +49,22 @@ func (f *fakeAnaliseGen) GenerateJSONStream(_ context.Context, req llm.Request, 
 
 // fakeAnaliseStore records the persisted analysis and can be told to fail.
 type fakeAnaliseStore struct {
-	calls       int
-	gotTenantID string
-	gotIntimID  string
-	gotSummary  string
-	gotProvJSON []byte
-	err         error
+	calls          int
+	gotTenantID    string
+	gotIntimID     string
+	gotSummary     string
+	gotProvJSON    []byte
+	gotLogActivity bool
+	err            error
 }
 
-func (f *fakeAnaliseStore) SaveAnalise(_ context.Context, tenantID, intimationID, summary string, providencias []byte) error {
+func (f *fakeAnaliseStore) SaveAnalise(_ context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error {
 	f.calls++
 	f.gotTenantID = tenantID
 	f.gotIntimID = intimationID
 	f.gotSummary = summary
 	f.gotProvJSON = providencias
+	f.gotLogActivity = logActivity
 	return f.err
 }
 
@@ -113,6 +115,9 @@ func TestAnalisar_HappyPath_ParsesAndPersists(t *testing.T) {
 	if store.gotTenantID != "t" || store.gotIntimID != "i" {
 		t.Errorf("store ids = {%q, %q}, want {t, i}", store.gotTenantID, store.gotIntimID)
 	}
+	if !store.gotLogActivity {
+		t.Error("logActivity = false, want true on the success path (INTIMATION_ANALYSIS_COMPLETED)")
+	}
 	// The persisted providências must be the parsed+sanitized list, as JSON.
 	var persisted []IntimacaoProvidenciaView
 	if err := json.Unmarshal(store.gotProvJSON, &persisted); err != nil {
@@ -147,6 +152,9 @@ func TestAnalisar_NilGenerator_PersistsDegraded(t *testing.T) {
 	if store.calls != 1 || store.gotSummary != "" || string(store.gotProvJSON) != "[]" {
 		t.Errorf("degraded persist = {calls:%d, summary:%q, prov:%s}, want {1, \"\", []}", store.calls, store.gotSummary, store.gotProvJSON)
 	}
+	if store.gotLogActivity {
+		t.Error("logActivity = true, want false on the degraded path (no LLM configured)")
+	}
 
 	// The wire serialization must be [] and never null.
 	raw, err := json.Marshal(view)
@@ -177,6 +185,9 @@ func TestAnalisar_LLMFault_Degrades(t *testing.T) {
 	if store.calls != 1 {
 		t.Errorf("store calls = %d, want 1 (degraded still persists)", store.calls)
 	}
+	if store.gotLogActivity {
+		t.Error("logActivity = true, want false on the degraded path (LLM fault)")
+	}
 }
 
 // A malformed LLM payload also degrades (parse fault → empty analysis, never 5xx).
@@ -193,6 +204,9 @@ func TestAnalisar_MalformedJSON_Degrades(t *testing.T) {
 	}
 	if view.Summary != "" || len(view.Providencias) != 0 {
 		t.Errorf("view = %#v, want the degraded empty analysis", view)
+	}
+	if store.gotLogActivity {
+		t.Error("logActivity = true, want false on the degraded path (parse fault)")
 	}
 }
 

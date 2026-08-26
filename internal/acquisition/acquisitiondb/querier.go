@@ -432,6 +432,12 @@ type Querier interface {
 	// per hash). (xmax = 0) tells the caller whether THIS upsert inserted a fresh row
 	// (true) or updated an existing one (false), so it can still tally new vs. deduped.
 	InsertIntimation(ctx context.Context, arg InsertIntimationParams) (InsertIntimationRow, error)
+	// Appends one row to the process's activity log (docs — Cockpit "Atividade" timeline).
+	// event_type is the closed set the migration's CHECK enforces; payload carries the
+	// event-specific detail as jsonb. Scoped by tenant_id (barrier 1) + RLS (barrier 2). Called
+	// LOG-NOT-FAIL by producers: a failed insert here must never roll back the write it
+	// documents, so callers log-and-continue on error instead of propagating it.
+	InsertProcessActivityLog(ctx context.Context, arg InsertProcessActivityLogParams) error
 	// publication store queries (acquisition slice). The national DJEN firehose: the
 	// ingestion sweeps the diário by tribunal/day and lands every communication here,
 	// to be matched to tenants' watched OABs locally. No tenant scope (national reference
@@ -638,7 +644,9 @@ type Querier interface {
 	// Persists (OVERWRITES) the AI analysis of one intimation. Unlike SetCourtRecordAIResume
 	// there is NO write-once guard — the analysis is re-executable ("Gerar novamente"). Scoped
 	// by tenant_id (barrier 1). Degraded mode passes ai_summary='' + ai_providencias='[]'.
-	SetIntimationAIAnalysis(ctx context.Context, arg SetIntimationAIAnalysisParams) error
+	// RETURNING court_record_id so the caller can log a process_activity_log row in the SAME
+	// tx, without a second round-trip to look up the owning court record.
+	SetIntimationAIAnalysis(ctx context.Context, arg SetIntimationAIAnalysisParams) (uuid.UUID, error)
 	// Overwrites ONLY the ai_providencias jsonb (leaves ai_summary / ai_analyzed_at untouched) —
 	// the write half of the aprovar/descartar status flip. Scoped by tenant_id (barrier 1).
 	SetIntimationProvidencias(ctx context.Context, arg SetIntimationProvidenciasParams) error

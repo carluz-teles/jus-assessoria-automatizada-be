@@ -60,8 +60,11 @@ type analiseReader interface {
 }
 
 // analiseStore persists the AI analysis (OVERWRITE — re-executable). nil skips the write.
+// logActivity tells the store whether this write should also append a process activity log
+// row (true on a real/successful analysis, false on the degraded write — a degraded analysis
+// is not something to surface on the process timeline).
 type analiseStore interface {
-	SaveAnalise(ctx context.Context, tenantID, intimationID, summary string, providencias []byte) error
+	SaveAnalise(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error
 }
 
 // AnaliseUseCase composes the intimation context, calls the LLM for the analysis, persists
@@ -143,7 +146,7 @@ func (uc *AnaliseUseCase) Analisar(ctx context.Context, tenantID, intimationID s
 	if err != nil {
 		rawProv = []byte("[]")
 	}
-	uc.persist(ctx, tenantID, intimationID, view.Summary, rawProv)
+	uc.persist(ctx, tenantID, intimationID, view.Summary, rawProv, true)
 	return view, nil
 }
 
@@ -258,17 +261,18 @@ func clampDueDate(due *string, endDate string) *string {
 // persistDegraded writes+returns the empty analysis (summary="", providencias=[]) with a
 // fresh analyzed_at, so the FE moves to pós-análise and shows the "IA indisponível" state.
 func (uc *AnaliseUseCase) persistDegraded(ctx context.Context, tenantID, intimationID string) IntimacaoAnaliseView {
-	uc.persist(ctx, tenantID, intimationID, "", []byte("[]"))
+	uc.persist(ctx, tenantID, intimationID, "", []byte("[]"), false)
 	return IntimacaoAnaliseView{Summary: "", Providencias: []IntimacaoProvidenciaView{}, AnalyzedAt: time.Now()}
 }
 
 // persistWrite write-throughs best-effort; a store fault is logged, never returned (the lawyer
-// keeps the answer even if the row didn't update).
-func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary string, providencias []byte) {
+// keeps the answer even if the row didn't update). logActivity=true only on a real analysis —
+// the degraded write (no LLM / LLM fault) never logs a process activity row.
+func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) {
 	if uc.store == nil {
 		return
 	}
-	if err := uc.store.SaveAnalise(ctx, tenantID, intimationID, summary, providencias); err != nil {
+	if err := uc.store.SaveAnalise(ctx, tenantID, intimationID, summary, providencias, logActivity); err != nil {
 		slog.WarnContext(ctx, "acquisition: persist intimation analysis failed",
 			slog.String("intimation_id", intimationID), slog.Any("error", err))
 	}
