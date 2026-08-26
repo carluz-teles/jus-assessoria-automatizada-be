@@ -34,6 +34,15 @@ type fakeEnrichRepo struct {
 
 	enrichRunCalls      int
 	enrichRunBackfillID string
+
+	// Responsável re-sync on merge (gradeInTx's CascadeCaseResponsibleToIntimations +
+	// GetCaseAssignedUser). caseAssignedID backs the GetCaseAssignedUser read; the rest
+	// capture what the cascade call was given.
+	caseAssignedID  *string
+	caseAssignedErr error
+	cascadeCalls    int
+	cascadeCaseID   string
+	cascadeUser     *string
 }
 
 func (r *fakeEnrichRepo) AcquireTenantWriteLock(_ context.Context, _ database.Tx, _ string) error {
@@ -71,6 +80,17 @@ func (r *fakeEnrichRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, p
 		out = append(out, DocketEntry{ID: "de-" + p.Hash, CourtRecordID: p.CourtRecordID, Hash: p.Hash})
 	}
 	return out, nil
+}
+
+func (r *fakeEnrichRepo) CascadeCaseResponsibleToIntimations(_ context.Context, _ database.Tx, _, caseID string, assignedUserID *string) (int64, error) {
+	r.cascadeCalls++
+	r.cascadeCaseID = caseID
+	r.cascadeUser = assignedUserID
+	return 0, nil
+}
+
+func (r *fakeEnrichRepo) GetCaseAssignedUser(_ context.Context, _ database.Tx, _, _ string) (*string, error) {
+	return r.caseAssignedID, r.caseAssignedErr
 }
 
 func (r *fakeEnrichRepo) IncrementImportEnrichmentRun(_ context.Context, _ database.Tx, _, backfillJobID string, _ time.Time) error {
@@ -212,6 +232,40 @@ func TestEnrichment_ConflictMerges(t *testing.T) {
 		if p.CourtRecordID != "graded-existing" {
 			t.Errorf("docket attached to %q, want the existing graded record", p.CourtRecordID)
 		}
+	}
+}
+
+// TestEnrichment_ConflictMerge_ReassignsResponsibleToTargetCase proves the merge branch
+// re-syncs the DESTINATION case's responsável onto the intimações RepointIntimations just
+// moved: after the merge, GetCaseAssignedUser is read for existing.CaseID (the target
+// case, NOT the placeholder's origin case) and CascadeCaseResponsibleToIntimations is
+// called with exactly that (caseID, assignee) pair.
+func TestEnrichment_ConflictMerge_ReassignsResponsibleToTargetCase(t *testing.T) {
+	t.Parallel()
+
+	targetUser := "user-target"
+	repo := &fakeEnrichRepo{
+		existing:       &CourtRecord{ID: "graded-existing", Degree: "G1", CaseID: "case-target"},
+		existingFound:  true,
+		caseAssignedID: &targetUser,
+	}
+	outbox := &fakeOutbox{}
+	uow := &stubBackfillUoW{tx: stubTx{rows: 1}}
+	payload := RawPayload{Source: SourceDATAJUD, Body: datajudFixtureBytes(t)}
+
+	err := enrichmentUnderTest(repo, outbox, uow, payload).OnCourtRecordObserved(context.Background(), placeholderObserved())
+	if err != nil {
+		t.Fatalf("OnCourtRecordObserved: %v", err)
+	}
+
+	if repo.cascadeCalls != 1 {
+		t.Fatalf("cascade calls = %d, want 1", repo.cascadeCalls)
+	}
+	if repo.cascadeCaseID != "case-target" {
+		t.Errorf("cascade caseID = %q, want the DESTINATION case %q", repo.cascadeCaseID, "case-target")
+	}
+	if repo.cascadeUser == nil || *repo.cascadeUser != targetUser {
+		t.Errorf("cascade user = %v, want %q (read from GetCaseAssignedUser on the target case)", repo.cascadeUser, targetUser)
 	}
 }
 

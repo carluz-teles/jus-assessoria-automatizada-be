@@ -109,6 +109,13 @@ type Querier interface {
 	// → typed ErrDeadlineNotFound at the mapper (the prazo's anchor cannot be resolved), never
 	// (nil, nil). $1 = intimation_id, $2 = tenant_id, both from the trusted principal's context.
 	GetIntimationAnchors(ctx context.Context, arg GetIntimationAnchorsParams) (GetIntimationAnchorsRow, error)
+	// Lê SÓ o assignee_user_id vigente da intimação, dentro da tx do caller, scoped a
+	// tenant_id. POST /v1/tasks usa para herdar o responsável no momento da criação
+	// (snapshot, não vínculo contínuo) quando intimation_id vem preenchido e
+	// assignee_user_id vem vazio. Lê a tabela intimation diretamente — sem importar
+	// internal/acquisition (mesmo precedente de GetIntimationAnchors). assignee_user_id
+	// pode ser NULL (intimação sem responsável) → nil, sem erro.
+	GetIntimationAssignee(ctx context.Context, arg GetIntimationAssigneeParams) (pgtype.UUID, error)
 	// Lê a sugestão MAIS RECENTE de um prazo, pela intimação 1:1 e escopada por tenant_id
 	// (barrier 1). O confirm (F2 "Aprovar tudo") a carrega para medir o DELTA entre o que a IA
 	// sugeriu e o que o humano confirmou. Sem sugestão (prazo manual, IA nunca usada) NÃO há

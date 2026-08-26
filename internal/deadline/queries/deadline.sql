@@ -96,6 +96,17 @@ SELECT made_available_at, published_at, deadline_start_at
 FROM intimation
 WHERE id = $1 AND tenant_id = $2;
 
+-- name: GetIntimationAssignee :one
+-- Lê SÓ o assignee_user_id vigente da intimação, dentro da tx do caller, scoped a
+-- tenant_id. POST /v1/tasks usa para herdar o responsável no momento da criação
+-- (snapshot, não vínculo contínuo) quando intimation_id vem preenchido e
+-- assignee_user_id vem vazio. Lê a tabela intimation diretamente — sem importar
+-- internal/acquisition (mesmo precedente de GetIntimationAnchors). assignee_user_id
+-- pode ser NULL (intimação sem responsável) → nil, sem erro.
+SELECT assignee_user_id
+FROM intimation
+WHERE id = @intimation_id::uuid AND tenant_id = @tenant_id::uuid;
+
 -- name: GetCourtRecordCourt :one
 -- Read the court sigla for the record the prazo hangs on — the confirmation recompute
 -- derives the UF from it (pkg/tribunal.UF) for the state-holiday calendar lookup, the

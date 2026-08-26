@@ -32,3 +32,22 @@ SELECT EXISTS (
 UPDATE court_case
    SET assigned_user_id = $2
  WHERE id = $1 AND tenant_id = $3;
+
+-- name: CascadeCaseResponsibleToIntimations :execrows
+-- Cascateia o responsável do court_case para as intimações filhas, na MESMA tx do
+-- AssignResponsible. Filtra por court_record_id → court_record.case_id (não por
+-- intimation.case_id direto): é essa a coluna que todo READ do app usa para decidir
+-- "a qual processo esta intimação pertence". Um UPDATE ... FROM, O(1) statements
+-- independente de N filhas. NULL desatribui (mesma semântica do pai).
+UPDATE intimation i
+   SET assignee_user_id = sqlc.narg('assignee_user_id')::uuid
+  FROM court_record cr
+ WHERE i.court_record_id = cr.id
+   AND cr.case_id = @case_id::uuid
+   AND i.tenant_id = @tenant_id::uuid;
+
+-- name: GetCaseAssignedUser :one
+-- Lê o assigned_user_id vigente do court_case, dentro da tx do caller, tenant-scoped.
+-- Usado no merge de grade (gradeInTx) para re-sincronizar o responsável do case de
+-- DESTINO nas intimações repontadas, ANTES de cascatear.
+SELECT assigned_user_id FROM court_case WHERE id = @case_id::uuid AND tenant_id = @tenant_id::uuid;

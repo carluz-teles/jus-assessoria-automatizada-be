@@ -56,6 +56,53 @@ func (q *Queries) AssignCaseResponsible(ctx context.Context, arg AssignCaseRespo
 	return err
 }
 
+const cascadeCaseResponsibleToIntimations = `-- name: CascadeCaseResponsibleToIntimations :execrows
+UPDATE intimation i
+   SET assignee_user_id = $1::uuid
+  FROM court_record cr
+ WHERE i.court_record_id = cr.id
+   AND cr.case_id = $2::uuid
+   AND i.tenant_id = $3::uuid
+`
+
+type CascadeCaseResponsibleToIntimationsParams struct {
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+	CaseID         uuid.UUID   `json:"case_id"`
+	TenantID       uuid.UUID   `json:"tenant_id"`
+}
+
+// Cascateia o responsável do court_case para as intimações filhas, na MESMA tx do
+// AssignResponsible. Filtra por court_record_id → court_record.case_id (não por
+// intimation.case_id direto): é essa a coluna que todo READ do app usa para decidir
+// "a qual processo esta intimação pertence". Um UPDATE ... FROM, O(1) statements
+// independente de N filhas. NULL desatribui (mesma semântica do pai).
+func (q *Queries) CascadeCaseResponsibleToIntimations(ctx context.Context, arg CascadeCaseResponsibleToIntimationsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cascadeCaseResponsibleToIntimations, arg.AssigneeUserID, arg.CaseID, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getCaseAssignedUser = `-- name: GetCaseAssignedUser :one
+SELECT assigned_user_id FROM court_case WHERE id = $1::uuid AND tenant_id = $2::uuid
+`
+
+type GetCaseAssignedUserParams struct {
+	CaseID   uuid.UUID `json:"case_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Lê o assigned_user_id vigente do court_case, dentro da tx do caller, tenant-scoped.
+// Usado no merge de grade (gradeInTx) para re-sincronizar o responsável do case de
+// DESTINO nas intimações repontadas, ANTES de cascatear.
+func (q *Queries) GetCaseAssignedUser(ctx context.Context, arg GetCaseAssignedUserParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getCaseAssignedUser, arg.CaseID, arg.TenantID)
+	var assigned_user_id pgtype.UUID
+	err := row.Scan(&assigned_user_id)
+	return assigned_user_id, err
+}
+
 const getCaseIDByCourtRecord = `-- name: GetCaseIDByCourtRecord :one
 
 SELECT cr.case_id

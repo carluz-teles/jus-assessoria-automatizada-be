@@ -56,6 +56,12 @@ var (
 	// but its current status forbids the flip. It mirrors ErrDeadlineNotOpen (same guard shape).
 	ErrTaskNotOpen = apperr.NewConflict("task transition requires an OPEN task")
 
+	// ErrIntimationNotFound — the requested intimation id resolves to no row in the tenant.
+	// POST /v1/tasks hits this when intimation_id is set but the row is missing/foreign
+	// while resolving the herdado assignee (GetIntimationAssignee). Typed not-found, never
+	// (nil, nil).
+	ErrIntimationNotFound = apperr.NewNotFound("intimation not found")
+
 	// ErrTaskItemNotFound — the requested checklist item resolves to no row under the parent
 	// task in the tenant (PATCH/DELETE /v1/tasks/:id/items/:itemId), OR the parent task itself
 	// is unknown/foreign on a create (POST /v1/tasks/:id/items). Typed not-found (→ 404), never

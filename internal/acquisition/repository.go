@@ -101,6 +101,17 @@ type Repository interface {
 	AppUserInTenant(ctx context.Context, tx database.Tx, tenantID, appUserID string) (bool, error)
 	AssignCaseResponsible(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) error
 
+	// CascadeCaseResponsibleToIntimations propagates the case's responsável to every
+	// intimação already anchored under it (via court_record_id → court_record.case_id), in
+	// the SAME tx as AssignCaseResponsible. Always overwrites (retroactive, no per-intimação
+	// opt-out). NULL desatribui, mirroring the parent's semantics.
+	CascadeCaseResponsibleToIntimations(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) (int64, error)
+
+	// GetCaseAssignedUser reads the case's vigente assigned_user_id, tenant-scoped. Used by
+	// the enrichment merge (gradeInTx) to re-sync the destination case's responsável onto
+	// the intimações it just absorbed via RepointIntimations.
+	GetCaseAssignedUser(ctx context.Context, tx database.Tx, tenantID, caseID string) (*string, error)
+
 	// Triagem da intimação (user_status) — the resolve/ignore/reopen write path. It
 	// sets ONLY user_status (the DJEN cancellation `status` is untouched), tenant-scoped;
 	// a miss/foreign row surfaces as ErrIntimationNotFound. Tx-taking (the use case owns
@@ -1672,6 +1683,68 @@ func (r *pgRepository) AssignCaseResponsible(ctx context.Context, tx database.Tx
 		TenantID:       tid,
 	})
 	return database.WrapInfra(err)
+}
+
+// CascadeCaseResponsibleToIntimations propagates a court_case's responsável to every
+// intimação anchored under it (via court_record_id → court_record.case_id), inside the
+// caller's tx, scoped by tenant_id (barrier 1, RLS barrier 2). NULL desatribui, mirroring
+// AssignCaseResponsible's own semantics. Returns the number of intimações touched (a
+// diagnostic count, not a not-found signal — zero rows is a valid outcome, e.g. a
+// process with no intimations yet).
+func (r *pgRepository) CascadeCaseResponsibleToIntimations(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	cid, err := uuid.Parse(caseID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	assignee, err := assigneePtrToUUID(assignedUserID)
+	if err != nil {
+		return 0, err
+	}
+
+	n, err := acquisitiondb.New(tx).CascadeCaseResponsibleToIntimations(ctx, acquisitiondb.CascadeCaseResponsibleToIntimationsParams{
+		AssigneeUserID: assignee,
+		CaseID:         cid,
+		TenantID:       tid,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return n, nil
+}
+
+// GetCaseAssignedUser reads a court_case's vigente assigned_user_id inside the caller's
+// tx, scoped by tenant_id (barrier 1, RLS barrier 2). A missing/foreign case is
+// ErrProcessoNotFound (mirroring ResolveCaseIDByCourtRecord's not-found), never (nil, nil).
+// A NULL column (no responsável) is a valid nil, not an error.
+func (r *pgRepository) GetCaseAssignedUser(ctx context.Context, tx database.Tx, tenantID, caseID string) (*string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	cid, err := uuid.Parse(caseID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	assigned, err := acquisitiondb.New(tx).GetCaseAssignedUser(ctx, acquisitiondb.GetCaseAssignedUserParams{
+		CaseID:   cid,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrProcessoNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	if !assigned.Valid {
+		return nil, nil
+	}
+	id := uuid.UUID(assigned.Bytes).String()
+	return &id, nil
 }
 
 // ListProcessos reads the tenant's live processes (keyset-paginated) on the pool,

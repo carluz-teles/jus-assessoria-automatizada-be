@@ -51,6 +51,15 @@ type mockRepo struct {
 	assignedUser    *string
 	memberCheckedID string
 
+	// Cascata processo → intimações (CascadeCaseResponsibleToIntimations). Captures what
+	// AssignResponsible's cascade call was given; cascadeErr forces a failure branch.
+	cascadeCalls    int
+	cascadeCaseID   string
+	cascadeUser     *string
+	cascadeErr      error
+	caseAssignedID  *string
+	caseAssignedErr error
+
 	// Triagem write path (SetIntimationUserStatus): capture what was written and an
 	// optional canned error to drive the not-found branch.
 	setUserStatusErr    error
@@ -343,6 +352,20 @@ func (m *mockRepo) AssignCaseResponsible(_ context.Context, _ database.Tx, _, ca
 	m.assignedCaseID = caseID
 	m.assignedUser = assignedUserID
 	return nil
+}
+
+func (m *mockRepo) CascadeCaseResponsibleToIntimations(_ context.Context, _ database.Tx, _, caseID string, assignedUserID *string) (int64, error) {
+	m.cascadeCalls++
+	m.cascadeCaseID = caseID
+	m.cascadeUser = assignedUserID
+	if m.cascadeErr != nil {
+		return 0, m.cascadeErr
+	}
+	return 0, nil
+}
+
+func (m *mockRepo) GetCaseAssignedUser(_ context.Context, _ database.Tx, _, _ string) (*string, error) {
+	return m.caseAssignedID, m.caseAssignedErr
 }
 
 func (m *mockRepo) ListIntimacoes(_ context.Context, _ IntimacoesQuery) ([]IntimacaoView, error) {
@@ -798,6 +821,76 @@ func TestUseCase_AssignResponsible_UnknownRecord_NotFound(t *testing.T) {
 	}
 	if repo.memberCheckedID != "" || repo.assignedCaseID != "" {
 		t.Fatalf("guard/assign ran despite an unresolved record (checked=%q case=%q)", repo.memberCheckedID, repo.assignedCaseID)
+	}
+}
+
+// TestUseCase_AssignResponsible_CascadesToIntimacoes proves the cascade runs, inside the
+// same uow.Do, with the SAME caseID that ResolveCaseIDByCourtRecord resolved — never a
+// different id, never a second transaction.
+func TestUseCase_AssignResponsible_CascadesToIntimacoes(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-42", memberOK: true}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	user := "user-7"
+	if err := uc.AssignResponsible(context.Background(), testTenant, "cr-1", &user); err != nil {
+		t.Fatalf("AssignResponsible() error = %v", err)
+	}
+
+	if uow.calls != 1 {
+		t.Fatalf("uow calls = %d, want 1 (cascade must run in the SAME tx)", uow.calls)
+	}
+	if repo.cascadeCalls != 1 {
+		t.Fatalf("cascade calls = %d, want 1", repo.cascadeCalls)
+	}
+	if repo.cascadeCaseID != repo.assignedCaseID {
+		t.Fatalf("cascade caseID = %q, want the same resolved caseID %q", repo.cascadeCaseID, repo.assignedCaseID)
+	}
+	if repo.cascadeCaseID != "case-42" {
+		t.Fatalf("cascade caseID = %q, want %q", repo.cascadeCaseID, "case-42")
+	}
+}
+
+// TestUseCase_AssignResponsible_CascadeOverwritesManualAssignee proves the cascade always
+// overwrites — no conditional check against a prior/different assignee on the intimações.
+// The mock has no "prior value" concept because the SQL itself is an unconditional UPDATE;
+// this test asserts the use case passes the NEW assignee straight through with no guard.
+func TestUseCase_AssignResponsible_CascadeOverwritesManualAssignee(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-42", memberOK: true}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	newUser := "user-new"
+	if err := uc.AssignResponsible(context.Background(), testTenant, "cr-1", &newUser); err != nil {
+		t.Fatalf("AssignResponsible() error = %v", err)
+	}
+
+	if repo.cascadeUser == nil || *repo.cascadeUser != newUser {
+		t.Fatalf("cascade user = %v, want %q (unconditional overwrite)", repo.cascadeUser, newUser)
+	}
+}
+
+// TestUseCase_AssignResponsible_NilCascadesToNilOnIntimacoes proves a desatribuir
+// (assignedUserID = nil) propagates nil to the cascade call too — the intimações lose
+// their responsável along with the process.
+func TestUseCase_AssignResponsible_NilCascadesToNilOnIntimacoes(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-42", memberOK: false}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	if err := uc.AssignResponsible(context.Background(), testTenant, "cr-1", nil); err != nil {
+		t.Fatalf("AssignResponsible(nil) error = %v", err)
+	}
+
+	if repo.cascadeCalls != 1 {
+		t.Fatalf("cascade calls = %d, want 1", repo.cascadeCalls)
+	}
+	if repo.cascadeUser != nil {
+		t.Fatalf("cascade user = %v, want nil", repo.cascadeUser)
 	}
 }
 
