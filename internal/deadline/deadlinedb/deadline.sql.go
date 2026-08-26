@@ -354,6 +354,30 @@ func (q *Queries) GetIntimationAnchors(ctx context.Context, arg GetIntimationAnc
 	return i, err
 }
 
+const getIntimationAssignee = `-- name: GetIntimationAssignee :one
+SELECT assignee_user_id
+FROM intimation
+WHERE id = $1::uuid AND tenant_id = $2::uuid
+`
+
+type GetIntimationAssigneeParams struct {
+	IntimationID uuid.UUID `json:"intimation_id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+}
+
+// Lê SÓ o assignee_user_id vigente da intimação, dentro da tx do caller, scoped a
+// tenant_id. POST /v1/tasks usa para herdar o responsável no momento da criação
+// (snapshot, não vínculo contínuo) quando intimation_id vem preenchido e
+// assignee_user_id vem vazio. Lê a tabela intimation diretamente — sem importar
+// internal/acquisition (mesmo precedente de GetIntimationAnchors). assignee_user_id
+// pode ser NULL (intimação sem responsável) → nil, sem erro.
+func (q *Queries) GetIntimationAssignee(ctx context.Context, arg GetIntimationAssigneeParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getIntimationAssignee, arg.IntimationID, arg.TenantID)
+	var assignee_user_id pgtype.UUID
+	err := row.Scan(&assignee_user_id)
+	return assignee_user_id, err
+}
+
 const getLatestTaskSuggestion = `-- name: GetLatestTaskSuggestion :one
 SELECT id, prompt_version, model, suggested
 FROM task_suggestion

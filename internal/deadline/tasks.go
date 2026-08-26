@@ -142,6 +142,21 @@ func (uc *UseCase) CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task
 		if err := uc.validateTaskDueDate(ctx, tx, cmd.DeadlineID, cmd.TenantID, cmd.DueDate); err != nil {
 			return err
 		}
+
+		// Herança intimação → tarefa: a SNAPSHOT taken at create time, not a continuous link.
+		// Only kicks in when the caller left assignee_user_id empty but pointed at an
+		// intimação — an explicit assignee always wins.
+		assignee := cmd.AssigneeUserID
+		if cmd.IntimationID != "" && assignee == "" {
+			inherited, err := uc.repo.GetIntimationAssignee(ctx, tx, cmd.IntimationID, cmd.TenantID)
+			if err != nil {
+				return err
+			}
+			if inherited != nil {
+				assignee = *inherited
+			}
+		}
+
 		saved, err := uc.repo.InsertTask(ctx, tx, &Task{
 			TenantID:       cmd.TenantID,
 			CourtRecordID:  cmd.CourtRecordID,
@@ -154,7 +169,7 @@ func (uc *UseCase) CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task
 			DueDate:        cmd.DueDate,
 			Status:         TaskStatusOpen,
 			Source:         SourceManual,
-			AssigneeUserID: cmd.AssigneeUserID,
+			AssigneeUserID: assignee,
 			CreatedBy:      cmd.UserID,
 		})
 		if err != nil {

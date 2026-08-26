@@ -93,6 +93,82 @@ func TestCreateTask_AvulsaTaskHasNoContext(t *testing.T) {
 	if len(publishedOfType[TaskCreated](outbox)) != 1 {
 		t.Error("task.created not emitted for an avulsa task")
 	}
+	if repo.intimationAssignCalls != 0 {
+		t.Errorf("GetIntimationAssignee calls = %d, want 0 (no intimation_id, regression guard)", repo.intimationAssignCalls)
+	}
+}
+
+// TestCreateTask_InheritsAssigneeFromIntimation is the happy path of herança intimação →
+// tarefa: intimation_id is set and assignee_user_id is left empty, so CreateTask snapshots
+// the intimação's vigente assignee onto the new task at CREATE time.
+func TestCreateTask_InheritsAssigneeFromIntimation(t *testing.T) {
+	tenantID := uuid.NewString()
+	intimationID := uuid.NewString()
+	inheritedUser := uuid.NewString()
+
+	repo := &mockRepo{intimationAssignee: &inheritedUser}
+	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	task, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: tenantID, UserID: uuid.NewString(), IntimationID: intimationID,
+		Title: "Peça",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if repo.intimationAssignCalls != 1 || repo.gotIntimationAssignID != intimationID {
+		t.Fatalf("GetIntimationAssignee calls/id = %d/%q, want 1/%q", repo.intimationAssignCalls, repo.gotIntimationAssignID, intimationID)
+	}
+	if task.AssigneeUserID != inheritedUser {
+		t.Errorf("task.AssigneeUserID = %q, want inherited %q", task.AssigneeUserID, inheritedUser)
+	}
+}
+
+// TestCreateTask_ExplicitAssigneeWinsOverIntimation proves an explicit assignee_user_id in
+// the command always wins over the intimação's — the herança is a fallback for an empty
+// field, never an override of an explicit choice.
+func TestCreateTask_ExplicitAssigneeWinsOverIntimation(t *testing.T) {
+	intimationID := uuid.NewString()
+	explicitUser := uuid.NewString()
+	inheritedUser := uuid.NewString()
+
+	repo := &mockRepo{intimationAssignee: &inheritedUser}
+	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	task, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: uuid.NewString(), UserID: uuid.NewString(), IntimationID: intimationID,
+		Title: "Peça", AssigneeUserID: explicitUser,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if repo.intimationAssignCalls != 0 {
+		t.Errorf("GetIntimationAssignee calls = %d, want 0 (explicit assignee skips the lookup)", repo.intimationAssignCalls)
+	}
+	if task.AssigneeUserID != explicitUser {
+		t.Errorf("task.AssigneeUserID = %q, want the explicit %q", task.AssigneeUserID, explicitUser)
+	}
+}
+
+// TestCreateTask_IntimationWithoutAssignee_TaskStaysUnassigned proves a nil
+// GetIntimationAssignee answer (the intimação has no responsável) is not an error — the
+// task is created OPEN with an empty AssigneeUserID.
+func TestCreateTask_IntimationWithoutAssignee_TaskStaysUnassigned(t *testing.T) {
+	intimationID := uuid.NewString()
+
+	repo := &mockRepo{intimationAssignee: nil}
+	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	task, err := uc.CreateTask(context.Background(), CreateTaskCommand{
+		TenantID: uuid.NewString(), UserID: uuid.NewString(), IntimationID: intimationID,
+		Title: "Peça",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if task.AssigneeUserID != "" {
+		t.Errorf("task.AssigneeUserID = %q, want empty (intimação has no responsável)", task.AssigneeUserID)
+	}
 }
 
 // TestCreateTask_DueDateWithinDeadline is the happy path of the task invariant (ERD §4): a task

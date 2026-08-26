@@ -199,6 +199,36 @@ func (r *pgRepository) GetIntimationAnchors(ctx context.Context, tx database.Tx,
 	}, nil
 }
 
+// GetIntimationAssignee reads ONLY the intimação's assignee_user_id inside the caller's
+// tx, filtered by tenantID (barrier 1). A missing/foreign intimação maps to the typed
+// ErrIntimationNotFound. A NULL column (no responsável) is a valid nil, not an error.
+func (r *pgRepository) GetIntimationAssignee(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*string, error) {
+	intID, err := parseUUID(intimationID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	assignee, err := deadlinedb.New(tx).GetIntimationAssignee(ctx, deadlinedb.GetIntimationAssigneeParams{
+		IntimationID: intID,
+		TenantID:     tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrIntimationNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	if !assignee.Valid {
+		return nil, nil
+	}
+	id := uuidText(assignee)
+	return &id, nil
+}
+
 // GetPreviewContext loads the preview's anchors + court inside the caller's tx (the pool, on the
 // read-only preview path), filtered by tenantID (barrier 1). A missing/foreign intimação maps to
 // the typed ErrDeadlineNotFound.

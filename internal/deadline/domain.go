@@ -77,6 +77,12 @@ type Repository interface {
 	// is ErrDeadlineNotFound (→ 404 at the edge, the prazo's anchor cannot be resolved), never
 	// (nil, nil).
 	GetIntimationAnchors(ctx context.Context, tx database.Tx, intimationID, tenantID string) (IntimationAnchors, error)
+	// GetIntimationAssignee reads ONLY the intimação's vigente assignee_user_id, scoped to
+	// tenantID (barrier 1). POST /v1/tasks uses it to snapshot the responsável onto a new
+	// task at CREATE time when intimation_id is set and assignee_user_id is not — a one-time
+	// inheritance, not a continuous link. nil means the intimação has no assignee (not an
+	// error); a missing/foreign intimação is ErrIntimationNotFound, never (nil, nil).
+	GetIntimationAssignee(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*string, error)
 	// GetPreviewContext loads the confirmation panel's preview context (the three anchor dates +
 	// the process's court sigla) for an intimação, scoped to tenantID (barrier 1). It backs the
 	// read-only POST /v1/prazos/preview: the use case passes the pool (not a tx) as the Tx, so

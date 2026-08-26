@@ -259,7 +259,16 @@ func (uc *UseCase) AssignResponsible(ctx context.Context, tenantID, courtRecordI
 			}
 		}
 
-		return uc.repo.AssignCaseResponsible(ctx, tx, tenantID, caseID, assignedUserID)
+		if err := uc.repo.AssignCaseResponsible(ctx, tx, tenantID, caseID, assignedUserID); err != nil {
+			return err
+		}
+
+		// Cascade: the same transaction propagates the case's new responsável to every
+		// intimação already anchored under it (via court_record_id → court_record.case_id).
+		// Always overwrites — retroactive, no per-intimação opt-out — matching the case-level
+		// field of truth.
+		_, err = uc.repo.CascadeCaseResponsibleToIntimations(ctx, tx, tenantID, caseID, assignedUserID)
+		return err
 	})
 }
 

@@ -109,6 +109,12 @@ type Querier interface {
 	// Atribuição em massa do responsável para uma lista explícita de ids,
 	// tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
 	BulkAssignIntimacoesByIDs(ctx context.Context, arg BulkAssignIntimacoesByIDsParams) (int64, error)
+	// Cascateia o responsável do court_case para as intimações filhas, na MESMA tx do
+	// AssignResponsible. Filtra por court_record_id → court_record.case_id (não por
+	// intimation.case_id direto): é essa a coluna que todo READ do app usa para decidir
+	// "a qual processo esta intimação pertence". Um UPDATE ... FROM, O(1) statements
+	// independente de N filhas. NULL desatribui (mesma semântica do pai).
+	CascadeCaseResponsibleToIntimations(ctx context.Context, arg CascadeCaseResponsibleToIntimationsParams) (int64, error)
 	// Push a record's next_sync_at forward as its re-poll is enqueued, so the next tick
 	// does not re-enqueue it; if the resync never lands, it falls due again after the
 	// interval (at-least-once).
@@ -240,6 +246,10 @@ type Querier interface {
 	// bem-sucedida mais recente (OK/PARTIAL, com finished_at); intimations_new_today
 	// soma as intimações novas das capturas iniciadas hoje (started_at >= hoje).
 	GetCaptureSummary(ctx context.Context, tenantID uuid.UUID) (GetCaptureSummaryRow, error)
+	// Lê o assigned_user_id vigente do court_case, dentro da tx do caller, tenant-scoped.
+	// Usado no merge de grade (gradeInTx) para re-sincronizar o responsável do case de
+	// DESTINO nas intimações repontadas, ANTES de cascatear.
+	GetCaseAssignedUser(ctx context.Context, arg GetCaseAssignedUserParams) (pgtype.UUID, error)
 	// responsável do processo (case-level) — the write path for PUT
 	// /v1/processos/:id/responsavel. All three run inside the caller's tx (UoW +
 	// SET LOCAL app.tenant_id), so RLS is a second barrier under the explicit

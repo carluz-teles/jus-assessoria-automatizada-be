@@ -116,12 +116,20 @@ type mockRepo struct {
 	taskForUpdateErr   error
 	deadlineEndDate    time.Time
 	deadlineEndDateErr error
-	updatedTask        *Task
-	updateTaskErr      error
-	taskTransition     TaskStatus
-	taskTransitionErr  error
-	markTaskStatusID   string
-	markTaskStatusErr  error
+
+	// herança intimação → tarefa (POST /v1/tasks snapshot). intimationAssignee backs
+	// GetIntimationAssignee's answer (nil = unassigned intimação); intimationAssigneeErr
+	// forces the not-found branch.
+	intimationAssignee    *string
+	intimationAssigneeErr error
+	gotIntimationAssignID string
+	intimationAssignCalls int
+	updatedTask           *Task
+	updateTaskErr         error
+	taskTransition        TaskStatus
+	taskTransitionErr     error
+	markTaskStatusID      string
+	markTaskStatusErr     error
 
 	// task_item write path (checklist / subtarefas, 0031)
 	ensureTaskErr    error
@@ -260,6 +268,12 @@ func (m *mockRepo) GetDeadlineEndDate(_ context.Context, _ database.Tx, deadline
 	m.gotDeadlineEndDateTenant = tenantID
 	m.deadlineEndDateCalls++
 	return m.deadlineEndDate, m.deadlineEndDateErr
+}
+
+func (m *mockRepo) GetIntimationAssignee(_ context.Context, _ database.Tx, intimationID, _ string) (*string, error) {
+	m.gotIntimationAssignID = intimationID
+	m.intimationAssignCalls++
+	return m.intimationAssignee, m.intimationAssigneeErr
 }
 
 func (m *mockRepo) MarkMissed(_ context.Context, _ database.Tx, deadlineID, tenantID string) (string, error) {

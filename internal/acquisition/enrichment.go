@@ -65,6 +65,12 @@ type enrichRepo interface {
 	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
 	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
+
+	// CascadeCaseResponsibleToIntimations + GetCaseAssignedUser re-sync the destination
+	// case's responsável onto the intimações a merge just repointed onto it (same shape as
+	// the AssignResponsible cascade in repository.go's Repository interface).
+	CascadeCaseResponsibleToIntimations(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) (int64, error)
+	GetCaseAssignedUser(ctx context.Context, tx database.Tx, tenantID, caseID string) (*string, error)
 }
 
 // EnrichmentUseCase reacts to court_record_observed by running one DATAJUD
@@ -240,6 +246,16 @@ func (uc *EnrichmentUseCase) gradeInTx(ctx context.Context, tx database.Tx, tena
 			return nil, nil, err
 		}
 		if err := uc.repo.SupersedeCourtRecord(ctx, tx, tenantID, courtRecordID); err != nil {
+			return nil, nil, err
+		}
+		// The repointed intimations now hang off existing.CaseID (the destination case), so
+		// their responsável must match ITS vigente assignee — not whatever the placeholder's
+		// (now-superseded) case had. Re-sync before returning.
+		assignedUserID, err := uc.repo.GetCaseAssignedUser(ctx, tx, tenantID, existing.CaseID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err := uc.repo.CascadeCaseResponsibleToIntimations(ctx, tx, tenantID, existing.CaseID, assignedUserID); err != nil {
 			return nil, nil, err
 		}
 		target = existing.ID
