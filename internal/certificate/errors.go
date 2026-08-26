@@ -45,6 +45,10 @@ var ErrInvalidDigest = apperr.NewInvalid("digest deve ter exatamente 32 bytes (S
 // válido (cadeia vazia ou estrutura PKCS#12 corrompida).
 var ErrMalformedPFX = apperr.NewInvalid("certificado PKCS#12 malformado (sem leaf)")
 
+// ErrInvalidPasswordPolicy: valor de password_policy fora do enum aceito
+// ('always', 'session', 'never'). Rejeitado antes de tocar o repositório.
+var ErrInvalidPasswordPolicy = apperr.NewInvalid("password_policy inválido; use 'always', 'session' ou 'never'")
+
 // classifyPKCS12Error inspects a pkcs12.DecodeChain error and returns the
 // appropriate typed error (bad password vs malformed file).
 func classifyPKCS12Error(err error) error {

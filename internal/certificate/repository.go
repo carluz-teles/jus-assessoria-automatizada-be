@@ -28,6 +28,8 @@ type Repository interface {
 	// RecordSigning appends an audit row (signing_event) for a server-side signature —
 	// digest only, never the signature or key material.
 	RecordSigning(ctx context.Context, tx database.Tx, tenantID, certificateID, signerUserID string, digest []byte) error
+	// UpdatePasswordPolicy troca a política de senha de um certificado ATIVO.
+	UpdatePasswordPolicy(ctx context.Context, tx database.Tx, tenantID, id string, policy PasswordPolicy) (*Certificate, error)
 }
 
 // CertificateWithOwner é o shape do read model da lista — inclui o nome do
@@ -52,19 +54,20 @@ func (r *pgRepository) Insert(ctx context.Context, tx database.Tx, c *Certificat
 		return "", time.Time{}, apperr.NewInvalid("owner id inválido")
 	}
 	row, err := certificatedb.New(tx).InsertCertificate(ctx, certificatedb.InsertCertificateParams{
-		TenantID:    tid,
-		OwnerUserID: uid,
-		SubjectCn:   c.SubjectCN,
-		Oab:         nullString(c.OAB),
-		Issuer:      c.Issuer,
-		Serial:      c.Serial,
-		NotBefore:   pgtype.Timestamptz{Time: c.NotBefore, Valid: true},
-		NotAfter:    pgtype.Timestamptz{Time: c.NotAfter, Valid: true},
-		Fingerprint: c.Fingerprint,
-		Ciphertext:  c.Envelope.Ciphertext,
-		Nonce:       c.Envelope.Nonce,
-		WrappedDek:  c.Envelope.WrappedDEK,
-		KekRef:      c.Envelope.KEKRef,
+		TenantID:       tid,
+		OwnerUserID:    uid,
+		SubjectCn:      c.SubjectCN,
+		Oab:            nullString(c.OAB),
+		Issuer:         c.Issuer,
+		Serial:         c.Serial,
+		NotBefore:      pgtype.Timestamptz{Time: c.NotBefore, Valid: true},
+		NotAfter:       pgtype.Timestamptz{Time: c.NotAfter, Valid: true},
+		Fingerprint:    c.Fingerprint,
+		Ciphertext:     c.Envelope.Ciphertext,
+		Nonce:          c.Envelope.Nonce,
+		WrappedDek:     c.Envelope.WrappedDEK,
+		KekRef:         c.Envelope.KEKRef,
+		PasswordPolicy: string(c.PasswordPolicy),
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -112,8 +115,9 @@ func (r *pgRepository) GetByID(ctx context.Context, tx database.Tx, tenantID, id
 			WrappedDEK: row.WrappedDek,
 			KEKRef:     row.KekRef,
 		},
-		CreatedAt: row.CreatedAt.Time.UTC(),
-		RevokedAt: timePtr(row.RevokedAt),
+		CreatedAt:      row.CreatedAt.Time.UTC(),
+		RevokedAt:      timePtr(row.RevokedAt),
+		PasswordPolicy: PasswordPolicy(row.PasswordPolicy),
 	}, nil
 }
 
@@ -130,18 +134,19 @@ func (r *pgRepository) ListActive(ctx context.Context, tx database.Tx, tenantID 
 	for _, row := range rows {
 		out = append(out, CertificateWithOwner{
 			Certificate: Certificate{
-				ID:          row.ID.String(),
-				TenantID:    row.TenantID.String(),
-				OwnerUserID: row.OwnerUserID.String(),
-				SubjectCN:   row.SubjectCn,
-				OAB:         derefString(row.Oab),
-				Issuer:      row.Issuer,
-				Serial:      row.Serial,
-				NotBefore:   row.NotBefore.Time.UTC(),
-				NotAfter:    row.NotAfter.Time.UTC(),
-				Fingerprint: row.Fingerprint,
-				CreatedAt:   row.CreatedAt.Time.UTC(),
-				RevokedAt:   timePtr(row.RevokedAt),
+				ID:             row.ID.String(),
+				TenantID:       row.TenantID.String(),
+				OwnerUserID:    row.OwnerUserID.String(),
+				SubjectCN:      row.SubjectCn,
+				OAB:            derefString(row.Oab),
+				Issuer:         row.Issuer,
+				Serial:         row.Serial,
+				NotBefore:      row.NotBefore.Time.UTC(),
+				NotAfter:       row.NotAfter.Time.UTC(),
+				Fingerprint:    row.Fingerprint,
+				CreatedAt:      row.CreatedAt.Time.UTC(),
+				RevokedAt:      timePtr(row.RevokedAt),
+				PasswordPolicy: PasswordPolicy(row.PasswordPolicy),
 				// Envelope não vem no read model da lista (não é necessário).
 			},
 			OwnerUserName: derefString(row.OwnerUserName),
@@ -196,6 +201,43 @@ func (r *pgRepository) RecordSigning(ctx context.Context, tx database.Tx, tenant
 		return database.WrapInfra(err)
 	}
 	return nil
+}
+
+func (r *pgRepository) UpdatePasswordPolicy(ctx context.Context, tx database.Tx, tenantID, id string, policy PasswordPolicy) (*Certificate, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return nil, apperr.NewInvalid("tenant id inválido")
+	}
+	cid, err := uuid.Parse(id)
+	if err != nil {
+		return nil, apperr.NewInvalid("id do certificado inválido")
+	}
+	row, err := certificatedb.New(tx).UpdateCertificatePasswordPolicy(ctx, certificatedb.UpdateCertificatePasswordPolicyParams{
+		ID:             cid,
+		TenantID:       tid,
+		PasswordPolicy: string(policy),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCertificateNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return &Certificate{
+		ID:             row.ID.String(),
+		TenantID:       row.TenantID.String(),
+		OwnerUserID:    row.OwnerUserID.String(),
+		SubjectCN:      row.SubjectCn,
+		OAB:            derefString(row.Oab),
+		Issuer:         row.Issuer,
+		Serial:         row.Serial,
+		NotBefore:      row.NotBefore.Time.UTC(),
+		NotAfter:       row.NotAfter.Time.UTC(),
+		Fingerprint:    row.Fingerprint,
+		CreatedAt:      row.CreatedAt.Time.UTC(),
+		RevokedAt:      timePtr(row.RevokedAt),
+		PasswordPolicy: PasswordPolicy(row.PasswordPolicy),
+	}, nil
 }
 
 // ── pequenos helpers ────────────────────────────────────────────────────────

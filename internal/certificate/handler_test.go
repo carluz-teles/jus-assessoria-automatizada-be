@@ -181,23 +181,57 @@ func TestHandler_Sign_200_RecordsAuditWithPrincipalAsSigner(t *testing.T) {
 	is.NotEmpty(got["cert_chain"])
 }
 
+// TestHandler_Sign_MissingPassword_400 pins the fix for the security bug: a
+// certificate whose PasswordPolicy requires a password (the default, "always")
+// must reject a request that omits it. Password is no longer
+// validation.Required on SignRequest's shape — the 400 now comes from the
+// domain (ErrInvalidPassword), which is why the cert must resolve via
+// repo.getRes instead of short-circuiting at request validation.
 func TestHandler_Sign_MissingPassword_400(t *testing.T) {
 	t.Parallel()
 	is := assert.New(t)
 
 	repo := &fakeRepo{}
-	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV", "pw", time.Hour)
+	repo.getRes = cert
+	app := newTestApp(uc)
 
 	sum := sha256.Sum256([]byte("doc"))
 	body := `{"digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-7/sign", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-1/sign", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
 	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
-	is.Nil(repo.recordedDig, "use case must not be called without a password")
+	is.Nil(repo.recordedDig, "signing must never proceed without a matching password")
+}
+
+// TestHandler_Sign_WrongPassword_400 pins the core bug: before the fix, Sign()
+// discarded the password parameter (`_ string`) and any value — including a
+// wrong one — signed successfully.
+func TestHandler_Sign_WrongPassword_400(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	uc := NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{})
+	cert := sealedCertificate(t, uc, repo, "ADV", "right-pw", time.Hour)
+	repo.getRes = cert
+	app := newTestApp(uc)
+
+	sum := sha256.Sum256([]byte("doc"))
+	body := `{"password":"wrong-pw","digest_sha256":"` + base64.StdEncoding.EncodeToString(sum[:]) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/certificates/cert-1/sign", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
+	is.Nil(repo.recordedDig, "signing must never proceed with a wrong password")
 }
 
 func TestHandler_Sign_NotFound_404(t *testing.T) {
@@ -270,6 +304,82 @@ func TestHandler_Revoke_204(t *testing.T) {
 	is.Equal(fiber.StatusNoContent, resp.StatusCode)
 	is.Equal("tenant-1", repo.revokedTID)
 	is.Equal("cert-9", repo.revokedID)
+}
+
+func TestHandler_UpdatePasswordPolicy_200(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	updated := &Certificate{ID: "cert-1", PasswordPolicy: PasswordPolicyNever}
+	repo := &fakeRepo{updateRes: updated}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
+
+	body := `{"password_policy":"never"}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/certificates/cert-1/password-policy", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusOK, resp.StatusCode)
+	is.Equal(PasswordPolicyNever, repo.updatedPolicy)
+	is.Equal("tenant-1", repo.updatedTID)
+
+	var got certificateView
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	is.Equal("never", got.PasswordPolicy)
+}
+
+func TestHandler_UpdatePasswordPolicy_InvalidValue_400(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
+
+	body := `{"password_policy":"bogus"}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/certificates/cert-1/password-policy", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
+	is.Zero(repo.updatePolicyCalls)
+}
+
+func TestHandler_UpdatePasswordPolicy_MissingField_400(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
+
+	req := httptest.NewRequest(http.MethodPatch, "/v1/certificates/cert-1/password-policy", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusBadRequest, resp.StatusCode)
+	is.Zero(repo.updatePolicyCalls)
+}
+
+func TestHandler_UpdatePasswordPolicy_NotFound_404(t *testing.T) {
+	t.Parallel()
+	is := assert.New(t)
+
+	repo := &fakeRepo{updateErr: ErrCertificateNotFound}
+	app := newTestApp(NewUseCase(repo, &fakeUOW{}, newFakeCipher(t), &fakeOutbox{}))
+
+	body := `{"password_policy":"always"}`
+	req := httptest.NewRequest(http.MethodPatch, "/v1/certificates/missing/password-policy", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	is.Equal(fiber.StatusNotFound, resp.StatusCode)
 }
 
 func TestHandler_Revoke_NotFound_404(t *testing.T) {

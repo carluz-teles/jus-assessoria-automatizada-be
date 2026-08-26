@@ -15,10 +15,28 @@ type SignRequest struct {
 
 func (r SignRequest) Validate() error {
 	return validation.ValidateStruct(&r,
-		validation.Field(&r.Password, validation.Required),
+		// Password NÃO é validation.Required: sua obrigatoriedade agora é regra
+		// de domínio dependente de PasswordPolicy (ver Sign em domain.go), não
+		// de shape do request — um certificado com policy="never" assina sem
+		// senha no body.
 		validation.Field(&r.DigestSHA256B64,
 			validation.Required,
 			is.Base64,
 		),
+	)
+}
+
+// UpdatePasswordPolicyRequest é o body JSON de
+// PATCH /v1/certificates/:id/password-policy.
+type UpdatePasswordPolicyRequest struct {
+	PasswordPolicy string `json:"password_policy"`
+}
+
+// Validate checa só a forma (campo presente); o enum em si
+// ('always'/'session'/'never') é responsabilidade de PasswordPolicy.Valid()
+// no domínio — uma única fonte de verdade pro conjunto de valores aceitos.
+func (r UpdatePasswordPolicyRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.PasswordPolicy, validation.Required),
 	)
 }

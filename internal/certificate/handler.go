@@ -33,6 +33,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/certificates", h.list)
 	r.Delete("/certificates/:id", h.revoke)
 	r.Post("/certificates/:id/sign", h.sign)
+	r.Patch("/certificates/:id/password-policy", h.updatePasswordPolicy)
 }
 
 // preview: POST /v1/certificates/preview (multipart: file, password) →
@@ -127,6 +128,27 @@ func (h *Handler) sign(c *fiber.Ctx) error {
 	})
 }
 
+// updatePasswordPolicy: PATCH /v1/certificates/:id/password-policy body
+// { password_policy } → CertificateView completo. 400 quando o valor não é
+// 'always'/'session'/'never' (checado no domínio via PasswordPolicy.Valid());
+// 404 quando o certificado não existe/está revogado.
+func (h *Handler) updatePasswordPolicy(c *fiber.Ctx) error {
+	var req UpdatePasswordPolicyRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	cert, err := h.uc.UpdatePasswordPolicy(c.UserContext(), tenantID, id, PasswordPolicy(req.PasswordPolicy))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(certificateToView(cert, ""))
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 // readMultipartPFX lê o campo `file` + `password` de um multipart. Valida
@@ -158,18 +180,19 @@ func readMultipartPFX(c *fiber.Ctx) ([]byte, string, error) {
 // ── response DTOs (bate com o FE certificado.ts) ─────────────────────────────
 
 type certificateView struct {
-	ID            string  `json:"id"`
-	SubjectCN     string  `json:"subject_cn"`
-	OAB           string  `json:"oab"`
-	Issuer        string  `json:"issuer"`
-	Serial        string  `json:"serial"`
-	NotBefore     string  `json:"not_before"`
-	NotAfter      string  `json:"not_after"`
-	Fingerprint   string  `json:"fingerprint"`
-	OwnerUserID   string  `json:"owner_user_id"`
-	OwnerUserName string  `json:"owner_user_name,omitempty"`
-	CreatedAt     string  `json:"created_at"`
-	RevokedAt     *string `json:"revoked_at"`
+	ID             string  `json:"id"`
+	SubjectCN      string  `json:"subject_cn"`
+	OAB            string  `json:"oab"`
+	Issuer         string  `json:"issuer"`
+	Serial         string  `json:"serial"`
+	NotBefore      string  `json:"not_before"`
+	NotAfter       string  `json:"not_after"`
+	Fingerprint    string  `json:"fingerprint"`
+	OwnerUserID    string  `json:"owner_user_id"`
+	OwnerUserName  string  `json:"owner_user_name,omitempty"`
+	CreatedAt      string  `json:"created_at"`
+	RevokedAt      *string `json:"revoked_at"`
+	PasswordPolicy string  `json:"password_policy"`
 }
 
 func certificateToView(c *Certificate, ownerName string) certificateView {
@@ -179,18 +202,19 @@ func certificateToView(c *Certificate, ownerName string) certificateView {
 		revoked = &s
 	}
 	return certificateView{
-		ID:            c.ID,
-		SubjectCN:     c.SubjectCN,
-		OAB:           c.OAB,
-		Issuer:        c.Issuer,
-		Serial:        c.Serial,
-		NotBefore:     c.NotBefore.Format(time.RFC3339),
-		NotAfter:      c.NotAfter.Format(time.RFC3339),
-		Fingerprint:   c.Fingerprint,
-		OwnerUserID:   c.OwnerUserID,
-		OwnerUserName: ownerName,
-		CreatedAt:     c.CreatedAt.Format(time.RFC3339),
-		RevokedAt:     revoked,
+		ID:             c.ID,
+		SubjectCN:      c.SubjectCN,
+		OAB:            c.OAB,
+		Issuer:         c.Issuer,
+		Serial:         c.Serial,
+		NotBefore:      c.NotBefore.Format(time.RFC3339),
+		NotAfter:       c.NotAfter.Format(time.RFC3339),
+		Fingerprint:    c.Fingerprint,
+		OwnerUserID:    c.OwnerUserID,
+		OwnerUserName:  ownerName,
+		CreatedAt:      c.CreatedAt.Format(time.RFC3339),
+		RevokedAt:      revoked,
+		PasswordPolicy: string(c.PasswordPolicy),
 	}
 }
 

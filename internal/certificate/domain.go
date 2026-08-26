@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -92,6 +93,9 @@ func (uc *UseCase) Upload(ctx context.Context, tenantID, ownerUserID string, pfx
 		NotAfter:    meta.NotAfter,
 		Fingerprint: meta.Fingerprint,
 		Envelope:    *env,
+		// Default explícito == default da coluna (migration 0072): senha sempre
+		// exigida/comparada no Sign, salvo o titular abaixar a política depois.
+		PasswordPolicy: PasswordPolicyAlways,
 	}
 
 	err = uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
@@ -134,6 +138,30 @@ func (uc *UseCase) Revoke(ctx context.Context, tenantID, id string) error {
 	})
 }
 
+// UpdatePasswordPolicy troca a política de exigência de senha no Sign
+// (PATCH /v1/certificates/:id/password-policy). Valida o enum ANTES de tocar
+// o repositório — um valor fora de 'always'/'session'/'never' nunca chega a
+// abrir uma tx. Sem outbox event: é uma preferência de UX, não um fato de
+// domínio que outro slice precise reagir.
+func (uc *UseCase) UpdatePasswordPolicy(ctx context.Context, tenantID, id string, policy PasswordPolicy) (*Certificate, error) {
+	if !policy.Valid() {
+		return nil, ErrInvalidPasswordPolicy
+	}
+	var cert *Certificate
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		c, e := uc.repo.UpdatePasswordPolicy(ctx, tx, tenantID, id, policy)
+		if e != nil {
+			return e
+		}
+		cert = c
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cert, nil
+}
+
 // vaultBlob é o payload interno cifrado pelo envelope: {pfx, password} juntos
 // como JSON. NUNCA vaza pra fora do pacote — só o Sign/openVault manipulam.
 type vaultBlob struct {
@@ -141,30 +169,36 @@ type vaultBlob struct {
 	Password  string `json:"password"` // senha do PKCS#12 (protegida por KMS at-rest)
 }
 
-// openVault decodifica o envelope e devolve o parsedPFX pronto pra assinar.
-// Centraliza pra Sign e o KMSBackedSigner reusar a mesma lógica.
-func (uc *UseCase) openVault(ctx context.Context, cert *Certificate) (*parsedPFX, error) {
+// openVault decodifica o envelope e devolve o parsedPFX pronto pra assinar,
+// junto com a senha armazenada em claro (só na memória do processo — nunca
+// serializada de volta). Centraliza pra Sign e o KMSBackedSigner reusar a
+// mesma lógica de decrypt+parse.
+func (uc *UseCase) openVault(ctx context.Context, cert *Certificate) (*parsedPFX, string, error) {
 	blob, err := uc.cipher.Open(ctx, &cert.Envelope)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var v vaultBlob
 	if err := json.Unmarshal(blob, &v); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	pfx, err := base64.StdEncoding.DecodeString(v.PFXBase64)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return parsePFX(pfx, v.Password)
+	p, err := parsePFX(pfx, v.Password)
+	return p, v.Password, err
 }
 
 // Sign assina um digest SHA-256 com a chave do certificado. Fluxo: busca cert
 // (metadata + envelope); openVault (KMS.Decrypt → JSON → parsePFX com senha
-// armazenada); assina digest; grava o audit row (signing_event) numa tx própria,
-// só depois de assinar com sucesso. O parâmetro `password` fica aqui por compat
-// com o handler antigo — quando presente, é IGNORADO (senha vem do vault).
-func (uc *UseCase) Sign(ctx context.Context, tenantID, id, signerUserID, _ string, digest []byte) (*SignResult, error) {
+// armazenada); confere a senha do request contra a senha do vault (salvo
+// policy=never); assina digest; grava o audit row (signing_event) numa tx
+// própria, só depois de assinar com sucesso.
+//
+// A comparação usa crypto/subtle.ConstantTimeCompare para não vazar quantos
+// bytes bateram via timing (side-channel clássico em comparação de segredo).
+func (uc *UseCase) Sign(ctx context.Context, tenantID, id, signerUserID, password string, digest []byte) (*SignResult, error) {
 	var cert *Certificate
 	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		c, e := uc.repo.GetByID(ctx, tx, tenantID, id)
@@ -180,10 +214,18 @@ func (uc *UseCase) Sign(ctx context.Context, tenantID, id, signerUserID, _ strin
 	if err != nil {
 		return nil, err
 	}
-	p, err := uc.openVault(ctx, cert)
+	p, storedPassword, err := uc.openVault(ctx, cert)
 	if err != nil {
 		return nil, err
 	}
+
+	if cert.PasswordPolicy != PasswordPolicyNever {
+		passwordMatches := password != "" && subtle.ConstantTimeCompare([]byte(password), []byte(storedPassword)) == 1
+		if !passwordMatches {
+			return nil, ErrInvalidPassword
+		}
+	}
+
 	sig, err := signSHA256(p, digest)
 	if err != nil {
 		return nil, err
@@ -233,7 +275,9 @@ func (uc *UseCase) NewSigner(ctx context.Context, tenantID, id string) (crypto.S
 	if err != nil {
 		return nil, nil, nil, SignerInfo{}, err
 	}
-	p, err := uc.openVault(ctx, cert)
+	// Fluxo automático (e-SAJ/peticionamento) — sem input do usuário, então não
+	// há senha de request pra comparar; a senha do vault só abre o .pfx aqui.
+	p, _, err := uc.openVault(ctx, cert)
 	if err != nil {
 		return nil, nil, nil, SignerInfo{}, err
 	}

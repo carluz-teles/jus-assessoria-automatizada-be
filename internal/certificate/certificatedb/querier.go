@@ -40,6 +40,11 @@ type Querier interface {
 	// (missing, foreign, or already revoked) → pgx.ErrNoRows → ErrCertificateNotFound at
 	// the mapper. The row stays for audit. $1 = id, $2 = tenant_id, $3 = revoked_at.
 	RevokeCertificate(ctx context.Context, arg RevokeCertificateParams) (RevokeCertificateRow, error)
+	// Troca a política de exigência de senha do Sign (PATCH
+	// /v1/certificates/:id/password-policy). Só afeta certificado ATIVO
+	// (revoked_at IS NULL) — revogado não recebe mais writes de configuração. $1 =
+	// id, $2 = tenant_id, $3 = password_policy.
+	UpdateCertificatePasswordPolicy(ctx context.Context, arg UpdateCertificatePasswordPolicyParams) (UpdateCertificatePasswordPolicyRow, error)
 }
 
 var _ Querier = (*Queries)(nil)
