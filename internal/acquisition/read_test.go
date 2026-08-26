@@ -44,6 +44,9 @@ type recordingReadRepo struct {
 	intiRows      []IntimacaoView
 	intiTotal     int64
 	lastIntiQuery IntimacoesByProcessoQuery
+	actRows       []ActivityLogView
+	actTotal      int64
+	lastActQuery  ActivityLogQuery
 	// Partes deep-read — capture the forwarded (tenant, court_record) and return canned rows.
 	partesRows    []PartyRow
 	gotPartesTID  string
@@ -129,6 +132,16 @@ func (r *recordingReadRepo) ListIntimacoesByProcesso(_ context.Context, q Intima
 }
 func (r *recordingReadRepo) CountIntimacoesByProcesso(context.Context, string, string) (int64, error) {
 	return r.intiTotal, nil
+}
+func (r *recordingReadRepo) ListProcessActivityLog(_ context.Context, q ActivityLogQuery) ([]ActivityLogView, error) {
+	r.lastActQuery = q
+	return r.actRows, nil
+}
+func (r *recordingReadRepo) CountProcessActivityLog(context.Context, string, string) (int64, error) {
+	return r.actTotal, nil
+}
+func (r *recordingReadRepo) ResolveCourtRecordIDForDraftIntimation(context.Context, string, string) (string, error) {
+	return "", nil
 }
 func (r *recordingReadRepo) GetImportStatus(context.Context, string) (ImportStatusView, error) {
 	return ImportStatusView{}, nil
@@ -553,6 +566,79 @@ func TestReadUseCase_Andamentos_OverfetchesAndWiresTotal(t *testing.T) {
 	}
 	if res.Total != 87 {
 		t.Errorf("Total = %d, want 87", res.Total)
+	}
+}
+
+// TestReadUseCase_ActivityLog_OverfetchesAndWiresTotal mirrors
+// TestReadUseCase_Andamentos_OverfetchesAndWiresTotal for the Atividade tab.
+func TestReadUseCase_ActivityLog_OverfetchesAndWiresTotal(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{
+		actRows:  []ActivityLogView{{ID: "a"}, {ID: "b"}, {ID: "c"}}, // 3 rows for limit 2 → hasMore
+		actTotal: 42,
+	}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.ActivityLog(context.Background(), ActivityLogQuery{
+		TenantID: "t-1", CourtRecordID: "cr-9", Limit: 2,
+	})
+	if err != nil {
+		t.Fatalf("ActivityLog: %v", err)
+	}
+	if repo.lastActQuery.Limit != 3 {
+		t.Errorf("repo limit = %d, want 3 (over-fetch of limit+1)", repo.lastActQuery.Limit)
+	}
+	if repo.lastActQuery.CourtRecordID != "cr-9" {
+		t.Errorf("CourtRecordID = %q, want cr-9 (forwarded)", repo.lastActQuery.CourtRecordID)
+	}
+	if !res.HasMore {
+		t.Error("HasMore = false, want true")
+	}
+	if len(res.Items) != 2 {
+		t.Errorf("len(Items) = %d, want 2 (extra row trimmed)", len(res.Items))
+	}
+	if res.Total != 42 {
+		t.Errorf("Total = %d, want 42", res.Total)
+	}
+}
+
+// TestReadUseCase_ActivityLog_NoNextPage mirrors TestReadUseCase_Andamentos_NoNextPage.
+func TestReadUseCase_ActivityLog_NoNextPage(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingReadRepo{actRows: []ActivityLogView{{ID: "a"}}}
+	uc := NewReadUseCase(repo)
+
+	res, err := uc.ActivityLog(context.Background(), ActivityLogQuery{TenantID: "t-1", CourtRecordID: "cr-1", Limit: 20})
+	if err != nil {
+		t.Fatalf("ActivityLog: %v", err)
+	}
+	if res.HasMore {
+		t.Error("HasMore = true, want false")
+	}
+	if len(res.Items) != 1 {
+		t.Errorf("len(Items) = %d, want 1", len(res.Items))
+	}
+}
+
+// TestRenderActivityText pins the PT-BR labels for the closed event_type set —
+// neither string may ever mention "IA" (app-wide wording directive).
+func TestRenderActivityText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		eventType string
+		want      string
+	}{
+		{ActivityEventIntimationAnalysisCompleted, "Análise da intimação concluída"},
+		{ActivityEventDraftGenerated, "Peça gerada"},
+		{"UNKNOWN_EVENT", "UNKNOWN_EVENT"}, // fallback: never a blank row
+	}
+	for _, tt := range tests {
+		if got := renderActivityText(tt.eventType); got != tt.want {
+			t.Errorf("renderActivityText(%q) = %q, want %q", tt.eventType, got, tt.want)
+		}
 	}
 }
 

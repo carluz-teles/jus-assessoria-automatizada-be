@@ -312,12 +312,15 @@ func queueFor(typ string) string {
 	if typ == "filing.succeeded" || typ == "filing.failed" {
 		return "notifications"
 	}
-	// review.completed has no active consumer today. Route to "ingestao" (archived as
-	// handler-not-found — the worker drains that queue) rather than "default" (which no
-	// worker drains — silently building up in Redis). Mirrors the orphan deadline.*
-	// pattern above. When a consumer is added, move this routing to its queue.
+	// review.completed (ReviewUseCase.ReviewDraft, internal/draft/review.go) is
+	// consumed by acquisition's activity listener (process cockpit "Atividade"
+	// timeline, migration 0073 — DRAFT_GENERATED). Light/low-volume (one per
+	// Revisar call), so it rides the "notifications" queue alongside the other
+	// light cross-slice consumers (identity.tenant_provisioned, billing.trial_*,
+	// deadline.due_soon/missed) rather than standing up a dedicated queue. String
+	// literal avoids an import cycle with internal/draft.
 	if typ == "review.completed" {
-		return "ingestao"
+		return "notifications"
 	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":

@@ -258,6 +258,68 @@ func TestReviewUseCase_HappyPath(t *testing.T) {
 	}
 }
 
+// TestReviewUseCase_PublishesReviewCompleted verifies that a successful ReviewDraft
+// publishes review.completed to the outbox, in the SAME tx as the review insert,
+// carrying TenantID (the RLS-scoping field consumers need) + Status COMPLETED.
+func TestReviewUseCase_PublishesReviewCompleted(t *testing.T) {
+	d := makeDraftedDraft()
+	gen := &fakeGen{out: []byte(cannedReviewJSON)}
+	w := &fakeReviewWriter{}
+	ob := &fakeOutbox{}
+
+	uc := NewReviewUseCase(ReviewUseCaseParams{
+		UoW:      fakeUoW{},
+		Reader:   fakeReader{draft: d},
+		Writer:   w,
+		Outbox:   ob,
+		Gen:      gen,
+		Search:   indexing.SearchDeps{Pool: nil},
+		Composer: advisory.NewTemplateComposer(),
+		Model:    "test-model",
+	})
+
+	if _, err := uc.ReviewDraft(context.Background(), reviewCmd()); err != nil {
+		t.Fatalf("want nil err, got %v", err)
+	}
+
+	if len(ob.published) != 1 {
+		t.Fatalf("published events = %d, want 1", len(ob.published))
+	}
+	ev, ok := ob.published[0].(ReviewCompleted)
+	if !ok {
+		t.Fatalf("published event type = %T, want ReviewCompleted", ob.published[0])
+	}
+	if ev.TenantID != "tenant-rev-1" {
+		t.Errorf("ev.TenantID = %q, want %q", ev.TenantID, "tenant-rev-1")
+	}
+	if ev.DraftID != "draft-rev-1" {
+		t.Errorf("ev.DraftID = %q, want %q", ev.DraftID, "draft-rev-1")
+	}
+	if ev.ReviewID != "review-rev-1" {
+		t.Errorf("ev.ReviewID = %q, want %q", ev.ReviewID, "review-rev-1")
+	}
+	if ev.Status != ReviewStatusCompleted {
+		t.Errorf("ev.Status = %q, want COMPLETED", ev.Status)
+	}
+	if ev.Type() != TypeReviewCompleted {
+		t.Errorf("ev.Type() = %q, want %q", ev.Type(), TypeReviewCompleted)
+	}
+}
+
+// TestReviewUseCase_NilOutbox_NoPanic verifies that a nil Outbox (not wired) never
+// panics — ReviewDraft simply skips publishing.
+func TestReviewUseCase_NilOutbox_NoPanic(t *testing.T) {
+	d := makeDraftedDraft()
+	gen := &fakeGen{out: []byte(cannedReviewJSON)}
+	w := &fakeReviewWriter{}
+
+	uc := buildReviewUC(fakeUoW{}, fakeReader{draft: d}, w, gen, nil)
+
+	if _, err := uc.ReviewDraft(context.Background(), reviewCmd()); err != nil {
+		t.Fatalf("want nil err, got %v", err)
+	}
+}
+
 // TestReviewUseCase_SubstringValidation verifies that suggestions whose `original`
 // does not appear in the draft content are dropped by buildFindings.
 func TestReviewUseCase_SubstringValidation(t *testing.T) {

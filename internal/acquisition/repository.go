@@ -139,6 +139,14 @@ type Repository interface {
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
 	ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error)
+	// ListProcessActivityLog / CountProcessActivityLog back the Atividade tab
+	// (migration 0073) — same keyset-plus-count shape as Andamentos.
+	ListProcessActivityLog(ctx context.Context, q ActivityLogQuery) ([]ActivityLogView, error)
+	CountProcessActivityLog(ctx context.Context, tenantID, courtRecordID string) (int64, error)
+	// ResolveCourtRecordIDForDraftIntimation backs the activity listener
+	// (activity_listener.go): resolves the court_record a draft belongs to via its
+	// intimation, so a review.completed event can be logged against the right process.
+	ResolveCourtRecordIDForDraftIntimation(ctx context.Context, tenantID, draftID string) (string, error)
 	CountProcessos(ctx context.Context, q ProcessosQuery) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, q IntimacoesQuery) (totalCount, total int64, err error)
 	BucketIntimacoes(ctx context.Context, q IntimacoesQuery) (IntimacaoBucketsView, error)
@@ -2119,6 +2127,97 @@ func (r *pgRepository) CountAndamentosByProcesso(ctx context.Context, tenantID, 
 		return 0, database.WrapInfra(err)
 	}
 	total, err := r.q.CountAndamentosByProcesso(ctx, acquisitiondb.CountAndamentosByProcessoParams{
+		CourtRecordID: crid,
+		TenantID:      tid,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return total, nil
+}
+
+// ResolveCourtRecordIDForDraftIntimation resolves the court_record a draft belongs to
+// via its intimation (see queries/activity.sql for why: draft has no court_record_id
+// column, and case_id is not a reliable 1:1 path). Returns "" (no error wrapping a
+// not-found — the caller, the activity listener, treats every failure mode alike as
+// LOG-NOT-FAIL) when the draft has no intimation_id or is invisible under tenantID.
+func (r *pgRepository) ResolveCourtRecordIDForDraftIntimation(ctx context.Context, tenantID, draftID string) (string, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	did, err := uuid.Parse(draftID)
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	crid, err := r.q.ResolveCourtRecordIDForDraftIntimation(ctx, acquisitiondb.ResolveCourtRecordIDForDraftIntimationParams{
+		DraftID:  did,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return crid.String(), nil
+}
+
+// ListProcessActivityLog reads a process's activity log (keyset-paginated, newest
+// first) on the pool — the "Atividade" tab (migration 0073). Scoped by tenant_id
+// (barrier 1) + RLS. Text is left for the read use case to render (a pure function of
+// event_type, no DB round-trip).
+func (r *pgRepository) ListProcessActivityLog(ctx context.Context, q ActivityLogQuery) ([]ActivityLogView, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	crid, err := uuid.Parse(q.CourtRecordID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastID, err := uuid.Parse(q.LastID)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	lastOccurred, err := time.Parse(time.RFC3339Nano, q.LastOccurred)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := r.q.ListProcessActivityLog(ctx, acquisitiondb.ListProcessActivityLogParams{
+		CourtRecordID: crid,
+		TenantID:      tid,
+		LastOccurred:  pgtype.Timestamptz{Time: lastOccurred, Valid: true},
+		LastID:        lastID,
+		PageLimit:     int32(q.Limit),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]ActivityLogView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ActivityLogView{
+			ID:         row.ID.String(),
+			EventType:  row.EventType,
+			Text:       renderActivityText(row.EventType),
+			OccurredAt: row.OccurredAt.Time,
+		})
+	}
+	return out, nil
+}
+
+// CountProcessActivityLog returns the "X de Y" total for the Atividade tab: how many
+// activity rows the process holds. Tenant-scoped, same predicate as the list.
+func (r *pgRepository) CountProcessActivityLog(ctx context.Context, tenantID, courtRecordID string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	crid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	total, err := r.q.CountProcessActivityLog(ctx, acquisitiondb.CountProcessActivityLogParams{
 		CourtRecordID: crid,
 		TenantID:      tid,
 	})

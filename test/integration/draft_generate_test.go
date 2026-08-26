@@ -263,7 +263,7 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 		{
 			name:      "review.completed does not route to default",
 			eventType: draft.TypeReviewCompleted,
-			wantQueue: "ingestao", // current routing: archived in ingestao (no active consumer)
+			wantQueue: "notifications", // consumed by acquisition's activity listener
 		},
 	}
 
@@ -277,7 +277,7 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 			//
 			// For "draft.generation_requested": queueFor uses a string-literal check
 			// (not the prefix switch) → must be "ai".
-			// For "review.completed": routed to "ingestao" (no active consumer).
+			// For "review.completed": routed to "notifications" (activity listener).
 			// We assert these by testing the exported TypeXxx consts match exactly
 			// the string literals in relay.go's queueFor function.
 			//

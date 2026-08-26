@@ -9,8 +9,10 @@ import (
 // events.go defines the events the draft slice PRODUCES for Fatia 3. The generation trigger
 // (draft.generation_requested) is published on the write path (POST /v1/pecas/:id/generate)
 // and consumed by worker-ai. The review completion fact (review.completed) is published by
-// the worker-ai listener after a successful generation and is routed to an archivable queue
-// (no active consumer today — see relay routing in lib/events/relay.go).
+// ReviewUseCase.ReviewDraft (review.go, the SYNCHRONOUS Revisar use case) inside the same tx
+// that persists the review row, and is routed to the "notifications" queue (see relay routing
+// in lib/events/relay.go) — acquisition's activity listener consumes it for the process
+// cockpit's "Atividade" timeline (migration 0073, event DRAFT_GENERATED).
 
 const aggregateTypeDraft = "draft"
 
@@ -49,13 +51,17 @@ func newGenerationRequested(d *Draft) GenerationRequested {
 	}
 }
 
-// ReviewCompleted is published by the worker-ai listener inside the same tx that
-// persists the review row. It announces a finished (COMPLETED or FAILED) generation.
-// Downstream consumers (future: notifications, read-model invalidation) subscribe here.
+// ReviewCompleted is published by ReviewUseCase.ReviewDraft (review.go) inside the
+// SAME tx that persists the review row. It announces a finished (COMPLETED) review —
+// the advogado's synchronous "Revisar" call produced AI suggestions over the minuta.
+// Consumers: acquisition's activity listener (process cockpit "Atividade" timeline,
+// migration 0073 — DRAFT_GENERATED). TenantID is REQUIRED so a consumer can scope its
+// RLS-guarded tx without a second, tenant-less lookup (docs §4d.4 barrier 1).
 type ReviewCompleted struct {
 	events.Base
 	DraftID  string `json:"draft_id"`
 	ReviewID string `json:"review_id"`
+	TenantID string `json:"tenant_id"`
 	Status   string `json:"status"` // COMPLETED | FAILED
 }
 
@@ -66,11 +72,12 @@ func (ReviewCompleted) AggregateType() string { return aggregateTypeDraft }
 
 // newReviewCompleted builds the event after the review row is persisted. aggregate_id =
 // draft_id (uuid); event_id is a fresh uuid v7 (consumer dedup key).
-func newReviewCompleted(draftID, reviewID, status string) ReviewCompleted {
+func newReviewCompleted(draftID, reviewID, tenantID, status string) ReviewCompleted {
 	return ReviewCompleted{
 		Base:     events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: draftID},
 		DraftID:  draftID,
 		ReviewID: reviewID,
+		TenantID: tenantID,
 		Status:   status,
 	}
 }

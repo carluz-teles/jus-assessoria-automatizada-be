@@ -250,6 +250,55 @@ type PartyRow struct {
 	PartyView
 }
 
+// ActivityLogQuery carries the descending keyset cursor (the last row's occurred_at
+// and id) plus the process (court_record) whose activity log to read and the tenant.
+// Mirrors AndamentosQuery — this tab has no ?search — the sort key is occurred_at (a
+// timestamptz). The handler fills the max sentinel for a first page.
+type ActivityLogQuery struct {
+	TenantID      string
+	CourtRecordID string
+	LastOccurred  string
+	LastID        string
+	Limit         int
+}
+
+// ActivityLogView is one row of a process's "Atividade" timeline (migration 0073).
+// Text is PRE-RENDERED in PT-BR by the repo (renderActivityText, a pure function of
+// EventType) — never mentions "IA" (app-wide wording directive): the activity is
+// framed by the action ("Peça gerada"), not the technology behind it.
+type ActivityLogView struct {
+	ID         string    `json:"id"`
+	EventType  string    `json:"event_type"`
+	Text       string    `json:"text"`
+	OccurredAt time.Time `json:"occurred_at"`
+}
+
+// ActivityLogResult is a page of a process's activity log plus its total for the
+// "X de Y" counter. Like AndamentosResult (no search on this tab), it carries a
+// single Total; HasMore drives the next cursor. Filters is always empty (no chips).
+type ActivityLogResult struct {
+	Items   []ActivityLogView
+	HasMore bool
+	Total   int64
+	Filters httpx.Filters
+}
+
+// renderActivityText materializes the human-readable PT-BR label for one
+// process_activity_log event_type — the closed set migration 0073's CHECK enforces.
+// An unrecognized event_type (should never happen — the CHECK guards the DB) falls
+// back to the raw code rather than an empty string, so the timeline never renders
+// a blank row.
+func renderActivityText(eventType string) string {
+	switch eventType {
+	case ActivityEventIntimationAnalysisCompleted:
+		return "Análise da intimação concluída"
+	case ActivityEventDraftGenerated:
+		return "Peça gerada"
+	default:
+		return eventType
+	}
+}
+
 // ProcessosQuery / IntimacoesQuery carry the keyset cursor (the last row's sort key
 // and id) and the page size. The handler fills the sentinel for a first page; the
 // repo turns them into the query's keyset predicate. The filter fields mirror the
@@ -623,6 +672,10 @@ type readRepo interface {
 	GetIntimacao(ctx context.Context, tenantID, id string) (IntimacaoDetailView, error)
 	ListAndamentosByProcesso(ctx context.Context, q AndamentosQuery) ([]AndamentoView, error)
 	ListIntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) ([]IntimacaoView, error)
+	// ListProcessActivityLog / CountProcessActivityLog back the Atividade tab (migration
+	// 0073) — same keyset-plus-count shape as Andamentos.
+	ListProcessActivityLog(ctx context.Context, q ActivityLogQuery) ([]ActivityLogView, error)
+	CountProcessActivityLog(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	ListPartesByProcesso(ctx context.Context, tenantID, courtRecordID string) ([]PartyRow, error)
 	CountProcessos(ctx context.Context, q ProcessosQuery) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, q IntimacoesQuery) (totalCount, total int64, err error)
@@ -785,6 +838,29 @@ func (uc *ReadUseCase) Andamentos(ctx context.Context, q AndamentosQuery) (Andam
 		return AndamentosResult{}, err
 	}
 	return AndamentosResult{Items: rows, HasMore: hasMore, Total: total, Filters: httpx.Filters{}}, nil
+}
+
+// ActivityLog returns up to q.Limit rows of a process's activity log (newest first),
+// whether a further page exists, and the tab's total. Same over-fetch policy as
+// Andamentos: the keyset read over-fetches one row for hasMore, the total is a
+// separate COUNT — a small skew under concurrent inserts is fine (read model). The
+// tab has no filter chips, so Filters is the empty object.
+func (uc *ReadUseCase) ActivityLog(ctx context.Context, q ActivityLogQuery) (ActivityLogResult, error) {
+	limit := q.Limit
+	q.Limit = limit + 1
+	rows, err := uc.repo.ListProcessActivityLog(ctx, q)
+	if err != nil {
+		return ActivityLogResult{}, err
+	}
+	hasMore := false
+	if len(rows) > limit {
+		rows, hasMore = rows[:limit], true
+	}
+	total, err := uc.repo.CountProcessActivityLog(ctx, q.TenantID, q.CourtRecordID)
+	if err != nil {
+		return ActivityLogResult{}, err
+	}
+	return ActivityLogResult{Items: rows, HasMore: hasMore, Total: total, Filters: httpx.Filters{}}, nil
 }
 
 // IntimacoesByProcesso returns up to q.Limit of a process's intimations (newest

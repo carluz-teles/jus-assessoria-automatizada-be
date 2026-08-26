@@ -146,6 +146,10 @@ func (fakeReader) Andamentos(context.Context, AndamentosQuery) (AndamentosResult
 	return AndamentosResult{}, nil
 }
 
+func (fakeReader) ActivityLog(context.Context, ActivityLogQuery) (ActivityLogResult, error) {
+	return ActivityLogResult{}, nil
+}
+
 func (fakeReader) IntimacoesByProcesso(context.Context, IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
 	return IntimacoesByProcessoResult{}, nil
 }
@@ -438,6 +442,8 @@ type recordingReader struct {
 	gotQuery     ProcessosQuery
 	andRes       AndamentosResult
 	gotAndQuery  AndamentosQuery
+	actRes       ActivityLogResult
+	gotActQuery  ActivityLogQuery
 	intiRes      IntimacoesByProcessoResult
 	gotIntiQuery IntimacoesByProcessoQuery
 	// GET /v1/intimacoes — capture the forwarded query and return a canned result so
@@ -485,6 +491,10 @@ func (r *recordingReader) Intimacao(_ context.Context, tenantID, id string) (Int
 func (r *recordingReader) Andamentos(_ context.Context, q AndamentosQuery) (AndamentosResult, error) {
 	r.gotAndQuery = q
 	return r.andRes, nil
+}
+func (r *recordingReader) ActivityLog(_ context.Context, q ActivityLogQuery) (ActivityLogResult, error) {
+	r.gotActQuery = q
+	return r.actRes, nil
 }
 func (r *recordingReader) IntimacoesByProcesso(_ context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error) {
 	r.gotIntiQuery = q
@@ -1090,6 +1100,117 @@ func TestHandler_ListAndamentos_CursorRoundTrip(t *testing.T) {
 	}
 	if rd.gotAndQuery.LastID != last.ID {
 		t.Errorf("page 2 LastID = %q, want %q", rd.gotAndQuery.LastID, last.ID)
+	}
+}
+
+// --- read route: /v1/processos/:id/activity ---------------------------------
+
+// GET /v1/processos/:id/activity forwards the path :id (the court_record id) and the
+// decoded ?cursor to the read port, clamps ?limit, and takes the tenant from the
+// principal (never the query) — mirrors TestHandler_ListAndamentos_ForwardsProcessoAndCursor.
+func TestHandler_ListActivity_ForwardsProcessoAndCursor(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	cursor := httpx.EncodeCursor(httpx.Cursor{
+		LastSortValue: "2024-03-01T12:30:00Z",
+		LastID:        "018f0000-0000-7000-8000-000000000abc",
+	})
+	status, _ := do(t, app, http.MethodGet,
+		"/v1/processos/cr-77/activity?limit=25&cursor="+cursor, "", "jwt")
+
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotActQuery.CourtRecordID != "cr-77" {
+		t.Errorf("CourtRecordID = %q, want cr-77 (from path)", rd.gotActQuery.CourtRecordID)
+	}
+	if rd.gotActQuery.TenantID != "tenant-9" {
+		t.Errorf("TenantID = %q, want tenant-9 (from principal)", rd.gotActQuery.TenantID)
+	}
+	if rd.gotActQuery.LastOccurred != "2024-03-01T12:30:00Z" {
+		t.Errorf("LastOccurred = %q, want the decoded cursor sort value", rd.gotActQuery.LastOccurred)
+	}
+	if rd.gotActQuery.LastID != "018f0000-0000-7000-8000-000000000abc" {
+		t.Errorf("LastID = %q, want the decoded cursor id", rd.gotActQuery.LastID)
+	}
+	if rd.gotActQuery.Limit != 25 {
+		t.Errorf("Limit = %d, want 25", rd.gotActQuery.Limit)
+	}
+}
+
+// The first page passes the max sentinel cursor (no ?cursor), and ?limit defaults to
+// DefaultLimit when absent.
+func TestHandler_ListActivity_FirstPageSentinelAndDefaultLimit(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, _ := do(t, app, http.MethodGet, "/v1/processos/cr-1/activity", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if rd.gotActQuery.Limit != httpx.DefaultLimit {
+		t.Errorf("Limit = %d, want %d (default)", rd.gotActQuery.Limit, httpx.DefaultLimit)
+	}
+	if rd.gotActQuery.LastOccurred != maxTimestamp || rd.gotActQuery.LastID != maxUUID {
+		t.Errorf("first-page sentinel = (%q, %q), want (%q, %q)",
+			rd.gotActQuery.LastOccurred, rd.gotActQuery.LastID, maxTimestamp, maxUUID)
+	}
+}
+
+// A process with no activity serializes as an empty data array (never null) with the
+// zero totals — 200, not 404.
+func TestHandler_ListActivity_Empty(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{actRes: ActivityLogResult{}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-empty/activity", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"data":[]`, `"next_cursor":null`, `"total":0`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("envelope missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// Rows carry the pre-rendered PT-BR text — the FE never needs to map event_type itself.
+func TestHandler_ListActivity_RendersText(t *testing.T) {
+	t.Parallel()
+
+	rd := &recordingReader{actRes: ActivityLogResult{
+		Items: []ActivityLogView{
+			{ID: "a1", EventType: ActivityEventDraftGenerated, Text: "Peça gerada", OccurredAt: time.Now()},
+		},
+	}}
+	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-1/activity", "", "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, want := range []string{`"event_type":"DRAFT_GENERATED"`, `"text":"Peça gerada"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\ngot: %s", want, body)
+		}
+	}
+}
+
+// A malformed ?cursor is a client error → 400, not a 500.
+func TestHandler_ListActivity_BadCursor_400(t *testing.T) {
+	t.Parallel()
+
+	app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+	status, body := do(t, app, http.MethodGet, "/v1/processos/cr-1/activity?cursor=not-a-cursor", "", "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
 	}
 }
 

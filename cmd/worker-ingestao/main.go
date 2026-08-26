@@ -298,6 +298,14 @@ func run(logger *slog.Logger) error {
 	inAppUC := notifications.NewInAppUseCase(notifRepo, notifDedup, uow, pubsub.NewRedisPubSub(pubsubClient))
 	notifications.NewListener(notifyUC, inAppUC).Register(mux)
 
+	// acquisition's activity listener (process cockpit "Atividade" timeline, migration
+	// 0073): consumes draft's review.completed (a Revisar call finished) and appends a
+	// DRAFT_GENERATED row. Rides the SAME "notifications" queue/mux as the listener
+	// above (see lib/events' queueFor routing) — light, low-volume, one per Revisar
+	// call. repo already satisfies activityCourtRecordResolver (ResolveCourtRecordIDForDraftIntimation).
+	activityUC := acquisition.NewActivityUseCase(repo, acquisition.NewActivityDeduper(), acquisition.NewActivityLogWriter(), uow)
+	acquisition.NewActivityListener(activityUC).Register(mux)
+
 	// billing (fatia 2): consume identity.tenant_provisioned (start the tenant's trial)
 	// and the scheduled billing.trial_ending_soon_check (re-check + warn). This is the
 	// FIRST asynq consumer billing needs (it was webhook-only until now); both types
