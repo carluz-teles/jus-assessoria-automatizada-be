@@ -12,39 +12,45 @@ import (
 	"github.com/jusassessoria/platform/lib/events"
 )
 
-// activity_listener.go is acquisition's consumer of draft's review.completed — the
+// activity_listener.go is acquisition's consumer of draft's draft.generated — the
 // second (async) half of the process_activity_log feature (migration 0073; the first
 // half, the SYNCHRONOUS intimation-analysis producer, lives in analise_store.go). It
 // follows the same cross-slice contract shape as internal/notifications/events.go:
-// only the dotted type id crosses the import boundary (TypeReviewCompleted below is a
+// only the dotted type id crosses the import boundary (TypeDraftGenerated below is a
 // string literal, matching the relay's routing literal in lib/events/relay.go — NOT an
-// alias to draft.TypeReviewCompleted, to keep this package import-free of internal/draft
+// alias to draft.TypeDraftGenerated, to keep this package import-free of internal/draft
 // per the vertical-slice rule); the payload SHAPE is redefined LOCALLY
-// (reviewCompletedPayload) so acquisition never imports draft's entity/repo.
+// (draftGeneratedPayload) so acquisition never imports draft's entity/repo.
+//
+// NOTE (bug fix, 2026-08-26): this listener originally consumed "review.completed",
+// published from draft's Revisar use case. That was wrong — Revisar never writes the
+// peça's content (it only produces critique suggestions over an existing minuta), so
+// the "Peça gerada" timeline entry never fired from real product usage. The producer
+// moved to Gerar (the use case that actually persists content_html) and the event was
+// renamed to draft.generated; this listener follows suit.
 
-// TypeReviewCompleted is the dotted id this listener consumes. Mirrors
-// draft.TypeReviewCompleted's value exactly (see draft/events.go); kept as an
+// TypeDraftGenerated is the dotted id this listener consumes. Mirrors
+// draft.TypeDraftGenerated's value exactly (see draft/events.go); kept as an
 // independent string literal (not an import) to avoid a slice-to-slice import.
-const TypeReviewCompleted = "review.completed"
+const TypeDraftGenerated = "draft.generated"
 
-// reviewCompletedPayload is the LOCAL decode shape of review.completed: a draft's
-// Revisar call finished. TenantID scopes the write (barrier 1); DraftID resolves the
-// owning court_record (via intimation — see queries/activity.sql); Status distinguishes
-// a successful review (COMPLETED — the peça is considered "gerada" for the timeline)
-// from a failure (FAILED — logged nowhere; review.go today only ever publishes
-// COMPLETED, but a future FAILED path is handled defensively here too). Base carries
-// the event id (consumer dedup) and the aggregate id.
-type reviewCompletedPayload struct {
+// draftGeneratedPayload is the LOCAL decode shape of draft.generated: a draft's Gerar
+// call finished successfully. TenantID scopes the write (barrier 1); DraftID resolves
+// the owning court_record (via intimation — see queries/activity.sql) when
+// CourtRecordID isn't already carried on the event. draft.generated is ONLY published
+// on Gerar's success path (its failure path, persistFailure, never touches the
+// outbox — a failed generation is not a "peça gerada" fact), so there is no Status
+// field to check here. Base carries the event id (consumer dedup) and the aggregate id.
+type draftGeneratedPayload struct {
 	events.Base
-	TenantID string `json:"tenant_id"`
-	DraftID  string `json:"draft_id"`
-	ReviewID string `json:"review_id"`
-	Status   string `json:"status"`
+	TenantID      string `json:"tenant_id"`
+	DraftID       string `json:"draft_id"`
+	CourtRecordID string `json:"court_record_id"`
 }
 
-// consumerActivityReviewCompleted is this listener's identity in processed_event —
+// consumerActivityDraftGenerated is this listener's identity in processed_event —
 // distinct from every other acquisition consumer, so its dedup never collides.
-const consumerActivityReviewCompleted = "acquisition.activity_review_completed"
+const consumerActivityDraftGenerated = "acquisition.activity_draft_generated"
 
 // activityCourtRecordResolver is the narrow read port the activity use case needs to
 // turn a draft id into the court_record it belongs to. Satisfied by pgRepository
@@ -125,27 +131,25 @@ func NewActivityUseCase(
 }
 
 // activityDraftGeneratedPayload is the process_activity_log payload for
-// DRAFT_GENERATED — the draft and review ids, so the timeline can deep-link to them.
+// DRAFT_GENERATED — the draft id, so the timeline can deep-link to it.
 type activityDraftGeneratedPayload struct {
-	DraftID  string `json:"draft_id"`
-	ReviewID string `json:"review_id"`
+	DraftID string `json:"draft_id"`
 }
 
-// OnReviewCompleted handles one review.completed. A FAILED status (a peça was NOT
-// successfully generated) is a no-op — DRAFT_GENERATED only ever fires for a
-// successful review. Otherwise, in the event's tenant scope, it dedups FIRST (so the
-// event is consumed exactly once), then resolves the owning court_record from the
-// draft id and appends the DRAFT_GENERATED row. LOG-NOT-FAIL: an unresolvable
+// OnDraftGenerated handles one draft.generated. It is only ever published on Gerar's
+// success path (never on failure — persistFailure never touches the outbox), so there
+// is no status to branch on. In the event's tenant scope, it dedups FIRST (so the
+// event is consumed exactly once), then resolves the owning court_record — preferring
+// the id already carried on the event (CourtRecordID, the common intimation-sourced
+// case) over a resolver round-trip, falling back to the resolver only when the event
+// didn't carry one (e.g. published before this field existed, or genuinely unknown at
+// publish time) — and appends the DRAFT_GENERATED row. LOG-NOT-FAIL: an unresolvable
 // court_record (a blank/processo draft with no intimation, or the draft was deleted)
 // or a failed insert is WARNED and swallowed — this consumer never fails the asynq
 // task for what is, at most, a missing timeline entry.
-func (uc *ActivityUseCase) OnReviewCompleted(ctx context.Context, ev reviewCompletedPayload) error {
-	if ev.Status != "" && ev.Status != "COMPLETED" {
-		return nil // FAILED (or any non-success status) — nothing to log
-	}
-
+func (uc *ActivityUseCase) OnDraftGenerated(ctx context.Context, ev draftGeneratedPayload) error {
 	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
-		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerActivityReviewCompleted, ev.EventID)
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerActivityDraftGenerated, ev.EventID)
 		if err != nil {
 			return err
 		}
@@ -153,11 +157,15 @@ func (uc *ActivityUseCase) OnReviewCompleted(ctx context.Context, ev reviewCompl
 			return nil
 		}
 
-		courtRecordID, err := uc.resolver.ResolveCourtRecordIDForDraftIntimation(ctx, ev.TenantID, ev.DraftID)
-		if err != nil {
-			slog.WarnContext(ctx, "acquisition: activity listener could not resolve court_record for draft",
-				slog.String("draft_id", ev.DraftID), slog.Any("error", err))
-			return nil // LOG-NOT-FAIL — the dedup mark above still commits
+		courtRecordID := ev.CourtRecordID
+		if courtRecordID == "" {
+			resolved, err := uc.resolver.ResolveCourtRecordIDForDraftIntimation(ctx, ev.TenantID, ev.DraftID)
+			if err != nil {
+				slog.WarnContext(ctx, "acquisition: activity listener could not resolve court_record for draft",
+					slog.String("draft_id", ev.DraftID), slog.Any("error", err))
+				return nil // LOG-NOT-FAIL — the dedup mark above still commits
+			}
+			courtRecordID = resolved
 		}
 		if courtRecordID == "" {
 			slog.WarnContext(ctx, "acquisition: activity listener found no court_record for draft (blank/processo draft?)",
@@ -165,7 +173,7 @@ func (uc *ActivityUseCase) OnReviewCompleted(ctx context.Context, ev reviewCompl
 			return nil
 		}
 
-		payload, err := json.Marshal(activityDraftGeneratedPayload{DraftID: ev.DraftID, ReviewID: ev.ReviewID})
+		payload, err := json.Marshal(activityDraftGeneratedPayload{DraftID: ev.DraftID})
 		if err != nil {
 			payload = []byte("{}")
 		}
@@ -179,7 +187,7 @@ func (uc *ActivityUseCase) OnReviewCompleted(ctx context.Context, ev reviewCompl
 	})
 }
 
-// ActivityListener is acquisition's asynq consumer for review.completed. It holds no
+// ActivityListener is acquisition's asynq consumer for draft.generated. It holds no
 // transport state; ActivityUseCase owns persistence and the transaction boundary.
 // Kept as a SEPARATE type from Listener (listener.go) — a distinct name avoids any
 // confusion with that type's own Register (they mount on the SAME "notifications"
@@ -193,21 +201,21 @@ func NewActivityListener(uc *ActivityUseCase) *ActivityListener {
 	return &ActivityListener{uc: uc}
 }
 
-// Register mounts the review.completed handler on the asynq mux. Called on the SAME
+// Register mounts the draft.generated handler on the asynq mux. Called on the SAME
 // mux as notifications.NewListener(...).Register(mux) (both drain the "notifications"
 // queue) — see cmd/worker-ingestao/main.go.
 func (l *ActivityListener) Register(mux *asynq.ServeMux) {
-	mux.HandleFunc(TypeReviewCompleted, l.handleReviewCompleted)
+	mux.HandleFunc(TypeDraftGenerated, l.handleDraftGenerated)
 }
 
-// handleReviewCompleted is the asynq.HandlerFunc for review.completed. A decode fault
+// handleDraftGenerated is the asynq.HandlerFunc for draft.generated. A decode fault
 // wraps asynq.SkipRetry (archived, not retried); the use case itself never returns an
 // error for a resolvable-but-missing court_record (LOG-NOT-FAIL) — only a genuine
 // infra fault (dedup/tx failure) stays retryable.
-func (l *ActivityListener) handleReviewCompleted(ctx context.Context, t *asynq.Task) error {
-	ev, err := events.Decode[reviewCompletedPayload](t)
+func (l *ActivityListener) handleDraftGenerated(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[draftGeneratedPayload](t)
 	if err != nil {
 		return err
 	}
-	return l.uc.OnReviewCompleted(ctx, ev)
+	return l.uc.OnDraftGenerated(ctx, ev)
 }

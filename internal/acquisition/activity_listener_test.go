@@ -63,22 +63,22 @@ func (f *fakeActivityWriter) InsertProcessActivityLog(
 	return f.err
 }
 
-// reviewCompletedEv returns a canonical reviewCompletedPayload for the tests below.
-func reviewCompletedEv(status string) reviewCompletedPayload {
-	return reviewCompletedPayload{
-		Base:     events.Base{EventID: "event-rc-1", Aggregate: "draft-1"},
-		TenantID: "tenant-1",
-		DraftID:  "draft-1",
-		ReviewID: "review-1",
-		Status:   status,
+// draftGeneratedEv returns a canonical draftGeneratedPayload for the tests below.
+func draftGeneratedEv(courtRecordID string) draftGeneratedPayload {
+	return draftGeneratedPayload{
+		Base:          events.Base{EventID: "event-dg-1", Aggregate: "draft-1"},
+		TenantID:      "tenant-1",
+		DraftID:       "draft-1",
+		CourtRecordID: courtRecordID,
 	}
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-// TestActivityUseCase_OnReviewCompleted_HappyPath verifies that a COMPLETED review
-// resolves the court_record from the draft and inserts a DRAFT_GENERATED log row.
-func TestActivityUseCase_OnReviewCompleted_HappyPath(t *testing.T) {
+// TestActivityUseCase_OnDraftGenerated_HappyPath verifies that when the event carries
+// no CourtRecordID, the use case falls back to the resolver and inserts a
+// DRAFT_GENERATED log row.
+func TestActivityUseCase_OnDraftGenerated_HappyPath(t *testing.T) {
 	resolver := &fakeResolver{courtRecordID: "cr-1"}
 	dedup := &fakeActivityDedup{}
 	writer := &fakeActivityWriter{}
@@ -86,7 +86,7 @@ func TestActivityUseCase_OnReviewCompleted_HappyPath(t *testing.T) {
 
 	uc := NewActivityUseCase(resolver, dedup, writer, uow)
 
-	if err := uc.OnReviewCompleted(context.Background(), reviewCompletedEv("COMPLETED")); err != nil {
+	if err := uc.OnDraftGenerated(context.Background(), draftGeneratedEv("")); err != nil {
 		t.Fatalf("want nil err, got %v", err)
 	}
 
@@ -112,38 +112,37 @@ func TestActivityUseCase_OnReviewCompleted_HappyPath(t *testing.T) {
 	if err := json.Unmarshal(writer.gotPayload, &payload); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
-	if payload.DraftID != "draft-1" || payload.ReviewID != "review-1" {
-		t.Errorf("payload = %+v, want {draft-1 review-1}", payload)
+	if payload.DraftID != "draft-1" {
+		t.Errorf("payload = %+v, want {draft-1}", payload)
 	}
 }
 
-// TestActivityUseCase_OnReviewCompleted_Failed verifies that a FAILED review never
-// dedups, resolves or writes — it is not a "peça gerada" fact.
-func TestActivityUseCase_OnReviewCompleted_Failed(t *testing.T) {
-	resolver := &fakeResolver{courtRecordID: "cr-1"}
+// TestActivityUseCase_OnDraftGenerated_CourtRecordIDFromEvent verifies that when the
+// event already carries CourtRecordID (the common case — resolved by GenerateUseCase
+// from the already-loaded intimation), the resolver is never called.
+func TestActivityUseCase_OnDraftGenerated_CourtRecordIDFromEvent(t *testing.T) {
+	resolver := &fakeResolver{courtRecordID: "cr-should-not-be-used"}
 	dedup := &fakeActivityDedup{}
 	writer := &fakeActivityWriter{}
 	uow := &fakeUoW{}
 
 	uc := NewActivityUseCase(resolver, dedup, writer, uow)
 
-	if err := uc.OnReviewCompleted(context.Background(), reviewCompletedEv("FAILED")); err != nil {
+	if err := uc.OnDraftGenerated(context.Background(), draftGeneratedEv("cr-from-event")); err != nil {
 		t.Fatalf("want nil err, got %v", err)
 	}
-	if dedup.calls != 0 {
-		t.Errorf("dedup.calls = %d, want 0 (FAILED short-circuits before the tx)", dedup.calls)
-	}
+
 	if resolver.calls != 0 {
-		t.Errorf("resolver.calls = %d, want 0", resolver.calls)
+		t.Errorf("resolver.calls = %d, want 0 (event already carried CourtRecordID)", resolver.calls)
 	}
-	if writer.calls != 0 {
-		t.Errorf("writer.calls = %d, want 0", writer.calls)
+	if writer.gotCourtID != "cr-from-event" {
+		t.Errorf("writer courtRecordID = %q, want cr-from-event", writer.gotCourtID)
 	}
 }
 
-// TestActivityUseCase_OnReviewCompleted_Dedup verifies that a replayed event_id
+// TestActivityUseCase_OnDraftGenerated_Dedup verifies that a replayed event_id
 // (already marked seen) is a no-op — the resolver and writer are never called.
-func TestActivityUseCase_OnReviewCompleted_Dedup(t *testing.T) {
+func TestActivityUseCase_OnDraftGenerated_Dedup(t *testing.T) {
 	resolver := &fakeResolver{courtRecordID: "cr-1"}
 	dedup := &fakeActivityDedup{seen: true}
 	writer := &fakeActivityWriter{}
@@ -151,7 +150,7 @@ func TestActivityUseCase_OnReviewCompleted_Dedup(t *testing.T) {
 
 	uc := NewActivityUseCase(resolver, dedup, writer, uow)
 
-	if err := uc.OnReviewCompleted(context.Background(), reviewCompletedEv("COMPLETED")); err != nil {
+	if err := uc.OnDraftGenerated(context.Background(), draftGeneratedEv("")); err != nil {
 		t.Fatalf("want nil err, got %v", err)
 	}
 	if resolver.calls != 0 {
@@ -162,10 +161,10 @@ func TestActivityUseCase_OnReviewCompleted_Dedup(t *testing.T) {
 	}
 }
 
-// TestActivityUseCase_OnReviewCompleted_UnresolvableDraft verifies LOG-NOT-FAIL: when
+// TestActivityUseCase_OnDraftGenerated_UnresolvableDraft verifies LOG-NOT-FAIL: when
 // the resolver finds no court_record for the draft (a deleted draft, or a blank/processo
 // draft with no intimation), the use case returns nil without writing a log row.
-func TestActivityUseCase_OnReviewCompleted_UnresolvableDraft(t *testing.T) {
+func TestActivityUseCase_OnDraftGenerated_UnresolvableDraft(t *testing.T) {
 	resolver := &fakeResolver{courtRecordID: ""} // not found
 	dedup := &fakeActivityDedup{}
 	writer := &fakeActivityWriter{}
@@ -173,7 +172,7 @@ func TestActivityUseCase_OnReviewCompleted_UnresolvableDraft(t *testing.T) {
 
 	uc := NewActivityUseCase(resolver, dedup, writer, uow)
 
-	if err := uc.OnReviewCompleted(context.Background(), reviewCompletedEv("COMPLETED")); err != nil {
+	if err := uc.OnDraftGenerated(context.Background(), draftGeneratedEv("")); err != nil {
 		t.Fatalf("want nil err (LOG-NOT-FAIL), got %v", err)
 	}
 	if writer.calls != 0 {
@@ -181,9 +180,9 @@ func TestActivityUseCase_OnReviewCompleted_UnresolvableDraft(t *testing.T) {
 	}
 }
 
-// TestActivityUseCase_OnReviewCompleted_ResolverError verifies LOG-NOT-FAIL when the
+// TestActivityUseCase_OnDraftGenerated_ResolverError verifies LOG-NOT-FAIL when the
 // resolver itself errors (e.g. an infra fault) — swallowed, not retried.
-func TestActivityUseCase_OnReviewCompleted_ResolverError(t *testing.T) {
+func TestActivityUseCase_OnDraftGenerated_ResolverError(t *testing.T) {
 	resolver := &fakeResolver{err: errors.New("boom")}
 	dedup := &fakeActivityDedup{}
 	writer := &fakeActivityWriter{}
@@ -191,7 +190,7 @@ func TestActivityUseCase_OnReviewCompleted_ResolverError(t *testing.T) {
 
 	uc := NewActivityUseCase(resolver, dedup, writer, uow)
 
-	if err := uc.OnReviewCompleted(context.Background(), reviewCompletedEv("COMPLETED")); err != nil {
+	if err := uc.OnDraftGenerated(context.Background(), draftGeneratedEv("")); err != nil {
 		t.Fatalf("want nil err (LOG-NOT-FAIL), got %v", err)
 	}
 	if writer.calls != 0 {
@@ -199,10 +198,10 @@ func TestActivityUseCase_OnReviewCompleted_ResolverError(t *testing.T) {
 	}
 }
 
-// TestActivityUseCase_OnReviewCompleted_WriteFails verifies LOG-NOT-FAIL when the
+// TestActivityUseCase_OnDraftGenerated_WriteFails verifies LOG-NOT-FAIL when the
 // insert itself fails — the use case still returns nil (never rolls back the tx over
 // a best-effort timeline row).
-func TestActivityUseCase_OnReviewCompleted_WriteFails(t *testing.T) {
+func TestActivityUseCase_OnDraftGenerated_WriteFails(t *testing.T) {
 	resolver := &fakeResolver{courtRecordID: "cr-1"}
 	dedup := &fakeActivityDedup{}
 	writer := &fakeActivityWriter{err: errors.New("insert failed")}
@@ -210,7 +209,7 @@ func TestActivityUseCase_OnReviewCompleted_WriteFails(t *testing.T) {
 
 	uc := NewActivityUseCase(resolver, dedup, writer, uow)
 
-	if err := uc.OnReviewCompleted(context.Background(), reviewCompletedEv("COMPLETED")); err != nil {
+	if err := uc.OnDraftGenerated(context.Background(), draftGeneratedEv("")); err != nil {
 		t.Fatalf("want nil err (LOG-NOT-FAIL), got %v", err)
 	}
 	if writer.calls != 1 {
@@ -218,16 +217,16 @@ func TestActivityUseCase_OnReviewCompleted_WriteFails(t *testing.T) {
 	}
 }
 
-// TestActivityUseCase_OnReviewCompleted_TenantScoped verifies the uow.Do call is
+// TestActivityUseCase_OnDraftGenerated_TenantScoped verifies the uow.Do call is
 // scoped to the event's tenant (barrier 1/2 — RLS is set per this tenant).
-func TestActivityUseCase_OnReviewCompleted_TenantScoped(t *testing.T) {
+func TestActivityUseCase_OnDraftGenerated_TenantScoped(t *testing.T) {
 	resolver := &fakeResolver{courtRecordID: "cr-1"}
 	dedup := &fakeActivityDedup{}
 	writer := &fakeActivityWriter{}
 	uow := &fakeUoW{}
 
 	uc := NewActivityUseCase(resolver, dedup, writer, uow)
-	if err := uc.OnReviewCompleted(context.Background(), reviewCompletedEv("COMPLETED")); err != nil {
+	if err := uc.OnDraftGenerated(context.Background(), draftGeneratedEv("")); err != nil {
 		t.Fatalf("want nil err, got %v", err)
 	}
 	if uow.tenantID != "tenant-1" {
@@ -235,22 +234,21 @@ func TestActivityUseCase_OnReviewCompleted_TenantScoped(t *testing.T) {
 	}
 }
 
-// TestReviewCompleted_ContractRoundTrip is the producer∥consumer contract guard
+// TestDraftGenerated_ContractRoundTrip is the producer∥consumer contract guard
 // (memória parallel-producer-consumer-roundtrip): it MARSHALS the producer's
-// draft.ReviewCompleted and UNMARSHALS it into this slice's LOCAL decode struct
-// (reviewCompletedPayload), asserting every field this listener reads survives the
+// draft.DraftGenerated and UNMARSHALS it into this slice's LOCAL decode struct
+// (draftGeneratedPayload), asserting every field this listener reads survives the
 // wire, and pins the shared dotted id.
-func TestReviewCompleted_ContractRoundTrip(t *testing.T) {
-	if TypeReviewCompleted != draft.TypeReviewCompleted {
-		t.Fatalf("consumed type %q != producer type %q", TypeReviewCompleted, draft.TypeReviewCompleted)
+func TestDraftGenerated_ContractRoundTrip(t *testing.T) {
+	if TypeDraftGenerated != draft.TypeDraftGenerated {
+		t.Fatalf("consumed type %q != producer type %q", TypeDraftGenerated, draft.TypeDraftGenerated)
 	}
 
-	producer := draft.ReviewCompleted{
-		Base:     events.Base{EventID: uuid.NewString(), Aggregate: "draft-x"},
-		DraftID:  "draft-x",
-		ReviewID: "review-x",
-		TenantID: "tenant-x",
-		Status:   "COMPLETED",
+	producer := draft.DraftGenerated{
+		Base:          events.Base{EventID: uuid.NewString(), Aggregate: "draft-x"},
+		DraftID:       "draft-x",
+		TenantID:      "tenant-x",
+		CourtRecordID: "cr-x",
 	}
 
 	raw, err := json.Marshal(producer)
@@ -258,7 +256,7 @@ func TestReviewCompleted_ContractRoundTrip(t *testing.T) {
 		t.Fatalf("marshal producer: %v", err)
 	}
 
-	var got reviewCompletedPayload
+	var got draftGeneratedPayload
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal into local shape: %v", err)
 	}
@@ -272,10 +270,7 @@ func TestReviewCompleted_ContractRoundTrip(t *testing.T) {
 	if got.DraftID != producer.DraftID {
 		t.Errorf("DraftID = %q, want %q", got.DraftID, producer.DraftID)
 	}
-	if got.ReviewID != producer.ReviewID {
-		t.Errorf("ReviewID = %q, want %q", got.ReviewID, producer.ReviewID)
-	}
-	if got.Status != producer.Status {
-		t.Errorf("Status = %q, want %q", got.Status, producer.Status)
+	if got.CourtRecordID != producer.CourtRecordID {
+		t.Errorf("CourtRecordID = %q, want %q", got.CourtRecordID, producer.CourtRecordID)
 	}
 }

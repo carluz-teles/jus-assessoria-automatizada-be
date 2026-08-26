@@ -2,21 +2,32 @@
 
 // Process activity log integration test — the SECOND half of the feature (the first
 // half, the SYNCHRONOUS intimation-analysis producer, is covered by
-// analise_activity_test.go). This file proves the async draft-generation path: a
-// successful Revisar call (ReviewUseCase.ReviewDraft, internal/draft/review.go)
-// publishes review.completed to the outbox in the SAME tx as the review row; the
-// relay routes it to the "notifications" queue; acquisition's activity listener
-// (internal/acquisition/activity_listener.go) consumes it and appends ONE
-// DRAFT_GENERATED row to process_activity_log, resolving the owning court_record via
-// the draft's intimation. It also proves GET /processos/:id/activity's tenant
-// isolation via the read use case.
+// analise_activity_test.go). This file proves the async draft-GENERATION path: a
+// successful Gerar call (GenerateUseCase.OnGenerationRequested, internal/draft/generate.go)
+// publishes draft.generated to the outbox in the SAME tx that persists content_html and
+// flips saga_state to DRAFTED; the relay routes it to the "notifications" queue;
+// acquisition's activity listener (internal/acquisition/activity_listener.go) consumes it
+// and appends ONE DRAFT_GENERATED row to process_activity_log, resolving the owning
+// court_record via the draft's intimation. It also proves GET /processos/:id/activity's
+// tenant isolation via the read use case.
+//
+// NOTE (bug fix, 2026-08-26): this round-trip originally exercised REVISAR (ReviewDraft),
+// because the "peça gerada" fact was (wrongly) published from there. QA found that Revisar
+// never touches the minuta's content — it only produces critique suggestions over an
+// EXISTING draft, and in the real product the advogado can't even reach Revisar without
+// first "assuming authorship" over an already-generated peça (no button wires to it yet).
+// So the fact was moved to Gerar (GenerateUseCase.OnGenerationRequested), the use case that
+// actually writes content_html/saga_state=DRAFTED, and the event was renamed
+// review.completed → draft.generated. This file now exercises GERAR, not Revisar.
 //
 // What the unit tests with mocked repos/fakes CANNOT prove:
-//   - ReviewDraft's outbox row and the review row commit in the SAME tx (real Postgres).
-//   - The relay's queueFor literal for "review.completed" matches what the consumer
+//   - OnGenerationRequested's outbox row and the content_html/saga_state writes commit in
+//     the SAME tx (real Postgres).
+//   - The relay's queueFor literal for "draft.generated" matches what the consumer
 //     listener is actually registered on (both point at "notifications").
 //   - The listener's SQL resolution of court_record_id from draft_id (via the
-//     intimation join) works against the real schema.
+//     intimation join) works against the real schema, for the fallback path (when the
+//     event itself doesn't carry court_record_id).
 //   - processed_event dedup: a duplicate event_id is a no-op (idempotent insert).
 //   - Tenant isolation: the Atividade read never leaks a foreign tenant's rows.
 package integration_test
@@ -31,31 +42,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
-	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/draft"
-	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
-	"github.com/jusassessoria/platform/lib/llm"
 )
-
-// newReviewUCWithOutbox wires the review use case against the real pool, WITH the
-// real Outbox (unlike draft_review_test.go's newReviewUC, which leaves Outbox nil
-// for its own review-only assertions) so review.completed actually lands in the
-// outbox table — this file's round-trip test needs it published.
-func newReviewUCWithOutbox(pool *pgxpool.Pool, gen llm.Generator) *draft.ReviewUseCase {
-	repo := draft.NewRepository()
-	return draft.NewReviewUseCase(draft.ReviewUseCaseParams{
-		UoW:      database.NewUnitOfWork(pool),
-		Reader:   repo,
-		Writer:   repo,
-		Outbox:   events.NewOutbox(),
-		Gen:      gen,
-		Search:   indexing.SearchDeps{Pool: nil}, // degraded — no RAG
-		Composer: advisory.NewTemplateComposer(),
-		Model:    "test-model",
-	})
-}
 
 // readOutboxPayload reads back one outbox row's raw jsonb payload for (type, aggregate_id)
 // — the owner query the round-trip test uses to feed the REAL asynq decode path
@@ -72,20 +62,21 @@ func readOutboxPayload(t *testing.T, pool *pgxpool.Pool, eventType, aggregateID 
 	return payload
 }
 
-// TestReviewCompleted_ActivityListener_RoundTrip proves the full producer→outbox→
-// consumer chain: Gerar (DRAFTED) → Revisar (ReviewDraft, publishes review.completed)
-// → the activity listener (via the real asynq decode path, ServeMux.ProcessTask) →
-// one DRAFT_GENERATED row, readable through GET /processos/:id/activity's use case.
-func TestReviewCompleted_ActivityListener_RoundTrip(t *testing.T) {
+// TestDraftGenerated_ActivityListener_RoundTrip proves the full producer→outbox→
+// consumer chain: Gerar (OnGenerationRequested — content_html + saga_state=DRAFTED +
+// publishes draft.generated, all in ONE tx) → the activity listener (via the real
+// asynq decode path, ServeMux.ProcessTask) → one DRAFT_GENERATED row, readable through
+// GET /processos/:id/activity's use case.
+func TestDraftGenerated_ActivityListener_RoundTrip(t *testing.T) {
 	pool := newPool(t)
 	ctx := context.Background()
 
 	tenantID := uuid.NewString()
-	seedTenant(t, pool, tenantID, "org-activity-review", 0)
+	seedTenant(t, pool, tenantID, "org-activity-generate", 0)
 	recordID, caseID := seedCourtRecordCNJ(t, pool, tenantID, "0020002-02.2026.8.26.0002")
 	intimationID := seedIntimationTyped(t, pool, tenantID, caseID, recordID, "CITACAO")
 
-	// ── Gerar: create + trigger + consume, so the draft has content (DRAFTED) ──
+	// ── Gerar: create + trigger + consume (publishes draft.generated on success) ──
 	draftUC := newDraftUC(pool)
 	created, err := draftUC.Create(ctx, draft.CreateCommand{
 		TenantID:     tenantID,
@@ -112,17 +103,12 @@ func TestReviewCompleted_ActivityListener_RoundTrip(t *testing.T) {
 		t.Fatalf("OnGenerationRequested: %v", err)
 	}
 
-	// ── Revisar: publishes review.completed in the SAME tx as the review row ──
-	reviewUC := newReviewUCWithOutbox(pool, &integrationFakeGen{out: []byte(cannedReviewJSON)})
-	if _, err := reviewUC.ReviewDraft(ctx, draft.ReviewDraftCommand{TenantID: tenantID, DraftID: draftID}); err != nil {
-		t.Fatalf("ReviewDraft: %v", err)
-	}
-	if n := countOutboxRows(t, pool, draft.TypeReviewCompleted, draftID); n != 1 {
-		t.Fatalf("outbox rows for review.completed = %d, want 1", n)
+	if n := countOutboxRows(t, pool, draft.TypeDraftGenerated, draftID); n != 1 {
+		t.Fatalf("outbox rows for draft.generated = %d, want 1", n)
 	}
 
 	// ── Consumer: feed the REAL outbox payload through the REAL asynq decode path ──
-	payload := readOutboxPayload(t, pool, draft.TypeReviewCompleted, draftID)
+	payload := readOutboxPayload(t, pool, draft.TypeDraftGenerated, draftID)
 	repo := acquisition.NewRepository(pool)
 	activityUC := acquisition.NewActivityUseCase(
 		repo, acquisition.NewActivityDeduper(), acquisition.NewActivityLogWriter(), database.NewUnitOfWork(pool),
@@ -130,9 +116,9 @@ func TestReviewCompleted_ActivityListener_RoundTrip(t *testing.T) {
 	mux := asynq.NewServeMux()
 	acquisition.NewActivityListener(activityUC).Register(mux)
 
-	task := events.Encode(acquisition.TypeReviewCompleted, payload)
+	task := events.Encode(acquisition.TypeDraftGenerated, payload)
 	if err := mux.ProcessTask(ctx, task); err != nil {
-		t.Fatalf("ProcessTask(review.completed): %v", err)
+		t.Fatalf("ProcessTask(draft.generated): %v", err)
 	}
 
 	if got := countProcessActivityLog(t, pool, recordID, acquisition.ActivityEventDraftGenerated); got != 1 {

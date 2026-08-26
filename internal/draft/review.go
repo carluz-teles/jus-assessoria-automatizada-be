@@ -25,17 +25,8 @@ import (
 	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/database"
-	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/llm"
 )
-
-// reviewOutboxPublisher is the narrow outbox port ReviewUseCase needs to announce a
-// completed review. Same shape as generate.go's outboxPublisher (kept as a separate
-// name so review.go stays readable standalone); satisfied by *events.Outbox in
-// production and a fakeOutbox in tests.
-type reviewOutboxPublisher interface {
-	Publish(ctx context.Context, tx database.Tx, ev events.Event) error
-}
 
 // ReviewDraftCommand is the input for POST /v1/pecas/:id/review.
 type ReviewDraftCommand struct {
@@ -104,17 +95,13 @@ type reviewOutput struct {
 }
 
 // ReviewUseCase is the synchronous review use case. It is composed independently
-// from GenerateUseCase (no dedup — synchronous request/response, called at most
-// once per HTTP request). It DOES publish to the outbox (review.completed, Phase 3,
-// same tx as the review row) so async consumers can react to a finished review
-// without the request/response path knowing about them.
+// from GenerateUseCase (no outbox, no dedup — synchronous request/response).
 type ReviewUseCase struct {
 	uow      database.UnitOfWork
 	reader   reviewDepsReader
 	writer   reviewWriter
-	outbox   reviewOutboxPublisher // nil → review.completed is not published (degrades silently)
-	gen      llm.Generator         // nil → apperr Invalid "IA não configurada"
-	emb      embedder              // nil → degraded (no RAG grounding)
+	gen      llm.Generator // nil → apperr Invalid "IA não configurada"
+	emb      embedder      // nil → degraded (no RAG grounding)
 	search   indexing.SearchDeps
 	ragCache *RAGCache // nil → sem cache
 	composer advisory.PromptComposer
@@ -126,7 +113,6 @@ type ReviewUseCaseParams struct {
 	UoW      database.UnitOfWork
 	Reader   reviewDepsReader
 	Writer   reviewWriter
-	Outbox   reviewOutboxPublisher // nil → review.completed is not published
 	Gen      llm.Generator
 	Emb      embedder
 	Search   indexing.SearchDeps
@@ -145,7 +131,6 @@ func NewReviewUseCase(p ReviewUseCaseParams) *ReviewUseCase {
 		uow:      p.UoW,
 		reader:   p.Reader,
 		writer:   p.Writer,
-		outbox:   p.Outbox,
 		gen:      p.Gen,
 		emb:      p.Emb,
 		search:   p.Search,
@@ -261,16 +246,6 @@ func (uc *ReviewUseCase) ReviewDraft(ctx context.Context, cmd ReviewDraftCommand
 		updated, e := uc.writer.UpdateSagaState(ctx, tx, cmd.DraftID, cmd.TenantID, SagaStateReviewed, false, "", nil)
 		if e != nil {
 			return fmt.Errorf("review: update saga state: %w", e)
-		}
-
-		// Announce the completed review in the SAME tx (transactional outbox). Optional:
-		// a nil outbox (not wired) simply skips publishing — Revisar itself never fails
-		// for it. Consumers: acquisition's activity listener (process cockpit timeline).
-		if uc.outbox != nil {
-			ev := newReviewCompleted(cmd.DraftID, rev.ID, cmd.TenantID, ReviewStatusCompleted)
-			if e := uc.outbox.Publish(ctx, tx, ev); e != nil {
-				return fmt.Errorf("review: publish review.completed: %w", e)
-			}
 		}
 
 		result = &ReviewResult{Review: rev, SagaState: updated.SagaState}

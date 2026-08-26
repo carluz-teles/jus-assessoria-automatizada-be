@@ -145,7 +145,7 @@ type Repository interface {
 	CountProcessActivityLog(ctx context.Context, tenantID, courtRecordID string) (int64, error)
 	// ResolveCourtRecordIDForDraftIntimation backs the activity listener
 	// (activity_listener.go): resolves the court_record a draft belongs to via its
-	// intimation, so a review.completed event can be logged against the right process.
+	// intimation, so a draft.generated event can be logged against the right process.
 	ResolveCourtRecordIDForDraftIntimation(ctx context.Context, tenantID, draftID string) (string, error)
 	CountProcessos(ctx context.Context, q ProcessosQuery) (totalCount, total int64, err error)
 	CountIntimacoes(ctx context.Context, q IntimacoesQuery) (totalCount, total int64, err error)

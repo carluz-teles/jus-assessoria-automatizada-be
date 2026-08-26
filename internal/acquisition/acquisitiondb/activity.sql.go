@@ -111,7 +111,7 @@ type ResolveCourtRecordIDForDraftIntimationParams struct {
 // draft carries back to a process today — draft has no court_record_id column of its
 // own; draft.case_id is nullable and, even when set, a court_case can have more than
 // one court_record (1º/2º grau), so it is not a reliable 1:1 resolution). Used by the
-// activity listener (review.completed → DRAFT_GENERATED) to know which process's
+// activity listener (draft.generated → DRAFT_GENERATED) to know which process's
 // timeline to append to. Scoped by tenant_id on BOTH draft and intimation (barrier 1).
 // No rows when the draft has no intimation_id (a blank/processo draft) — the caller
 // treats that as LOG-NOT-FAIL (nothing to log against).

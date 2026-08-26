@@ -299,9 +299,9 @@ func run(logger *slog.Logger) error {
 	notifications.NewListener(notifyUC, inAppUC).Register(mux)
 
 	// acquisition's activity listener (process cockpit "Atividade" timeline, migration
-	// 0073): consumes draft's review.completed (a Revisar call finished) and appends a
+	// 0073): consumes draft's draft.generated (a successful Gerar call) and appends a
 	// DRAFT_GENERATED row. Rides the SAME "notifications" queue/mux as the listener
-	// above (see lib/events' queueFor routing) — light, low-volume, one per Revisar
+	// above (see lib/events' queueFor routing) — light, low-volume, one per Gerar
 	// call. repo already satisfies activityCourtRecordResolver (ResolveCourtRecordIDForDraftIntimation).
 	activityUC := acquisition.NewActivityUseCase(repo, acquisition.NewActivityDeduper(), acquisition.NewActivityLogWriter(), uow)
 	acquisition.NewActivityListener(activityUC).Register(mux)

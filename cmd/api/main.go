@@ -475,7 +475,6 @@ func run(logger *slog.Logger) error {
 		UoW:      uow,
 		Reader:   draftRepo,
 		Writer:   draftRepo,
-		Outbox:   events.NewOutbox(),
 		Gen:      taskGenerator,
 		Emb:      chatEmbedder,
 		Search:   indexing.SearchDeps{Pool: pool},

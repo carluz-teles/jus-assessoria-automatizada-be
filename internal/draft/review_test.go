@@ -258,57 +258,15 @@ func TestReviewUseCase_HappyPath(t *testing.T) {
 	}
 }
 
-// TestReviewUseCase_PublishesReviewCompleted verifies that a successful ReviewDraft
-// publishes review.completed to the outbox, in the SAME tx as the review insert,
-// carrying TenantID (the RLS-scoping field consumers need) + Status COMPLETED.
-func TestReviewUseCase_PublishesReviewCompleted(t *testing.T) {
-	d := makeDraftedDraft()
-	gen := &fakeGen{out: []byte(cannedReviewJSON)}
-	w := &fakeReviewWriter{}
-	ob := &fakeOutbox{}
-
-	uc := NewReviewUseCase(ReviewUseCaseParams{
-		UoW:      fakeUoW{},
-		Reader:   fakeReader{draft: d},
-		Writer:   w,
-		Outbox:   ob,
-		Gen:      gen,
-		Search:   indexing.SearchDeps{Pool: nil},
-		Composer: advisory.NewTemplateComposer(),
-		Model:    "test-model",
-	})
-
-	if _, err := uc.ReviewDraft(context.Background(), reviewCmd()); err != nil {
-		t.Fatalf("want nil err, got %v", err)
-	}
-
-	if len(ob.published) != 1 {
-		t.Fatalf("published events = %d, want 1", len(ob.published))
-	}
-	ev, ok := ob.published[0].(ReviewCompleted)
-	if !ok {
-		t.Fatalf("published event type = %T, want ReviewCompleted", ob.published[0])
-	}
-	if ev.TenantID != "tenant-rev-1" {
-		t.Errorf("ev.TenantID = %q, want %q", ev.TenantID, "tenant-rev-1")
-	}
-	if ev.DraftID != "draft-rev-1" {
-		t.Errorf("ev.DraftID = %q, want %q", ev.DraftID, "draft-rev-1")
-	}
-	if ev.ReviewID != "review-rev-1" {
-		t.Errorf("ev.ReviewID = %q, want %q", ev.ReviewID, "review-rev-1")
-	}
-	if ev.Status != ReviewStatusCompleted {
-		t.Errorf("ev.Status = %q, want COMPLETED", ev.Status)
-	}
-	if ev.Type() != TypeReviewCompleted {
-		t.Errorf("ev.Type() = %q, want %q", ev.Type(), TypeReviewCompleted)
-	}
-}
-
-// TestReviewUseCase_NilOutbox_NoPanic verifies that a nil Outbox (not wired) never
-// panics — ReviewDraft simply skips publishing.
-func TestReviewUseCase_NilOutbox_NoPanic(t *testing.T) {
+// TestReviewUseCase_NeverPublishes verifies that Revisar (ReviewUseCase.ReviewDraft)
+// never touches the outbox — it only produces AI critique suggestions over an
+// EXISTING minuta (review.go's own header comment) and must not be confused with
+// Gerar, which is the use case that actually writes draft content and publishes
+// draft.generated (see generate_test.go's TestGenerateUseCase_HappyPath for that
+// assertion in the mirror direction). ReviewUseCase has no Outbox port at all —
+// this test pins that by construction: any future Publish call added here would
+// fail to compile against ReviewUseCaseParams, not just fail an assertion.
+func TestReviewUseCase_NeverPublishes(t *testing.T) {
 	d := makeDraftedDraft()
 	gen := &fakeGen{out: []byte(cannedReviewJSON)}
 	w := &fakeReviewWriter{}
