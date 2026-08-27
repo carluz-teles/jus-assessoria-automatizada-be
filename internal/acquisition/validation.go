@@ -52,6 +52,36 @@ func (r AssignResponsibleRequest) Validate() error {
 	)
 }
 
+// BulkAssignResponsibleRequest é o corpo de POST /v1/processos/bulk/responsavel:
+// atribui o responsável a vários processos. Dois modos: All=true aplica a TODA a
+// faixa/filtro atual (filtros espelham o GET /processos; inclui os itens ainda não
+// paginados); senão aplica aos IDs (court_record ids — mesma granularidade do
+// PUT /processos/:id/responsavel). UserID nil desatribui; mesmo nome de campo do
+// endpoint single-item (AssignResponsibleRequest.UserID), pra manter consistência.
+type BulkAssignResponsibleRequest struct {
+	UserID *string  `json:"user_id"`
+	All    bool     `json:"all"`
+	IDs    []string `json:"ids"`
+	// filtros (usados só quando All=true) — espelham o GET /processos.
+	Search    string `json:"search"`
+	Court     string `json:"court"`
+	Lifecycle string `json:"lifecycle"`
+	Degree    string `json:"degree"`
+	Assignee  string `json:"assignee"`
+}
+
+// Validate: user_id (quando presente) uuid; no modo por-ids, ao menos um id, cada
+// um uuid. A pertinência do user_id ao tenant é checada no caso de uso (sob a tx).
+func (r BulkAssignResponsibleRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.UserID, is.UUID),
+		validation.Field(&r.IDs,
+			validation.When(!r.All, validation.Required),
+			validation.Each(is.UUID),
+		),
+	)
+}
+
 // AssignIntimacaoResponsavelRequest is the PUT /v1/intimacoes/:id/responsavel body:
 // o responsável único da intimação (0057, ex-conductor/reviewer). *string permite
 // null explícito para desatribuir. tenant_id vem do principal, nunca do body.

@@ -51,6 +51,15 @@ type fakeHandlerUC struct {
 	gotAssignRecord string
 	gotAssignUser   *string
 	assignErr       error
+	// Bulk responsável write path (BulkAssignResponsible): what the handler forwarded
+	// (tenant, mode, filter, ids, user), a canned affected-count/error pair.
+	gotBulkTenant string
+	gotBulkAll    bool
+	gotBulkQuery  ProcessosQuery
+	gotBulkIDs    []string
+	gotBulkUser   *string
+	bulkResp      int64
+	bulkErr       error
 	// Triagem write path: what the handler forwarded (tenant, id) and which verb was
 	// called, plus an optional canned error to drive the failure branch.
 	gotTriageTenant string
@@ -86,6 +95,15 @@ func (f *fakeHandlerUC) AssignResponsible(_ context.Context, tenantID, courtReco
 	f.gotAssignRecord = courtRecordID
 	f.gotAssignUser = assignedUserID
 	return f.assignErr
+}
+
+func (f *fakeHandlerUC) BulkAssignResponsible(_ context.Context, tenantID string, all bool, q ProcessosQuery, ids []string, assignedUserID *string) (int64, error) {
+	f.gotBulkTenant = tenantID
+	f.gotBulkAll = all
+	f.gotBulkQuery = q
+	f.gotBulkIDs = ids
+	f.gotBulkUser = assignedUserID
+	return f.bulkResp, f.bulkErr
 }
 
 func (f *fakeHandlerUC) ResolveIntimacao(_ context.Context, tenantID, intimationID string) error {
@@ -1625,6 +1643,142 @@ func TestHandler_AssignResponsible_InvalidBody_400(t *testing.T) {
 	}
 	if uc.gotAssignRecord != "" {
 		t.Errorf("use case was called on an invalid body (record=%q)", uc.gotAssignRecord)
+	}
+}
+
+// --- bulk responsável route: POST /v1/processos/bulk/responsavel -------------
+
+// The "por ids" mode forwards All=false, the ids list and the assignee straight to
+// the use case, and answers 200 with the affected count the use case returned.
+func TestHandler_BulkAssignResponsible_ByIDs_OK(t *testing.T) {
+	t.Parallel()
+
+	userID := "018f0000-0000-7000-8000-0000000000aa"
+	recordID1 := "018f0000-0000-7000-8000-000000000cc1"
+	recordID2 := "018f0000-0000-7000-8000-000000000cc2"
+	uc := &fakeHandlerUC{bulkResp: 2}
+	app := newApp(uc, "LAWYER", "tenant-9")
+
+	body := `{"user_id":"` + userID + `","ids":["` + recordID1 + `","` + recordID2 + `"]}`
+	status, resp := do(t, app, http.MethodPost, "/v1/processos/bulk/responsavel", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resp)
+	}
+	if uc.gotBulkAll {
+		t.Errorf("all forwarded = true, want false (por-ids mode)")
+	}
+	if len(uc.gotBulkIDs) != 2 || uc.gotBulkIDs[0] != recordID1 || uc.gotBulkIDs[1] != recordID2 {
+		t.Errorf("ids forwarded = %v, want [%s %s]", uc.gotBulkIDs, recordID1, recordID2)
+	}
+	if uc.gotBulkUser == nil || *uc.gotBulkUser != userID {
+		t.Errorf("user forwarded = %v, want %q", uc.gotBulkUser, userID)
+	}
+	if !strings.Contains(resp, `"affected":2`) {
+		t.Errorf("body = %s, want affected:2", resp)
+	}
+}
+
+// All=true forwards the ProcessosQuery filters (search/court/lifecycle/degree/assignee)
+// mirroring GET /processos, and ids stays empty — the "all" mode ignores it.
+func TestHandler_BulkAssignResponsible_All_ForwardsFilters(t *testing.T) {
+	t.Parallel()
+
+	assigneeID := "018f0000-0000-7000-8000-0000000000bb"
+	uc := &fakeHandlerUC{bulkResp: 7}
+	app := newApp(uc, "LAWYER", "tenant-9")
+
+	body := `{"all":true,"search":"0004567","court":"TJSP","lifecycle":"ACTIVE","degree":"1","assignee":"` + assigneeID + `"}`
+	status, resp := do(t, app, http.MethodPost, "/v1/processos/bulk/responsavel", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resp)
+	}
+	if !uc.gotBulkAll {
+		t.Fatalf("all forwarded = false, want true")
+	}
+	want := ProcessosQuery{
+		TenantID: "tenant-9", Search: "0004567", Court: "TJSP",
+		Lifecycle: "ACTIVE", Degree: "1", Assignee: assigneeID,
+	}
+	if uc.gotBulkQuery != want {
+		t.Errorf("query forwarded = %+v, want %+v", uc.gotBulkQuery, want)
+	}
+	if !strings.Contains(resp, `"affected":7`) {
+		t.Errorf("body = %s, want affected:7", resp)
+	}
+}
+
+// A null user_id (desatribuir em massa) is valid → 200, and the handler forwards nil.
+func TestHandler_BulkAssignResponsible_Unassign_OK(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{bulkResp: 1}
+	app := newApp(uc, "LAWYER", "tenant-9")
+
+	status, resp := do(t, app, http.MethodPost, "/v1/processos/bulk/responsavel",
+		`{"user_id":null,"ids":["018f0000-0000-7000-8000-000000000cc1"]}`, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resp)
+	}
+	if uc.gotBulkUser != nil {
+		t.Errorf("user forwarded = %v, want nil (desatribuir)", uc.gotBulkUser)
+	}
+}
+
+// The por-ids mode requires at least one id — an empty list is a 400 at the edge,
+// before the use case is ever called.
+func TestHandler_BulkAssignResponsible_EmptyIDs_400(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newApp(uc, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodPost, "/v1/processos/bulk/responsavel",
+		`{"ids":[]}`, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+	if uc.gotBulkIDs != nil {
+		t.Errorf("use case was called on an invalid body (ids=%v)", uc.gotBulkIDs)
+	}
+}
+
+// A malformed user_id (not a uuid) is rejected at the edge by Validate → 400, before
+// the use case is ever called.
+func TestHandler_BulkAssignResponsible_InvalidUserID_400(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{}
+	app := newApp(uc, "LAWYER", "tenant-9")
+
+	status, body := do(t, app, http.MethodPost, "/v1/processos/bulk/responsavel",
+		`{"user_id":"not-a-uuid","ids":["cr-1"]}`, "jwt")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", status, body)
+	}
+	if uc.gotBulkTenant != "" {
+		t.Errorf("use case was called on an invalid body (tenant=%q)", uc.gotBulkTenant)
+	}
+}
+
+// tenant_id sempre vem do principal, nunca do body: the request shape has no
+// tenant field at all, so even a malicious "tenant_id" key in the raw JSON is a
+// no-op — the handler forwards httpx.TenantFromCtx(c), not anything client-supplied.
+func TestHandler_BulkAssignResponsible_TenantFromPrincipal_NeverBody(t *testing.T) {
+	t.Parallel()
+
+	uc := &fakeHandlerUC{bulkResp: 1}
+	app := newApp(uc, "LAWYER", "tenant-9")
+
+	body := `{"tenant_id":"attacker-tenant","ids":["018f0000-0000-7000-8000-000000000cc1"]}`
+	status, resp := do(t, app, http.MethodPost, "/v1/processos/bulk/responsavel", body, "jwt")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", status, resp)
+	}
+	if uc.gotBulkTenant != "tenant-9" {
+		t.Fatalf("tenant forwarded = %q, want tenant-9 (from principal, never the body)", uc.gotBulkTenant)
+	}
+	if uc.gotBulkQuery.TenantID != "tenant-9" {
+		t.Fatalf("query tenant = %q, want tenant-9", uc.gotBulkQuery.TenantID)
 	}
 }
 

@@ -38,6 +38,9 @@ type handlerUC interface {
 	// :id, in one tx. It returns only an error; the handler re-reads the ProcessoView
 	// through the read port so the FE reidrates the header from the fresh row.
 	AssignResponsible(ctx context.Context, tenantID, courtRecordID string, assignedUserID *string) error
+	// BulkAssignResponsible atribui o responsável a vários processos (por ids ou toda a
+	// faixa via All+filtros). Devolve a contagem afetada (court_record rows).
+	BulkAssignResponsible(ctx context.Context, tenantID string, all bool, q ProcessosQuery, ids []string, assignedUserID *string) (int64, error)
 	// Triagem da intimação: move the intimation's user_status to RESOLVED / IGNORED /
 	// PENDING in one tx. Each returns only an error; the handler re-reads the detail view
 	// through the read port so the FE reidrates the row from the fresh state.
@@ -143,6 +146,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/processos/summary", h.processosSummary)
 	r.Get("/processos/:id", h.getProcesso)
 	r.Put("/processos/:id/responsavel", h.assignResponsible)
+	r.Post("/processos/bulk/responsavel", h.bulkAssignResponsible)
 	r.Get("/processos/:id/andamentos", h.listAndamentos)
 	r.Get("/processos/:id/activity", h.listActivity)
 	r.Get("/processos/:id/intimacoes", h.listIntimacoesByProcesso)
@@ -886,6 +890,45 @@ func (h *Handler) assignResponsible(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// bulkAssignResponsible handles POST /v1/processos/bulk/responsavel: atribui o
+// responsável a vários processos de uma vez. All=true aplica a TODA a faixa/filtro
+// atual (inclui os não paginados) reusando os filtros do GET /processos; senão
+// aplica aos ids (court_record ids — mesma granularidade do PUT
+// /processos/:id/responsavel). Mesmo padrão do bulk de intimações
+// (bulkAssignIntimacaoResponsavel). tenant_id vem do principal, nunca do body.
+func (h *Handler) bulkAssignResponsible(c *fiber.Ctx) error {
+	var req BulkAssignResponsibleRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+	if req.All && req.Lifecycle != "" && !isKnownLifecycle(req.Lifecycle) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid lifecycle filter"))
+	}
+	if req.Assignee != "" {
+		if _, err := uuid.Parse(req.Assignee); err != nil {
+			return httpx.WriteError(c, apperr.NewInvalid("invalid assignee filter (want a user id)"))
+		}
+	}
+
+	tenantID := httpx.TenantFromCtx(c)
+	q := ProcessosQuery{
+		TenantID:  tenantID,
+		Search:    req.Search,
+		Court:     req.Court,
+		Lifecycle: req.Lifecycle,
+		Degree:    req.Degree,
+		Assignee:  req.Assignee,
+	}
+	n, err := h.uc.BulkAssignResponsible(c.UserContext(), tenantID, req.All, q, req.IDs, req.UserID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"affected": n})
 }
 
 // listAndamentos handles GET /v1/processos/:id/andamentos: the "Andamentos" tab of one

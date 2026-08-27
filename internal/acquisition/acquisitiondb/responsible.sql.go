@@ -56,6 +56,55 @@ func (q *Queries) AssignCaseResponsible(ctx context.Context, arg AssignCaseRespo
 	return err
 }
 
+const bulkAssignCaseResponsible = `-- name: BulkAssignCaseResponsible :execrows
+UPDATE court_case
+   SET assigned_user_id = $1::uuid
+ WHERE tenant_id = $2::uuid
+   AND id = ANY($3::uuid[])
+`
+
+type BulkAssignCaseResponsibleParams struct {
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+	TenantID       uuid.UUID   `json:"tenant_id"`
+	CaseIds        []uuid.UUID `json:"case_ids"`
+}
+
+// Atribuição em massa do responsável para uma lista de court_case ids (já resolvida
+// pelas duas queries acima), tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
+func (q *Queries) BulkAssignCaseResponsible(ctx context.Context, arg BulkAssignCaseResponsibleParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bulkAssignCaseResponsible, arg.AssigneeUserID, arg.TenantID, arg.CaseIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const bulkCascadeCaseResponsibleToIntimations = `-- name: BulkCascadeCaseResponsibleToIntimations :execrows
+UPDATE intimation i
+   SET assignee_user_id = $1::uuid
+  FROM court_record cr
+ WHERE i.court_record_id = cr.id
+   AND i.tenant_id = $2::uuid
+   AND cr.case_id = ANY($3::uuid[])
+`
+
+type BulkCascadeCaseResponsibleToIntimationsParams struct {
+	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
+	TenantID       uuid.UUID   `json:"tenant_id"`
+	CaseIds        []uuid.UUID `json:"case_ids"`
+}
+
+// Gêmeo batchado de CascadeCaseResponsibleToIntimations: cascateia o mesmo
+// responsável para as intimações filhas de TODOS os court_case em @case_ids, na
+// MESMA tx do bulk assign acima. NULL desatribui (mesma semântica do pai).
+func (q *Queries) BulkCascadeCaseResponsibleToIntimations(ctx context.Context, arg BulkCascadeCaseResponsibleToIntimationsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bulkCascadeCaseResponsibleToIntimations, arg.AssigneeUserID, arg.TenantID, arg.CaseIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const cascadeCaseResponsibleToIntimations = `-- name: CascadeCaseResponsibleToIntimations :execrows
 UPDATE intimation i
    SET assignee_user_id = $1::uuid
@@ -130,4 +179,110 @@ func (q *Queries) GetCaseIDByCourtRecord(ctx context.Context, arg GetCaseIDByCou
 	var case_id uuid.UUID
 	err := row.Scan(&case_id)
 	return case_id, err
+}
+
+const resolveCaseIDsByProcessosFilter = `-- name: ResolveCaseIDsByProcessosFilter :many
+SELECT cr.id, cr.case_id
+FROM court_record cr
+LEFT JOIN court_case cc ON cc.id = cr.case_id
+WHERE cr.tenant_id = $1::uuid
+  AND ($2::text = '' OR cr.cnj_number ILIKE '%' || $2 || '%' ESCAPE '\')
+  AND ($3::text = '' OR cr.court = $3::text)
+  AND ($4::text = '' OR cr.degree = $4::text)
+  AND ($5::text = '' OR cr.lifecycle = $5::text)
+  AND ($5::text <> '' OR cr.lifecycle = 'ACTIVE')
+  AND ($6::uuid IS NULL OR cc.assigned_user_id = $6::uuid)
+`
+
+type ResolveCaseIDsByProcessosFilterParams struct {
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	Search     string      `json:"search"`
+	Court      string      `json:"court"`
+	Degree     string      `json:"degree"`
+	Lifecycle  string      `json:"lifecycle"`
+	AssigneeID pgtype.UUID `json:"assignee_id"`
+}
+
+type ResolveCaseIDsByProcessosFilterRow struct {
+	ID     uuid.UUID `json:"id"`
+	CaseID uuid.UUID `json:"case_id"`
+}
+
+// Gêmeo de ResolveCaseIDsByRecordIDs pro modo "all" do bulk: reusa EXATAMENTE a
+// cláusula de filtro do ListProcessos (search/court/degree/lifecycle/assignee), de
+// modo que "all" aplica a TODA a faixa filtrada, não só à página carregada.
+func (q *Queries) ResolveCaseIDsByProcessosFilter(ctx context.Context, arg ResolveCaseIDsByProcessosFilterParams) ([]ResolveCaseIDsByProcessosFilterRow, error) {
+	rows, err := q.db.Query(ctx, resolveCaseIDsByProcessosFilter,
+		arg.TenantID,
+		arg.Search,
+		arg.Court,
+		arg.Degree,
+		arg.Lifecycle,
+		arg.AssigneeID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ResolveCaseIDsByProcessosFilterRow
+	for rows.Next() {
+		var i ResolveCaseIDsByProcessosFilterRow
+		if err := rows.Scan(&i.ID, &i.CaseID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const resolveCaseIDsByRecordIDs = `-- name: ResolveCaseIDsByRecordIDs :many
+
+SELECT cr.id, cr.case_id
+FROM court_record cr
+WHERE cr.tenant_id = $1::uuid
+  AND cr.id = ANY($2::uuid[])
+`
+
+type ResolveCaseIDsByRecordIDsParams struct {
+	TenantID uuid.UUID   `json:"tenant_id"`
+	Ids      []uuid.UUID `json:"ids"`
+}
+
+type ResolveCaseIDsByRecordIDsRow struct {
+	ID     uuid.UUID `json:"id"`
+	CaseID uuid.UUID `json:"case_id"`
+}
+
+// ── bulk (POST /v1/processos/bulk/responsavel) ──────────────────────────────────
+// Twins batchados do fluxo acima (GetCaseIDByCourtRecord → AssignCaseResponsible →
+// CascadeCaseResponsibleToIntimations), pra atribuir o responsável a vários
+// processos numa tx só. A FE endereça processos pelo court_record :id (mesma
+// granularidade do PUT single-item); o responsável vive no court_case (case-level,
+// compartilhado entre graus) — então o write resolve ids/filtro para os court_case
+// por trás e cascateia pras intimações filhas.
+// Gêmeo batchado de GetCaseIDByCourtRecord, pro modo "por ids" do bulk: resolve os
+// pares (record_id, case_id) para uma lista explícita, tenant-scoped (barrier 1).
+// Ids desconhecidos ou de outro tenant simplesmente somem do resultado (sem erro) —
+// o "affected" do caller é len(rows), mesma semântica de BulkAssignIntimacoesByIDs.
+func (q *Queries) ResolveCaseIDsByRecordIDs(ctx context.Context, arg ResolveCaseIDsByRecordIDsParams) ([]ResolveCaseIDsByRecordIDsRow, error) {
+	rows, err := q.db.Query(ctx, resolveCaseIDsByRecordIDs, arg.TenantID, arg.Ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ResolveCaseIDsByRecordIDsRow
+	for rows.Next() {
+		var i ResolveCaseIDsByRecordIDsRow
+		if err := rows.Scan(&i.ID, &i.CaseID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

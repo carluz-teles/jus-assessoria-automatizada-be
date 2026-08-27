@@ -112,6 +112,14 @@ type Repository interface {
 	// the intimações it just absorbed via RepointIntimations.
 	GetCaseAssignedUser(ctx context.Context, tx database.Tx, tenantID, caseID string) (*string, error)
 
+	// Bulk: atribui o responsável a vários processos de uma vez (batched twin of
+	// ResolveCaseIDByCourtRecord → AssignCaseResponsible → CascadeCaseResponsibleToIntimations
+	// above). ByIDs = lista explícita de court_record ids; ByFilter = TODA a faixa/filtro
+	// atual (modo "todos" da UI, mesmos filtros do ListProcessos, inclui não-paginados).
+	// Devolvem quantos court_record (processos) foram afetados.
+	BulkAssignResponsibleByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, assignedUserID *string) (int64, error)
+	BulkAssignResponsibleByFilter(ctx context.Context, tx database.Tx, q ProcessosQuery, assignedUserID *string) (int64, error)
+
 	// Triagem da intimação (user_status) — the resolve/ignore/reopen write path. It
 	// sets ONLY user_status (the DJEN cancellation `status` is untouched), tenant-scoped;
 	// a miss/foreign row surfaces as ErrIntimationNotFound. Tx-taking (the use case owns
@@ -1753,6 +1761,119 @@ func (r *pgRepository) GetCaseAssignedUser(ctx context.Context, tx database.Tx, 
 	}
 	id := uuid.UUID(assigned.Bytes).String()
 	return &id, nil
+}
+
+// BulkAssignResponsibleByIDs resolves an explicit list of court_record ids to their
+// court_case ids (ResolveCaseIDsByRecordIDs — unknown/foreign ids simply drop out),
+// then delegates the actual assign+cascade to bulkAssignCasesAndCascade. Returns the
+// number of matched court_record rows (the FE's selection granularity), not the
+// (typically smaller, since graus share a case) distinct case count.
+func (r *pgRepository) BulkAssignResponsibleByIDs(ctx context.Context, tx database.Tx, tenantID string, ids []string, assignedUserID *string) (int64, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	uuids := make([]uuid.UUID, 0, len(ids))
+	for _, id := range ids {
+		u, perr := uuid.Parse(id)
+		if perr != nil {
+			return 0, apperr.NewInvalid("id de processo inválido")
+		}
+		uuids = append(uuids, u)
+	}
+
+	rows, err := acquisitiondb.New(tx).ResolveCaseIDsByRecordIDs(ctx, acquisitiondb.ResolveCaseIDsByRecordIDsParams{
+		TenantID: tid,
+		Ids:      uuids,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+
+	caseIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		caseIDs = append(caseIDs, row.CaseID)
+	}
+	return r.bulkAssignCasesAndCascade(ctx, tx, tid, caseIDs, int64(len(rows)), assignedUserID)
+}
+
+// BulkAssignResponsibleByFilter resolves the whole ListProcessos-filtered range (the
+// "all" mode — ResolveCaseIDsByProcessosFilter reuses that exact WHERE clause) to
+// their court_case ids, then delegates to bulkAssignCasesAndCascade. Returns the
+// number of matched court_record rows.
+func (r *pgRepository) BulkAssignResponsibleByFilter(ctx context.Context, tx database.Tx, q ProcessosQuery, assignedUserID *string) (int64, error) {
+	tid, err := uuid.Parse(q.TenantID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+
+	rows, err := acquisitiondb.New(tx).ResolveCaseIDsByProcessosFilter(ctx, acquisitiondb.ResolveCaseIDsByProcessosFilterParams{
+		TenantID:   tid,
+		Search:     escapeLike(q.Search),
+		Court:      q.Court,
+		Degree:     q.Degree,
+		Lifecycle:  q.Lifecycle,
+		AssigneeID: nullUUID(q.Assignee),
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+
+	caseIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		caseIDs = append(caseIDs, row.CaseID)
+	}
+	return r.bulkAssignCasesAndCascade(ctx, tx, tid, caseIDs, int64(len(rows)), assignedUserID)
+}
+
+// bulkAssignCasesAndCascade is the shared write step behind both bulk resolve paths
+// above: dedupe the resolved case ids (multiple graus share one court_case), assign
+// them the responsável, then cascade the same assignee to their intimações filhas —
+// same order/semantics as AssignCaseResponsible + CascadeCaseResponsibleToIntimations
+// for the single-item endpoint, just batched. matchedRows is the caller's already-known
+// affected count (court_record rows, not the deduped case count) — returned as-is when
+// there is nothing to write.
+func (r *pgRepository) bulkAssignCasesAndCascade(ctx context.Context, tx database.Tx, tenantID uuid.UUID, caseIDs []uuid.UUID, matchedRows int64, assignedUserID *string) (int64, error) {
+	if len(caseIDs) == 0 {
+		return 0, nil
+	}
+	assignee, err := assigneePtrToUUID(assignedUserID)
+	if err != nil {
+		return 0, err
+	}
+	caseIDs = dedupeUUIDs(caseIDs)
+
+	q := acquisitiondb.New(tx)
+	if _, err := q.BulkAssignCaseResponsible(ctx, acquisitiondb.BulkAssignCaseResponsibleParams{
+		AssigneeUserID: assignee,
+		TenantID:       tenantID,
+		CaseIds:        caseIDs,
+	}); err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	if _, err := q.BulkCascadeCaseResponsibleToIntimations(ctx, acquisitiondb.BulkCascadeCaseResponsibleToIntimationsParams{
+		AssigneeUserID: assignee,
+		TenantID:       tenantID,
+		CaseIds:        caseIDs,
+	}); err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return matchedRows, nil
+}
+
+// dedupeUUIDs returns the distinct values of ids, order-preserving on first
+// occurrence (a court_case can repeat across multiple court_record rows/graus).
+func dedupeUUIDs(ids []uuid.UUID) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{}, len(ids))
+	out := make([]uuid.UUID, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 // ListProcessos reads the tenant's live processes (keyset-paginated) on the pool,
