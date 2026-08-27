@@ -2262,7 +2262,8 @@ const writeBackStructuredContent = `-- name: WriteBackStructuredContent :exec
 UPDATE draft
 SET structured_content = $3
 WHERE id = $1 AND tenant_id = $2
-  AND structured_content IS NULL
+  AND (structured_content IS NULL
+       OR structured_content->'sections' = '[]'::jsonb)
 `
 
 type WriteBackStructuredContentParams struct {
@@ -2272,9 +2273,12 @@ type WriteBackStructuredContentParams struct {
 }
 
 // Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
-// into a StructuredContent on the fly (structured_content IS NULL for drafts
-// created before migration 0056 / Fatia B), this UPDATE persists the parsed shape
-// so subsequent reads skip the parser. Fire-and-forget within the same tx — the
+// into a StructuredContent on the fly, this UPDATE persists the parsed shape so
+// subsequent reads skip the parser. Two cases trigger this: structured_content
+// IS NULL (drafts created before migration 0056 / Fatia B), or it has zero
+// sections (a draft generated before the htmlparse.go fix, where the LLM
+// emitted a heading as a plain paragraph instead of markdown `##` and the
+// parser silently dropped it). Fire-and-forget within the same tx — the
 // caller does NOT check RowsAffected (a race where another writer already
 // populated it is harmless — the last writer wins). Scoped to (id, tenant_id).
 func (q *Queries) WriteBackStructuredContent(ctx context.Context, arg WriteBackStructuredContentParams) error {

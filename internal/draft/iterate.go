@@ -221,10 +221,15 @@ func (uc *IterateUseCase) Iterate(ctx context.Context, cmd IterateCommand) (*Ite
 		return nil, err
 	}
 
-	// Resolve the structured shape — fall back to the parser when the column
-	// is still NULL (a draft not yet touched by Fatia B or by a lazy write-back).
+	// Resolve the structured shape — fall back to the plain-text parser when
+	// the column is NULL (draft not yet touched by Fatia B) OR when it was
+	// persisted with zero sections (the LLM emitted a heading as a plain
+	// paragraph instead of markdown `##`, which parseHTMLToStructured used to
+	// silently drop — see htmlparse.go). draft.Content already has the same
+	// "ROMAN — TÍTULO" line shape ParseStructured expects, so this recovers
+	// the sections without needing to regenerate the peça.
 	structured := draft.StructuredContent
-	if structured == nil {
+	if structured == nil || len(structured.Sections) == 0 {
 		structured = ParseStructured(draft.Content)
 	}
 	if structured == nil || len(structured.Sections) == 0 {
