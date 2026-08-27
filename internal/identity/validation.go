@@ -2,11 +2,15 @@ package identity
 
 import (
 	"regexp"
-	"strings"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/go-ozzo/ozzo-validation/v4/is"
 )
+
+// nonDigit matches everything that is not a digit, used to strip a CNPJ mask
+// (dots, slash, dash, spaces) before persistence. Compiled once at package level
+// (compilation is O(n) and allocates).
+var nonDigit = regexp.MustCompile(`\D`)
 
 // phoneDigits matches a bare phone of 10 or 11 digits (BR landline vs mobile). The
 // phone is optional, so ozzo skips this rule on an empty value — only a present
@@ -16,8 +20,11 @@ var phoneDigits = regexp.MustCompile(`^\d{10,11}$`)
 
 // UpdateOrgProfileRequest is the PUT /organization/profile body: the escritório's
 // company profile. tenant_id is NOT here — it comes from the verified principal.
-// CNPJ is free text: required, but not format-checked (no check-digit algorithm
-// exists in the product; the field only records whatever the user typed).
+// CNPJ accepts a masked value ("12.345.678/0001-95"), stripped to bare digits
+// before persistence (see toOrgProfile). It is required, but not format-checked —
+// there is no check-digit algorithm in the product, so a value that isn't exactly
+// 14 digits once stripped is still accepted (the FE input mask guides entry; the
+// API doesn't reject on it).
 type UpdateOrgProfileRequest struct {
 	CNPJ      string  `json:"cnpj"`
 	LegalName string  `json:"legal_name"`
@@ -64,12 +71,17 @@ func (a Address) Validate() error {
 	)
 }
 
-// toOrgProfile maps the validated request to the use-case input. CNPJ is persisted
-// as typed (trimmed only) — no digit-stripping, since the field is no longer
-// format-constrained.
+// normalizeCNPJ strips a CNPJ mask down to its bare digits.
+func normalizeCNPJ(cnpj string) string {
+	return nonDigit.ReplaceAllString(cnpj, "")
+}
+
+// toOrgProfile maps the validated request to the use-case input, normalizing the
+// CNPJ to bare digits so what is persisted is mask-free regardless of how it
+// arrived.
 func (r UpdateOrgProfileRequest) toOrgProfile() OrgProfile {
 	return OrgProfile{
-		CNPJ:      strings.TrimSpace(r.CNPJ),
+		CNPJ:      normalizeCNPJ(r.CNPJ),
 		LegalName: r.LegalName,
 		TradeName: r.TradeName,
 		Address:   r.Address,
