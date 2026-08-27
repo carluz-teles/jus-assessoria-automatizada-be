@@ -101,6 +101,9 @@ type Querier interface {
 	// neither duplicates nor errors. source is DJEN. The name is refreshed only on insert
 	// (a DO NOTHING leaves the existing row) — an advogado's OAB is the stable identity.
 	BatchUpsertPartyCounsels(ctx context.Context, arg BatchUpsertPartyCounselsParams) error
+	// Atribuição em massa do responsável para uma lista de court_case ids (já resolvida
+	// pelas duas queries acima), tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
+	BulkAssignCaseResponsible(ctx context.Context, arg BulkAssignCaseResponsibleParams) (int64, error)
 	// Atribuição em massa do responsável para TODA a faixa/filtro atual (modo
 	// "todos" da UI — inclui linhas ainda não paginadas). Reusa EXATAMENTE a
 	// cláusula de filtro do ListIntimacoes (search/type/user_status/court/assignee/
@@ -109,6 +112,10 @@ type Querier interface {
 	// Atribuição em massa do responsável para uma lista explícita de ids,
 	// tenant-scoped (barrier 1, RLS barrier 2). NULL desatribui.
 	BulkAssignIntimacoesByIDs(ctx context.Context, arg BulkAssignIntimacoesByIDsParams) (int64, error)
+	// Gêmeo batchado de CascadeCaseResponsibleToIntimations: cascateia o mesmo
+	// responsável para as intimações filhas de TODOS os court_case em @case_ids, na
+	// MESMA tx do bulk assign acima. NULL desatribui (mesma semântica do pai).
+	BulkCascadeCaseResponsibleToIntimations(ctx context.Context, arg BulkCascadeCaseResponsibleToIntimationsParams) (int64, error)
 	// Cascateia o responsável do court_case para as intimações filhas, na MESMA tx do
 	// AssignResponsible. Filtra por court_record_id → court_record.case_id (não por
 	// intimation.case_id direto): é essa a coluna que todo READ do app usa para decidir
@@ -638,6 +645,22 @@ type Querier interface {
 	// Unicidade de intimation é (tenant, case_id, hash), so swapping court_record_id never
 	// breaks dedup (same case). Returns the number of rows moved.
 	RepointIntimations(ctx context.Context, arg RepointIntimationsParams) (int64, error)
+	// Gêmeo de ResolveCaseIDsByRecordIDs pro modo "all" do bulk: reusa EXATAMENTE a
+	// cláusula de filtro do ListProcessos (search/court/degree/lifecycle/assignee), de
+	// modo que "all" aplica a TODA a faixa filtrada, não só à página carregada.
+	ResolveCaseIDsByProcessosFilter(ctx context.Context, arg ResolveCaseIDsByProcessosFilterParams) ([]ResolveCaseIDsByProcessosFilterRow, error)
+	// ── bulk (POST /v1/processos/bulk/responsavel) ──────────────────────────────────
+	// Twins batchados do fluxo acima (GetCaseIDByCourtRecord → AssignCaseResponsible →
+	// CascadeCaseResponsibleToIntimations), pra atribuir o responsável a vários
+	// processos numa tx só. A FE endereça processos pelo court_record :id (mesma
+	// granularidade do PUT single-item); o responsável vive no court_case (case-level,
+	// compartilhado entre graus) — então o write resolve ids/filtro para os court_case
+	// por trás e cascateia pras intimações filhas.
+	// Gêmeo batchado de GetCaseIDByCourtRecord, pro modo "por ids" do bulk: resolve os
+	// pares (record_id, case_id) para uma lista explícita, tenant-scoped (barrier 1).
+	// Ids desconhecidos ou de outro tenant simplesmente somem do resultado (sem erro) —
+	// o "affected" do caller é len(rows), mesma semântica de BulkAssignIntimacoesByIDs.
+	ResolveCaseIDsByRecordIDs(ctx context.Context, arg ResolveCaseIDsByRecordIDsParams) ([]ResolveCaseIDsByRecordIDsRow, error)
 	// Resolves the court_record a draft belongs to, via its intimation (the only path a
 	// draft carries back to a process today — draft has no court_record_id column of its
 	// own; draft.case_id is nullable and, even when set, a court_case can have more than

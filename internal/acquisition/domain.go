@@ -272,6 +272,45 @@ func (uc *UseCase) AssignResponsible(ctx context.Context, tenantID, courtRecordI
 	})
 }
 
+// BulkAssignResponsible atribui o responsável a vários processos de uma vez. Dois
+// modos (mutuamente exclusivos): All=true aplica a TODA a faixa/filtro atual (q —
+// mesmos filtros do ListProcessos; inclui os não paginados); senão aplica aos ids
+// (court_record ids — mesma granularidade do PUT /processos/:id/responsavel).
+// Valida a pertinência do responsável (quando não-nil) antes do write, na mesma tx
+// (UoW + RLS) — reusa AppUserInTenant, mesmo guard de AssignResponsible. O repo
+// resolve os ids/filtro para os court_case por trás e cascateia pras intimações
+// filhas (mesmo padrão de AssignResponsible, só que em lote). Devolve quantos
+// processos (court_record) foram afetados.
+func (uc *UseCase) BulkAssignResponsible(
+	ctx context.Context,
+	tenantID string,
+	all bool,
+	q ProcessosQuery,
+	ids []string,
+	assignedUserID *string,
+) (int64, error) {
+	var n int64
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		if assignedUserID != nil {
+			member, err := uc.repo.AppUserInTenant(ctx, tx, tenantID, *assignedUserID)
+			if err != nil {
+				return err
+			}
+			if !member {
+				return ErrResponsibleNotMember
+			}
+		}
+		var err error
+		if all {
+			n, err = uc.repo.BulkAssignResponsibleByFilter(ctx, tx, q, assignedUserID)
+		} else {
+			n, err = uc.repo.BulkAssignResponsibleByIDs(ctx, tx, tenantID, ids, assignedUserID)
+		}
+		return err
+	})
+	return n, err
+}
+
 // AssignIntimacaoAssignee sets (or clears, when nil) the single responsável of one
 // intimação, in ONE transaction (UoW → SET LOCAL app.tenant_id, RLS as a second barrier
 // under the explicit tenant filter). When non-nil, the use case guards that the target

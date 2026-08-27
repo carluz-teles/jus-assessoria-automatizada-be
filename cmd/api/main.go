@@ -386,6 +386,9 @@ func run(logger *slog.Logger) error {
 		certUC = certificate.NewUseCase(certificate.NewRepository(), uow, cipher, events.NewOutbox())
 		certificateHandler = certificate.New(certUC)
 		logger.Info("certificate slice ready", "kms_key", cfg.GCPKMSKeyName)
+	} else {
+		logger.Warn("GCP_KMS_KEY_NAME unset — certificate endpoints will be disabled",
+			"impact", "GET/POST/DELETE /v1/certificates* will return 404 until GCP_KMS_KEY_NAME and GCP_KMS_CREDENTIALS_JSON are configured")
 	}
 
 	// Draft (Peticionamento Fatias 1–3b): the peça create/read/autosave surface +

@@ -60,6 +60,21 @@ type mockRepo struct {
 	caseAssignedID  *string
 	caseAssignedErr error
 
+	// Bulk responsável do processo (BulkAssignResponsible). Each mode's call is
+	// captured separately (ids-mode vs filter-mode) so a test can assert exactly one
+	// ran; both share a canned affected-count/error pair per mode.
+	bulkByIDsCalls    int
+	gotBulkIDsTenant  string
+	gotBulkIDs        []string
+	gotBulkIDsUser    *string
+	bulkByIDsResp     int64
+	bulkByIDsErr      error
+	bulkByFilterCalls int
+	gotBulkFilter     ProcessosQuery
+	gotBulkFilterUser *string
+	bulkByFilterResp  int64
+	bulkByFilterErr   error
+
 	// Triagem write path (SetIntimationUserStatus): capture what was written and an
 	// optional canned error to drive the not-found branch.
 	setUserStatusErr    error
@@ -366,6 +381,27 @@ func (m *mockRepo) CascadeCaseResponsibleToIntimations(_ context.Context, _ data
 
 func (m *mockRepo) GetCaseAssignedUser(_ context.Context, _ database.Tx, _, _ string) (*string, error) {
 	return m.caseAssignedID, m.caseAssignedErr
+}
+
+func (m *mockRepo) BulkAssignResponsibleByIDs(_ context.Context, _ database.Tx, tenantID string, ids []string, assignedUserID *string) (int64, error) {
+	m.bulkByIDsCalls++
+	m.gotBulkIDsTenant = tenantID
+	m.gotBulkIDs = ids
+	m.gotBulkIDsUser = assignedUserID
+	if m.bulkByIDsErr != nil {
+		return 0, m.bulkByIDsErr
+	}
+	return m.bulkByIDsResp, nil
+}
+
+func (m *mockRepo) BulkAssignResponsibleByFilter(_ context.Context, _ database.Tx, q ProcessosQuery, assignedUserID *string) (int64, error) {
+	m.bulkByFilterCalls++
+	m.gotBulkFilter = q
+	m.gotBulkFilterUser = assignedUserID
+	if m.bulkByFilterErr != nil {
+		return 0, m.bulkByFilterErr
+	}
+	return m.bulkByFilterResp, nil
 }
 
 func (m *mockRepo) ListIntimacoes(_ context.Context, _ IntimacoesQuery) ([]IntimacaoView, error) {
@@ -903,6 +939,152 @@ func TestUseCase_AssignResponsible_NilCascadesToNilOnIntimacoes(t *testing.T) {
 	}
 	if repo.cascadeUser != nil {
 		t.Fatalf("cascade user = %v, want nil", repo.cascadeUser)
+	}
+}
+
+// --- BulkAssignResponsible: POST /v1/processos/bulk/responsavel --------------
+
+// All=false delegates to BulkAssignResponsibleByIDs with the given ids, inside the
+// one uow tx scoped to tenantID, and never touches the filter-mode repo method.
+func TestUseCase_BulkAssignResponsible_ByIDs_DelegatesToRepo(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{memberOK: true, bulkByIDsResp: 2}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	user := "user-7"
+	ids := []string{"cr-1", "cr-2"}
+	n, err := uc.BulkAssignResponsible(context.Background(), testTenant, false, ProcessosQuery{}, ids, &user)
+	if err != nil {
+		t.Fatalf("BulkAssignResponsible() error = %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("affected = %d, want 2", n)
+	}
+	if uow.calls != 1 || uow.tenantID != testTenant {
+		t.Fatalf("uow calls=%d tenant=%q, want 1 run scoped to %q", uow.calls, uow.tenantID, testTenant)
+	}
+	if repo.bulkByIDsCalls != 1 {
+		t.Fatalf("ByIDs calls = %d, want 1", repo.bulkByIDsCalls)
+	}
+	if repo.gotBulkIDsTenant != testTenant {
+		t.Fatalf("ByIDs tenant = %q, want %q", repo.gotBulkIDsTenant, testTenant)
+	}
+	if len(repo.gotBulkIDs) != 2 || repo.gotBulkIDs[0] != "cr-1" || repo.gotBulkIDs[1] != "cr-2" {
+		t.Fatalf("ByIDs ids = %v, want %v", repo.gotBulkIDs, ids)
+	}
+	if repo.gotBulkIDsUser == nil || *repo.gotBulkIDsUser != user {
+		t.Fatalf("ByIDs user = %v, want %q", repo.gotBulkIDsUser, user)
+	}
+	if repo.bulkByFilterCalls != 0 {
+		t.Fatalf("ByFilter calls = %d, want 0 (ids mode must not touch the filter path)", repo.bulkByFilterCalls)
+	}
+}
+
+// All=true delegates to BulkAssignResponsibleByFilter with the given query (forwarded
+// verbatim, including the caller-scoped tenant), and never touches the ids-mode repo
+// method — mirroring the ids/filter mutual exclusivity of intimações' bulk.
+func TestUseCase_BulkAssignResponsible_All_DelegatesToFilterRepo(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{memberOK: true, bulkByFilterResp: 9}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	user := "user-7"
+	q := ProcessosQuery{TenantID: testTenant, Search: "0004567", Court: "TJSP"}
+	n, err := uc.BulkAssignResponsible(context.Background(), testTenant, true, q, nil, &user)
+	if err != nil {
+		t.Fatalf("BulkAssignResponsible() error = %v", err)
+	}
+	if n != 9 {
+		t.Fatalf("affected = %d, want 9", n)
+	}
+	if repo.bulkByFilterCalls != 1 {
+		t.Fatalf("ByFilter calls = %d, want 1", repo.bulkByFilterCalls)
+	}
+	if repo.gotBulkFilter != q {
+		t.Fatalf("ByFilter query = %+v, want %+v", repo.gotBulkFilter, q)
+	}
+	if repo.gotBulkFilterUser == nil || *repo.gotBulkFilterUser != user {
+		t.Fatalf("ByFilter user = %v, want %q", repo.gotBulkFilterUser, user)
+	}
+	if repo.bulkByIDsCalls != 0 {
+		t.Fatalf("ByIDs calls = %d, want 0 (all mode must not touch the ids path)", repo.bulkByIDsCalls)
+	}
+}
+
+// A user_id from outside the escritório fails the membership guard → the typed
+// ErrResponsibleNotMember, BEFORE either repo write path runs (mirrors
+// AssignResponsible_ForeignUser_Errors, just for the bulk write).
+func TestUseCase_BulkAssignResponsible_ForeignUser_Errors(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{memberOK: false}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	user := "user-outsider"
+	_, err := uc.BulkAssignResponsible(context.Background(), testTenant, false, ProcessosQuery{}, []string{"cr-1"}, &user)
+	if !errors.Is(err, ErrResponsibleNotMember) {
+		t.Fatalf("error = %v, want ErrResponsibleNotMember", err)
+	}
+	if repo.bulkByIDsCalls != 0 {
+		t.Fatalf("ByIDs calls = %d, want 0 (guard must block the write)", repo.bulkByIDsCalls)
+	}
+}
+
+// Desatribuir em massa: a nil user_id SKIPS the membership guard (there is no user to
+// validate) and still writes — mirrors AssignResponsible_Unassigns for the bulk path.
+func TestUseCase_BulkAssignResponsible_Unassign_SkipsMembershipGuard(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{memberOK: false, bulkByIDsResp: 1}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	n, err := uc.BulkAssignResponsible(context.Background(), testTenant, false, ProcessosQuery{}, []string{"cr-1"}, nil)
+	if err != nil {
+		t.Fatalf("BulkAssignResponsible(nil) error = %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("affected = %d, want 1", n)
+	}
+	if repo.memberCheckedID != "" {
+		t.Fatalf("membership guard ran for a desatribuir (checked %q), want skipped", repo.memberCheckedID)
+	}
+	if repo.gotBulkIDsUser != nil {
+		t.Fatalf("ByIDs user = %v, want nil (desatribuir)", repo.gotBulkIDsUser)
+	}
+}
+
+// tenant isolation: the tenantID the use case receives is the ONLY tenant that ever
+// reaches the repo/uow, in both modes — proving a caller cannot smuggle a foreign
+// tenant through the ProcessosQuery.TenantID field (the handler always sets it from
+// the principal; this test proves the domain layer forwards it undisturbed too).
+func TestUseCase_BulkAssignResponsible_TenantIsolation(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{memberOK: true}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	user := "user-7"
+	if _, err := uc.BulkAssignResponsible(context.Background(), testTenant, false, ProcessosQuery{}, []string{"cr-1"}, &user); err != nil {
+		t.Fatalf("BulkAssignResponsible() error = %v", err)
+	}
+	if uow.tenantID != testTenant {
+		t.Fatalf("uow tenant = %q, want %q", uow.tenantID, testTenant)
+	}
+	if repo.gotBulkIDsTenant != testTenant {
+		t.Fatalf("repo tenant = %q, want %q", repo.gotBulkIDsTenant, testTenant)
+	}
+
+	q := ProcessosQuery{TenantID: "attacker-tenant"}
+	if _, err := uc.BulkAssignResponsible(context.Background(), testTenant, true, q, nil, &user); err != nil {
+		t.Fatalf("BulkAssignResponsible(all) error = %v", err)
+	}
+	if uow.tenantID != testTenant {
+		t.Fatalf("uow tenant = %q, want %q (the caller's tenantID param, not q.TenantID)", uow.tenantID, testTenant)
 	}
 }
 
