@@ -9,7 +9,6 @@ package integration_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,12 +35,22 @@ func seedAppUserReturningID(t *testing.T, pool *pgxpool.Pool, tenantID, clerkUse
 // exercised against the real CURRENT_DATE.
 func seedDeadlineFor(t *testing.T, pool *pgxpool.Pool, tenantID, recordID, intimationID string, daysFromNow int) {
 	t.Helper()
-	end := time.Now().UTC().AddDate(0, 0, daysFromNow).Format(time.DateOnly)
+	// end_date is computed by Postgres itself, relative to its own CURRENT_DATE
+	// (CURRENT_DATE + integer days), rather than from the Go process's wall
+	// clock formatted and passed in as a literal date. The two clocks are not
+	// guaranteed to agree — e.g. Docker Desktop/WSL2's VM clock can drift a
+	// day behind the host (observed directly: a fresh testcontainer's
+	// CURRENT_DATE lagged time.Now().UTC() by 24h after a host sleep/resume) —
+	// which silently shifted every days_left by one and made the
+	// days_left=2/days_left=3 boundary assertions flaky. Deriving the offset
+	// in SQL keeps the seed and the query (`d.end_date - CURRENT_DATE` in
+	// queries/read.sql) anchored to the exact same "now", eliminating the
+	// cross-clock dependency entirely instead of just tightening a tolerance.
 	mustExec(t, pool,
 		`INSERT INTO deadline
 		   (tenant_id, court_record_id, notification_id, start_date, end_date, days, counting, status)
-		 VALUES ($1, $2, $3, CURRENT_DATE, $4::date, 5, 'BUSINESS', 'OPEN')`,
-		tenantID, recordID, intimationID, end)
+		 VALUES ($1, $2, $3, CURRENT_DATE, CURRENT_DATE + $4::int, 5, 'BUSINESS', 'OPEN')`,
+		tenantID, recordID, intimationID, daysFromNow)
 }
 
 // TestListIntimacoes_UrgenciaBucketBoundaries covers the redefined day-left ranges:
