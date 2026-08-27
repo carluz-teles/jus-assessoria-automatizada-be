@@ -14,13 +14,19 @@ import (
 	"github.com/jusassessoria/platform/lib/obs"
 )
 
-// selectUnpublished drains one batch of undelivered outbox rows in publication
-// order. FOR UPDATE SKIP LOCKED lets several relay replicas share the table
-// without publishing a row twice; the LIMIT bounds the work per Tick.
+// selectUnpublished drains one batch of undelivered outbox rows, interactive
+// (priority 0) rows ahead of background ones (priority 1), FIFO within each
+// priority. ORDER BY priority, id is satisfied directly by the composite partial
+// index outbox_unpublished_priority_idx (priority, id) WHERE published_at IS NULL —
+// an index-order scan, no sort — so a 10k-row bulk backfill (acquisition.*,
+// priority 1) never delays an interactive row (draft.generation_requested, …)
+// behind a full table sort. FOR UPDATE SKIP LOCKED lets several relay replicas
+// share the table without publishing a row twice; the LIMIT bounds the work per
+// Tick. Migration 0075.
 const selectUnpublished = `SELECT id, type, payload, idempotency_key, trace_context, aggregate_id, process_at
 	FROM outbox
 	WHERE published_at IS NULL
-	ORDER BY id
+	ORDER BY priority, id
 	LIMIT 200
 	FOR UPDATE SKIP LOCKED`
 
@@ -389,6 +395,39 @@ func maxRetryFor(typ string) int {
 		return 3
 	default:
 		return 5
+	}
+}
+
+// priorityFor sorts a dotted event type into the outbox drain priority written at
+// Publish time (migration 0075): 0 (interactive) jumps ahead of 1 (background) in
+// selectUnpublished's ORDER BY priority, id, so a mass backfill of bulk events (a
+// DJEN sync minting ~10,000 acquisition.court_record_observed rows) can never
+// starve an event a user is staring at a screen waiting for. This was a real
+// production incident: draft.generation_requested sat behind the backfill for 8+
+// minutes because the relay drained strict ORDER BY id with no priority.
+//
+// Only the EXACT types below are 0; everything else — including every unlisted or
+// future event type — is 1 via the default branch. That is the fail-safe: a new
+// event type nobody remembered to classify degrades to "background", never to
+// silently jumping the queue.
+//
+// String literals, not another slice's consts: this file already documents (see
+// queueFor) that lib/events cannot import internal/* without an import cycle.
+func priorityFor(typ string) int16 {
+	switch typ {
+	case "draft.generation_requested",
+		"draft.generated",
+		"filing.enqueued",
+		"filing.succeeded",
+		"filing.failed",
+		"identity.tenant_provisioned",
+		"notification.requested",
+		"billing.trial_ending_soon_check",
+		"billing.trial_ending_soon",
+		"billing.payment_failed":
+		return 0
+	default:
+		return 1
 	}
 }
 
