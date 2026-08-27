@@ -552,3 +552,40 @@ func TestMaxRetryFor(t *testing.T) {
 		})
 	}
 }
+
+// TestPriorityFor covers every EXACT type in the P0 (interactive) list, one sample per
+// bulk family (acquisition.*, deadline.*, document.*, billing.subscription_created) to
+// prove the default branch, and an unknown/future type to prove the fail-safe: anything
+// not explicitly classified degrades to background (1), never jumps the queue silently.
+func TestPriorityFor(t *testing.T) {
+	tests := []struct {
+		typ  string
+		want int16
+	}{
+		// The 10 P0 (interactive) types — exact list from the outbox priority fatia.
+		{"draft.generation_requested", 0},
+		{"draft.generated", 0},
+		{"filing.enqueued", 0},
+		{"filing.succeeded", 0},
+		{"filing.failed", 0},
+		{"identity.tenant_provisioned", 0},
+		{"notification.requested", 0},
+		{"billing.trial_ending_soon_check", 0},
+		{"billing.trial_ending_soon", 0},
+		{"billing.payment_failed", 0},
+		// One sample per bulk family — all P1 (background) via the default branch.
+		{"acquisition.court_record_observed", 1},
+		{"deadline.opened", 1},
+		{"document.uploaded", 1},
+		{"billing.subscription_created", 1},
+		// Fail-safe: an unknown/future type degrades to background, not interactive.
+		{"invented.made_up_type", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.typ, func(t *testing.T) {
+			if got := priorityFor(tt.typ); got != tt.want {
+				t.Errorf("priorityFor(%q) = %d, want %d", tt.typ, got, tt.want)
+			}
+		})
+	}
+}

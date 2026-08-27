@@ -11,10 +11,11 @@ import (
 // insertOutbox appends one row to the transactional outbox. Column order matches
 // Publish's argument order; id and created_at default in the DB and published_at
 // stays NULL until the relay drains it. process_at is NULL unless the event opts
-// into future delivery (see scheduledAt).
+// into future delivery (see scheduledAt). priority is priorityFor(ev.Type()) — the
+// relay's drain order (migration 0075), written once here at the event's birth.
 const insertOutbox = `INSERT INTO outbox
-	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context, process_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context, process_at, priority)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
 // Outbox is the producer half of the pipeline. It is stateless: Publish writes
 // through the caller's transaction, so the same tx that persists the domain entity
@@ -47,6 +48,7 @@ func (o *Outbox) Publish(ctx context.Context, tx database.Tx, ev Event) error {
 		ev.IdempotencyKey(),
 		TraceContextFromCtx(ctx),
 		scheduledAt(ev),
+		priorityFor(ev.Type()),
 	)
 	return database.WrapInfra(err)
 }
@@ -71,20 +73,23 @@ func scheduledAt(ev Event) *time.Time {
 
 // insertOutboxBatch appends MANY rows in one round-trip from a jsonb array — the set-
 // based counterpart of insertOutbox. bigserial ids are assigned in array order, so the
-// events keep their relative publication order.
+// events keep their relative publication order. priority is carried per row (same
+// priorityFor(ev.Type()) rule as insertOutbox), not a single batch-wide value — a mixed
+// batch (rare, but not precluded) still drains each event at its own priority.
 const insertOutboxBatch = `INSERT INTO outbox
-	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context, process_at)
-	SELECT r.aggregate_type, r.aggregate_id, r.type, r.payload, r.idempotency_key, r.trace_context, r.process_at
+	(aggregate_type, aggregate_id, type, payload, idempotency_key, trace_context, process_at, priority)
+	SELECT r.aggregate_type, r.aggregate_id, r.type, r.payload, r.idempotency_key, r.trace_context, r.process_at, r.priority
 	FROM jsonb_to_recordset($1::jsonb) AS r(
 		aggregate_type text, aggregate_id uuid, type text, payload jsonb,
-		idempotency_key text, trace_context text, process_at timestamptz
+		idempotency_key text, trace_context text, process_at timestamptz, priority smallint
 	)`
 
 // outboxRowJSON is one row of the PublishBatch payload. payload is the event's own JSON,
 // embedded as-is; trace_context is captured once for the whole batch. ProcessAt is the
 // per-event optional ETA: a nil pointer marshals to JSON null, which jsonb_to_recordset
 // reads back as a SQL NULL process_at (immediate delivery); a set time marshals as
-// RFC3339, which timestamptz parses (future delivery).
+// RFC3339, which timestamptz parses (future delivery). Priority is priorityFor(ev.Type())
+// per event — the relay's drain order (migration 0075).
 type outboxRowJSON struct {
 	AggregateType  string          `json:"aggregate_type"`
 	AggregateID    string          `json:"aggregate_id"`
@@ -93,6 +98,7 @@ type outboxRowJSON struct {
 	IdempotencyKey string          `json:"idempotency_key"`
 	TraceContext   string          `json:"trace_context"`
 	ProcessAt      *time.Time      `json:"process_at"`
+	Priority       int16           `json:"priority"`
 }
 
 // PublishBatch inserts MANY events into the outbox in ONE round-trip, within tx. It is
@@ -118,6 +124,7 @@ func (o *Outbox) PublishBatch(ctx context.Context, tx database.Tx, evs []Event) 
 			IdempotencyKey: ev.IdempotencyKey(),
 			TraceContext:   trace,
 			ProcessAt:      scheduledAt(ev),
+			Priority:       priorityFor(ev.Type()),
 		}
 	}
 	batch, err := json.Marshal(rows)
