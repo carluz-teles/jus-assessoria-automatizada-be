@@ -87,6 +87,21 @@ func parseHTMLToStructured(htmlStr string) *StructuredContent {
 			if text == "" {
 				return
 			}
+			if tag == "p" {
+				if m := headingRE.FindStringSubmatch(text); m != nil {
+					roman, title := m[1], strings.TrimSpace(m[2])
+					id := slugForSection(title, roman, len(sections)+1)
+					shortTitle := shortTitleFromTitle(title, roman)
+					sections = append(sections, StructuredSection{
+						ID:         id,
+						Roman:      roman,
+						Title:      title,
+						ShortTitle: shortTitle,
+					})
+					current = &sections[len(sections)-1]
+					return
+				}
+			}
 			if current != nil {
 				current.Paragraphs = append(current.Paragraphs, text)
 			} else {

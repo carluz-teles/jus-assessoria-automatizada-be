@@ -211,7 +211,7 @@ func (uc *ReviewUseCase) ReviewDraft(ctx context.Context, cmd ReviewDraftCommand
 		Schema:     reviewSchema,
 		SchemaName: "review_minuta",
 		Model:      uc.model,
-		MaxTokens:  2048,
+		MaxTokens:  4096,
 	})
 	if err != nil {
 		// Return the error typed as-is; the handler maps via WriteError.

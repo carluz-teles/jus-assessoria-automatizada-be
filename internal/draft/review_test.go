@@ -392,6 +392,11 @@ func TestReviewUseCase_ThreePhasesLLMOutsideTx(t *testing.T) {
 	if calls[0] != "tx" || calls[1] != "llm" || calls[2] != "tx" {
 		t.Errorf("call order = %v, want [tx, llm, tx]", calls)
 	}
+	// MaxTokens must give review the same headroom as generation (4096), not
+	// the 2048 that truncated real review JSON output in production.
+	if gen.gotReq.MaxTokens != 4096 {
+		t.Errorf("MaxTokens = %d, want 4096", gen.gotReq.MaxTokens)
+	}
 }
 
 // ── Phase-tracking helpers ────────────────────────────────────────────────────

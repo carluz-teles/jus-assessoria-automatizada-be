@@ -268,7 +268,7 @@ func (h *Handler) createPeca(c *fiber.Ctx) error {
 
 	var req CreateRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
@@ -330,7 +330,7 @@ func (h *Handler) iteratePeca(c *fiber.Ctx) error {
 
 	var req IterateRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
@@ -376,7 +376,7 @@ func (h *Handler) patchPeca(c *fiber.Ctx) error {
 
 	var req PatchRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
@@ -695,7 +695,7 @@ func (h *Handler) generatePeca(c *fiber.Ctx) error {
 	// EOF for the JSON content type); only a malformed body errors.
 	if len(c.Body()) > 0 {
 		if err := c.BodyParser(&req); err != nil {
-			return httpx.WriteError(c, err)
+			return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 		}
 	}
 	if err := req.Validate(); err != nil {
@@ -804,7 +804,7 @@ func (h *Handler) thesesFromIntimation(c *fiber.Ctx) error {
 
 	var req thesesFromIntimationRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if req.IntimationID == "" {
 		return httpx.WriteError(c, apperr.NewInvalid("intimation_id é obrigatório"))
@@ -871,7 +871,7 @@ func (h *Handler) postChat(c *fiber.Ctx) error {
 
 	var req ChatRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
@@ -1046,7 +1046,7 @@ func (h *Handler) attachDocument(c *fiber.Ctx) error {
 
 	var req AttachDocumentRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
@@ -1072,7 +1072,7 @@ func (h *Handler) updateAttachmentCategory(c *fiber.Ctx) error {
 
 	var req UpdateAttachmentCategoryRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
@@ -1170,7 +1170,7 @@ func (h *Handler) filePeca(c *fiber.Ctx) error {
 
 	var req FileRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
@@ -1219,7 +1219,7 @@ func (h *Handler) resultPeca(c *fiber.Ctx) error {
 
 	var req ResultRequest
 	if err := c.BodyParser(&req); err != nil {
-		return httpx.WriteError(c, err)
+		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
 	if err := req.Validate(); err != nil {
 		return httpx.WriteValidationError(c, err)
