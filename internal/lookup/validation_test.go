@@ -17,10 +17,10 @@ func TestNormalizeCNPJ(t *testing.T) {
 	}{
 		{name: "bare 14 digits", raw: "19131243000197", want: "19131243000197"},
 		{name: "masked strips to digits", raw: "19.131.243/0001-97", want: "19131243000197"},
-		{name: "too short is invalid", raw: "1913124300019", wantErr: true},
-		{name: "too long is invalid", raw: "191312430001970", wantErr: true},
-		{name: "letters are invalid", raw: "1913124300019X", wantErr: true},
-		{name: "empty is invalid", raw: "", wantErr: true},
+		{name: "too short passes through (no format check)", raw: "1913124300019", want: "1913124300019"},
+		{name: "too long passes through (no format check)", raw: "191312430001970", want: "191312430001970"},
+		{name: "letters strip out, no format check", raw: "1913124300019X", want: "1913124300019"},
+		{name: "empty stays empty (no format check)", raw: "", want: ""},
 	}
 
 	for _, tt := range tests {

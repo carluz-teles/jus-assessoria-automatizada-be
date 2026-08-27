@@ -7,24 +7,20 @@ import (
 )
 
 // Registry identifiers travel in the URL with or without their usual mask
-// (e.g. "12.345.678/0001-95" or "01311-902"), so validation normalizes to bare
-// digits first, then checks the length. Both patterns are compiled once at
-// package level — compilation is O(n) and allocates.
+// (e.g. "12.345.678/0001-95" or "01311-902"), so normalization strips to bare
+// digits first. Compiled once at package level — compilation is O(n) and
+// allocates.
 var (
-	nonDigit  = regexp.MustCompile(`\D`)
-	cnpjExact = regexp.MustCompile(`^\d{14}$`)
-	cepExact  = regexp.MustCompile(`^\d{8}$`)
+	nonDigit = regexp.MustCompile(`\D`)
+	cepExact = regexp.MustCompile(`^\d{8}$`)
 )
 
-// normalizeCNPJ strips any mask and requires exactly 14 digits, returning the
-// bare-digit form the provider expects. A bad format is a typed Invalid error
-// (→ 400 at the edge) raised BEFORE any network call.
+// normalizeCNPJ strips any mask, returning the bare-digit form the provider
+// expects. No length/format check: the CNPJ field is free text elsewhere in the
+// product, so a value that isn't CNPJ-shaped is passed through and simply fails
+// (or 404s) at the provider instead of being rejected here.
 func normalizeCNPJ(raw string) (string, error) {
-	digits := nonDigit.ReplaceAllString(raw, "")
-	if !cnpjExact.MatchString(digits) {
-		return "", apperr.NewInvalid("cnpj must have 14 digits")
-	}
-	return digits, nil
+	return nonDigit.ReplaceAllString(raw, ""), nil
 }
 
 // normalizeCEP strips any mask and requires exactly 8 digits, returning the

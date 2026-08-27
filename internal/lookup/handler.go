@@ -25,10 +25,11 @@ func (h *Handler) Register(r fiber.Router) {
 	r.Get("/lookup/cep/:cep", h.lookupCEP)
 }
 
-// lookupCNPJ handles GET /v1/lookup/cnpj/:cnpj: normalize+validate the id (a bad
-// format is 400 before any fetch), then resolve it through the registry port and
-// return the Company. Provider outcomes arrive already mapped to typed errors, so
-// WriteError renders the right status (404 not-found, 503 unavailable, …).
+// lookupCNPJ handles GET /v1/lookup/cnpj/:cnpj: normalize the id to bare digits
+// (no format check — the CNPJ field itself has none), then resolve it through the
+// registry port and return the Company. Provider outcomes arrive already mapped to
+// typed errors, so WriteError renders the right status (404 not-found, 503
+// unavailable, …) — including for an id that isn't CNPJ-shaped.
 func (h *Handler) lookupCNPJ(c *fiber.Ctx) error {
 	cnpj, err := normalizeCNPJ(c.Params("cnpj"))
 	if err != nil {

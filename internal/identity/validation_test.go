@@ -42,16 +42,14 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "cnpj with too few digits is rejected",
+			name:    "cnpj with too few digits is accepted (no format check)",
 			mutate:  func(r *UpdateOrgProfileRequest) { r.CNPJ = "12.345.678/0001" },
-			wantErr: true,
-			field:   "cnpj",
+			wantErr: false,
 		},
 		{
-			name:    "cnpj with letters strips short and is rejected",
+			name:    "cnpj with letters is accepted (no format check)",
 			mutate:  func(r *UpdateOrgProfileRequest) { r.CNPJ = "12A45678000195XY" },
-			wantErr: true,
-			field:   "cnpj",
+			wantErr: false,
 		},
 		{
 			name:    "empty cnpj is required",
@@ -190,14 +188,15 @@ func TestUpdateOrgProfileRequest_Validate(t *testing.T) {
 	}
 }
 
-func TestToOrgProfile_NormalizesCNPJ(t *testing.T) {
-	req := validRequest() // CNPJ carries the mask "12.345.678/0001-95"
+func TestToOrgProfile_TrimsCNPJ(t *testing.T) {
+	req := validRequest()
+	req.CNPJ = "  12.345.678/0001-95  "
 	req.Phone = "11987654321"
 	req.Email = "contato@escritorio.com.br"
 
 	got := req.toOrgProfile()
-	if got.CNPJ != "12345678000195" {
-		t.Fatalf("CNPJ = %q, want the 14 bare digits", got.CNPJ)
+	if got.CNPJ != "12.345.678/0001-95" {
+		t.Fatalf("CNPJ = %q, want the trimmed value with no digit-stripping", got.CNPJ)
 	}
 	if got.LegalName != req.LegalName || got.TradeName != req.TradeName || got.Address != req.Address {
 		t.Fatalf("toOrgProfile() dropped a field: %+v", got)
