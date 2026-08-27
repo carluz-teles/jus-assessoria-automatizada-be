@@ -15,6 +15,7 @@ import (
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
+	"github.com/jusassessoria/platform/internal/onboarding"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
 	"github.com/jusassessoria/platform/lib/vault"
@@ -51,6 +52,7 @@ type routerDeps struct {
 	draft                *draft.Handler
 	lookup               *lookup.Handler
 	certificate          *certificate.Handler
+	onboarding           *onboarding.Handler
 	// vault is the optional envelope-encryption adapter (lib/vault). It is nil
 	// when VAULT_KEK_BASE64 is unset. S1 carries it here so S2 (court_connection
 	// credential wiring) can extend routerDeps without touching main.go's boot
@@ -222,6 +224,14 @@ func newRouter(deps routerDeps) *fiber.App {
 	// preview, list, revoke) and mounts them via Register — the api only composes.
 	// Nil-guarded so the router test fixture builds without a use case, and so a boot
 	// with no vault configured (no CERT_KEK / AWS_KMS_KEY_ID) leaves the slice unmounted.
+
+	// onboarding owns its authenticated /v1/onboarding routes (the post-signup
+	// activation widget: progress + dismiss) and mounts them via Register — the api
+	// only composes. Nil-guarded so the router test fixture builds without a use
+	// case, like the others.
+	if deps.onboarding != nil {
+		deps.onboarding.Register(v1)
+	}
 
 	return app
 }

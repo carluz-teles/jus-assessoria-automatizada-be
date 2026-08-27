@@ -82,10 +82,12 @@ type OrgProfile struct {
 // far along onboarding they are. UserID is the Clerk user id (the stable identity
 // available before a tenant exists). TenantID and OnboardingCompletedAt are nil
 // when the authenticated user has no tenant yet — that is a valid "not onboarded"
-// state, not an error.
+// state, not an error. Role is the zero value ("") for that same "not onboarded"
+// case, since there is no app_user row yet to read it from.
 type Me struct {
 	UserID                string
 	TenantID              *string
+	Role                  Role
 	OnboardingCompletedAt *time.Time
 }
 

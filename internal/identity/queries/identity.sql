@@ -115,11 +115,12 @@ JOIN app_user u ON u.id = m.app_user_id AND u.tenant_id = m.tenant_id
 WHERE m.tenant_id = $1 AND m.app_user_id = $2 AND m.status = 'ACTIVE';
 
 -- name: GetMeByClerkUser :one
--- Onboarding read model for GET /identity/me: the caller's internal tenant and
--- its onboarding gate, joined from app_user by Clerk user id. No row → the
--- authenticated user has no tenant yet (the domain treats that as "not
--- onboarded", a 200 with nulls, not an error).
+-- Onboarding read model for GET /identity/me: the caller's internal tenant,
+-- its onboarding gate, and its authorization role, joined from app_user by
+-- Clerk user id. No row → the authenticated user has no tenant yet (the
+-- domain treats that as "not onboarded", a 200 with nulls, not an error).
 SELECT u.tenant_id,
+       u.role,
        t.onboarding_completed_at
 FROM app_user u
 JOIN tenant t ON t.id = u.tenant_id

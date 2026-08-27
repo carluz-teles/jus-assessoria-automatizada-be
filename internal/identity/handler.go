@@ -55,10 +55,13 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 
 // meView is the read model returned by GET /identity/me. tenant_id and
 // onboarding_completed_at are pointers so they serialize as JSON null when the
-// caller has no tenant / has not completed onboarding.
+// caller has no tenant / has not completed onboarding. role is "" (empty
+// string, not omitted) in that same no-tenant case — there is no app_user row
+// yet to carry a role.
 type meView struct {
 	UserID                string     `json:"user_id"`
 	TenantID              *string    `json:"tenant_id"`
+	Role                  string     `json:"role"`
 	OnboardingCompletedAt *time.Time `json:"onboarding_completed_at"`
 }
 
@@ -197,6 +200,7 @@ func newMeView(me Me) meView {
 	return meView{
 		UserID:                me.UserID,
 		TenantID:              me.TenantID,
+		Role:                  string(me.Role),
 		OnboardingCompletedAt: me.OnboardingCompletedAt,
 	}
 }

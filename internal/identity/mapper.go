@@ -39,11 +39,12 @@ func tenantToEntity(r identitydb.Tenant) (*Tenant, error) {
 
 // meToEntity maps the GET /identity/me read model row to Me. UserID is left empty
 // here — the use case fills it with the Clerk user id — since the row itself
-// carries only the tenant scope and the onboarding gate.
+// carries only the tenant scope, the role, and the onboarding gate.
 func meToEntity(r identitydb.GetMeByClerkUserRow) *Me {
 	tenantID := r.TenantID.String()
 	return &Me{
 		TenantID:              &tenantID,
+		Role:                  Role(r.Role),
 		OnboardingCompletedAt: timeToPtr(r.OnboardingCompletedAt),
 	}
 }

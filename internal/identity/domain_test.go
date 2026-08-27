@@ -837,7 +837,7 @@ func TestUseCase_GetMe(t *testing.T) {
 				if gotClerkUser != clerkUser {
 					t.Fatalf("getMe clerk user = %q, want %q", gotClerkUser, clerkUser)
 				}
-				return &Me{TenantID: &tenantID, OnboardingCompletedAt: &onboarded}, nil
+				return &Me{TenantID: &tenantID, Role: RoleAdmin, OnboardingCompletedAt: &onboarded}, nil
 			},
 		}
 
@@ -850,6 +850,9 @@ func TestUseCase_GetMe(t *testing.T) {
 		}
 		if got.TenantID == nil || *got.TenantID != tenantID {
 			t.Fatalf("TenantID = %v, want %q", got.TenantID, tenantID)
+		}
+		if got.Role != RoleAdmin {
+			t.Fatalf("Role = %q, want %q", got.Role, RoleAdmin)
 		}
 		if got.OnboardingCompletedAt == nil || !got.OnboardingCompletedAt.Equal(onboarded) {
 			t.Fatalf("OnboardingCompletedAt = %v, want %v", got.OnboardingCompletedAt, onboarded)
