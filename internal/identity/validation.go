@@ -1,21 +1,12 @@
 package identity
 
 import (
-	"errors"
 	"regexp"
+	"strings"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/go-ozzo/ozzo-validation/v4/is"
 )
-
-// nonDigit matches everything that is not a digit, used to strip a CNPJ mask
-// (dots, slash, dash, spaces) before validation and persistence. Compiled once at
-// package level (compilation is O(n) and allocates).
-var nonDigit = regexp.MustCompile(`\D`)
-
-// errCNPJLength is the message for a CNPJ that is not exactly 14 digits once the
-// mask is stripped. Lowercase, no trailing punctuation (Go error convention).
-var errCNPJLength = errors.New("must be 14 digits")
 
 // phoneDigits matches a bare phone of 10 or 11 digits (BR landline vs mobile). The
 // phone is optional, so ozzo skips this rule on an empty value — only a present
@@ -25,8 +16,8 @@ var phoneDigits = regexp.MustCompile(`^\d{10,11}$`)
 
 // UpdateOrgProfileRequest is the PUT /organization/profile body: the escritório's
 // company profile. tenant_id is NOT here — it comes from the verified principal.
-// CNPJ accepts a masked value ("12.345.678/0001-95"); it is normalized to 14
-// digits before persistence (see toOrgProfile).
+// CNPJ is free text: required, but not format-checked (no check-digit algorithm
+// exists in the product; the field only records whatever the user typed).
 type UpdateOrgProfileRequest struct {
 	CNPJ      string  `json:"cnpj"`
 	LegalName string  `json:"legal_name"`
@@ -41,17 +32,17 @@ type UpdateOrgProfileRequest struct {
 }
 
 // Validate enforces the boundary rules via ozzo (method-based, not struct tags):
-// cnpj must be 14 digits once the mask is stripped, legal_name and trade_name are
-// required, and phone/email — being optional — are only checked when present (ozzo
-// skips non-Required rules on empty values): phone must be 10 or 11 bare digits,
-// email a well-formed address. The address is optional AS A WHOLE: when it arrives
+// cnpj, legal_name and trade_name are required (cnpj has no format check), and
+// phone/email — being optional — are only checked when present (ozzo skips
+// non-Required rules on empty values): phone must be 10 or 11 bare digits, email a
+// well-formed address. The address is optional AS A WHOLE: when it arrives
 // entirely blank (the zero struct) Skip suppresses Address.Validate so a profile
 // can be saved with no address; the moment ANY address field is filled, its
 // required fields (cidade/uf) apply. A failure here is a 400 at the edge
 // (KindInvalid → 400).
 func (r UpdateOrgProfileRequest) Validate() error {
 	return validation.ValidateStruct(&r,
-		validation.Field(&r.CNPJ, validation.Required, validation.By(validCNPJ)),
+		validation.Field(&r.CNPJ, validation.Required),
 		validation.Field(&r.LegalName, validation.Required),
 		validation.Field(&r.TradeName, validation.Required),
 		validation.Field(&r.Address, validation.Skip.When(r.Address == (Address{}))),
@@ -73,27 +64,12 @@ func (a Address) Validate() error {
 	)
 }
 
-// validCNPJ is the ozzo rule: the value, stripped of its mask, must be exactly 14
-// digits. Stripping non-digits means anything left is a digit, so a length check
-// is sufficient (a value with letters strips shorter than 14 and fails).
-func validCNPJ(value any) error {
-	cnpj, _ := value.(string)
-	if len(normalizeCNPJ(cnpj)) != 14 {
-		return errCNPJLength
-	}
-	return nil
-}
-
-// normalizeCNPJ strips a CNPJ mask down to its bare digits.
-func normalizeCNPJ(cnpj string) string {
-	return nonDigit.ReplaceAllString(cnpj, "")
-}
-
-// toOrgProfile maps the validated request to the use-case input, normalizing the
-// CNPJ to 14 digits so what is persisted is mask-free regardless of how it arrived.
+// toOrgProfile maps the validated request to the use-case input. CNPJ is persisted
+// as typed (trimmed only) — no digit-stripping, since the field is no longer
+// format-constrained.
 func (r UpdateOrgProfileRequest) toOrgProfile() OrgProfile {
 	return OrgProfile{
-		CNPJ:      normalizeCNPJ(r.CNPJ),
+		CNPJ:      strings.TrimSpace(r.CNPJ),
 		LegalName: r.LegalName,
 		TradeName: r.TradeName,
 		Address:   r.Address,

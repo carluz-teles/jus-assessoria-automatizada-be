@@ -296,7 +296,7 @@ func TestHandler_GetOrgProfile_NoToken_401(t *testing.T) {
 // --- PUT /organization/profile ----------------------------------------------
 
 // AC2: an ADMIN with a valid body → 200; tenant comes from the principal (not the
-// body) and the CNPJ is persisted mask-free.
+// body) and the CNPJ is persisted as typed (trimmed, no mask-stripping).
 func TestHandler_UpdateProfile_Admin_200(t *testing.T) {
 	t.Parallel()
 
@@ -317,8 +317,8 @@ func TestHandler_UpdateProfile_Admin_200(t *testing.T) {
 	if uc.gotTenantID != "tenant-42" {
 		t.Fatalf("tenant passed to uc = %q, want tenant-42 (from principal)", uc.gotTenantID)
 	}
-	if uc.gotProfile.CNPJ != "12345678000195" {
-		t.Fatalf("persisted cnpj = %q, want mask stripped", uc.gotProfile.CNPJ)
+	if uc.gotProfile.CNPJ != "12.345.678/0001-95" {
+		t.Fatalf("persisted cnpj = %q, want the trimmed value as typed", uc.gotProfile.CNPJ)
 	}
 	if !strings.Contains(body, `"cnpj":"12345678000195"`) {
 		t.Fatalf("response missing saved cnpj: %s", body)
@@ -471,7 +471,7 @@ func TestHandler_UpdateProfile_InvalidBody_400(t *testing.T) {
 		name string
 		body string
 	}{
-		{name: "cnpj wrong length", body: `{"cnpj":"123","legal_name":"L","trade_name":"T","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
+		{name: "missing cnpj", body: `{"cnpj":"","legal_name":"L","trade_name":"T","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
 		{name: "missing legal_name", body: `{"cnpj":"12345678000195","legal_name":"","trade_name":"T","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},
 		{name: "address missing uf", body: `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","address":{"cidade":"C","uf":""}}`},
 		{name: "malformed email", body: `{"cnpj":"12345678000195","legal_name":"L","trade_name":"T","email":"not-an-email","address":{"cep":"1","logradouro":"L","cidade":"C","uf":"SP"}}`},

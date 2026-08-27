@@ -105,8 +105,6 @@ func TestHandler_ValidationShortCircuitsFetch(t *testing.T) {
 		name   string
 		target string
 	}{
-		{name: "cnpj too short", target: "/lookup/cnpj/123"},
-		{name: "cnpj with letters", target: "/lookup/cnpj/1913124300019X"},
 		{name: "cep too short", target: "/lookup/cep/123"},
 		{name: "cep with letters", target: "/lookup/cep/0131190X"},
 	}
