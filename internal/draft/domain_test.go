@@ -702,6 +702,44 @@ func TestUseCase_GetDetail(t *testing.T) {
 	}
 }
 
+// TestUseCase_GetDetail_BackfillsEmptySections covers a draft persisted with a
+// non-nil StructuredContent that has zero sections (the htmlparse.go bug: the
+// LLM emitted a heading as a plain paragraph, so parseHTMLToStructured found
+// no <h1-3> and dropped everything into the preamble). GetDetail must re-parse
+// draft.Content — which still has the "ROMAN — TÍTULO" line shape — and
+// recover the sections instead of leaving the peça stuck with none.
+func TestUseCase_GetDetail_BackfillsEmptySections(t *testing.T) {
+	tenantID := newTenantID()
+	draftID := newDraftID()
+
+	repo := &fakeRepo{
+		detailResult: &DraftDetailView{
+			ID:        draftID,
+			PieceType: PieceTypeDefense,
+			Status:    "DRAFT",
+			SagaState: "DRAFTED",
+			Content:   "Preâmbulo.\n\nI — DOS FATOS\n\nCorpo do fato.",
+			StructuredContent: &StructuredContent{
+				Preamble: StructuredPreamble{Paragraphs: []string{"Preâmbulo.", "I — DOS FATOS", "Corpo do fato."}},
+				Sections: []StructuredSection{},
+			},
+		},
+	}
+	uow := &fakeUOW{}
+	uc := NewUseCase(uow, repo)
+
+	view, err := uc.GetDetail(context.Background(), tenantID, draftID)
+	if err != nil {
+		t.Fatalf("GetDetail() unexpected error: %v", err)
+	}
+	if view.StructuredContent == nil || len(view.StructuredContent.Sections) != 1 {
+		t.Fatalf("GetDetail() did not backfill sections, got: %+v", view.StructuredContent)
+	}
+	if got := view.StructuredContent.Sections[0].Roman; got != "I" {
+		t.Errorf("Sections[0].Roman = %q, want %q", got, "I")
+	}
+}
+
 // ── AttachDocument tests ──────────────────────────────────────────────────────
 
 func TestUseCase_AttachDocument(t *testing.T) {

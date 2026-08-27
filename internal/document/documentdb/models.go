@@ -406,6 +406,7 @@ type Outbox struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	PublishedAt    pgtype.Timestamptz `json:"published_at"`
 	ProcessAt      pgtype.Timestamptz `json:"process_at"`
+	Priority       int16              `json:"priority"`
 }
 
 type Party struct {

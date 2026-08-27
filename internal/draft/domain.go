@@ -320,11 +320,14 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 
 		// Peça v2 (migration 0056): lazy backfill of structured_content for
 		// drafts that were persisted before the Fatia B pipeline (or by a
-		// legacy PATCH path). When the column is NULL but there IS content,
-		// parse it here and write back best-effort — subsequent reads skip the
-		// parser. When both are empty the peça is truly empty (never
-		// generated) and we leave nil so the FE renders the empty state.
-		if v.StructuredContent == nil && v.Content != "" {
+		// legacy PATCH path), OR that were persisted with zero sections
+		// because the LLM emitted a heading as a plain paragraph instead of
+		// markdown `##` (parseHTMLToStructured used to drop those — see
+		// htmlparse.go). When there IS content, parse it here and write back
+		// best-effort — subsequent reads skip the parser. When both are empty
+		// the peça is truly empty (never generated) and we leave nil so the
+		// FE renders the empty state.
+		if (v.StructuredContent == nil || len(v.StructuredContent.Sections) == 0) && v.Content != "" {
 			parsed := ParseStructured(v.Content)
 			if parsed != nil {
 				v.StructuredContent = parsed
