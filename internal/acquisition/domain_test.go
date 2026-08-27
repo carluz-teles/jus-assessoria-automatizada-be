@@ -442,6 +442,18 @@ func (m *mockRepo) ListIntimacoesByProcesso(_ context.Context, _ IntimacoesByPro
 	return nil, nil
 }
 
+func (m *mockRepo) ListProcessActivityLog(_ context.Context, _ ActivityLogQuery) ([]ActivityLogView, error) {
+	return nil, nil
+}
+
+func (m *mockRepo) CountProcessActivityLog(_ context.Context, _, _ string) (int64, error) {
+	return 0, nil
+}
+
+func (m *mockRepo) ResolveCourtRecordIDForDraftIntimation(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
+
 func (m *mockRepo) CountIntimacoesByProcesso(_ context.Context, _, _ string) (int64, error) {
 	return 0, nil
 }

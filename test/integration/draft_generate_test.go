@@ -8,9 +8,10 @@
 //   - TriggerGeneration writes BOTH the outbox row AND saga_state=EXTRACTING in
 //     the SAME committed transaction (unit of work atomicity).
 //   - The relay correctly routes "draft.generation_requested" → queue "ai" and
-//     "review.completed" does NOT route to "default".
+//     "draft.generated" does NOT route to "default".
 //   - OnGenerationRequested updates draft.content and sets saga_state=DRAFTED
-//     (Gerar no longer inserts a review row — that is Revisar's job).
+//     (Gerar no longer inserts a review row — that is Revisar's job), and publishes
+//     draft.generated in the SAME tx (the process-activity-log producer).
 //   - saga_state=FAILED + review(status=FAILED) persists on terminal generator error.
 //   - processed_event dedup: a duplicate event_id is a no-op (idempotent).
 //   - Tenant isolation: GetDetail for a foreign tenant never leaks data
@@ -242,7 +243,7 @@ func TestDraftGenerate_Trigger_AtomicOutboxAndSagaState(t *testing.T) {
 
 // TestDraftGenerate_RelayRouting proves the queueFor contract:
 //   - "draft.generation_requested" → "ai" (consumed by worker-ai)
-//   - "review.completed" → NOT "default" (would silently accumulate)
+//   - "draft.generated" → NOT "default" (would silently accumulate)
 //
 // The relay routing is a pure function of the type string; this test asserts the
 // routing WITHOUT spinning up a real relay (no Redis / no asynq). The relay is
@@ -261,9 +262,9 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 			wantQueue: "ai",
 		},
 		{
-			name:      "review.completed does not route to default",
-			eventType: draft.TypeReviewCompleted,
-			wantQueue: "ingestao", // current routing: archived in ingestao (no active consumer)
+			name:      "draft.generated does not route to default",
+			eventType: draft.TypeDraftGenerated,
+			wantQueue: "notifications", // consumed by acquisition's activity listener
 		},
 	}
 
@@ -277,7 +278,7 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 			//
 			// For "draft.generation_requested": queueFor uses a string-literal check
 			// (not the prefix switch) → must be "ai".
-			// For "review.completed": routed to "ingestao" (no active consumer).
+			// For "draft.generated": routed to "notifications" (activity listener).
 			// We assert these by testing the exported TypeXxx consts match exactly
 			// the string literals in relay.go's queueFor function.
 			//
@@ -289,9 +290,9 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 				if tt.eventType != "draft.generation_requested" {
 					t.Errorf("TypeGenerationRequested changed: relay routing will break")
 				}
-			case "review.completed":
-				if tt.eventType != "review.completed" {
-					t.Errorf("TypeReviewCompleted changed: relay routing will break")
+			case "draft.generated":
+				if tt.eventType != "draft.generated" {
+					t.Errorf("TypeDraftGenerated changed: relay routing will break")
 				}
 			}
 			// Explicit routing check via a seeded outbox row read-back.
@@ -312,7 +313,8 @@ func TestDraftGenerate_RelayRouting(t *testing.T) {
 // TestDraftGenerate_Consumer_HappyPath proves OnGenerationRequested (Gerar):
 //  1. Updates draft.content and sets saga_state=DRAFTED in the DB.
 //  2. Does NOT insert a review row (that is Revisar's job).
-//  3. Does NOT publish review.completed (no outbox row for that type).
+//  3. DOES publish draft.generated (one outbox row) — the process-activity-log
+//     producer, moved here from Revisar (see draft/events.go's 2026-08-26 note).
 //
 // The fake generator returns cannedGenerationJSON (only draft_content);
 // embedder is nil (degraded — no RAG).
@@ -380,9 +382,9 @@ func TestDraftGenerate_Consumer_HappyPath(t *testing.T) {
 		t.Errorf("review count = %d, want 0 (Gerar no longer inserts reviews)", n)
 	}
 
-	// ── no review.completed outbox row ────────────────────────────────────────
-	if n := countOutboxRows(t, pool, draft.TypeReviewCompleted, draftID); n != 0 {
-		t.Errorf("outbox rows for review.completed = %d, want 0", n)
+	// ── draft.generated outbox row published (process-activity-log producer) ──
+	if n := countOutboxRows(t, pool, draft.TypeDraftGenerated, draftID); n != 1 {
+		t.Errorf("outbox rows for draft.generated = %d, want 1", n)
 	}
 
 	// ── processed_event dedup mark written under consumer "draft_ai" ─────────

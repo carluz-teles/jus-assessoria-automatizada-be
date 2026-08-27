@@ -247,6 +247,7 @@ func (uc *ReviewUseCase) ReviewDraft(ctx context.Context, cmd ReviewDraftCommand
 		if e != nil {
 			return fmt.Errorf("review: update saga state: %w", e)
 		}
+
 		result = &ReviewResult{Review: rev, SagaState: updated.SagaState}
 		return nil
 	}); err != nil {

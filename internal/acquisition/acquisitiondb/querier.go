@@ -183,6 +183,9 @@ type Querier interface {
 	// The reconciliations totals: how many intimations the tenant holds (paired with
 	// CountActiveCourtRecordsByTenant for the processes side).
 	CountIntimationsByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
+	// The "X de Y" total for the Atividade tab: how many activity rows the process holds.
+	// Scoped by the same court_record_id + tenant_id as the list.
+	CountProcessActivityLog(ctx context.Context, arg CountProcessActivityLogParams) (int64, error)
 	// The filtered "X" of the processes screen's "X de Y" counter: how many court records
 	// match the active filters (search on cnj_number ILIKE, court, degree, lifecycle, and
 	// the case-level responsável). Called only when any filter is present; the unfiltered
@@ -432,6 +435,12 @@ type Querier interface {
 	// per hash). (xmax = 0) tells the caller whether THIS upsert inserted a fresh row
 	// (true) or updated an existing one (false), so it can still tally new vs. deduped.
 	InsertIntimation(ctx context.Context, arg InsertIntimationParams) (InsertIntimationRow, error)
+	// Appends one row to the process's activity log (docs — Cockpit "Atividade" timeline).
+	// event_type is the closed set the migration's CHECK enforces; payload carries the
+	// event-specific detail as jsonb. Scoped by tenant_id (barrier 1) + RLS (barrier 2). Called
+	// LOG-NOT-FAIL by producers: a failed insert here must never roll back the write it
+	// documents, so callers log-and-continue on error instead of propagating it.
+	InsertProcessActivityLog(ctx context.Context, arg InsertProcessActivityLogParams) error
 	// publication store queries (acquisition slice). The national DJEN firehose: the
 	// ingestion sweeps the diário by tribunal/day and lands every communication here,
 	// to be matched to tenants' watched OABs locally. No tenant scope (national reference
@@ -529,6 +538,12 @@ type Querier interface {
 	// name so the caller buckets autor/réu/terceiro deterministically. counsels defaults to
 	// an empty jsonb array (never NULL) when a party has no advogado.
 	ListPartiesByProcesso(ctx context.Context, arg ListPartiesByProcessoParams) ([]ListPartiesByProcessoRow, error)
+	// The process cockpit's "Atividade" timeline (migration 0073): every logged event for
+	// one court_record, newest first. Descending keyset on (occurred_at, id) — served by
+	// the migration's index on (court_record_id, occurred_at DESC, id DESC) — the first
+	// page passes the max sentinel ('9999-12-31T23:59:59Z', max-uuid). Scoped by tenant_id
+	// (barrier 1) + RLS (barrier 2, migration 0073's tenant_isolation policy).
+	ListProcessActivityLog(ctx context.Context, arg ListProcessActivityLogParams) ([]ListProcessActivityLogRow, error)
 	// Selectable ?assignee values for the processes screen: the responsáveis of the
 	// tenant's live processes, joined at case level (court_record → court_case →
 	// app_user) exactly like the list's projection, deduped by id, ordered by name
@@ -623,6 +638,15 @@ type Querier interface {
 	// Unicidade de intimation é (tenant, case_id, hash), so swapping court_record_id never
 	// breaks dedup (same case). Returns the number of rows moved.
 	RepointIntimations(ctx context.Context, arg RepointIntimationsParams) (int64, error)
+	// Resolves the court_record a draft belongs to, via its intimation (the only path a
+	// draft carries back to a process today — draft has no court_record_id column of its
+	// own; draft.case_id is nullable and, even when set, a court_case can have more than
+	// one court_record (1º/2º grau), so it is not a reliable 1:1 resolution). Used by the
+	// activity listener (draft.generated → DRAFT_GENERATED) to know which process's
+	// timeline to append to. Scoped by tenant_id on BOTH draft and intimation (barrier 1).
+	// No rows when the draft has no intimation_id (a blank/processo draft) — the caller
+	// treats that as LOG-NOT-FAIL (nothing to log against).
+	ResolveCourtRecordIDForDraftIntimation(ctx context.Context, arg ResolveCourtRecordIDForDraftIntimationParams) (uuid.UUID, error)
 	// The batch enrichment's scan: up to @lim court_records of ONE tribunal (@court) that
 	// still need enriching — completeness below the DATAJUD ceiling (0.9), never attempted,
 	// and not a superseded merge-placeholder. Served by court_record_enrichment_scan_idx
@@ -638,7 +662,9 @@ type Querier interface {
 	// Persists (OVERWRITES) the AI analysis of one intimation. Unlike SetCourtRecordAIResume
 	// there is NO write-once guard — the analysis is re-executable ("Gerar novamente"). Scoped
 	// by tenant_id (barrier 1). Degraded mode passes ai_summary='' + ai_providencias='[]'.
-	SetIntimationAIAnalysis(ctx context.Context, arg SetIntimationAIAnalysisParams) error
+	// RETURNING court_record_id so the caller can log a process_activity_log row in the SAME
+	// tx, without a second round-trip to look up the owning court record.
+	SetIntimationAIAnalysis(ctx context.Context, arg SetIntimationAIAnalysisParams) (uuid.UUID, error)
 	// Overwrites ONLY the ai_providencias jsonb (leaves ai_summary / ai_analyzed_at untouched) —
 	// the write half of the aprovar/descartar status flip. Scoped by tenant_id (barrier 1).
 	SetIntimationProvidencias(ctx context.Context, arg SetIntimationProvidenciasParams) error

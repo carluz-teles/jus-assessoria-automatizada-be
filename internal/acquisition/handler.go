@@ -65,6 +65,7 @@ type reader interface {
 	Intimacoes(ctx context.Context, q IntimacoesQuery) (IntimacoesResult, error)
 	Intimacao(ctx context.Context, tenantID, id string) (IntimacaoDetailView, error)
 	Andamentos(ctx context.Context, q AndamentosQuery) (AndamentosResult, error)
+	ActivityLog(ctx context.Context, q ActivityLogQuery) (ActivityLogResult, error)
 	IntimacoesByProcesso(ctx context.Context, q IntimacoesByProcessoQuery) (IntimacoesByProcessoResult, error)
 	Partes(ctx context.Context, tenantID, courtRecordID string) (PartesView, error)
 	ProcessosSummary(ctx context.Context, tenantID string) (ProcessosSummaryView, error)
@@ -143,6 +144,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Get("/processos/:id", h.getProcesso)
 	r.Put("/processos/:id/responsavel", h.assignResponsible)
 	r.Get("/processos/:id/andamentos", h.listAndamentos)
+	r.Get("/processos/:id/activity", h.listActivity)
 	r.Get("/processos/:id/intimacoes", h.listIntimacoesByProcesso)
 	r.Get("/processos/:id/partes", h.listPartes)
 	r.Get("/processos/:id/resume", h.getResume)
@@ -913,6 +915,34 @@ func (h *Handler) listAndamentos(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(newAndamentosPage(res, limit))
 }
 
+// listActivity handles GET /v1/processos/:id/activity: the "Atividade" tab of one
+// process — its activity log (migration 0073), newest first, keyset paginated
+// (?limit, ?cursor). The :id is the court_record id (the same id /processos
+// returns); tenant_id comes from the principal, and the read is tenant-scoped so a
+// foreign :id yields an empty page.
+func (h *Handler) listActivity(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	limit := httpx.ClampLimit(c.QueryInt("limit"), httpx.DefaultLimit, httpx.MaxLimit)
+
+	lastOccurred, lastID := maxTimestamp, maxUUID
+	if tok := c.Query("cursor"); tok != "" {
+		cur, err := httpx.DecodeCursor(tok)
+		if err != nil {
+			return httpx.WriteError(c, err)
+		}
+		lastOccurred, lastID = cur.LastSortValue, cur.LastID
+	}
+
+	res, err := h.reader.ActivityLog(c.UserContext(), ActivityLogQuery{
+		TenantID: tenantID, CourtRecordID: c.Params("id"),
+		LastOccurred: lastOccurred, LastID: lastID, Limit: limit,
+	})
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newActivityLogPage(res, limit))
+}
+
 // listIntimacoesByProcesso handles GET /v1/processos/:id/intimacoes: the "Intimações" tab
 // of one process — its intimations, newest availability first, keyset paginated (?limit,
 // ?cursor). The :id is the court_record id (the same id /processos returns); tenant_id
@@ -1026,6 +1056,25 @@ func newAndamentosPage(res AndamentosResult, limit int) httpx.Page[AndamentoView
 // newIntimacoesByProcessoPage wraps the per-process intimations read model in the cursor
 // envelope; the next cursor keys off the last row's (made_available_at, id). There is no
 // search on this tab, so the "X de Y" totals coincide (both the process's intimation count).
+// newActivityLogPage assembles the Atividade tab's paginated envelope, mirroring
+// newAndamentosPage: the cursor sorts on OccurredAt (descending keyset).
+func newActivityLogPage(res ActivityLogResult, limit int) httpx.Page[ActivityLogView] {
+	items := res.Items
+	if items == nil {
+		items = []ActivityLogView{}
+	}
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.Total, Total: res.Total}
+	if res.HasMore && len(items) > 0 {
+		last := items[len(items)-1]
+		tok := httpx.EncodeCursor(httpx.Cursor{
+			LastID:        last.ID,
+			LastSortValue: last.OccurredAt.Format(time.RFC3339Nano),
+		})
+		meta.NextCursor = &tok
+	}
+	return httpx.Page[ActivityLogView]{Data: items, Page: meta, Filters: res.Filters.NonNil()}
+}
+
 func newIntimacoesByProcessoPage(res IntimacoesByProcessoResult, limit int) httpx.Page[IntimacaoView] {
 	items := res.Items
 	if items == nil {

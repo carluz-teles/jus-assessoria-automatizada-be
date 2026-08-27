@@ -446,6 +446,15 @@ type Plan struct {
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ProcessActivityLog struct {
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	CourtRecordID uuid.UUID          `json:"court_record_id"`
+	EventType     string             `json:"event_type"`
+	Payload       []byte             `json:"payload"`
+	OccurredAt    pgtype.Timestamptz `json:"occurred_at"`
+}
+
 type ProcessedEvent struct {
 	Consumer    string             `json:"consumer"`
 	EventID     string             `json:"event_id"`

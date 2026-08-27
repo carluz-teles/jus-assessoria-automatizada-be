@@ -312,12 +312,17 @@ func queueFor(typ string) string {
 	if typ == "filing.succeeded" || typ == "filing.failed" {
 		return "notifications"
 	}
-	// review.completed has no active consumer today. Route to "ingestao" (archived as
-	// handler-not-found — the worker drains that queue) rather than "default" (which no
-	// worker drains — silently building up in Redis). Mirrors the orphan deadline.*
-	// pattern above. When a consumer is added, move this routing to its queue.
-	if typ == "review.completed" {
-		return "ingestao"
+	// draft.generated (GenerateUseCase.OnGenerationRequested, internal/draft/generate.go)
+	// is consumed by acquisition's activity listener (process cockpit "Atividade"
+	// timeline, migration 0073 — DRAFT_GENERATED). Light/low-volume (one per successful
+	// Gerar call), so it rides the "notifications" queue alongside the other light
+	// cross-slice consumers (identity.tenant_provisioned, billing.trial_*,
+	// deadline.due_soon/missed) rather than standing up a dedicated queue. String
+	// literal avoids an import cycle with internal/draft. Was "review.completed" until
+	// 2026-08-26 — moved because Revisar never actually writes the peça's content (see
+	// draft/events.go's note); draft.generated is the semantically correct producer.
+	if typ == "draft.generated" {
+		return "notifications"
 	}
 	switch prefix(typ) {
 	case "ingestao", "acquisition":

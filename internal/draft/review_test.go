@@ -258,6 +258,26 @@ func TestReviewUseCase_HappyPath(t *testing.T) {
 	}
 }
 
+// TestReviewUseCase_NeverPublishes verifies that Revisar (ReviewUseCase.ReviewDraft)
+// never touches the outbox — it only produces AI critique suggestions over an
+// EXISTING minuta (review.go's own header comment) and must not be confused with
+// Gerar, which is the use case that actually writes draft content and publishes
+// draft.generated (see generate_test.go's TestGenerateUseCase_HappyPath for that
+// assertion in the mirror direction). ReviewUseCase has no Outbox port at all —
+// this test pins that by construction: any future Publish call added here would
+// fail to compile against ReviewUseCaseParams, not just fail an assertion.
+func TestReviewUseCase_NeverPublishes(t *testing.T) {
+	d := makeDraftedDraft()
+	gen := &fakeGen{out: []byte(cannedReviewJSON)}
+	w := &fakeReviewWriter{}
+
+	uc := buildReviewUC(fakeUoW{}, fakeReader{draft: d}, w, gen, nil)
+
+	if _, err := uc.ReviewDraft(context.Background(), reviewCmd()); err != nil {
+		t.Fatalf("want nil err, got %v", err)
+	}
+}
+
 // TestReviewUseCase_SubstringValidation verifies that suggestions whose `original`
 // does not appear in the draft content are dropped by buildFindings.
 func TestReviewUseCase_SubstringValidation(t *testing.T) {

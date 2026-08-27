@@ -46,13 +46,25 @@ UPDATE intimation
 SET ai_providencias = $1
 WHERE id = $2 AND tenant_id = $3;
 
--- name: SetIntimationAIAnalysis :exec
+-- name: SetIntimationAIAnalysis :one
 -- Persists (OVERWRITES) the AI analysis of one intimation. Unlike SetCourtRecordAIResume
 -- there is NO write-once guard — the analysis is re-executable ("Gerar novamente"). Scoped
 -- by tenant_id (barrier 1). Degraded mode passes ai_summary='' + ai_providencias='[]'.
+-- RETURNING court_record_id so the caller can log a process_activity_log row in the SAME
+-- tx, without a second round-trip to look up the owning court record.
 UPDATE intimation
 SET ai_summary      = $1,
     ai_providencias = $2,
     ai_analyzed_at  = now()
 WHERE id = $3
-  AND tenant_id = $4;
+  AND tenant_id = $4
+RETURNING court_record_id;
+
+-- name: InsertProcessActivityLog :exec
+-- Appends one row to the process's activity log (docs — Cockpit "Atividade" timeline).
+-- event_type is the closed set the migration's CHECK enforces; payload carries the
+-- event-specific detail as jsonb. Scoped by tenant_id (barrier 1) + RLS (barrier 2). Called
+-- LOG-NOT-FAIL by producers: a failed insert here must never roll back the write it
+-- documents, so callers log-and-continue on error instead of propagating it.
+INSERT INTO process_activity_log (tenant_id, court_record_id, event_type, payload)
+VALUES ($1, $2, $3, $4);

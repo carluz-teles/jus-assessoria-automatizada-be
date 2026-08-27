@@ -239,7 +239,9 @@ func TestGenerateUseCase_NilGenerator_FAILED(t *testing.T) {
 }
 
 // TestGenerateUseCase_HappyPath verifies the successful generation: saga DRAFTED + content
-// set + prior reviews deleted + NO review inserted + NO outbox event published.
+// set + prior reviews deleted + NO review inserted + draft.generated published (the fact
+// that actually writes the peça's content — see events.go's 2026-08-26 note on why this
+// moved here from Revisar).
 func TestGenerateUseCase_HappyPath(t *testing.T) {
 	d := makeDraft()
 	w := &fakeWriter{returnedDraft: d}
@@ -268,9 +270,53 @@ func TestGenerateUseCase_HappyPath(t *testing.T) {
 	if w.insertedReview != nil {
 		t.Errorf("insertedReview is non-nil, want nil (Gerar must not insert reviews)")
 	}
-	// No outbox event must be published — review.completed has no consumer at this stage.
-	if len(ob.published) != 0 {
-		t.Errorf("published events = %v, want [] (Gerar must not publish review.completed)", ob.published)
+	// draft.generated MUST be published — Gerar is the use case that writes the peça's
+	// content, so it (not Revisar) is the correct producer of the activity-log fact.
+	if len(ob.published) != 1 {
+		t.Fatalf("published events = %d, want 1", len(ob.published))
+	}
+	pubEv, ok := ob.published[0].(DraftGenerated)
+	if !ok {
+		t.Fatalf("published event type = %T, want DraftGenerated", ob.published[0])
+	}
+	if pubEv.DraftID != d.ID {
+		t.Errorf("pubEv.DraftID = %q, want %q", pubEv.DraftID, d.ID)
+	}
+	if pubEv.TenantID != d.TenantID {
+		t.Errorf("pubEv.TenantID = %q, want %q", pubEv.TenantID, d.TenantID)
+	}
+	if pubEv.Type() != TypeDraftGenerated {
+		t.Errorf("pubEv.Type() = %q, want %q", pubEv.Type(), TypeDraftGenerated)
+	}
+}
+
+// TestGenerateUseCase_PublishesCourtRecordID verifies that when the draft resolves an
+// intimation (the common case), the published draft.generated event carries the
+// intimation's court_record_id — sparing acquisition's activity listener a resolver
+// round-trip in the common path.
+func TestGenerateUseCase_PublishesCourtRecordID(t *testing.T) {
+	d := makeDraft()
+	d.IntimationID = "intimation-1"
+	intim := &IntimationContext{CourtRecordID: "cr-42"}
+	w := &fakeWriter{returnedDraft: d}
+	ob := &fakeOutbox{}
+	gen := &fakeGen{out: []byte(cannedJSON)}
+
+	uc := buildUC(fakeUoW{}, fakeReader{draft: d, intimation: intim}, w, ob, fakeDedup{}, gen, nil)
+
+	if err := uc.OnGenerationRequested(context.Background(), ev()); err != nil {
+		t.Fatalf("want nil err, got %v", err)
+	}
+
+	if len(ob.published) != 1 {
+		t.Fatalf("published events = %d, want 1", len(ob.published))
+	}
+	pubEv, ok := ob.published[0].(DraftGenerated)
+	if !ok {
+		t.Fatalf("published event type = %T, want DraftGenerated", ob.published[0])
+	}
+	if pubEv.CourtRecordID != "cr-42" {
+		t.Errorf("pubEv.CourtRecordID = %q, want %q", pubEv.CourtRecordID, "cr-42")
 	}
 }
 

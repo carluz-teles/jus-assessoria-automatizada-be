@@ -208,10 +208,9 @@ var generateSchema = json.RawMessage(`{
 //  1. Dedups (processed_event guard — consumer "draft_ai").
 //  2. Reloads the draft; guards saga_state == EXTRACTING (skip if obsolete).
 //  3. Embeds the intimation text and runs RAG (degraded if embedder nil or empty result).
-//  4. Calls the LLM to generate draft_content + suggestions.
-//  5. Validates and filters suggestions (substring match + citation requirement).
-//  6. Persists: UPDATE draft SET content=..., saga_state=REVIEWED; INSERT review;
-//     mark processed_event; outbox.Publish(review.completed) — all in ONE tx.
+//  4. Calls the LLM to generate draft_content.
+//  5. Persists: UPDATE draft SET content_html=..., saga_state=DRAFTED; mark
+//     processed_event; outbox.Publish(draft.generated) — all in ONE tx.
 //
 // On any terminal failure (LLM nil, parse error, context timeout after retries):
 // persists saga_state=FAILED + review(status=FAILED) in a short tx.
@@ -415,6 +414,24 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		}
 		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, plainText, structured); e != nil {
 			return fmt.Errorf("update saga state: %w", e)
+		}
+
+		// Announce the successful generation in the SAME tx (transactional outbox).
+		// Optional: a nil outbox (not wired) simply skips publishing — Gerar itself
+		// never fails for it. Consumers: acquisition's activity listener (process
+		// cockpit "Atividade" timeline — "Peça gerada"). court_record_id is carried
+		// when the intimation was already resolved above (the common, intimation-
+		// sourced draft case); a blank/processo draft leaves it empty and the
+		// consumer falls back to its own resolution.
+		if uc.outbox != nil {
+			var crid string
+			if intimation != nil {
+				crid = intimation.CourtRecordID
+			}
+			pubEv := newDraftGenerated(ev.DraftID, ev.TenantID, crid)
+			if e := uc.outbox.Publish(ctx, tx, pubEv); e != nil {
+				return fmt.Errorf("publish draft.generated: %w", e)
+			}
 		}
 		return nil
 	}); err5 != nil {
