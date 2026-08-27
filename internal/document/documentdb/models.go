@@ -389,6 +389,12 @@ type NotificationRead struct {
 	ReadAt         pgtype.Timestamptz `json:"read_at"`
 }
 
+type OnboardingWidgetDismissal struct {
+	AppUserID   uuid.UUID          `json:"app_user_id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	DismissedAt pgtype.Timestamptz `json:"dismissed_at"`
+}
+
 type Outbox struct {
 	ID             int64              `json:"id"`
 	AggregateType  string             `json:"aggregate_type"`

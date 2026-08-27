@@ -31,6 +31,7 @@ import (
 	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
+	"github.com/jusassessoria/platform/internal/onboarding"
 	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
@@ -321,6 +322,12 @@ func run(logger *slog.Logger) error {
 	// client and mounts the handler.
 	lookupHandler := lookup.NewHandler(lookup.NewBrasilAPIClient())
 
+	// Onboarding wiring: the post-signup activation widget (progress read +
+	// dismiss write). Read-only over other slices' tables via its own SQL — no
+	// domain repo/outbox from those slices is injected here, only pool + the
+	// shared unit of work.
+	onboardingHandler := onboarding.NewHandler(onboarding.NewUseCase(onboarding.NewRepository(pool), uow))
+
 	// Storage is optional at v0: only wired when S3 is fully configured. The Documentos
 	// slice (Fatia 1) consumes it — the presigned upload/download — so when storage is
 	// present the document write use case + handler are built off it (repo + storage +
@@ -552,6 +559,7 @@ func run(logger *slog.Logger) error {
 		draft:                draftHandler,
 		lookup:               lookupHandler,
 		certificate:          certificateHandler,
+		onboarding:           onboardingHandler,
 		vault:                vlt,
 		streamTokenStore:     streamTokenStore,
 	})

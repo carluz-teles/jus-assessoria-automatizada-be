@@ -67,6 +67,7 @@ func (q *Queries) GetActiveUserByClerkUser(ctx context.Context, clerkUserID stri
 
 const getMeByClerkUser = `-- name: GetMeByClerkUser :one
 SELECT u.tenant_id,
+       u.role,
        t.onboarding_completed_at
 FROM app_user u
 JOIN tenant t ON t.id = u.tenant_id
@@ -75,17 +76,18 @@ WHERE u.clerk_user_id = $1
 
 type GetMeByClerkUserRow struct {
 	TenantID              uuid.UUID          `json:"tenant_id"`
+	Role                  string             `json:"role"`
 	OnboardingCompletedAt pgtype.Timestamptz `json:"onboarding_completed_at"`
 }
 
-// Onboarding read model for GET /identity/me: the caller's internal tenant and
-// its onboarding gate, joined from app_user by Clerk user id. No row → the
-// authenticated user has no tenant yet (the domain treats that as "not
-// onboarded", a 200 with nulls, not an error).
+// Onboarding read model for GET /identity/me: the caller's internal tenant,
+// its onboarding gate, and its authorization role, joined from app_user by
+// Clerk user id. No row → the authenticated user has no tenant yet (the
+// domain treats that as "not onboarded", a 200 with nulls, not an error).
 func (q *Queries) GetMeByClerkUser(ctx context.Context, clerkUserID string) (GetMeByClerkUserRow, error) {
 	row := q.db.QueryRow(ctx, getMeByClerkUser, clerkUserID)
 	var i GetMeByClerkUserRow
-	err := row.Scan(&i.TenantID, &i.OnboardingCompletedAt)
+	err := row.Scan(&i.TenantID, &i.Role, &i.OnboardingCompletedAt)
 	return i, err
 }
 

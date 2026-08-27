@@ -146,6 +146,27 @@ func TestUserToEntity(t *testing.T) {
 	}
 }
 
+func TestMeToEntity(t *testing.T) {
+	tenantID := uuid.New()
+	onboarded := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	got := meToEntity(identitydb.GetMeByClerkUserRow{
+		TenantID:              tenantID,
+		Role:                  "ADMIN",
+		OnboardingCompletedAt: pgtype.Timestamptz{Time: onboarded, Valid: true},
+	})
+
+	if got.TenantID == nil || *got.TenantID != tenantID.String() {
+		t.Errorf("TenantID = %v, want %q", got.TenantID, tenantID.String())
+	}
+	if got.Role != RoleAdmin {
+		t.Errorf("Role = %q, want %q", got.Role, RoleAdmin)
+	}
+	if got.OnboardingCompletedAt == nil || !got.OnboardingCompletedAt.Equal(onboarded) {
+		t.Errorf("OnboardingCompletedAt = %v, want %v", got.OnboardingCompletedAt, onboarded)
+	}
+}
+
 func TestTextToNull(t *testing.T) {
 	if got := textToNull(""); got != nil {
 		t.Errorf("textToNull(\"\") = %v, want nil", got)

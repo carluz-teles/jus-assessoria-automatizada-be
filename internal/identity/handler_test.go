@@ -151,7 +151,7 @@ func TestHandler_Me_WithTenant_200(t *testing.T) {
 
 	tenantID := "tenant-9"
 	onboarded := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
-	uc := &fakeHandlerUC{me: Me{UserID: "clerk-user", TenantID: &tenantID, OnboardingCompletedAt: &onboarded}}
+	uc := &fakeHandlerUC{me: Me{UserID: "clerk-user", TenantID: &tenantID, Role: RoleAdmin, OnboardingCompletedAt: &onboarded}}
 	app := newMeApp(uc)
 
 	status, body := do(t, app, http.MethodGet, "/v1/identity/me", "", "jwt")
@@ -163,6 +163,9 @@ func TestHandler_Me_WithTenant_200(t *testing.T) {
 	}
 	if !strings.Contains(body, `"user_id":"clerk-user"`) || !strings.Contains(body, `"tenant_id":"tenant-9"`) {
 		t.Fatalf("body missing user/tenant: %s", body)
+	}
+	if !strings.Contains(body, `"role":"ADMIN"`) {
+		t.Fatalf("body missing role: %s", body)
 	}
 	if strings.Contains(body, `"tenant_id":null`) {
 		t.Fatalf("tenant_id should not be null for an onboarded user: %s", body)

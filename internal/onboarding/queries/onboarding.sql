@@ -1,0 +1,41 @@
+-- name: GetProgress :one
+-- Read model for GET /v1/onboarding/progress: the tenant-wide activation
+-- Steps (sources connected, team invited, first triagem, first análise, first
+-- peça) plus the caller's OWN dismissal timestamp, in one round-trip. Every
+-- step is an EXISTS subquery over another slice's table — cheap on an indexed
+-- tenant_id/FK column, never NULL. Subquery tables are aliased and columns
+-- qualified so the planner never confuses one sibling subquery's tenant_id
+-- with another's. members_invited excludes the caller itself ($2) so a lone
+-- admin does not read as "team invited". dismissed_at is scoped by
+-- app_user_id ($2), not tenant_id — dismissal is per-user, so each teammate
+-- sees their own widget state.
+SELECT
+  EXISTS(
+    SELECT 1 FROM integration i WHERE i.tenant_id = $1
+  ) AS sources_connected,
+  EXISTS(
+    SELECT 1 FROM membership m
+    WHERE m.tenant_id = $1 AND m.status = 'ACTIVE' AND m.app_user_id != $2
+  ) AS members_invited,
+  EXISTS(
+    SELECT 1 FROM intimation it WHERE it.tenant_id = $1 AND it.user_status = 'RESOLVED'
+  ) AS first_triagem,
+  EXISTS(
+    SELECT 1 FROM intimation ia WHERE ia.tenant_id = $1 AND ia.ai_analyzed_at IS NOT NULL
+  ) AS first_analise,
+  EXISTS(
+    SELECT 1 FROM process_activity_log pal
+    WHERE pal.tenant_id = $1 AND pal.event_type = 'DRAFT_GENERATED'
+  ) AS first_peca,
+  (
+    SELECT owd.dismissed_at FROM onboarding_widget_dismissal owd WHERE owd.app_user_id = $2
+  ) AS dismissed_at;
+
+-- name: Dismiss :exec
+-- Upsert the caller's dismissal timestamp (PATCH /v1/onboarding/dismiss),
+-- inside the caller's tx. Idempotent: a repeat dismiss just restamps
+-- dismissed_at to now() — never an error.
+INSERT INTO onboarding_widget_dismissal (app_user_id, tenant_id, dismissed_at)
+VALUES ($1, $2, now())
+ON CONFLICT (app_user_id) DO UPDATE
+   SET dismissed_at = now();

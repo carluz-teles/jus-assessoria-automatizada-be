@@ -24,10 +24,10 @@ type Querier interface {
 	// exactly like an unknown user. The role returned is app_user.role (kept in sync by
 	// an organizationMembership.updated), never the membership row's own copy.
 	GetActiveUserByClerkUser(ctx context.Context, clerkUserID string) (AppUser, error)
-	// Onboarding read model for GET /identity/me: the caller's internal tenant and
-	// its onboarding gate, joined from app_user by Clerk user id. No row → the
-	// authenticated user has no tenant yet (the domain treats that as "not
-	// onboarded", a 200 with nulls, not an error).
+	// Onboarding read model for GET /identity/me: the caller's internal tenant,
+	// its onboarding gate, and its authorization role, joined from app_user by
+	// Clerk user id. No row → the authenticated user has no tenant yet (the
+	// domain treats that as "not onboarded", a 200 with nulls, not an error).
 	GetMeByClerkUser(ctx context.Context, clerkUserID string) (GetMeByClerkUserRow, error)
 	GetTenantByClerkOrg(ctx context.Context, clerkOrgID string) (Tenant, error)
 	GetTenantByID(ctx context.Context, id uuid.UUID) (Tenant, error)
