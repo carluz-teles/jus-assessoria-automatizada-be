@@ -103,10 +103,14 @@ type fakeRepo struct {
 	// ListDraftsAll
 	listAllResult []DraftListItem
 	listAllErr    error
+	// gotListAllAssignee records the assignee param ListAll forwarded to the
+	// repo, so tests can assert the wiring without a real database.
+	gotListAllAssignee string
 
 	// CountDraftsAll
-	countAllResult int64
-	countAllErr    error
+	countAllResult      int64
+	countAllErr         error
+	gotCountAllAssignee string
 
 	// GetCourtRecordIDByIntimation
 	courtRecordIDResult string
@@ -339,14 +343,16 @@ func (r *fakeRepo) CountDraftsByProcess(_ context.Context, _ database.Tx, _, _ s
 	return r.countByProcessResult, nil
 }
 
-func (r *fakeRepo) ListDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _, _, _ string, _ int) ([]DraftListItem, error) {
+func (r *fakeRepo) ListDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _, assignee, _, _ string, _ int) ([]DraftListItem, error) {
+	r.gotListAllAssignee = assignee
 	if r.listAllErr != nil {
 		return nil, r.listAllErr
 	}
 	return r.listAllResult, nil
 }
 
-func (r *fakeRepo) CountDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _ string) (int64, error) {
+func (r *fakeRepo) CountDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _, assignee string) (int64, error) {
+	r.gotCountAllAssignee = assignee
 	if r.countAllErr != nil {
 		return 0, r.countAllErr
 	}
@@ -1611,5 +1617,36 @@ func TestUseCase_ListAll(t *testing.T) {
 				t.Errorf("ListAll() Total = %d, want %d", result.Total, tt.wantTotal)
 			}
 		})
+	}
+}
+
+// TestUseCase_ListAll_ForwardsAssignee pins the ?assignee wiring (the "Minhas" chip):
+// ListAll must forward q.Assignee to both ListDraftsAll and CountDraftsAll verbatim —
+// the handler is the one that resolves "me"/uuid, ListAll just relays it.
+func TestUseCase_ListAll_ForwardsAssignee(t *testing.T) {
+	t.Parallel()
+
+	tenantID := newTenantID()
+	assigneeID := newDraftID() // any uuid stands in for a user id here
+
+	repo := &fakeRepo{listAllResult: []DraftListItem{}, countAllResult: 0}
+	uow := &fakeUOW{}
+	uc := NewUseCase(uow, repo)
+
+	_, err := uc.ListAll(context.Background(), ListAllQuery{
+		TenantID:    tenantID,
+		Assignee:    assigneeID,
+		LastCreated: maxCreatedAt,
+		LastID:      maxUUID,
+		Limit:       20,
+	})
+	if err != nil {
+		t.Fatalf("ListAll() unexpected error: %v", err)
+	}
+	if repo.gotListAllAssignee != assigneeID {
+		t.Errorf("ListDraftsAll assignee = %q, want %q", repo.gotListAllAssignee, assigneeID)
+	}
+	if repo.gotCountAllAssignee != assigneeID {
+		t.Errorf("CountDraftsAll assignee = %q, want %q", repo.gotCountAllAssignee, assigneeID)
 	}
 }

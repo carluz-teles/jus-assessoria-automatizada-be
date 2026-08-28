@@ -55,17 +55,22 @@ func newAppWithIterator(iter iterator, tenant string) *fiber.App {
 }
 
 // fakeLister is a configurable stub satisfying the lister port, used to pin the
-// page envelope shape (total_count/total) the list endpoints return.
+// page envelope shape (total_count/total) the list endpoints return. gotListAllQuery
+// records the last ListAllQuery received, so tests can assert what the handler
+// resolved (e.g. the ?assignee filter) without a real database.
 type fakeLister struct {
 	result DraftListResult
 	err    error
+
+	gotListAllQuery *ListAllQuery
 }
 
-func (f fakeLister) ListByProcess(context.Context, ListByProcessQuery) (DraftListResult, error) {
+func (f *fakeLister) ListByProcess(context.Context, ListByProcessQuery) (DraftListResult, error) {
 	return f.result, f.err
 }
 
-func (f fakeLister) ListAll(context.Context, ListAllQuery) (DraftListResult, error) {
+func (f *fakeLister) ListAll(_ context.Context, q ListAllQuery) (DraftListResult, error) {
+	f.gotListAllQuery = &q
 	return f.result, f.err
 }
 
@@ -158,7 +163,7 @@ func TestHandler_ListPecas_Total(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			app := newAppWithLister(fakeLister{result: DraftListResult{Items: items, Total: 7}}, "tenant-1")
+			app := newAppWithLister(&fakeLister{result: DraftListResult{Items: items, Total: 7}}, "tenant-1")
 
 			status, body := doJSON(t, app, http.MethodGet, tt.path, "jwt", "")
 			if status != http.StatusOK {
@@ -177,6 +182,51 @@ func TestHandler_ListPecas_Total(t *testing.T) {
 			}
 			if got.Page.Total != 7 {
 				t.Errorf("page.total = %d, want 7", got.Page.Total)
+			}
+		})
+	}
+}
+
+// TestHandler_ListPecas_AssigneeFilter covers the ?assignee filter (the FE "Minhas"
+// chip): "" is no filter, "me" resolves to the authenticated principal's id
+// (stubResolver returns UserID "u-1"), an explicit uuid passes through verbatim, and
+// a malformed value is a 400 before the use case is ever reached.
+func TestHandler_ListPecas_AssigneeFilter(t *testing.T) {
+	t.Parallel()
+
+	otherUserID := newDraftID() // any well-formed uuid stands in for another user's id
+
+	tests := []struct {
+		name         string
+		path         string
+		wantStatus   int
+		wantAssignee string // only checked when wantStatus == 200
+	}{
+		{name: "no filter", path: "/v1/pecas", wantStatus: http.StatusOK, wantAssignee: ""},
+		{name: "me resolves to principal id", path: "/v1/pecas?assignee=me", wantStatus: http.StatusOK, wantAssignee: "u-1"},
+		{name: "explicit uuid passes through", path: "/v1/pecas?assignee=" + otherUserID, wantStatus: http.StatusOK, wantAssignee: otherUserID},
+		{name: "malformed value is 400", path: "/v1/pecas?assignee=not-a-uuid", wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lister := &fakeLister{result: DraftListResult{Items: []DraftListItem{}, Total: 0}}
+			app := newAppWithLister(lister, "tenant-1")
+
+			status, body := doJSON(t, app, http.MethodGet, tt.path, "jwt", "")
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", status, tt.wantStatus, body)
+			}
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+			if lister.gotListAllQuery == nil {
+				t.Fatal("ListAll was not called")
+			}
+			if lister.gotListAllQuery.Assignee != tt.wantAssignee {
+				t.Errorf("Assignee = %q, want %q", lister.gotListAllQuery.Assignee, tt.wantAssignee)
 			}
 		})
 	}

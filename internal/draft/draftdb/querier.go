@@ -12,9 +12,9 @@ import (
 
 type Querier interface {
 	// Total peças matching ListDraftsAll's WHERE (same piece_type/status/workflow_state/
-	// urgencia filters), without the cursor predicate or LIMIT — feeds the "total" in the
-	// page envelope. Reuses the same petition + deadline LATERAL joins the filters need;
-	// drops the court_record/app_user/review joins (only used for projection there).
+	// urgencia/assignee_id filters), without the cursor predicate or LIMIT — feeds the
+	// "total" in the page envelope. Reuses the same petition + deadline LATERAL joins the
+	// filters need; drops the court_record/app_user/review joins (only used for projection there).
 	CountDraftsAll(ctx context.Context, arg CountDraftsAllParams) (int64, error)
 	// Total peças matching ListDraftsByProcess's WHERE (same court_record_id + tenant_id),
 	// without the cursor predicate or LIMIT — feeds the "total" in the page envelope.
@@ -164,7 +164,8 @@ type Querier interface {
 	InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error)
 	// Paginated list of all peças for a tenant, ordered by (created_at DESC,
 	// id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
-	// urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+	// urgencia (atraso, hoje), assignee_id (d.created_by — o chip "Minhas"; NULL = todos os
+	// responsáveis). Coverage do último review via LATERAL. Prazo derivado
 	// da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
 	// Over-fetch por 1 pra hasMore.
 	ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error)

@@ -1163,6 +1163,7 @@ type ListAllQuery struct {
 	Status        string // optional filter
 	WorkflowState string // "aguardando_assinatura" | "aguardando_protocolo" | ""
 	Urgencia      string // "atraso" | "hoje" | "" (contra deadline.end_date da intimation)
+	Assignee      string // "" = todos; already resolved by the handler ("me" → principal id)
 	LastCreated   string
 	LastID        string
 	Limit         int
@@ -1197,7 +1198,7 @@ func (uc *UseCase) ListByProcess(ctx context.Context, q ListByProcessQuery) (Dra
 func (uc *UseCase) ListAll(ctx context.Context, q ListAllQuery) (DraftListResult, error) {
 	var result DraftListResult
 	err := uc.repo.Do(ctx, q.TenantID, func(tx database.Tx) error {
-		rows, err := uc.rw.ListDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.WorkflowState, q.Urgencia, q.LastCreated, q.LastID, q.Limit+1)
+		rows, err := uc.rw.ListDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.WorkflowState, q.Urgencia, q.Assignee, q.LastCreated, q.LastID, q.Limit+1)
 		if err != nil {
 			return err
 		}
@@ -1205,7 +1206,7 @@ func (uc *UseCase) ListAll(ctx context.Context, q ListAllQuery) (DraftListResult
 		if len(rows) > q.Limit {
 			rows, hasMore = rows[:q.Limit], true
 		}
-		total, err := uc.rw.CountDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.WorkflowState, q.Urgencia)
+		total, err := uc.rw.CountDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.WorkflowState, q.Urgencia, q.Assignee)
 		if err != nil {
 			return err
 		}

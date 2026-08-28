@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
@@ -1487,6 +1488,15 @@ func (h *Handler) listPecas(c *fiber.Ctx) error {
 	workflowState := c.Query("workflow_state")
 	urgencia := c.Query("urgencia")
 
+	var principalUserID string
+	if p, ok := httpx.PrincipalFromCtx(c); ok {
+		principalUserID = p.UserID
+	}
+	assignee, err := resolveAssignee(c.Query("assignee"), principalUserID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+
 	lastCreated, lastID := maxCreatedAt, maxUUID
 	if tok := c.Query("cursor"); tok != "" {
 		cur, err := httpx.DecodeCursor(tok)
@@ -1502,6 +1512,7 @@ func (h *Handler) listPecas(c *fiber.Ctx) error {
 		Status:        status,
 		WorkflowState: workflowState,
 		Urgencia:      urgencia,
+		Assignee:      assignee,
 		LastCreated:   lastCreated,
 		LastID:        lastID,
 		Limit:         limit,
@@ -1510,6 +1521,26 @@ func (h *Handler) listPecas(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(newDraftListPage(res, limit))
+}
+
+// resolveAssignee turns the ?assignee filter (chip "Minhas") into the value ListAll
+// filters d.created_by on: "" is no filter, the sentinel "me" resolves to the
+// principal's own id, and any other value must be a well-formed uuid (a client error
+// → 400 otherwise). Mirrors deadline's resolveAssignee (internal/deadline/handler.go)
+// and acquisition's resolveIntimacaoAssignee — kept as a local copy since slices only
+// communicate by event, never by importing each other's code.
+func resolveAssignee(assignee, principalUserID string) (string, error) {
+	switch assignee {
+	case "":
+		return "", nil
+	case "me":
+		return principalUserID, nil
+	default:
+		if _, err := uuid.Parse(assignee); err != nil {
+			return "", apperr.NewInvalid("invalid assignee filter (want a user id or \"me\")")
+		}
+		return assignee, nil
+	}
 }
 
 // ── Fatia 4 response shapes ────────────────────────────────────────────────

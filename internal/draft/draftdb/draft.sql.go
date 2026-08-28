@@ -37,20 +37,22 @@ WHERE d.tenant_id = $1
     OR ($5::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
     OR ($5::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
   )
+  AND ($6::uuid IS NULL OR d.created_by = $6::uuid)
 `
 
 type CountDraftsAllParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	Column2  string    `json:"column_2"`
-	Column3  string    `json:"column_3"`
-	Column4  string    `json:"column_4"`
-	Column5  string    `json:"column_5"`
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	Column2    string      `json:"column_2"`
+	Column3    string      `json:"column_3"`
+	Column4    string      `json:"column_4"`
+	Column5    string      `json:"column_5"`
+	AssigneeID pgtype.UUID `json:"assignee_id"`
 }
 
 // Total peças matching ListDraftsAll's WHERE (same piece_type/status/workflow_state/
-// urgencia filters), without the cursor predicate or LIMIT — feeds the "total" in the
-// page envelope. Reuses the same petition + deadline LATERAL joins the filters need;
-// drops the court_record/app_user/review joins (only used for projection there).
+// urgencia/assignee_id filters), without the cursor predicate or LIMIT — feeds the
+// "total" in the page envelope. Reuses the same petition + deadline LATERAL joins the
+// filters need; drops the court_record/app_user/review joins (only used for projection there).
 func (q *Queries) CountDraftsAll(ctx context.Context, arg CountDraftsAllParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countDraftsAll,
 		arg.TenantID,
@@ -58,6 +60,7 @@ func (q *Queries) CountDraftsAll(ctx context.Context, arg CountDraftsAllParams) 
 		arg.Column3,
 		arg.Column4,
 		arg.Column5,
+		arg.AssigneeID,
 	)
 	var count int64
 	err := row.Scan(&count)
@@ -1474,20 +1477,23 @@ WHERE d.tenant_id = $1
     OR ($7::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
     OR ($7::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
   )
+  -- assignee_id: NULL = todos, senão só o criador informado (chip "Minhas")
+  AND ($9::uuid IS NULL OR d.created_by = $9::uuid)
   AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
 LIMIT $8
 `
 
 type ListDraftsAllParams struct {
-	TenantID uuid.UUID          `json:"tenant_id"`
-	Column2  string             `json:"column_2"`
-	Column3  string             `json:"column_3"`
-	Column4  pgtype.Timestamptz `json:"column_4"`
-	Column5  uuid.UUID          `json:"column_5"`
-	Column6  string             `json:"column_6"`
-	Column7  string             `json:"column_7"`
-	Limit    int32              `json:"limit"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	Column2    string             `json:"column_2"`
+	Column3    string             `json:"column_3"`
+	Column4    pgtype.Timestamptz `json:"column_4"`
+	Column5    uuid.UUID          `json:"column_5"`
+	Column6    string             `json:"column_6"`
+	Column7    string             `json:"column_7"`
+	Limit      int32              `json:"limit"`
+	AssigneeID pgtype.UUID        `json:"assignee_id"`
 }
 
 type ListDraftsAllRow struct {
@@ -1510,7 +1516,8 @@ type ListDraftsAllRow struct {
 
 // Paginated list of all peças for a tenant, ordered by (created_at DESC,
 // id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
-// urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+// urgencia (atraso, hoje), assignee_id (d.created_by — o chip "Minhas"; NULL = todos os
+// responsáveis). Coverage do último review via LATERAL. Prazo derivado
 // da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
 // Over-fetch por 1 pra hasMore.
 func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([]ListDraftsAllRow, error) {
@@ -1523,6 +1530,7 @@ func (q *Queries) ListDraftsAll(ctx context.Context, arg ListDraftsAllParams) ([
 		arg.Column6,
 		arg.Column7,
 		arg.Limit,
+		arg.AssigneeID,
 	)
 	if err != nil {
 		return nil, err
