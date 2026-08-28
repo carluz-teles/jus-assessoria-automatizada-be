@@ -11,6 +11,14 @@ import (
 )
 
 type Querier interface {
+	// Total peças matching ListDraftsAll's WHERE (same piece_type/status/workflow_state/
+	// urgencia filters), without the cursor predicate or LIMIT — feeds the "total" in the
+	// page envelope. Reuses the same petition + deadline LATERAL joins the filters need;
+	// drops the court_record/app_user/review joins (only used for projection there).
+	CountDraftsAll(ctx context.Context, arg CountDraftsAllParams) (int64, error)
+	// Total peças matching ListDraftsByProcess's WHERE (same court_record_id + tenant_id),
+	// without the cursor predicate or LIMIT — feeds the "total" in the page envelope.
+	CountDraftsByProcess(ctx context.Context, arg CountDraftsByProcessParams) (int64, error)
 	// Hard-delete the join row. The document itself is NOT touched (ON DELETE RESTRICT
 	// enforces that in the FK). Scoped to (id, draft_id, tenant_id) — a miss is silently
 	// ignored (the caller checks rows-affected via the :exec tag; our mapper maps 0 to

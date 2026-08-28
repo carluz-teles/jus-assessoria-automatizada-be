@@ -1180,7 +1180,11 @@ func (uc *UseCase) ListByProcess(ctx context.Context, q ListByProcessQuery) (Dra
 		if len(rows) > q.Limit {
 			rows, hasMore = rows[:q.Limit], true
 		}
-		result = DraftListResult{Items: rows, HasMore: hasMore}
+		total, err := uc.rw.CountDraftsByProcess(ctx, tx, q.TenantID, q.CaseID)
+		if err != nil {
+			return err
+		}
+		result = DraftListResult{Items: rows, HasMore: hasMore, Total: total}
 		return nil
 	})
 	if err != nil {
@@ -1201,7 +1205,11 @@ func (uc *UseCase) ListAll(ctx context.Context, q ListAllQuery) (DraftListResult
 		if len(rows) > q.Limit {
 			rows, hasMore = rows[:q.Limit], true
 		}
-		result = DraftListResult{Items: rows, HasMore: hasMore}
+		total, err := uc.rw.CountDraftsAll(ctx, tx, q.TenantID, q.PieceType, q.Status, q.WorkflowState, q.Urgencia)
+		if err != nil {
+			return err
+		}
+		result = DraftListResult{Items: rows, HasMore: hasMore, Total: total}
 		return nil
 	})
 	if err != nil {

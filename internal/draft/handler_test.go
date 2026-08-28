@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -53,6 +54,32 @@ func newAppWithIterator(iter iterator, tenant string) *fiber.App {
 	return app
 }
 
+// fakeLister is a configurable stub satisfying the lister port, used to pin the
+// page envelope shape (total_count/total) the list endpoints return.
+type fakeLister struct {
+	result DraftListResult
+	err    error
+}
+
+func (f fakeLister) ListByProcess(context.Context, ListByProcessQuery) (DraftListResult, error) {
+	return f.result, f.err
+}
+
+func (f fakeLister) ListAll(context.Context, ListAllQuery) (DraftListResult, error) {
+	return f.result, f.err
+}
+
+// newAppWithLister wires a Handler with the given lister under the Auth boundary,
+// mirroring production's /v1 group.
+func newAppWithLister(l lister, tenant string) *fiber.App {
+	app := fiber.New(fiber.Config{
+		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
+	})
+	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{tenant: tenant}))
+	NewHandler(nil).WithLister(l).RegisterV1(v1)
+	return app
+}
+
 // doJSON drives one request with a JSON body through app, returning status and raw body.
 func doJSON(t *testing.T, app *fiber.App, method, path, bearer, body string) (int, string) {
 	t.Helper()
@@ -95,5 +122,62 @@ func TestHandler_IteratePeca_MalformedBody_400(t *testing.T) {
 	}
 	if got.Kind != string(apperr.KindInvalid) {
 		t.Errorf("kind = %q, want %q", got.Kind, apperr.KindInvalid)
+	}
+}
+
+// pageEnvelope decodes only the {data, page} shape needed to assert the total —
+// it deliberately ignores the per-item fields (covered by mapper tests).
+type pageEnvelope struct {
+	Data []map[string]any `json:"data"`
+	Page httpx.PageMeta   `json:"page"`
+}
+
+// TestHandler_ListPecas_Total pins the fix for a QA-found bug: GET /v1/pecas always
+// returned page.total_count/page.total = 0 even when data had real items, because
+// newDraftListPage never read a total off the result. Covers both list endpoints
+// that share DraftListResult/newDraftListPage: the tenant library (/v1/pecas) and
+// the per-process tab (/v1/processos/:id/pecas).
+func TestHandler_ListPecas_Total(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	items := []DraftListItem{
+		{ID: newDraftID(), PieceType: PieceTypeDefense, Status: StatusDraft, CreatedAt: now},
+		{ID: newDraftID(), PieceType: PieceTypeAppeal, Status: StatusSigned, CreatedAt: now.Add(-time.Hour)},
+	}
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "tenant library", path: "/v1/pecas?limit=5"},
+		{name: "per-process tab", path: "/v1/processos/case-1/pecas?limit=5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			app := newAppWithLister(fakeLister{result: DraftListResult{Items: items, Total: 7}}, "tenant-1")
+
+			status, body := doJSON(t, app, http.MethodGet, tt.path, "jwt", "")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body: %s)", status, body)
+			}
+
+			var got pageEnvelope
+			if err := json.Unmarshal([]byte(body), &got); err != nil {
+				t.Fatalf("unmarshal body: %v (body: %s)", err, body)
+			}
+			if len(got.Data) != len(items) {
+				t.Errorf("len(data) = %d, want %d", len(got.Data), len(items))
+			}
+			if got.Page.TotalCount != 7 {
+				t.Errorf("page.total_count = %d, want 7", got.Page.TotalCount)
+			}
+			if got.Page.Total != 7 {
+				t.Errorf("page.total = %d, want 7", got.Page.Total)
+			}
+		})
 	}
 }

@@ -96,9 +96,17 @@ type fakeRepo struct {
 	listByProcessResult []DraftListItem
 	listByProcessErr    error
 
+	// CountDraftsByProcess
+	countByProcessResult int64
+	countByProcessErr    error
+
 	// ListDraftsAll
 	listAllResult []DraftListItem
 	listAllErr    error
+
+	// CountDraftsAll
+	countAllResult int64
+	countAllErr    error
 
 	// GetCourtRecordIDByIntimation
 	courtRecordIDResult string
@@ -324,11 +332,25 @@ func (r *fakeRepo) ListDraftsByProcess(_ context.Context, _ database.Tx, _, _, _
 	return r.listByProcessResult, nil
 }
 
+func (r *fakeRepo) CountDraftsByProcess(_ context.Context, _ database.Tx, _, _ string) (int64, error) {
+	if r.countByProcessErr != nil {
+		return 0, r.countByProcessErr
+	}
+	return r.countByProcessResult, nil
+}
+
 func (r *fakeRepo) ListDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _, _, _ string, _ int) ([]DraftListItem, error) {
 	if r.listAllErr != nil {
 		return nil, r.listAllErr
 	}
 	return r.listAllResult, nil
+}
+
+func (r *fakeRepo) CountDraftsAll(_ context.Context, _ database.Tx, _, _, _, _, _ string) (int64, error) {
+	if r.countAllErr != nil {
+		return 0, r.countAllErr
+	}
+	return r.countAllResult, nil
 }
 
 func (r *fakeRepo) GetCourtRecordIDByIntimation(_ context.Context, _ database.Tx, _, _ string) (string, error) {
@@ -1439,30 +1461,40 @@ func TestUseCase_ListByProcess(t *testing.T) {
 		wantErr   bool
 		wantCount int
 		wantMore  bool
+		wantTotal int64
 	}{
 		{
 			name:      "returns items with hasMore=false when exact page",
 			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:      &fakeRepo{listByProcessResult: items},
+			repo:      &fakeRepo{listByProcessResult: items, countByProcessResult: 2},
 			wantCount: 2,
+			wantTotal: 2,
 		},
 		{
 			name:      "returns hasMore=true when overfetch",
 			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 1},
-			repo:      &fakeRepo{listByProcessResult: items},
+			repo:      &fakeRepo{listByProcessResult: items, countByProcessResult: 2},
 			wantCount: 1,
 			wantMore:  true,
+			wantTotal: 2,
 		},
 		{
 			name:      "empty result → empty list, no error",
 			query:     ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:      &fakeRepo{listByProcessResult: []DraftListItem{}},
+			repo:      &fakeRepo{listByProcessResult: []DraftListItem{}, countByProcessResult: 0},
 			wantCount: 0,
+			wantTotal: 0,
 		},
 		{
-			name:    "repo error → propagated",
+			name:    "list error → propagated",
 			query:   ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
 			repo:    &fakeRepo{listByProcessErr: errors.New("db error")},
+			wantErr: true,
+		},
+		{
+			name:    "count error → propagated",
+			query:   ListByProcessQuery{TenantID: tenantID, CaseID: caseID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:    &fakeRepo{listByProcessResult: items, countByProcessErr: errors.New("db error")},
 			wantErr: true,
 		},
 	}
@@ -1489,6 +1521,9 @@ func TestUseCase_ListByProcess(t *testing.T) {
 			if result.HasMore != tt.wantMore {
 				t.Errorf("ListByProcess() HasMore = %v, want %v", result.HasMore, tt.wantMore)
 			}
+			if result.Total != tt.wantTotal {
+				t.Errorf("ListByProcess() Total = %d, want %d", result.Total, tt.wantTotal)
+			}
 		})
 	}
 }
@@ -1502,6 +1537,13 @@ func TestUseCase_ListAll(t *testing.T) {
 	items := []DraftListItem{
 		{ID: newDraftID(), PieceType: PieceTypeDefense, Status: StatusDraft, CreatedAt: now},
 	}
+	// allItems stands in for the tenant's full library (3 peças, mixed types) — the
+	// "sem filtro" fixture; its count must equal len(allItems).
+	allItems := []DraftListItem{
+		{ID: newDraftID(), PieceType: PieceTypeDefense, Status: StatusDraft, CreatedAt: now},
+		{ID: newDraftID(), PieceType: PieceTypeAppeal, Status: StatusSigned, CreatedAt: now.Add(-time.Hour)},
+		{ID: newDraftID(), PieceType: PieceTypeAppeal, Status: StatusDraft, CreatedAt: now.Add(-2 * time.Hour)},
+	}
 
 	tests := []struct {
 		name      string
@@ -1509,29 +1551,39 @@ func TestUseCase_ListAll(t *testing.T) {
 		repo      *fakeRepo
 		wantErr   bool
 		wantCount int
+		wantTotal int64
 	}{
 		{
-			name:      "returns items",
+			name:      "returns items, total = all (no filter)",
 			query:     ListAllQuery{TenantID: tenantID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:      &fakeRepo{listAllResult: items},
-			wantCount: 1,
+			repo:      &fakeRepo{listAllResult: allItems, countAllResult: int64(len(allItems))},
+			wantCount: 3,
+			wantTotal: 3,
 		},
 		{
-			name:      "with piece_type filter",
+			name:      "with piece_type filter, total = only matching",
 			query:     ListAllQuery{TenantID: tenantID, PieceType: PieceTypeDefense, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:      &fakeRepo{listAllResult: items},
+			repo:      &fakeRepo{listAllResult: items, countAllResult: 1},
 			wantCount: 1,
+			wantTotal: 1,
 		},
 		{
-			name:      "with status filter",
+			name:      "with status filter, total = only matching",
 			query:     ListAllQuery{TenantID: tenantID, Status: StatusDraft, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
-			repo:      &fakeRepo{listAllResult: items},
+			repo:      &fakeRepo{listAllResult: items, countAllResult: 1},
 			wantCount: 1,
+			wantTotal: 1,
 		},
 		{
-			name:    "repo error → propagated",
+			name:    "list error → propagated",
 			query:   ListAllQuery{TenantID: tenantID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
 			repo:    &fakeRepo{listAllErr: errors.New("db error")},
+			wantErr: true,
+		},
+		{
+			name:    "count error → propagated",
+			query:   ListAllQuery{TenantID: tenantID, LastCreated: maxCreatedAt, LastID: maxUUID, Limit: 20},
+			repo:    &fakeRepo{listAllResult: items, countAllErr: errors.New("db error")},
 			wantErr: true,
 		},
 	}
@@ -1554,6 +1606,9 @@ func TestUseCase_ListAll(t *testing.T) {
 			}
 			if len(result.Items) != tt.wantCount {
 				t.Errorf("ListAll() Items len = %d, want %d", len(result.Items), tt.wantCount)
+			}
+			if result.Total != tt.wantTotal {
+				t.Errorf("ListAll() Total = %d, want %d", result.Total, tt.wantTotal)
 			}
 		})
 	}
