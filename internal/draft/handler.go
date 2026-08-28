@@ -1610,7 +1610,7 @@ func newDraftListPage(res DraftListResult, limit int) httpx.Page[draftListItemRe
 		items = append(items, resp)
 	}
 
-	meta := httpx.PageMeta{Limit: limit}
+	meta := httpx.PageMeta{Limit: limit, TotalCount: res.Total, Total: res.Total}
 	if res.HasMore && len(items) > 0 {
 		last := res.Items[len(items)-1]
 		tok := httpx.EncodeCursor(httpx.Cursor{

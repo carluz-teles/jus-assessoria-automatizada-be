@@ -186,6 +186,10 @@ type Repository interface {
 	// paginated (created_at DESC, id DESC). Over-fetches by 1 for hasMore.
 	ListDraftsByProcess(ctx context.Context, tx database.Tx, tenantID, caseID string, lastCreated string, lastID string, limit int) ([]DraftListItem, error)
 
+	// CountDraftsByProcess returns the total peças matching ListDraftsByProcess's
+	// WHERE (same court_record_id + tenant_id), no pagination.
+	CountDraftsByProcess(ctx context.Context, tx database.Tx, tenantID, caseID string) (int64, error)
+
 	// ListDraftsAll returns draft list items across all processes for a tenant,
 	// keyset paginated (created_at DESC, id DESC). Filtros opcionais (vazio = ignorado):
 	//   pieceType, status  — colunas próprias do draft
@@ -193,6 +197,10 @@ type Repository interface {
 	//   urgencia           — "atraso" | "hoje" (contra deadline.end_date da intimation)
 	// Over-fetches por 1 pra hasMore.
 	ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, lastCreated, lastID string, limit int) ([]DraftListItem, error)
+
+	// CountDraftsAll returns the total peças matching ListDraftsAll's WHERE (same
+	// pieceType/status/workflowState/urgencia filters), no pagination.
+	CountDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia string) (int64, error)
 
 	// GetCourtRecordIDByIntimation returns the court_record_id for an intimation,
 	// or empty string if the intimation has no linked court record.
@@ -1155,6 +1163,26 @@ func (r *pgRepository) ListDraftsByProcess(ctx context.Context, tx database.Tx, 
 	return items, nil
 }
 
+func (r *pgRepository) CountDraftsByProcess(ctx context.Context, tx database.Tx, tenantID, caseID string) (int64, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return 0, err
+	}
+	cid, err := parseUUID(caseID)
+	if err != nil {
+		return 0, err
+	}
+
+	total, err := draftdb.New(tx).CountDraftsByProcess(ctx, draftdb.CountDraftsByProcessParams{
+		TenantID: tid,
+		ID:       cid,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return total, nil
+}
+
 func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, lastCreated, lastID string, limit int) ([]DraftListItem, error) {
 	tid, err := parseUUID(tenantID)
 	if err != nil {
@@ -1189,6 +1217,25 @@ func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenant
 		items = append(items, draftListItemFromAllRow(row))
 	}
 	return items, nil
+}
+
+func (r *pgRepository) CountDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia string) (int64, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return 0, err
+	}
+
+	total, err := draftdb.New(tx).CountDraftsAll(ctx, draftdb.CountDraftsAllParams{
+		TenantID: tid,
+		Column2:  pieceType,
+		Column3:  status,
+		Column4:  workflowState,
+		Column5:  urgencia,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return total, nil
 }
 
 func (r *pgRepository) GetCourtRecordIDByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (string, error) {

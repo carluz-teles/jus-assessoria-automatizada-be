@@ -599,8 +599,12 @@ type DraftListItem struct {
 	DeadlineDaysLeft *int32
 }
 
-// DraftListResult is a page of peças plus whether a further page exists.
+// DraftListResult is a page of peças plus whether a further page exists. Total
+// is a separate COUNT(*) matching the exact same WHERE as the list query (no
+// filtered-vs-tenant-wide distinction — single number, mirrors deadline's
+// PrazosByProcessoResult).
 type DraftListResult struct {
 	Items   []DraftListItem
 	HasMore bool
+	Total   int64
 }

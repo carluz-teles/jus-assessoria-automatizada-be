@@ -12,6 +12,80 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countDraftsAll = `-- name: CountDraftsAll :one
+SELECT COUNT(*)
+FROM draft d
+LEFT JOIN petition p ON p.draft_id = d.id
+LEFT JOIN LATERAL (
+    SELECT dln.end_date
+    FROM deadline dln
+    WHERE dln.notification_id = d.intimation_id
+      AND dln.tenant_id = d.tenant_id
+    ORDER BY dln.end_date ASC
+    LIMIT 1
+) dl ON true
+WHERE d.tenant_id = $1
+  AND ($2::text = '' OR d.piece_type = $2)
+  AND ($3::text = '' OR d.status = $3)
+  AND (
+    $4::text = ''
+    OR ($4::text = 'aguardando_assinatura' AND d.sent_to_signing_at IS NOT NULL AND d.signed_at IS NULL)
+    OR ($4::text = 'aguardando_protocolo'  AND d.signed_at IS NOT NULL AND d.filed_at IS NULL AND p.filed_at IS NULL)
+  )
+  AND (
+    $5::text = ''
+    OR ($5::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
+    OR ($5::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
+  )
+`
+
+type CountDraftsAllParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	Column2  string    `json:"column_2"`
+	Column3  string    `json:"column_3"`
+	Column4  string    `json:"column_4"`
+	Column5  string    `json:"column_5"`
+}
+
+// Total peças matching ListDraftsAll's WHERE (same piece_type/status/workflow_state/
+// urgencia filters), without the cursor predicate or LIMIT — feeds the "total" in the
+// page envelope. Reuses the same petition + deadline LATERAL joins the filters need;
+// drops the court_record/app_user/review joins (only used for projection there).
+func (q *Queries) CountDraftsAll(ctx context.Context, arg CountDraftsAllParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countDraftsAll,
+		arg.TenantID,
+		arg.Column2,
+		arg.Column3,
+		arg.Column4,
+		arg.Column5,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countDraftsByProcess = `-- name: CountDraftsByProcess :one
+SELECT COUNT(*)
+FROM draft d
+JOIN court_record cr ON cr.case_id = d.case_id AND cr.tenant_id = d.tenant_id
+WHERE d.tenant_id = $1
+  AND cr.id = $2
+`
+
+type CountDraftsByProcessParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+}
+
+// Total peças matching ListDraftsByProcess's WHERE (same court_record_id + tenant_id),
+// without the cursor predicate or LIMIT — feeds the "total" in the page envelope.
+func (q *Queries) CountDraftsByProcess(ctx context.Context, arg CountDraftsByProcessParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countDraftsByProcess, arg.TenantID, arg.ID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteDraftAttachment = `-- name: DeleteDraftAttachment :exec
 DELETE FROM draft_attachment
 WHERE id = $1 AND draft_id = $2 AND tenant_id = $3

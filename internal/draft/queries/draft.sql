@@ -565,6 +565,15 @@ WHERE d.tenant_id = $1
 ORDER BY d.created_at DESC, d.id DESC
 LIMIT $5;
 
+-- name: CountDraftsByProcess :one
+-- Total peças matching ListDraftsByProcess's WHERE (same court_record_id + tenant_id),
+-- without the cursor predicate or LIMIT — feeds the "total" in the page envelope.
+SELECT COUNT(*)
+FROM draft d
+JOIN court_record cr ON cr.case_id = d.case_id AND cr.tenant_id = d.tenant_id
+WHERE d.tenant_id = $1
+  AND cr.id = $2;
+
 -- name: ListDraftsAll :many
 -- Paginated list of all peças for a tenant, ordered by (created_at DESC,
 -- id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
@@ -624,6 +633,36 @@ WHERE d.tenant_id = $1
   AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
 LIMIT $8;
+
+-- name: CountDraftsAll :one
+-- Total peças matching ListDraftsAll's WHERE (same piece_type/status/workflow_state/
+-- urgencia filters), without the cursor predicate or LIMIT — feeds the "total" in the
+-- page envelope. Reuses the same petition + deadline LATERAL joins the filters need;
+-- drops the court_record/app_user/review joins (only used for projection there).
+SELECT COUNT(*)
+FROM draft d
+LEFT JOIN petition p ON p.draft_id = d.id
+LEFT JOIN LATERAL (
+    SELECT dln.end_date
+    FROM deadline dln
+    WHERE dln.notification_id = d.intimation_id
+      AND dln.tenant_id = d.tenant_id
+    ORDER BY dln.end_date ASC
+    LIMIT 1
+) dl ON true
+WHERE d.tenant_id = $1
+  AND ($2::text = '' OR d.piece_type = $2)
+  AND ($3::text = '' OR d.status = $3)
+  AND (
+    $4::text = ''
+    OR ($4::text = 'aguardando_assinatura' AND d.sent_to_signing_at IS NOT NULL AND d.signed_at IS NULL)
+    OR ($4::text = 'aguardando_protocolo'  AND d.signed_at IS NOT NULL AND d.filed_at IS NULL AND p.filed_at IS NULL)
+  )
+  AND (
+    $5::text = ''
+    OR ($5::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
+    OR ($5::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
+  );
 
 -- ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
 -- Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA
