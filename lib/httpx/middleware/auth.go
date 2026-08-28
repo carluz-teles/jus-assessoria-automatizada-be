@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
@@ -53,6 +54,13 @@ func Auth(v TokenVerifier, r PrincipalResolver) fiber.Handler {
 
 		userID, orgID, _, err := v.Verify(ctx, bearer)
 		if err != nil {
+			// The client-facing message stays generic (never reveal WHY a token
+			// was rejected — decode vs JWKS vs issuer are all the same 401 to an
+			// attacker), but the real cause is logged server-side so a bad
+			// CLERK_ISSUER/instance mismatch is diagnosable from prod logs.
+			slog.WarnContext(ctx, "auth: token verify failed",
+				slog.String("request_id", RequestIDFromCtx(c)),
+				slog.String("cause", err.Error()))
 			return httpx.WriteError(c, apperr.NewUnauthorized("invalid token"))
 		}
 
@@ -85,6 +93,9 @@ func AuthUser(v TokenVerifier) fiber.Handler {
 
 		userID, _, _, err := v.Verify(c.UserContext(), bearer)
 		if err != nil {
+			slog.WarnContext(c.UserContext(), "auth: token verify failed",
+				slog.String("request_id", RequestIDFromCtx(c)),
+				slog.String("cause", err.Error()))
 			return httpx.WriteError(c, apperr.NewUnauthorized("invalid token"))
 		}
 
