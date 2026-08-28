@@ -1497,18 +1497,16 @@ func TestHandler_GetIntimacao_InvalidID_400(t *testing.T) {
 
 // GET /v1/processos/:id forwards the path :id and the principal's tenant (never the
 // path/query) to the read port and returns the ProcessoView as the whole payload —
-// 200, no list envelope, and claim_value (valor da causa) is carried on the wire.
+// 200, no list envelope.
 func TestHandler_GetProcesso_OK(t *testing.T) {
 	t.Parallel()
 
-	claim := "150000.00"
 	rd := &recordingReader{procOneRes: ProcessoView{
-		ID:         "018f0000-0000-7000-8000-000000000abc",
-		CNJNumber:  "0004567-11.2023.8.26.0001",
-		Court:      "TJSP",
-		Degree:     "G1",
-		Lifecycle:  "ACTIVE",
-		ClaimValue: &claim,
+		ID:        "018f0000-0000-7000-8000-000000000abc",
+		CNJNumber: "0004567-11.2023.8.26.0001",
+		Court:     "TJSP",
+		Degree:    "G1",
+		Lifecycle: "ACTIVE",
 	}}
 	app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
 
@@ -1523,7 +1521,7 @@ func TestHandler_GetProcesso_OK(t *testing.T) {
 	if rd.gotProcOneID != "018f0000-0000-7000-8000-000000000abc" {
 		t.Errorf("id forwarded = %q, want the path :id", rd.gotProcOneID)
 	}
-	for _, want := range []string{`"cnj_number":"0004567-11.2023.8.26.0001"`, `"claim_value":"150000.00"`} {
+	for _, want := range []string{`"cnj_number":"0004567-11.2023.8.26.0001"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %s\ngot: %s", want, body)
 		}

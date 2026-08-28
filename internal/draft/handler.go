@@ -536,7 +536,6 @@ type processResponse struct {
 	Class         string   `json:"class"`
 	Subject       string   `json:"subject"`
 	JudgingBody   string   `json:"judging_body"`
-	ClaimValue    string   `json:"claim_value"`
 	Plaintiffs    []string `json:"plaintiffs"`
 	Defendants    []string `json:"defendants"`
 }
@@ -603,7 +602,6 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 			Class:         v.Process.Class,
 			Subject:       v.Process.Subject,
 			JudgingBody:   v.Process.JudgingBody,
-			ClaimValue:    v.Process.ClaimValue,
 			Plaintiffs:    v.Process.Plaintiffs,
 			Defendants:    v.Process.Defendants,
 		}

@@ -271,7 +271,6 @@ const getIntimacao = `-- name: GetIntimacao :one
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        i.recipients, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id, cr.judging_body,
-       cr.claim_value,
        (SELECT array_agg(p.name ORDER BY p.name)
           FROM party p
          WHERE p.case_id = cr.case_id
@@ -334,7 +333,6 @@ type GetIntimacaoRow struct {
 	Subject              *string            `json:"subject"`
 	CourtRecordID        uuid.UUID          `json:"court_record_id"`
 	JudgingBody          *string            `json:"judging_body"`
-	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	Plaintiffs           []string           `json:"plaintiffs"`
 	Defendants           []string           `json:"defendants"`
 	DistributionDate     pgtype.Date        `json:"distribution_date"`
@@ -391,7 +389,6 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 		&i.Subject,
 		&i.CourtRecordID,
 		&i.JudgingBody,
-		&i.ClaimValue,
 		&i.Plaintiffs,
 		&i.Defendants,
 		&i.DistributionDate,
@@ -414,7 +411,6 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 const getProcesso = `-- name: GetProcesso :one
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
-       cr.claim_value,
        -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
        -- an unassigned case still returns the record with NULL assigned_user_id/name.
        cc.assigned_user_id, au.name AS assigned_user_name,
@@ -464,7 +460,6 @@ type GetProcessoRow struct {
 	Secrecy              string             `json:"secrecy"`
 	Lifecycle            string             `json:"lifecycle"`
 	Completeness         float32            `json:"completeness"`
-	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
 	LastMovementText     string             `json:"last_movement_text"`
@@ -475,8 +470,8 @@ type GetProcessoRow struct {
 }
 
 // One process by id, for the FE deep-link into the processes detail (a process not on
-// the loaded list page). SAME projection as ListProcessos — the record's fields, its
-// last andamento via the LATERAL, and claim_value — so it maps to the same ProcessoView.
+// the loaded list page). SAME projection as ListProcessos — the record's fields and its
+// last andamento via the LATERAL — so it maps to the same ProcessoView.
 // Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
 // placeholder is still reachable by direct link. A foreign or unknown id yields no row
 // (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
@@ -497,7 +492,6 @@ func (q *Queries) GetProcesso(ctx context.Context, arg GetProcessoParams) (GetPr
 		&i.Secrecy,
 		&i.Lifecycle,
 		&i.Completeness,
-		&i.ClaimValue,
 		&i.AssignedUserID,
 		&i.AssignedUserName,
 		&i.LastMovementText,
@@ -1088,7 +1082,6 @@ const listProcessos = `-- name: ListProcessos :many
 
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
-       cr.claim_value,
        -- responsável do processo: assigned at case level (court_case), shared across
        -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
        -- leaves assigned_user_id/name NULL, never dropping the record from the list.
@@ -1155,7 +1148,6 @@ type ListProcessosRow struct {
 	Secrecy              string             `json:"secrecy"`
 	Lifecycle            string             `json:"lifecycle"`
 	Completeness         float32            `json:"completeness"`
-	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
 	LastMovementText     string             `json:"last_movement_text"`
@@ -1215,7 +1207,6 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 			&i.Secrecy,
 			&i.Lifecycle,
 			&i.Completeness,
-			&i.ClaimValue,
 			&i.AssignedUserID,
 			&i.AssignedUserName,
 			&i.LastMovementText,

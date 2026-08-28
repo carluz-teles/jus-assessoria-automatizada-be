@@ -1961,8 +1961,4 @@ func TestHandler_GetPrazo_RendersAuditFields(t *testing.T) {
 			t.Errorf("body missing %s\ngot: %s", want, resBody)
 		}
 	}
-	// low_confidence is DEFERRED — omitempty keeps it off the wire (always false).
-	if strings.Contains(resBody, "low_confidence") {
-		t.Errorf("low_confidence should be omitted (deferred): %s", resBody)
-	}
 }

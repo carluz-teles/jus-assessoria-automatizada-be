@@ -136,7 +136,6 @@ SELECT
     cr.class        AS process_class,
     cr.subject      AS process_subject,
     cr.judging_body AS process_judging_body,
-    cr.claim_value  AS process_claim_value,
     -- partes (autor/réu) do processo, agregadas por polo. Correlated subqueries
     -- sobre party (mesma case_id + tenant do court_record) — o slice lê party
     -- direto, sem importar acquisition (mesmo padrão do JOIN em court_record).

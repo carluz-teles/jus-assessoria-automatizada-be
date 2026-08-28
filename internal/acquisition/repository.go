@@ -1917,7 +1917,6 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 			Secrecy:          row.Secrecy,
 			Lifecycle:        row.Lifecycle,
 			Completeness:     row.Completeness,
-			ClaimValue:       numericStr(row.ClaimValue),
 			AssignedUserID:   uuidStrPtr(row.AssignedUserID),
 			AssignedUserName: row.AssignedUserName,
 			LastMovementText: row.LastMovementText,
@@ -1962,7 +1961,6 @@ func (r *pgRepository) GetProcesso(ctx context.Context, tenantID, id string) (Pr
 		Secrecy:          row.Secrecy,
 		Lifecycle:        row.Lifecycle,
 		Completeness:     row.Completeness,
-		ClaimValue:       numericStr(row.ClaimValue),
 		AssignedUserID:   uuidStrPtr(row.AssignedUserID),
 		AssignedUserName: row.AssignedUserName,
 		LastMovementText: row.LastMovementText,
@@ -2087,7 +2085,6 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		AISummary:        deref(row.AiSummary),
 		AIProvidencias:   decodeProvidencias(row.AiProvidencias),
 		AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
-		ClaimValue:       numericStr(row.ClaimValue),
 		Plaintiffs:       stringsOrEmpty(row.Plaintiffs),
 		Defendants:       stringsOrEmpty(row.Defendants),
 	}, nil
@@ -2971,7 +2968,6 @@ func (r *pgRepository) GetResumoContext(ctx context.Context, tenantID, courtReco
 		Degree:              base.Degree,
 		Class:               deref(base.Class),
 		Subject:             deref(base.Subject),
-		ClaimValue:          numericStr(base.ClaimValue),
 		Lifecycle:           base.Lifecycle,
 		FiledAt:             datePtr(base.FiledAt),
 		JudgingBody:         deref(base.JudgingBody),
@@ -3007,24 +3003,6 @@ func (r *pgRepository) GetResumoContext(ctx context.Context, tenantID, courtReco
 		})
 	}
 	return ctxData, nil
-}
-
-// numericStr lifts a nullable numeric column (claim_value, the valor da causa) to a
-// *string for a read model — nil on NULL, so an absent value serializes as JSON null.
-// The value is carried as a decimal string (not a float64) to preserve precision; the
-// driver's Value() yields that string form.
-func numericStr(n pgtype.Numeric) *string {
-	if !n.Valid {
-		return nil
-	}
-	v, err := n.Value()
-	if err != nil {
-		return nil
-	}
-	if s, ok := v.(string); ok {
-		return &s
-	}
-	return nil
 }
 
 // uuidStrPtr lifts a nullable uuid column (assigned_user_id, the responsável) to a

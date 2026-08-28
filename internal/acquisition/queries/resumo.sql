@@ -16,7 +16,6 @@ SELECT
     cr.degree,
     cr.class,
     cr.subject,
-    cr.claim_value,
     cr.lifecycle,
     cr.filed_at,
     cr.judging_body,

@@ -112,23 +112,6 @@ func pgDateToTime(d pgtype.Date) time.Time {
 	return d.Time
 }
 
-// numericToString collapses a nullable numeric column (claim_value) to its decimal
-// string form (e.g. "15000.00"), "" for SQL NULL. The FE formats it for display.
-func numericToString(n pgtype.Numeric) string {
-	if !n.Valid {
-		return ""
-	}
-	v, err := n.Value()
-	if err != nil {
-		return ""
-	}
-	s, ok := v.(string)
-	if !ok {
-		return ""
-	}
-	return s
-}
-
 // nonNilStrings normalizes a possibly-nil slice (a party array with no rows comes
 // back as nil from array_agg) to an empty slice, so the read model never carries nil
 // and the JSON serializes as [] rather than null.

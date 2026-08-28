@@ -320,16 +320,13 @@ func TestProcessosQuery_Filtered(t *testing.T) {
 }
 
 // Processo (the deep-link) is a plain delegation: it forwards (tenant, id) verbatim to
-// the repo and returns the canned ProcessoView — including claim_value — untouched (no
-// pagination policy).
+// the repo and returns the canned ProcessoView untouched (no pagination policy).
 func TestReadUseCase_Processo_ForwardsAndReturnsView(t *testing.T) {
 	t.Parallel()
 
-	claim := "150000.00"
 	repo := &recordingReadRepo{procOneRes: ProcessoView{
-		ID:         "cr-7",
-		CNJNumber:  "0001111-22.2024.8.26.0100",
-		ClaimValue: &claim,
+		ID:        "cr-7",
+		CNJNumber: "0001111-22.2024.8.26.0100",
 	}}
 	uc := NewReadUseCase(repo)
 
@@ -342,9 +339,6 @@ func TestReadUseCase_Processo_ForwardsAndReturnsView(t *testing.T) {
 	}
 	if view.ID != "cr-7" || view.CNJNumber != "0001111-22.2024.8.26.0100" {
 		t.Errorf("view not returned verbatim: %+v", view)
-	}
-	if view.ClaimValue == nil || *view.ClaimValue != "150000.00" {
-		t.Errorf("claim_value = %v, want 150000.00", view.ClaimValue)
 	}
 }
 

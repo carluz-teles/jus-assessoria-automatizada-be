@@ -324,8 +324,8 @@ type Querier interface {
 	// importing). Scoped by tenant_id (isolation barrier 1; RLS is barrier 2).
 	GetLatestBackfillStatus(ctx context.Context, tenantID uuid.UUID) (GetLatestBackfillStatusRow, error)
 	// One process by id, for the FE deep-link into the processes detail (a process not on
-	// the loaded list page). SAME projection as ListProcessos — the record's fields, its
-	// last andamento via the LATERAL, and claim_value — so it maps to the same ProcessoView.
+	// the loaded list page). SAME projection as ListProcessos — the record's fields and its
+	// last andamento via the LATERAL — so it maps to the same ProcessoView.
 	// Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
 	// placeholder is still reachable by direct link. A foreign or unknown id yields no row
 	// (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
