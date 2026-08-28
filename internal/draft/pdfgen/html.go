@@ -99,6 +99,12 @@ func RenderHTML(ctx context.Context, in RenderHTMLInput) ([]byte, error) {
 		chromedp.Flag("hide-scrollbars", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("run-all-compositor-stages-before-draw", true),
+		// O runtime roda como --no-create-home (Dockerfile), então $HOME não existe —
+		// o crashpad handler do Chromium precisa de um --database gravável pra
+		// inicializar e falha com "chrome_crashpad_handler: --database is required"
+		// sem essa flag. Desabilitar o crash-reporter evita a dependência por inteiro
+		// (não precisamos de crash dumps num renderer headless de vida curta).
+		chromedp.Flag("disable-crash-reporter", true),
 	)
 	if path := resolveChromePath(); path != "" {
 		opts = append(opts, chromedp.ExecPath(path))
