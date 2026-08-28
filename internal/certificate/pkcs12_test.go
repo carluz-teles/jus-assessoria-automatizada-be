@@ -46,7 +46,7 @@ func generateTestPFX(t *testing.T, cn, password string, ttl time.Duration) []byt
 
 func TestParsePFX_Success(t *testing.T) {
 	pfx := generateTestPFX(t, "LUAN GOMES", "senha123", time.Hour)
-	p, err := parsePFX(pfx, "senha123")
+	p, err := parsePFX(t.Context(), pfx, "senha123")
 	if err != nil {
 		t.Fatalf("parsePFX: %v", err)
 	}
@@ -57,14 +57,14 @@ func TestParsePFX_Success(t *testing.T) {
 
 func TestParsePFX_WrongPassword(t *testing.T) {
 	pfx := generateTestPFX(t, "X", "certa", time.Hour)
-	_, err := parsePFX(pfx, "errada")
+	_, err := parsePFX(t.Context(), pfx, "errada")
 	if err != ErrPKCS12BadPassword {
 		t.Fatalf("esperado ErrPKCS12BadPassword, obtido %v", err)
 	}
 }
 
 func TestParsePFX_CorruptFile(t *testing.T) {
-	_, err := parsePFX([]byte("isso não é pfx nenhum"), "qualquer")
+	_, err := parsePFX(t.Context(), []byte("isso não é pfx nenhum"), "qualquer")
 	if err != ErrPKCS12Parse && err != ErrPKCS12BadPassword {
 		t.Fatalf("esperado ErrPKCS12Parse ou BadPassword, obtido %v", err)
 	}
@@ -72,7 +72,7 @@ func TestParsePFX_CorruptFile(t *testing.T) {
 
 func TestToMetadataAndChecks(t *testing.T) {
 	pfx := generateTestPFX(t, "MARIA SILVA", "senha", 24*time.Hour)
-	p, _ := parsePFX(pfx, "senha")
+	p, _ := parsePFX(t.Context(), pfx, "senha")
 	m := toMetadata(p)
 	if m.SubjectCN != "MARIA SILVA" {
 		t.Fatalf("SubjectCN = %q", m.SubjectCN)
@@ -95,7 +95,7 @@ func TestToMetadataAndChecks(t *testing.T) {
 
 func TestSignSHA256_RoundTrip(t *testing.T) {
 	pfx := generateTestPFX(t, "TEST", "s", time.Hour)
-	p, _ := parsePFX(pfx, "s")
+	p, _ := parsePFX(t.Context(), pfx, "s")
 	digest := sha256.Sum256([]byte("documento fake"))
 	sig, err := signSHA256(p, digest[:])
 	if err != nil {

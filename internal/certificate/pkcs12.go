@@ -1,6 +1,7 @@
 package certificate
 
 import (
+	"context"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -26,17 +27,31 @@ type parsedPFX struct {
 // parsePFX decodes the .pfx bytes using the given password. Returns typed
 // errors: BadPassword vs Parse — the FE distinguishes them (senha errada vs
 // arquivo inválido).
-func parsePFX(pfx []byte, password string) (*parsedPFX, error) {
+func parsePFX(ctx context.Context, pfx []byte, password string) (*parsedPFX, error) {
+	p, err := decodeDER(pfx, password)
+	if err != ErrPKCS12Parse {
+		return p, err
+	}
+	// go-pkcs12 only reads DER (its own doc: "only DER-encoded ...
+	// encoding/asn1 only supports DER"). Some real .pfx files (Windows
+	// certutil/certmgr exports, some token/HSM middlewares) use BER
+	// (indefinite-length encoding) and land here with a generic error even
+	// though the certificate itself is valid. Before giving up, normalize
+	// via openssl — whose ASN.1 decoder reads BER natively — and retry.
+	der, newPassword, nerr := normalizeBERToDER(ctx, pfx, password)
+	if nerr != nil {
+		return nil, nerr
+	}
+	return decodeDER(der, newPassword)
+}
+
+// decodeDER reads a strictly DER-encoded PKCS#12.
+func decodeDER(pfx []byte, password string) (*parsedPFX, error) {
 	// go-pkcs12 devolve (key, cert, cadeia). O primeiro cert é a folha; a
 	// cadeia vem no 3º retorno (pode estar vazia se o PFX é minimal).
 	key, cert, caCerts, err := pkcs12.DecodeChain(pfx, password)
 	if err != nil {
-		// mensagens da lib: "pkcs12: decryption password incorrect" ou "asn1"
-		low := strings.ToLower(err.Error())
-		if strings.Contains(low, "password") || strings.Contains(low, "mac verify") {
-			return nil, ErrPKCS12BadPassword
-		}
-		return nil, ErrPKCS12Parse
+		return nil, classifyPKCS12Error(err)
 	}
 	if cert == nil {
 		return nil, ErrPKCS12Parse

@@ -56,10 +56,17 @@ ENTRYPOINT ["/app/app"]
 #
 # fonts-liberation: garante que a família "Liberation Serif" resolva mesmo
 # quando o CSS @font-face inline falhar (fallback seguro).
+#
+# openssl: fallback do internal/certificate/pkcs12_ber.go — go-pkcs12 só lê
+# PKCS#12 DER-encoded (limitação do encoding/asn1); alguns .pfx reais (Windows
+# certutil/certmgr, alguns tokens/HSM) exportam em BER e o parser puro-Go
+# rejeita com erro genérico mesmo sendo um certificado válido. openssl lê BER
+# nativamente, então normalizamos por ele antes de desistir.
 FROM debian:bookworm-slim AS runtime-chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates tzdata \
         chromium fonts-liberation \
+        openssl \
     && rm -rf /var/lib/apt/lists/*
 # chromedp usa "chromium" ou "chromium-browser" no PATH; deixamos ambos.
 RUN ln -sf /usr/bin/chromium /usr/bin/chromium-browser || true
