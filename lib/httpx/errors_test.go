@@ -152,6 +152,12 @@ func TestWriteError_KindMapsToStatus(t *testing.T) {
 			wantStatus: http.StatusServiceUnavailable,
 			wantKind:   string(apperr.KindUnavailable),
 		},
+		{
+			name:       "rate limited",
+			err:        apperr.NewRateLimited("too many requests"),
+			wantStatus: http.StatusTooManyRequests,
+			wantKind:   string(apperr.KindRateLimited),
+		},
 	}
 
 	for _, tt := range tests {

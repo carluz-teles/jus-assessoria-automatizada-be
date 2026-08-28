@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -36,7 +37,13 @@ const identityMePath = "/v1/identity/me"
 // the graph here (not inside newRouter) keeps the router a pure function of its
 // dependencies — the test builds it with fakes and never touches the network.
 type routerDeps struct {
-	logger               *slog.Logger
+	logger *slog.Logger
+	// rateLimitMax/rateLimitWebhookMax/rateLimitWindow feed middleware.RateLimit
+	// (RATE_LIMIT_* env vars, lib/config). Two separate budgets, one shared
+	// window — see newRouter for where each is mounted and why.
+	rateLimitMax         int
+	rateLimitWebhookMax  int
+	rateLimitWindow      time.Duration
 	corsOrigins          string
 	verifier             middleware.TokenVerifier
 	resolver             middleware.PrincipalResolver
@@ -103,6 +110,16 @@ func newRouter(deps routerDeps) *fiber.App {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
+	// Rate limit the 3 public webhooks (Clerk/Stripe/Resend) as one group, ahead
+	// of registering any of them — Fiber matches this prefix Use against the
+	// specific POST routes each Register call below adds, regardless of mount
+	// order. Its own budget (RATE_LIMIT_WEBHOOK_MAX, tighter than /v1's) keeps
+	// this low-and-predictable traffic from competing with real users for the
+	// same headroom. /health stays unlimited on purpose (see routerDeps' doc):
+	// it is polled by a load balancer/orchestrator at a fixed short interval, and
+	// a false-positive 429 there would take a healthy instance out of rotation.
+	app.Use("/webhooks", middleware.RateLimit(deps.rateLimitWebhookMax, deps.rateLimitWindow))
+
 	// Domain routes come from each slice, never hand-listed here — the api only
 	// composes. identity owns its public Clerk provisioning webhook (svix-verified
 	// inside, so unauthenticated at the router level, §4d.3) and mounts it via
@@ -131,6 +148,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	userAuth := middleware.AuthUser(deps.verifier)
 
 	v1 := app.Group("/v1")
+	// Rate limit ahead of the auth dispatch below: a request over budget is
+	// rejected before paying for JWT verification/tenant resolution, and
+	// RequestID/Telemetry (mounted globally in Base, above) still ran first so
+	// the 429 stays traceable. Its own budget (RATE_LIMIT_MAX, generous — many
+	// users legitimately share one office's public IP behind a NAT) is separate
+	// from the public webhooks' tighter one above.
+	v1.Use(middleware.RateLimit(deps.rateLimitMax, deps.rateLimitWindow))
 	v1.Use(func(c *fiber.Ctx) error {
 		if strings.HasPrefix(c.Path(), lookupPrefix) || c.Path() == identityMePath {
 			return userAuth(c)

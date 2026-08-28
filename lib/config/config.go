@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -66,6 +67,20 @@ type Config struct {
 	// browser descarta a resposta. O default cobre o domínio de prod (app.atjud.com.br),
 	// o subdomínio Railway (legado) e o dev local; produção pode sobrescrever via env.
 	CORSAllowedOrigins string `env:"CORS_ALLOWED_ORIGINS" envDefault:"https://app.atjud.com.br,https://autojus-web.up.railway.app,http://localhost:3000"`
+
+	// Rate limiting por IP (lib/httpx/middleware.RateLimit), só o api consome —
+	// nenhum endpoint tinha proteção contra abuso volumétrico. Duas budgets
+	// separadas, mesma janela: RateLimitMax cobre o tráfego autenticado /v1/*
+	// (default 600/min — generoso o bastante pra um escritório inteiro atrás de
+	// um único IP de NAT compartilhado, mas corta um scraper/bot óbvio);
+	// RateLimitWebhookMax cobre os 3 webhooks públicos (Clerk/Stripe/Resend,
+	// default 120/min — volume baixo e previsível, orçamento próprio pra não
+	// competir com o tráfego de usuário real). /health fica de fora de propósito:
+	// é sondado por load balancer/orquestrador em intervalo curto e fixo, e
+	// 429 ali derrubaria a instância por engano.
+	RateLimitMax           int `env:"RATE_LIMIT_MAX"            envDefault:"600"`
+	RateLimitWebhookMax    int `env:"RATE_LIMIT_WEBHOOK_MAX"    envDefault:"120"`
+	RateLimitWindowSeconds int `env:"RATE_LIMIT_WINDOW_SECONDS" envDefault:"60"`
 
 	// Stripe billing (só o api os consome, no webhook /webhooks/stripe). Opcionais
 	// pelo mesmo motivo do ClerkWebhookSecret: um segredo vazio só quebra ao
@@ -308,6 +323,13 @@ func (c Config) SlogLevel() slog.Level {
 // típo — mantém o padrão seguro import-only. Ver lib/telemetry.buildSampler.
 func (c Config) TracesImportOnly() bool {
 	return strings.ToLower(strings.TrimSpace(c.OTELTracesMode)) != "all"
+}
+
+// RateLimitWindow converte RateLimitWindowSeconds na time.Duration que
+// middleware.RateLimit espera. Ambas as budgets (v1 e webhook) compartilham a
+// mesma janela — só o teto (Max) muda entre elas.
+func (c Config) RateLimitWindow() time.Duration {
+	return time.Duration(c.RateLimitWindowSeconds) * time.Second
 }
 
 // S3Enabled informa se o storage de objetos está totalmente configurado. O api

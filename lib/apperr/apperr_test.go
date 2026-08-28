@@ -60,6 +60,12 @@ func TestConstructors_SetKindAndMessage(t *testing.T) {
 			wantKind: apperr.KindUnavailable,
 			wantMsg:  "provedor indisponível",
 		},
+		{
+			name:     "rate limited",
+			build:    func() *apperr.AppError { return apperr.NewRateLimited("too many requests") },
+			wantKind: apperr.KindRateLimited,
+			wantMsg:  "too many requests",
+		},
 	}
 
 	for _, tt := range tests {
@@ -93,6 +99,7 @@ func TestKind_Values(t *testing.T) {
 		{apperr.KindConflict, "CONFLICT"},
 		{apperr.KindInfra, "INFRA_ERROR"},
 		{apperr.KindUnavailable, "SERVICE_UNAVAILABLE"},
+		{apperr.KindRateLimited, "RATE_LIMITED"},
 	}
 
 	for _, tt := range tests {

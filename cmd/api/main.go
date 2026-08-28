@@ -547,6 +547,9 @@ func run(logger *slog.Logger) error {
 	// 5. Router — the testable seam; no I/O happens here.
 	app := newRouter(routerDeps{
 		logger:               logger,
+		rateLimitMax:         cfg.RateLimitMax,
+		rateLimitWebhookMax:  cfg.RateLimitWebhookMax,
+		rateLimitWindow:      cfg.RateLimitWindow(),
 		corsOrigins:          cfg.CORSAllowedOrigins,
 		verifier:             verifier,
 		resolver:             resolver,

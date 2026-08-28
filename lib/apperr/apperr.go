@@ -27,6 +27,10 @@ const (
 	// upstream service — being unreachable or failing (→ 503 at the edge). Unlike
 	// KindInfra it is not a bug in our code: the caller may simply retry later.
 	KindUnavailable Kind = "SERVICE_UNAVAILABLE"
+	// KindRateLimited reports that the caller exceeded the request budget the
+	// edge enforces for a window (→ 429 at the edge). Not a bug on either side —
+	// the caller may retry after the window resets.
+	KindRateLimited Kind = "RATE_LIMITED"
 )
 
 // AppError is a typed application error. Message is safe to expose to the
@@ -87,6 +91,10 @@ func NewInfra(msg string, cause error) *AppError {
 func NewUnavailable(msg string, cause error) *AppError {
 	return &AppError{Kind: KindUnavailable, Message: msg, cause: cause}
 }
+
+// NewRateLimited reports that the caller exceeded the request budget for the
+// current window (→ 429). No cause: hitting a rate limit is not a bug.
+func NewRateLimited(msg string) *AppError { return &AppError{Kind: KindRateLimited, Message: msg} }
 
 // From extracts an *AppError from anywhere in err's chain. Call sites may also
 // use errors.As directly; this is the convenience form.
