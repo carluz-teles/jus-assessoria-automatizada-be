@@ -25,6 +25,7 @@ var statusByKind = map[apperr.Kind]int{
 	apperr.KindConflict:     fiber.StatusConflict,            // 409
 	apperr.KindInfra:        fiber.StatusInternalServerError, // 500
 	apperr.KindUnavailable:  fiber.StatusServiceUnavailable,  // 503
+	apperr.KindRateLimited:  fiber.StatusTooManyRequests,     // 429
 }
 
 // ErrorBody is the single client-facing error envelope (§4.4): {kind, message,
@@ -138,6 +139,8 @@ func kindByStatus(status int) apperr.Kind {
 		return apperr.KindConflict
 	case fiber.StatusServiceUnavailable:
 		return apperr.KindUnavailable
+	case fiber.StatusTooManyRequests:
+		return apperr.KindRateLimited
 	}
 	if status >= fiber.StatusInternalServerError {
 		return apperr.KindInfra

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jusassessoria/platform/internal/identity"
 	"github.com/jusassessoria/platform/internal/lookup"
@@ -40,12 +41,26 @@ func (fakeResolver) Resolve(context.Context, string, string) (httpx.Principal, e
 	return httpx.Principal{}, nil
 }
 
+// testRateLimitMax/testRateLimitWebhookMax/testRateLimitWindow mirror the
+// production defaults (lib/config's RATE_LIMIT_*) — set explicitly so the
+// fixture's behavior does not depend on the limiter package's own zero-value
+// fallback (5 req/min), which is high enough to be misread as "no limiter".
+const (
+	testRateLimitMax        = 600
+	testRateLimitWebhookMax = 120
+)
+
+var testRateLimitWindow = 60 * time.Second
+
 func newTestRouterDeps() routerDeps {
 	return routerDeps{
-		logger:      telemetry.NewLogger(io.Discard, nil),
-		corsOrigins: testCORSOrigin,
-		verifier:    fakeVerifier{},
-		resolver:    fakeResolver{},
+		logger:              telemetry.NewLogger(io.Discard, nil),
+		rateLimitMax:        testRateLimitMax,
+		rateLimitWebhookMax: testRateLimitWebhookMax,
+		rateLimitWindow:     testRateLimitWindow,
+		corsOrigins:         testCORSOrigin,
+		verifier:            fakeVerifier{},
+		resolver:            fakeResolver{},
 		// webhook is never invoked by these tests; a nil handler is safe because
 		// no route below reaches Handle. Left nil deliberately to keep the fixture
 		// free of a real UseCase.
