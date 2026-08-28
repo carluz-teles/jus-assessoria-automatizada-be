@@ -63,7 +63,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 # chromedp usa "chromium" ou "chromium-browser" no PATH; deixamos ambos.
 RUN ln -sf /usr/bin/chromium /usr/bin/chromium-browser || true
-RUN useradd --system --no-create-home --uid 10001 appuser
+# --create-home (ao contrário dos outros estágios): o crashpad handler do
+# Chromium resolve o --database a partir de $HOME; sem HOME (usuário sem home
+# dir) ele recebe um path vazio e recusa subir com "--database is required",
+# quebrando o printToPDF do pdfgen inteiro. ENV HOME fixa explicitamente —
+# não depender de USER setar isso implicitamente (não seta).
+RUN useradd --system --create-home --uid 10001 appuser
+ENV HOME=/home/appuser
 WORKDIR /app
 COPY --from=build /out/app /app/app
 COPY migrations/ /app/migrations/
