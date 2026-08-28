@@ -577,7 +577,8 @@ WHERE d.tenant_id = $1
 -- name: ListDraftsAll :many
 -- Paginated list of all peças for a tenant, ordered by (created_at DESC,
 -- id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
--- urgencia (atraso, hoje). Coverage do último review via LATERAL. Prazo derivado
+-- urgencia (atraso, hoje), assignee_id (d.created_by — o chip "Minhas"; NULL = todos os
+-- responsáveis). Coverage do último review via LATERAL. Prazo derivado
 -- da intimation de origem: deadline mais recente (deadline.notification_id = intimation.id).
 -- Over-fetch por 1 pra hasMore.
 SELECT
@@ -630,15 +631,17 @@ WHERE d.tenant_id = $1
     OR ($7::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
     OR ($7::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
   )
+  -- assignee_id: NULL = todos, senão só o criador informado (chip "Minhas")
+  AND (sqlc.narg('assignee_id')::uuid IS NULL OR d.created_by = sqlc.narg('assignee_id')::uuid)
   AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
 LIMIT $8;
 
 -- name: CountDraftsAll :one
 -- Total peças matching ListDraftsAll's WHERE (same piece_type/status/workflow_state/
--- urgencia filters), without the cursor predicate or LIMIT — feeds the "total" in the
--- page envelope. Reuses the same petition + deadline LATERAL joins the filters need;
--- drops the court_record/app_user/review joins (only used for projection there).
+-- urgencia/assignee_id filters), without the cursor predicate or LIMIT — feeds the
+-- "total" in the page envelope. Reuses the same petition + deadline LATERAL joins the
+-- filters need; drops the court_record/app_user/review joins (only used for projection there).
 SELECT COUNT(*)
 FROM draft d
 LEFT JOIN petition p ON p.draft_id = d.id
@@ -662,7 +665,8 @@ WHERE d.tenant_id = $1
     $5::text = ''
     OR ($5::text = 'atraso' AND dl.end_date IS NOT NULL AND dl.end_date < CURRENT_DATE)
     OR ($5::text = 'hoje'   AND dl.end_date = CURRENT_DATE)
-  );
+  )
+  AND (sqlc.narg('assignee_id')::uuid IS NULL OR d.created_by = sqlc.narg('assignee_id')::uuid);
 
 -- ── e-SAJ credentials (Fatia 1 — peticionamento automático) ───────────────────
 -- Reusa o envelope KMS (ciphertext+nonce+wrapped_dek+kek_ref). A senha NUNCA

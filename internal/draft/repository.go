@@ -195,12 +195,13 @@ type Repository interface {
 	//   pieceType, status  — colunas próprias do draft
 	//   workflowState      — "aguardando_assinatura" | "aguardando_protocolo"
 	//   urgencia           — "atraso" | "hoje" (contra deadline.end_date da intimation)
+	//   assignee           — d.created_by (o chip "Minhas"), já resolvido pelo handler
 	// Over-fetches por 1 pra hasMore.
-	ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, lastCreated, lastID string, limit int) ([]DraftListItem, error)
+	ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, assignee, lastCreated, lastID string, limit int) ([]DraftListItem, error)
 
 	// CountDraftsAll returns the total peças matching ListDraftsAll's WHERE (same
-	// pieceType/status/workflowState/urgencia filters), no pagination.
-	CountDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia string) (int64, error)
+	// pieceType/status/workflowState/urgencia/assignee filters), no pagination.
+	CountDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, assignee string) (int64, error)
 
 	// GetCourtRecordIDByIntimation returns the court_record_id for an intimation,
 	// or empty string if the intimation has no linked court record.
@@ -1183,7 +1184,7 @@ func (r *pgRepository) CountDraftsByProcess(ctx context.Context, tx database.Tx,
 	return total, nil
 }
 
-func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, lastCreated, lastID string, limit int) ([]DraftListItem, error) {
+func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, assignee, lastCreated, lastID string, limit int) ([]DraftListItem, error) {
 	tid, err := parseUUID(tenantID)
 	if err != nil {
 		return nil, err
@@ -1199,14 +1200,15 @@ func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenant
 	}
 
 	rows, err := draftdb.New(tx).ListDraftsAll(ctx, draftdb.ListDraftsAllParams{
-		TenantID: tid,
-		Column2:  pieceType,
-		Column3:  status,
-		Column4:  timeToTimestamptz(created),
-		Column5:  lid,
-		Column6:  workflowState,
-		Column7:  urgencia,
-		Limit:    int32(limit),
+		TenantID:   tid,
+		Column2:    pieceType,
+		Column3:    status,
+		Column4:    timeToTimestamptz(created),
+		Column5:    lid,
+		Column6:    workflowState,
+		Column7:    urgencia,
+		Limit:      int32(limit),
+		AssigneeID: optUUID(assignee),
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -1219,18 +1221,19 @@ func (r *pgRepository) ListDraftsAll(ctx context.Context, tx database.Tx, tenant
 	return items, nil
 }
 
-func (r *pgRepository) CountDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia string) (int64, error) {
+func (r *pgRepository) CountDraftsAll(ctx context.Context, tx database.Tx, tenantID, pieceType, status, workflowState, urgencia, assignee string) (int64, error) {
 	tid, err := parseUUID(tenantID)
 	if err != nil {
 		return 0, err
 	}
 
 	total, err := draftdb.New(tx).CountDraftsAll(ctx, draftdb.CountDraftsAllParams{
-		TenantID: tid,
-		Column2:  pieceType,
-		Column3:  status,
-		Column4:  workflowState,
-		Column5:  urgencia,
+		TenantID:   tid,
+		Column2:    pieceType,
+		Column3:    status,
+		Column4:    workflowState,
+		Column5:    urgencia,
+		AssigneeID: optUUID(assignee),
 	})
 	if err != nil {
 		return 0, database.WrapInfra(err)
