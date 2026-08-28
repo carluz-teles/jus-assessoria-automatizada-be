@@ -213,7 +213,6 @@ CREATE TABLE court_record (
   subject        text,
   filed_at       date,                    -- ajuizamento (DATAJUD dataAjuizamento) [0012]
   judging_body   text,                    -- órgão julgador (DATAJUD orgaoJulgador / DJEN nomeOrgao) [0012]
-  claim_value    numeric(15,2),
   secrecy        text NOT NULL DEFAULT 'PUBLIC',    -- PUBLIC|RESTRICTED|SECRET
   lifecycle      text NOT NULL DEFAULT 'ACTIVE',    -- ACTIVE|SUSPENDED|ARCHIVED|SUPERSEDED
   completeness   real NOT NULL DEFAULT 0,

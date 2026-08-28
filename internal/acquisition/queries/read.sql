@@ -20,7 +20,6 @@
 -- ListIntimacoes pattern in this file) so sqlc infers nullable types correctly.
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
-       cr.claim_value,
        -- responsável do processo: assigned at case level (court_case), shared across
        -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
        -- leaves assigned_user_id/name NULL, never dropping the record from the list.
@@ -63,15 +62,14 @@ LIMIT $2;
 
 -- name: GetProcesso :one
 -- One process by id, for the FE deep-link into the processes detail (a process not on
--- the loaded list page). SAME projection as ListProcessos — the record's fields, its
--- last andamento via the LATERAL, and claim_value — so it maps to the same ProcessoView.
+-- the loaded list page). SAME projection as ListProcessos — the record's fields and its
+-- last andamento via the LATERAL — so it maps to the same ProcessoView.
 -- Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
 -- placeholder is still reachable by direct link. A foreign or unknown id yields no row
 -- (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
 -- next_deadline: same correlated LATERAL as ListProcessos (see above).
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
-       cr.claim_value,
        -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
        -- an unassigned case still returns the record with NULL assigned_user_id/name.
        cc.assigned_user_id, au.name AS assigned_user_name,
@@ -182,7 +180,6 @@ LIMIT $2;
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        i.recipients, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id, cr.judging_body,
-       cr.claim_value,
        (SELECT array_agg(p.name ORDER BY p.name)
           FROM party p
          WHERE p.case_id = cr.case_id

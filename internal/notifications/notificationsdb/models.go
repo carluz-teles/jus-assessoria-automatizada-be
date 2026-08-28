@@ -129,7 +129,6 @@ type CourtRecord struct {
 	Court                 string             `json:"court"`
 	Class                 *string            `json:"class"`
 	Subject               *string            `json:"subject"`
-	ClaimValue            pgtype.Numeric     `json:"claim_value"`
 	Secrecy               string             `json:"secrecy"`
 	Lifecycle             string             `json:"lifecycle"`
 	Completeness          float32            `json:"completeness"`

@@ -80,14 +80,13 @@ type DeadlineCtx struct {
 // open deadlines, and optional RAG document chunks.
 type ProcessContext struct {
 	// court_record identification
-	CNJNumber  string
-	Court      string
-	Degree     string
-	Class      string
-	Subject    string
-	ClaimValue string // formatado; vazio se nil
-	Lifecycle  string // ACTIVE|SUSPENDED|ARCHIVED|SUPERSEDED
-	FiledAt    string // ISO date; vazio se nil
+	CNJNumber string
+	Court     string
+	Degree    string
+	Class     string
+	Subject   string
+	Lifecycle string // ACTIVE|SUSPENDED|ARCHIVED|SUPERSEDED
+	FiledAt   string // ISO date; vazio se nil
 
 	// dados agregados (pré-truncados pelo use case)
 	RecentMovements   []DocketEntryCtx // últimos 10, text truncado 500 chars
@@ -1039,7 +1038,6 @@ func composeSummarizeProcess(c ProcessContext) Composed {
 	add("Grau", c.Degree)
 	add("Classe/rito", c.Class)
 	add("Assunto", c.Subject)
-	add("Valor da causa", c.ClaimValue)
 	add("Fase de vida", c.Lifecycle)
 	add("Data de ajuizamento", c.FiledAt)
 

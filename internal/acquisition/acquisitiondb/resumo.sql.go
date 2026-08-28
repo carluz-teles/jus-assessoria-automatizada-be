@@ -65,7 +65,6 @@ SELECT
     cr.degree,
     cr.class,
     cr.subject,
-    cr.claim_value,
     cr.lifecycle,
     cr.filed_at,
     cr.judging_body,
@@ -87,7 +86,6 @@ type GetResumoContextRow struct {
 	Degree              string             `json:"degree"`
 	Class               *string            `json:"class"`
 	Subject             *string            `json:"subject"`
-	ClaimValue          pgtype.Numeric     `json:"claim_value"`
 	Lifecycle           string             `json:"lifecycle"`
 	FiledAt             pgtype.Date        `json:"filed_at"`
 	JudgingBody         *string            `json:"judging_body"`
@@ -114,7 +112,6 @@ func (q *Queries) GetResumoContext(ctx context.Context, arg GetResumoContextPara
 		&i.Degree,
 		&i.Class,
 		&i.Subject,
-		&i.ClaimValue,
 		&i.Lifecycle,
 		&i.FiledAt,
 		&i.JudgingBody,

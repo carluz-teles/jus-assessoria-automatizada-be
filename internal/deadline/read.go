@@ -73,15 +73,13 @@ type PrazoDetailView struct {
 	Confirmed       bool      `json:"confirmed"`
 	// Confirmation panel fields (migration 0049): the termo inicial the prazo is anchored on, the
 	// frozen legal citation snapshot, the lawyer's manual extra days, and the audit stamp (who/
-	// when confirmed, with the resolved name). LowConfidence is DEFERRED (always false/absent) —
-	// omitempty keeps it off the wire until the signal exists.
+	// when confirmed, with the resolved name).
 	AnchorEvent     string     `json:"anchor_event"`
 	LegalCitation   string     `json:"legal_citation,omitempty"`
 	ManualExtraDays int        `json:"manual_extra_days"`
 	ConfirmedByID   string     `json:"confirmed_by_id,omitempty"`
 	ConfirmedByName string     `json:"confirmed_by_name,omitempty"`
 	ConfirmedAt     *time.Time `json:"confirmed_at"`
-	LowConfidence   bool       `json:"low_confidence,omitempty"`
 }
 
 // PrazoSuggestContext is the advisory case context the AI suggester (suggest.go) composes the

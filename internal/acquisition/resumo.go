@@ -69,7 +69,6 @@ type ProcessoResumoCtx struct {
 	Degree              string
 	Class               string
 	Subject             string
-	ClaimValue          *string
 	Lifecycle           string
 	FiledAt             *time.Time
 	JudgingBody         string
@@ -372,18 +371,12 @@ func (uc *ResumoUseCase) buildProcessContext(ctx context.Context, tenantID, cour
 		filedAt = ctxData.FiledAt.Format(time.RFC3339)
 	}
 
-	claimValue := ""
-	if ctxData.ClaimValue != nil {
-		claimValue = *ctxData.ClaimValue
-	}
-
 	return advisory.ProcessContext{
 		CNJNumber:         ctxData.CNJNumber,
 		Court:             ctxData.Court,
 		Degree:            ctxData.Degree,
 		Class:             ctxData.Class,
 		Subject:           ctxData.Subject,
-		ClaimValue:        claimValue,
 		Lifecycle:         ctxData.Lifecycle,
 		FiledAt:           filedAt,
 		RecentMovements:   recentMovements,

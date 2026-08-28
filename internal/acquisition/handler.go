@@ -767,9 +767,9 @@ func (h *Handler) intimacoesSummary(c *fiber.Ctx) error {
 
 // getProcesso handles GET /v1/processos/:id: one process for the FE deep-link (open the
 // detail of a process not on the loaded list page). The view is the whole payload — one
-// ProcessoView, same shape as a list row (including claim_value) — so it is returned
-// without a list envelope. tenant_id comes from the principal, never the path/body: a
-// miss or a foreign tenant's id is the read model's typed 404, a non-uuid id its typed 400.
+// ProcessoView, same shape as a list row — so it is returned without a list envelope.
+// tenant_id comes from the principal, never the path/body: a miss or a foreign tenant's
+// id is the read model's typed 404, a non-uuid id its typed 400.
 func (h *Handler) getProcesso(c *fiber.Ctx) error {
 	tenantID := httpx.TenantFromCtx(c)
 	view, err := h.reader.Processo(c.UserContext(), tenantID, c.Params("id"))

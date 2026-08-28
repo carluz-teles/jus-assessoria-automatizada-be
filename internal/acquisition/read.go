@@ -39,7 +39,6 @@ type ProcessoView struct {
 	Secrecy      string     `json:"secrecy"`
 	Lifecycle    string     `json:"lifecycle"`
 	Completeness float32    `json:"completeness"`
-	ClaimValue   *string    `json:"claim_value"` // valor da causa (numeric); nil (JSON null) when unset
 	// responsável do processo — assigned at case level (court_case), so it is shared
 	// across the process's graus. Both nil (JSON null) when no one is assigned; name
 	// is the app_user.name joined in, so the FE renders the header without a second read.
@@ -165,12 +164,10 @@ type IntimacaoDetailView struct {
 	AIProvidencias []IntimacaoProvidenciaView `json:"ai_providencias"`
 	AIAnalyzedAt   *time.Time                 `json:"ai_analyzed_at"`
 
-	// Partes + valor da causa (débito do preview da intimação): lidos direto de
-	// party + court_record no GetIntimacao. ClaimValue é o valor da causa como
-	// string decimal (nil/JSON null quando NULL); Plaintiffs (autor/polo ativo) e
-	// Defendants (réu/polo passivo) são os nomes das partes, nunca null (array
-	// vazio quando não há partes cadastradas — dado ainda não ingerido).
-	ClaimValue *string  `json:"claim_value"`
+	// Partes (débito do preview da intimação): lidas direto de party + court_record
+	// no GetIntimacao. Plaintiffs (autor/polo ativo) e Defendants (réu/polo passivo)
+	// são os nomes das partes, nunca null (array vazio quando não há partes
+	// cadastradas — dado ainda não ingerido).
 	Plaintiffs []string `json:"plaintiffs"`
 	Defendants []string `json:"defendants"`
 }
