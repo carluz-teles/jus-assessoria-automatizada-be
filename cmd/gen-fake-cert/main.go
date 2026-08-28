@@ -127,20 +127,22 @@ func makeICPBrasilOAB(oab string) (pkix.Extension, error) {
 	if err != nil {
 		return pkix.Extension{}, err
 	}
-	// OtherName SEQUENCE { OID, [0] EXPLICIT value }
-	// Simplificado: encoda como SEQUENCE {OID, value} — o parser é permissivo.
-	inner, err := asn1.Marshal(struct {
-		OID   asn1.ObjectIdentifier
-		Value asn1.RawValue
-	}{
-		OID:   oidICPBrasilOAB,
-		Value: asn1.RawValue{Tag: 0, Class: asn1.ClassContextSpecific, IsCompound: true, Bytes: valueBytes},
-	})
+	oidBytes, err := asn1.Marshal(oidICPBrasilOAB)
 	if err != nil {
 		return pkix.Extension{}, err
 	}
+	// OtherName ::= SEQUENCE { type-id OID, value [0] EXPLICIT ANY }, mas o
+	// GeneralName choice (`otherName [0] OtherName`) usa tagging IMPLICIT —
+	// o tag [0] SUBSTITUI o tag SEQUENCE do OtherName, não o envolve numa
+	// camada extra. extractOAB() do slice (internal/certificate/pkcs12.go)
+	// espera exatamente isso: {OID}{[0]{value}} sem SEQUENCE aninhada.
+	valueWrapped, err := asn1.Marshal(asn1.RawValue{Tag: 0, Class: asn1.ClassContextSpecific, IsCompound: true, Bytes: valueBytes})
+	if err != nil {
+		return pkix.Extension{}, err
+	}
+	otherNameContent := append(oidBytes, valueWrapped...)
 	// GeneralNames [0] wrapper (OtherName tag)
-	san, err := asn1.Marshal([]asn1.RawValue{{Tag: 0, Class: asn1.ClassContextSpecific, IsCompound: true, Bytes: inner}})
+	san, err := asn1.Marshal([]asn1.RawValue{{Tag: 0, Class: asn1.ClassContextSpecific, IsCompound: true, Bytes: otherNameContent}})
 	if err != nil {
 		return pkix.Extension{}, err
 	}
