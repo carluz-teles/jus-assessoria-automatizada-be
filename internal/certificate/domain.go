@@ -39,8 +39,8 @@ func NewUseCase(repo Repository, uow database.UnitOfWork, c Cipher, outbox publi
 
 // Preview parseia o .pfx com a senha, devolve metadata + checks. NADA é
 // persistido. Erros típicos: senha errada, arquivo corrupto.
-func (uc *UseCase) Preview(_ context.Context, pfx []byte, password string) (*PreviewResult, error) {
-	p, err := parsePFX(pfx, password)
+func (uc *UseCase) Preview(ctx context.Context, pfx []byte, password string) (*PreviewResult, error) {
+	p, err := parsePFX(ctx, pfx, password)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +53,7 @@ func (uc *UseCase) Preview(_ context.Context, pfx []byte, password string) (*Pre
 // Idempotência: mesmo fingerprint duplicado no tenant ativo devolve
 // ErrCertificateAlreadyExists.
 func (uc *UseCase) Upload(ctx context.Context, tenantID, ownerUserID string, pfx []byte, password string) (*Certificate, error) {
-	p, err := parsePFX(pfx, password)
+	p, err := parsePFX(ctx, pfx, password)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +186,7 @@ func (uc *UseCase) openVault(ctx context.Context, cert *Certificate) (*parsedPFX
 	if err != nil {
 		return nil, "", err
 	}
-	p, err := parsePFX(pfx, v.Password)
+	p, err := parsePFX(ctx, pfx, v.Password)
 	return p, v.Password, err
 }
 
