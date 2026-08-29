@@ -1,13 +1,19 @@
 package court
 
 import (
+	"io"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/jusassessoria/platform/lib/apperr"
 	"github.com/jusassessoria/platform/lib/httpx"
+	"github.com/jusassessoria/platform/lib/totp"
 )
+
+// maxQRScreenshotSize bounds the "print" upload — a phone/browser screenshot of a
+// QR code is a few hundred KB at most; 5MB is generous margin, not a real limit.
+const maxQRScreenshotSize = 5 * 1024 * 1024
 
 // Handler exposes the "Conexões com tribunais" screen's two endpoints. Every route
 // resolves tenant/user from the verified principal — never the body.
@@ -25,6 +31,7 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/court-connections", h.create)
 	r.Get("/court-connections", h.list)
 	r.Post("/court-connections/:id/connect", h.connect)
+	r.Post("/court-connections/:id/mfa-seed", h.submitMFASeed)
 }
 
 type createConnectionRequest struct {
@@ -86,6 +93,68 @@ func (h *Handler) connect(c *fiber.Ctx) error {
 	// the FE wants to see the resulting status even when Connect itself failed
 	// (e.g. MFA_ENROLLMENT_REQUIRED is not a 500, it's informative state).
 	return c.Status(fiber.StatusOK).JSON(connectionToView(conn))
+}
+
+// submitMFASeed: POST /v1/court-connections/:id/mfa-seed (multipart) — the
+// human-assisted, ONE-TIME capture UseCase.SubmitMFASeed's doc describes. Accepts
+// EITHER a "qr" file field (a screenshot of the enrollment/reconfiguration QR code)
+// OR a "secret" text field (the manual-entry key Keycloak's "Unable to scan?" toggle
+// shows, when the lawyer can copy it directly instead of a screenshot) — whichever
+// the portal happened to show. Exactly one is required; both together is also fine
+// (the file wins, since a screenshot is unambiguous where a hand-copied string could
+// have a typo).
+func (h *Handler) submitMFASeed(c *fiber.Ctx) error {
+	secret, err := extractMFASecret(c)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	id := c.Params("id")
+	conn, err := h.uc.SubmitMFASeed(c.UserContext(), tenantID, id, secret)
+	if err != nil && conn == nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(connectionToView(conn))
+}
+
+// extractMFASecret resolves the request into a raw TOTP secret ready for
+// totp.GenerateCode — decoding a QR screenshot when "qr" is present, otherwise
+// parsing "secret" as either a bare manual-entry key or a full otpauth:// URI (see
+// totp.ExtractSecret's doc for why both shapes are accepted).
+func extractMFASecret(c *fiber.Ctx) (string, error) {
+	if fileHdr, err := c.FormFile("qr"); err == nil {
+		if fileHdr.Size > maxQRScreenshotSize {
+			return "", apperr.NewInvalid("imagem maior que o limite permitido")
+		}
+		f, err := fileHdr.Open()
+		if err != nil {
+			return "", apperr.NewInvalid("não foi possível abrir a imagem")
+		}
+		defer f.Close()
+		imgBytes, err := io.ReadAll(f)
+		if err != nil {
+			return "", apperr.NewInvalid("erro lendo a imagem")
+		}
+		text, err := totp.DecodeQRImage(imgBytes)
+		if err != nil {
+			return "", apperr.NewInvalid("não foi possível ler o QR code na imagem enviada")
+		}
+		secret, err := totp.ExtractSecret(text)
+		if err != nil {
+			return "", apperr.NewInvalid("o QR code não contém uma chave TOTP reconhecível")
+		}
+		return secret, nil
+	}
+
+	raw := c.FormValue("secret")
+	if raw == "" {
+		return "", apperr.NewInvalid("envie o campo 'qr' (print) ou 'secret' (texto)")
+	}
+	secret, err := totp.ExtractSecret(raw)
+	if err != nil {
+		return "", apperr.NewInvalid("texto enviado não contém uma chave TOTP reconhecível")
+	}
+	return secret, nil
 }
 
 // connectionView is the wire shape — never includes a *_ref (those are internal

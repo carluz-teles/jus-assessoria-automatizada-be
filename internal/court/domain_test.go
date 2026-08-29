@@ -264,3 +264,49 @@ func TestConnect_GenericProviderError_MarksStatusError(t *testing.T) {
 	require.Error(t, err)
 	is.Equal(StatusError, conn.Status)
 }
+
+// --- SubmitMFASeed (human-assisted enrollment) ---------------------------------
+
+func TestSubmitMFASeed_SealsAndConnects(t *testing.T) {
+	is := assert.New(t)
+	repo := newFakeRepo(newConn())
+	outbox := &fakeOutbox{}
+	provider := &fakeProvider{} // Connect succeeds once the seed is presented
+
+	uc := NewUseCase(repo, fakeUOW{}, testVault(t), outbox)
+	uc.RegisterProvider("EPROC", provider)
+
+	conn, err := uc.SubmitMFASeed(context.Background(), "tenant-1", "conn-1", "JBSWY3DPEHPK3PXP")
+
+	require.NoError(t, err)
+	is.Equal(StatusConnected, conn.Status)
+	is.NotEmpty(conn.MFASeedRef, "the submitted seed must be sealed and referenced")
+	is.Len(provider.connectCalls, 1)
+	is.Equal("JBSWY3DPEHPK3PXP", provider.connectCalls[0], "Connect must be called with the just-submitted seed")
+	is.Len(outbox.published, 1)
+}
+
+func TestSubmitMFASeed_ProviderStillRejects_MarksError(t *testing.T) {
+	is := assert.New(t)
+	repo := newFakeRepo(newConn())
+	// The submitted seed doesn't fix things (e.g. the lawyer copied the wrong key).
+	provider := &fakeProvider{connectErrs: []error{errors.New("eproc: certificate accepted, MFA/TOTP challenge required")}}
+
+	uc := NewUseCase(repo, fakeUOW{}, testVault(t), &fakeOutbox{})
+	uc.RegisterProvider("EPROC", provider)
+
+	conn, err := uc.SubmitMFASeed(context.Background(), "tenant-1", "conn-1", "WRONGSEED")
+
+	require.Error(t, err)
+	is.Equal(StatusError, conn.Status)
+	is.NotEmpty(conn.MFASeedRef, "the (wrong) seed is still stored — resubmitting overwrites it, not silently dropped")
+}
+
+func TestSubmitMFASeed_ProviderNotRegistered(t *testing.T) {
+	repo := newFakeRepo(newConn())
+	uc := NewUseCase(repo, fakeUOW{}, testVault(t), &fakeOutbox{})
+
+	_, err := uc.SubmitMFASeed(context.Background(), "tenant-1", "conn-1", "JBSWY3DPEHPK3PXP")
+
+	require.ErrorIs(t, err, ErrProviderNotRegistered)
+}

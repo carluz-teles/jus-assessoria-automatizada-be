@@ -147,6 +147,17 @@ func (uc *UseCase) enrollAndRetry(ctx context.Context, provider CourtProvider, c
 		return err
 	}
 
+	if err := uc.sealAndStoreSeed(ctx, conn, seed); err != nil {
+		return err
+	}
+
+	return provider.Connect(ctx, conn, seed)
+}
+
+// sealAndStoreSeed seals seed into the vault, persists it as a tenant_secret, and
+// points conn.MFASeedRef at it — the common tail of both the (future) automated
+// EnrollMFA path and SubmitMFASeed's human-assisted one.
+func (uc *UseCase) sealAndStoreSeed(ctx context.Context, conn *CourtConnection, seed string) error {
 	sealed, err := uc.vault.Seal(seed)
 	if err != nil {
 		return err
@@ -164,8 +175,44 @@ func (uc *UseCase) enrollAndRetry(ctx context.Context, provider CourtProvider, c
 		return err
 	}
 	conn.MFASeedRef = seedRef
+	return nil
+}
 
-	return provider.Connect(ctx, conn, seed)
+// SubmitMFASeed is the human-assisted enrollment path this fatia landed on after
+// investigation: eproc's own MFA (re)configuration requires the lawyer's
+// username/password, which a certificate-only connection doesn't have (see
+// EprocProvider's doc) — so the lawyer captures their EXISTING/reconfigured TOTP QR
+// ONCE, by hand, in their own browser (their certificate already lives in their OS's
+// store, so THAT login is frictionless for them), and hands the result to this
+// endpoint as either a screenshot or the manual-entry text. From here on, every
+// future login generates its own code automatically (WithTOTPSeed) — no more
+// screenshots, unlike the competitor pattern this was compared against.
+//
+// secret is the ALREADY-EXTRACTED TOTP secret (the handler calls totp.DecodeQRImage +
+// totp.ExtractSecret on whatever the lawyer submitted before reaching this method —
+// domain.go stays free of image-decoding concerns, same layering as everywhere else).
+func (uc *UseCase) SubmitMFASeed(ctx context.Context, tenantID, id, secret string) (*CourtConnection, error) {
+	var conn *CourtConnection
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		c, err := uc.repo.GetByID(ctx, tx, tenantID, id)
+		conn = c
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := uc.sealAndStoreSeed(ctx, conn, secret); err != nil {
+		return nil, err
+	}
+
+	provider, ok := uc.providers[conn.System]
+	if !ok {
+		return nil, ErrProviderNotRegistered
+	}
+
+	connectErr := provider.Connect(ctx, conn, secret)
+	return conn, uc.finalizeConnect(ctx, tenantID, conn, connectErr)
 }
 
 // finalizeConnect persists the outcome of a Connect attempt (success or the mapped

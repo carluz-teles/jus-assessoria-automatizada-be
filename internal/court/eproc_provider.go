@@ -23,12 +23,23 @@ type CertSigner interface {
 	NewSigner(ctx context.Context, tenantID, certificateID string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error)
 }
 
-// EprocProvider implements CourtProvider (and MFAEnroller) for TJSP's eproc, wrapping
-// lib/eproc — the client that CONFIRMED, live against the real portal, that
-// certificate-only login works via Keycloak's native X.509 authenticator (no browser
-// extension, no Desktop Agent). This provider's only job is turning a CourtConnection
-// (vault pointers) into the concrete inputs lib/eproc needs (a client cert, a TOTP
-// seed) and mapping its errors back onto the court state machine.
+// EprocProvider implements CourtProvider for TJSP's eproc, wrapping lib/eproc — the
+// client that CONFIRMED, live against the real portal, that certificate-only login
+// works via Keycloak's native X.509 authenticator (no browser extension, no Desktop
+// Agent). This provider's only job is turning a CourtConnection (vault pointers) into
+// the concrete inputs lib/eproc needs (a client cert, a TOTP seed) and mapping its
+// errors back onto the court state machine.
+//
+// It deliberately does NOT implement MFAEnroller: investigation (2026-08-29) found
+// eproc's own MFA reconfiguration flow requires the lawyer's username/password (a
+// hidden `2fa_configurar` action on the login page's own JS, or an equivalent
+// authenticated self-service page) — a certificate-authenticated session cannot
+// trigger it. Every real-world alternative in this market (including the competitor
+// the client already compared us to) has the SAME limitation and solves it the same
+// way: the lawyer captures their existing/reconfigured QR ONCE, by hand, and the
+// platform takes it from there forever after (see UseCase.SubmitMFASeed). Automating
+// the one-time capture itself remains open for a FUTURE portal/adapter that turns out
+// to support it — MFAEnroller stays in provider.go for exactly that case.
 type EprocProvider struct {
 	certSigner CertSigner
 	proxyURL   *url.URL // optional residential/BR proxy — same anti-bot posture DJEN needed
@@ -76,18 +87,6 @@ func (p *EprocProvider) Connect(ctx context.Context, conn *CourtConnection, seed
 	default:
 		return err
 	}
-}
-
-// EnrollMFA is intentionally NOT implemented yet — this is the next Portão B
-// investigation (finding eproc's real "habilitar autenticação em dois fatores"
-// endpoint and confirming whether it renders a fresh QR/manual-key setup or an
-// existing-credential challenge for an account that already has TOTP configured
-// elsewhere — see the roadmap plan's §4). Returning a typed, clearly-labeled error
-// keeps the rest of the slice (schema, Connect, the automatic-retry orchestration in
-// domain.go, TOTP code generation/submission) shippable and tested independently of
-// this one open unknown.
-func (p *EprocProvider) EnrollMFA(ctx context.Context, conn *CourtConnection) (string, error) {
-	return "", ErrMFAEnrollmentFailed
 }
 
 // buildClient resolves conn's certificate into a *tls.Certificate (leaf + chain,
