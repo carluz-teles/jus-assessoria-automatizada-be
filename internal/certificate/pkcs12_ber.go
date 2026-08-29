@@ -43,8 +43,14 @@ func normalizeBERToDER(ctx context.Context, pfx []byte, password string) ([]byte
 // chain as PEM. pfx travels via stdin ("/dev/stdin" — "-in -" isn't
 // recognized by every openssl pkcs12 code path); password via a dedicated
 // pipe ("-passin fd:3") so it never appears in argv, visible to `ps`.
+// "-legacy" loads OpenSSL 3.x's legacy provider: real-world old .pfx exports
+// that trip the BER path (Windows certutil/certmgr, older tokens/HSMs) very
+// often also encrypt the cert bag with RC2-40-CBC, which OpenSSL 3.0+
+// no longer supports in its default provider — without this flag the hop
+// fails with "unsupported algorithm" and the file is wrongly rejected as
+// invalid even though the password was correct.
 func opensslExtractPEM(ctx context.Context, pfx []byte, password string) ([]byte, error) {
-	out, stderr, err := runOpenSSL(ctx, pfx, password, "pkcs12", "-in", "/dev/stdin", "-nodes", "-passin", "fd:3")
+	out, stderr, err := runOpenSSL(ctx, pfx, password, "pkcs12", "-in", "/dev/stdin", "-nodes", "-passin", "fd:3", "-legacy")
 	if err != nil {
 		return nil, classifyPKCS12Error(errWithStderr{stderr})
 	}
