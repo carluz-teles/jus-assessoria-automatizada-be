@@ -283,6 +283,149 @@ func TestClient_MissingCredentialsIsInvalid(t *testing.T) {
 	}
 }
 
+// certisignRewriteTransport redirects the absolute Certisign URL to the test server, so
+// the client's real certLogin flow runs against the stub without changing production
+// code — mirroring rewriteTransport's role for the SSO login URL above.
+type certisignRewriteTransport struct {
+	base   http.RoundTripper
+	server string
+}
+
+func (t *certisignRewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Host, "certisign.com.br") {
+		u, _ := req.URL.Parse(t.server + "/certisign-login")
+		req = req.Clone(req.Context())
+		req.URL = u
+		req.Host = u.Host
+	}
+	return t.base.RoundTrip(req)
+}
+
+func newCertTestClient(t *testing.T, srv *httptest.Server) *Client {
+	t.Helper()
+	hc := &http.Client{
+		Transport: &certisignRewriteTransport{base: http.DefaultTransport, server: srv.URL},
+	}
+	return NewEprocClient(hc, WithBaseURL(srv.URL), WithCertificateAuth())
+}
+
+// certisignAcceptedStub serves the auto-submitting form Certisign returns when it
+// accepts the certificate presented during the (real) mTLS handshake — the "cb" token
+// certLogin extracts and redeems at the callback path.
+func certisignAcceptedStub(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.WriteString(w, `<html><body onload="document.getElementById('f').submit()">
+<form id="f" method="post" action="https://eproc1g.tjsp.jus.br/eproc/externo_controlador.php?acao=entrar_certificado_certisign">
+<input type="hidden" name="cb" value="opaque-test-token"/>
+</form></body></html>`)
+}
+
+// certisignRejectedStub serves a body with NO "cb" field — what Certisign returns when
+// the certificate is not recognized (no auto-submit form appears at all).
+func certisignRejectedStub(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.WriteString(w, `<html><body>certificado não reconhecido</body></html>`)
+}
+
+// eprocCallbackStub serves the eproc side of certisignCallbackPath with a configurable
+// status/body — the second hop, after Certisign has already vouched for the cert.
+func eprocCallbackStub(status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if status != 0 {
+			w.WriteHeader(status)
+		}
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+// TestClient_CertLogin_Success proves the full two-hop flow: Certisign accepts the
+// certificate (served the "cb" token), certLogin redeems it at eproc's callback, and a
+// 2xx with no challenge/redirect marker establishes the session — no username/password
+// ever leaves the client (there is no SSO endpoint registered in this stub at all).
+func TestClient_CertLogin_Success(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignAcceptedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", eprocCallbackStub(0, "<html>bem-vindo</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login = %v, want nil", err)
+	}
+	if c.Status() != StatusConnected {
+		t.Fatalf("Status = %v, want CONNECTED", c.Status())
+	}
+}
+
+// TestClient_CertLogin_MFARequired proves the expected TOTP step (documented in TJSP's
+// own eproc manuals as mandatory after certificate recognition) surfaces as Forbidden,
+// distinct from a rejected certificate — Certisign still accepted the cert; the
+// challenge appears on the eproc side of the callback.
+func TestClient_CertLogin_MFARequired(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignAcceptedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", eprocCallbackStub(0, `<html>Digite o código de verificação</html>`))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsForbidden(err) {
+		t.Fatalf("Login err = %v, want Forbidden (MFA/TOTP required)", err)
+	}
+}
+
+// TestClient_CertLogin_RejectedByCertisign proves Certisign never issuing a "cb" token
+// (the certificate itself was not recognized/is expired) is Unauthorized — the eproc
+// callback is never even called.
+func TestClient_CertLogin_RejectedByCertisign(t *testing.T) {
+	t.Parallel()
+
+	calledEproc := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignRejectedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		calledEproc = true
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("Login err = %v, want Unauthorized", err)
+	}
+	if calledEproc {
+		t.Error("eproc callback was called despite Certisign never issuing a cb token")
+	}
+}
+
+// TestClient_CertLogin_RejectedByEprocCallback proves a 401 from eproc's callback
+// (Certisign vouched for the cert, but eproc itself rejects the token) is Unauthorized
+// too, distinctly from a Certisign-side rejection.
+func TestClient_CertLogin_RejectedByEprocCallback(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignAcceptedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", eprocCallbackStub(http.StatusUnauthorized, "<html>token inválido</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("Login err = %v, want Unauthorized", err)
+	}
+}
+
 // TestClient_DownloadStreamsToWriter proves the download writes the document bytes to the
 // provided writer (streamed) and reports the byte count.
 func TestClient_DownloadStreamsToWriter(t *testing.T) {

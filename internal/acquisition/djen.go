@@ -170,7 +170,7 @@ func NewDJENConnector(opts ...DJENOption) *DJENConnector {
 	// client was injected (WithDJENHTTPClient, e.g. an httptest client), so tests keep
 	// their transport.
 	if c.httpClient.Transport == nil {
-		c.httpClient.Transport = transport.ChromeTransport(c.proxyURL)
+		c.httpClient.Transport = transport.ChromeTransport(c.proxyURL, nil)
 	}
 	return c
 }

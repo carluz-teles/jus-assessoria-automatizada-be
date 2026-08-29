@@ -3,12 +3,19 @@ package eproc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// errCallbackTokenMissing signals Certisign's response carried no "cb" field — the
+// auto-submit form (and its token) only appears when the certificate was accepted, so
+// this means the certificate was rejected/not recognized, not a transport fault.
+var errCallbackTokenMissing = errors.New("certisign: no callback token in response (certificate not accepted)")
 
 // wiring.go isolates EVERYTHING provisional about the real eproc/Keycloak portal — the
 // paths, the login request shape, the response parsing, and the challenge/success
@@ -25,12 +32,21 @@ const (
 	// itself is a separate host (sso.tjsp.jus.br) handled in ssoLoginRequest.
 	eprocDefaultBaseURL = "https://eproc1g.tjsp.jus.br"
 
-	// ssoLoginURL is the TJSP Keycloak login/token endpoint. ASSUMPTION (Portão B): a
-	// real Keycloak realm exposes a token endpoint at
-	// /realms/<realm>/protocol/openid-connect/token; the realm name and whether the
-	// portal uses ROPC vs the browser auth-code flow must be confirmed. Kept as one
-	// constant so it is a one-line fix.
-	ssoLoginURL = "https://sso.tjsp.jus.br/realms/tjsp/protocol/openid-connect/token"
+	// ssoLoginURL is the TJSP Keycloak login/token endpoint.
+	//
+	// CONFIRMED (Portão B, 2026-08-29, live probe against eproc1g.tjsp.jus.br/eproc/
+	// with a real certificate): GETting the portal root redirects to
+	// https://sso.tjsp.jus.br/realms/eproc/protocol/openid-connect/auth?response_type=code&...
+	// — a real Keycloak, but realm "eproc" (not "tjsp" as originally guessed) and a
+	// full browser AUTHORIZATION-CODE flow, NOT Resource-Owner-Password-Credentials.
+	// The rendered login page's password form POSTs to
+	// .../realms/eproc/login-actions/authenticate?session_code=...&execution=...
+	// (both harvested from the page — ssoLoginRequest below is therefore STILL WRONG
+	// for password mode; a ROPC POST to this constant will not work against the real
+	// portal). Left uncorrected pending a password-mode Portão B pass; certificate
+	// mode does not use this endpoint at all (see certLoginPath's doc — cert login is
+	// brokered through Certisign, a separate discovery from the same probe).
+	ssoLoginURL = "https://sso.tjsp.jus.br/realms/eproc/protocol/openid-connect/token"
 
 	// browserUserAgent presents a current browser (the portal, like DJEN, edge-filters
 	// bot-looking clients). It complements the Chrome uTLS transport the caller injects.
@@ -39,6 +55,27 @@ const (
 	// challengePrefixBytes bounds how much of a login body we sniff for a captcha/MFA
 	// marker — enough to catch a challenge page header without buffering a whole page.
 	challengePrefixBytes = 8 << 10 // 8 KiB
+
+	// certisignLoginURL is where certLogin actually presents the certificate —
+	// NOT eproc1g.tjsp.jus.br or sso.tjsp.jus.br. CONFIRMED (Portão B, 2026-08-29,
+	// live probe, real certificate + real CNJ): the Keycloak login page rendered by
+	// eprocDefaultBaseURL+"/eproc/" links "Certificado Digital" to this THIRD PARTY
+	// (Certisign, a real ICP-Brasil CA). id/nome identify eproc1g's registration
+	// with Certisign — static, not per-session. GETting this URL with the client
+	// cert configured on the transport (plain mutual TLS, no browser extension
+	// involved: the extension's only job for a human is exposing the OS certificate
+	// store to the TLS stack, which this package already bypasses by presenting the
+	// cert directly) makes Certisign read the cert off the mTLS handshake and answer
+	// with an auto-submitting HTML form — see certisignCallbackPath's doc for what
+	// happens to it.
+	certisignLoginURL = "https://autenticador.certisign.com.br/CertisignLogin/certificado/login" +
+		"?id=28424&nome=eproc1g_prod" +
+		"&retorno=" + eprocDefaultBaseURL + certisignCallbackPath
+
+	// certisignCallbackPath is where the auto-submitting form from certisignLoginURL
+	// posts its "cb" token — CONFIRMED (same probe) to establish a real eproc session
+	// (a PHPSESSID cookie, landing on externo_controlador.php?acao=principal).
+	certisignCallbackPath = "/eproc/externo_controlador.php?acao=entrar_certificado_certisign"
 )
 
 // eprocProcessPath/eventsPath/documentPath: ASSUMPTION (Portão B). Placeholder JSON
@@ -80,6 +117,51 @@ func ssoLoginRequest(ctx context.Context, creds Credentials) (*http.Request, err
 		ctx,
 		http.MethodPost,
 		ssoLoginURL,
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
+}
+
+// cbFieldRe extracts the hidden "cb" field Certisign's auto-submitting form carries —
+// CONFIRMED (Portão B): `<form ...><input type="hidden" id="cb" name="cb" value="...">`.
+// A plain regex (not an HTML parser) is enough and matches the rest of this file's
+// "don't invest in elaborate HTML scraping" philosophy — the field is a single opaque
+// token, not a structure worth a DOM walk.
+var cbFieldRe = regexp.MustCompile(`name="cb"\s+value="([^"]*)"`)
+
+// certisignLoginRequest builds the GET that presents the client certificate to
+// Certisign (mutual TLS, via the caller's transport — see certisignLoginURL's doc).
+func certisignLoginRequest(ctx context.Context) (*http.Request, error) {
+	return http.NewRequestWithContext(ctx, http.MethodGet, certisignLoginURL, nil)
+}
+
+// extractCallbackToken pulls the "cb" token out of Certisign's response body.
+// ErrCallbackTokenMissing means Certisign did NOT recognize/accept the certificate —
+// its auto-submit form (and therefore the token) only appears on success.
+func extractCallbackToken(body []byte) (string, error) {
+	m := cbFieldRe.FindSubmatch(body)
+	if m == nil {
+		return "", errCallbackTokenMissing
+	}
+	return string(m[1]), nil
+}
+
+// certisignCallbackRequest builds the POST that redeems the cb token for an eproc
+// session — CONFIRMED (Portão B) to be a form POST (mirroring the browser's
+// auto-submitted <form method="post">) to certisignCallbackPath. baseURL is the
+// client's configured portal root (WithBaseURL), NOT the certisignLoginURL constant's
+// hardcoded "retorno" param — that param is a fixed value Certisign was registered
+// with in production and stays real even when a test points baseURL elsewhere.
+func certisignCallbackRequest(ctx context.Context, baseURL, cb string) (*http.Request, error) {
+	form := url.Values{"cb": {cb}}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		baseURL+certisignCallbackPath,
 		strings.NewReader(form.Encode()),
 	)
 	if err != nil {

@@ -38,6 +38,22 @@ type Credentials struct {
 	Password string
 }
 
+// authMode selects which login mechanism the client uses. Certificate mode exists
+// because eproc's "Certificado Digital" option is genuinely a different mechanism from
+// password login (confirmed against TJSP's own manuals): the browser's native
+// certificate picker appearing is the signature of the server REQUESTING a client
+// certificate during the TLS handshake (mutual TLS), not an in-page challenge/response
+// like Lacuna Web PKI. The private key never enters this package — the caller's
+// *http.Client is already mTLS-authenticated (via transport.ChromeTransport's
+// clientCert param) before any request here is sent; certLogin only confirms the
+// handshake actually established a session and surfaces the (expected) TOTP MFA step.
+type authMode int
+
+const (
+	authModePassword    authMode = iota // default: username/password ROPC-style POST
+	authModeCertificate                 // mutual TLS already negotiated by the transport
+)
+
 // Process is the minimal court-case shape D0 dumps: enough to prove the read reached a
 // real process. Parsing is provisional (see wiring.go).
 type Process struct {
@@ -97,6 +113,8 @@ type Client struct {
 	mu       sync.Mutex
 	status   SessionStatus
 	authOnce *authGroup
+
+	mode authMode
 }
 
 // Option tunes a Client at construction (functional options, per the repo convention).
@@ -116,6 +134,18 @@ func WithBaseURL(baseURL string) Option {
 func WithCredentials(creds Credentials) Option {
 	return func(c *Client) {
 		c.creds = creds
+	}
+}
+
+// WithCertificateAuth switches the client to certificate-login mode: Login/re-auth
+// skip the username/password POST and instead confirm the session the caller's
+// mTLS-configured *http.Client should already have established (see authMode's doc).
+// The caller is responsible for injecting the client certificate into the transport
+// (transport.ChromeTransport's clientCert param) — this package never touches key
+// material.
+func WithCertificateAuth() Option {
+	return func(c *Client) {
+		c.mode = authModeCertificate
 	}
 }
 
