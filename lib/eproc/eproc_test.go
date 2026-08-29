@@ -3,6 +3,7 @@ package eproc
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -283,6 +284,193 @@ func TestClient_MissingCredentialsIsInvalid(t *testing.T) {
 	}
 }
 
+// certificadoSSORewriteTransport redirects any request targeting certificadoSSOHost to
+// a fixed path on the test server, regardless of the incoming query string — mirroring
+// what the real "Certificado Digital" button's host-swap does, but the stub doesn't need
+// to echo back the Keycloak nonce/state/session_code it would carry in production.
+type certificadoSSORewriteTransport struct {
+	base   http.RoundTripper
+	server string
+}
+
+func (t *certificadoSSORewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == certificadoSSOHost {
+		u, _ := req.URL.Parse(t.server + "/certificado-sso-confirm")
+		req = req.Clone(req.Context())
+		req.URL = u
+		req.Host = u.Host
+	}
+	return t.base.RoundTrip(req)
+}
+
+func newRealCertTestClient(t *testing.T, srv *httptest.Server) *Client {
+	t.Helper()
+	hc := &http.Client{
+		Transport: &certificadoSSORewriteTransport{base: http.DefaultTransport, server: srv.URL},
+	}
+	return NewEprocClient(hc, WithBaseURL(srv.URL), WithCertificateAuth())
+}
+
+// x509AcceptedStub serves Keycloak's own hidden "kc-x509-login-info" confirm form —
+// what its built-in X.509 authenticator renders after reading an accepted certificate
+// off the (real, in production) mTLS handshake. The action must be absolute (Keycloak's
+// own form actions always are — see extractX509ConfirmAction's doc), so it's a
+// parameter rather than a hardcoded relative path.
+func x509AcceptedStub(confirmURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<html><body onload="document.getElementById('kc-x509-login-info').submit()">
+<form id="kc-x509-login-info" method="post" action="%s">
+<input type="submit" name="login" value="Continuar"/>
+</form></body></html>`, confirmURL)
+	}
+}
+
+// x509RejectedStub serves a body with NO "kc-x509-login-info" form — what Keycloak
+// renders when its X.509 authenticator does not recognize/accept the certificate.
+func x509RejectedStub(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.WriteString(w, `<html><body>certificado não reconhecido</body></html>`)
+}
+
+// x509ConfirmStub serves the eproc/Keycloak side of the confirm POST with a
+// configurable status/body — the final hop after Keycloak's X.509 authenticator has
+// already vouched for the certificate.
+func x509ConfirmStub(status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if status != 0 {
+			w.WriteHeader(status)
+		}
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+// TestClient_CertLogin_Success proves the real (primary) flow end to end: the SSO
+// bounce lands on a Keycloak URL, re-issuing it against certificadoSSOHost (the client
+// certificate presented during that TLS handshake, in production) gets the
+// "kc-x509-login-info" confirm form, and posting it lands on a 2xx with no
+// challenge/redirect marker — CONNECTED. No username/password ever leaves the client.
+func TestClient_CertLogin_Success(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page (unswapped host, not used further)</html>")
+	})
+	var confirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", x509ConfirmStub(0, "<html>bem-vindo</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+
+	c := newRealCertTestClient(t, srv)
+
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login = %v, want nil", err)
+	}
+	if c.Status() != StatusConnected {
+		t.Fatalf("Status = %v, want CONNECTED", c.Status())
+	}
+}
+
+// TestClient_CertLogin_MFARequired proves the expected TOTP step (documented in TJSP's
+// own eproc manuals as mandatory after certificate recognition, and confirmed live as a
+// "kc-otp-login-form") surfaces as Forbidden, distinct from a rejected certificate —
+// Keycloak's X.509 authenticator already vouched for the cert; the challenge appears in
+// the confirm response.
+func TestClient_CertLogin_MFARequired(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", x509ConfirmStub(0, `<html>kc-otp-login-form: Digite o código de verificação</html>`))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+
+	c := newRealCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsForbidden(err) {
+		t.Fatalf("Login err = %v, want Forbidden (MFA/TOTP required)", err)
+	}
+}
+
+// TestClient_CertLogin_RejectedByKeycloak proves Keycloak's X.509 authenticator never
+// rendering the confirm form (the certificate itself was not recognized/is expired) is
+// Unauthorized — the confirm POST is never even sent.
+func TestClient_CertLogin_RejectedByKeycloak(t *testing.T) {
+	t.Parallel()
+
+	calledConfirm := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	mux.HandleFunc("/certificado-sso-confirm", x509RejectedStub)
+	mux.HandleFunc("/x509-confirm", func(w http.ResponseWriter, r *http.Request) {
+		calledConfirm = true
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newRealCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("Login err = %v, want Unauthorized", err)
+	}
+	if calledConfirm {
+		t.Error("confirm POST was sent despite Keycloak never rendering the X.509 confirm form")
+	}
+}
+
+// TestClient_CertLogin_RejectedByConfirm proves a 401 from the confirm POST (Keycloak's
+// X.509 authenticator vouched for the cert, but the confirm step itself is rejected) is
+// Unauthorized too, distinctly from a Keycloak-side rejection.
+func TestClient_CertLogin_RejectedByConfirm(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", x509ConfirmStub(http.StatusUnauthorized, "<html>token inválido</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+
+	c := newRealCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("Login err = %v, want Unauthorized", err)
+	}
+}
+
 // certisignRewriteTransport redirects the absolute Certisign URL to the test server, so
 // the client's real certLogin flow runs against the stub without changing production
 // code — mirroring rewriteTransport's role for the SSO login URL above.
@@ -336,11 +524,13 @@ func eprocCallbackStub(status int, body string) http.HandlerFunc {
 	}
 }
 
-// TestClient_CertLogin_Success proves the full two-hop flow: Certisign accepts the
-// certificate (served the "cb" token), certLogin redeems it at eproc's callback, and a
-// 2xx with no challenge/redirect marker establishes the session — no username/password
-// ever leaves the client (there is no SSO endpoint registered in this stub at all).
-func TestClient_CertLogin_Success(t *testing.T) {
+// TestClient_CertLoginCertisignFallback_Success proves the fallback's full two-hop flow:
+// Certisign accepts the certificate (served the "cb" token), the fallback redeems it at
+// eproc's callback, and a 2xx with no challenge/redirect marker establishes the (legacy)
+// session — no username/password ever leaves the client (there is no SSO endpoint
+// registered in this stub at all). certLoginCertisignFallback is called directly since
+// c.Login() now uses the primary certLogin (certificadoSSOHost), not this fallback.
+func TestClient_CertLoginCertisignFallback_Success(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
@@ -351,19 +541,18 @@ func TestClient_CertLogin_Success(t *testing.T) {
 
 	c := newCertTestClient(t, srv)
 
-	if err := c.Login(context.Background()); err != nil {
-		t.Fatalf("Login = %v, want nil", err)
+	if err := c.certLoginCertisignFallback(context.Background()); err != nil {
+		t.Fatalf("certLoginCertisignFallback = %v, want nil", err)
 	}
 	if c.Status() != StatusConnected {
 		t.Fatalf("Status = %v, want CONNECTED", c.Status())
 	}
 }
 
-// TestClient_CertLogin_MFARequired proves the expected TOTP step (documented in TJSP's
-// own eproc manuals as mandatory after certificate recognition) surfaces as Forbidden,
-// distinct from a rejected certificate — Certisign still accepted the cert; the
-// challenge appears on the eproc side of the callback.
-func TestClient_CertLogin_MFARequired(t *testing.T) {
+// TestClient_CertLoginCertisignFallback_MFARequired proves the expected TOTP step
+// surfaces as Forbidden, distinct from a rejected certificate — Certisign still accepted
+// the cert; the challenge appears on the eproc side of the callback.
+func TestClient_CertLoginCertisignFallback_MFARequired(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
@@ -374,16 +563,16 @@ func TestClient_CertLogin_MFARequired(t *testing.T) {
 
 	c := newCertTestClient(t, srv)
 
-	err := c.Login(context.Background())
+	err := c.certLoginCertisignFallback(context.Background())
 	if !IsForbidden(err) {
-		t.Fatalf("Login err = %v, want Forbidden (MFA/TOTP required)", err)
+		t.Fatalf("certLoginCertisignFallback err = %v, want Forbidden (MFA/TOTP required)", err)
 	}
 }
 
-// TestClient_CertLogin_RejectedByCertisign proves Certisign never issuing a "cb" token
-// (the certificate itself was not recognized/is expired) is Unauthorized — the eproc
-// callback is never even called.
-func TestClient_CertLogin_RejectedByCertisign(t *testing.T) {
+// TestClient_CertLoginCertisignFallback_RejectedByCertisign proves Certisign never
+// issuing a "cb" token (the certificate itself was not recognized/is expired) is
+// Unauthorized — the eproc callback is never even called.
+func TestClient_CertLoginCertisignFallback_RejectedByCertisign(t *testing.T) {
 	t.Parallel()
 
 	calledEproc := false
@@ -397,19 +586,19 @@ func TestClient_CertLogin_RejectedByCertisign(t *testing.T) {
 
 	c := newCertTestClient(t, srv)
 
-	err := c.Login(context.Background())
+	err := c.certLoginCertisignFallback(context.Background())
 	if !IsUnauthorized(err) {
-		t.Fatalf("Login err = %v, want Unauthorized", err)
+		t.Fatalf("certLoginCertisignFallback err = %v, want Unauthorized", err)
 	}
 	if calledEproc {
 		t.Error("eproc callback was called despite Certisign never issuing a cb token")
 	}
 }
 
-// TestClient_CertLogin_RejectedByEprocCallback proves a 401 from eproc's callback
-// (Certisign vouched for the cert, but eproc itself rejects the token) is Unauthorized
-// too, distinctly from a Certisign-side rejection.
-func TestClient_CertLogin_RejectedByEprocCallback(t *testing.T) {
+// TestClient_CertLoginCertisignFallback_RejectedByEprocCallback proves a 401 from
+// eproc's callback (Certisign vouched for the cert, but eproc itself rejects the token)
+// is Unauthorized too, distinctly from a Certisign-side rejection.
+func TestClient_CertLoginCertisignFallback_RejectedByEprocCallback(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
@@ -420,9 +609,9 @@ func TestClient_CertLogin_RejectedByEprocCallback(t *testing.T) {
 
 	c := newCertTestClient(t, srv)
 
-	err := c.Login(context.Background())
+	err := c.certLoginCertisignFallback(context.Background())
 	if !IsUnauthorized(err) {
-		t.Fatalf("Login err = %v, want Unauthorized", err)
+		t.Fatalf("certLoginCertisignFallback err = %v, want Unauthorized", err)
 	}
 }
 

@@ -123,22 +123,104 @@ func (c *Client) passwordLogin(ctx context.Context) error {
 	}
 }
 
-// certLogin performs the real two-hop certificate login CONFIRMED against the live
-// portal (Portão B, 2026-08-29, real certificate + real CNJ):
+// certLogin performs the real certificate login CONFIRMED end-to-end against the live
+// portal (Portão B, 2026-08-29, real certificate + real CNJ, verified up to the point
+// this package can go without a TOTP seed — see WithCertificateAuth's doc):
 //
-//  1. GET certisignLoginURL. The client certificate is presented during the TLS
-//     handshake itself (never by this function — see authMode's doc); Certisign reads
-//     it off the mTLS session and, on acceptance, answers with an auto-submitting HTML
-//     form carrying a "cb" token. No token in the body means the certificate was
-//     rejected (errCallbackTokenMissing) — surfaced as Unauthorized, not Unavailable.
-//  2. POST that token to certisignCallbackPath — the same request the form's onload
-//     JS would auto-submit in a real browser. On success this lands the client on
-//     eproc's authenticated home (acao=principal) with a real session cookie.
+//  1. GET ssoLoginBouncePath and let the client follow eproc's redirect to Keycloak's
+//     auth URL (kc_idp_hint, nonce, state, redirect_uri) — exactly what eproc's own
+//     front-end JS does when a route needs a Keycloak session.
+//  2. Re-issue that SAME URL against certificadoSSOHost (certificadoSSORequest) — the
+//     client certificate is presented during THIS request's TLS handshake (never by
+//     this function — see authMode's doc). Keycloak's built-in X.509 authenticator
+//     reads it and, on success, renders a hidden "kc-x509-login-info" confirm form.
+//     No form found means the certificate was rejected (errX509NotAccepted) —
+//     Unauthorized, not Unavailable.
+//  3. POST that form (x509ConfirmRequest) — what the page's own auto-submit JS does.
 //
 // A captcha/MFA marker in the final response is the TOTP step TJSP's own manuals
-// document as mandatory after certificate recognition — surfaced as Forbidden
-// (certificate accepted, second factor needed) rather than a login failure.
+// document as mandatory after certificate recognition (confirmed live: Keycloak's next
+// step here is literally a "kc-otp-login-form") — surfaced as Forbidden (certificate
+// accepted, second factor needed), not a login failure. Completing that TOTP step
+// needs the seed captured at onboarding (ERD §11 item 3) — out of scope for this
+// package until court_connection exists.
 func (c *Client) certLogin(ctx context.Context) error {
+	bounce, err := ssoLoginBounceRequest(ctx, c.baseURL)
+	if err != nil {
+		return apperr.NewInfra("eproc: build SSO bounce request", err)
+	}
+	applyBrowserHeaders(bounce)
+
+	bounceResp, err := c.hc.Do(bounce)
+	if err != nil {
+		return apperr.NewUnavailable("eproc: SSO bounce request failed", err)
+	}
+	keycloakURL := bounceResp.Request.URL
+	io.Copy(io.Discard, bounceResp.Body) //nolint:errcheck
+	bounceResp.Body.Close()
+
+	step1, err := certificadoSSORequest(ctx, keycloakURL)
+	if err != nil {
+		return apperr.NewInfra("eproc: build certificado-sso request", err)
+	}
+	applyBrowserHeaders(step1)
+
+	resp1, err := c.hc.Do(step1)
+	if err != nil {
+		return apperr.NewUnavailable("eproc: certificado-sso request failed", err)
+	}
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if err != nil {
+		return apperr.NewUnavailable("eproc: read certificado-sso response", err)
+	}
+
+	action, err := extractX509ConfirmAction(body1)
+	if err != nil {
+		return apperr.NewUnauthorized("eproc: certificate rejected by Keycloak's X.509 authenticator (not recognized or expired)")
+	}
+
+	step2, err := x509ConfirmRequest(ctx, action)
+	if err != nil {
+		return apperr.NewInfra("eproc: build X.509 confirm request", err)
+	}
+	applyBrowserHeaders(step2)
+
+	resp2, err := c.hc.Do(step2)
+	if err != nil {
+		return apperr.NewUnavailable("eproc: X.509 confirm failed", err)
+	}
+	defer resp2.Body.Close()
+
+	prefix := readBoundedPrefix(resp2.Body)
+
+	if looksLikeChallenge(prefix) {
+		return apperr.NewForbidden("eproc: certificate accepted, MFA/TOTP challenge required")
+	}
+
+	switch {
+	case resp2.StatusCode == http.StatusUnauthorized || resp2.StatusCode == http.StatusForbidden:
+		return apperr.NewUnauthorized("eproc: X.509 confirm rejected by eproc")
+	case resp2.StatusCode >= 500:
+		return apperr.NewUnavailable("eproc: portal unavailable", statusError(resp2.StatusCode))
+	case resp2.StatusCode >= 200 && resp2.StatusCode < 400:
+		if isLoginRedirect(resp2.Header.Get("Location")) || !loginSucceeded(resp2, prefix) {
+			return apperr.NewUnauthorized("eproc: X.509 confirm did not establish a session (redirected back to login)")
+		}
+		c.markConnected()
+		return nil
+	default:
+		return apperr.NewUnavailable("eproc: unexpected portal status", statusError(resp2.StatusCode))
+	}
+}
+
+// certLoginCertisignFallback is the "Acesso alternativo com certificado digital"
+// fallback path (see certisignLoginURL's doc) — NOT called by certLogin today (it only
+// grants a legacy PHPSESSID-based session, not the full Keycloak-integrated one), kept
+// so it's a small change to wire in if the primary certificadoSSOHost vhost is ever
+// unavailable. Same two-hop shape: GET certisignLoginURL (cert presented via mTLS),
+// extract the "cb" token, POST it to certisignCallbackPath.
+func (c *Client) certLoginCertisignFallback(ctx context.Context) error {
 	step1, err := certisignLoginRequest(ctx)
 	if err != nil {
 		return apperr.NewInfra("eproc: build certisign request", err)

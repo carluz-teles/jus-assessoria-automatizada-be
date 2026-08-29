@@ -17,6 +17,11 @@ import (
 // this means the certificate was rejected/not recognized, not a transport fault.
 var errCallbackTokenMissing = errors.New("certisign: no callback token in response (certificate not accepted)")
 
+// errX509NotAccepted signals certificadoSSORequest's response carried no
+// "kc-x509-login-info" confirm form — Keycloak's X.509 authenticator only renders it
+// after successfully reading a recognized certificate off the mTLS handshake.
+var errX509NotAccepted = errors.New("eproc: certificate not accepted by Keycloak's X.509 authenticator")
+
 // wiring.go isolates EVERYTHING provisional about the real eproc/Keycloak portal — the
 // paths, the login request shape, the response parsing, and the challenge/success
 // sniffing. It is the single place Portão B has to touch. Nothing here is verified
@@ -56,25 +61,54 @@ const (
 	// marker — enough to catch a challenge page header without buffering a whole page.
 	challengePrefixBytes = 8 << 10 // 8 KiB
 
-	// certisignLoginURL is where certLogin actually presents the certificate —
-	// NOT eproc1g.tjsp.jus.br or sso.tjsp.jus.br. CONFIRMED (Portão B, 2026-08-29,
-	// live probe, real certificate + real CNJ): the Keycloak login page rendered by
-	// eprocDefaultBaseURL+"/eproc/" links "Certificado Digital" to this THIRD PARTY
-	// (Certisign, a real ICP-Brasil CA). id/nome identify eproc1g's registration
-	// with Certisign — static, not per-session. GETting this URL with the client
-	// cert configured on the transport (plain mutual TLS, no browser extension
-	// involved: the extension's only job for a human is exposing the OS certificate
-	// store to the TLS stack, which this package already bypasses by presenting the
-	// cert directly) makes Certisign read the cert off the mTLS handshake and answer
-	// with an auto-submitting HTML form — see certisignCallbackPath's doc for what
-	// happens to it.
+	// ssoLoginBouncePath is what certLogin GETs first — CONFIRMED (Portão B,
+	// 2026-08-29, real certificate + real CNJ, chromedp network capture) to be
+	// exactly what eproc's OWN front-end JS requests when a route needs a Keycloak
+	// session it doesn't have: it 302s to the Keycloak auth URL
+	// (sso.tjsp.jus.br/realms/eproc/protocol/openid-connect/auth?kc_idp_hint=tjsp&
+	// response_type=code&redirect_uri=.../SSO/callback&...&nonce=...&state=...),
+	// which the client (following redirects normally) lands on.
+	ssoLoginBouncePath = "/eproc/externo_controlador.php?acao=SSO/login&num_processo_bi=&lista_processos=&acao_origem=processo_selecionar"
+
+	// certificadoSSOHost is the SEPARATE Keycloak vhost that actually gates on the
+	// client certificate — CONFIRMED (Portão B): the login page's "Certificado
+	// Digital" BUTTON (id="kc-login-certificate") runs
+	// `document.location.host = 'certificado-sso.tjsp.jus.br'`, i.e. it re-issues
+	// the CURRENT Keycloak auth URL (same path+query: kc_idp_hint, nonce, state,
+	// redirect_uri — everything) against this different host. THAT host is where
+	// the TLS layer actually requests/reads the client certificate (Keycloak's
+	// built-in X.509 authenticator — confirmed by the "kc-x509-login-info" form
+	// name in the response), landing on the OTP step next (every eproc login
+	// requires TOTP per TJSP's manuals — ERD §11 item 3 already designed for this).
+	//
+	// This is DISTINCT from and MORE CORRECT than certisignLoginURL below: that one
+	// is labeled on the real page itself "Acesso alternativo com certificado
+	// digital" / "Utilize essa opção em caso de problema de acesso com o
+	// certificado digital" — a documented FALLBACK that only grants the legacy
+	// PHPSESSID-based session (acao=principal renders, but acao=processo_selecionar
+	// still bounces to a fresh Keycloak login — verified live). The primary,
+	// Keycloak-integrated path is this constant.
+	certificadoSSOHost = "certificado-sso.tjsp.jus.br"
+
+	// certisignLoginURL is the FALLBACK "Acesso alternativo com certificado
+	// digital" link (see certificadoSSOHost's doc for why it is not the primary
+	// path) — kept here, unused by certLogin today, in case the primary Keycloak
+	// vhost is ever down and this documented fallback is worth wiring in too.
+	// CONFIRMED (Portão B, 2026-08-29): GETting this with the client cert
+	// configured on the transport (plain mutual TLS — no browser extension
+	// involved; the extension's only job for a human is exposing the OS
+	// certificate store to the TLS stack, which this package bypasses by
+	// presenting the cert directly) makes Certisign read the cert off the mTLS
+	// handshake and answer with an auto-submitting HTML form carrying a "cb"
+	// token — see certisignCallbackPath's doc for what happens to it.
 	certisignLoginURL = "https://autenticador.certisign.com.br/CertisignLogin/certificado/login" +
 		"?id=28424&nome=eproc1g_prod" +
 		"&retorno=" + eprocDefaultBaseURL + certisignCallbackPath
 
 	// certisignCallbackPath is where the auto-submitting form from certisignLoginURL
-	// posts its "cb" token — CONFIRMED (same probe) to establish a real eproc session
-	// (a PHPSESSID cookie, landing on externo_controlador.php?acao=principal).
+	// posts its "cb" token — CONFIRMED (same probe) to establish the legacy eproc
+	// session (a PHPSESSID cookie, landing on externo_controlador.php?acao=principal
+	// only — see certificadoSSOHost's doc for why that is not enough on its own).
 	certisignCallbackPath = "/eproc/externo_controlador.php?acao=entrar_certificado_certisign"
 )
 
@@ -119,6 +153,60 @@ func ssoLoginRequest(ctx context.Context, creds Credentials) (*http.Request, err
 		ssoLoginURL,
 		strings.NewReader(form.Encode()),
 	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
+}
+
+// ssoLoginBounceRequest builds the GET that starts the real certificate flow — see
+// ssoLoginBouncePath's doc. The client's normal redirect-following lands this on the
+// Keycloak auth URL for certificadoSSORequest to re-target at the cert-gated vhost.
+func ssoLoginBounceRequest(ctx context.Context, baseURL string) (*http.Request, error) {
+	return http.NewRequestWithContext(ctx, http.MethodGet, baseURL+ssoLoginBouncePath, nil)
+}
+
+// certificadoSSORequest re-issues the CURRENT Keycloak auth URL (kc_idp_hint, nonce,
+// state, redirect_uri — everything the SSO bounce produced) against certificadoSSOHost
+// instead of sso.tjsp.jus.br — exactly what the real "Certificado Digital" button's
+// `document.location.host = 'certificado-sso.tjsp.jus.br'` does. The client certificate
+// is presented during THIS request's TLS handshake (via the caller's transport).
+func certificadoSSORequest(ctx context.Context, keycloakURL *url.URL) (*http.Request, error) {
+	certURL := *keycloakURL
+	certURL.Host = certificadoSSOHost
+	return http.NewRequestWithContext(ctx, http.MethodGet, certURL.String(), nil)
+}
+
+// x509ConfirmFormActionRe extracts Keycloak's own "kc-x509-login-info" form action —
+// CONFIRMED (Portão B): a hidden, auto-submitting confirmation Keycloak's built-in X.509
+// authenticator renders after successfully reading the certificate off the mTLS
+// handshake on certificadoSSOHost. Its action posts back to the ORIGINAL sso.tjsp.jus.br
+// host (not certificadoSSOHost) to continue the OIDC flow. No token/HTML-parsing needed
+// beyond this one attribute — the form has exactly one field (a submit button).
+var x509ConfirmFormActionRe = regexp.MustCompile(`<form id="kc-x509-login-info"[^>]*action="([^"]*)"`)
+
+// extractX509ConfirmAction pulls the confirm form's action URL out of
+// certificadoSSORequest's response body, unescaping the "&amp;" HTML entities Keycloak's
+// template emits in the (otherwise plain) query string. No match means Keycloak's X.509
+// authenticator did NOT recognize the certificate — errX509NotAccepted, not a transport
+// fault.
+func extractX509ConfirmAction(body []byte) (string, error) {
+	m := x509ConfirmFormActionRe.FindSubmatch(body)
+	if m == nil {
+		return "", errX509NotAccepted
+	}
+	return strings.ReplaceAll(string(m[1]), "&amp;", "&"), nil
+}
+
+// x509ConfirmRequest builds the POST that submits Keycloak's auto-submitting
+// confirmation form — CONFIRMED (Portão B): a single "login=Continuar" field (the
+// form's only input, a submit button), matching what the page's own inline JS
+// (`document.getElementById("kc-x509-login-info").submit()`) does automatically in a
+// real browser.
+func x509ConfirmRequest(ctx context.Context, action string) (*http.Request, error) {
+	form := url.Values{"login": {"Continuar"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, action, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
