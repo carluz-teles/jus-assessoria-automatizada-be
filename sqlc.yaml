@@ -177,6 +177,24 @@ sql:
               import: "github.com/google/uuid"
               type: "UUID"
 
+  # ── court (execução judicial): court_connection + tenant_secret (MFA seed) ──
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/court/queries"
+    gen:
+      go:
+        package: "courtdb"
+        out: "internal/court/courtdb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
   # ── onboarding (widget de ativação pós-signup): onboarding_widget_dismissal ─
   - engine: "postgresql"
     schema: "migrations"

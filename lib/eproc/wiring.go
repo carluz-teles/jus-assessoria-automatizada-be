@@ -214,6 +214,44 @@ func x509ConfirmRequest(ctx context.Context, action string) (*http.Request, erro
 	return req, nil
 }
 
+// errOTPFormMissing signals a challenge was detected (looksLikeChallenge matched) but
+// no "kc-otp-login-form" was found to extract an action from — the page shape isn't
+// what we expect, so submitOTP refuses to guess rather than POST somewhere wrong.
+var errOTPFormMissing = errors.New("eproc: no OTP confirm form found in challenge response")
+
+// otpConfirmFormActionRe extracts Keycloak's own "kc-otp-login-form" action —
+// ASSUMPTION (Portão B): the form ID is Keycloak's own default theme naming (same
+// family as the CONFIRMED "kc-x509-login-info"), so the shape is very likely right, but
+// this specific form has never been submitted against the real portal yet. The next
+// thing to confirm once TOTP enrollment (internal/court) has produced a real seed.
+var otpConfirmFormActionRe = regexp.MustCompile(`<form id="kc-otp-login-form"[^>]*action="([^"]*)"`)
+
+// extractOTPConfirmAction pulls the OTP form's action out of a challenge response body.
+func extractOTPConfirmAction(body []byte) (string, error) {
+	m := otpConfirmFormActionRe.FindSubmatch(body)
+	if m == nil {
+		return "", errOTPFormMissing
+	}
+	return strings.ReplaceAll(string(m[1]), "&amp;", "&"), nil
+}
+
+// otpConfirmRequest builds the POST that submits the generated code.
+//
+// ASSUMPTION (Portão B): the field name is Keycloak's own default OTP login template
+// convention (`otp`), and the submit button mirrors kc-x509-login-info's
+// ("login=Continuar" family). Isolated here so correcting the field name — the one
+// real unknown left in this whole flow — is a one-line fix, same philosophy as every
+// other wiring.go function.
+func otpConfirmRequest(ctx context.Context, action, code string) (*http.Request, error) {
+	form := url.Values{"otp": {code}, "login": {"Continuar"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, action, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
+}
+
 // cbFieldRe extracts the hidden "cb" field Certisign's auto-submitting form carries —
 // CONFIRMED (Portão B): `<form ...><input type="hidden" id="cb" name="cb" value="...">`.
 // A plain regex (not an HTML parser) is enough and matches the rest of this file's

@@ -76,7 +76,7 @@ func TestEmbeddedSource(t *testing.T) {
 	// seed); the DJEN connector adds 14 (intimation DJEN fields + court_record
 	// judging_body); the DATAJUD enrichment adds 15 (court_record.filed_at); the
 	// re-poll scheduler adds 16 (court_record RLS system escape hatch).
-	// (chain continues below; 76 is the last — nothing follows it.)
+	// (chain continues below; 78 is the last — nothing follows it.)
 	if next, err := src.Next(1); err != nil || next != 2 {
 		t.Fatalf("Next(1) = (%d, %v), want (2, nil)", next, err)
 	}
@@ -307,8 +307,15 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(75); err != nil || next != 76 {
 		t.Fatalf("Next(75) = (%d, %v), want (76, nil)", next, err)
 	}
-	if _, err := src.Next(76); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(76) error = %v, want fs.ErrNotExist", err)
+	// 77 does not exist on this branch (it lands on a sibling branch not yet
+	// merged here) — Next(76) legitimately skips straight to 78, the real next
+	// file on disk; golang-migrate's Next() returns the next EXISTING version,
+	// not "76+1".
+	if next, err := src.Next(76); err != nil || next != 78 {
+		t.Fatalf("Next(76) = (%d, %v), want (78, nil)", next, err)
+	}
+	if _, err := src.Next(78); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(78) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

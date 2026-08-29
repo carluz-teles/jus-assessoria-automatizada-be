@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/totp"
 )
 
 // authGroup single-flights concurrent logins: when a burst of read calls all find the
@@ -75,8 +76,8 @@ func (c *Client) login(ctx context.Context) error {
 // real portal may instead require fetching a login page to harvest a CSRF/execution
 // token first, or an OIDC redirect dance. That wiring is isolated in ssoLoginRequest so
 // correcting it is a small, contained change. What is REAL and tested here: on 200 we
-// become CONNECTED; a 401/403 is a credential/challenge failure; a captcha marker in the
-// body is surfaced distinctly; a transport error is Unavailable.
+// become CONNECTED; a 401/403 is a credential/challenge failure; a transport error is
+// Unavailable. A captcha/MFA marker is handled by classifyLoginResult — see its doc.
 func (c *Client) passwordLogin(ctx context.Context) error {
 	if c.creds.Username == "" || c.creds.Password == "" {
 		return apperr.NewInvalid("eproc: missing credentials")
@@ -92,35 +93,13 @@ func (c *Client) passwordLogin(ctx context.Context) error {
 	if err != nil {
 		return apperr.NewUnavailable("eproc: login request failed", err)
 	}
-	defer resp.Body.Close()
-
-	// Read a bounded prefix of the body so we can sniff for a captcha/MFA challenge
-	// without buffering an arbitrarily large page.
-	prefix := readBoundedPrefix(resp.Body)
-
-	if looksLikeChallenge(prefix) {
-		// The spike's second UNKNOWN: did a captcha/MFA appear? Surface it as Forbidden
-		// (access blocked by a challenge, not wrong password) so the caller reports it.
-		return apperr.NewForbidden("eproc: login blocked by captcha/MFA challenge")
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return apperr.NewUnavailable("eproc: read login response", err)
 	}
 
-	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return apperr.NewUnauthorized("eproc: login rejected (invalid credentials)")
-	case resp.StatusCode >= 500:
-		return apperr.NewUnavailable("eproc: SSO unavailable", statusError(resp.StatusCode))
-	case resp.StatusCode >= 200 && resp.StatusCode < 400:
-		// 2xx or an OIDC redirect the jar/client already followed — treat as success and
-		// let the first read confirm the session. loginSucceeded lets the wiring reject a
-		// 200 that is actually the login page re-rendered with an error.
-		if !loginSucceeded(resp, prefix) {
-			return apperr.NewUnauthorized("eproc: login rejected (login page re-rendered)")
-		}
-		c.markConnected()
-		return nil
-	default:
-		return apperr.NewUnavailable("eproc: unexpected SSO status", statusError(resp.StatusCode))
-	}
+	return c.classifyLoginResult(ctx, resp, body, false)
 }
 
 // certLogin performs the real certificate login CONFIRMED end-to-end against the live
@@ -140,10 +119,10 @@ func (c *Client) passwordLogin(ctx context.Context) error {
 //
 // A captcha/MFA marker in the final response is the TOTP step TJSP's own manuals
 // document as mandatory after certificate recognition (confirmed live: Keycloak's next
-// step here is literally a "kc-otp-login-form") — surfaced as Forbidden (certificate
-// accepted, second factor needed), not a login failure. Completing that TOTP step
-// needs the seed captured at onboarding (ERD §11 item 3) — out of scope for this
-// package until court_connection exists.
+// step here is literally a "kc-otp-login-form") — handled by classifyLoginResult: with
+// a seed configured (WithTOTPSeed) it completes automatically; without one it surfaces
+// Forbidden (certificate accepted, second factor needed — the caller's cue to run MFA
+// enrollment once, see internal/court).
 func (c *Client) certLogin(ctx context.Context) error {
 	bounce, err := ssoLoginBounceRequest(ctx, c.baseURL)
 	if err != nil {
@@ -190,28 +169,88 @@ func (c *Client) certLogin(ctx context.Context) error {
 	if err != nil {
 		return apperr.NewUnavailable("eproc: X.509 confirm failed", err)
 	}
-	defer resp2.Body.Close()
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if err != nil {
+		return apperr.NewUnavailable("eproc: read X.509 confirm response", err)
+	}
 
-	prefix := readBoundedPrefix(resp2.Body)
+	return c.classifyLoginResult(ctx, resp2, body2, false)
+}
 
-	if looksLikeChallenge(prefix) {
+// classifyLoginResult is the shared tail of every login mechanism once it has a final
+// HTTP response + body in hand: a captcha/MFA marker in the body is the TOTP step TJSP's
+// own manuals document as mandatory after certificate/password recognition (confirmed
+// live: Keycloak's next step is literally a "kc-otp-login-form"). When a TOTP seed is
+// configured (WithTOTPSeed — captured once at MFA enrollment, see internal/court) and
+// this is the first time this login attempt has seen the challenge, submitOTP generates
+// the code and completes the flow automatically instead of surfacing Forbidden — this
+// is the whole point of court_connection's mfa_seed_ref: no human, no phone, ever again
+// after the one-time enrollment. otpAttempted guards against looping if the OTP
+// submission itself lands on ANOTHER challenge (wrong/expired seed, rate limit).
+func (c *Client) classifyLoginResult(ctx context.Context, resp *http.Response, body []byte, otpAttempted bool) error {
+	if looksLikeChallenge(body) {
+		if c.totpSeed != "" && !otpAttempted {
+			nextResp, nextBody, err := c.submitOTP(ctx, body)
+			if err != nil {
+				return err
+			}
+			return c.classifyLoginResult(ctx, nextResp, nextBody, true)
+		}
 		return apperr.NewForbidden("eproc: certificate accepted, MFA/TOTP challenge required")
 	}
 
 	switch {
-	case resp2.StatusCode == http.StatusUnauthorized || resp2.StatusCode == http.StatusForbidden:
-		return apperr.NewUnauthorized("eproc: X.509 confirm rejected by eproc")
-	case resp2.StatusCode >= 500:
-		return apperr.NewUnavailable("eproc: portal unavailable", statusError(resp2.StatusCode))
-	case resp2.StatusCode >= 200 && resp2.StatusCode < 400:
-		if isLoginRedirect(resp2.Header.Get("Location")) || !loginSucceeded(resp2, prefix) {
-			return apperr.NewUnauthorized("eproc: X.509 confirm did not establish a session (redirected back to login)")
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return apperr.NewUnauthorized("eproc: login rejected by eproc")
+	case resp.StatusCode >= 500:
+		return apperr.NewUnavailable("eproc: portal unavailable", statusError(resp.StatusCode))
+	case resp.StatusCode >= 200 && resp.StatusCode < 400:
+		// 2xx or an OIDC redirect the jar/client already followed — treat as success and
+		// let the first read confirm the session. loginSucceeded lets the wiring reject a
+		// 200 that is actually the login page re-rendered with an error.
+		if isLoginRedirect(resp.Header.Get("Location")) || !loginSucceeded(resp, body) {
+			return apperr.NewUnauthorized("eproc: login did not establish a session (redirected back to login)")
 		}
 		c.markConnected()
 		return nil
 	default:
-		return apperr.NewUnavailable("eproc: unexpected portal status", statusError(resp2.StatusCode))
+		return apperr.NewUnavailable("eproc: unexpected portal status", statusError(resp.StatusCode))
 	}
+}
+
+// submitOTP generates the 6-digit code for c.totpSeed and posts it to the OTP
+// confirmation form found in body — see extractOTPConfirmAction/otpConfirmRequest
+// (wiring.go) for what is ASSUMPTION (Portão B) vs confirmed. No form found means the
+// challenge wasn't the OTP page we expect (errOTPFormMissing) — surfaced as Unauthorized,
+// not silently ignored.
+func (c *Client) submitOTP(ctx context.Context, body []byte) (*http.Response, []byte, error) {
+	action, err := extractOTPConfirmAction(body)
+	if err != nil {
+		return nil, nil, apperr.NewUnauthorized("eproc: MFA challenge present but no OTP form found (page shape changed?)")
+	}
+
+	code, err := totp.GenerateCode(c.totpSeed, c.now())
+	if err != nil {
+		return nil, nil, apperr.NewInfra("eproc: generate TOTP code", err)
+	}
+
+	req, err := otpConfirmRequest(ctx, action, code)
+	if err != nil {
+		return nil, nil, apperr.NewInfra("eproc: build OTP confirm request", err)
+	}
+	applyBrowserHeaders(req)
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, nil, apperr.NewUnavailable("eproc: OTP confirm request failed", err)
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, nil, apperr.NewUnavailable("eproc: read OTP confirm response", err)
+	}
+	return resp, respBody, nil
 }
 
 // certLoginCertisignFallback is the "Acesso alternativo com certificado digital"

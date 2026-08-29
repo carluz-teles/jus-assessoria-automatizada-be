@@ -114,7 +114,8 @@ type Client struct {
 	status   SessionStatus
 	authOnce *authGroup
 
-	mode authMode
+	mode     authMode
+	totpSeed string
 }
 
 // Option tunes a Client at construction (functional options, per the repo convention).
@@ -146,6 +147,18 @@ func WithCredentials(creds Credentials) Option {
 func WithCertificateAuth() Option {
 	return func(c *Client) {
 		c.mode = authModeCertificate
+	}
+}
+
+// WithTOTPSeed configures the RFC 6238 seed captured once at MFA enrollment (see
+// internal/court's MFAEnroller) so classifyLoginResult can complete the "kc-otp-login-form"
+// step automatically — generating the 6-digit code on the fly instead of surfacing
+// Forbidden. The seed itself is caller-managed (decrypted from the vault right before
+// building the Client); this package never persists it. An empty seed (the default)
+// keeps the current behavior: an MFA challenge always surfaces as Forbidden.
+func WithTOTPSeed(seed string) Option {
+	return func(c *Client) {
+		c.totpSeed = seed
 	}
 }
 

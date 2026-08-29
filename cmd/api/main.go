@@ -24,6 +24,7 @@ import (
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/certificate"
+	"github.com/jusassessoria/platform/internal/court"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -527,6 +528,22 @@ func run(logger *slog.Logger) error {
 		logger.Warn("VAULT_KEK_BASE64 unset — court credential endpoints will be disabled")
 	}
 
+	// Court (execução judicial, fatia 1 — autenticação + MFA automatizado):
+	// precisa do certUC (assina/decifra o certificado A1 do advogado) E do vault
+	// (sela a seed TOTP capturada no enrollment automatizado) — sem os dois, a
+	// conexão com o tribunal não tem como autenticar de verdade, então o slice
+	// fica desmontado (mesmo padrão optional-adapter do document/S3 e do vault
+	// acima), não half-up.
+	var courtHandler *court.Handler
+	if certUC != nil && vlt != nil {
+		courtUC := court.NewUseCase(court.NewRepository(), uow, vlt, events.NewOutbox())
+		courtUC.RegisterProvider("EPROC", court.NewEprocProvider(courtCertSignerFunc(certUC.NewSigner)))
+		courtHandler = court.New(courtUC)
+		logger.Info("court slice ready", "providers", []string{"EPROC"})
+	} else {
+		logger.Warn("GCP_KMS_KEY_NAME or VAULT_KEK_BASE64 unset — court-connection endpoints will be disabled")
+	}
+
 	// Iterate use case (Peça v2 — POST /v1/pecas/:id/iterate síncrono). Reusa
 	// o mesmo generator + embedder + composer das outras fatias de IA. nil
 	// generator → 422 em runtime; nunca falha de boot. Stateless (no writer —
@@ -565,6 +582,7 @@ func run(logger *slog.Logger) error {
 		draft:                draftHandler,
 		lookup:               lookupHandler,
 		certificate:          certificateHandler,
+		court:                courtHandler,
 		onboarding:           onboardingHandler,
 		vault:                vlt,
 		streamTokenStore:     streamTokenStore,
@@ -616,6 +634,17 @@ type certSignerFunc func(ctx context.Context, tenantID, id string) (crypto.Signe
 func (f certSignerFunc) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, draft.SignerInfo, error) {
 	signer, leaf, chain, info, err := f(ctx, tenantID, id)
 	return signer, leaf, chain, draft.SignerInfo{OAB: info.OAB, SubjectCN: info.SubjectCN}, err
+}
+
+// courtCertSignerFunc adapta certificate.UseCase.NewSigner ao port court.CertSigner —
+// mesma técnica de certSignerFunc (mesmo import cíclico a evitar), só descartando
+// certificate.SignerInfo, que o slice court não precisa (EprocProvider só monta um
+// tls.Certificate a partir do signer+leaf+chain).
+type courtCertSignerFunc func(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, certificate.SignerInfo, error)
+
+func (f courtCertSignerFunc) NewSigner(ctx context.Context, tenantID, id string) (crypto.Signer, *x509.Certificate, []*x509.Certificate, error) {
+	signer, leaf, chain, _, err := f(ctx, tenantID, id)
+	return signer, leaf, chain, err
 }
 
 // secretVaultAdapter adapta certificate.Cipher (KMS envelope: Seal/Open/Close)

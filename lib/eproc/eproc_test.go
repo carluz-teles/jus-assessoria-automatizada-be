@@ -3,6 +3,7 @@ package eproc
 import (
 	"bytes"
 	"context"
+	"encoding/base32"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/jusassessoria/platform/lib/totp"
 )
 
 // stubPortal is an httptest-backed fake of the eproc portal + SSO. It counts logins and
@@ -303,12 +307,13 @@ func (t *certificadoSSORewriteTransport) RoundTrip(req *http.Request) (*http.Res
 	return t.base.RoundTrip(req)
 }
 
-func newRealCertTestClient(t *testing.T, srv *httptest.Server) *Client {
+func newRealCertTestClient(t *testing.T, srv *httptest.Server, opts ...Option) *Client {
 	t.Helper()
 	hc := &http.Client{
 		Transport: &certificadoSSORewriteTransport{base: http.DefaultTransport, server: srv.URL},
 	}
-	return NewEprocClient(hc, WithBaseURL(srv.URL), WithCertificateAuth())
+	allOpts := append([]Option{WithBaseURL(srv.URL), WithCertificateAuth()}, opts...)
+	return NewEprocClient(hc, allOpts...)
 }
 
 // x509AcceptedStub serves Keycloak's own hidden "kc-x509-login-info" confirm form —
@@ -468,6 +473,124 @@ func TestClient_CertLogin_RejectedByConfirm(t *testing.T) {
 	err := c.Login(context.Background())
 	if !IsUnauthorized(err) {
 		t.Fatalf("Login err = %v, want Unauthorized", err)
+	}
+}
+
+// testTOTPSecret is a fixed RFC 4226 Appendix D test secret, base32-encoded — good
+// enough for these tests since only the wiring (does the right code reach the right
+// field) is under test, not the RFC 6238 math itself (see lib/totp's own tests for that).
+func testTOTPSecret() string {
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte("12345678901234567890"))
+}
+
+// otpFormStub serves the "kc-otp-login-form" the real portal renders for the TOTP
+// challenge — its action is the only thing extractOTPConfirmAction reads.
+func otpFormStub(confirmURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<html><body>
+<form id="kc-otp-login-form" method="post" action="%s">
+<input type="text" name="otp"/>
+<input type="submit" name="login" value="Continuar"/>
+</form></body></html>`, confirmURL)
+	}
+}
+
+// TestClient_CertLogin_TOTPAutoCompletes proves the whole point of WithTOTPSeed: the
+// client reaches the "kc-otp-login-form" challenge and, WITHOUT any human/phone,
+// generates the correct RFC 6238 code and completes the login — CONNECTED, no
+// Forbidden ever surfaced to the caller.
+func TestClient_CertLogin_TOTPAutoCompletes(t *testing.T) {
+	t.Parallel()
+
+	secret := testTOTPSecret()
+	fixedNow := time.Unix(1_700_000_000, 0).UTC()
+	wantCode, err := totp.GenerateCode(secret, fixedNow)
+	if err != nil {
+		t.Fatalf("totp.GenerateCode: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL, otpConfirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", func(w http.ResponseWriter, r *http.Request) {
+		otpFormStub(otpConfirmURL)(w, r)
+	})
+	mux.HandleFunc("/otp-confirm", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse OTP confirm form: %v", err)
+		}
+		if got := r.FormValue("otp"); got != wantCode {
+			t.Errorf("submitted otp = %q, want %q", got, wantCode)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, "<html>bem-vindo</html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+	otpConfirmURL = srv.URL + "/otp-confirm"
+
+	c := newRealCertTestClient(t, srv, WithTOTPSeed(secret), WithClock(func() time.Time { return fixedNow }))
+
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login = %v, want nil (TOTP should auto-complete)", err)
+	}
+	if c.Status() != StatusConnected {
+		t.Fatalf("Status = %v, want CONNECTED", c.Status())
+	}
+}
+
+// TestClient_CertLogin_TOTPWrongCodeDoesNotLoop proves that if the OTP confirm step
+// itself lands on another challenge (expired/rate-limited/wrong seed — not expected in
+// practice, but the server is not ours to trust blindly), the client tries exactly once
+// and surfaces Forbidden instead of looping.
+func TestClient_CertLogin_TOTPWrongCodeDoesNotLoop(t *testing.T) {
+	t.Parallel()
+
+	secret := testTOTPSecret()
+	otpConfirmHits := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL, otpConfirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", func(w http.ResponseWriter, r *http.Request) {
+		otpFormStub(otpConfirmURL)(w, r)
+	})
+	mux.HandleFunc("/otp-confirm", func(w http.ResponseWriter, r *http.Request) {
+		otpConfirmHits++
+		// Still the OTP challenge — as if the code were rejected.
+		otpFormStub(otpConfirmURL)(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+	otpConfirmURL = srv.URL + "/otp-confirm"
+
+	c := newRealCertTestClient(t, srv, WithTOTPSeed(secret))
+
+	err := c.Login(context.Background())
+	if !IsForbidden(err) {
+		t.Fatalf("Login err = %v, want Forbidden", err)
+	}
+	if otpConfirmHits != 1 {
+		t.Errorf("otp confirm hits = %d, want exactly 1 (no retry loop)", otpConfirmHits)
 	}
 }
 
