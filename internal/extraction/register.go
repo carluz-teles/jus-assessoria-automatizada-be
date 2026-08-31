@@ -58,7 +58,7 @@ func RegisterExtractionListeners(mux *asynq.ServeMux, deps Deps) error {
 		ocr = NewTesseractOCR()
 	}
 
-	extractor := NewDispatchExtractor(NewTextLayerExtractor(), ocr)
+	extractor := NewDispatchExtractor(NewTextLayerExtractor(), ocr).WithHTMLExtractor(NewHTMLExtractor())
 	store := NewStorage(deps.Storage, deps.HTTPClient)
 
 	uc, err := NewUseCase(deps.UoW, store, NewRepository(), extractor, NewDedup(), deps.Outbox, deps.Logger)

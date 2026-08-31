@@ -12,7 +12,11 @@ import (
 
 // textLayerVersion identifies the pure-Go PDF text-layer adapter in extractor_version. A
 // bump (a library change that alters extraction) makes a re-extraction auditable.
-const textLayerVersion = "pdftext-v1"
+// v2: stopped inserting a space between EVERY row fragment (the reader emits one fragment
+// per GLYPH for some eproc PDFs, so v1 produced "e n d e r e ç o" — bad RAG data); v2
+// concatenates fragments verbatim (they already carry their own spacing) and collapses
+// whitespace runs.
+const textLayerVersion = "pdftext-v2"
 
 // minCharsPerPage is the density floor: the AVERAGE non-whitespace characters per page below
 // which a PDF is judged to have NO usable text layer (a scan) and Extract reports
@@ -75,10 +79,17 @@ func hasUsableTextLayer(total, numPages int) bool {
 }
 
 // pagePlainText renders one page's text layer as plain text, row by row (GetTextByRow
-// preserves reading order: words within a row joined by spaces, rows by newlines). A null
-// page or a page with no Contents (a scan) yields "". Errors from a single page are swallowed
-// to "" rather than failing the whole document — a partial extraction still routes to OCR via
-// the density floor if it comes up empty.
+// preserves reading order; rows joined by newlines). A null page or a page with no Contents
+// (a scan) yields "". Errors from a single page are swallowed to "" rather than failing the
+// whole document — a partial extraction still routes to OCR via the density floor if it comes
+// up empty.
+//
+// It CONCATENATES a row's fragments verbatim (NOT joined by a space): the reader's fragments
+// already carry their own spacing — a word fragment ends with its trailing space
+// ("EXCELENTÍSSIMO "), and word boundaries appear as explicit " " fragments. Some eproc PDFs
+// emit one fragment PER GLYPH ("e","n","d",…); joining THOSE with a space (the v1 bug) yielded
+// "e n d e r e ç o". Concatenation reconstructs the word; a final Fields/Join collapses the
+// resulting whitespace runs (v1's per-fragment spacing also produced ragged multi-space text).
 func pagePlainText(p pdf.Page) string {
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == pdf.Null {
 		return ""
@@ -89,12 +100,12 @@ func pagePlainText(p pdf.Page) string {
 	}
 	var b strings.Builder
 	for _, row := range rows {
-		for i, word := range row.Content {
-			if i > 0 {
-				b.WriteByte(' ')
-			}
-			b.WriteString(word.S)
+		var line strings.Builder
+		for _, frag := range row.Content {
+			line.WriteString(frag.S)
 		}
+		// Collapse runs of whitespace to single spaces; a row of only spaces yields "".
+		b.WriteString(strings.Join(strings.Fields(line.String()), " "))
 		b.WriteByte('\n')
 	}
 	return b.String()
