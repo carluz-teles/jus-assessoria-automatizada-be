@@ -3,7 +3,9 @@ package extraction
 import (
 	"bytes"
 	"context"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/ledongthuc/pdf"
 
@@ -84,12 +86,10 @@ func hasUsableTextLayer(total, numPages int) bool {
 // whole document — a partial extraction still routes to OCR via the density floor if it comes
 // up empty.
 //
-// It CONCATENATES a row's fragments verbatim (NOT joined by a space): the reader's fragments
-// already carry their own spacing — a word fragment ends with its trailing space
-// ("EXCELENTÍSSIMO "), and word boundaries appear as explicit " " fragments. Some eproc PDFs
-// emit one fragment PER GLYPH ("e","n","d",…); joining THOSE with a space (the v1 bug) yielded
-// "e n d e r e ç o". Concatenation reconstructs the word; a final Fields/Join collapses the
-// resulting whitespace runs (v1's per-fragment spacing also produced ragged multi-space text).
+// It joins a row's fragments with joinFragments (see there) — NOT a space between every
+// fragment (v1's bug: the reader emits one fragment per GLYPH for some eproc PDFs, so that
+// produced "e n d e r e ç o"). A final Fields/Join collapses whitespace runs; rows joined by
+// newlines. A row of only spaces yields "".
 func pagePlainText(p pdf.Page) string {
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == pdf.Null {
 		return ""
@@ -100,13 +100,66 @@ func pagePlainText(p pdf.Page) string {
 	}
 	var b strings.Builder
 	for _, row := range rows {
-		var line strings.Builder
-		for _, frag := range row.Content {
-			line.WriteString(frag.S)
-		}
-		// Collapse runs of whitespace to single spaces; a row of only spaces yields "".
-		b.WriteString(strings.Join(strings.Fields(line.String()), " "))
+		line := despaceRuns(joinFragments(row.Content))
+		b.WriteString(strings.Join(strings.Fields(line), " "))
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// charSpacedRun matches a run of 4+ single-character tokens separated by SINGLE spaces —
+// the fingerprint of a text stream that emitted one character at a time with a space between
+// each ("e n d e r e ç o"). A real word is a multi-char token so it never matches; a legit
+// short sequence of single chars ("a e i") stays under the 4-token floor. Word boundaries in
+// such streams are typically multi-space, and a run of 2+ spaces breaks the single-space
+// pattern — so those boundaries survive the collapse.
+var charSpacedRun = regexp.MustCompile(`(?:\S ){3,}\S`)
+
+// despaceRuns removes the intra-run single spaces from character-spaced runs (see
+// charSpacedRun), reconstructing "e n d e r e ç o" → "endereço". Runs are collapsed BEFORE the
+// caller's Fields/Join so multi-space word boundaries (which break the pattern) still separate
+// words. Text with no such run is returned unchanged.
+func despaceRuns(s string) string {
+	return charSpacedRun.ReplaceAllStringFunc(s, func(m string) string {
+		return strings.ReplaceAll(m, " ", "")
+	})
+}
+
+// joinFragments reconstructs a row's text from the reader's fragments. The fragments already
+// carry their own spacing (a word fragment ends with a trailing space, "EXCELENTÍSSIMO "; word
+// boundaries also appear as explicit " " fragments), so it concatenates verbatim — EXCEPT it
+// inserts one boundary space between two adjacent fragments when neither already has boundary
+// whitespace AND at least one side is a real word (>1 rune). That single rule threads the needle:
+//   - glyph-per-fragment runs ("e","n","d",…) — both sides single-rune → NO space → "end" (fixes
+//     the v1 "e n d e r e ç o" garbling);
+//   - two words the reader emitted back-to-back across a line break ("PAULO","COMARCA") — both
+//     multi-rune → space → "PAULO COMARCA" (fixes the merge a naïve concat introduced).
+//
+// It can't recover a boundary between two SINGLE-rune words emitted as separate glyphs (rare),
+// nor split spaces that are literally inside one fragment's string — those are residual.
+func joinFragments(frags pdf.TextHorizontal) string {
+	var b strings.Builder
+	prev := ""
+	for _, f := range frags {
+		s := f.S
+		if s == "" {
+			continue
+		}
+		if prev != "" && needBoundarySpace(prev, s) {
+			b.WriteByte(' ')
+		}
+		b.WriteString(s)
+		prev = s
+	}
+	return b.String()
+}
+
+// needBoundarySpace reports whether a space must be inserted between two adjacent non-empty
+// fragments: only when neither side already provides boundary whitespace and at least one side
+// is a word (more than one rune), so glyph runs stay joined but word-to-word boundaries don't.
+func needBoundarySpace(prev, curr string) bool {
+	if strings.HasSuffix(prev, " ") || strings.HasPrefix(curr, " ") {
+		return false
+	}
+	return utf8.RuneCountInString(prev) > 1 || utf8.RuneCountInString(curr) > 1
 }
