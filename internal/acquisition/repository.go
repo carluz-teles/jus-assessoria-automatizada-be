@@ -1998,6 +1998,8 @@ func (r *pgRepository) GetProcesso(ctx context.Context, tenantID, id string) (Pr
 		Secrecy:          row.Secrecy,
 		Lifecycle:        row.Lifecycle,
 		Completeness:     row.Completeness,
+		Phase:            row.Phase,
+		ClaimValue:       numericToFloatPtr(row.ClaimValue),
 		AssignedUserID:   uuidStrPtr(row.AssignedUserID),
 		AssignedUserName: row.AssignedUserName,
 		LastMovementText: row.LastMovementText,
