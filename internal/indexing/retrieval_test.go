@@ -12,7 +12,7 @@ import (
 // courtRecordID binds NULL (whole-tenant) vs the id (single-process), and the rows map to
 // ChunkHits ordered as returned.
 
-var searchColumns = []string{"document_id", "page", "text", "score"}
+var searchColumns = []string{"document_id", "page", "text", "score", "title", "document_type"}
 
 func TestSearchChunks_WholeTenant(t *testing.T) {
 	t.Parallel()
@@ -29,8 +29,8 @@ func TestSearchChunks_WholeTenant(t *testing.T) {
 		WithArgs(pgxmock.AnyArg(), testTenant, nil, 5).
 		WillReturnRows(
 			pgxmock.NewRows(searchColumns).
-				AddRow(testDoc, 3, "primeiro trecho", 0.91).
-				AddRow(testDoc, 7, "segundo trecho", 0.80),
+				AddRow(testDoc, 3, "primeiro trecho", 0.91, "Petição inicial", "PET").
+				AddRow(testDoc, 7, "segundo trecho", 0.80, "Contrato social", "CONTRSOCIAL"),
 		)
 
 	hits, err := SearchChunks(context.Background(), SearchDeps{Pool: mock}, testTenant, nil, []float32{0.1, 0.2, 0.3, 0.4}, 5)
@@ -65,7 +65,7 @@ func TestSearchChunks_ScopedToProcess(t *testing.T) {
 	// one process).
 	mock.ExpectQuery(searchChunksSQL).
 		WithArgs(pgxmock.AnyArg(), testTenant, crid, 3).
-		WillReturnRows(pgxmock.NewRows(searchColumns).AddRow(testDoc, 1, "trecho", 0.5))
+		WillReturnRows(pgxmock.NewRows(searchColumns).AddRow(testDoc, 1, "trecho", 0.5, "Petição inicial", "PET"))
 
 	hits, err := SearchChunks(context.Background(), SearchDeps{Pool: mock}, testTenant, &crid, []float32{1, 0, 0, 0}, 3)
 	if err != nil {

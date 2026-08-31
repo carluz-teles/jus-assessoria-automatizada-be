@@ -275,6 +275,17 @@ type Thesis struct {
 	Reference  string   `json:"reference"`  // jurisprudência ou dispositivo legal, texto livre
 	Foundation string   `json:"foundation"`
 	Evidence   []string `json:"evidence"`
+
+	// Source* attribute the thesis back to the AUTOS document its evidence was
+	// retrieved from — populated post-hoc by matching Evidence against the RAG chunk
+	// hits (the LLM returns only literal quotes, not document ids), NOT part of the
+	// LLM contract (json:"-"). Empty when no evidence matched a retrieved chunk (the
+	// thesis is grounded only in the teor or is doctrinal); the FE then falls back to
+	// the teor. This is what surfaces "esta tese se apoia na Petição inicial · pág. 3".
+	SourceDocumentID string `json:"-"`
+	SourceLabel      string `json:"-"`
+	SourceExcerpt    string `json:"-"`
+	SourcePage       int    `json:"-"`
 }
 
 // ThesisConfidence closed set.
