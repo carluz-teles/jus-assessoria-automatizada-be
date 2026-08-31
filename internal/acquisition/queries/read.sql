@@ -20,6 +20,8 @@
 -- ListIntimacoes pattern in this file) so sqlc infers nullable types correctly.
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo: assigned at case level (court_case), shared across
        -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
        -- leaves assigned_user_id/name NULL, never dropping the record from the list.
@@ -70,6 +72,8 @@ LIMIT $2;
 -- next_deadline: same correlated LATERAL as ListProcessos (see above).
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
        -- an unassigned case still returns the record with NULL assigned_user_id/name.
        cc.assigned_user_id, au.name AS assigned_user_name,
@@ -370,11 +374,22 @@ WHERE de.court_record_id = @court_record_id::uuid
 -- tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
 -- served by intimation(court_record_id, made_available_at DESC) — the first page
 -- passes the max sentinel ('9999-12-31', max-uuid).
+-- MESMA projeção do ListIntimacoes (inbox): traz o responsável (assignee_user_id/name)
+-- e o prazo derivado (LEFT JOINs deadline + app_user), pra o card de intimação do cockpit
+-- renderizar "resp." e o prazo/fatal como no design.
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
-       cr.cnj_number, cr.court, cr.degree, cr.class, cr.id AS court_record_id
+       cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id,
+       i.ai_analyzed_at, i.assignee_user_id, ua.name AS assignee_user_name,
+       d.id                                                                 AS prazo_deadline_id,
+       d.end_date                                                           AS prazo_end_date,
+       CASE WHEN d.id IS NOT NULL THEN (d.end_date - CURRENT_DATE)::int END AS prazo_days_left,
+       d.status                                                             AS prazo_status,
+       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END     AS prazo_confirmed
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
 WHERE i.court_record_id = @court_record_id::uuid
   AND i.tenant_id = @tenant_id::uuid
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)

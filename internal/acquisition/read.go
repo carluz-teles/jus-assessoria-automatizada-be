@@ -41,6 +41,11 @@ type ProcessoView struct {
 	Secrecy      string     `json:"secrecy"`
 	Lifecycle    string     `json:"lifecycle"`
 	Completeness float32    `json:"completeness"`
+	// Phase is the EFFECTIVE procedural phase (phase_override ?? phase); nil (JSON null)
+	// until the process is graded or the user sets it. ClaimValue is the valor da causa —
+	// user-entered (no automatic source), nil when never filled.
+	Phase      *string  `json:"phase"`
+	ClaimValue *float64 `json:"claim_value"`
 	// responsável do processo — assigned at case level (court_case), so it is shared
 	// across the process's graus. Both nil (JSON null) when no one is assigned; name
 	// is the app_user.name joined in, so the FE renders the header without a second read.

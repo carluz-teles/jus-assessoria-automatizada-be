@@ -535,6 +535,9 @@ type Querier interface {
 	// tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
 	// served by intimation(court_record_id, made_available_at DESC) — the first page
 	// passes the max sentinel ('9999-12-31', max-uuid).
+	// MESMA projeção do ListIntimacoes (inbox): traz o responsável (assignee_user_id/name)
+	// e o prazo derivado (LEFT JOINs deadline + app_user), pra o card de intimação do cockpit
+	// renderizar "resp." e o prazo/fatal como no design.
 	ListIntimacoesByProcesso(ctx context.Context, arg ListIntimacoesByProcessoParams) ([]ListIntimacoesByProcessoRow, error)
 	// The intimations a window first discovered (collapse), newest availability first.
 	ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoesBySyncRunParams) ([]ListIntimacoesBySyncRunRow, error)
@@ -760,6 +763,11 @@ type Querier interface {
 	// empty (source does not carry movimentos) the existing lifecycle is preserved via the
 	// NULLIF/COALESCE: NULLIF('', lifecycle) = NULL → COALESCE falls back to lifecycle.
 	UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRecordGradeParams) (UpdateCourtRecordGradeRow, error)
+	// Campos do processo preenchidos À MÃO no cockpit: a fase (phase_override — vence a
+	// derivada no read model) e o valor da causa (claim_value, sem fonte automática). PATCH
+	// parcial: cada campo só é escrito quando o argumento vem não-nulo (COALESCE mantém o
+	// valor atual quando o cliente não mandou aquele campo). Tenant-scoped (barreira 1 + RLS).
+	UpdateProcessoManualFields(ctx context.Context, arg UpdateProcessoManualFieldsParams) error
 	// Close a sync run, but ONLY from RUNNING: the status guard makes this the single
 	// winning transition (compare-and-swap), so a redelivery that resumes a run
 	// another execution already closed affects zero rows. OK carries the item tallies

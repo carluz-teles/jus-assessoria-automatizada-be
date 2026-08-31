@@ -187,6 +187,9 @@ type CourtRecord struct {
 	Magistrate            *string            `json:"magistrate"`
 	CourtSituation        *string            `json:"court_situation"`
 	Competence            *string            `json:"competence"`
+	Phase                 *string            `json:"phase"`
+	PhaseOverride         *string            `json:"phase_override"`
+	ClaimValue            pgtype.Numeric     `json:"claim_value"`
 }
 
 type Deadline struct {

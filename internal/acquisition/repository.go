@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,6 +101,11 @@ type Repository interface {
 	ResolveCaseIDByCourtRecord(ctx context.Context, tx database.Tx, tenantID, courtRecordID string) (caseID string, err error)
 	AppUserInTenant(ctx context.Context, tx database.Tx, tenantID, appUserID string) (bool, error)
 	AssignCaseResponsible(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) error
+
+	// UpdateProcessoManualFields grava os campos que o advogado preenche à mão no cockpit
+	// — a fase (phase_override) e o valor da causa (claim_value) — no court_record. PATCH
+	// parcial: um argumento nil deixa o campo como está.
+	UpdateProcessoManualFields(ctx context.Context, tx database.Tx, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error
 
 	// CascadeCaseResponsibleToIntimations propagates the case's responsável to every
 	// intimação already anchored under it (via court_record_id → court_record.case_id), in
@@ -1522,6 +1528,9 @@ func (r *pgRepository) UpdateCourtRecordGrade(ctx context.Context, tx database.T
 		// Empty string when graded.Lifecycle is unset: the SQL NULLIF('')→NULL and
 		// COALESCE falls back to the existing lifecycle column value (preserves SUPERSEDED).
 		Lifecycle: params.Lifecycle,
+		// Empty when the source carries no movimentos (DJEN): NULLIF('')→NULL, COALESCE
+		// keeps the existing derived phase. phase_override is untouched here.
+		Phase: params.Phase,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrCourtRecordNotFound
@@ -1699,6 +1708,32 @@ func (r *pgRepository) AssignCaseResponsible(ctx context.Context, tx database.Tx
 		TenantID:       tid,
 	})
 	return database.WrapInfra(err)
+}
+
+// UpdateProcessoManualFields writes the hand-entered fase/valor onto the court_record.
+// A nil phaseOverride/claimValue leaves that column untouched (the SQL COALESCE keeps the
+// current value), so the same endpoint serves "set only the fase" and "set only o valor".
+func (r *pgRepository) UpdateProcessoManualFields(ctx context.Context, tx database.Tx, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	rid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		return apperr.NewInvalid("id de processo inválido")
+	}
+	var cv pgtype.Numeric
+	if claimValue != nil {
+		if err := cv.Scan(strconv.FormatFloat(*claimValue, 'f', 2, 64)); err != nil {
+			return database.WrapInfra(err)
+		}
+	}
+	return database.WrapInfra(acquisitiondb.New(tx).UpdateProcessoManualFields(ctx, acquisitiondb.UpdateProcessoManualFieldsParams{
+		PhaseOverride: phaseOverride,
+		ClaimValue:    cv,
+		CourtRecordID: rid,
+		TenantID:      tid,
+	}))
 }
 
 // CascadeCaseResponsibleToIntimations propagates a court_case's responsável to every
@@ -1917,6 +1952,8 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 			Secrecy:          row.Secrecy,
 			Lifecycle:        row.Lifecycle,
 			Completeness:     row.Completeness,
+			Phase:            row.Phase,
+			ClaimValue:       numericToFloatPtr(row.ClaimValue),
 			AssignedUserID:   uuidStrPtr(row.AssignedUserID),
 			AssignedUserName: row.AssignedUserName,
 			LastMovementText: row.LastMovementText,
@@ -2437,21 +2474,26 @@ func (r *pgRepository) ListIntimacoesByProcesso(ctx context.Context, q Intimacoe
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, IntimacaoView{
-			ID:              row.ID.String(),
-			CNJNumber:       row.CnjNumber,
-			Class:           deref(row.Class),
-			CourtRecordID:   row.CourtRecordID.String(),
-			Court:           row.Court,
-			Degree:          row.Degree,
-			Type:            deref(row.Type),
-			Status:          row.Status,
-			UserStatus:      row.UserStatus,
-			Source:          row.Source,
-			SourceURL:       deref(row.SourceUrl),
-			MadeAvailableAt: row.MadeAvailableAt.Time,
-			PublishedAt:     row.PublishedAt.Time,
-			DeadlineStartAt: row.DeadlineStartAt.Time,
-			ContentPreview:  contentPreview(row.Content),
+			ID:               row.ID.String(),
+			CNJNumber:        row.CnjNumber,
+			Class:            deref(row.Class),
+			Subject:          deref(row.Subject),
+			CourtRecordID:    row.CourtRecordID.String(),
+			Court:            row.Court,
+			Degree:           row.Degree,
+			Type:             deref(row.Type),
+			Status:           row.Status,
+			UserStatus:       row.UserStatus,
+			Source:           row.Source,
+			SourceURL:        deref(row.SourceUrl),
+			MadeAvailableAt:  row.MadeAvailableAt.Time,
+			PublishedAt:      row.PublishedAt.Time,
+			DeadlineStartAt:  row.DeadlineStartAt.Time,
+			ContentPreview:   contentPreview(row.Content),
+			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
+			AssigneeUserID:   uuidPtrFromPgtype(row.AssigneeUserID),
+			AssigneeUserName: row.AssigneeUserName,
 		})
 	}
 	return out, nil
@@ -2903,6 +2945,21 @@ func datePtr(d pgtype.Date) *time.Time {
 	}
 	t := d.Time
 	return &t
+}
+
+// numericToFloatPtr converts a nullable numeric (valor da causa) to *float64 — nil when
+// SQL NULL. The values are money in reais (well within float64's exact-integer range at
+// two decimals), so the FE can format/edit them as a number.
+func numericToFloatPtr(n pgtype.Numeric) *float64 {
+	if !n.Valid {
+		return nil
+	}
+	f, err := n.Float64Value()
+	if err != nil || !f.Valid {
+		return nil
+	}
+	v := f.Float64
+	return &v
 }
 
 func timestampPtr(ts pgtype.Timestamptz) *time.Time {

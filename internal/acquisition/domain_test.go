@@ -369,6 +369,10 @@ func (m *mockRepo) AssignCaseResponsible(_ context.Context, _ database.Tx, _, ca
 	return nil
 }
 
+func (m *mockRepo) UpdateProcessoManualFields(_ context.Context, _ database.Tx, _, _ string, _ *string, _ *float64) error {
+	return nil
+}
+
 func (m *mockRepo) CascadeCaseResponsibleToIntimations(_ context.Context, _ database.Tx, _, caseID string, assignedUserID *string) (int64, error) {
 	m.cascadeCalls++
 	m.cascadeCaseID = caseID

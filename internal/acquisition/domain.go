@@ -272,6 +272,16 @@ func (uc *UseCase) AssignResponsible(ctx context.Context, tenantID, courtRecordI
 	})
 }
 
+// UpdateProcessoManual grava os campos que o advogado preenche à mão no cockpit — a fase
+// (phase_override, que vence a derivada no read model) e o valor da causa (claim_value, sem
+// fonte automática). Um argumento nil deixa o campo como está (PATCH parcial). tenantID vem
+// do principal, nunca do body.
+func (uc *UseCase) UpdateProcessoManual(ctx context.Context, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error {
+	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		return uc.repo.UpdateProcessoManualFields(ctx, tx, tenantID, courtRecordID, phaseOverride, claimValue)
+	})
+}
+
 // BulkAssignResponsible atribui o responsável a vários processos de uma vez. Dois
 // modos (mutuamente exclusivos): All=true aplica a TODA a faixa/filtro atual (q —
 // mesmos filtros do ListProcessos; inclui os não paginados); senão aplica aos ids

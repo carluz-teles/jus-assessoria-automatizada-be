@@ -411,6 +411,8 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 const getProcesso = `-- name: GetProcesso :one
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
        -- an unassigned case still returns the record with NULL assigned_user_id/name.
        cc.assigned_user_id, au.name AS assigned_user_name,
@@ -460,6 +462,8 @@ type GetProcessoRow struct {
 	Secrecy              string             `json:"secrecy"`
 	Lifecycle            string             `json:"lifecycle"`
 	Completeness         float32            `json:"completeness"`
+	Phase                *string            `json:"phase"`
+	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
 	LastMovementText     string             `json:"last_movement_text"`
@@ -492,6 +496,8 @@ func (q *Queries) GetProcesso(ctx context.Context, arg GetProcessoParams) (GetPr
 		&i.Secrecy,
 		&i.Lifecycle,
 		&i.Completeness,
+		&i.Phase,
+		&i.ClaimValue,
 		&i.AssignedUserID,
 		&i.AssignedUserName,
 		&i.LastMovementText,
@@ -823,9 +829,17 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 const listIntimacoesByProcesso = `-- name: ListIntimacoesByProcesso :many
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
-       cr.cnj_number, cr.court, cr.degree, cr.class, cr.id AS court_record_id
+       cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id,
+       i.ai_analyzed_at, i.assignee_user_id, ua.name AS assignee_user_name,
+       d.id                                                                 AS prazo_deadline_id,
+       d.end_date                                                           AS prazo_end_date,
+       CASE WHEN d.id IS NOT NULL THEN (d.end_date - CURRENT_DATE)::int END AS prazo_days_left,
+       d.status                                                             AS prazo_status,
+       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END     AS prazo_confirmed
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
 WHERE i.court_record_id = $1::uuid
   AND i.tenant_id = $2::uuid
   AND (i.made_available_at, i.id) < ($3::date, $4::uuid)
@@ -842,21 +856,30 @@ type ListIntimacoesByProcessoParams struct {
 }
 
 type ListIntimacoesByProcessoRow struct {
-	ID              uuid.UUID   `json:"id"`
-	MadeAvailableAt pgtype.Date `json:"made_available_at"`
-	PublishedAt     pgtype.Date `json:"published_at"`
-	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
-	Content         string      `json:"content"`
-	Type            *string     `json:"type"`
-	Status          string      `json:"status"`
-	UserStatus      string      `json:"user_status"`
-	Source          string      `json:"source"`
-	SourceUrl       *string     `json:"source_url"`
-	CnjNumber       string      `json:"cnj_number"`
-	Court           string      `json:"court"`
-	Degree          string      `json:"degree"`
-	Class           *string     `json:"class"`
-	CourtRecordID   uuid.UUID   `json:"court_record_id"`
+	ID               uuid.UUID          `json:"id"`
+	MadeAvailableAt  pgtype.Date        `json:"made_available_at"`
+	PublishedAt      pgtype.Date        `json:"published_at"`
+	DeadlineStartAt  pgtype.Date        `json:"deadline_start_at"`
+	Content          string             `json:"content"`
+	Type             *string            `json:"type"`
+	Status           string             `json:"status"`
+	UserStatus       string             `json:"user_status"`
+	Source           string             `json:"source"`
+	SourceUrl        *string            `json:"source_url"`
+	CnjNumber        string             `json:"cnj_number"`
+	Court            string             `json:"court"`
+	Degree           string             `json:"degree"`
+	Class            *string            `json:"class"`
+	Subject          *string            `json:"subject"`
+	CourtRecordID    uuid.UUID          `json:"court_record_id"`
+	AiAnalyzedAt     pgtype.Timestamptz `json:"ai_analyzed_at"`
+	AssigneeUserID   pgtype.UUID        `json:"assignee_user_id"`
+	AssigneeUserName *string            `json:"assignee_user_name"`
+	PrazoDeadlineID  pgtype.UUID        `json:"prazo_deadline_id"`
+	PrazoEndDate     pgtype.Date        `json:"prazo_end_date"`
+	PrazoDaysLeft    interface{}        `json:"prazo_days_left"`
+	PrazoStatus      *string            `json:"prazo_status"`
+	PrazoConfirmed   interface{}        `json:"prazo_confirmed"`
 }
 
 // The "Intimações" tab of one process: the intimations filed on this court record,
@@ -866,6 +889,9 @@ type ListIntimacoesByProcessoRow struct {
 // tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
 // served by intimation(court_record_id, made_available_at DESC) — the first page
 // passes the max sentinel ('9999-12-31', max-uuid).
+// MESMA projeção do ListIntimacoes (inbox): traz o responsável (assignee_user_id/name)
+// e o prazo derivado (LEFT JOINs deadline + app_user), pra o card de intimação do cockpit
+// renderizar "resp." e o prazo/fatal como no design.
 func (q *Queries) ListIntimacoesByProcesso(ctx context.Context, arg ListIntimacoesByProcessoParams) ([]ListIntimacoesByProcessoRow, error) {
 	rows, err := q.db.Query(ctx, listIntimacoesByProcesso,
 		arg.CourtRecordID,
@@ -896,7 +922,16 @@ func (q *Queries) ListIntimacoesByProcesso(ctx context.Context, arg ListIntimaco
 			&i.Court,
 			&i.Degree,
 			&i.Class,
+			&i.Subject,
 			&i.CourtRecordID,
+			&i.AiAnalyzedAt,
+			&i.AssigneeUserID,
+			&i.AssigneeUserName,
+			&i.PrazoDeadlineID,
+			&i.PrazoEndDate,
+			&i.PrazoDaysLeft,
+			&i.PrazoStatus,
+			&i.PrazoConfirmed,
 		); err != nil {
 			return nil, err
 		}
@@ -1084,6 +1119,8 @@ const listProcessos = `-- name: ListProcessos :many
 
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo: assigned at case level (court_case), shared across
        -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
        -- leaves assigned_user_id/name NULL, never dropping the record from the list.
@@ -1150,6 +1187,8 @@ type ListProcessosRow struct {
 	Secrecy              string             `json:"secrecy"`
 	Lifecycle            string             `json:"lifecycle"`
 	Completeness         float32            `json:"completeness"`
+	Phase                *string            `json:"phase"`
+	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
 	LastMovementText     string             `json:"last_movement_text"`
@@ -1209,6 +1248,8 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 			&i.Secrecy,
 			&i.Lifecycle,
 			&i.Completeness,
+			&i.Phase,
+			&i.ClaimValue,
 			&i.AssignedUserID,
 			&i.AssignedUserName,
 			&i.LastMovementText,

@@ -304,6 +304,7 @@ func (p *DATAJUDParser) parseHit(ctx context.Context, rawSource json.RawMessage)
 		FiledAt:      parseDatajudDate(src.DataAjuizamento),
 		Secrecy:      secrecyFromNivel(src.NivelSigilo),
 		Lifecycle:    lifecycleFromMovimentos(src.Movimentos),
+		Phase:        faseFromClassAndMovimentos(src.Classe.Nome, src.Movimentos),
 	}
 
 	entries := make([]ParsedDocketEntry, 0, len(src.Movimentos))
