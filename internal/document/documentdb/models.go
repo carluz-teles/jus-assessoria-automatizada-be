@@ -184,6 +184,9 @@ type CourtRecord struct {
 	AiResume              []byte             `json:"ai_resume"`
 	AiResumeGeneratedAt   pgtype.Timestamptz `json:"ai_resume_generated_at"`
 	EnrichmentAttemptedAt pgtype.Timestamptz `json:"enrichment_attempted_at"`
+	Magistrate            *string            `json:"magistrate"`
+	CourtSituation        *string            `json:"court_situation"`
+	Competence            *string            `json:"competence"`
 }
 
 type Deadline struct {

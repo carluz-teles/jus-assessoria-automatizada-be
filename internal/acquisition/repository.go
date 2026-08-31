@@ -2224,7 +2224,7 @@ func (r *pgRepository) ListAndamentosByProcesso(ctx context.Context, q Andamento
 			OccurredAt: row.OccurredAt.Time,
 			ObservedAt: row.ObservedAt.Time,
 			TPUCode:    intPtr(row.TpuCode),
-			Text:       row.Text,
+			Text:       enrichAndamentoText(row.Text, row.Complements),
 			Source:     row.Source,
 			Fidelity:   int(row.Fidelity),
 		})

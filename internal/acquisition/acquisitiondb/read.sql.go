@@ -559,7 +559,7 @@ func (q *Queries) GetReconciliation(ctx context.Context, arg GetReconciliationPa
 }
 
 const listAndamentosByProcesso = `-- name: ListAndamentosByProcesso :many
-SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.source, de.fidelity
+SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.complements, de.source, de.fidelity
 FROM docket_entry de
 JOIN court_record cr ON cr.id = de.court_record_id
 WHERE de.court_record_id = $1::uuid
@@ -578,13 +578,14 @@ type ListAndamentosByProcessoParams struct {
 }
 
 type ListAndamentosByProcessoRow struct {
-	ID         uuid.UUID          `json:"id"`
-	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
-	ObservedAt pgtype.Timestamptz `json:"observed_at"`
-	TpuCode    *int32             `json:"tpu_code"`
-	Text       string             `json:"text"`
-	Source     string             `json:"source"`
-	Fidelity   int32              `json:"fidelity"`
+	ID          uuid.UUID          `json:"id"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+	ObservedAt  pgtype.Timestamptz `json:"observed_at"`
+	TpuCode     *int32             `json:"tpu_code"`
+	Text        string             `json:"text"`
+	Complements []byte             `json:"complements"`
+	Source      string             `json:"source"`
+	Fidelity    int32              `json:"fidelity"`
 }
 
 // The "Andamentos" tab of one process: the court record's docket entries, newest
@@ -613,6 +614,7 @@ func (q *Queries) ListAndamentosByProcesso(ctx context.Context, arg ListAndament
 			&i.ObservedAt,
 			&i.TpuCode,
 			&i.Text,
+			&i.Complements,
 			&i.Source,
 			&i.Fidelity,
 		); err != nil {

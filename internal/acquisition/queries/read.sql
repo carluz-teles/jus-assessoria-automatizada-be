@@ -345,7 +345,7 @@ ORDER BY LOWER(court) ASC;
 -- of its own) so a foreign court_record.id passed as :id yields nothing. Descending
 -- keyset on (occurred_at, id) — served by docket_entry(court_record_id, occurred_at)
 -- — the first page passes the max sentinel ('9999-12-31T23:59:59Z', max-uuid).
-SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.source, de.fidelity
+SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.complements, de.source, de.fidelity
 FROM docket_entry de
 JOIN court_record cr ON cr.id = de.court_record_id
 WHERE de.court_record_id = @court_record_id::uuid

@@ -3,7 +3,9 @@ package acquisition
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jusassessoria/platform/lib/httpx"
 )
@@ -294,6 +296,41 @@ func renderActivityText(eventType string) string {
 	default:
 		return eventType
 	}
+}
+
+// enrichAndamentoText turns a bare CNJ movement label ("Conclusão") into the rich one
+// the docket entry's complements carry ("Conclusão para despacho", "Expedição de
+// documento: Alvará"). complements is the docket_entry.complements jsonb — an array of
+// {"nome": "...", "descricao": "..."} the DATAJUD movimento discloses. Each complement's
+// `nome` is appended: with a bare space when it reads as a continuation ("para despacho",
+// "de mérito"), otherwise after " — " (a noun like "Alvará"). Blank/duplicate nomes are
+// skipped so a movement whose complement repeats does not double its label. Malformed or
+// empty complements leave the text untouched, so the timeline never regresses.
+func enrichAndamentoText(text string, complements []byte) string {
+	if len(complements) == 0 {
+		return text
+	}
+	var parsed []struct {
+		Nome string `json:"nome"`
+	}
+	if err := json.Unmarshal(complements, &parsed); err != nil {
+		return text
+	}
+	out := text
+	seen := map[string]bool{}
+	for _, c := range parsed {
+		nome := strings.TrimSpace(c.Nome)
+		if nome == "" || seen[nome] {
+			continue
+		}
+		seen[nome] = true
+		if r := []rune(nome)[0]; unicode.IsLower(r) {
+			out += " " + nome
+		} else {
+			out += " — " + nome
+		}
+	}
+	return out
 }
 
 // ProcessosQuery / IntimacoesQuery carry the keyset cursor (the last row's sort key
