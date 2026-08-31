@@ -90,11 +90,12 @@ func run(logger *slog.Logger) error {
 	// document handler); without it the worker still boots idle instead of crash-looping.
 	if cfg.S3Enabled() {
 		storageClient, err := storage.New(ctx, storage.Options{
-			Endpoint:  cfg.S3Endpoint,
-			Region:    cfg.S3Region,
-			Bucket:    cfg.S3Bucket,
-			AccessKey: cfg.S3AccessKey,
-			SecretKey: cfg.S3SecretKey,
+			Endpoint:     cfg.S3Endpoint,
+			Region:       cfg.S3Region,
+			Bucket:       cfg.S3Bucket,
+			AccessKey:    cfg.S3AccessKey,
+			SecretKey:    cfg.S3SecretKey,
+			UsePathStyle: cfg.S3UsePathStyle, // MinIO needs path-style (host/bucket/key); without it reads go to bucket.host and fail DNS
 		})
 		if err != nil {
 			return fmt.Errorf("init storage: %w", err)

@@ -15,10 +15,11 @@ import (
 // handler on the mux. Mirrors how internal/deadline exposes its listener registration: the
 // worker composes, the slice self-contains its wiring.
 
-// StoragePresigner is the lib/storage capability this slice needs — presigned GET/PUT. The
-// worker's *storage.Client satisfies it (its PresignedGet/PresignedPut match). It is an alias
-// of the internal presigner port so the Deps surface names the capability the worker binds.
-type StoragePresigner = presigner
+// StoragePresigner is the lib/storage capability this slice needs — DIRECT object byte access
+// (GetBytes/PutBytes). The worker's *storage.Client satisfies it. Name kept for call-site
+// stability; it is an alias of the internal objectStore port (server-side reads go direct, not
+// via presigned URLs — see storage.go).
+type StoragePresigner = backendStore
 
 // Deps carries everything RegisterExtractionListeners needs from the worker's composition
 // root. All are ports/values the worker already holds: the unit of work (tenant-scoped write

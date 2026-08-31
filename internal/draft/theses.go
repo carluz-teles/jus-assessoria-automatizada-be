@@ -286,6 +286,8 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		SchemaName: "suggest_theses",
 		Model:      model,
 		MaxTokens:  2048,
+		UseCase:    "draft.theses",
+		TenantID:   cmd.TenantID,
 	})
 	llmMs := time.Since(llmStart).Milliseconds()
 	if err != nil {

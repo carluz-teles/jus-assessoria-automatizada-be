@@ -135,7 +135,7 @@ func (uc *AnaliseUseCase) Analisar(ctx context.Context, tenantID, intimationID s
 		return uc.persistDegraded(ctx, tenantID, intimationID), nil
 	}
 
-	view, ok := uc.generate(ctx, intimationID, ctxData)
+	view, ok := uc.generate(ctx, tenantID, intimationID, ctxData)
 	if !ok {
 		// Any LLM/compose/parse fault degrades — never a 5xx on the analyze button.
 		return uc.persistDegraded(ctx, tenantID, intimationID), nil
@@ -152,7 +152,7 @@ func (uc *AnaliseUseCase) Analisar(ctx context.Context, tenantID, intimationID s
 
 // generate composes the prompt, calls the LLM, parses+sanitizes the output. ok=false on any
 // fault (the caller degrades). Never returns an error — faults are logged here.
-func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctxData IntimacaoAnaliseCtx) (IntimacaoAnaliseView, bool) {
+func (uc *AnaliseUseCase) generate(ctx context.Context, tenantID, intimationID string, ctxData IntimacaoAnaliseCtx) (IntimacaoAnaliseView, bool) {
 	members := make([]advisory.MemberCtx, 0, len(ctxData.Members))
 	for _, m := range ctxData.Members {
 		members = append(members, advisory.MemberCtx{UserID: m.UserID, Name: m.Name})
@@ -180,6 +180,8 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctx
 		SchemaName: "intimation_analysis",
 		Model:      uc.model, // "" = cai no default do generator
 		MaxTokens:  1500,
+		UseCase:    "acquisition.analyze_intimation",
+		TenantID:   tenantID,
 	})
 	if err != nil {
 		slog.WarnContext(ctx, "acquisition: intimation analysis generation failed",

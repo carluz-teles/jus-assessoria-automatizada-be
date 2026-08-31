@@ -10,6 +10,22 @@ import (
 	"github.com/pgvector/pgvector-go"
 )
 
+type AiUsageEvent struct {
+	ID               uuid.UUID          `json:"id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	UseCase          string             `json:"use_case"`
+	Provider         string             `json:"provider"`
+	Model            string             `json:"model"`
+	PromptTokens     int32              `json:"prompt_tokens"`
+	CompletionTokens int32              `json:"completion_tokens"`
+	TotalTokens      int32              `json:"total_tokens"`
+	CachedTokens     int32              `json:"cached_tokens"`
+	CostUsd          pgtype.Numeric     `json:"cost_usd"`
+	LatencyMs        int32              `json:"latency_ms"`
+	TraceID          *string            `json:"trace_id"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type AppUser struct {
 	ID          uuid.UUID          `json:"id"`
 	ClerkUserID string             `json:"clerk_user_id"`
@@ -118,6 +134,33 @@ type CourtCase struct {
 	MergedIntoID         pgtype.UUID        `json:"merged_into_id"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
+}
+
+type CourtConnection struct {
+	ID                   uuid.UUID          `json:"id"`
+	TenantID             uuid.UUID          `json:"tenant_id"`
+	AppUserID            uuid.UUID          `json:"app_user_id"`
+	Court                string             `json:"court"`
+	System               string             `json:"system"`
+	AuthenticationMethod string             `json:"authentication_method"`
+	CredentialRef        pgtype.UUID        `json:"credential_ref"`
+	CertificateRef       pgtype.UUID        `json:"certificate_ref"`
+	MfaSeedRef           pgtype.UUID        `json:"mfa_seed_ref"`
+	SessionRef           pgtype.UUID        `json:"session_ref"`
+	Status               string             `json:"status"`
+	LastAuthenticatedAt  pgtype.Timestamptz `json:"last_authenticated_at"`
+	Error                []byte             `json:"error"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
+type CourtFetchState struct {
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CourtConnectionID uuid.UUID          `json:"court_connection_id"`
+	CourtRecordID     uuid.UUID          `json:"court_record_id"`
+	CnjNumber         string             `json:"cnj_number"`
+	ObservedAt        pgtype.Timestamptz `json:"observed_at"`
+	LastFetchedAt     pgtype.Timestamptz `json:"last_fetched_at"`
+	DocketCursor      pgtype.Timestamptz `json:"docket_cursor"`
 }
 
 type CourtRecord struct {

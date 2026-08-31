@@ -212,6 +212,8 @@ func (uc *ReviewUseCase) ReviewDraft(ctx context.Context, cmd ReviewDraftCommand
 		SchemaName: "review_minuta",
 		Model:      uc.model,
 		MaxTokens:  4096,
+		UseCase:    "draft.review",
+		TenantID:   cmd.TenantID,
 	})
 	if err != nil {
 		// Return the error typed as-is; the handler maps via WriteError.

@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -53,7 +55,7 @@ func TestOpenRouterGenerator_RequestAndResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g, err := NewOpenRouterGenerator("sk-test", srv.URL, "openai/gpt-4o-mini", srv.Client())
+	g, err := NewOpenRouterGenerator("sk-test", srv.URL, "openai/gpt-4o-mini", srv.Client(), nil)
 	if err != nil {
 		t.Fatalf("NewOpenRouterGenerator: %v", err)
 	}
@@ -106,6 +108,77 @@ func TestOpenRouterGenerator_RequestAndResponse(t *testing.T) {
 	}
 }
 
+// fakeRecorder captures the last UsageEvent it was handed, and returns err on every call
+// when set — used to assert both the happy-path capture and the best-effort-on-failure
+// contract (a recorder fault must never fail the generation it describes).
+type fakeRecorder struct {
+	got UsageEvent
+	err error
+}
+
+func (r *fakeRecorder) RecordUsage(_ context.Context, ev UsageEvent) error {
+	r.got = ev
+	return r.err
+}
+
+func TestOpenRouterGenerator_RecordsUsageAndCost(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"}}],"usage":{` +
+			`"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"cost":0.001234,` +
+			`"prompt_tokens_details":{"cached_tokens":10}}}`))
+	}))
+	defer srv.Close()
+
+	rec := &fakeRecorder{}
+	g, err := NewOpenRouterGenerator("k", srv.URL, "openai/gpt-4o-mini", srv.Client(), rec)
+	if err != nil {
+		t.Fatalf("NewOpenRouterGenerator: %v", err)
+	}
+
+	if _, err := g.GenerateJSON(context.Background(), Request{
+		SchemaName: "s",
+		Schema:     json.RawMessage(`{}`),
+		UseCase:    "draft.generate",
+		TenantID:   "tenant-1",
+	}); err != nil {
+		t.Fatalf("GenerateJSON: %v", err)
+	}
+
+	if rec.got.TenantID != "tenant-1" || rec.got.UseCase != "draft.generate" {
+		t.Errorf("usage event attribution = %+v", rec.got)
+	}
+	if rec.got.Provider != "openrouter" || rec.got.Model != "openai/gpt-4o-mini" {
+		t.Errorf("usage event provider/model = %+v", rec.got)
+	}
+	wantUsage := Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, CachedTokens: 10, CostUSD: 0.001234}
+	if rec.got.Usage != wantUsage {
+		t.Errorf("usage = %+v, want %+v", rec.got.Usage, wantUsage)
+	}
+}
+
+func TestOpenRouterGenerator_RecorderFailureDoesNotFailGeneration(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"}}],"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	rec := &fakeRecorder{err: errors.New("insert failed")}
+	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client(), rec)
+
+	out, err := g.GenerateJSON(context.Background(), Request{SchemaName: "s", Schema: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("GenerateJSON should succeed despite a recorder failure: %v", err)
+	}
+	if string(out) != `{"ok":true}` {
+		t.Errorf("content = %s", out)
+	}
+}
+
 func TestOpenRouterGenerator_ModelOverrideAndMaxTokens(t *testing.T) {
 	t.Parallel()
 
@@ -116,7 +189,7 @@ func TestOpenRouterGenerator_ModelOverrideAndMaxTokens(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g, _ := NewOpenRouterGenerator("k", srv.URL, "default-model", srv.Client())
+	g, _ := NewOpenRouterGenerator("k", srv.URL, "default-model", srv.Client(), nil)
 	if _, err := g.GenerateJSON(context.Background(), Request{Model: "override/model", MaxTokens: 128, SchemaName: "s", Schema: json.RawMessage(`{}`)}); err != nil {
 		t.Fatalf("GenerateJSON: %v", err)
 	}
@@ -139,7 +212,7 @@ func TestOpenRouterGenerator_RetriesOn429ThenGivesUp(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client())
+	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client(), nil)
 	_, err := g.GenerateJSON(context.Background(), Request{SchemaName: "s", Schema: json.RawMessage(`{}`)})
 	if err == nil {
 		t.Fatal("expected error after exhausting retries on 429")
@@ -167,7 +240,7 @@ func TestOpenRouterGenerator_RetriesThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client())
+	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client(), nil)
 	out, err := g.GenerateJSON(context.Background(), Request{SchemaName: "s", Schema: json.RawMessage(`{}`)})
 	if err != nil {
 		t.Fatalf("expected success after one retry: %v", err)
@@ -191,7 +264,7 @@ func TestOpenRouterGenerator_4xxIsTerminalInvalidNoRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client())
+	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client(), nil)
 	_, err := g.GenerateJSON(context.Background(), Request{SchemaName: "s", Schema: json.RawMessage(`{}`)})
 	if err == nil {
 		t.Fatal("expected error on 401")
@@ -205,19 +278,59 @@ func TestOpenRouterGenerator_4xxIsTerminalInvalidNoRetry(t *testing.T) {
 	}
 }
 
+// TestOpenRouterGenerator_StreamRecordsUsageFromFinalChunk guards the streaming usage
+// capture: OpenRouter's usage arrives on the LAST SSE event, which typically carries an
+// EMPTY choices array — a naive parser that `continue`s on empty choices before checking
+// usage would silently drop the cost of every streamed call.
+func TestOpenRouterGenerator_StreamRecordsUsageFromFinalChunk(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"cost\":0.0005}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	rec := &fakeRecorder{}
+	g, _ := NewOpenRouterGenerator("k", srv.URL, "m", srv.Client(), rec)
+
+	out, err := g.GenerateJSONStream(context.Background(), Request{
+		SchemaName: "s",
+		Schema:     json.RawMessage(`{}`),
+		UseCase:    "draft.chat",
+		TenantID:   "tenant-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("GenerateJSONStream: %v", err)
+	}
+	if string(out) != "hi" {
+		t.Errorf("content = %s", out)
+	}
+
+	wantUsage := Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15, CostUSD: 0.0005}
+	if rec.got.Usage != wantUsage {
+		t.Errorf("usage = %+v, want %+v", rec.got.Usage, wantUsage)
+	}
+	if rec.got.UseCase != "draft.chat" || rec.got.TenantID != "tenant-1" {
+		t.Errorf("usage event attribution = %+v", rec.got)
+	}
+}
+
 func TestNewOpenRouterGenerator_Validation(t *testing.T) {
 	t.Parallel()
 
-	if _, err := NewOpenRouterGenerator("", "https://x", "m", nil); err == nil {
+	if _, err := NewOpenRouterGenerator("", "https://x", "m", nil, nil); err == nil {
 		t.Error("empty api key should error")
 	}
-	if _, err := NewOpenRouterGenerator("k", "", "m", nil); err == nil {
+	if _, err := NewOpenRouterGenerator("k", "", "m", nil, nil); err == nil {
 		t.Error("empty base url should error")
 	}
-	if _, err := NewOpenRouterGenerator("k", "https://x", "", nil); err == nil {
+	if _, err := NewOpenRouterGenerator("k", "https://x", "", nil, nil); err == nil {
 		t.Error("empty default model should error")
 	}
-	if _, err := NewOpenRouterGenerator("k", "https://x", "m", nil); err != nil {
+	if _, err := NewOpenRouterGenerator("k", "https://x", "m", nil, nil); err != nil {
 		t.Errorf("valid config errored: %v", err)
 	}
 }

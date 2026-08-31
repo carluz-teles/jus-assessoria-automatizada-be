@@ -277,7 +277,7 @@ func TestQueueFor(t *testing.T) {
 	}{
 		{"ingestao.movimento.observed", "ingestao"},
 		{"acquisition.integration_activated", "ingestao"}, // regression: stays on "ingestao"
-		{"acquisition.court_record_observed", "ingestao"}, // regression: enrichment stays on "ingestao"
+		{"acquisition.court_record_observed", "ingestao"}, // regression: enrichment consumer stays PRIMARY on "ingestao" (queuesFor fans this one out — see TestQueuesFor)
 		{"acquisition.sync_requested", "ingestao"},        // regression: the work event stays on "ingestao"
 		{"acquisition.diario_requested", "diario"},        // dedicated serialized queue, not "ingestao"
 		// The backfill completion counter gets its OWN light queue, drained by a separate
@@ -324,6 +324,13 @@ func TestQueueFor(t *testing.T) {
 		// (an orphan, same as before this fatia).
 		{"billing.subscription_activated", "default"},
 		{"minuta.revised", "default"},
+		// The FetchAutosBatch self-re-enqueuing job + its per-item retries get their OWN
+		// dedicated queue (cmd/worker-court, low concurrency by design).
+		{"court.fetch_autos_requested", "court_fetch"},
+		{"court.fetch_autos_item_requested", "court_fetch"},
+		// connection_state_changed has no async consumer (FE reads it via polling/SSE) —
+		// deliberately left OFF the court_fetch route, stays on "default" like before.
+		{"court.connection_state_changed", "default"},
 		{"nodot", "default"},
 		{"", "default"},
 	}
@@ -348,9 +355,11 @@ func TestQueuesFor(t *testing.T) {
 	}{
 		// The fan-out event: two consumers on two servers → two queues, ingestao first.
 		{"acquisition.docket_entry_observed", []string{"ingestao", "deadline"}},
+		// A SECOND fan-out: acquisition's enrichment trigger stays first, joined by
+		// internal/court's FetchAutosBatch arrival trigger.
+		{"acquisition.court_record_observed", []string{"ingestao", "court_fetch"}},
 		// Regression: every other event stays single-queue (queueFor unchanged).
 		{"ingestao.movimento.observed", []string{"ingestao"}},
-		{"acquisition.court_record_observed", []string{"ingestao"}},
 		{"acquisition.intimation.observed", []string{"deadline"}},
 		{"deadline.due_soon", []string{"notifications"}},
 		{"ai.revisao.requested", []string{"ai"}},

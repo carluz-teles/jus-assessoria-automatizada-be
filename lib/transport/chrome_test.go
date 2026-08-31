@@ -13,10 +13,10 @@ import (
 func TestChromeTransport_Nil(t *testing.T) {
 	t.Parallel()
 
-	tr := ChromeTransport(nil)
+	tr := ChromeTransport(nil, nil)
 
 	if tr == nil {
-		t.Fatal("ChromeTransport(nil) = nil, want a *http.Transport")
+		t.Fatal("ChromeTransport(nil, nil) = nil, want a *http.Transport")
 	}
 	if tr.DialTLSContext == nil {
 		t.Error("DialTLSContext = nil, want the uTLS Chrome dialer")
@@ -39,7 +39,7 @@ func TestChromeTransport_WithProxy(t *testing.T) {
 		t.Fatalf("url.Parse: %v", err)
 	}
 
-	tr := ChromeTransport(proxyURL)
+	tr := ChromeTransport(proxyURL, nil)
 
 	if tr.DialTLSContext == nil {
 		t.Error("DialTLSContext = nil, want the uTLS Chrome dialer even with a proxy")

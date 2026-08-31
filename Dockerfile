@@ -83,11 +83,32 @@ COPY migrations/ /app/migrations/
 USER appuser
 ENTRYPOINT ["/app/app"]
 
+# ---- runtime-openssl stage: signs with the A1 cert, no Chromium --------------
+# For services that build a KMS-backed certificate signer (internal/certificate)
+# but are plain HTTP clients with no browser engine — today worker-court (eproc
+# FetchAutos, mTLS + document download). NewSigner's BER-encoded .pfx fallback
+# (internal/certificate/pkcs12_ber.go) shells out to `openssl`, which the
+# distroless default lacks — so a real .pfx (Windows/token BER export) fails with
+# a generic "arquivo do certificado inválido" and EVERY sign/fetch dies. This is
+# debian-slim + ca-certs + tzdata + openssl, WITHOUT chromium/fonts (~200MB
+# lighter than runtime-chromium). Same reason worker-filing would need it if/when
+# it signs server-side.
+FROM debian:bookworm-slim AS runtime-openssl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates tzdata openssl \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --uid 10001 appuser
+WORKDIR /app
+COPY --from=build /out/app /app/app
+COPY migrations/ /app/migrations/
+USER appuser
+ENTRYPOINT ["/app/app"]
+
 # ---- runtime stage (DEFAULT): minimal, non-root, no shell --------------------
-# LAST stage = the implicit target for a target-less build, so the other five
+# LAST stage = the implicit target for a target-less build, so the remaining
 # services (and any `docker build` without --target) keep the same lean distroless
-# static image they had before. Only worker-documents overrides to runtime-ocr,
-# api overrides to runtime-chromium.
+# static image they had before. worker-documents overrides to runtime-ocr, api to
+# runtime-chromium, worker-court to runtime-openssl.
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 WORKDIR /app
 

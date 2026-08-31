@@ -38,6 +38,22 @@ type Credentials struct {
 	Password string
 }
 
+// authMode selects which login mechanism the client uses. Certificate mode exists
+// because eproc's "Certificado Digital" option is genuinely a different mechanism from
+// password login (confirmed against TJSP's own manuals): the browser's native
+// certificate picker appearing is the signature of the server REQUESTING a client
+// certificate during the TLS handshake (mutual TLS), not an in-page challenge/response
+// like Lacuna Web PKI. The private key never enters this package — the caller's
+// *http.Client is already mTLS-authenticated (via transport.ChromeTransport's
+// clientCert param) before any request here is sent; certLogin only confirms the
+// handshake actually established a session and surfaces the (expected) TOTP MFA step.
+type authMode int
+
+const (
+	authModePassword    authMode = iota // default: username/password ROPC-style POST
+	authModeCertificate                 // mutual TLS already negotiated by the transport
+)
+
 // Process is the minimal court-case shape D0 dumps: enough to prove the read reached a
 // real process. Parsing is provisional (see wiring.go).
 type Process struct {
@@ -65,10 +81,19 @@ type Event struct {
 }
 
 // DocumentRef points at a downloadable document within an event.
+//
+// DownloadPath is the ONLY way to fetch the bytes: eproc's real document link
+// (a.infraLinkDocumento href — CONFIRMED live 2026-08-31) is a session-bound
+// "controlador.php?acao=acessar_documento&doc=…&evento=…&key=…&hash=…" whose
+// key/hash are per-document security tokens that CANNOT be reconstructed from
+// the doc id alone — so the parser must capture the whole href, and the download
+// must happen within the same session that rendered the event page (which is
+// exactly what internal/court's FetchAutos does).
 type DocumentRef struct {
-	ExternalID string
-	Label      string
-	MIMEType   string
+	ExternalID   string // data-doc — stable per-document id (traceability/dedup)
+	DownloadPath string // page-relative href carrying the acessar_documento key/hash
+	Label        string // data-nome
+	MIMEType     string // data-mimetype
 }
 
 // SessionStatus mirrors the court_connection state machine (ERD §5) that matters to a
@@ -97,6 +122,9 @@ type Client struct {
 	mu       sync.Mutex
 	status   SessionStatus
 	authOnce *authGroup
+
+	mode     authMode
+	totpSeed string
 }
 
 // Option tunes a Client at construction (functional options, per the repo convention).
@@ -116,6 +144,30 @@ func WithBaseURL(baseURL string) Option {
 func WithCredentials(creds Credentials) Option {
 	return func(c *Client) {
 		c.creds = creds
+	}
+}
+
+// WithCertificateAuth switches the client to certificate-login mode: Login/re-auth
+// skip the username/password POST and instead confirm the session the caller's
+// mTLS-configured *http.Client should already have established (see authMode's doc).
+// The caller is responsible for injecting the client certificate into the transport
+// (transport.ChromeTransport's clientCert param) — this package never touches key
+// material.
+func WithCertificateAuth() Option {
+	return func(c *Client) {
+		c.mode = authModeCertificate
+	}
+}
+
+// WithTOTPSeed configures the RFC 6238 seed captured once at MFA enrollment (see
+// internal/court's MFAEnroller) so classifyLoginResult can complete the "kc-otp-login-form"
+// step automatically — generating the 6-digit code on the fly instead of surfacing
+// Forbidden. The seed itself is caller-managed (decrypted from the vault right before
+// building the Client); this package never persists it. An empty seed (the default)
+// keeps the current behavior: an MFA challenge always surfaces as Forbidden.
+func WithTOTPSeed(seed string) Option {
+	return func(c *Client) {
+		c.totpSeed = seed
 	}
 }
 
@@ -190,41 +242,104 @@ func (c *Client) Reset() {
 }
 
 // GetProcess fetches one process by CNJ number, authenticating first if needed and
-// re-authenticating once if the portal rejects the session mid-flight.
+// re-authenticating once if the portal rejects the session mid-flight. Runs the
+// REAL search flow (fetchProcessPage — CONFIRMED live, 2026-08-31) rather than a
+// single request: eproc has no direct "GET process by CNJ" endpoint, only a
+// session-bound quick-search form.
 func (c *Client) GetProcess(ctx context.Context, cnjNumber string) (*Process, error) {
-	body, err := c.doAuthed(ctx, http.MethodGet, c.processPath(cnjNumber), nil)
+	page, err := c.fetchProcessPage(ctx, cnjNumber)
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
-
-	proc, err := parseProcess(body)
+	proc, err := parseProcessHTML(page)
 	if err != nil {
 		return nil, apperr.NewUnavailable("eproc: parse process", err)
 	}
+	proc.CNJNumber = cnjNumber
 	return proc, nil
 }
 
-// ListEvents fetches the event tree (docket) of a process.
+// ListEvents fetches the event tree (docket) of a process. Runs its OWN search
+// (see GetProcess's doc) — the process detail and its docket ride the SAME
+// result page on the real portal, so calling both back to back costs two
+// searches; internal/court's EprocProvider accepts that for now (correctness
+// first — see this package's CHANGELOG-style doc comment at the top of the file
+// for the follow-up to fetch once and parse both).
 func (c *Client) ListEvents(ctx context.Context, cnjNumber string) ([]Event, error) {
-	body, err := c.doAuthed(ctx, http.MethodGet, c.eventsPath(cnjNumber), nil)
+	page, err := c.fetchProcessPage(ctx, cnjNumber)
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
-
-	events, err := parseEvents(body)
+	events, err := parseEventsHTML(page)
 	if err != nil {
 		return nil, apperr.NewUnavailable("eproc: parse events", err)
 	}
 	return events, nil
 }
 
+// fetchProcessPage runs the REAL two-step quick search CONFIRMED live against
+// production (2026-08-29 login, 2026-08-31 full search+result): GET
+// processo_selecionar_publica (lands on a page whose "formPesquisaRapida" carries
+// a SESSION-BOUND action — the hash changes per session) → POST that action with
+// the CNJ. The resulting page IS the process detail + docket table both parsers
+// below read. Each step goes through doAuthed, so a stale session re-authenticates
+// exactly like every other read in this package.
+func (c *Client) fetchProcessPage(ctx context.Context, cnjNumber string) ([]byte, error) {
+	cnj := formatCNJ(cnjNumber)
+
+	body1, err := c.doAuthed(ctx, http.MethodGet, eprocSearchPublicPath(cnj), nil)
+	if err != nil {
+		return nil, err
+	}
+	page1, err := io.ReadAll(body1)
+	body1.Close()
+	if err != nil {
+		return nil, apperr.NewUnavailable("eproc: read search page", err)
+	}
+
+	action, err := extractPesquisaRapidaAction(page1)
+	if err != nil {
+		return nil, apperr.NewNotFound("eproc: process not found (no search form on the result page)")
+	}
+
+	form := url.Values{"txtNumProcessoPesquisaRapida": {cnj}}
+	body2, err := c.doAuthed(ctx, http.MethodPost, "/eproc/"+action, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	page2, err := io.ReadAll(body2)
+	body2.Close()
+	if err != nil {
+		return nil, apperr.NewUnavailable("eproc: read process result page", err)
+	}
+	return page2, nil
+}
+
 // DownloadDocument streams one document to dst, returning the number of bytes written.
-// It streams straight from the response body into dst (io.Copy) so a large PDF never
-// materializes in memory — the D0 requirement to not OOM on downloads.
-func (c *Client) DownloadDocument(ctx context.Context, docExternalID string, dst io.Writer) (int64, error) {
-	body, err := c.doAuthed(ctx, http.MethodGet, c.documentPath(docExternalID), nil)
+// downloadPath is DocumentRef.DownloadPath — the session-bound acessar_documento href
+// captured from the event page (see DocumentRef's doc for why the path itself, not a
+// reconstructed id, is required).
+//
+// eproc serves documents in TWO steps (CONFIRMED live 2026-08-31): acessar_documento
+// returns a small HTML wrapper whose <iframe id="conteudoIframe"> src
+// (acessar_documento_implementacao, carrying its OWN key/hash) serves the real bytes.
+// So this fetches the wrapper (buffered — it is only a few KB), follows the iframe,
+// and STREAMS the content into dst (io.Copy) so a large PDF never materializes in
+// memory — the D0 requirement to not OOM on downloads. A wrapper with no iframe is
+// taken to BE the document (e.g. an inline HTML doc) and written verbatim.
+func (c *Client) DownloadDocument(ctx context.Context, downloadPath string, dst io.Writer) (int64, error) {
+	wrapper, err := c.getAllAuthed(ctx, eprocResolveDocPath(downloadPath))
+	if err != nil {
+		return 0, err
+	}
+
+	contentPath := extractDocContentPath(wrapper)
+	if contentPath == "" {
+		n, werr := dst.Write(wrapper)
+		return int64(n), werr
+	}
+
+	body, err := c.doAuthed(ctx, http.MethodGet, eprocResolveDocPath(contentPath), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -235,6 +350,21 @@ func (c *Client) DownloadDocument(ctx context.Context, docExternalID string, dst
 		return n, apperr.NewUnavailable("eproc: stream document", err)
 	}
 	return n, nil
+}
+
+// getAllAuthed runs an authenticated GET and returns the fully-read body — for
+// small responses (the document wrapper, a search page) where buffering is fine.
+func (c *Client) getAllAuthed(ctx context.Context, path string) ([]byte, error) {
+	body, err := c.doAuthed(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return nil, apperr.NewUnavailable("eproc: read response", err)
+	}
+	return data, nil
 }
 
 // doAuthed runs an authenticated request with the re-auth-on-rejection loop. It ensures a
@@ -286,6 +416,9 @@ func (c *Client) send(ctx context.Context, method, path string, reqBody io.Reade
 		return nil, apperr.NewInfra("eproc: build request", err)
 	}
 	applyBrowserHeaders(httpReq)
+	if method == http.MethodPost {
+		httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 
 	resp, err := c.hc.Do(httpReq)
 	if err != nil {
@@ -315,18 +448,4 @@ func (c *Client) markDisconnected() {
 	c.mu.Lock()
 	c.status = StatusDisconnected
 	c.mu.Unlock()
-}
-
-// processPath/eventsPath/documentPath build the portal paths. They are provisional
-// (Portão B) — kept as one-liners here so the real paths are a one-line fix.
-func (c *Client) processPath(cnjNumber string) string {
-	return eprocProcessPath(url.QueryEscape(cnjNumber))
-}
-
-func (c *Client) eventsPath(cnjNumber string) string {
-	return eprocEventsPath(url.QueryEscape(cnjNumber))
-}
-
-func (c *Client) documentPath(docExternalID string) string {
-	return eprocDocumentPath(url.QueryEscape(docExternalID))
 }
