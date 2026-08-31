@@ -20,12 +20,15 @@ import (
 	"crypto"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jusassessoria/platform/internal/certificate"
 	"github.com/jusassessoria/platform/internal/court"
@@ -153,10 +156,12 @@ func run(logger *slog.Logger) error {
 		uow := database.NewUnitOfWork(pool)
 		courtUC := court.NewUseCase(court.NewRepository(), uow, vlt, events.NewOutbox())
 		recordWriter := courtRecordWriterAdapter{uow: database.NewUnitOfWork(pool)}
+		partyWriter := partyWriterAdapter{uow: database.NewUnitOfWork(pool)}
 		courtUC.RegisterProvider("EPROC", court.NewEprocProvider(
 			courtCertSignerFunc(certUC.NewSigner),
 			documentWriter,
 			court.WithCourtRecordWriter(recordWriter),
+			court.WithPartyWriter(partyWriter),
 		))
 
 		listener := court.NewListener(courtUC)
@@ -252,6 +257,105 @@ type documentWriterAdapter struct {
 // (magistrate, court_situation, competence) refresh when present and are otherwise kept.
 type courtRecordWriterAdapter struct {
 	uow database.UnitOfWork
+}
+
+// partyWriterAdapter satisfies court.PartyWriter by persisting the eproc capa parties
+// (autor/réu + CPF/CNPJ + advogados) into the SAME party/party_counsel tables DJEN
+// writes (owned by internal/acquisition), with source='EPROC'. Like courtRecordWriterAdapter
+// it is the cross-slice glue: it writes directly through a tenant-scoped UoW (RLS) rather
+// than routing through an acquisition use case (which does not yet expose this narrow
+// write) — promoting it to a proper acquisition write path is the follow-up.
+//
+// CONSISTENCY (fill-if-missing — never clobber DATAJUD/DJEN):
+//   - party is upserted on its natural key (tenant, case, role, name). ON CONFLICT only
+//     fills document when it is currently NULL, so the CPF/CNPJ eproc discloses lands on a
+//     DJEN-created (document-less) row without touching its source/name. A brand-new party
+//     is inserted with source='EPROC'.
+//   - party_counsel is inserted ON CONFLICT (tenant, party, oab, uf) DO NOTHING — a DJEN
+//     advogado already on file is left intact; a new one lands with source='EPROC'.
+//
+// eproc's polo ("AUTOR"/"REU") is mapped onto the persistence role enum
+// (PLAINTIFF/DEFENDANT) here so eproc parties share the DJEN unique key and the
+// fill-if-missing merge actually finds the matching row. A polo we don't map is skipped
+// rather than written under an unknown role.
+type partyWriterAdapter struct {
+	uow database.UnitOfWork
+}
+
+func (a partyWriterAdapter) UpsertParties(ctx context.Context, tenantID, courtRecordID string, parties []court.ProcessParty) error {
+	if len(parties) == 0 {
+		return nil
+	}
+	return a.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		var caseID string
+		err := tx.QueryRow(ctx,
+			`SELECT case_id FROM court_record WHERE id = $1 AND tenant_id = $2`,
+			courtRecordID, tenantID,
+		).Scan(&caseID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // court_record gone (or foreign) — nothing to attach parties to
+		}
+		if err != nil {
+			return fmt.Errorf("resolve case_id for court_record: %w", err)
+		}
+
+		for _, party := range parties {
+			role, ok := partyRoleFromPolo(party.Role)
+			if !ok {
+				continue // unknown polo — don't invent a role
+			}
+			if err := a.upsertParty(ctx, tx, tenantID, caseID, role, party); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// upsertParty inserts (or fill-if-missing updates) one party and its advogados.
+func (a partyWriterAdapter) upsertParty(ctx context.Context, tx database.Tx, tenantID, caseID, role string, party court.ProcessParty) error {
+	const upsertPartyQ = `
+		INSERT INTO party (tenant_id, case_id, role, name, document, source)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), 'EPROC')
+		ON CONFLICT (tenant_id, case_id, role, name)
+		DO UPDATE SET document = COALESCE(party.document, NULLIF(EXCLUDED.document, ''))
+		RETURNING id`
+	var partyID string
+	err := tx.QueryRow(ctx, upsertPartyQ,
+		tenantID, caseID, role, party.Name, party.Document,
+	).Scan(&partyID)
+	if err != nil {
+		return fmt.Errorf("upsert party: %w", err)
+	}
+
+	const upsertCounselQ = `
+		INSERT INTO party_counsel (tenant_id, party_id, name, oab, uf, source)
+		VALUES ($1, $2, $3, $4, $5, 'EPROC')
+		ON CONFLICT (tenant_id, party_id, oab, uf) DO NOTHING`
+	for _, c := range party.Counsels {
+		if c.OAB == "" && c.UF == "" {
+			continue // no natural key to dedup on — skip rather than write an anonymous row
+		}
+		if _, err := tx.Exec(ctx, upsertCounselQ, tenantID, partyID, c.Name, c.OAB, c.UF); err != nil {
+			return fmt.Errorf("upsert party counsel: %w", err)
+		}
+	}
+	return nil
+}
+
+// partyRoleFromPolo maps eproc's normalized polo ("AUTOR"/"REU") onto the party.role
+// enum DJEN also writes (PLAINTIFF/DEFENDANT), so eproc parties merge into the SAME row
+// DJEN created for that participant (shared unique key). An unrecognized polo yields
+// ok=false so the caller skips it rather than writing under an unknown role.
+func partyRoleFromPolo(polo string) (role string, ok bool) {
+	switch strings.ToUpper(strings.TrimSpace(polo)) {
+	case "AUTOR":
+		return "PLAINTIFF", true
+	case "REU":
+		return "DEFENDANT", true
+	default:
+		return "", false
+	}
 }
 
 func (a courtRecordWriterAdapter) UpdateProcessMetadata(ctx context.Context, tenantID, courtRecordID string, meta court.ProcessMetadata) error {

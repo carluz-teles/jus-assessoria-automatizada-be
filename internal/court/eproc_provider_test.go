@@ -169,6 +169,92 @@ func TestEprocProvider_downloadNewDocuments_NilDocWriterIsNoOp(t *testing.T) {
 	assert.Equal(t, 0, downloaded)
 }
 
+// fakePartyWriter is an in-memory PartyWriter — records the last UpsertParties call
+// and can be told to fail, so tests can prove writeParties maps the eproc parties
+// faithfully and swallows a writer error (best-effort enrichment, never fails the fetch).
+type fakePartyWriter struct {
+	fail    bool
+	calls   int
+	lastCtx context.Context //nolint:containedctx // test capture only
+	lastTID string
+	lastCRI string
+	last    []ProcessParty
+}
+
+func (w *fakePartyWriter) UpsertParties(ctx context.Context, tenantID, courtRecordID string, parties []ProcessParty) error {
+	w.calls++
+	w.lastCtx = ctx
+	w.lastTID = tenantID
+	w.lastCRI = courtRecordID
+	w.last = parties
+	if w.fail {
+		return assert.AnError
+	}
+	return nil
+}
+
+func TestEprocProvider_writeParties_MapsPartiesAndCounsels(t *testing.T) {
+	writer := &fakePartyWriter{}
+	p := NewEprocProvider(nil, nil, WithPartyWriter(writer))
+
+	proc := &eproc.Process{Parties: []eproc.Party{
+		{
+			Role:     "AUTOR",
+			Name:     "MURILO DE PAULA BALDAN",
+			Document: "284.669.278-59",
+			Counsels: []eproc.Counsel{{Name: "PAULO SOUZA", OAB: "321511", UF: "SP"}},
+		},
+		{
+			Role:     "REU",
+			Name:     "RITA MARCIA MONTEIRO SEZEFREDO",
+			Document: "",
+			Counsels: nil,
+		},
+	}}
+
+	p.writeParties(context.Background(), "tenant-1", "record-1", proc)
+
+	require.Equal(t, 1, writer.calls)
+	assert.Equal(t, "tenant-1", writer.lastTID)
+	assert.Equal(t, "record-1", writer.lastCRI)
+	require.Len(t, writer.last, 2)
+
+	assert.Equal(t, ProcessParty{
+		Role:     "AUTOR",
+		Name:     "MURILO DE PAULA BALDAN",
+		Document: "284.669.278-59",
+		Counsels: []ProcessCounsel{{Name: "PAULO SOUZA", OAB: "321511", UF: "SP"}},
+	}, writer.last[0])
+
+	assert.Equal(t, "REU", writer.last[1].Role)
+	assert.Empty(t, writer.last[1].Document)
+	assert.Empty(t, writer.last[1].Counsels)
+}
+
+func TestEprocProvider_writeParties_NilWriterAndEmptyPartiesAreNoOp(t *testing.T) {
+	// nil writer: must not panic.
+	NewEprocProvider(nil, nil).writeParties(context.Background(), "t", "r", &eproc.Process{
+		Parties: []eproc.Party{{Role: "AUTOR", Name: "X"}},
+	})
+
+	// empty parties: writer is never called.
+	writer := &fakePartyWriter{}
+	p := NewEprocProvider(nil, nil, WithPartyWriter(writer))
+	p.writeParties(context.Background(), "t", "r", &eproc.Process{Parties: nil})
+	assert.Equal(t, 0, writer.calls)
+}
+
+func TestEprocProvider_writeParties_WriterErrorIsSwallowed(t *testing.T) {
+	writer := &fakePartyWriter{fail: true}
+	p := NewEprocProvider(nil, nil, WithPartyWriter(writer))
+
+	// No panic, no propagation — writeParties returns nothing; the fetch is not failed.
+	p.writeParties(context.Background(), "t", "r", &eproc.Process{
+		Parties: []eproc.Party{{Role: "AUTOR", Name: "X"}},
+	})
+	assert.Equal(t, 1, writer.calls)
+}
+
 func TestDocTitleAndType(t *testing.T) {
 	tests := []struct {
 		name          string

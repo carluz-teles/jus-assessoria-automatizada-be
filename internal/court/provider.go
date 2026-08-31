@@ -88,6 +88,39 @@ type CourtRecordWriter interface {
 	UpdateProcessMetadata(ctx context.Context, tenantID, courtRecordID string, meta ProcessMetadata) error
 }
 
+// ProcessParty is one process participant (autor/réu + CPF/CNPJ + advogados) FetchAutos
+// reads off the eproc capa and hands to the PartyWriter. Role carries eproc's own polo
+// verbatim ("AUTOR"/"REU") — the adapter (cmd/worker-court) maps it onto the persistence
+// layer's role enum (PLAINTIFF/DEFENDANT), keeping this port free of DB vocabulary, the
+// same "generic types only" posture as ProcessMetadata. eproc, unlike DJEN, discloses the
+// CPF/CNPJ in clear, so Document is usually populated (the whole reason to capture parties
+// here rather than rely on DJEN's document-less rows).
+type ProcessParty struct {
+	Role     string // "AUTOR" / "REU" — eproc's polo, verbatim
+	Name     string
+	Document string // CPF/CNPJ in clear; "" when the capa carried none
+	Counsels []ProcessCounsel
+}
+
+// ProcessCounsel is one advogado tied to a ProcessParty (name + OAB + UF), matching the
+// party_counsel columns the adapter upserts into.
+type ProcessCounsel struct {
+	Name string
+	OAB  string
+	UF   string
+}
+
+// PartyWriter is the narrow port FetchAutos uses to persist the process parties above
+// into the SAME tables DJEN writes (party + party_counsel, owned by internal/acquisition),
+// with source='EPROC'. Generic types only (no internal/acquisition import — cmd/worker-court's
+// adapter is the only place allowed to know both slices). nil is fine — the write is then a
+// silent no-op (e.g. the api process wires no writer). The adapter is fill-if-missing: it
+// never clobbers an authoritative DATAJUD/DJEN row, only supplies what's absent (the CPF/CNPJ
+// eproc discloses and DJEN does not).
+type PartyWriter interface {
+	UpsertParties(ctx context.Context, tenantID, courtRecordID string, parties []ProcessParty) error
+}
+
 // AutosResult is what a successful FetchAutos call surfaces: the process
 // itself, its docket entries (kept in-memory only — never persisted as a
 // competing andamento store, see FetchAutos's doc), and how many NEW

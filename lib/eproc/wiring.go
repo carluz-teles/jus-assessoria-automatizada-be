@@ -413,9 +413,9 @@ func readBoundedPrefix(r io.Reader) []byte {
 // portal has no API, only server-rendered pages meant for a browser). Parsed with
 // golang.org/x/net/html (already a dependency — via otel/fiber transitively, not a
 // new one) instead of regex: the cells are deeply nested (buttons, scripts, divs)
-// in ways regex handles poorly. Parties are NOT parsed yet (tblPartesERepresentantes
-// exists on the page but its row shape isn't confirmed) — Process.Parties stays
-// empty; nothing in this fatia's scope reads it yet.
+// in ways regex handles poorly. Parties ARE parsed now (parsePartiesHTML, below) off
+// #tblPartesERepresentantes — CONFIRMED live: the capa exposes autor/réu, their
+// CPF/CNPJ in clear, and their advogados (OAB), richer than DJEN.
 
 // parseHTMLDocument parses an eproc page into an html tree, decoding its charset to
 // UTF-8 first. eproc serves ISO-8859-1 (Latin-1) — accented values (magistrado,
@@ -456,7 +456,127 @@ func parseProcessHTML(body []byte) (*Process, error) {
 		Situation:   text("txtSituacao"),
 		Competence:  text("txtCompetencia"),
 		FiledAt:     parseEproDateTime(text("txtAutuacao")),
+		Parties:     parsePartiesFromRoot(root),
 	}, nil
+}
+
+// cpfCnpjRe extracts a CPF/CNPJ from the capa's "( 284.669.278-59 ) - Pessoa Física"
+// rendering — the fallback used when a party block carries no spnCpfParte* span (some
+// rows render the document only inside the parenthesized text). Compiled once (regex
+// compilation allocates; see the file's other package-level regexps).
+var cpfCnpjRe = regexp.MustCompile(`\d{3}\.\d{3}\.\d{3}-\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}`)
+
+// oabRe splits an eproc OAB rendering ("SP321511") into its UF ("SP") and number
+// ("321511"): two letters followed by the registration digits. A value that doesn't
+// match (already-formatted, foreign, empty) yields no split and is carried as-is in OAB.
+var oabRe = regexp.MustCompile(`^([A-Za-z]{2})\s*(\d+)$`)
+
+// parsePartiesFromRoot extracts the process's partes (autor/réu + CPF/CNPJ + advogados)
+// off #tblPartesERepresentantes ONLY — the search is SCOPED to that table so the same
+// data-parte attribute appearing elsewhere on the page (a <style> selector like
+// span.infraEventoPrazoParte[data-parte="AUTOR"], or a docket row) is never mistaken
+// for a party. Authors (AUTOR) are ordered before réus (REU). Returns an empty slice
+// (never nil) when the table is absent, so callers can range freely.
+func parsePartiesFromRoot(root *html.Node) []Party {
+	table := findByID(root, "tblPartesERepresentantes")
+	if table == nil {
+		return []Party{}
+	}
+
+	blocks := findAllByAttr(table, "data-parte")
+	autores := make([]Party, 0, len(blocks))
+	reus := make([]Party, 0, len(blocks))
+	for _, block := range blocks {
+		polo := strings.ToUpper(strings.TrimSpace(attrVal(block, "data-parte")))
+		if polo != "AUTOR" && polo != "REU" {
+			continue // other polos (e.g. TERCEIRO) aren't split into cards yet
+		}
+		party := parsePartyBlock(block, polo)
+		if party.Name == "" {
+			continue // a data-parte carrier with no name is decoration, not a party
+		}
+		if polo == "AUTOR" {
+			autores = append(autores, party)
+		} else {
+			reus = append(reus, party)
+		}
+	}
+	return append(autores, reus...)
+}
+
+// parsePartyBlock turns one data-parte element into a Party: its name (the block's own
+// text minus the CPF/tooltip decorations), the CPF/CNPJ (a spnCpfParte* span if present,
+// else the parenthesized-text fallback), and every advogado tied to it.
+func parsePartyBlock(block *html.Node, polo string) Party {
+	return Party{
+		Name:        partyName(block),
+		Role:        polo,
+		Document:    partyDocument(block),
+		RawDocument: partyDocument(block),
+		Counsels:    parseCounsels(block),
+	}
+}
+
+// partyName reads the party's name span (spnNomeParte*) when the capa renders one, and
+// otherwise falls back to the block's leading text line — the name always precedes the
+// "( CPF ) - Pessoa Física" decoration, so trimming at the first "(" recovers it.
+func partyName(block *html.Node) string {
+	if span := findByIDPrefix(block, "spnNomeParte"); span != nil {
+		if name := strings.TrimSpace(textContent(span)); name != "" {
+			return name
+		}
+	}
+	raw := strings.TrimSpace(textContent(block))
+	if i := strings.IndexByte(raw, '('); i >= 0 {
+		raw = raw[:i]
+	}
+	// Collapse the name to its first non-empty line (the block's tail may carry the
+	// advogado renderings, which are separate <a> elements, not part of the name).
+	for _, line := range strings.Split(raw, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// partyDocument reads the party's CPF/CNPJ: first a spnCpfParte* span (the capa's
+// dedicated field, e.g. spnCpfParteAutor0="284.669.278-59"), then the parenthesized
+// "( 284.669.278-59 ) - Pessoa Física" text as a fallback. "" when neither is present.
+func partyDocument(block *html.Node) string {
+	if span := findByIDPrefix(block, "spnCpfParte"); span != nil {
+		if doc := cpfCnpjRe.FindString(textContent(span)); doc != "" {
+			return doc
+		}
+	}
+	return cpfCnpjRe.FindString(textContent(block))
+}
+
+// parseCounsels collects every advogado under a party block: eproc renders each as an
+// <a> whose onmouseover calls infraTooltipMostrar('ADVOGADO',…) and whose content is the
+// OAB ("UF+numero", e.g. "SP321511"); the advogado's NAME is the text immediately
+// preceding that <a>. A block with no such <a> yields an empty slice.
+func parseCounsels(block *html.Node) []Counsel {
+	var out []Counsel
+	for _, a := range findAllAdvogadoLinks(block) {
+		uf, oab := splitOAB(strings.TrimSpace(textContent(a)))
+		out = append(out, Counsel{
+			Name: nameBeforeNode(a),
+			OAB:  oab,
+			UF:   uf,
+		})
+	}
+	return out
+}
+
+// splitOAB splits eproc's "SP321511" into UF="SP", OAB="321511". A value that doesn't
+// match the UF+digits shape is returned whole as the OAB with an empty UF, rather than
+// guessing.
+func splitOAB(raw string) (uf, oab string) {
+	if m := oabRe.FindStringSubmatch(raw); m != nil {
+		return strings.ToUpper(m[1]), m[2]
+	}
+	return "", raw
 }
 
 // parseEventsHTML extracts the docket (#tblEventos) — one row per movimentação,
@@ -548,6 +668,99 @@ func findByID(n *html.Node, id string) *html.Node {
 		}
 	}
 	return nil
+}
+
+// findByIDPrefix returns the first descendant element whose id STARTS WITH prefix —
+// eproc numbers per-party spans (spnCpfParteAutor0, spnNomeParteReu1, …), so an exact
+// id can't be known ahead of time; the prefix is enough to find the one inside a given
+// party block.
+func findByIDPrefix(n *html.Node, prefix string) *html.Node {
+	if n.Type == html.ElementNode && strings.HasPrefix(attrVal(n, "id"), prefix) {
+		return n
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if found := findByIDPrefix(c, prefix); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// findAllByAttr collects every descendant element (and n itself) that carries the
+// attribute key with a non-empty value, in document order. Used to find party blocks
+// by their data-parte attribute WITHIN the parties table — the scoping that keeps a
+// data-parte in a <style> selector or a docket row from being read as a party.
+func findAllByAttr(n *html.Node, key string) []*html.Node {
+	var out []*html.Node
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && attrVal(n, key) != "" {
+			out = append(out, n)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// findAllAdvogadoLinks collects every <a> under n that eproc marks as an advogado —
+// either by an infraTooltipMostrar('ADVOGADO',…) onmouseover or by an adjacent
+// <div class="sr-only">Tipo de Usuário: ADVOGADO</div> (the two ways the capa flags
+// the role). Other <a> links in the block (a party's own profile link, e.g.) are
+// skipped so only real advogados become Counsels.
+func findAllAdvogadoLinks(n *html.Node) []*html.Node {
+	var out []*html.Node
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" && isAdvogadoLink(n) {
+			out = append(out, n)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// isAdvogadoLink reports whether an <a> is an advogado marker: its onmouseover invokes
+// infraTooltipMostrar('ADVOGADO',…), or a following sibling <div class="sr-only">
+// spells out "Tipo de Usuário: ADVOGADO".
+func isAdvogadoLink(a *html.Node) bool {
+	if strings.Contains(attrVal(a, "onmouseover"), "'ADVOGADO'") {
+		return true
+	}
+	for s := a.NextSibling; s != nil; s = s.NextSibling {
+		if s.Type == html.ElementNode && hasClass(s, "sr-only") &&
+			strings.Contains(strings.ToUpper(textContent(s)), "ADVOGADO") {
+			return true
+		}
+	}
+	return false
+}
+
+// nameBeforeNode returns the advogado's name: the trimmed text that immediately
+// precedes the <a> element (the capa renders "PAULO SERGIO DE OLIVEIRA SOUZA" then the
+// OAB <a>). It walks target's preceding text siblings, taking the last non-empty line.
+func nameBeforeNode(target *html.Node) string {
+	for s := target.PrevSibling; s != nil; s = s.PrevSibling {
+		var text string
+		switch s.Type {
+		case html.TextNode:
+			text = s.Data
+		case html.ElementNode:
+			text = textContent(s)
+		}
+		lines := strings.Split(text, "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			if line := strings.TrimSpace(lines[i]); line != "" {
+				return line
+			}
+		}
+	}
+	return ""
 }
 
 // findEventRows collects every <tr id="trEventoNN"> under n, in document order.

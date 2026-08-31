@@ -48,6 +48,7 @@ type EprocProvider struct {
 	certSigner   CertSigner
 	docWriter    DocumentWriter    // nil is fine — FetchAutos just skips document download (S3 not configured, same optional-adapter posture as the rest of the stack)
 	recordWriter CourtRecordWriter // nil is fine — FetchAutos then skips the capa-metadata enrichment
+	partyWriter  PartyWriter       // nil is fine — FetchAutos then skips persisting the capa parties
 	proxyURL     *url.URL          // optional residential/BR proxy — same anti-bot posture DJEN needed
 }
 
@@ -63,6 +64,13 @@ func WithEprocProxy(proxyURL *url.URL) EprocProviderOption {
 // capa metadata FetchAutos reads (nil keeps that a no-op).
 func WithCourtRecordWriter(w CourtRecordWriter) EprocProviderOption {
 	return func(p *EprocProvider) { p.recordWriter = w }
+}
+
+// WithPartyWriter injects the port that persists the capa parties (autor/réu + CPF/CNPJ
+// + advogados) FetchAutos reads into the shared party/party_counsel tables (nil keeps
+// that a no-op).
+func WithPartyWriter(w PartyWriter) EprocProviderOption {
+	return func(p *EprocProvider) { p.partyWriter = w }
 }
 
 // NewEprocProvider builds the eproc adapter. certSigner is required — a connection
@@ -124,6 +132,7 @@ func (p *EprocProvider) FetchAutos(ctx context.Context, conn *CourtConnection, s
 	}
 	if procErr == nil {
 		p.writeProcessMetadata(ctx, conn.TenantID, courtRecordID, proc)
+		p.writeParties(ctx, conn.TenantID, courtRecordID, proc)
 	}
 	if eventsErr == nil {
 		downloaded = p.downloadNewDocuments(ctx, client, conn.TenantID, courtRecordID, events, docketCursor)
@@ -221,6 +230,33 @@ func (p *EprocProvider) writeProcessMetadata(ctx context.Context, tenantID, cour
 		Competence:  proc.Competence,
 		FiledAt:     proc.FiledAt,
 	})
+}
+
+// writeParties hands the eproc capa parties (autor/réu + CPF/CNPJ + advogados) to the
+// PartyWriter to persist into the shared party/party_counsel tables (source='EPROC',
+// fill-if-missing — see PartyWriter's doc). A nil writer (api process, or a fetch with
+// no party sink) is a no-op; a write error is swallowed on purpose — persisting the
+// parties is a best-effort enrichment, never a reason to fail (and thus retry) the whole
+// autos fetch, whose real payload (documents + docket cursor) already succeeded by the
+// time this runs. Same posture as writeProcessMetadata.
+func (p *EprocProvider) writeParties(ctx context.Context, tenantID, courtRecordID string, proc *eproc.Process) {
+	if p.partyWriter == nil || proc == nil || len(proc.Parties) == 0 {
+		return
+	}
+	parties := make([]ProcessParty, 0, len(proc.Parties))
+	for _, pt := range proc.Parties {
+		counsels := make([]ProcessCounsel, 0, len(pt.Counsels))
+		for _, c := range pt.Counsels {
+			counsels = append(counsels, ProcessCounsel{Name: c.Name, OAB: c.OAB, UF: c.UF})
+		}
+		parties = append(parties, ProcessParty{
+			Role:     pt.Role,
+			Name:     pt.Name,
+			Document: pt.Document,
+			Counsels: counsels,
+		})
+	}
+	_ = p.partyWriter.UpsertParties(ctx, tenantID, courtRecordID, parties)
 }
 
 func newAutosResult(proc *eproc.Process, events []eproc.Event) AutosResult {

@@ -67,13 +67,28 @@ type Process struct {
 	Parties     []Party   // partes, with the CPF/CNPJ UNKNOWN this spike resolves
 }
 
-// Party is one participant of the process. RawDocument is the CPF/CNPJ field EXACTLY as
-// the portal exposes it (clear, masked, or empty) — the whole point of D0's Portão B is
-// to discover which, so we carry it verbatim and never normalize it away.
+// Party is one participant of the process, parsed off the eproc capa
+// (#tblPartesERepresentantes — CONFIRMED live). Role carries eproc's OWN normalized
+// polo verbatim ("AUTOR"/"REU"): translating it to the persistence layer's role enum
+// (PLAINTIFF/DEFENDANT) is the caller's job, keeping this package free of any DB
+// vocabulary. Document is the CPF/CNPJ the capa discloses in clear (eproc, unlike
+// DJEN, exposes it) — "" when the capa carried none. RawDocument is retained for
+// backward compatibility with the D0 spike callers; new code reads Document.
 type Party struct {
 	Name        string
-	Role        string // polo ativo/passivo, advogado, etc.
-	RawDocument string // CPF/CNPJ as-returned; may be "", "123.***.***-00", or full
+	Role        string    // eproc's normalized polo, verbatim: "AUTOR" / "REU"
+	Document    string    // CPF/CNPJ in clear off the capa; "" when absent
+	RawDocument string    // legacy alias of the CPF/CNPJ field (D0 spike callers)
+	Counsels    []Counsel // advogados linked to this party on the capa
+}
+
+// Counsel is one advogado tied to a Party on the eproc capa. OAB is the registration
+// number and UF its issuing state, split from the capa's "UF+numero" rendering (e.g.
+// "SP321511" → OAB "321511", UF "SP"). Either may be "" when the capa is incomplete.
+type Counsel struct {
+	Name string
+	OAB  string
+	UF   string
 }
 
 // Event is one node of the eproc event tree (docket entry).
