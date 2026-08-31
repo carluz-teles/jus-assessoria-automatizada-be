@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/charset"
 )
 
 // errCallbackTokenMissing signals Certisign's response carried no "cb" field — the
@@ -416,18 +417,46 @@ func readBoundedPrefix(r io.Reader) []byte {
 // exists on the page but its row shape isn't confirmed) — Process.Parties stays
 // empty; nothing in this fatia's scope reads it yet.
 
-// parseProcessHTML extracts the process's Classe from #txtClasse — CONFIRMED
-// against a real page (docs/… see lib/eproc's own commit history for the sample).
+// parseHTMLDocument parses an eproc page into an html tree, decoding its charset to
+// UTF-8 first. eproc serves ISO-8859-1 (Latin-1) — accented values (magistrado,
+// "Cível") arrive as raw Latin-1 bytes that are INVALID UTF-8, so parsing them without
+// transcoding yields strings Postgres rejects on write. charset.NewReader sniffs the
+// page's declared/heuristic encoding and transcodes to UTF-8 (a no-op for pages that
+// really are UTF-8), so every extracted string is valid UTF-8.
+func parseHTMLDocument(body []byte) (*html.Node, error) {
+	reader, err := charset.NewReader(bytes.NewReader(body), "text/html")
+	if err != nil {
+		return nil, err
+	}
+	return html.Parse(reader)
+}
+
+// parseProcessHTML extracts the process capa metadata from the labeled spans the
+// eproc detail page carries — CONFIRMED live 2026-08-31: #txtClasse (classe),
+// #txtOrgaoJulgador (vara), #txtMagistrado (magistrado), #txtSituacao (situação,
+// ex. "MOVIMENTO"), #txtCompetencia (competência) and #txtAutuacao (data/hora de
+// autuação, "DD/MM/YYYY HH:MM:SS"). The page does NOT expose the valor da causa
+// (only JS vars named *Valor*), so that field is intentionally absent. Each value
+// is the span's text content; a missing span leaves its field zero-valued.
 func parseProcessHTML(body []byte) (*Process, error) {
-	root, err := html.Parse(bytes.NewReader(body))
+	root, err := parseHTMLDocument(body)
 	if err != nil {
 		return nil, fmt.Errorf("eproc: parse process html: %w", err)
 	}
-	class := ""
-	if n := findByID(root, "txtClasse"); n != nil {
-		class = strings.TrimSpace(textContent(n))
+	text := func(id string) string {
+		if n := findByID(root, id); n != nil {
+			return strings.TrimSpace(textContent(n))
+		}
+		return ""
 	}
-	return &Process{Class: class}, nil
+	return &Process{
+		Class:       text("txtClasse"),
+		JudgingBody: text("txtOrgaoJulgador"),
+		Magistrate:  text("txtMagistrado"),
+		Situation:   text("txtSituacao"),
+		Competence:  text("txtCompetencia"),
+		FiledAt:     parseEproDateTime(text("txtAutuacao")),
+	}, nil
 }
 
 // parseEventsHTML extracts the docket (#tblEventos) — one row per movimentação,
@@ -440,7 +469,7 @@ func parseProcessHTML(body []byte) (*Process, error) {
 // is the session-bound acessar_documento URL (see DocumentRef's doc) — captured
 // whole because its key/hash can't be rebuilt from the doc id.
 func parseEventsHTML(body []byte) ([]Event, error) {
-	root, err := html.Parse(bytes.NewReader(body))
+	root, err := parseHTMLDocument(body)
 	if err != nil {
 		return nil, fmt.Errorf("eproc: parse events html: %w", err)
 	}

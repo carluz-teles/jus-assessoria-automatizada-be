@@ -63,7 +63,29 @@ type CourtProvider interface {
 // certificate). Returns the created document's id (informational — nothing in
 // this slice currently reads it back).
 type DocumentWriter interface {
-	WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title string, data []byte) (documentID string, err error)
+	WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, data []byte) (documentID string, err error)
+}
+
+// ProcessMetadata is the capa metadata FetchAutos reads off the eproc process page
+// (classe, órgão julgador, magistrado, situação, competência, autuação) and hands to
+// the CourtRecordWriter so it is captured at fetch time rather than backfilled later.
+// The valor da causa is absent on purpose: the eproc page does not expose it.
+type ProcessMetadata struct {
+	Class       string
+	JudgingBody string
+	Magistrate  string
+	Situation   string
+	Competence  string
+	FiledAt     time.Time // zero when the page had no readable autuação date
+}
+
+// CourtRecordWriter is the narrow port FetchAutos uses to enrich the court_record
+// (owned by internal/acquisition) with the capa metadata above. Generic types only
+// (no internal/acquisition import here — cmd/worker-court's adapter is the only place
+// allowed to know both slices, same technique as DocumentWriter). nil is fine — the
+// metadata write is then a silent no-op (e.g. the api process wires no writer).
+type CourtRecordWriter interface {
+	UpdateProcessMetadata(ctx context.Context, tenantID, courtRecordID string, meta ProcessMetadata) error
 }
 
 // AutosResult is what a successful FetchAutos call surfaces: the process

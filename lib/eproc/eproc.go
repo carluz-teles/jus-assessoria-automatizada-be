@@ -57,10 +57,14 @@ const (
 // Process is the minimal court-case shape D0 dumps: enough to prove the read reached a
 // real process. Parsing is provisional (see wiring.go).
 type Process struct {
-	CNJNumber   string  // número CNJ (nnnnnnn-dd.aaaa.j.tr.oooo)
-	Class       string  // classe processual
-	JudgingBody string  // órgão julgador / vara
-	Parties     []Party // partes, with the CPF/CNPJ UNKNOWN this spike resolves
+	CNJNumber   string    // número CNJ (nnnnnnn-dd.aaaa.j.tr.oooo)
+	Class       string    // classe processual (#txtClasse)
+	JudgingBody string    // órgão julgador / vara (#txtOrgaoJulgador)
+	Magistrate  string    // magistrado responsável (#txtMagistrado)
+	Situation   string    // situação no eproc, ex. "MOVIMENTO" (#txtSituacao)
+	Competence  string    // competência, ex. "Juizado Especial Cível" (#txtCompetencia)
+	FiledAt     time.Time // data de autuação (#txtAutuacao); zero quando ausente/ilegível
+	Parties     []Party   // partes, with the CPF/CNPJ UNKNOWN this spike resolves
 }
 
 // Party is one participant of the process. RawDocument is the CPF/CNPJ field EXACTLY as

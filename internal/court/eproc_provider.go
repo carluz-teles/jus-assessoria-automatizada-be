@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jusassessoria/platform/lib/eproc"
@@ -44,9 +45,10 @@ type CertSigner interface {
 // the one-time capture itself remains open for a FUTURE portal/adapter that turns out
 // to support it — MFAEnroller stays in provider.go for exactly that case.
 type EprocProvider struct {
-	certSigner CertSigner
-	docWriter  DocumentWriter // nil is fine — FetchAutos just skips document download (S3 not configured, same optional-adapter posture as the rest of the stack)
-	proxyURL   *url.URL       // optional residential/BR proxy — same anti-bot posture DJEN needed
+	certSigner   CertSigner
+	docWriter    DocumentWriter    // nil is fine — FetchAutos just skips document download (S3 not configured, same optional-adapter posture as the rest of the stack)
+	recordWriter CourtRecordWriter // nil is fine — FetchAutos then skips the capa-metadata enrichment
+	proxyURL     *url.URL          // optional residential/BR proxy — same anti-bot posture DJEN needed
 }
 
 // EprocProviderOption tunes an EprocProvider at construction.
@@ -55,6 +57,12 @@ type EprocProviderOption func(*EprocProvider)
 // WithEprocProxy sets the outbound proxy (nil keeps a direct connection).
 func WithEprocProxy(proxyURL *url.URL) EprocProviderOption {
 	return func(p *EprocProvider) { p.proxyURL = proxyURL }
+}
+
+// WithCourtRecordWriter injects the port that enriches the court_record with the
+// capa metadata FetchAutos reads (nil keeps that a no-op).
+func WithCourtRecordWriter(w CourtRecordWriter) EprocProviderOption {
+	return func(p *EprocProvider) { p.recordWriter = w }
 }
 
 // NewEprocProvider builds the eproc adapter. certSigner is required — a connection
@@ -114,6 +122,9 @@ func (p *EprocProvider) FetchAutos(ctx context.Context, conn *CourtConnection, s
 	if procErr == nil {
 		events, eventsErr = client.ListEvents(ctx, cnjNumber)
 	}
+	if procErr == nil {
+		p.writeProcessMetadata(ctx, conn.TenantID, courtRecordID, proc)
+	}
 	if eventsErr == nil {
 		downloaded = p.downloadNewDocuments(ctx, client, conn.TenantID, courtRecordID, events, docketCursor)
 	}
@@ -154,7 +165,7 @@ func (p *EprocProvider) downloadNewDocuments(ctx context.Context, client *eproc.
 			continue
 		}
 		for _, doc := range ev.Documents {
-			if p.downloadOneDocument(ctx, client, tenantID, courtRecordID, doc) {
+			if p.downloadOneDocument(ctx, client, tenantID, courtRecordID, doc, ev.Description) {
 				downloaded++
 			}
 		}
@@ -162,7 +173,7 @@ func (p *EprocProvider) downloadNewDocuments(ctx context.Context, client *eproc.
 	return downloaded
 }
 
-func (p *EprocProvider) downloadOneDocument(ctx context.Context, client *eproc.Client, tenantID, courtRecordID string, doc eproc.DocumentRef) bool {
+func (p *EprocProvider) downloadOneDocument(ctx context.Context, client *eproc.Client, tenantID, courtRecordID string, doc eproc.DocumentRef, eventDescription string) bool {
 	var buf bytes.Buffer
 	if _, err := client.DownloadDocument(ctx, doc.DownloadPath, &buf); err != nil {
 		return false
@@ -170,8 +181,46 @@ func (p *EprocProvider) downloadOneDocument(ctx context.Context, client *eproc.C
 	data := buf.Bytes()
 	sum := sha256.Sum256(data)
 	checksum := hex.EncodeToString(sum[:])
-	_, err := p.docWriter.WriteDocument(ctx, tenantID, courtRecordID, doc.MIMEType, checksum, doc.Label, data)
+	title, documentType := docTitleAndType(doc.Label, eventDescription)
+	_, err := p.docWriter.WriteDocument(ctx, tenantID, courtRecordID, doc.MIMEType, checksum, title, documentType, data)
 	return err == nil
+}
+
+// docTitleAndType turns the eproc document's terse code (data-nome, e.g. "PET",
+// "CONTRSOCIAL") into the pair the document row stores: a friendly pt-BR title and
+// the raw code as document_type (categorization). The title prefers the code's
+// mapped label; when the code is unknown it falls back to the event's description
+// (infraEventoDescricao — "Petição inicial", "Despacho saneador"), and only then to
+// the raw code, so a title is never blank.
+func docTitleAndType(code, eventDescription string) (title, documentType string) {
+	documentType = strings.TrimSpace(code)
+	title = eproc.DocumentTypeLabel(documentType)
+	if title == "" {
+		title = strings.TrimSpace(eventDescription)
+	}
+	if title == "" {
+		title = documentType
+	}
+	return title, documentType
+}
+
+// writeProcessMetadata hands the eproc capa metadata to the CourtRecordWriter to
+// enrich the court_record. A nil writer (api process, or S3-less dev) is a no-op; a
+// write error is swallowed on purpose — the metadata is a best-effort enrichment,
+// never a reason to fail (and thus retry) the whole autos fetch, whose real payload
+// (documents + docket cursor) already succeeded by the time this runs.
+func (p *EprocProvider) writeProcessMetadata(ctx context.Context, tenantID, courtRecordID string, proc *eproc.Process) {
+	if p.recordWriter == nil || proc == nil {
+		return
+	}
+	_ = p.recordWriter.UpdateProcessMetadata(ctx, tenantID, courtRecordID, ProcessMetadata{
+		Class:       proc.Class,
+		JudgingBody: proc.JudgingBody,
+		Magistrate:  proc.Magistrate,
+		Situation:   proc.Situation,
+		Competence:  proc.Competence,
+		FiledAt:     proc.FiledAt,
+	})
 }
 
 func newAutosResult(proc *eproc.Process, events []eproc.Event) AutosResult {

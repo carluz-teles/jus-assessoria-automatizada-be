@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/hibiken/asynq"
 
@@ -151,7 +152,12 @@ func run(logger *slog.Logger) error {
 	if vlt != nil && certUC != nil {
 		uow := database.NewUnitOfWork(pool)
 		courtUC := court.NewUseCase(court.NewRepository(), uow, vlt, events.NewOutbox())
-		courtUC.RegisterProvider("EPROC", court.NewEprocProvider(courtCertSignerFunc(certUC.NewSigner), documentWriter))
+		recordWriter := courtRecordWriterAdapter{uow: database.NewUnitOfWork(pool)}
+		courtUC.RegisterProvider("EPROC", court.NewEprocProvider(
+			courtCertSignerFunc(certUC.NewSigner),
+			documentWriter,
+			court.WithCourtRecordWriter(recordWriter),
+		))
 
 		listener := court.NewListener(courtUC)
 		listener.Register(mux)
@@ -235,12 +241,47 @@ type documentWriterAdapter struct {
 	storage *storage.Client
 }
 
-func (a documentWriterAdapter) WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title string, data []byte) (string, error) {
+// courtRecordWriterAdapter satisfies court.CourtRecordWriter by enriching the
+// court_record (owned by internal/acquisition) with the eproc capa metadata FetchAutos
+// reads. It writes directly through a tenant-scoped UoW (RLS) here — the cross-slice
+// glue layer, same posture as documentWriterAdapter — rather than routing through an
+// acquisition use case, which does not yet expose this narrow enrichment; promoting it
+// to a proper acquisition write path (sqlc query + use case) is the follow-up. Shared
+// fields (class, judging_body, filed_at) are filled ONLY when empty so an authoritative
+// DATAJUD value is never clobbered by the secondary eproc source; the eproc-only fields
+// (magistrate, court_situation, competence) refresh when present and are otherwise kept.
+type courtRecordWriterAdapter struct {
+	uow database.UnitOfWork
+}
+
+func (a courtRecordWriterAdapter) UpdateProcessMetadata(ctx context.Context, tenantID, courtRecordID string, meta court.ProcessMetadata) error {
+	var filedAt *time.Time
+	if !meta.FiledAt.IsZero() {
+		filedAt = &meta.FiledAt
+	}
+	const q = `UPDATE court_record SET
+		class            = COALESCE(NULLIF(class, ''), NULLIF($2, '')),
+		judging_body     = COALESCE(NULLIF(judging_body, ''), NULLIF($3, '')),
+		magistrate       = COALESCE(NULLIF($4, ''), magistrate),
+		court_situation  = COALESCE(NULLIF($5, ''), court_situation),
+		competence       = COALESCE(NULLIF($6, ''), competence),
+		filed_at         = COALESCE(filed_at, $7)
+	WHERE id = $1 AND tenant_id = $8`
+	return a.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		_, err := tx.Exec(ctx, q,
+			courtRecordID, meta.Class, meta.JudgingBody, meta.Magistrate,
+			meta.Situation, meta.Competence, filedAt, tenantID)
+		return err
+	})
+}
+
+func (a documentWriterAdapter) WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, data []byte) (string, error) {
 	started, err := a.uc.Start(ctx, document.StartUploadCommand{
 		TenantID:      tenantID,
 		CourtRecordID: courtRecordID,
 		Origin:        document.OriginCourt,
 		Title:         title,
+		DocumentType:  documentType,
 		MimeType:      mimeType,
 		SizeBytes:     int64(len(data)),
 	})

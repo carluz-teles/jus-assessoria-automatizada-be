@@ -24,16 +24,17 @@ type fakeDocumentWriter struct {
 }
 
 type fakeDocumentWrite struct {
-	tenantID, courtRecordID, mimeType, checksum, title string
+	tenantID, courtRecordID, mimeType, checksum, title, documentType string
 }
 
-func (w *fakeDocumentWriter) WriteDocument(_ context.Context, tenantID, courtRecordID, mimeType, checksum, title string, _ []byte) (string, error) {
+func (w *fakeDocumentWriter) WriteDocument(_ context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, _ []byte) (string, error) {
 	w.calls = append(w.calls, fakeDocumentWrite{
 		tenantID:      tenantID,
 		courtRecordID: courtRecordID,
 		mimeType:      mimeType,
 		checksum:      checksum,
 		title:         title,
+		documentType:  documentType,
 	})
 	if w.failTitles[title] {
 		return "", assert.AnError
@@ -166,4 +167,51 @@ func TestEprocProvider_downloadNewDocuments_NilDocWriterIsNoOp(t *testing.T) {
 	downloaded := p.downloadNewDocuments(context.Background(), nil, "tenant-1", "record-1", events, time.Time{})
 
 	assert.Equal(t, 0, downloaded)
+}
+
+func TestDocTitleAndType(t *testing.T) {
+	tests := []struct {
+		name          string
+		code          string
+		eventDesc     string
+		wantTitle     string
+		wantType      string
+	}{
+		{
+			name:      "known code maps to friendly label; type keeps the raw code",
+			code:      "SENT",
+			eventDesc: "Sentença registrada",
+			wantTitle: "Sentença",
+			wantType:  "SENT",
+		},
+		{
+			name:      "unknown code falls back to the event description",
+			code:      "XPTO",
+			eventDesc: "Despacho saneador",
+			wantTitle: "Despacho saneador",
+			wantType:  "XPTO",
+		},
+		{
+			name:      "unknown code with no description falls back to the raw code",
+			code:      "XPTO",
+			eventDesc: "",
+			wantTitle: "XPTO",
+			wantType:  "XPTO",
+		},
+		{
+			name:      "lowercase code is matched case-insensitively",
+			code:      "contrsocial",
+			eventDesc: "",
+			wantTitle: "Contrato social",
+			wantType:  "contrsocial",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			is := assert.New(t)
+			title, documentType := docTitleAndType(tt.code, tt.eventDesc)
+			is.Equal(tt.wantTitle, title)
+			is.Equal(tt.wantType, documentType)
+		})
+	}
 }
