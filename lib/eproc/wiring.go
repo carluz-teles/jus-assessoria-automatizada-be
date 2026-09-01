@@ -483,15 +483,15 @@ func parsePartiesFromRoot(root *html.Node) []Party {
 		return []Party{}
 	}
 
-	blocks := findAllByAttr(table, "data-parte")
-	autores := make([]Party, 0, len(blocks))
-	reus := make([]Party, 0, len(blocks))
-	for _, block := range blocks {
-		polo := strings.ToUpper(strings.TrimSpace(attrVal(block, "data-parte")))
+	markers := findAllByAttr(table, "data-parte")
+	autores := make([]Party, 0, len(markers))
+	reus := make([]Party, 0, len(markers))
+	for _, marker := range markers {
+		polo := strings.ToUpper(strings.TrimSpace(attrVal(marker, "data-parte")))
 		if polo != "AUTOR" && polo != "REU" {
 			continue // other polos (e.g. TERCEIRO) aren't split into cards yet
 		}
-		party := parsePartyBlock(block, polo)
+		party := parsePartyFromMarker(marker, polo)
 		if party.Name == "" {
 			continue // a data-parte carrier with no name is decoration, not a party
 		}
@@ -504,34 +504,63 @@ func parsePartiesFromRoot(root *html.Node) []Party {
 	return append(autores, reus...)
 }
 
-// parsePartyBlock turns one data-parte element into a Party: its name (the block's own
-// text minus the CPF/tooltip decorations), the CPF/CNPJ (a spnCpfParte* span if present,
-// else the parenthesized-text fallback), and every advogado tied to it.
-func parsePartyBlock(block *html.Node, polo string) Party {
+// parsePartyFromMarker builds a Party from its name marker — the element that carries
+// data-parte. The real capa puts data-parte on the <a class="infraNomeParte"> name link
+// itself, so the CPF span and advogado <a>s are its FOLLOWING SIBLINGS (up to the next
+// party marker), not its descendants. partyScope unites both regions so the parser works
+// whether the capa nests a party's data under the marker or lays it out as siblings.
+func parsePartyFromMarker(marker *html.Node, polo string) Party {
+	scope := partyScope(marker)
+	doc := documentInNodes(scope)
 	return Party{
-		Name:        partyName(block),
+		Name:        partyNameFromMarker(marker),
 		Role:        polo,
-		Document:    partyDocument(block),
-		RawDocument: partyDocument(block),
-		Counsels:    parseCounsels(block),
+		Document:    doc,
+		RawDocument: doc,
+		Counsels:    counselsInNodes(scope),
 	}
 }
 
-// partyName reads the party's name span (spnNomeParte*) when the capa renders one, and
-// otherwise falls back to the block's leading text line — the name always precedes the
-// "( CPF ) - Pessoa Física" decoration, so trimming at the first "(" recovers it.
-func partyName(block *html.Node) string {
-	if span := findByIDPrefix(block, "spnNomeParte"); span != nil {
+// partyScope returns the nodes that carry a party's data: the marker's own subtree
+// (when the capa nests CPF/advogados under it) PLUS its following siblings until the
+// next party marker (the real capa's layout, where they sit beside the name link). The
+// decorations that PRECEDE the name link — the <style> .item-barra-atributos-parte block
+// and the "Histórico de Representantes" icon link — are excluded, so neither can be read
+// as party data.
+func partyScope(marker *html.Node) []*html.Node {
+	scope := []*html.Node{marker}
+	for s := marker.NextSibling; s != nil; s = s.NextSibling {
+		if isPartyMarker(s) {
+			break // the next party starts here
+		}
+		scope = append(scope, s)
+	}
+	return scope
+}
+
+// isPartyMarker reports whether n is an AUTOR/REU party marker (an element carrying
+// data-parte="AUTOR" or "REU").
+func isPartyMarker(n *html.Node) bool {
+	if n.Type != html.ElementNode {
+		return false
+	}
+	polo := strings.ToUpper(strings.TrimSpace(attrVal(n, "data-parte")))
+	return polo == "AUTOR" || polo == "REU"
+}
+
+// partyNameFromMarker reads the party's name: a spnNomeParte* span inside the marker
+// when the capa renders one, otherwise the marker's own text up to the "( CPF )"
+// decoration (the real capa puts the name as the <a> link's text).
+func partyNameFromMarker(marker *html.Node) string {
+	if span := findByIDPrefix(marker, "spnNomeParte"); span != nil {
 		if name := strings.TrimSpace(textContent(span)); name != "" {
 			return name
 		}
 	}
-	raw := strings.TrimSpace(textContent(block))
+	raw := strings.TrimSpace(textContent(marker))
 	if i := strings.IndexByte(raw, '('); i >= 0 {
 		raw = raw[:i]
 	}
-	// Collapse the name to its first non-empty line (the block's tail may carry the
-	// advogado renderings, which are separate <a> elements, not part of the name).
 	for _, line := range strings.Split(raw, "\n") {
 		if s := strings.TrimSpace(line); s != "" {
 			return s
@@ -540,31 +569,41 @@ func partyName(block *html.Node) string {
 	return ""
 }
 
-// partyDocument reads the party's CPF/CNPJ: first a spnCpfParte* span (the capa's
-// dedicated field, e.g. spnCpfParteAutor0="284.669.278-59"), then the parenthesized
-// "( 284.669.278-59 ) - Pessoa Física" text as a fallback. "" when neither is present.
-func partyDocument(block *html.Node) string {
-	if span := findByIDPrefix(block, "spnCpfParte"); span != nil {
-		if doc := cpfCnpjRe.FindString(textContent(span)); doc != "" {
+// documentInNodes reads the party's CPF/CNPJ across its scope: first a spnCpfParte* span
+// (the capa's dedicated field, e.g. spnCpfParteAutor0="284.669.278-59"), then the
+// parenthesized "( 284.669.278-59 ) - Pessoa Física" text as a fallback. "" when neither
+// is present.
+func documentInNodes(nodes []*html.Node) string {
+	for _, n := range nodes {
+		if span := findByIDPrefix(n, "spnCpfParte"); span != nil {
+			if doc := cpfCnpjRe.FindString(textContent(span)); doc != "" {
+				return doc
+			}
+		}
+	}
+	for _, n := range nodes {
+		if doc := cpfCnpjRe.FindString(textContent(n)); doc != "" {
 			return doc
 		}
 	}
-	return cpfCnpjRe.FindString(textContent(block))
+	return ""
 }
 
-// parseCounsels collects every advogado under a party block: eproc renders each as an
-// <a> whose onmouseover calls infraTooltipMostrar('ADVOGADO',…) and whose content is the
-// OAB ("UF+numero", e.g. "SP321511"); the advogado's NAME is the text immediately
-// preceding that <a>. A block with no such <a> yields an empty slice.
-func parseCounsels(block *html.Node) []Counsel {
+// counselsInNodes collects every advogado across a party's scope: eproc renders each as
+// an <a> flagged by infraTooltipMostrar('ADVOGADO',…) (or an adjacent sr-only div) whose
+// content is the OAB ("UF+numero", e.g. "SP321511"); the advogado's NAME is the text
+// immediately preceding that <a>. A scope with no such <a> yields an empty slice.
+func counselsInNodes(nodes []*html.Node) []Counsel {
 	var out []Counsel
-	for _, a := range findAllAdvogadoLinks(block) {
-		uf, oab := splitOAB(strings.TrimSpace(textContent(a)))
-		out = append(out, Counsel{
-			Name: nameBeforeNode(a),
-			OAB:  oab,
-			UF:   uf,
-		})
+	for _, n := range nodes {
+		for _, a := range findAllAdvogadoLinks(n) {
+			uf, oab := splitOAB(strings.TrimSpace(textContent(a)))
+			out = append(out, Counsel{
+				Name: nameBeforeNode(a),
+				OAB:  oab,
+				UF:   uf,
+			})
+		}
 	}
 	return out
 }
@@ -726,17 +765,25 @@ func findAllAdvogadoLinks(n *html.Node) []*html.Node {
 }
 
 // isAdvogadoLink reports whether an <a> is an advogado marker: its onmouseover invokes
-// infraTooltipMostrar('ADVOGADO',…), or a following sibling <div class="sr-only">
-// spells out "Tipo de Usuário: ADVOGADO".
+// infraTooltipMostrar('ADVOGADO',…), or its FIRST following element sibling is a
+// <div class="sr-only">Tipo de Usuário: ADVOGADO</div>. The sr-only check is bounded to
+// the immediately-adjacent element — walking every following sibling let a party's own
+// name <a> match a distant advogado's sr-only div and be read as a counsel (with the
+// party name as OAB and the preceding <style> text as the name). An <a> that itself
+// carries data-parte is the party's name link, never a counsel.
 func isAdvogadoLink(a *html.Node) bool {
+	if attrVal(a, "data-parte") != "" {
+		return false
+	}
 	if strings.Contains(attrVal(a, "onmouseover"), "'ADVOGADO'") {
 		return true
 	}
 	for s := a.NextSibling; s != nil; s = s.NextSibling {
-		if s.Type == html.ElementNode && hasClass(s, "sr-only") &&
-			strings.Contains(strings.ToUpper(textContent(s)), "ADVOGADO") {
-			return true
+		if s.Type != html.ElementNode {
+			continue // skip the whitespace/&nbsp; text between </a> and the div
 		}
+		return hasClass(s, "sr-only") &&
+			strings.Contains(strings.ToUpper(textContent(s)), "ADVOGADO")
 	}
 	return false
 }
@@ -751,6 +798,9 @@ func nameBeforeNode(target *html.Node) string {
 		case html.TextNode:
 			text = s.Data
 		case html.ElementNode:
+			if s.Data == "style" || s.Data == "script" {
+				continue // never read CSS/JS as an advogado name
+			}
 			text = textContent(s)
 		}
 		lines := strings.Split(text, "\n")

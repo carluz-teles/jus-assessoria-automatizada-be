@@ -7,20 +7,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// stubPartiesHTML mirrors the CONFIRMED shape of the real capa's
-// #tblPartesERepresentantes: data-parte="AUTOR"/"REU" party blocks, each with a
-// spnCpfParte* span for the CPF/CNPJ and infraTooltipMostrar('ADVOGADO',…) links whose
-// content is the OAB (UF+numero) and whose name precedes them. It deliberately includes
-// two traps the parser must NOT fall for:
+// stubPartiesHTML mirrors the REAL capa's #tblPartesERepresentantes DOM (captured live
+// from TJSP eproc): data-parte="AUTOR"/"REU" sits on the <a class="infraNomeParte"> NAME
+// LINK itself, so the party's CPF span and its advogado <a>s are the link's FOLLOWING
+// SIBLINGS inside the <td> — not its descendants. Each advogado is an <a> flagged by
+// infraTooltipMostrar('ADVOGADO',…) with an adjacent <div class="sr-only">Tipo de
+// Usuário: ADVOGADO</div>, and its NAME is the text right before it.
 //
-//   - a <style> block BEFORE the table using data-parte inside a CSS selector
-//     (span.infraEventoPrazoParte[data-parte="AUTOR"]) — proves the search is SCOPED to
-//     the parties table, not the whole document.
-//   - accented values ("MURILO DE PÁULA", "Cristóvão") — proves the fixture drives the
-//     same UTF-8 text path the real (ISO-8859-1) page does after parseHTMLDocument.
+// It reproduces the exact traps that shipped garbage before:
 //
-// It also covers a réu WITHOUT a CPF span and WITHOUT any advogado (the incomplete-row
-// cases the parser must tolerate rather than skip or crash on).
+//   - the <style> .item-barra-atributos-parte block that the capa renders INSIDE each
+//     party cell, right before the name link — the parser must not read its CSS as an
+//     advogado name.
+//   - the "Histórico de Representantes" icon <a> before the name link — not a counsel.
+//   - a <style> selector and a #tblEventos div carrying data-parte OUTSIDE the table —
+//     the search must stay scoped to #tblPartesERepresentantes.
+//   - accented values ("MURILO DE PÁULA", "MÁRCIA") — drives the same UTF-8 text path
+//     the real (ISO-8859-1) page does after parseHTMLDocument.
+//
+// The réu carries a CPF but NO advogado (the incomplete-row case the parser must
+// tolerate rather than skip or crash on).
 const stubPartiesHTML = `<html><head>
 <style>
 span.infraEventoPrazoParte[data-parte="AUTOR"] { color: green; }
@@ -30,22 +36,26 @@ span.infraEventoPrazoParte[data-parte="REU"] { color: red; }
 <div id="tblEventos" data-parte="REU">docket noise carrying data-parte, outside the parties table</div>
 <table id="tblPartesERepresentantes">
   <tr>
-    <td>
-      <span data-parte="AUTOR">
-        <span id="spnNomeParteAutor0">MURILO DE PÁULA BALDAN</span>
-        ( <span id="spnCpfParteAutor0">284.669.278-59</span> ) - Pessoa Física
-        PAULO SERGIO DE OLIVEIRA SOUZA<a onmouseover="infraTooltipMostrar('ADVOGADO','Tipo de Usuário')" href="#">SP321511</a>
-        <div class="sr-only">Tipo de Usuário: ADVOGADO</div>
-        LUAN GOMES<a href="#">SP999000</a>
-        <div class="sr-only">Tipo de Usuário: ADVOGADO</div>
-      </span>
+    <td class="autorReu">
+      <div class="bootstrap-styles"><div class="d-flex"><div class="m-0">
+        <style> .item-barra-atributos-parte { font-size: 19px; cursor: pointer } </style>
+      </div></div></div>
+      <a aria-label="Histórico de Representantes" href="javascript:exibirSubFrm('x');"><img src="valores.gif" alt="Histórico"/></a>
+      <a title="Consultar" href="javascript:exibirSubFrm('y');" class="infraNomeParte" data-parte="AUTOR">MURILO DE PÁULA BALDAN</a>
+      <span class="ml-2"></span>
+      (<span id="spnCpfParteAutor0">284.669.278-59</span>)&nbsp; <span> - Pessoa Física</span>
+      <br/>
+      <br/>&nbsp;&nbsp;PAULO SERGIO DE OLIVEIRA SOUZA&nbsp;&nbsp;<a onmouseover="return infraTooltipMostrar('ADVOGADO','Tipo de Usuário',400);" >SP321511</a>&nbsp;<div class="sr-only">Tipo de Usuário: ADVOGADO</div>&nbsp;<br>&nbsp;&nbsp;LUAN GOMES&nbsp;&nbsp;<a href="#">SP999000</a>&nbsp;<div class="sr-only">Tipo de Usuário: ADVOGADO</div>&nbsp;<br>
     </td>
   </tr>
   <tr>
-    <td>
-      <span data-parte="REU">
-        <span id="spnNomeParteReu0">RITA MÁRCIA MONTEIRO SEZEFREDO</span>
-      </span>
+    <td class="autorReu">
+      <div class="bootstrap-styles"><div class="m-0">
+        <style> .item-barra-atributos-parte { font-size: 19px; cursor: pointer } </style>
+      </div></div>
+      <a title="Consultar" href="javascript:exibirSubFrm('z');" class="infraNomeParte" data-parte="REU">RITA MÁRCIA MONTEIRO SEZEFREDO</a>
+      <span class="ml-2"></span>
+      (<span id="spnCpfParteReu0">316.397.038-96</span>)&nbsp; <span> - Pessoa Física</span>
     </td>
   </tr>
 </table>
@@ -73,7 +83,7 @@ func TestParsePartiesHTML_ExtractsAutorReuCpfAndCounsels(t *testing.T) {
 	reu := proc.Parties[1]
 	assert.Equal(t, "REU", reu.Role)
 	assert.Equal(t, "RITA MÁRCIA MONTEIRO SEZEFREDO", reu.Name)
-	assert.Empty(t, reu.Document, "réu block carried no CPF span")
+	assert.Equal(t, "316.397.038-96", reu.Document)
 	assert.Empty(t, reu.Counsels, "réu block carried no advogado")
 }
 
