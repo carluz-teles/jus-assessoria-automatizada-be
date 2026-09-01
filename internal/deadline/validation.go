@@ -171,6 +171,105 @@ func (r AdjustRequest) toAdjustCommand(tenantID, userID, deadlineID string) Adju
 	return cmd
 }
 
+// ApurarDivergenciaRequest is the POST /v1/prazos/:id/apurar-divergencia body (V1,
+// docs/design-motor-de-prazos-v1.md §"Divergência"): the human's decision on a declarado×
+// calculado divergência. The AjusteManual* fields are used ONLY when Decisao=="ajuste_manual"
+// (a partial patch over the prazo's CURRENT {days, counting, doubled, anchor_event,
+// manual_extra_days}, mirroring AdjustRequest). tenant_id/user/the prazo id come from the
+// principal + path, never the body.
+type ApurarDivergenciaRequest struct {
+	Decisao         string  `json:"decisao"`
+	Days            *int    `json:"days"`
+	Counting        *string `json:"counting"`
+	Doubled         *bool   `json:"doubled"`
+	AnchorEvent     *string `json:"anchor_event"`
+	ManualExtraDays *int    `json:"manual_extra_days"`
+}
+
+// Validate enforces decisao ∈ {aceita_declarado, aceita_calculado, ajuste_manual} and the SAME
+// present-field rules AdjustRequest uses for the ajuste_manual fields (a PRESENT days/counting/
+// anchor_event/manual_extra_days must be well-formed; absent ones are a no-op).
+func (r ApurarDivergenciaRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Decisao, validation.Required, validation.In(
+			string(decisaoAceitaDeclarado), string(decisaoAceitaCalculado), string(decisaoAjusteManual))),
+		validation.Field(&r.Days, validation.By(positiveDaysIfPresent)),
+		validation.Field(&r.Counting, validation.By(validCountingIfPresent)),
+		validation.Field(&r.AnchorEvent, validation.By(validAnchorIfPresent)),
+		validation.Field(&r.ManualExtraDays, validation.By(nonNegativeExtraDaysIfPresent)),
+	)
+}
+
+// toApurarDivergenciaCommand maps the validated request + the principal's ids + the path id into
+// the use-case command. TenantID/UserID come from the principal and DeadlineID from the path
+// (never the body).
+func (r ApurarDivergenciaRequest) toApurarDivergenciaCommand(tenantID, userID, deadlineID string) ApurarDivergenciaCommand {
+	cmd := ApurarDivergenciaCommand{
+		TenantID:        tenantID,
+		UserID:          userID,
+		DeadlineID:      deadlineID,
+		Decisao:         apurarDecisao(r.Decisao),
+		Days:            r.Days,
+		Doubled:         r.Doubled,
+		ManualExtraDays: r.ManualExtraDays,
+	}
+	if r.Counting != nil {
+		c := Counting(*r.Counting)
+		cmd.Counting = &c
+	}
+	if r.AnchorEvent != nil {
+		a := AnchorEvent(*r.AnchorEvent)
+		cmd.AnchorEvent = &a
+	}
+	return cmd
+}
+
+// ApurarTipoRequest is the POST /v1/prazos/:id/apurar-tipo body (V1, docs/design-motor-de-
+// prazos-v1.md §"Fallback IA"): the human's confirmation/reclassification of the IA-inferred
+// tipo de ato. Tipo is required ONLY when Acao=="reclassificar" (enforced below); tenant_id/
+// user/the prazo id come from the principal + path, never the body.
+type ApurarTipoRequest struct {
+	Acao string  `json:"acao"`
+	Tipo *string `json:"tipo"`
+}
+
+// Validate enforces acao ∈ {confirmar, reclassificar} and a non-empty tipo when reclassificar.
+func (r ApurarTipoRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Acao, validation.Required, validation.In(
+			string(acaoConfirmar), string(acaoReclassificar))),
+		validation.Field(&r.Tipo, validation.By(requiredTipoIfReclassificar(r.Acao))),
+	)
+}
+
+// requiredTipoIfReclassificar rejects a missing/empty tipo when acao=="reclassificar"; any other
+// acao is a no-op (tipo is ignored on confirmar).
+func requiredTipoIfReclassificar(acao string) validation.RuleFunc {
+	return func(value any) error {
+		if acao != string(acaoReclassificar) {
+			return nil
+		}
+		t, ok := value.(*string)
+		if !ok || t == nil || *t == "" {
+			return errors.New("required when acao is reclassificar")
+		}
+		return nil
+	}
+}
+
+// toApurarTipoCommand maps the validated request + the principal's ids + the path id into the
+// use-case command. TenantID/UserID come from the principal and DeadlineID from the path (never
+// the body).
+func (r ApurarTipoRequest) toApurarTipoCommand(tenantID, userID, deadlineID string) ApurarTipoCommand {
+	return ApurarTipoCommand{
+		TenantID:   tenantID,
+		UserID:     userID,
+		DeadlineID: deadlineID,
+		Acao:       apurarTipoAcao(r.Acao),
+		Tipo:       r.Tipo,
+	}
+}
+
 // CreateTaskRequest is the POST /v1/tasks body (docs/erd-prazos.md §9): a manual task. Title is
 // required; the context FKs (court_record_id, deadline_id, intimation_id) and the assignee are
 // optional (a task can be avulsa / unassigned) but must be well-formed uuids when present.
@@ -569,6 +668,50 @@ func (d *Deadline) validate() error {
 	// always strictly after the start; an end on/before the start is impossible math.
 	if !d.EndDate.After(d.StartDate) {
 		return apperr.NewInvalid("deadline end date must be after start date")
+	}
+	return nil
+}
+
+// validOrigem reports whether o is a member of the V1 Origem closed set.
+func validOrigem(o Origem) bool {
+	switch o {
+	case OrigemDeclarado, OrigemValidado, OrigemCalculado, OrigemDivergente, OrigemIA, OrigemManual:
+		return true
+	}
+	return false
+}
+
+// validOrigemIfPresent rejects a PRESENT origem outside the closed set; an absent (nil) one
+// is a no-op. Backs V1 request validation.
+func validOrigemIfPresent(value any) error {
+	s, ok := value.(*string)
+	if !ok || s == nil {
+		return nil
+	}
+	if !validOrigem(Origem(*s)) {
+		return errors.New("must be one of declarado, validado, calculado, divergente, ia, manual")
+	}
+	return nil
+}
+
+// validSeal reports whether s is a member of the V1 Seal closed set.
+func validSeal(s Seal) bool {
+	switch s {
+	case SealConfiavel, SealAApurar:
+		return true
+	}
+	return false
+}
+
+// validSealIfPresent rejects a PRESENT seal outside the closed set; an absent (nil) one
+// is a no-op. Backs V1 request validation.
+func validSealIfPresent(value any) error {
+	s, ok := value.(*string)
+	if !ok || s == nil {
+		return nil
+	}
+	if !validSeal(Seal(*s)) {
+		return errors.New("must be one of confiavel, a_apurar")
 	}
 	return nil
 }

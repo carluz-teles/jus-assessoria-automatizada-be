@@ -308,6 +308,20 @@ func queueFor(typ string) string {
 	if typ == "draft.generation_requested" {
 		return "ai"
 	}
+	// court.fetch_autos_requested/fetch_autos_item_requested → "court_fetch": the
+	// FetchAutosBatch self-re-enqueuing job + its per-item retries (internal/court),
+	// consumed by cmd/worker-court's dedicated low-concurrency server (the real
+	// ceiling is how many court_connection exist, not worker slots). String
+	// literals, not the slice's consts — queueFor cannot import internal/court
+	// (import cycle). court.connection_state_changed is DELIBERATELY left off this
+	// list: it has no async consumer (the FE reads it via polling/SSE, not asynq),
+	// so it stays on the prefix switch's "default" fallthrough below, same as
+	// today — routing it here too would just move an already-orphaned event into a
+	// queue with a real worker attached, turning silence into handler-not-found
+	// noise for no benefit.
+	if typ == "court.fetch_autos_requested" || typ == "court.fetch_autos_item_requested" {
+		return "court_fetch"
+	}
 	// filing.enqueued → "filing": consumido pelo worker-filing (RPA e-SAJ).
 	// String literal evita import cycle com internal/draft. filing.succeeded/
 	// filing.failed são consumidos pelo listener de notificações (mesma fila
@@ -378,6 +392,16 @@ func queueFor(typ string) string {
 func queuesFor(typ string) []string {
 	if typ == "acquisition.docket_entry_observed" {
 		return []string{"ingestao", "deadline"}
+	}
+	// acquisition.court_record_observed gets a SECOND independent consumer the same
+	// way: acquisition's own listener (DATAJUD enrichment trigger, "ingestao") is
+	// joined by internal/court's FetchAutosBatch arrival trigger ("court_fetch",
+	// dedicated low-concurrency server — real ceiling is how many court_connection
+	// exist, not worker slots, see cmd/worker-court). "ingestao" stays FIRST so the
+	// existing consumer's perceived priority is unchanged; each consumer dedups
+	// under its own processed_event key.
+	if typ == "acquisition.court_record_observed" {
+		return []string{"ingestao", "court_fetch"}
 	}
 	return []string{queueFor(typ)}
 }

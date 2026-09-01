@@ -132,6 +132,41 @@ func timestampPtr(ts pgtype.Timestamptz) *time.Time {
 	return &t
 }
 
+// optionalBool lifts a Go bool to a *bool for a nullable boolean column. calc_memory
+// has a DEFAULT true on dias_uteis, but the mapper provides the value explicitly so the
+// column is never left to the default on an insert path.
+func optionalBool(b bool) *bool {
+	return &b
+}
+
+// derefBool collapses a nullable boolean column (*bool) to a plain bool, false standing in
+// for SQL NULL — the read-side counterpart of optionalBool (calc_memory.dias_uteis is nullable
+// on a LEFT JOIN, since a pre-calc_memory prazo has no row at all).
+func derefBool(b *bool) bool {
+	if b == nil {
+		return false
+	}
+	return *b
+}
+
+// derefFloat64 collapses a nullable double precision column (*float64) to a plain float64, 0
+// standing in for SQL NULL — calc_memory.ia_confianca is NULL until the IA classifier runs.
+func derefFloat64(f *float64) float64 {
+	if f == nil {
+		return 0
+	}
+	return *f
+}
+
+// derefInt32 collapses a nullable int4 column (*int32) to a plain int, 0 standing in for SQL
+// NULL — cross_validation.dif_dias is NULL until the cross-validation is computed.
+func derefInt32(i *int32) int {
+	if i == nil {
+		return 0
+	}
+	return int(*i)
+}
+
 // marshalHolidays encodes the skipped-days audit as a jsonb array of "2006-01-02"
 // strings — human-legible in the row (the whole point of holidays_applied: "por que
 // dia 14?"). An empty slice becomes "[]" so the column never holds JSON null.

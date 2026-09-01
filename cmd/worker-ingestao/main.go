@@ -17,6 +17,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/advisory"
+	"github.com/jusassessoria/platform/internal/aiusage"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/notifications"
@@ -25,6 +27,7 @@ import (
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/health"
+	"github.com/jusassessoria/platform/lib/llm"
 	"github.com/jusassessoria/platform/lib/pubsub"
 	"github.com/jusassessoria/platform/lib/telemetry"
 	"github.com/jusassessoria/platform/pkg/lifecycle"
@@ -321,7 +324,24 @@ func run(logger *slog.Logger) error {
 	// PENDING and emitting deadline.opened in one idempotent tx. The use case is built here,
 	// but its listener mounts on the DEDICATED deadline server below (not this main mux): the
 	// prazo flow moved off "ingestao" so it stops being starved by the enrichment flood.
-	deadlineUC := deadline.NewUseCase(deadline.NewRepository(), cal, outbox, deadline.NewDedup(), uow)
+	//
+	// The omissa-fallback IA classifier (classify.go, docs/design-motor-de-prazos-v1.md
+	// §"Fallback IA") is wired here — same optional-generator pattern as cmd/api: nil when
+	// OPENROUTER_API_KEY is unset, so OnIntimationObserved degrades gracefully (never chuta)
+	// instead of failing ingest.
+	var taskGenerator llm.Generator
+	if cfg.OpenRouterAPIKey != "" {
+		g, err := llm.NewOpenRouterGenerator(cfg.OpenRouterAPIKey, cfg.OpenRouterBaseURL, cfg.OpenRouterModel, nil, aiusage.NewRecorder(pool))
+		if err != nil {
+			return fmt.Errorf("init openrouter generator: %w", err)
+		}
+		taskGenerator = g
+	} else {
+		logger.Warn("OPENROUTER_API_KEY unset — omissa intimação classifier disabled (deterministic origem only)")
+	}
+	classifyUC := deadline.NewClassifyUseCase(advisory.NewTemplateComposer(), taskGenerator, cfg.OpenRouterModelFast)
+	deadlineUC := deadline.NewUseCase(deadline.NewRepository(), cal, outbox, deadline.NewDedup(), uow,
+		deadline.WithClassifier(classifyUC))
 
 	if err := srv.Start(mux); err != nil {
 		return fmt.Errorf("start asynq server: %w", err)

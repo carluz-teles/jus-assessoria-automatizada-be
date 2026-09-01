@@ -9,89 +9,11 @@ import (
 	"time"
 )
 
-// A frozen clock keeps the gate's arithmetic deterministic — no real sleeps.
-func frozenGate(at time.Time) *cooldownGate {
-	return &cooldownGate{now: func() time.Time { return at }}
-}
-
-func TestCooldownGate_ExponentialAndCap(t *testing.T) {
-	t.Parallel()
-	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
-	g := frozenGate(base)
-
-	// A fresh gate imposes no wait.
-	if d := g.until.Sub(base); d > 0 {
-		t.Fatalf("fresh gate should not be in cooldown, until-now=%s", d)
-	}
-
-	// Without a Retry-After the pause doubles per consecutive block.
-	for i, want := range []time.Duration{
-		djenCooldownBase, djenCooldownBase << 1, djenCooldownBase << 2, djenCooldownBase << 3,
-	} {
-		if got := g.trip(0); got != want {
-			t.Fatalf("trip #%d = %s, want %s", i+1, got, want)
-		}
-	}
-
-	// It keeps escalating but never exceeds the cap (and never overflows negative).
-	for i := 0; i < 12; i++ {
-		if got := g.trip(0); got <= 0 || got > djenCooldownMax {
-			t.Fatalf("escalated trip out of bounds: %s (cap %s)", got, djenCooldownMax)
-		}
-	}
-
-	// A clean page resets the streak, so the next block starts from the base again.
-	g.reset()
-	if got := g.trip(0); got != djenCooldownBase {
-		t.Fatalf("post-reset trip = %s, want %s", got, djenCooldownBase)
-	}
-}
-
-func TestCooldownGate_RetryAfterWinsButIsCapped(t *testing.T) {
-	t.Parallel()
-	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
-	g := frozenGate(base)
-
-	if got := g.trip(5 * time.Second); got != 5*time.Second {
-		t.Fatalf("Retry-After pause = %s, want 5s", got)
-	}
-	if got := g.trip(2 * time.Minute); got != djenCooldownMax {
-		t.Fatalf("over-cap Retry-After pause = %s, want cap %s", got, djenCooldownMax)
-	}
-}
-
-func TestCooldownGate_Wait(t *testing.T) {
-	t.Parallel()
-	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
-	now := base
-	g := &cooldownGate{now: func() time.Time { return now }}
-
-	// No cooldown → returns immediately.
-	if err := g.wait(context.Background()); err != nil {
-		t.Fatalf("wait with no cooldown: %v", err)
-	}
-
-	// After a trip, advancing the clock past the deadline clears the wait.
-	g.trip(0) // until = base + djenCooldownBase
-	now = base.Add(djenCooldownBase + time.Second)
-	if err := g.wait(context.Background()); err != nil {
-		t.Fatalf("wait after deadline passed: %v", err)
-	}
-}
-
-func TestCooldownGate_WaitRespectsContext(t *testing.T) {
-	t.Parallel()
-	// Real clock so an active cooldown has a real (short) deadline; a cancelled ctx
-	// must unblock wait immediately instead of sleeping it out.
-	g := newCooldownGate()
-	g.trip(0)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := g.wait(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("wait(cancelled ctx) = %v, want context.Canceled", err)
-	}
-}
+// The breaker.Gate mechanics (exponential backoff, cap, reset, Wait/context) are
+// tested once in lib/breaker/breaker_test.go — not re-tested here, that would be
+// the exact duplicated-logic-as-duplicated-tests smell Regra nº1 warns about.
+// What's DJEN-specific and still worth covering here: parseRetryAfter's parsing and
+// that a 429 response actually trips the connector's shared gate end-to-end.
 
 func TestParseRetryAfter(t *testing.T) {
 	t.Parallel()
@@ -152,7 +74,12 @@ func TestDJENConnector_RateLimited(t *testing.T) {
 	if rle.OAB != "347019" || rle.UF != "SP" || rle.Page != 1 {
 		t.Errorf("identity = %s/%s page %d, want 347019/SP page 1", rle.OAB, rle.UF, rle.Page)
 	}
-	if c.cooldown.until.Sub(c.cooldown.now()) <= 0 {
+	// A tripped gate blocks Wait even on an already-cancelled context (it has a real
+	// deadline to honor); an untripped gate would return nil before ever selecting on
+	// ctx.Done(). Only the exported API is used — the gate now lives in lib/breaker.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.cooldown.Wait(ctx); !errors.Is(err, context.Canceled) {
 		t.Error("cooldown gate should be tripped after a 429")
 	}
 }

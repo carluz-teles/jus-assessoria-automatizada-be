@@ -41,6 +41,55 @@ func (q *Queries) IsHoliday(ctx context.Context, arg IsHolidayParams) (bool, err
 	return exists, err
 }
 
+const lookupHolidays = `-- name: LookupHolidays :many
+SELECT scope, scope_id, date, name FROM holiday
+WHERE date = ANY($1::date[])
+  AND ( scope = 'NATIONAL'
+     OR (scope = 'STATE' AND scope_id = $2)
+     OR (scope = 'COURT' AND scope_id = $3) )
+`
+
+type LookupHolidaysParams struct {
+	Dates        []pgtype.Date `json:"dates"`
+	UfScopeID    *string       `json:"uf_scope_id"`
+	CourtScopeID *string       `json:"court_scope_id"`
+}
+
+type LookupHolidaysRow struct {
+	Scope   string      `json:"scope"`
+	ScopeID *string     `json:"scope_id"`
+	Date    pgtype.Date `json:"date"`
+	Name    string      `json:"name"`
+}
+
+// Full rows (scope/scope_id/name) for the given dates, scoped to national/uf/court — the
+// audit-trail name lookup for applied_holiday (IsHoliday only returns a bool). Empty
+// uf/court are sent as NULL (mirrors IsHoliday), which never match their scope.
+func (q *Queries) LookupHolidays(ctx context.Context, arg LookupHolidaysParams) ([]LookupHolidaysRow, error) {
+	rows, err := q.db.Query(ctx, lookupHolidays, arg.Dates, arg.UfScopeID, arg.CourtScopeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LookupHolidaysRow
+	for rows.Next() {
+		var i LookupHolidaysRow
+		if err := rows.Scan(
+			&i.Scope,
+			&i.ScopeID,
+			&i.Date,
+			&i.Name,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const seededNationalYears = `-- name: SeededNationalYears :many
 SELECT DISTINCT EXTRACT(YEAR FROM date)::int AS year
 FROM holiday

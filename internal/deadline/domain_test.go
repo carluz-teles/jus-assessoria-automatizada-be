@@ -9,7 +9,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
@@ -149,6 +151,40 @@ type mockRepo struct {
 	insertCommentErr    error
 	insertedActivities  []*TaskActivity
 	insertActivityErr   error
+
+	// V1 audit trail capture
+	gotCalcMemory      *CalcMemory
+	gotCrossValidation *CrossValidation
+	gotDeadlineEvent   *DeadlineEvent
+	gotAppliedHolidays []*AppliedHoliday
+	policy             DeadlinePolicy
+
+	// V1 apuração (apurar.go): ApurarDivergencia/ApurarTipo repo doubles
+	crossValidation              *CrossValidation
+	crossValidationErr           error
+	gotGetCrossValidationTenant  string
+	gotGetCrossValidationID      string
+	updateCVDecisionErr          error
+	updateCVDecisionCalls        int
+	gotUpdateCVDecisionTenant    string
+	gotUpdateCVDecisionID        string
+	gotUpdateCVDecisionDecisao   string
+	gotUpdateCVDecisionBy        string
+	updateEndDateErr             error
+	updateEndDateCalls           int
+	gotUpdateEndDate             time.Time
+	gotUpdateEndDatePrazoInterno time.Time
+	updateSeloErr                error
+	updateSeloCalls              int
+	gotUpdateSelo                Seal
+	gotUpdateSeloConfirmedBy     string
+	gotUpdateSeloConfirmedAt     time.Time
+	calcMemory                   *CalcMemory
+	calcMemoryErr                error
+	updateCalcMemoryTipoErr      error
+	updateCalcMemoryTipoCalls    int
+	gotUpdateCalcMemoryTipo      string
+	gotUpdateCalcMemoryConfianca float64
 
 	// captured inputs
 	gotClassTenantID         string
@@ -595,6 +631,91 @@ func (m *mockRepo) DeleteTaskItem(_ context.Context, _ database.Tx, itemID, task
 	return m.deleteItemErr
 }
 
+// InsertCalcMemory is a V1 stub — captures the memory for assertion.
+func (m *mockRepo) InsertCalcMemory(_ context.Context, _ database.Tx, cm *CalcMemory) (*CalcMemory, error) {
+	m.gotCalcMemory = cm
+	return cm, nil
+}
+
+// InsertAppliedHoliday is a V1 stub — captures each row for assertion (e.g. the
+// name/âmbito the "por que essa data?" audit label resolves to).
+func (m *mockRepo) InsertAppliedHoliday(_ context.Context, _ database.Tx, h *AppliedHoliday) (*AppliedHoliday, error) {
+	m.gotAppliedHolidays = append(m.gotAppliedHolidays, h)
+	return h, nil
+}
+
+// InsertCrossValidation is a V1 stub — captures the row for assertion.
+func (m *mockRepo) InsertCrossValidation(_ context.Context, _ database.Tx, cv *CrossValidation) (*CrossValidation, error) {
+	m.gotCrossValidation = cv
+	return cv, nil
+}
+
+// InsertDeadlineEvent is a V1 stub — captures the event for assertion.
+func (m *mockRepo) InsertDeadlineEvent(_ context.Context, _ database.Tx, e *DeadlineEvent) error {
+	m.gotDeadlineEvent = e
+	return nil
+}
+
+// GetPolicy is a V1 stub — returns the configured policy (default: seletiva).
+func (m *mockRepo) GetPolicy(_ context.Context, _ database.Tx, tenantID string) (DeadlinePolicy, error) {
+	return m.policy, nil
+}
+
+// GetCrossValidation is a V1 apuração stub (apurar.go) — returns the configured row/error.
+func (m *mockRepo) GetCrossValidation(_ context.Context, _ database.Tx, tenantID, deadlineID string) (*CrossValidation, error) {
+	m.gotGetCrossValidationTenant = tenantID
+	m.gotGetCrossValidationID = deadlineID
+	if m.crossValidationErr != nil {
+		return nil, m.crossValidationErr
+	}
+	return m.crossValidation, nil
+}
+
+// UpdateCrossValidationDecision is a V1 apuração stub — captures the decision for assertion.
+func (m *mockRepo) UpdateCrossValidationDecision(_ context.Context, _ database.Tx, tenantID, deadlineID, decisao, decididoPor string) error {
+	m.updateCVDecisionCalls++
+	m.gotUpdateCVDecisionTenant = tenantID
+	m.gotUpdateCVDecisionID = deadlineID
+	m.gotUpdateCVDecisionDecisao = decisao
+	m.gotUpdateCVDecisionBy = decididoPor
+	return m.updateCVDecisionErr
+}
+
+// UpdateDeadlineEndDate is a V1 apuração stub — captures the new end_date + prazo_interno for
+// assertion.
+func (m *mockRepo) UpdateDeadlineEndDate(_ context.Context, _ database.Tx, tenantID, deadlineID string, endDate, prazoInterno time.Time) error {
+	m.updateEndDateCalls++
+	m.gotUpdateEndDate = endDate
+	m.gotUpdateEndDatePrazoInterno = prazoInterno
+	return m.updateEndDateErr
+}
+
+// UpdateDeadlineSelo is a V1 apuração stub — captures the flipped selo + confirmed_by/at for
+// assertion.
+func (m *mockRepo) UpdateDeadlineSelo(_ context.Context, _ database.Tx, tenantID, deadlineID string, selo Seal, confirmedBy string, confirmedAt time.Time) error {
+	m.updateSeloCalls++
+	m.gotUpdateSelo = selo
+	m.gotUpdateSeloConfirmedBy = confirmedBy
+	m.gotUpdateSeloConfirmedAt = confirmedAt
+	return m.updateSeloErr
+}
+
+// GetCalcMemory is a V1 apuração stub — returns the configured row/error.
+func (m *mockRepo) GetCalcMemory(_ context.Context, _ database.Tx, tenantID, deadlineID string) (*CalcMemory, error) {
+	if m.calcMemoryErr != nil {
+		return nil, m.calcMemoryErr
+	}
+	return m.calcMemory, nil
+}
+
+// UpdateCalcMemoryTipoConfirmation is a V1 apuração stub — captures the confirmed tipo for assertion.
+func (m *mockRepo) UpdateCalcMemoryTipoConfirmation(_ context.Context, _ database.Tx, tenantID, deadlineID, tipo string, confianca float64) error {
+	m.updateCalcMemoryTipoCalls++
+	m.gotUpdateCalcMemoryTipo = tipo
+	m.gotUpdateCalcMemoryConfianca = confianca
+	return m.updateCalcMemoryTipoErr
+}
+
 // fakeCalendar records which motor was called (business vs calendar) and the args, and
 // returns a configured end date + skipped days. The default end date is well after any
 // start so validate() passes.
@@ -608,6 +729,37 @@ type fakeCalendar struct {
 	endDate       time.Time
 	holidays      []time.Time
 	err           error
+
+	// SubtractBusinessDays call recording/stubbing — the internal buffer's motor. When
+	// subtractEndDate is zero, result() falls back to start.AddDate(0, 0, -n), mirroring
+	// AddBusinessDays/AddCalendarDays' zero-value convention.
+	subtractCalls   int
+	gotSubtractArgs struct {
+		start time.Time
+		n     int
+		uf    string
+		court string
+	}
+	subtractEndDate time.Time
+	subtractErr     error
+
+	// LookupHolidays call recording/stubbing — the "por que essa data?" name/scope
+	// lookup OnIntimationObserved uses to label applied_holiday.
+	lookupCalls int
+	lookupDays  []time.Time
+	lookupUF    string
+	lookupCourt string
+	lookupLabel map[time.Time]calendar.Holiday
+	lookupErr   error
+}
+
+func (c *fakeCalendar) LookupHolidays(_ context.Context, days []time.Time, uf, court string) (map[time.Time]calendar.Holiday, error) {
+	c.lookupCalls++
+	c.lookupDays, c.lookupUF, c.lookupCourt = days, uf, court
+	if c.lookupErr != nil {
+		return nil, c.lookupErr
+	}
+	return c.lookupLabel, nil
 }
 
 func (c *fakeCalendar) AddBusinessDays(_ context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error) {
@@ -631,6 +783,22 @@ func (c *fakeCalendar) result(start time.Time, n int) (time.Time, []time.Time, e
 		end = start.AddDate(0, 0, n)
 	}
 	return end, c.holidays, nil
+}
+
+// SubtractBusinessDays records the call and returns the configured subtractEndDate (or, when
+// unset, start walked back n calendar days — a deterministic default so a test that never
+// stubs the internal buffer still gets a stable, plausible date rather than a zero value).
+func (c *fakeCalendar) SubtractBusinessDays(_ context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error) {
+	c.subtractCalls++
+	c.gotSubtractArgs.start, c.gotSubtractArgs.n, c.gotSubtractArgs.uf, c.gotSubtractArgs.court = start, n, uf, court
+	if c.subtractErr != nil {
+		return time.Time{}, nil, c.subtractErr
+	}
+	end := c.subtractEndDate
+	if end.IsZero() {
+		end = start.AddDate(0, 0, -n)
+	}
+	return end, nil, nil
 }
 
 // fakeUOW runs fn with a nil tx (the mocked repo/dedup never touch it) and records the
@@ -806,6 +974,49 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 	}
 }
 
+// TestOnIntimationObserved_PersistsPrazoInterno verifies the internal safety buffer is
+// computed via SubtractBusinessDays(EndDate, internalBufferBusinessDays, uf, court) — the SAME
+// event uf/court the forward AddBusinessDays motor used — and persisted on the deadline row
+// (deadline.prazo_interno), not left as an in-memory read-time placeholder. The stubbed
+// subtractEndDate lands well before a naive EndDate-minus-2-calendar-days would, standing in
+// for a business-day count that crossed a holiday/weekend (the real crossing math is covered
+// by lib/calendar's own SubtractBusinessDays tests).
+func TestOnIntimationObserved_PersistsPrazoInterno(t *testing.T) {
+	ev := observedFixture()
+	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)          // a Tuesday
+	prazoInterno := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC) // 2 dias úteis antes, atravessando o fds
+
+	repo := &mockRepo{class: "Procedimento Comum Cível", rule: citacaoRule(), insertID: uuid.NewString()}
+	cal := &fakeCalendar{endDate: end, subtractEndDate: prazoInterno}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{},
+		WithClock(func() time.Time { return time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC) }))
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	d := repo.inserted
+	if d == nil {
+		t.Fatal("expected a deadline to be inserted")
+	}
+	if !d.PrazoInterno.Equal(prazoInterno) {
+		t.Errorf("PrazoInterno = %v, want %v", d.PrazoInterno, prazoInterno)
+	}
+	if cal.subtractCalls != 1 {
+		t.Fatalf("SubtractBusinessDays calls = %d, want 1", cal.subtractCalls)
+	}
+	if !cal.gotSubtractArgs.start.Equal(end) {
+		t.Errorf("SubtractBusinessDays start = %v, want the derived EndDate %v", cal.gotSubtractArgs.start, end)
+	}
+	if cal.gotSubtractArgs.n != internalBufferBusinessDays {
+		t.Errorf("SubtractBusinessDays n = %d, want %d", cal.gotSubtractArgs.n, internalBufferBusinessDays)
+	}
+	if cal.gotSubtractArgs.uf != ev.UF || cal.gotSubtractArgs.court != ev.Court {
+		t.Errorf("SubtractBusinessDays uf/court = %q/%q, want the event's %q/%q", cal.gotSubtractArgs.uf, cal.gotSubtractArgs.court, ev.UF, ev.Court)
+	}
+}
+
 // TestOnIntimationObserved_ComunicacaoIsNoOp is the belt-and-suspenders guard: a generic
 // COMUNICACAO opens no prazo, so it is dropped BEFORE any transaction — no dedup mark, no
 // tx scope, no deadline inserted, no event published. The DJEN parser already gates these,
@@ -864,9 +1075,10 @@ func TestOnIntimationObserved_OverdueBornMissed(t *testing.T) {
 	if repo.inserted.Status != StatusMissed {
 		t.Errorf("Status = %q, want MISSED (nascido já vencido)", repo.inserted.Status)
 	}
-	// Silencioso: só deadline.opened; nenhum deadline.missed, missed_check ou reminder_check.
-	if got := len(outbox.published); got != 1 {
-		t.Fatalf("published events = %d, want 1 (só deadline.opened)", got)
+	// Silencioso: opened + V1 calculated + V1 seal_assigned; nenhum deadline.missed,
+	// missed_check ou reminder_check. (No confirmation required: seal=confiavel, policy=seletiva.)
+	if got := len(outbox.published); got != 3 {
+		t.Fatalf("published events = %d, want 3 (opened + calculated + seal_assigned)", got)
 	}
 	if _, ok := outbox.published[0].(DeadlineOpened); !ok {
 		t.Errorf("published[0] = %T, want DeadlineOpened", outbox.published[0])
@@ -1136,9 +1348,9 @@ func TestOnIntimationObserved_SchedulesReminderAndMissedChecks(t *testing.T) {
 		t.Errorf("missed_check idempotency key = %q, want %q", missed[0].IdempotencyKey(), want)
 	}
 
-	// opened + 3 reminders + 1 missed = 5 total, nothing else.
-	if len(outbox.published) != 5 {
-		t.Errorf("total published = %d, want 5", len(outbox.published))
+	// opened + 3 reminders + 1 missed + V1 calculated + V1 seal_assigned = 7 total, nothing else.
+	if len(outbox.published) != 7 {
+		t.Errorf("total published = %d, want 7", len(outbox.published))
 	}
 }
 
@@ -1159,14 +1371,14 @@ func TestOnIntimationObserved_SkipsPastMarks(t *testing.T) {
 			now:          time.Date(2024, 1, 30, 12, 0, 0, 0, time.UTC), // D-3 (01-29) already past
 			wantDaysLeft: []int{1, 0},
 			wantMissed:   true,
-			wantTotalPub: 4, // opened + 2 reminders + missed
+			wantTotalPub: 6, // opened + 2 reminders + missed + V1 calculated + V1 seal_assigned
 		},
 		{
 			name:         "born after vencimento schedules nothing",
 			now:          time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC), // even D+1 is past
 			wantDaysLeft: nil,
 			wantMissed:   false,
-			wantTotalPub: 1, // opened only
+			wantTotalPub: 3, // opened + V1 calculated + V1 seal_assigned
 		},
 	}
 	for _, tt := range tests {
@@ -1887,5 +2099,727 @@ func TestOnMissedCheck_InfraErrorPropagates(t *testing.T) {
 	}
 	if len(outbox.published) != 0 {
 		t.Errorf("published events = %d, want 0 on error", len(outbox.published))
+	}
+}
+
+// ── V1 Motor de Prazos: derive functions ──────────────────────────────────────
+
+func TestDeriveOrigem(t *testing.T) {
+	tests := []struct {
+		name         string
+		hasDeclarado bool
+		usedIA       bool
+		want         Origem
+	}{
+		{"declarado wins over IA", true, true, OrigemDeclarado},
+		{"declarado without IA", true, false, OrigemDeclarado},
+		{"IA only", false, true, OrigemIA},
+		{"neither — calculado", false, false, OrigemCalculado},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveOrigem(tt.hasDeclarado, tt.usedIA)
+			if got != tt.want {
+				t.Errorf("deriveOrigem(%v, %v) = %q, want %q", tt.hasDeclarado, tt.usedIA, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeriveSeal(t *testing.T) {
+	tests := []struct {
+		name      string
+		origem    Origem
+		divergent bool
+		want      Seal
+	}{
+		{"IA always a_apurar", OrigemIA, false, SealAApurar},
+		{"divergent always a_apurar", OrigemCalculado, true, SealAApurar},
+		{"IA + divergent", OrigemIA, true, SealAApurar},
+		{"declarado normal", OrigemDeclarado, false, SealConfiavel},
+		{"calculado normal", OrigemCalculado, false, SealConfiavel},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveSeal(tt.origem, tt.divergent)
+			if got != tt.want {
+				t.Errorf("deriveSeal(%q, %v) = %q, want %q", tt.origem, tt.divergent, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeriveConfirmacaoExigida(t *testing.T) {
+	tests := []struct {
+		name              string
+		seal              Seal
+		policyObrigatoria bool
+		want              bool
+	}{
+		{"seal a_apurar overrides policy", SealAApurar, false, true},
+		{"seal a_apurar + policy true", SealAApurar, true, true},
+		{"seal confiavel + policy obrigatoria", SealConfiavel, true, true},
+		{"seal confiavel + policy seletiva", SealConfiavel, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveConfirmacaoExigida(tt.seal, tt.policyObrigatoria)
+			if got != tt.want {
+				t.Errorf("deriveConfirmacaoExigida(%q, %v) = %v, want %v", tt.seal, tt.policyObrigatoria, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOnIntimationObserved_V1Fields verifies the V1 fields (origem, selo,
+// confirmacao_exigida) are set on the born deadline and that the audit trail
+// (calc_memory, deadline_event) is persisted in the same tx.
+func TestOnIntimationObserved_V1Fields(t *testing.T) {
+	tenantID := uuid.NewString()
+	courtRecordID := uuid.NewString()
+	intimationID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule: DeadlineRule{
+			RulesVersion:  rulesVersion,
+			Kind:          "MANIFESTACAO",
+			Days:          15,
+			Counting:      CountingBusiness,
+			LegalCitation: "art. 335, CPC",
+		},
+	}
+	cal := &fakeCalendar{endDate: time.Now().AddDate(0, 0, 20)}
+	outbox := &fakeOutbox{}
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, cal, outbox, dedup, uow)
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   courtRecordID,
+		IntimationID:    intimationID,
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+	}
+
+	err := uc.OnIntimationObserved(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	// Verify deadline V1 fields
+	d := repo.inserted
+	if d == nil {
+		t.Fatal("InsertDeadline not called")
+	}
+	if d.Origem != OrigemCalculado {
+		t.Errorf("origem = %q, want %q (no declarado, no IA)", d.Origem, OrigemCalculado)
+	}
+	if d.Seal != SealConfiavel {
+		t.Errorf("selo = %q, want %q (calculado + not divergent)", d.Seal, SealConfiavel)
+	}
+	if d.ConfirmacaoExigida {
+		t.Error("confirmacao_exigida = true, want false (seal=confiavel + policy=seletiva)")
+	}
+
+	// Verify calc_memory was persisted
+	if repo.gotCalcMemory == nil {
+		t.Error("InsertCalcMemory not called")
+	} else {
+		if repo.gotCalcMemory.DeadlineID != d.ID {
+			t.Errorf("calc_memory.deadline_id = %s, want %s", repo.gotCalcMemory.DeadlineID, d.ID)
+		}
+		if repo.gotCalcMemory.PrazoBase != "15 dias úteis" {
+			t.Errorf("calc_memory.prazo_base = %q, want %q", repo.gotCalcMemory.PrazoBase, "15 dias úteis")
+		}
+		// The "por que essa data?" card must show human text, never the raw rule/anchor
+		// identifiers (the bug this fix addresses).
+		wantFonte := "art. 335, CPC · Tabela legal"
+		if repo.gotCalcMemory.PrazoBaseFonte != wantFonte {
+			t.Errorf("calc_memory.prazo_base_fonte = %q, want %q", repo.gotCalcMemory.PrazoBaseFonte, wantFonte)
+		}
+		if repo.gotCalcMemory.PrazoBaseFonte == "tabela_legal" {
+			t.Error("calc_memory.prazo_base_fonte still the raw internal literal")
+		}
+		wantTermo := "Publicação no DJEN → contagem inicia no 1º dia útil seguinte (art. 224, §3º · 231, CPC)."
+		if repo.gotCalcMemory.TermoInicialRegra != wantTermo {
+			t.Errorf("calc_memory.termo_inicial_regra = %q, want %q", repo.gotCalcMemory.TermoInicialRegra, wantTermo)
+		}
+		if repo.gotCalcMemory.TermoInicialRegra == "deadline_start_at" {
+			t.Error("calc_memory.termo_inicial_regra still the raw internal literal")
+		}
+	}
+
+	// Verify deadline_event was persisted
+	if repo.gotDeadlineEvent == nil {
+		t.Error("InsertDeadlineEvent not called")
+	} else {
+		if repo.gotDeadlineEvent.DeadlineID != d.ID {
+			t.Errorf("deadline_event.deadline_id = %s, want %s", repo.gotDeadlineEvent.DeadlineID, d.ID)
+		}
+		if repo.gotDeadlineEvent.Tipo != "calculado" {
+			t.Errorf("deadline_event.tipo = %q, want %q", repo.gotDeadlineEvent.Tipo, "calculado")
+		}
+	}
+
+	// V1 events: opened + calculated + seal_assigned + 3 reminders + 1 missed = 7
+	if got := len(outbox.published); got != 7 {
+		names := make([]string, got)
+		for i, e := range outbox.published {
+			names[i] = e.Type()
+		}
+		t.Errorf("published events = %d (%v), want 7 (opened + calculated + seal_assigned + 3 reminders + missed)", got, names)
+	}
+
+	// No skipped days were returned by AddBusinessDays (fakeCalendar.holidays unset), so the
+	// name/scope lookup must not run at all — it is an audit-trail label pass, never on the
+	// path that decides the date.
+	if cal.lookupCalls != 0 {
+		t.Errorf("LookupHolidays calls = %d, want 0 (no holidays skipped)", cal.lookupCalls)
+	}
+}
+
+// TestOnIntimationObserved_AppliedHolidayLabels verifies the "por que essa data?" card gets a
+// human holiday name/âmbito resolved from the calendar's LookupHolidays, not the hardcoded
+// "feriado"/"nacional" this fix replaces — and that an unresolved date (drift between
+// AddBusinessDays' skip list and LookupHolidays' rows) still degrades to a defensive label
+// instead of leaving the fields empty.
+func TestOnIntimationObserved_AppliedHolidayLabels(t *testing.T) {
+	tenantID := uuid.NewString()
+	feriadoEstadual := time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC)
+	feriadoSemLabel := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+
+	repo := &mockRepo{
+		rule: DeadlineRule{
+			RulesVersion: rulesVersion,
+			Kind:         "MANIFESTACAO",
+			Days:         15,
+			Counting:     CountingBusiness,
+		},
+	}
+	cal := &fakeCalendar{
+		endDate:  time.Now().AddDate(0, 0, 20),
+		holidays: []time.Time{feriadoEstadual, feriadoSemLabel},
+		lookupLabel: map[time.Time]calendar.Holiday{
+			feriadoEstadual: {Scope: calendar.ScopeState, ScopeID: "SP", Name: "Revolução Constitucionalista"},
+			// feriadoSemLabel deliberately absent: exercises the drift fallback.
+		},
+	}
+	uc := NewUseCase(repo, cal, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+	}
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	if cal.lookupCalls != 1 {
+		t.Fatalf("LookupHolidays calls = %d, want 1", cal.lookupCalls)
+	}
+	if cal.lookupUF != "SP" || cal.lookupCourt != "TJSP" {
+		t.Errorf("LookupHolidays(uf=%q, court=%q), want (SP, TJSP)", cal.lookupUF, cal.lookupCourt)
+	}
+
+	if len(repo.gotAppliedHolidays) != 2 {
+		t.Fatalf("InsertAppliedHoliday calls = %d, want 2", len(repo.gotAppliedHolidays))
+	}
+	byDate := make(map[time.Time]*AppliedHoliday, len(repo.gotAppliedHolidays))
+	for _, h := range repo.gotAppliedHolidays {
+		byDate[h.Data] = h
+	}
+
+	resolved, ok := byDate[feriadoEstadual]
+	if !ok {
+		t.Fatal("applied_holiday missing the resolved-label date")
+	}
+	if resolved.Nome != "Revolução Constitucionalista" {
+		t.Errorf("applied_holiday.nome = %q, want %q", resolved.Nome, "Revolução Constitucionalista")
+	}
+	if resolved.Ambito != "estadual" {
+		t.Errorf("applied_holiday.ambito = %q, want %q", resolved.Ambito, "estadual")
+	}
+
+	fallback, ok := byDate[feriadoSemLabel]
+	if !ok {
+		t.Fatal("applied_holiday missing the unresolved-label date")
+	}
+	if fallback.Nome != "Feriado ou suspensão" {
+		t.Errorf("applied_holiday.nome = %q, want the defensive fallback %q", fallback.Nome, "Feriado ou suspensão")
+	}
+	if fallback.Ambito != "nacional" {
+		t.Errorf("applied_holiday.ambito = %q, want the defensive fallback %q", fallback.Ambito, "nacional")
+	}
+
+	// Neither field is the old hardcoded literal for both rows — the bug this fix addresses.
+	for _, h := range repo.gotAppliedHolidays {
+		if h.Nome == "feriado" {
+			t.Errorf("applied_holiday.nome = %q, still the old hardcoded literal", h.Nome)
+		}
+	}
+}
+
+// TestOnIntimationObserved_ConfirmacaoExigida_PolicyObrigatoria verifies the
+// piso inegociável: even with seal=confiavel, a tenant with ConfirmacaoObrigatoria=true
+// gets confirmacao_exigida=true and a deadline.confirmation_required event.
+func TestOnIntimationObserved_ConfirmacaoExigida_PolicyObrigatoria(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule: DeadlineRule{
+			RulesVersion: rulesVersion,
+			Kind:         "MANIFESTACAO",
+			Days:         15,
+			Counting:     CountingBusiness,
+		},
+		policy: DeadlinePolicy{
+			TenantID:               tenantID,
+			ConfirmacaoObrigatoria: true,
+		},
+	}
+	cal := &fakeCalendar{endDate: time.Now().AddDate(0, 0, 20)}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+	}
+
+	err := uc.OnIntimationObserved(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	d := repo.inserted
+	if d == nil {
+		t.Fatal("InsertDeadline not called")
+	}
+	if !d.ConfirmacaoExigida {
+		t.Error("confirmacao_exigida = false, want true (policy obrigatoria)")
+	}
+	if d.Seal != SealConfiavel {
+		t.Errorf("selo = %q, want %q", d.Seal, SealConfiavel)
+	}
+
+	// V1 events: opened + calculated + seal_assigned + confirmation_required + 3 reminders + 1 missed = 8
+	if got := len(outbox.published); got != 8 {
+		names := make([]string, got)
+		for i, e := range outbox.published {
+			names[i] = e.Type()
+		}
+		t.Errorf("published events = %d (%v), want 8 (opened + calculated + seal_assigned + confirmation_required + 3 reminders + missed)", got, names)
+	}
+}
+
+// TestOnIntimationObserved_DeclaradoOrigem verifies that when PrazoDeclarado is present,
+// the origem is "declarado" and seal is "confiavel".
+func TestOnIntimationObserved_DeclaradoOrigem(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule: DeadlineRule{
+			RulesVersion: rulesVersion,
+			Kind:         "MANIFESTACAO",
+			Days:         15,
+			Counting:     CountingBusiness,
+		},
+	}
+	cal := &fakeCalendar{endDate: time.Now().AddDate(0, 0, 20)}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+		PrazoDeclarado:  "5 dias",
+	}
+
+	err := uc.OnIntimationObserved(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	d := repo.inserted
+	if d == nil {
+		t.Fatal("InsertDeadline not called")
+	}
+	if d.Origem != OrigemDeclarado {
+		t.Errorf("origem = %q, want %q", d.Origem, OrigemDeclarado)
+	}
+	if d.Seal != SealConfiavel {
+		t.Errorf("selo = %q, want %q (declarado + not divergent = confiavel)", d.Seal, SealConfiavel)
+	}
+}
+
+// --- parseDeclaradoDays / buildCrossValidation (pure, unit) ------------------
+
+func TestParseDeclaradoDays(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		in     string
+		wantN  int
+		wantOK bool
+	}{
+		{name: "simple dias", in: "5 dias", wantN: 5, wantOK: true},
+		{name: "dias uteis suffix", in: "15 dias úteis", wantN: 15, wantOK: true},
+		{name: "leading whitespace", in: "  10 dias", wantN: 10, wantOK: true},
+		{name: "empty", in: "", wantN: 0, wantOK: false},
+		{name: "non numeric", in: "prazo indeterminado", wantN: 0, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			n, ok := parseDeclaradoDays(tt.in)
+			if n != tt.wantN || ok != tt.wantOK {
+				t.Errorf("parseDeclaradoDays(%q) = (%d, %v), want (%d, %v)", tt.in, n, ok, tt.wantN, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestBuildCrossValidation(t *testing.T) {
+	t.Parallel()
+
+	declared := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+
+	t.Run("convergente when dates match", func(t *testing.T) {
+		t.Parallel()
+		cv := buildCrossValidation("tenant-1", declared, declared, nil)
+		if cv.Resultado != crossValidationConvergente {
+			t.Errorf("resultado = %q, want %q", cv.Resultado, crossValidationConvergente)
+		}
+		if cv.DifDias != 0 {
+			t.Errorf("dif_dias = %d, want 0", cv.DifDias)
+		}
+		if cv.CausaProvavel != "" {
+			t.Errorf("causa_provavel = %q, want empty on convergente", cv.CausaProvavel)
+		}
+	})
+
+	t.Run("divergente when dates differ, dif_dias signed", func(t *testing.T) {
+		t.Parallel()
+		calculated := declared.AddDate(0, 0, 10)
+		cv := buildCrossValidation("tenant-1", declared, calculated, nil)
+		if cv.Resultado != crossValidationDivergente {
+			t.Errorf("resultado = %q, want %q", cv.Resultado, crossValidationDivergente)
+		}
+		if cv.DifDias != 10 {
+			t.Errorf("dif_dias = %d, want 10", cv.DifDias)
+		}
+		if cv.CausaProvavel == "" {
+			t.Error("causa_provavel = empty, want a heuristic explanation on divergente")
+		}
+	})
+
+	t.Run("divergente causa mentions applied holidays when present", func(t *testing.T) {
+		t.Parallel()
+		calculated := declared.AddDate(0, 0, 3)
+		holidays := []time.Time{declared.AddDate(0, 0, 1)}
+		cv := buildCrossValidation("tenant-1", declared, calculated, holidays)
+		if cv.CausaProvavel == "" {
+			t.Fatal("causa_provavel = empty, want holiday-aware heuristic")
+		}
+	})
+}
+
+// --- OnIntimationObserved: cross-validation + IA classification (integration) ---
+
+// TestOnIntimationObserved_CrossValidation_Divergente verifies that when the declared and
+// calculated day counts differ, InsertCrossValidation is called with resultado=divergente and
+// the deadline's selo is forced to a_apurar (the piso inegociável), even though origem stays
+// "declarado" (the intimação DID declare a prazo).
+func TestOnIntimationObserved_CrossValidation_Divergente(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule:     DeadlineRule{RulesVersion: rulesVersion, Kind: "MANIFESTACAO", Days: 15, Counting: CountingBusiness},
+		insertID: uuid.NewString(),
+	}
+	// endDate left zero so fakeCalendar computes start.AddDate(0,0,n) per call — the declared
+	// (5 dias) and calculado (15 dias) calls then land on genuinely different dates.
+	cal := &fakeCalendar{}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2099-01-01",
+		PrazoDeclarado:  "5 dias",
+	}
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	if repo.gotCrossValidation == nil {
+		t.Fatal("InsertCrossValidation not called")
+	}
+	if repo.gotCrossValidation.Resultado != crossValidationDivergente {
+		t.Errorf("cross_validation.resultado = %q, want %q", repo.gotCrossValidation.Resultado, crossValidationDivergente)
+	}
+	if repo.gotCrossValidation.DifDias != 10 {
+		t.Errorf("cross_validation.dif_dias = %d, want 10", repo.gotCrossValidation.DifDias)
+	}
+	if repo.gotCrossValidation.DeadlineID != repo.insertID {
+		t.Errorf("cross_validation.deadline_id = %q, want %q (the saved deadline's id)", repo.gotCrossValidation.DeadlineID, repo.insertID)
+	}
+
+	d := repo.inserted
+	if d.Origem != OrigemDeclarado {
+		t.Errorf("origem = %q, want %q (a divergência does not change origem)", d.Origem, OrigemDeclarado)
+	}
+	if d.Seal != SealAApurar {
+		t.Errorf("selo = %q, want %q (divergent = piso inegociável)", d.Seal, SealAApurar)
+	}
+	if !d.ConfirmacaoExigida {
+		t.Error("confirmacao_exigida = false, want true (piso inegociável on a_apurar)")
+	}
+}
+
+// TestOnIntimationObserved_CrossValidation_Convergente verifies that when the declared and
+// calculated day counts match, InsertCrossValidation is called with resultado=convergente and
+// selo stays confiavel.
+func TestOnIntimationObserved_CrossValidation_Convergente(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule:     DeadlineRule{RulesVersion: rulesVersion, Kind: "MANIFESTACAO", Days: 15, Counting: CountingBusiness},
+		insertID: uuid.NewString(),
+	}
+	cal := &fakeCalendar{}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2099-01-01",
+		PrazoDeclarado:  "15 dias",
+	}
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	if repo.gotCrossValidation == nil {
+		t.Fatal("InsertCrossValidation not called")
+	}
+	if repo.gotCrossValidation.Resultado != crossValidationConvergente {
+		t.Errorf("cross_validation.resultado = %q, want %q", repo.gotCrossValidation.Resultado, crossValidationConvergente)
+	}
+	if repo.inserted.Seal != SealConfiavel {
+		t.Errorf("selo = %q, want %q (convergent + declarado = confiavel)", repo.inserted.Seal, SealConfiavel)
+	}
+}
+
+// TestOnIntimationObserved_CrossValidation_UnparseableDeclaracao verifies that a
+// prazo_declarado the extractor cannot resolve to a day count (free text with no leading
+// integer) skips cross-validation entirely — no InsertCrossValidation call, no error — while
+// origem still derives "declarado" (the intimação DID declare something).
+func TestOnIntimationObserved_CrossValidation_UnparseableDeclaracao(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule: DeadlineRule{RulesVersion: rulesVersion, Kind: "MANIFESTACAO", Days: 15, Counting: CountingBusiness},
+	}
+	cal := &fakeCalendar{endDate: time.Now().AddDate(0, 0, 20)}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+		PrazoDeclarado:  "prazo indeterminado",
+	}
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	if repo.gotCrossValidation != nil {
+		t.Errorf("InsertCrossValidation called = %+v, want no call (unparseable declaração)", repo.gotCrossValidation)
+	}
+	if repo.inserted.Origem != OrigemDeclarado {
+		t.Errorf("origem = %q, want %q", repo.inserted.Origem, OrigemDeclarado)
+	}
+}
+
+// fakeClassifier is a typeClassifier double: returns a configured ClassifiedType/error and
+// records the CaseContext it was called with.
+type fakeClassifier struct {
+	result ClassifiedType
+	err    error
+	calls  int
+	gotCtx advisory.CaseContext
+}
+
+func (f *fakeClassifier) ClassifyType(_ context.Context, _ string, c advisory.CaseContext) (ClassifiedType, error) {
+	f.calls++
+	f.gotCtx = c
+	return f.result, f.err
+}
+
+// TestOnIntimationObserved_OmissaClassifiedByIA verifies that when the intimação is omissa (no
+// prazo_declarado) and a classifier is wired + succeeds, origem derives "ia" (usedIA=true) and
+// selo is forced to a_apurar (the piso inegociável) — and the classified tipo/confiança land in
+// calc_memory (provenance).
+func TestOnIntimationObserved_OmissaClassifiedByIA(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule: DeadlineRule{RulesVersion: rulesVersion, Kind: "GENERICO", Days: 15, Counting: CountingBusiness},
+	}
+	cal := &fakeCalendar{endDate: time.Now().AddDate(0, 0, 20)}
+	outbox := &fakeOutbox{}
+	classifier := &fakeClassifier{result: ClassifiedType{Tipo: "Contestação", Confianca: 0.8}}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{}, WithClassifier(classifier))
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+		// PrazoDeclarado deliberately empty — omissa intimação.
+	}
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	if classifier.calls != 1 {
+		t.Fatalf("classifier calls = %d, want 1", classifier.calls)
+	}
+	d := repo.inserted
+	if d.Origem != OrigemIA {
+		t.Errorf("origem = %q, want %q", d.Origem, OrigemIA)
+	}
+	if d.Seal != SealAApurar {
+		t.Errorf("selo = %q, want %q (origem=ia is a piso inegociável)", d.Seal, SealAApurar)
+	}
+	if repo.gotCalcMemory == nil || repo.gotCalcMemory.IATipoInferido != "Contestação" {
+		t.Errorf("calc_memory.ia_tipo_inferido = %+v, want %q", repo.gotCalcMemory, "Contestação")
+	}
+	if repo.gotCalcMemory.IAConfianca != 0.8 {
+		t.Errorf("calc_memory.ia_confianca = %v, want 0.8", repo.gotCalcMemory.IAConfianca)
+	}
+}
+
+// TestOnIntimationObserved_OmissaClassifierUnavailable verifies that an omissa intimação with
+// NO classifier wired (nil, the common worker/api composition when OpenRouter is unconfigured)
+// never fails the ingest — the prazo still opens, just without the IA enrichment (origem stays
+// "calculado", never chuta a tipo).
+func TestOnIntimationObserved_OmissaClassifierUnavailable(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule: DeadlineRule{RulesVersion: rulesVersion, Kind: "GENERICO", Days: 15, Counting: CountingBusiness},
+	}
+	cal := &fakeCalendar{endDate: time.Now().AddDate(0, 0, 20)}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{}) // no WithClassifier
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+	}
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v", err)
+	}
+
+	d := repo.inserted
+	if d == nil {
+		t.Fatal("InsertDeadline not called")
+	}
+	if d.Origem != OrigemCalculado {
+		t.Errorf("origem = %q, want %q (no classifier wired, never chuta)", d.Origem, OrigemCalculado)
+	}
+}
+
+// TestOnIntimationObserved_OmissaClassifierFailureDoesNotBlockIngest verifies that a
+// classifier error (LLM call failed, timed out, etc — anything other than
+// ErrClassifierUnavailable) is swallowed (logged, not propagated): the design's floor is
+// "prazo sempre nasce", so an OPTIONAL enrichment failure never fails the ingest.
+func TestOnIntimationObserved_OmissaClassifierFailureDoesNotBlockIngest(t *testing.T) {
+	tenantID := uuid.NewString()
+
+	repo := &mockRepo{
+		rule: DeadlineRule{RulesVersion: rulesVersion, Kind: "GENERICO", Days: 15, Counting: CountingBusiness},
+	}
+	cal := &fakeCalendar{endDate: time.Now().AddDate(0, 0, 20)}
+	outbox := &fakeOutbox{}
+	classifier := &fakeClassifier{err: errors.New("llm: timeout")}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{}, WithClassifier(classifier))
+
+	ev := IntimationObserved{
+		Base:            events.Base{EventID: uuid.NewString()},
+		TenantID:        tenantID,
+		CourtRecordID:   uuid.NewString(),
+		IntimationID:    uuid.NewString(),
+		Type:            "INTIMACAO",
+		Court:           "TJSP",
+		UF:              "SP",
+		DeadlineStartAt: "2026-09-15",
+	}
+
+	if err := uc.OnIntimationObserved(context.Background(), ev); err != nil {
+		t.Fatalf("OnIntimationObserved() error = %v, want nil (classifier failure must not block ingest)", err)
+	}
+	if repo.inserted.Origem != OrigemCalculado {
+		t.Errorf("origem = %q, want %q (classifier failed, never chuta)", repo.inserted.Origem, OrigemCalculado)
 	}
 }

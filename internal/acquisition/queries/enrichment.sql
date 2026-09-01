@@ -43,7 +43,10 @@ UPDATE court_record SET
     lifecycle = CASE
         WHEN lifecycle = 'SUPERSEDED' THEN lifecycle
         ELSE COALESCE(NULLIF(@lifecycle, ''), lifecycle)
-    END
+    END,
+    -- phase: refresh the DERIVED value; keep the existing one when the grade carries none
+    -- (empty). phase_override (the manual correction) is a separate column, never touched here.
+    phase = COALESCE(NULLIF(@phase, ''), phase)
 WHERE id = @court_record_id AND tenant_id = @tenant_id
 RETURNING id, case_id;
 

@@ -44,4 +44,38 @@ type Request struct {
 	SchemaName string          // e.g. "suggested_tasks" — response_format.json_schema.name
 	Model      string          // optional override; "" → the adapter's default model
 	MaxTokens  int             // 0 → a sane default (defaultMaxTokens)
+	// UseCase labels the calling slice/use case for cost attribution (e.g.
+	// "draft.generate", "acquisition.analyze_intimation"). "" is a valid answer — the
+	// call is simply not attributed to any use case in the usage record.
+	UseCase string
+	// TenantID scopes the usage record to the tenant that triggered the call. "" is a
+	// valid answer for calls with no tenant in scope.
+	TenantID string
+}
+
+// Usage is one completed call's token/cost facts, as reported by the provider.
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CachedTokens     int
+	CostUSD          float64
+}
+
+// UsageEvent is one completed generation call's usage, ready for a UsageRecorder to persist.
+type UsageEvent struct {
+	TenantID  string
+	UseCase   string
+	Provider  string
+	Model     string
+	Usage     Usage
+	LatencyMs int64
+	TraceID   string
+}
+
+// UsageRecorder is a best-effort telemetry sink for a completed generation call. A
+// recorder fault must never fail the underlying generation — callers only log it, they
+// never propagate it as the call's result.
+type UsageRecorder interface {
+	RecordUsage(ctx context.Context, ev UsageEvent) error
 }

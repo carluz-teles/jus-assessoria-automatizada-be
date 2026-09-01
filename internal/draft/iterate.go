@@ -274,6 +274,8 @@ func (uc *IterateUseCase) Iterate(ctx context.Context, cmd IterateCommand) (*Ite
 		SchemaName: "draft_iterate",
 		Model:      uc.model,
 		MaxTokens:  4096,
+		UseCase:    "draft.iterate",
+		TenantID:   cmd.TenantID,
 	})
 	if err != nil {
 		if isTerminalGenErr(err) {

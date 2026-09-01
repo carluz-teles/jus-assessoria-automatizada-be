@@ -20,6 +20,8 @@
 -- ListIntimacoes pattern in this file) so sqlc infers nullable types correctly.
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo: assigned at case level (court_case), shared across
        -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
        -- leaves assigned_user_id/name NULL, never dropping the record from the list.
@@ -70,6 +72,8 @@ LIMIT $2;
 -- next_deadline: same correlated LATERAL as ListProcessos (see above).
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
        -- an unassigned case still returns the record with NULL assigned_user_id/name.
        cc.assigned_user_id, au.name AS assigned_user_name,
@@ -123,11 +127,15 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        d.end_date                                                                 AS prazo_end_date,
        CASE WHEN d.id IS NOT NULL THEN (d.end_date - CURRENT_DATE)::int END       AS prazo_days_left,
        d.status                                                                   AS prazo_status,
-       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed
+       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed,
+       -- peça (draft) da intimação → work_stage (mesmo join do GetIntimacao).
+       dr.status                                                                  AS draft_status,
+       dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.tenant_id = $1
   AND (
     @search::text = ''
@@ -141,6 +149,19 @@ WHERE i.tenant_id = $1
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
     OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
+  )
+  -- Status = work_stage derivado. O CASE ESPELHA deriveWorkStage (read.go) — mesma
+  -- precedência marco-mais-avançado-vence. Manter os dois em sincronia.
+  AND (
+    @work_stage::text = ''
+    OR (CASE
+      WHEN dr.filed_at IS NOT NULL THEN 'FILED'
+      WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
+      WHEN dr.status = 'DRAFT' THEN 'DRAFTING'
+      WHEN d.id IS NULL THEN 'RECEIVED'
+      WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
+      ELSE 'AWAITING_CONFIRMATION'
+    END) = @work_stage::text
   )
   AND (
     @urgencia::text = ''
@@ -195,7 +216,8 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        -- detail pra alimentar a linha "Distribuição" da barra rica.
        cr.filed_at AS distribution_date,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
-       i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
+       -- ai_act (0082) = o ato classificado pela IA (título do detalhe + pill "Ato").
+       i.ai_summary, i.ai_providencias, i.ai_analyzed_at, i.ai_act,
        -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
        i.assignee_user_id,
        ua.name                                                                     AS assignee_user_name,
@@ -209,13 +231,36 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed,
        -- histórico derivado: confirmed_at + confirmer name (para label "Prazo confirmado por X")
        d.confirmed_at                                                             AS prazo_confirmed_at,
-       ucf.name                                                                   AS prazo_confirmed_by_name
+       ucf.name                                                                   AS prazo_confirmed_by_name,
+       -- peça (draft) desta intimação — no máximo uma (unique parcial em
+       -- (tenant_id, intimation_id), migration 0042). status + filed_at posicionam
+       -- o work_stage nas etapas de peticionamento (DRAFTING/PARTNER_REVIEW/FILED).
+       -- NULL/false quando a intimação ainda não tem peça.
+       dr.status                                                                  AS draft_status,
+       dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua  ON ua.id = i.assignee_user_id
 LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.id = $1 AND i.tenant_id = $2;
+
+-- name: ListDeadlineEventsByDeadlineID :many
+-- The deadline_event audit trail for one prazo (deadline slice's table — acquisition already
+-- reads `deadline` directly for other GetIntimacao fields, e.g. confirmed_at/confirmed_by_name
+-- above, the same precedent: read the table, never import the deadline package). GetIntimacao
+-- merges these into the intimação's unified Trilha (IntimacaoHistoryEntry) alongside the
+-- capture/confirmation/analysis signals — every "calculado"/"validado"/"confirmado" moment the
+-- apuração flow (deadline slice's apurar.go) recorded. Ordered ASC by em (the caller merges +
+-- re-sorts the WHOLE timeline anyway, but an already-ordered result keeps this query useful
+-- standalone). Scoped to (deadline_id, tenant_id) (barrier 1, on top of RLS barrier 2). No rows
+-- (a prazo with no recorded events, or none at all when the intimação has no prazo yet) yields an
+-- empty slice, never an error. $1 = deadline_id, $2 = tenant_id.
+SELECT em, detalhe
+FROM deadline_event
+WHERE deadline_id = $1 AND tenant_id = $2
+ORDER BY em;
 
 -- name: CountProcessosFiltered :one
 -- The filtered "X" of the processes screen's "X de Y" counter: how many court records
@@ -251,6 +296,7 @@ SELECT count(*) FROM court_record WHERE tenant_id = $1 AND lifecycle = $2;
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.tenant_id = $1
   AND (
     @search::text = ''
@@ -264,6 +310,18 @@ WHERE i.tenant_id = $1
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
     OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
+  )
+  -- Status = work_stage (CASE espelha deriveWorkStage; igual ao ListIntimacoes).
+  AND (
+    @work_stage::text = ''
+    OR (CASE
+      WHEN dr.filed_at IS NOT NULL THEN 'FILED'
+      WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
+      WHEN dr.status = 'DRAFT' THEN 'DRAFTING'
+      WHEN d.id IS NULL THEN 'RECEIVED'
+      WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
+      ELSE 'AWAITING_CONFIRMATION'
+    END) = @work_stage::text
   )
   AND (
     @urgencia::text = ''
@@ -345,7 +403,7 @@ ORDER BY LOWER(court) ASC;
 -- of its own) so a foreign court_record.id passed as :id yields nothing. Descending
 -- keyset on (occurred_at, id) — served by docket_entry(court_record_id, occurred_at)
 -- — the first page passes the max sentinel ('9999-12-31T23:59:59Z', max-uuid).
-SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.source, de.fidelity
+SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.complements, de.source, de.fidelity
 FROM docket_entry de
 JOIN court_record cr ON cr.id = de.court_record_id
 WHERE de.court_record_id = @court_record_id::uuid
@@ -370,11 +428,22 @@ WHERE de.court_record_id = @court_record_id::uuid
 -- tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
 -- served by intimation(court_record_id, made_available_at DESC) — the first page
 -- passes the max sentinel ('9999-12-31', max-uuid).
+-- MESMA projeção do ListIntimacoes (inbox): traz o responsável (assignee_user_id/name)
+-- e o prazo derivado (LEFT JOINs deadline + app_user), pra o card de intimação do cockpit
+-- renderizar "resp." e o prazo/fatal como no design.
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
-       cr.cnj_number, cr.court, cr.degree, cr.class, cr.id AS court_record_id
+       cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id,
+       i.ai_analyzed_at, i.assignee_user_id, ua.name AS assignee_user_name,
+       d.id                                                                 AS prazo_deadline_id,
+       d.end_date                                                           AS prazo_end_date,
+       CASE WHEN d.id IS NOT NULL THEN (d.end_date - CURRENT_DATE)::int END AS prazo_days_left,
+       d.status                                                             AS prazo_status,
+       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END     AS prazo_confirmed
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
 WHERE i.court_record_id = @court_record_id::uuid
   AND i.tenant_id = @tenant_id::uuid
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)

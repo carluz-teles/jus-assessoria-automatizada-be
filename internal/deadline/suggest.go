@@ -155,6 +155,8 @@ func (uc *SuggestUseCase) SuggestTasks(ctx context.Context, tenantID, prazoID st
 		User:       composed.User,
 		Schema:     suggestTasksSchema,
 		SchemaName: "suggested_tasks",
+		UseCase:    "deadline.suggest_tasks",
+		TenantID:   tenantID,
 	})
 	if err != nil {
 		return Suggestion{}, err

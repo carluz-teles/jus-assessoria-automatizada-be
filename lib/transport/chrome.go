@@ -16,6 +16,7 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -36,13 +37,20 @@ var chromeHello = utls.HelloChrome_120
 // is handled INSIDE DialTLSContext (not Transport.Proxy) because the uTLS handshake
 // must run over the tunneled conn — the Proxy field would run the stdlib's own TLS
 // instead and lose the fingerprint. A nil proxyURL keeps the direct connection.
-func ChromeTransport(proxyURL *url.URL) *http.Transport {
+//
+// clientCert is optional (nil for every caller except the eproc cert-login spike):
+// when set, it is presented during the handshake for mutual TLS — the mechanism
+// eproc's "Certificado Digital" login uses (the browser's native certificate picker
+// is exactly what a server-requested client cert triggers). The stdlib
+// *tls.Certificate shape keeps this package's only non-stdlib dependency (uTLS)
+// from leaking into callers.
+func ChromeTransport(proxyURL *url.URL, clientCert *tls.Certificate) *http.Transport {
 	return &http.Transport{
 		ForceAttemptHTTP2: false, // the uTLS hello pins ALPN to http/1.1
 		MaxIdleConns:      10,
 		IdleConnTimeout:   90 * time.Second,
 		DialTLSContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-			return dialChromeTLS(ctx, proxyURL, addr)
+			return dialChromeTLS(ctx, proxyURL, clientCert, addr)
 		},
 	}
 }
@@ -50,8 +58,9 @@ func ChromeTransport(proxyURL *url.URL) *http.Transport {
 // dialChromeTLS opens the TCP conn (direct or via the proxy's CONNECT tunnel) and
 // completes a uTLS handshake presenting the Chrome ClientHello, with ALPN pinned to
 // http/1.1 so net/http speaks HTTP/1.1 over it (the cipher/extension fingerprint the
-// WAF keys on is preserved).
-func dialChromeTLS(ctx context.Context, proxyURL *url.URL, addr string) (net.Conn, error) {
+// WAF keys on is preserved). clientCert, when non-nil, is offered if the peer
+// requests client authentication (mutual TLS).
+func dialChromeTLS(ctx context.Context, proxyURL *url.URL, clientCert *tls.Certificate, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: 15 * time.Second}
 	var raw net.Conn
 	var err error
@@ -79,7 +88,14 @@ func dialChromeTLS(ctx context.Context, proxyURL *url.URL, addr string) (net.Con
 			a.AlpnProtocols = []string{"http/1.1"}
 		}
 	}
-	u := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloCustom)
+	tlsConfig := &utls.Config{ServerName: host}
+	if clientCert != nil {
+		tlsConfig.Certificates = []utls.Certificate{{
+			Certificate: clientCert.Certificate,
+			PrivateKey:  clientCert.PrivateKey,
+		}}
+	}
+	u := utls.UClient(raw, tlsConfig, utls.HelloCustom)
 	if err := u.ApplyPreset(&spec); err != nil {
 		_ = raw.Close()
 		return nil, err

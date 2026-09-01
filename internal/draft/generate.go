@@ -348,6 +348,8 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			SchemaName: "draft_minuta",
 			Model:      uc.model,
 			MaxTokens:  4096,
+			UseCase:    "draft.generate",
+			TenantID:   ev.TenantID,
 		}, func(chunk string) error {
 			// Best-effort: erro no XADD não aborta geração. Cliente que
 			// reconecta usa Last-Event-ID pra retomar; se o key expirou,
@@ -367,6 +369,8 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			SchemaName: "draft_minuta",
 			Model:      uc.model,
 			MaxTokens:  4096,
+			UseCase:    "draft.generate",
+			TenantID:   ev.TenantID,
 		})
 	}
 	if err3 != nil {

@@ -20,9 +20,9 @@ import (
 type Deps struct {
 	// UOW is the tenant-scoped write transaction boundary (database.NewUnitOfWork(pool)).
 	UOW database.UnitOfWork
-	// Storage is the object storage client used to read the extracted-text JSON. It only needs to
-	// presign GETs (the presigner port); pass the *storage.Client.
-	Storage presigner
+	// Storage is the object storage client used to read the extracted-text JSON. It only needs a
+	// direct byte read (the objectByteReader port); pass the *storage.Client.
+	Storage objectByteReader
 	// Outbox is the transactional-outbox producer (events.NewOutbox()).
 	Outbox *events.Outbox
 	// Embedder is the embeddings port (NewVoyageEmbedder(cfg.VoyageAPIKey, cfg.VoyageModel,

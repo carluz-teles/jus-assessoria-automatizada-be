@@ -52,6 +52,10 @@ type GradeParams struct {
 	// row is never downgraded to ACTIVE/ARCHIVED/SUSPENDED: superseding is a structural
 	// merge operation, not a lifecycle transition, and must be preserved.
 	Lifecycle string
+	// Phase is the derived procedural phase; the SQL refreshes court_record.phase (the
+	// auto value) and keeps the existing one when empty. The manual phase_override is a
+	// separate column the enrichment never touches.
+	Phase string
 }
 
 // enrichRepo is the narrow persistence port the enrichment use case drives: grading
@@ -278,6 +282,8 @@ func (uc *EnrichmentUseCase) gradeInTx(ctx context.Context, tx database.Tx, tena
 		// Lifecycle derived from movimentos; the SQL guards SUPERSEDED (never downgrades it).
 		// Falls back to the existing value when graded.Lifecycle is empty.
 		Lifecycle: graded.Lifecycle,
+		// Phase derived from classe+movimentos; refreshes the auto column, keeps existing when empty.
+		Phase: graded.Phase,
 	})
 	if err != nil {
 		return nil, nil, err

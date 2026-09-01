@@ -10,6 +10,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/certificate"
+	"github.com/jusassessoria/platform/internal/court"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -59,6 +60,7 @@ type routerDeps struct {
 	draft                *draft.Handler
 	lookup               *lookup.Handler
 	certificate          *certificate.Handler
+	court                *court.Handler
 	onboarding           *onboarding.Handler
 	// vault is the optional envelope-encryption adapter (lib/vault). It is nil
 	// when VAULT_KEK_BASE64 is unset. S1 carries it here so S2 (court_connection
@@ -219,6 +221,13 @@ func newRouter(deps routerDeps) *fiber.App {
 	// simplesmente não existem (o FE cai em 404 e mostra a lista vazia).
 	if deps.certificate != nil {
 		deps.certificate.RegisterV1(v1)
+	}
+
+	// court owns /v1/court-connections (create/list/connect — autenticação por
+	// certificado + enrollment automatizado de MFA). Nil-guarded: sem certUC E vault
+	// configurados o slice não sobe (main.go's boot log explains which is missing).
+	if deps.court != nil {
+		deps.court.RegisterV1(v1)
 	}
 
 	// notifications owns its authenticated /v1 in-app inbox routes (list/badge/

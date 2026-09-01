@@ -89,11 +89,14 @@ func NewUseCase(repo Repository, store storagePort, outbox publisher, uow databa
 // StartUploadCommand is the POST /v1/documentos input the handler builds from the request + the
 // verified principal. TenantID comes from the principal, NEVER the body (tenant isolation cannot
 // be spoofed). CourtRecordID is optional (an avulsa upload). Title defaults to OriginalFilename
-// when absent (filled here at the edge). SizeBytes/MimeType are validated at the edge.
+// when absent (filled here at the edge). SizeBytes/MimeType are validated at the edge. Origin
+// defaults to OriginUpload (the zero value) — only cmd/worker-court's DocumentWriter adapter sets
+// OriginCourt, for documents fetched from the autos rather than uploaded by hand.
 type StartUploadCommand struct {
 	TenantID         string
 	CourtRecordID    string
 	DocumentType     string
+	Origin           Origin
 	Title            string
 	OriginalFilename string
 	MimeType         string
@@ -122,6 +125,10 @@ func (uc *UseCase) Start(ctx context.Context, cmd StartUploadCommand) (StartUplo
 	if title == "" {
 		title = cmd.OriginalFilename
 	}
+	origin := cmd.Origin
+	if origin == "" {
+		origin = OriginUpload
+	}
 	key := uc.newKey(cmd.TenantID, "documents")
 
 	var created *Document
@@ -135,7 +142,7 @@ func (uc *UseCase) Start(ctx context.Context, cmd StartUploadCommand) (StartUplo
 			TenantID:         cmd.TenantID,
 			CourtRecordID:    cmd.CourtRecordID,
 			DocumentType:     cmd.DocumentType,
-			Origin:           OriginUpload,
+			Origin:           origin,
 			StorageKey:       key,
 			Status:           StatusPending,
 			MimeType:         cmd.MimeType,

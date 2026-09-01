@@ -199,6 +199,8 @@ func (uc *ChatUseCase) AnswerQuestion(ctx context.Context, cmd AnswerQuestionCom
 		SchemaName: "chat_answer",
 		Model:      uc.model,
 		MaxTokens:  2048,
+		UseCase:    "draft.chat",
+		TenantID:   cmd.TenantID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("chat: llm call: %w", err)

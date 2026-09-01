@@ -14,6 +14,16 @@ SELECT EXISTS (
          OR (scope = 'COURT' AND scope_id = $3) )
 );
 
+-- name: LookupHolidays :many
+-- Full rows (scope/scope_id/name) for the given dates, scoped to national/uf/court — the
+-- audit-trail name lookup for applied_holiday (IsHoliday only returns a bool). Empty
+-- uf/court are sent as NULL (mirrors IsHoliday), which never match their scope.
+SELECT scope, scope_id, date, name FROM holiday
+WHERE date = ANY(@dates::date[])
+  AND ( scope = 'NATIONAL'
+     OR (scope = 'STATE' AND scope_id = @uf_scope_id)
+     OR (scope = 'COURT' AND scope_id = @court_scope_id) );
+
 -- name: SeededNationalYears :many
 -- Distinct years that already hold at least one NATIONAL holiday, so the seeder
 -- fetches only the missing years.

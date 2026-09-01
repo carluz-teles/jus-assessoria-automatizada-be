@@ -161,15 +161,17 @@ const setIntimationAIAnalysis = `-- name: SetIntimationAIAnalysis :one
 UPDATE intimation
 SET ai_summary      = $1,
     ai_providencias = $2,
+    ai_act          = $3,
     ai_analyzed_at  = now()
-WHERE id = $3
-  AND tenant_id = $4
+WHERE id = $4
+  AND tenant_id = $5
 RETURNING court_record_id
 `
 
 type SetIntimationAIAnalysisParams struct {
 	AiSummary      *string   `json:"ai_summary"`
 	AiProvidencias []byte    `json:"ai_providencias"`
+	AiAct          *string   `json:"ai_act"`
 	ID             uuid.UUID `json:"id"`
 	TenantID       uuid.UUID `json:"tenant_id"`
 }
@@ -183,6 +185,7 @@ func (q *Queries) SetIntimationAIAnalysis(ctx context.Context, arg SetIntimation
 	row := q.db.QueryRow(ctx, setIntimationAIAnalysis,
 		arg.AiSummary,
 		arg.AiProvidencias,
+		arg.AiAct,
 		arg.ID,
 		arg.TenantID,
 	)

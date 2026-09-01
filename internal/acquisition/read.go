@@ -3,7 +3,9 @@ package acquisition
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jusassessoria/platform/lib/httpx"
 )
@@ -39,6 +41,11 @@ type ProcessoView struct {
 	Secrecy      string     `json:"secrecy"`
 	Lifecycle    string     `json:"lifecycle"`
 	Completeness float32    `json:"completeness"`
+	// Phase is the EFFECTIVE procedural phase (phase_override ?? phase); nil (JSON null)
+	// until the process is graded or the user sets it. ClaimValue is the valor da causa —
+	// user-entered (no automatic source), nil when never filled.
+	Phase      *string  `json:"phase"`
+	ClaimValue *float64 `json:"claim_value"`
 	// responsável do processo — assigned at case level (court_case), so it is shared
 	// across the process's graus. Both nil (JSON null) when no one is assigned; name
 	// is the app_user.name joined in, so the FE renders the header without a second read.
@@ -94,6 +101,10 @@ type IntimacaoView struct {
 	AIAnalyzedAt     *time.Time `json:"ai_analyzed_at"`
 	AssigneeUserID   *string    `json:"assignee_user_id"`
 	AssigneeUserName *string    `json:"assignee_user_name"`
+	// WorkStage é a posição da intimação no ciclo da unidade de trabalho (recebida →
+	// protocolada), fonte ÚNICA do stepper do detalhe e do filtro/pill de Status na
+	// lista. Projeção pura de prazo + peça — ver deriveWorkStage. Um dos WorkStage*.
+	WorkStage string `json:"work_stage"`
 }
 
 // IntimacaoHistoryEntry is one event in the intimation's derived timeline (Histórico
@@ -115,6 +126,14 @@ const (
 	ProvidenciaStatusDiscarded = "DISCARDED"
 )
 
+// Natureza da providência (chip do card) — classificada pela IA. PECA exige redigir
+// uma peça; CIENCIA é comunicação/ciência (fluxo curto). "" = não classificada
+// (análise antiga ou valor inesperado do modelo).
+const (
+	ProvidenciaKindPeca    = "PECA"
+	ProvidenciaKindCiencia = "CIENCIA"
+)
+
 // IntimacaoProvidenciaView is one derived providência of the AI analysis: a short
 // imperative title (the IA already embeds the legal citation in the title, e.g. "Redigir
 // defesa (art. 919, CPC)") plus an actionable description, an IA-suggested responsável and
@@ -124,8 +143,12 @@ const (
 // by the model from the member list injected into the prompt); the FE resolves the name from
 // the row's suggested_assignee_name (or re-resolves via the members directory).
 type IntimacaoProvidenciaView struct {
-	Title                   string  `json:"title"`
-	Description             string  `json:"description"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	// Kind é a natureza da providência classificada pela IA: "PECA" (exige redigir
+	// uma peça) ou "CIENCIA" (comunicação/ciência, fluxo curto). "" em análises
+	// antigas (o campo é novo no ai_providencias jsonb). Alimenta os chips do card.
+	Kind                    string  `json:"kind"`
 	SuggestedAssigneeUserID *string `json:"suggested_assignee_user_id"`
 	SuggestedAssigneeName   *string `json:"suggested_assignee_name"`
 	DueDate                 *string `json:"due_date"` // "2006-01-02" or null
@@ -160,7 +183,10 @@ type IntimacaoDetailView struct {
 	// Análise IA (0051) — o card "Analisar esta intimação". AISummary vazio com
 	// AIAnalyzedAt (no embedded IntimacaoView) non-nil = modo degradado (IA
 	// indisponível). AIProvidencias é sempre inicializado (nunca null).
-	AISummary      string                     `json:"ai_summary,omitempty"`
+	AISummary string `json:"ai_summary,omitempty"`
+	// AIAct é o ato principal classificado pela IA (ex.: "Contestação") — o FE usa como
+	// TÍTULO do detalhe (fallback class+subject) e no pill "Ato". "" pré-análise.
+	AIAct          string                     `json:"ai_act"`
 	AIProvidencias []IntimacaoProvidenciaView `json:"ai_providencias"`
 	AIAnalyzedAt   *time.Time                 `json:"ai_analyzed_at"`
 
@@ -170,6 +196,46 @@ type IntimacaoDetailView struct {
 	// cadastradas — dado ainda não ingerido).
 	Plaintiffs []string `json:"plaintiffs"`
 	Defendants []string `json:"defendants"`
+	// WorkStage é carregado pelo IntimacaoView embutido (list + detail compartilham).
+}
+
+// Estágios do ciclo da unidade de trabalho (o stepper do detalhe). Ordem = progressão
+// recebida → protocolada; deriveWorkStage escolhe o marco mais avançado alcançado.
+// text + derivação na app (nunca coluna/enum no banco — é projeção, não estado).
+const (
+	WorkStageReceived             = "RECEIVED"              // intimação chegou (baseline)
+	WorkStageAwaitingConfirmation = "AWAITING_CONFIRMATION" // prazo derivado, aguarda confirmação humana
+	WorkStageConfirmed            = "CONFIRMED"             // prazo confirmado, peça ainda não iniciada
+	WorkStageDrafting             = "DRAFTING"              // peça em elaboração (draft.status DRAFT)
+	WorkStagePartnerReview        = "PARTNER_REVIEW"        // revisão do sócio (draft REVIEWED/SIGNED)
+	WorkStageFiled                = "FILED"                 // protocolada (draft.filed_at preenchido)
+)
+
+// deriveWorkStage projeta a posição da intimação no ciclo de trabalho a partir de
+// sinais REAIS: o prazo derivado (confirmado?) e a peça (draft) desta intimação
+// (status + protocolo). Precedência alto→baixo — o marco mais avançado vence. É
+// projeção pura (sem estado armazenado, sem drift). draftStatus é o valor cru da
+// coluna draft.status ("DRAFT"|"REVIEWED"|"SIGNED", contrato do slice draft); vazio
+// quando a intimação ainda não tem peça.
+func deriveWorkStage(prazo *IntimacaoPrazoView, draftStatus string, draftFiled bool) string {
+	// Peticionamento (peça) domina — é a jusante do prazo.
+	switch {
+	case draftFiled:
+		return WorkStageFiled
+	case draftStatus == "SIGNED" || draftStatus == "REVIEWED":
+		return WorkStagePartnerReview
+	case draftStatus == "DRAFT":
+		return WorkStageDrafting
+	}
+	// Sem peça: a posição vem do prazo.
+	switch {
+	case prazo == nil:
+		return WorkStageReceived
+	case prazo.Confirmed:
+		return WorkStageConfirmed
+	default:
+		return WorkStageAwaitingConfirmation
+	}
 }
 
 // ProcessosSummaryView is the KPI header of the processes list (GET
@@ -296,6 +362,41 @@ func renderActivityText(eventType string) string {
 	}
 }
 
+// enrichAndamentoText turns a bare CNJ movement label ("Conclusão") into the rich one
+// the docket entry's complements carry ("Conclusão para despacho", "Expedição de
+// documento: Alvará"). complements is the docket_entry.complements jsonb — an array of
+// {"nome": "...", "descricao": "..."} the DATAJUD movimento discloses. Each complement's
+// `nome` is appended: with a bare space when it reads as a continuation ("para despacho",
+// "de mérito"), otherwise after " — " (a noun like "Alvará"). Blank/duplicate nomes are
+// skipped so a movement whose complement repeats does not double its label. Malformed or
+// empty complements leave the text untouched, so the timeline never regresses.
+func enrichAndamentoText(text string, complements []byte) string {
+	if len(complements) == 0 {
+		return text
+	}
+	var parsed []struct {
+		Nome string `json:"nome"`
+	}
+	if err := json.Unmarshal(complements, &parsed); err != nil {
+		return text
+	}
+	out := text
+	seen := map[string]bool{}
+	for _, c := range parsed {
+		nome := strings.TrimSpace(c.Nome)
+		if nome == "" || seen[nome] {
+			continue
+		}
+		seen[nome] = true
+		if r := []rune(nome)[0]; unicode.IsLower(r) {
+			out += " " + nome
+		} else {
+			out += " — " + nome
+		}
+	}
+	return out
+}
+
 // ProcessosQuery / IntimacoesQuery carry the keyset cursor (the last row's sort key
 // and id) and the page size. The handler fills the sentinel for a first page; the
 // repo turns them into the query's keyset predicate. The filter fields mirror the
@@ -332,6 +433,7 @@ type IntimacoesQuery struct {
 	Urgencia          string // ?urgencia: closed set (atraso|hoje|proximos_dois_dias|semana|este_mes|mais_adiante|sem_data_definida); "" = all
 	NaoConfirmado     bool   // ?nao_confirmado: server-side triage toggle; true = only suggested-not-confirmed deadlines (d.status = 'PENDING')
 	Assignee          string // ?assignee: a user id ("me" resolved by the handler); matches assignee_user_id (0057 single-assignee); "" = any
+	WorkStage         string // ?work_stage: closed set (WorkStage* consts); filtra pelo estágio derivado (CASE espelha deriveWorkStage); "" = all
 }
 
 // Filtered reports whether any list filter (search included) is active.

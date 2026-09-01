@@ -259,6 +259,8 @@ func (uc *ResumoUseCase) Resume(ctx context.Context, tenantID, courtRecordID str
 		Schema:     processResumeSchema,
 		SchemaName: "process_resume",
 		MaxTokens:  2000,
+		UseCase:    "acquisition.resume_process",
+		TenantID:   tenantID,
 	})
 	if err != nil {
 		return ProcessResumoView{}, err

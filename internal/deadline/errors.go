@@ -67,4 +67,41 @@ var (
 	// is unknown/foreign on a create (POST /v1/tasks/:id/items). Typed not-found (→ 404), never
 	// (nil, nil): a foreign or cross-task itemId is a client-facing miss, not a swallowed empty.
 	ErrTaskItemNotFound = apperr.NewNotFound("task item not found")
+
+	// ErrCalcMemoryExists — a calc_memory already exists for the deadline (the 1:1
+	// deadline_id UNIQUE). The idempotent INSERT ... ON CONFLICT DO NOTHING yields no
+	// row; the use case treats this as a no-op (the memory is already there). Typed
+	// conflict, never (nil, nil).
+	ErrCalcMemoryExists = apperr.NewConflict("calc memory already exists for deadline")
+
+	// ErrCrossValidationExists — a cross_validation already exists for the deadline (the
+	// 1:1 deadline_id UNIQUE). Same idempotent shape as ErrCalcMemoryExists.
+	ErrCrossValidationExists = apperr.NewConflict("cross validation already exists for deadline")
+
+	// ErrCrossValidationNotFound — POST /v1/prazos/:id/apurar-divergencia on a deadline that
+	// never got a cross_validation row (no prazo_declarado at birth, so nothing was ever
+	// cross-checked). Typed not-found (→ 404), never (nil, nil): there is nothing to apurar.
+	ErrCrossValidationNotFound = apperr.NewNotFound("cross validation not found for deadline")
+
+	// ErrCalcMemoryNotFound — POST /v1/prazos/:id/apurar-tipo on a deadline that has no
+	// calc_memory row (the V1 audit trail is written at birth alongside every deadline, so a
+	// miss here signals a pre-V1 row or a config fault). Typed not-found, never (nil, nil).
+	ErrCalcMemoryNotFound = apperr.NewNotFound("calc memory not found for deadline")
+
+	// ErrDeadlineNotApuravel — apurar-divergencia/apurar-tipo requested on a prazo that is
+	// CUMPRIDO (MET) or BAIXADO_MANUAL (CANCELLED): its dates/selo are frozen, closed cases
+	// are not apuráveis. CONFLICT (→ 409), distinct from the 404 miss.
+	ErrDeadlineNotApuravel = apperr.NewConflict("deadline is not apuravel: only a non-terminal prazo can be apurado")
+
+	// ErrClassifierUnavailable — the omissa-intimação IA fallback (classify.go) has no
+	// generator configured (OpenRouter unset). OnIntimationObserved treats it as a signal to
+	// no-op the classification (never chuta), not as a failure of the ingest.
+	ErrClassifierUnavailable = apperr.NewUnavailable("type classifier unavailable: no LLM generator configured", nil)
+
+	// ErrDeadlineNotDivergent — apurar-divergencia requested when cross_validation.resultado is
+	// not "divergente", OR the divergência was already decided (decisao already set) —
+	// idempotency guard: a second apuração on an already-resolved divergência is refused rather
+	// than silently reprocessed. apurar-tipo reuses it when selo is already "confiavel" (nothing
+	// left to apurar). CONFLICT (→ 409), distinct from the 404 miss.
+	ErrDeadlineNotDivergent = apperr.NewConflict("deadline has no pending divergência or tipo to apurar")
 )

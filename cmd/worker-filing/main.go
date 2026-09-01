@@ -101,11 +101,12 @@ func run(logger *slog.Logger) error {
 	vault := secretVaultAdapter{cipher}
 
 	storageClient, err := storage.New(ctx, storage.Options{
-		Endpoint:  cfg.S3Endpoint,
-		Region:    cfg.S3Region,
-		Bucket:    cfg.S3Bucket,
-		AccessKey: cfg.S3AccessKey,
-		SecretKey: cfg.S3SecretKey,
+		Endpoint:     cfg.S3Endpoint,
+		Region:       cfg.S3Region,
+		Bucket:       cfg.S3Bucket,
+		AccessKey:    cfg.S3AccessKey,
+		SecretKey:    cfg.S3SecretKey,
+		UsePathStyle: cfg.S3UsePathStyle, // MinIO needs path-style; parity with the other workers
 	})
 	if err != nil {
 		return fmt.Errorf("init storage: %w", err)

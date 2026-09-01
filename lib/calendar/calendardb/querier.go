@@ -16,6 +16,10 @@ type Querier interface {
 	// UF, or the given court. Empty uf/court never match their scope (STATE/COURT
 	// rows always carry a non-empty scope_id).
 	IsHoliday(ctx context.Context, arg IsHolidayParams) (bool, error)
+	// Full rows (scope/scope_id/name) for the given dates, scoped to national/uf/court — the
+	// audit-trail name lookup for applied_holiday (IsHoliday only returns a bool). Empty
+	// uf/court are sent as NULL (mirrors IsHoliday), which never match their scope.
+	LookupHolidays(ctx context.Context, arg LookupHolidaysParams) ([]LookupHolidaysRow, error)
 	// Distinct years that already hold at least one NATIONAL holiday, so the seeder
 	// fetches only the missing years.
 	SeededNationalYears(ctx context.Context) ([]int32, error)

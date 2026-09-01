@@ -10,6 +10,22 @@ import (
 	"github.com/pgvector/pgvector-go"
 )
 
+type AiUsageEvent struct {
+	ID               uuid.UUID          `json:"id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	UseCase          string             `json:"use_case"`
+	Provider         string             `json:"provider"`
+	Model            string             `json:"model"`
+	PromptTokens     int32              `json:"prompt_tokens"`
+	CompletionTokens int32              `json:"completion_tokens"`
+	TotalTokens      int32              `json:"total_tokens"`
+	CachedTokens     int32              `json:"cached_tokens"`
+	CostUsd          pgtype.Numeric     `json:"cost_usd"`
+	LatencyMs        int32              `json:"latency_ms"`
+	TraceID          *string            `json:"trace_id"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type AppUser struct {
 	ID          uuid.UUID          `json:"id"`
 	ClerkUserID string             `json:"clerk_user_id"`
@@ -19,6 +35,17 @@ type AppUser struct {
 	Role        string             `json:"role"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	Phone       *string            `json:"phone"`
+}
+
+type AppliedHoliday struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CalcMemoryID uuid.UUID          `json:"calc_memory_id"`
+	Data         pgtype.Date        `json:"data"`
+	Nome         *string            `json:"nome"`
+	Ambito       *string            `json:"ambito"`
+	Comarca      *string            `json:"comarca"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
 type BackfillJob struct {
@@ -34,6 +61,22 @@ type BackfillJob struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	TriggerReason *string            `json:"trigger_reason"`
 	TriggerOabs   []string           `json:"trigger_oabs"`
+}
+
+type CalcMemory struct {
+	ID                      uuid.UUID          `json:"id"`
+	TenantID                uuid.UUID          `json:"tenant_id"`
+	DeadlineID              uuid.UUID          `json:"deadline_id"`
+	PrazoBase               *string            `json:"prazo_base"`
+	PrazoBaseFonte          *string            `json:"prazo_base_fonte"`
+	TermoInicialRegra       *string            `json:"termo_inicial_regra"`
+	DiasUteis               *bool              `json:"dias_uteis"`
+	DobraMotivo             *string            `json:"dobra_motivo"`
+	TabelaLegalRef          *string            `json:"tabela_legal_ref"`
+	IaTipoInferido          *string            `json:"ia_tipo_inferido"`
+	IaConfianca             *float64           `json:"ia_confianca"`
+	CalendarProviderVersion *string            `json:"calendar_provider_version"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
 }
 
 type CaptureRun struct {
@@ -120,6 +163,33 @@ type CourtCase struct {
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 }
 
+type CourtConnection struct {
+	ID                   uuid.UUID          `json:"id"`
+	TenantID             uuid.UUID          `json:"tenant_id"`
+	AppUserID            uuid.UUID          `json:"app_user_id"`
+	Court                string             `json:"court"`
+	System               string             `json:"system"`
+	AuthenticationMethod string             `json:"authentication_method"`
+	CredentialRef        pgtype.UUID        `json:"credential_ref"`
+	CertificateRef       pgtype.UUID        `json:"certificate_ref"`
+	MfaSeedRef           pgtype.UUID        `json:"mfa_seed_ref"`
+	SessionRef           pgtype.UUID        `json:"session_ref"`
+	Status               string             `json:"status"`
+	LastAuthenticatedAt  pgtype.Timestamptz `json:"last_authenticated_at"`
+	Error                []byte             `json:"error"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
+type CourtFetchState struct {
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CourtConnectionID uuid.UUID          `json:"court_connection_id"`
+	CourtRecordID     uuid.UUID          `json:"court_record_id"`
+	CnjNumber         string             `json:"cnj_number"`
+	ObservedAt        pgtype.Timestamptz `json:"observed_at"`
+	LastFetchedAt     pgtype.Timestamptz `json:"last_fetched_at"`
+	DocketCursor      pgtype.Timestamptz `json:"docket_cursor"`
+}
+
 type CourtRecord struct {
 	ID                    uuid.UUID          `json:"id"`
 	TenantID              uuid.UUID          `json:"tenant_id"`
@@ -141,6 +211,26 @@ type CourtRecord struct {
 	AiResume              []byte             `json:"ai_resume"`
 	AiResumeGeneratedAt   pgtype.Timestamptz `json:"ai_resume_generated_at"`
 	EnrichmentAttemptedAt pgtype.Timestamptz `json:"enrichment_attempted_at"`
+	Magistrate            *string            `json:"magistrate"`
+	CourtSituation        *string            `json:"court_situation"`
+	Competence            *string            `json:"competence"`
+	Phase                 *string            `json:"phase"`
+	PhaseOverride         *string            `json:"phase_override"`
+	ClaimValue            pgtype.Numeric     `json:"claim_value"`
+}
+
+type CrossValidation struct {
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	DeadlineID    uuid.UUID          `json:"deadline_id"`
+	DataDeclarada pgtype.Date        `json:"data_declarada"`
+	DataCalculada pgtype.Date        `json:"data_calculada"`
+	DifDias       *int32             `json:"dif_dias"`
+	Resultado     *string            `json:"resultado"`
+	CausaProvavel *string            `json:"causa_provavel"`
+	Decisao       *string            `json:"decisao"`
+	DecididoPor   pgtype.UUID        `json:"decidido_por"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
 type Deadline struct {
@@ -168,6 +258,30 @@ type Deadline struct {
 	AnchorEvent          string             `json:"anchor_event"`
 	ManualExtraDays      int32              `json:"manual_extra_days"`
 	LegalCitation        *string            `json:"legal_citation"`
+	Origem               *string            `json:"origem"`
+	Selo                 *string            `json:"selo"`
+	ConfirmacaoExigida   *bool              `json:"confirmacao_exigida"`
+	Providencia          *string            `json:"providencia"`
+	ConfirmadoPor        pgtype.UUID        `json:"confirmado_por"`
+	ConfirmadoEm         pgtype.Timestamptz `json:"confirmado_em"`
+	PrazoInterno         pgtype.Date        `json:"prazo_interno"`
+}
+
+type DeadlineEvent struct {
+	ID         uuid.UUID          `json:"id"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	DeadlineID uuid.UUID          `json:"deadline_id"`
+	Tipo       string             `json:"tipo"`
+	Detalhe    *string            `json:"detalhe"`
+	AtorID     pgtype.UUID        `json:"ator_id"`
+	Em         pgtype.Timestamptz `json:"em"`
+}
+
+type DeadlinePolicy struct {
+	TenantID               uuid.UUID          `json:"tenant_id"`
+	ConfirmacaoObrigatoria bool               `json:"confirmacao_obrigatoria"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 }
 
 type DeadlineRule struct {
@@ -334,6 +448,7 @@ type Intimation struct {
 	AiSummary       *string            `json:"ai_summary"`
 	AiProvidencias  []byte             `json:"ai_providencias"`
 	AiAnalyzedAt    pgtype.Timestamptz `json:"ai_analyzed_at"`
+	AiAct           *string            `json:"ai_act"`
 }
 
 type Membership struct {

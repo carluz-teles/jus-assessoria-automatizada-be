@@ -510,6 +510,17 @@ type Querier interface {
 	// DAILY_CAPTURE/ENRICHMENT nunca têm uma OAB única a atribuir (NULL). Bounded por $2
 	// (sem paginação v0).
 	ListCaptureRuns(ctx context.Context, arg ListCaptureRunsParams) ([]ListCaptureRunsRow, error)
+	// The deadline_event audit trail for one prazo (deadline slice's table — acquisition already
+	// reads `deadline` directly for other GetIntimacao fields, e.g. confirmed_at/confirmed_by_name
+	// above, the same precedent: read the table, never import the deadline package). GetIntimacao
+	// merges these into the intimação's unified Trilha (IntimacaoHistoryEntry) alongside the
+	// capture/confirmation/analysis signals — every "calculado"/"validado"/"confirmado" moment the
+	// apuração flow (deadline slice's apurar.go) recorded. Ordered ASC by em (the caller merges +
+	// re-sorts the WHOLE timeline anyway, but an already-ordered result keeps this query useful
+	// standalone). Scoped to (deadline_id, tenant_id) (barrier 1, on top of RLS barrier 2). No rows
+	// (a prazo with no recorded events, or none at all when the intimação has no prazo yet) yields an
+	// empty slice, never an error. $1 = deadline_id, $2 = tenant_id.
+	ListDeadlineEventsByDeadlineID(ctx context.Context, arg ListDeadlineEventsByDeadlineIDParams) ([]ListDeadlineEventsByDeadlineIDRow, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)
@@ -535,6 +546,9 @@ type Querier interface {
 	// tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
 	// served by intimation(court_record_id, made_available_at DESC) — the first page
 	// passes the max sentinel ('9999-12-31', max-uuid).
+	// MESMA projeção do ListIntimacoes (inbox): traz o responsável (assignee_user_id/name)
+	// e o prazo derivado (LEFT JOINs deadline + app_user), pra o card de intimação do cockpit
+	// renderizar "resp." e o prazo/fatal como no design.
 	ListIntimacoesByProcesso(ctx context.Context, arg ListIntimacoesByProcessoParams) ([]ListIntimacoesByProcessoRow, error)
 	// The intimations a window first discovered (collapse), newest availability first.
 	ListIntimacoesBySyncRun(ctx context.Context, arg ListIntimacoesBySyncRunParams) ([]ListIntimacoesBySyncRunRow, error)
@@ -760,6 +774,11 @@ type Querier interface {
 	// empty (source does not carry movimentos) the existing lifecycle is preserved via the
 	// NULLIF/COALESCE: NULLIF('', lifecycle) = NULL → COALESCE falls back to lifecycle.
 	UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRecordGradeParams) (UpdateCourtRecordGradeRow, error)
+	// Campos do processo preenchidos À MÃO no cockpit: a fase (phase_override — vence a
+	// derivada no read model) e o valor da causa (claim_value, sem fonte automática). PATCH
+	// parcial: cada campo só é escrito quando o argumento vem não-nulo (COALESCE mantém o
+	// valor atual quando o cliente não mandou aquele campo). Tenant-scoped (barreira 1 + RLS).
+	UpdateProcessoManualFields(ctx context.Context, arg UpdateProcessoManualFieldsParams) error
 	// Close a sync run, but ONLY from RUNNING: the status guard makes this the single
 	// winning transition (compare-and-swap), so a redelivery that resumes a run
 	// another execution already closed affects zero rows. OK carries the item tallies

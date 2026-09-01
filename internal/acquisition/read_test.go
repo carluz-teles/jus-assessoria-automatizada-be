@@ -1139,3 +1139,51 @@ func TestReadUseCase_Intimacoes_UrgenciaFilterIncludesMaisAdiante(t *testing.T) 
 		}
 	}
 }
+
+func TestEnrichAndamentoText(t *testing.T) {
+	tests := []struct {
+		name        string
+		text        string
+		complements string
+		want        string
+	}{
+		{
+			name:        "no complements leaves the bare text",
+			text:        "Publicação",
+			complements: "",
+			want:        "Publicação",
+		},
+		{
+			name:        "lowercase continuation joins with a space",
+			text:        "Conclusão",
+			complements: `[{"nome":"para despacho","descricao":"tipo_de_conclusao"}]`,
+			want:        "Conclusão para despacho",
+		},
+		{
+			name:        "noun complement joins after an em dash",
+			text:        "Expedição de documento",
+			complements: `[{"nome":"Carta precatória","descricao":"tipo_de_documento"}]`,
+			want:        "Expedição de documento — Carta precatória",
+		},
+		{
+			name:        "duplicate nomes are collapsed",
+			text:        "Conclusão",
+			complements: `[{"nome":"para despacho"},{"nome":"para despacho"}]`,
+			want:        "Conclusão para despacho",
+		},
+		{
+			name:        "malformed json leaves the text untouched",
+			text:        "Remessa",
+			complements: `{not-json`,
+			want:        "Remessa",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := enrichAndamentoText(tt.text, []byte(tt.complements))
+			if got != tt.want {
+				t.Errorf("enrichAndamentoText(%q, %q) = %q, want %q", tt.text, tt.complements, got, tt.want)
+			}
+		})
+	}
+}

@@ -181,6 +181,26 @@ services:
     volumes:
       - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/run/secrets/gcp-kms.json:ro
 
+  worker-court:
+    <<: *worker
+    build:
+      context: .
+      # runtime-openssl (NOT distroless default): the eproc client is a plain HTTP
+      # client (uTLS Chrome fingerprint, no browser engine), but it SIGNS with the
+      # advogado's A1 certificate, and NewSigner's BER .pfx fallback shells out to
+      # openssl — absent from distroless. Without it every FetchAutos dies at
+      # "arquivo do certificado inválido". No Chromium needed (lighter than api).
+      target: runtime-openssl
+      args:
+        SVC: worker-court
+    image: jus-worker-court:local
+    environment:
+      <<: *net-env
+      # Same KMS mount as worker-filing: signs with the advogado's A1 certificate.
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp-kms.json
+    volumes:
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/run/secrets/gcp-kms.json:ro
+
   scheduler:
     <<: *worker
     build:

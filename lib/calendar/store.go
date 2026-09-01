@@ -41,6 +41,53 @@ func (s *Store) IsHoliday(ctx context.Context, day time.Time, uf, court string) 
 	})
 }
 
+// LookupHolidays resolves the registered holiday row for each of the given dates, scoped to
+// national/uf/court — the applied_holiday audit-trail name lookup (IsHoliday only answers a
+// bool). When more than one row matches the same date (e.g. a NATIONAL holiday that also
+// happens to be a COURT closure), the most specific scope wins: COURT > STATE > NATIONAL. A
+// date with no matching row is simply absent from the returned map.
+func (s *Store) LookupHolidays(ctx context.Context, days []time.Time, uf, court string) (map[time.Time]Holiday, error) {
+	dates := make([]pgtype.Date, len(days))
+	for i, day := range days {
+		dates[i] = pgDate(day)
+	}
+	rows, err := s.q.LookupHolidays(ctx, calendardb.LookupHolidaysParams{
+		Dates:        dates,
+		UfScopeID:    ptrOrNil(uf),
+		CourtScopeID: ptrOrNil(court),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[time.Time]Holiday, len(rows))
+	for _, row := range rows {
+		day := dateOnly(row.Date.Time)
+		scopeID := ""
+		if row.ScopeID != nil {
+			scopeID = *row.ScopeID
+		}
+		h := Holiday{Scope: row.Scope, ScopeID: scopeID, Date: day, Name: row.Name}
+		if existing, ok := result[day]; !ok || scopeRank(h.Scope) > scopeRank(existing.Scope) {
+			result[day] = h
+		}
+	}
+	return result, nil
+}
+
+// scopeRank orders holiday scopes by specificity for LookupHolidays' precedence:
+// COURT (most specific) > STATE > NATIONAL.
+func scopeRank(scope string) int {
+	switch scope {
+	case ScopeCourt:
+		return 2
+	case ScopeState:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // SeededNationalYears returns the set of years that already hold at least one
 // NATIONAL holiday, so SeedNational fetches only the missing years.
 func (s *Store) SeededNationalYears(ctx context.Context) (map[int]bool, error) {

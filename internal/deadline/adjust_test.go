@@ -71,8 +71,9 @@ func TestAdjust_AppliesOnlyPresentFields(t *testing.T) {
 	end := time.Date(2024, 3, 18, 0, 0, 0, 0, time.UTC)
 	holiday := time.Date(2024, 3, 6, 0, 0, 0, 0, time.UTC)
 
+	prazoInterno := time.Date(2024, 3, 14, 0, 0, 0, 0, time.UTC)
 	repo := adjustRepo(p, storedDeadline(p, start, StatusOpen), "TJSP")
-	cal := &fakeCalendar{endDate: end, holidays: []time.Time{holiday}}
+	cal := &fakeCalendar{endDate: end, holidays: []time.Time{holiday}, subtractEndDate: prazoInterno}
 	outbox := &fakeOutbox{}
 	uow := &fakeUOW{}
 	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, uow)
@@ -117,6 +118,16 @@ func TestAdjust_AppliesOnlyPresentFields(t *testing.T) {
 	}
 	if !up.EndDate.Equal(end) || len(up.HolidaysApplied) != 1 || !up.HolidaysApplied[0].Equal(holiday) {
 		t.Errorf("update end/holidays = %v/%v, want %v/[%v]", up.EndDate, up.HolidaysApplied, end, holiday)
+	}
+	// The internal safety buffer is recomputed in lockstep with the recomputed end_date, via
+	// the SAME uf/court the recompute used — never stale, never crude date arithmetic. This is
+	// the critical regression this slice guards against.
+	if !up.PrazoInterno.Equal(prazoInterno) {
+		t.Errorf("update prazo_interno = %v, want %v", up.PrazoInterno, prazoInterno)
+	}
+	if cal.subtractCalls != 1 || !cal.gotSubtractArgs.start.Equal(end) || cal.gotSubtractArgs.n != internalBufferBusinessDays {
+		t.Errorf("SubtractBusinessDays calls=%d start=%v n=%d, want 1 call from end_date %v with n=%d",
+			cal.subtractCalls, cal.gotSubtractArgs.start, cal.gotSubtractArgs.n, end, internalBufferBusinessDays)
 	}
 
 	// The result mirrors the recompute; status is unchanged (OPEN stays OPEN).
