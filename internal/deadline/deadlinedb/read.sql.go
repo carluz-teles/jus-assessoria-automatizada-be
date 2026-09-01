@@ -163,9 +163,18 @@ SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
        (d.confirmed_by IS NOT NULL) AS confirmed,
        d.anchor_event, d.legal_citation, d.manual_extra_days,
        d.confirmed_by, d.confirmed_at,
-       au.name AS confirmed_by_name
+       au.name AS confirmed_by_name,
+       d.origem, d.selo, d.confirmacao_exigida,
+       COALESCE(d.prazo_interno, d.end_date) AS prazo_interno,
+       cm.id AS calc_memory_id, cm.prazo_base, cm.prazo_base_fonte, cm.termo_inicial_regra,
+       cm.dias_uteis, cm.dobra_motivo, cm.tabela_legal_ref, cm.ia_tipo_inferido, cm.ia_confianca,
+       cm.calendar_provider_version,
+       cv.data_declarada, cv.data_calculada, cv.dif_dias, cv.resultado, cv.causa_provavel,
+       cv.decisao, cv.decidido_por
 FROM deadline d
 LEFT JOIN app_user au ON au.id = d.confirmed_by
+LEFT JOIN calc_memory cm ON cm.deadline_id = d.id
+LEFT JOIN cross_validation cv ON cv.deadline_id = d.id
 WHERE d.id = $1::uuid AND d.tenant_id = $2::uuid
 `
 
@@ -175,34 +184,62 @@ type GetPrazoParams struct {
 }
 
 type GetPrazoRow struct {
-	ID              uuid.UUID          `json:"id"`
-	CourtRecordID   uuid.UUID          `json:"court_record_id"`
-	Kind            *string            `json:"kind"`
-	StartDate       pgtype.Date        `json:"start_date"`
-	EndDate         pgtype.Date        `json:"end_date"`
-	DaysLeft        int32              `json:"days_left"`
-	Days            int32              `json:"days"`
-	Counting        string             `json:"counting"`
-	Doubled         bool               `json:"doubled"`
-	DoubledReason   *string            `json:"doubled_reason"`
-	Status          string             `json:"status"`
-	Source          string             `json:"source"`
-	HolidaysApplied []byte             `json:"holidays_applied"`
-	NotificationID  uuid.UUID          `json:"notification_id"`
-	RulesVersion    string             `json:"rules_version"`
-	Confirmed       interface{}        `json:"confirmed"`
-	AnchorEvent     string             `json:"anchor_event"`
-	LegalCitation   *string            `json:"legal_citation"`
-	ManualExtraDays int32              `json:"manual_extra_days"`
-	ConfirmedBy     pgtype.UUID        `json:"confirmed_by"`
-	ConfirmedAt     pgtype.Timestamptz `json:"confirmed_at"`
-	ConfirmedByName *string            `json:"confirmed_by_name"`
+	ID                      uuid.UUID          `json:"id"`
+	CourtRecordID           uuid.UUID          `json:"court_record_id"`
+	Kind                    *string            `json:"kind"`
+	StartDate               pgtype.Date        `json:"start_date"`
+	EndDate                 pgtype.Date        `json:"end_date"`
+	DaysLeft                int32              `json:"days_left"`
+	Days                    int32              `json:"days"`
+	Counting                string             `json:"counting"`
+	Doubled                 bool               `json:"doubled"`
+	DoubledReason           *string            `json:"doubled_reason"`
+	Status                  string             `json:"status"`
+	Source                  string             `json:"source"`
+	HolidaysApplied         []byte             `json:"holidays_applied"`
+	NotificationID          uuid.UUID          `json:"notification_id"`
+	RulesVersion            string             `json:"rules_version"`
+	Confirmed               interface{}        `json:"confirmed"`
+	AnchorEvent             string             `json:"anchor_event"`
+	LegalCitation           *string            `json:"legal_citation"`
+	ManualExtraDays         int32              `json:"manual_extra_days"`
+	ConfirmedBy             pgtype.UUID        `json:"confirmed_by"`
+	ConfirmedAt             pgtype.Timestamptz `json:"confirmed_at"`
+	ConfirmedByName         *string            `json:"confirmed_by_name"`
+	Origem                  *string            `json:"origem"`
+	Selo                    *string            `json:"selo"`
+	ConfirmacaoExigida      *bool              `json:"confirmacao_exigida"`
+	PrazoInterno            pgtype.Date        `json:"prazo_interno"`
+	CalcMemoryID            pgtype.UUID        `json:"calc_memory_id"`
+	PrazoBase               *string            `json:"prazo_base"`
+	PrazoBaseFonte          *string            `json:"prazo_base_fonte"`
+	TermoInicialRegra       *string            `json:"termo_inicial_regra"`
+	DiasUteis               *bool              `json:"dias_uteis"`
+	DobraMotivo             *string            `json:"dobra_motivo"`
+	TabelaLegalRef          *string            `json:"tabela_legal_ref"`
+	IaTipoInferido          *string            `json:"ia_tipo_inferido"`
+	IaConfianca             *float64           `json:"ia_confianca"`
+	CalendarProviderVersion *string            `json:"calendar_provider_version"`
+	DataDeclarada           pgtype.Date        `json:"data_declarada"`
+	DataCalculada           pgtype.Date        `json:"data_calculada"`
+	DifDias                 *int32             `json:"dif_dias"`
+	Resultado               *string            `json:"resultado"`
+	CausaProvavel           *string            `json:"causa_provavel"`
+	Decisao                 *string            `json:"decisao"`
+	DecididoPor             pgtype.UUID        `json:"decidido_por"`
 }
 
 // The audit/detail view of one prazo (GET /v1/prazos/:id): every field the "por quê"
 // popover needs — the full holidays_applied, the rules_version that derived the days,
-// the origin intimation_id, and start/end/days/counting/doubled. Tenant-scoped (barrier
-// 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
+// the origin intimation_id, and start/end/days/counting/doubled. V1 adds the full memória de
+// cálculo: origem/selo/confirmacao_exigida off the deadline row, prazo_interno (the internal
+// safety buffer, COALESCEd to end_date for a pré-migration row that never had it recomputed),
+// and the 1:1 calc_memory +
+// cross_validation LEFT JOINed in (a pre-V1 or not-yet-derived prazo has neither row, so every
+// cm./cv. column comes back NULL — the mapper degrades to nil, never an error). applied_holiday
+// is 1:N so it is NOT joined here (would multiply the deadline row); ListAppliedHolidaysByCalc
+// Memory reads it separately, keyed by calc_memory_id, only when cm.id is present. Tenant-scoped
+// (barrier 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
 // at the repo, never (nil, nil).
 func (q *Queries) GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow, error) {
 	row := q.db.QueryRow(ctx, getPrazo, arg.ID, arg.TenantID)
@@ -230,6 +267,27 @@ func (q *Queries) GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow
 		&i.ConfirmedBy,
 		&i.ConfirmedAt,
 		&i.ConfirmedByName,
+		&i.Origem,
+		&i.Selo,
+		&i.ConfirmacaoExigida,
+		&i.PrazoInterno,
+		&i.CalcMemoryID,
+		&i.PrazoBase,
+		&i.PrazoBaseFonte,
+		&i.TermoInicialRegra,
+		&i.DiasUteis,
+		&i.DobraMotivo,
+		&i.TabelaLegalRef,
+		&i.IaTipoInferido,
+		&i.IaConfianca,
+		&i.CalendarProviderVersion,
+		&i.DataDeclarada,
+		&i.DataCalculada,
+		&i.DifDias,
+		&i.Resultado,
+		&i.CausaProvavel,
+		&i.Decisao,
+		&i.DecididoPor,
 	)
 	return i, err
 }
@@ -493,6 +551,57 @@ func (q *Queries) GetTasksSummary(ctx context.Context, tenantID uuid.UUID) (GetT
 		&i.Abertas,
 	)
 	return i, err
+}
+
+const listAppliedHolidaysByCalcMemory = `-- name: ListAppliedHolidaysByCalcMemory :many
+SELECT id, data, nome, ambito, comarca
+FROM applied_holiday
+WHERE calc_memory_id = $1 AND tenant_id = $2
+ORDER BY data ASC
+`
+
+type ListAppliedHolidaysByCalcMemoryParams struct {
+	CalcMemoryID uuid.UUID `json:"calc_memory_id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+}
+
+type ListAppliedHolidaysByCalcMemoryRow struct {
+	ID      uuid.UUID   `json:"id"`
+	Data    pgtype.Date `json:"data"`
+	Nome    *string     `json:"nome"`
+	Ambito  *string     `json:"ambito"`
+	Comarca *string     `json:"comarca"`
+}
+
+// The 1:N feriados snapshot applied to one calc_memory (GET /v1/prazos/:id memória de
+// cálculo). Kept as a companion query to GetPrazo (not joined there) so a prazo with N applied
+// holidays never multiplies the deadline row. Scoped to tenant_id (barrier 1, on top of RLS
+// barrier 2). No holidays applied (a dias corridos calc, or a short prazo that skipped none)
+// yields an empty slice, never an error. $1 = calc_memory_id, $2 = tenant_id.
+func (q *Queries) ListAppliedHolidaysByCalcMemory(ctx context.Context, arg ListAppliedHolidaysByCalcMemoryParams) ([]ListAppliedHolidaysByCalcMemoryRow, error) {
+	rows, err := q.db.Query(ctx, listAppliedHolidaysByCalcMemory, arg.CalcMemoryID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAppliedHolidaysByCalcMemoryRow
+	for rows.Next() {
+		var i ListAppliedHolidaysByCalcMemoryRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Data,
+			&i.Nome,
+			&i.Ambito,
+			&i.Comarca,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listPrazoCourts = `-- name: ListPrazoCourts :many

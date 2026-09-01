@@ -38,11 +38,21 @@ func (f fakeSource) IsHoliday(_ context.Context, day time.Time, uf, court string
 	return false, nil
 }
 
+// LookupHolidays is not exercised by the business-day tests in this file — see
+// TestCalendar_LookupHolidays for its dedicated coverage with a purpose-built fake.
+func (f fakeSource) LookupHolidays(context.Context, []time.Time, string, string) (map[time.Time]Holiday, error) {
+	return map[time.Time]Holiday{}, nil
+}
+
 // errSource always fails — used to assert the Calendar propagates source errors.
 type errSource struct{}
 
 func (errSource) IsHoliday(context.Context, time.Time, string, string) (bool, error) {
 	return false, errors.New("boom")
+}
+
+func (errSource) LookupHolidays(context.Context, []time.Time, string, string) (map[time.Time]Holiday, error) {
+	return nil, errors.New("boom")
 }
 
 // allHolidaySource marks every day a holiday — used to force the prorrogação
@@ -51,6 +61,10 @@ type allHolidaySource struct{}
 
 func (allHolidaySource) IsHoliday(context.Context, time.Time, string, string) (bool, error) {
 	return true, nil
+}
+
+func (allHolidaySource) LookupHolidays(context.Context, []time.Time, string, string) (map[time.Time]Holiday, error) {
+	return map[time.Time]Holiday{}, nil
 }
 
 // sample fixture: Independência (07/09) and Ano Novo (01/01) national; Revolução
@@ -205,6 +219,69 @@ func TestCalendar_AddBusinessDays_SourceError(t *testing.T) {
 	}
 }
 
+func TestCalendar_SubtractBusinessDays(t *testing.T) {
+	t.Parallel()
+	cal := New(sample())
+
+	tests := []struct {
+		name        string
+		start       string
+		n           int
+		wantEnd     string
+		mustContain []string // dates that MUST appear in the skipped/audit list
+		wantEmpty   bool     // skipped must be empty
+	}{
+		{name: "n=0 devolve o proprio start", start: "2026-02-06", n: 0, wantEnd: "2026-02-06", wantEmpty: true},
+		{name: "3 dias uteis pra tras, exclui o start", start: "2026-02-06", n: 3, wantEnd: "2026-02-03", wantEmpty: true},
+		{name: "pula feriado de segunda (pra tras) e o audita", start: "2026-09-09", n: 2, wantEnd: "2026-09-04", mustContain: []string{"2026-09-07"}},
+		{name: "atravessa o recesso pra tras e audita o natal", start: "2027-01-21", n: 2, wantEnd: "2026-12-17", mustContain: []string{"2026-12-25"}},
+		{name: "pula fim de semana pra tras sem auditar", start: "2026-02-09", n: 1, wantEnd: "2026-02-06", wantEmpty: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			end, skipped, err := cal.SubtractBusinessDays(context.Background(), d(tt.start), tt.n, "", "")
+			if err != nil {
+				t.Fatalf("SubtractBusinessDays(%s, %d) unexpected error: %v", tt.start, tt.n, err)
+			}
+			if !end.Equal(d(tt.wantEnd)) {
+				t.Errorf("end = %s, want %s", end.Format(time.DateOnly), tt.wantEnd)
+			}
+			if tt.wantEmpty && len(skipped) != 0 {
+				t.Errorf("skipped = %v, want empty", fmtDates(skipped))
+			}
+			for _, want := range tt.mustContain {
+				if !containsDate(skipped, d(want)) {
+					t.Errorf("skipped %v missing %s", fmtDates(skipped), want)
+				}
+			}
+			// Sanity: no weekend day is ever audited (only holidays/recess).
+			for _, s := range skipped {
+				if isWeekend(s) {
+					t.Errorf("skipped contains weekend %s", s.Format(time.DateOnly))
+				}
+			}
+		})
+	}
+}
+
+func TestCalendar_SubtractBusinessDays_NegativeN(t *testing.T) {
+	t.Parallel()
+	cal := New(sample())
+	if _, _, err := cal.SubtractBusinessDays(context.Background(), d("2026-02-06"), -1, "", ""); err == nil {
+		t.Fatal("expected error for negative n, got nil")
+	}
+}
+
+func TestCalendar_SubtractBusinessDays_SourceError(t *testing.T) {
+	t.Parallel()
+	cal := New(errSource{})
+	if _, _, err := cal.SubtractBusinessDays(context.Background(), d("2026-02-06"), 1, "", ""); err == nil {
+		t.Fatal("expected error from source, got nil")
+	}
+}
+
 func TestCalendar_AddCalendarDays(t *testing.T) {
 	t.Parallel()
 	cal := New(sample())
@@ -307,6 +384,64 @@ func TestCalendar_AddCalendarDays_MaxScan(t *testing.T) {
 	cal := New(allHolidaySource{})
 	if _, _, err := cal.AddCalendarDays(context.Background(), d("2026-02-02"), 1, "", ""); err == nil {
 		t.Fatal("expected maxScan error, got nil")
+	}
+}
+
+// lookupSource is a HolidaySource whose LookupHolidays resolves COURT > STATE > NATIONAL
+// precedence per date, mirroring the real Store's behavior — used to verify Calendar.
+// LookupHolidays plumbs the source's resolved winner through (including date normalization)
+// without reimplementing IsHoliday.
+type lookupSource struct {
+	rows []Holiday // candidate rows across scopes; a date may appear more than once
+}
+
+func (lookupSource) IsHoliday(context.Context, time.Time, string, string) (bool, error) {
+	return false, nil
+}
+
+func (l lookupSource) LookupHolidays(_ context.Context, days []time.Time, _, _ string) (map[time.Time]Holiday, error) {
+	wanted := make(map[time.Time]bool, len(days))
+	for _, day := range days {
+		wanted[day] = true
+	}
+	rank := map[string]int{ScopeCourt: 2, ScopeState: 1, ScopeNational: 0}
+	result := make(map[time.Time]Holiday, len(days))
+	for _, row := range l.rows {
+		if !wanted[row.Date] {
+			continue
+		}
+		if existing, ok := result[row.Date]; !ok || rank[row.Scope] > rank[existing.Scope] {
+			result[row.Date] = row
+		}
+	}
+	return result, nil
+}
+
+// U-cal-lookup: the same date has NATIONAL, STATE and COURT rows — the most specific scope
+// (COURT) must win, and a requested date with no row is simply absent from the result.
+func TestCalendar_LookupHolidays(t *testing.T) {
+	t.Parallel()
+	src := lookupSource{rows: []Holiday{
+		{Scope: ScopeNational, Date: d("2026-11-02"), Name: "Finados"},
+		{Scope: ScopeState, ScopeID: "SP", Date: d("2026-11-02"), Name: "Feriado estadual SP"},
+		{Scope: ScopeCourt, ScopeID: "TJSP", Date: d("2026-11-02"), Name: "Feriado forense TJSP"},
+	}}
+	cal := New(src)
+
+	got, err := cal.LookupHolidays(context.Background(), []time.Time{d("2026-11-02"), d("2026-11-03")}, "SP", "TJSP")
+	if err != nil {
+		t.Fatalf("LookupHolidays unexpected error: %v", err)
+	}
+
+	winner, ok := got[d("2026-11-02")]
+	if !ok {
+		t.Fatal("expected 2026-11-02 present in result")
+	}
+	if winner.Scope != ScopeCourt || winner.Name != "Feriado forense TJSP" {
+		t.Errorf("winner = %+v, want the COURT row (most specific scope)", winner)
+	}
+	if _, ok := got[d("2026-11-03")]; ok {
+		t.Error("2026-11-03 has no holiday row, must be absent from the result")
 	}
 }
 

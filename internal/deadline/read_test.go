@@ -33,6 +33,11 @@ type recordingReadRepo struct {
 	lastGetTID string
 	lastGetID  string
 
+	holidaysRows             []AppliedHolidayView
+	holidaysErr              error
+	lastHolidaysTID          string
+	lastHolidaysCalcMemoryID string
+
 	suggestContext PrazoSuggestContext
 	suggestErr     error
 
@@ -93,6 +98,11 @@ func (r *recordingReadRepo) CountPrazos(_ context.Context, q PrazosQuery) (int64
 func (r *recordingReadRepo) GetPrazo(_ context.Context, tenantID, id string) (PrazoDetailView, error) {
 	r.lastGetTID, r.lastGetID = tenantID, id
 	return r.detailView, r.detailErr
+}
+
+func (r *recordingReadRepo) ListAppliedHolidaysByCalcMemory(_ context.Context, tenantID, calcMemoryID string) ([]AppliedHolidayView, error) {
+	r.lastHolidaysTID, r.lastHolidaysCalcMemoryID = tenantID, calcMemoryID
+	return r.holidaysRows, r.holidaysErr
 }
 
 func (r *recordingReadRepo) GetPrazoSuggestContext(_ context.Context, tenantID, id string) (PrazoSuggestContext, error) {

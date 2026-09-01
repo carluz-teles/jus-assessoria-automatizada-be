@@ -275,30 +275,98 @@ func (r *pgReadRepository) GetPrazo(ctx context.Context, tenantID, id string) (P
 		return PrazoDetailView{}, database.WrapInfra(err)
 	}
 
-	return PrazoDetailView{
-		ID:              row.ID.String(),
-		CourtRecordID:   row.CourtRecordID.String(),
-		Kind:            derefString(row.Kind),
-		StartDate:       row.StartDate.Time,
-		EndDate:         row.EndDate.Time,
-		DaysLeft:        int(row.DaysLeft),
-		Days:            int(row.Days),
-		Counting:        row.Counting,
-		Doubled:         row.Doubled,
-		DoubledReason:   derefString(row.DoubledReason),
-		Status:          row.Status,
-		Source:          row.Source,
-		HolidaysApplied: holidaysFromJSON(row.HolidaysApplied),
-		IntimationID:    row.NotificationID.String(),
-		RulesVersion:    row.RulesVersion,
-		Confirmed:       confirmedBool(row.Confirmed),
-		AnchorEvent:     row.AnchorEvent,
-		LegalCitation:   derefString(row.LegalCitation),
-		ManualExtraDays: int(row.ManualExtraDays),
-		ConfirmedByID:   uuidText(row.ConfirmedBy),
-		ConfirmedByName: derefString(row.ConfirmedByName),
-		ConfirmedAt:     timestampPtr(row.ConfirmedAt),
-	}, nil
+	view := PrazoDetailView{
+		ID:                 row.ID.String(),
+		CourtRecordID:      row.CourtRecordID.String(),
+		Kind:               derefString(row.Kind),
+		StartDate:          row.StartDate.Time,
+		EndDate:            row.EndDate.Time,
+		DaysLeft:           int(row.DaysLeft),
+		Days:               int(row.Days),
+		Counting:           row.Counting,
+		Doubled:            row.Doubled,
+		DoubledReason:      derefString(row.DoubledReason),
+		Status:             row.Status,
+		Source:             row.Source,
+		HolidaysApplied:    holidaysFromJSON(row.HolidaysApplied),
+		IntimationID:       row.NotificationID.String(),
+		RulesVersion:       row.RulesVersion,
+		Confirmed:          confirmedBool(row.Confirmed),
+		AnchorEvent:        row.AnchorEvent,
+		LegalCitation:      derefString(row.LegalCitation),
+		ManualExtraDays:    int(row.ManualExtraDays),
+		ConfirmedByID:      uuidText(row.ConfirmedBy),
+		ConfirmedByName:    derefString(row.ConfirmedByName),
+		ConfirmedAt:        timestampPtr(row.ConfirmedAt),
+		Origem:             derefString(row.Origem),
+		Selo:               derefString(row.Selo),
+		ConfirmacaoExigida: derefBool(row.ConfirmacaoExigida),
+		PrazoInterno:       row.PrazoInterno.Time,
+	}
+
+	// V1 memória de cálculo: calc_memory/cross_validation are LEFT JOINed, so a pré-V1 prazo (no
+	// row ever written) comes back with every cm./cv. column NULL — row.CalcMemoryID.Valid /
+	// row.Decisao being nil are the presence checks, degrading to nil rather than a zeroed view.
+	if row.CalcMemoryID.Valid {
+		view.CalcMemory = &CalcMemoryView{
+			ID:                      row.CalcMemoryID.String(),
+			PrazoBase:               derefString(row.PrazoBase),
+			PrazoBaseFonte:          derefString(row.PrazoBaseFonte),
+			TermoInicialRegra:       derefString(row.TermoInicialRegra),
+			DiasUteis:               derefBool(row.DiasUteis),
+			DobraMotivo:             derefString(row.DobraMotivo),
+			TabelaLegalRef:          derefString(row.TabelaLegalRef),
+			IATipoInferido:          derefString(row.IaTipoInferido),
+			IAConfianca:             derefFloat64(row.IaConfianca),
+			CalendarProviderVersion: derefString(row.CalendarProviderVersion),
+		}
+	}
+	if row.Resultado != nil {
+		view.CrossValidation = &CrossValidationView{
+			DataDeclarada: row.DataDeclarada.Time,
+			DataCalculada: row.DataCalculada.Time,
+			DifDias:       derefInt32(row.DifDias),
+			Resultado:     derefString(row.Resultado),
+			CausaProvavel: derefString(row.CausaProvavel),
+			Decisao:       derefString(row.Decisao),
+			DecididoPor:   uuidText(row.DecididoPor),
+		}
+	}
+
+	return view, nil
+}
+
+// ListAppliedHolidaysByCalcMemory reads the 1:N feriados snapshot for one calc_memory on the
+// pool, filtered by tenant_id (barrier 1). No holidays applied yields an empty slice, never an
+// error (a :many query never returns pgx.ErrNoRows).
+func (r *pgReadRepository) ListAppliedHolidaysByCalcMemory(ctx context.Context, tenantID, calcMemoryID string) ([]AppliedHolidayView, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	cmid, err := parseUUID(calcMemoryID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.q.ListAppliedHolidaysByCalcMemory(ctx, deadlinedb.ListAppliedHolidaysByCalcMemoryParams{
+		CalcMemoryID: cmid,
+		TenantID:     tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]AppliedHolidayView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, AppliedHolidayView{
+			Data:    row.Data.Time,
+			Nome:    derefString(row.Nome),
+			Ambito:  derefString(row.Ambito),
+			Comarca: derefString(row.Comarca),
+		})
+	}
+	return out, nil
 }
 
 // GetPrazoSuggestContext reads the advisory case context for one prazo on the pool, filtered by

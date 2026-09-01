@@ -167,6 +167,16 @@ type recordingWriter struct {
 	reopenRes                                               MarkedDeadline
 	reopenErr                                               error
 
+	// apurar-divergencia / apurar-tipo (V1)
+	gotApurarDivergenciaCmd ApurarDivergenciaCommand
+	apurarDivergenciaCalls  int
+	apurarDivergenciaRes    ApuradoDivergencia
+	apurarDivergenciaErr    error
+	gotApurarTipoCmd        ApurarTipoCommand
+	apurarTipoCalls         int
+	apurarTipoRes           ApuradoTipo
+	apurarTipoErr           error
+
 	// task writes
 	gotCreateTaskCmd               CreateTaskCommand
 	createTaskCalls                int
@@ -231,6 +241,18 @@ func (w *recordingWriter) Reopen(_ context.Context, tenantID, deadlineID string)
 	w.reopenCalls++
 	w.gotReopenTenant, w.gotReopenID = tenantID, deadlineID
 	return w.reopenRes, w.reopenErr
+}
+
+func (w *recordingWriter) ApurarDivergencia(_ context.Context, cmd ApurarDivergenciaCommand) (ApuradoDivergencia, error) {
+	w.apurarDivergenciaCalls++
+	w.gotApurarDivergenciaCmd = cmd
+	return w.apurarDivergenciaRes, w.apurarDivergenciaErr
+}
+
+func (w *recordingWriter) ApurarTipo(_ context.Context, cmd ApurarTipoCommand) (ApuradoTipo, error) {
+	w.apurarTipoCalls++
+	w.gotApurarTipoCmd = cmd
+	return w.apurarTipoRes, w.apurarTipoErr
 }
 
 func (w *recordingWriter) MarkMet(_ context.Context, tenantID, deadlineID string) (MarkedDeadline, error) {

@@ -45,14 +45,17 @@ type AdjustCommand struct {
 // It is a plain struct (not the Deadline aggregate) because the ajuste updates a subset of
 // columns and leaves status/source/start_date/rules_version untouched.
 type UpdateDeadlineAdjustParams struct {
-	DeadlineID      string
-	TenantID        string
-	Kind            string
-	Days            int
-	Counting        Counting
-	Doubled         bool
-	DoubledReason   string
-	EndDate         time.Time
+	DeadlineID    string
+	TenantID      string
+	Kind          string
+	Days          int
+	Counting      Counting
+	Doubled       bool
+	DoubledReason string
+	EndDate       time.Time
+	// PrazoInterno is the recomputed internal safety buffer (internalBufferBusinessDays
+	// business days before EndDate), kept in sync with the recomputed EndDate.
+	PrazoInterno    time.Time
 	HolidaysApplied []time.Time
 	// StartDate is re-persisted because re-anchoring changes the start; AnchorEvent /
 	// ManualExtraDays are the merged panel choices.
@@ -177,6 +180,13 @@ func (uc *UseCase) Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadl
 			return apperr.NewInvalid("deadline end date must be after start date")
 		}
 
+		// V1: recompute the internal safety buffer in lockstep with EndDate, via the SAME
+		// uf/court already resolved above — never left stale against the recomputed EndDate.
+		prazoInterno, _, err := uc.cal.SubtractBusinessDays(ctx, endDate, internalBufferBusinessDays, uf, court)
+		if err != nil {
+			return err
+		}
+
 		deadlineID, courtRecordID, err := uc.repo.UpdateDeadlineAdjust(ctx, tx, UpdateDeadlineAdjustParams{
 			DeadlineID:      cmd.DeadlineID,
 			TenantID:        cmd.TenantID,
@@ -186,6 +196,7 @@ func (uc *UseCase) Adjust(ctx context.Context, cmd AdjustCommand) (AdjustedDeadl
 			Doubled:         doubled,
 			DoubledReason:   doubledReason,
 			EndDate:         endDate,
+			PrazoInterno:    prazoInterno,
 			HolidaysApplied: holidays,
 			StartDate:       start,
 			AnchorEvent:     anchorEvent,

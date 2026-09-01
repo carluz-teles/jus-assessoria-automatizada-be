@@ -46,6 +46,8 @@ type writer interface {
 	MarkMissed(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
 	NoDeadline(ctx context.Context, tenantID, userID, deadlineID string) (MarkedDeadline, error)
 	Reopen(ctx context.Context, tenantID, deadlineID string) (MarkedDeadline, error)
+	ApurarDivergencia(ctx context.Context, cmd ApurarDivergenciaCommand) (ApuradoDivergencia, error)
+	ApurarTipo(ctx context.Context, cmd ApurarTipoCommand) (ApuradoTipo, error)
 	CreateTask(ctx context.Context, cmd CreateTaskCommand) (*Task, error)
 	UpdateTask(ctx context.Context, cmd UpdateTaskCommand) (*Task, error)
 	MarkTaskDone(ctx context.Context, tenantID, userID, taskID string) (TaskTransition, error)
@@ -102,6 +104,9 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/prazos/:id/missed", h.markPrazoMissed)
 	r.Post("/prazos/:id/no-deadline", h.markPrazoNoDeadline)
 	r.Post("/prazos/:id/reopen", h.reopenPrazo)
+	// V1 apuração (docs/design-motor-de-prazos-v1.md): human decision on an a_apurar prazo.
+	r.Post("/prazos/:id/apurar-divergencia", h.apurarDivergencia)
+	r.Post("/prazos/:id/apurar-tipo", h.apurarTipo)
 	r.Get("/processos/:id/tasks", h.listTasksByProcesso)
 	r.Get("/tasks", h.listTasks)
 	// Same static-before-param ordering for /tasks/summary vs /tasks/:id.
@@ -424,6 +429,57 @@ func (h *Handler) reopenPrazo(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(newMarkResponse(res))
+}
+
+// apurarDivergencia handles POST /v1/prazos/:id/apurar-divergencia (V1, docs/design-motor-de-
+// prazos-v1.md §"Divergência"): the human resolves a declarado×calculado divergência
+// (aceita_declarado | aceita_calculado | ajuste_manual), flipping selo a_apurar → confiavel. A
+// miss is ErrDeadlineNotFound → 404; a terminal (MET/CANCELLED) or already-resolved/non-
+// divergente prazo is ErrDeadlineNotApuravel/ErrDeadlineNotDivergent → 409.
+func (h *Handler) apurarDivergencia(c *fiber.Ctx) error {
+	var req ApurarDivergenciaRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	res, err := h.writer.ApurarDivergencia(c.UserContext(), req.toApurarDivergenciaCommand(p.TenantID, p.UserID, c.Params("id")))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newApuradoDivergenciaResponse(res))
+}
+
+// apurarTipo handles POST /v1/prazos/:id/apurar-tipo (V1, docs/design-motor-de-prazos-v1.md
+// §"Fallback IA"): the human confirms or reclassifies the IA-inferred tipo de ato, flipping
+// selo a_apurar → confiavel. A miss is ErrDeadlineNotFound → 404; a terminal prazo or one whose
+// selo is already confiavel is ErrDeadlineNotApuravel/ErrDeadlineNotDivergent → 409.
+func (h *Handler) apurarTipo(c *fiber.Ctx) error {
+	var req ApurarTipoRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteError(c, apperr.NewInvalid("malformed request body"))
+	}
+	if err := req.Validate(); err != nil {
+		return httpx.WriteValidationError(c, err)
+	}
+
+	p, ok := httpx.PrincipalFromCtx(c)
+	if !ok {
+		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
+	}
+
+	res, err := h.writer.ApurarTipo(c.UserContext(), req.toApurarTipoCommand(p.TenantID, p.UserID, c.Params("id")))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(newApuradoTipoResponse(res))
 }
 
 // listTasksByProcesso handles GET /v1/processos/:id/tasks: one process's Tasks tab — its tasks
@@ -932,6 +988,38 @@ type markResponse struct {
 // newMarkResponse maps the use case's MarkedDeadline to the client-facing payload.
 func newMarkResponse(d MarkedDeadline) markResponse {
 	return markResponse{DeadlineID: d.ID, Status: string(d.Status)}
+}
+
+// apuradoDivergenciaResponse is the POST /v1/prazos/:id/apurar-divergencia payload: the (possibly
+// recomputed) end_date, the flipped selo and the decisão recorded.
+type apuradoDivergenciaResponse struct {
+	DeadlineID string    `json:"deadline_id"`
+	EndDate    time.Time `json:"end_date"`
+	Selo       string    `json:"selo"`
+	Decisao    string    `json:"decisao"`
+}
+
+// newApuradoDivergenciaResponse maps the use case's ApuradoDivergencia to the client-facing payload.
+func newApuradoDivergenciaResponse(d ApuradoDivergencia) apuradoDivergenciaResponse {
+	return apuradoDivergenciaResponse{
+		DeadlineID: d.ID,
+		EndDate:    d.EndDate,
+		Selo:       string(d.Seal),
+		Decisao:    string(d.Decisao),
+	}
+}
+
+// apuradoTipoResponse is the POST /v1/prazos/:id/apurar-tipo payload: the confirmed/reclassified
+// tipo de ato and the flipped selo.
+type apuradoTipoResponse struct {
+	DeadlineID string `json:"deadline_id"`
+	Tipo       string `json:"tipo"`
+	Selo       string `json:"selo"`
+}
+
+// newApuradoTipoResponse maps the use case's ApuradoTipo to the client-facing payload.
+func newApuradoTipoResponse(t ApuradoTipo) apuradoTipoResponse {
+	return apuradoTipoResponse{DeadlineID: t.ID, Tipo: t.Tipo, Selo: string(t.Seal)}
 }
 
 // taskTransitionResponse is the POST /v1/tasks/:id/done | .../dismiss payload: the transitioned

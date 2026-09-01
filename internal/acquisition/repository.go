@@ -2092,7 +2092,22 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		return IntimacaoDetailView{}, database.WrapInfra(err)
 	}
 	assigneeID := uuidPtrFromPgtype(row.AssigneeUserID)
-	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt)
+
+	// Trilha unificada (Architect decisão 2): merge the deadline slice's own audit trail
+	// (deadline_event — "calculado"/"validado"/"confirmado" from the apuração flow) into the
+	// intimação's derived Histórico. Only fetched when a prazo exists (row.PrazoDeadlineID is
+	// the LEFT JOIN deadline's id, nullable) — no prazo means no events to merge.
+	var deadlineEvents []acquisitiondb.ListDeadlineEventsByDeadlineIDRow
+	if row.PrazoDeadlineID.Valid {
+		deadlineEvents, err = r.q.ListDeadlineEventsByDeadlineID(ctx, acquisitiondb.ListDeadlineEventsByDeadlineIDParams{
+			DeadlineID: uuid.UUID(row.PrazoDeadlineID.Bytes),
+			TenantID:   tid,
+		})
+		if err != nil {
+			return IntimacaoDetailView{}, database.WrapInfra(err)
+		}
+	}
+	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt, deadlineEvents)
 
 	// Prazo derivado + work_stage: o estágio é projeção do prazo (confirmado?) e da
 	// peça desta intimação (draft.status + filed_at) — fonte única do stepper.
@@ -3179,18 +3194,23 @@ func uuidPtrFromPgtype(u pgtype.UUID) *string {
 //     status is OPEN (confirmed) or NO_DEADLINE; label includes the confirmer name when
 //     available. Absent when there is no deadline or it is not yet confirmed.
 //  3. Providências geradas: ai_analyzed_at, when the analysis has run at least once.
+//  4. deadlineEvents: the deadline slice's OWN audit trail (deadline_event — every
+//     "calculado"/"validado"/"confirmado" moment the derivation + apuração flow recorded,
+//     Architect decisão 2 "Trilha unificada"), merged in verbatim (em → OccurredAt, detalhe →
+//     Label). Empty when the intimação has no prazo yet, or the prazo has no recorded events.
 //
-// Ordered ASC by occurred_at (the three sources don't have a fixed relative order — a
-// re-analysis can happen before or after the prazo is confirmed — so the slice is sorted
-// after assembly rather than relying on append order).
+// Ordered ASC by occurred_at (the sources don't have a fixed relative order — a re-analysis
+// can happen before or after the prazo is confirmed, and a deadline_event can land anywhere
+// in between — so the slice is sorted after assembly rather than relying on append order).
 func buildIntimacaoHistory(
 	madeAvailableAt pgtype.Date,
 	confirmedAt pgtype.Timestamptz,
 	confirmedByName *string,
 	deadlineStatus *string,
 	aiAnalyzedAt pgtype.Timestamptz,
+	deadlineEvents []acquisitiondb.ListDeadlineEventsByDeadlineIDRow,
 ) []IntimacaoHistoryEntry {
-	entries := make([]IntimacaoHistoryEntry, 0, 3)
+	entries := make([]IntimacaoHistoryEntry, 0, 3+len(deadlineEvents))
 
 	// 1. Captura — made_available_at is always present (NOT NULL column).
 	if madeAvailableAt.Valid {
@@ -3229,6 +3249,18 @@ func buildIntimacaoHistory(
 		entries = append(entries, IntimacaoHistoryEntry{
 			OccurredAt: aiAnalyzedAt.Time,
 			Label:      "Providências geradas",
+		})
+	}
+
+	// 4. deadline_event — the deadline slice's own audit trail merged verbatim (em → OccurredAt,
+	// detalhe → Label). Chronological re-sort below interleaves these with 1-3 correctly.
+	for _, e := range deadlineEvents {
+		if !e.Em.Valid {
+			continue
+		}
+		entries = append(entries, IntimacaoHistoryEntry{
+			OccurredAt: e.Em.Time,
+			Label:      derefString(e.Detalhe),
 		})
 	}
 

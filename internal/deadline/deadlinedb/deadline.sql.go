@@ -27,7 +27,8 @@ SET status            = 'OPEN',
     start_date        = $12,
     anchor_event      = $13,
     manual_extra_days = $14,
-    legal_citation    = $15
+    legal_citation    = $15,
+    prazo_interno     = $16
 WHERE notification_id = $1 AND tenant_id = $2
 RETURNING id, court_record_id
 `
@@ -48,6 +49,7 @@ type ConfirmDeadlineParams struct {
 	AnchorEvent     string             `json:"anchor_event"`
 	ManualExtraDays int32              `json:"manual_extra_days"`
 	LegalCitation   *string            `json:"legal_citation"`
+	PrazoInterno    pgtype.Date        `json:"prazo_interno"`
 }
 
 type ConfirmDeadlineRow struct {
@@ -57,16 +59,19 @@ type ConfirmDeadlineRow struct {
 
 // The F2 confirmation (§9: "Aprovar tudo" grava o deadline PENDING→OPEN recalculado).
 // Flips the prazo to OPEN with the human-approved {kind, days, counting, doubled,
-// doubled_reason} and the RECOMPUTED {end_date, holidays_applied}, stamping who/when
-// (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
+// doubled_reason} and the RECOMPUTED {end_date, holidays_applied, prazo_interno}, stamping
+// who/when (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
 // 1). IDEMPOTENT on the deadline: re-confirming the same intimação re-UPDATEs the one row
 // (the 1:1 notification_id) — it never opens a second prazo. source/rules_version are LEFT
 // AS-IS: source keeps its provenance (RULE/AI) and rules_version still records which rule set
 // first derived the prazo even when the human overrode the days. start_date IS written now: the
 // confirmation panel may re-anchor (anchor_event → a different intimação date), and
-// anchor_event/manual_extra_days/legal_citation persist the panel's choices. A no-match yields
-// NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id, $2 =
-// tenant_id, then the confirmed fields.
+// anchor_event/manual_extra_days/legal_citation persist the panel's choices. prazo_interno is
+// recomputed in lockstep with end_date (never left stale against it). V1 fields
+// (origem/selo/confirmacao_exigida) are SET ONLY at birth and preserved through all
+// subsequent operations — they are never overwritten by confirm or adjust. A no-match
+// yields NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id,
+// $2 = tenant_id, then the confirmed fields.
 func (q *Queries) ConfirmDeadline(ctx context.Context, arg ConfirmDeadlineParams) (ConfirmDeadlineRow, error) {
 	row := q.db.QueryRow(ctx, confirmDeadline,
 		arg.NotificationID,
@@ -84,6 +89,7 @@ func (q *Queries) ConfirmDeadline(ctx context.Context, arg ConfirmDeadlineParams
 		arg.AnchorEvent,
 		arg.ManualExtraDays,
 		arg.LegalCitation,
+		arg.PrazoInterno,
 	)
 	var i ConfirmDeadlineRow
 	err := row.Scan(&i.ID, &i.CourtRecordID)
@@ -111,6 +117,53 @@ func (q *Queries) DeleteTaskItem(ctx context.Context, arg DeleteTaskItemParams) 
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const getCalcMemory = `-- name: GetCalcMemory :one
+SELECT id, prazo_base, prazo_base_fonte, termo_inicial_regra, dias_uteis, dobra_motivo,
+       tabela_legal_ref, ia_tipo_inferido, ia_confianca, calendar_provider_version
+FROM calc_memory
+WHERE deadline_id = $1 AND tenant_id = $2
+`
+
+type GetCalcMemoryParams struct {
+	DeadlineID uuid.UUID `json:"deadline_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+}
+
+type GetCalcMemoryRow struct {
+	ID                      uuid.UUID `json:"id"`
+	PrazoBase               *string   `json:"prazo_base"`
+	PrazoBaseFonte          *string   `json:"prazo_base_fonte"`
+	TermoInicialRegra       *string   `json:"termo_inicial_regra"`
+	DiasUteis               *bool     `json:"dias_uteis"`
+	DobraMotivo             *string   `json:"dobra_motivo"`
+	TabelaLegalRef          *string   `json:"tabela_legal_ref"`
+	IaTipoInferido          *string   `json:"ia_tipo_inferido"`
+	IaConfianca             *float64  `json:"ia_confianca"`
+	CalendarProviderVersion *string   `json:"calendar_provider_version"`
+}
+
+// Read one deadline's calc_memory (apurar-tipo: the IA's inferred tipo/confiança the human
+// confirms or overrides). Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing
+// row → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper (→ 404), never (nil, nil).
+// $1 = deadline_id, $2 = tenant_id.
+func (q *Queries) GetCalcMemory(ctx context.Context, arg GetCalcMemoryParams) (GetCalcMemoryRow, error) {
+	row := q.db.QueryRow(ctx, getCalcMemory, arg.DeadlineID, arg.TenantID)
+	var i GetCalcMemoryRow
+	err := row.Scan(
+		&i.ID,
+		&i.PrazoBase,
+		&i.PrazoBaseFonte,
+		&i.TermoInicialRegra,
+		&i.DiasUteis,
+		&i.DobraMotivo,
+		&i.TabelaLegalRef,
+		&i.IaTipoInferido,
+		&i.IaConfianca,
+		&i.CalendarProviderVersion,
+	)
+	return i, err
 }
 
 const getCourtRecordClass = `-- name: GetCourtRecordClass :one
@@ -166,6 +219,57 @@ func (q *Queries) GetCourtRecordCourt(ctx context.Context, arg GetCourtRecordCou
 	return court, err
 }
 
+const getCrossValidation = `-- name: GetCrossValidation :one
+
+SELECT id, data_declarada, data_calculada, dif_dias, resultado, causa_provavel, decisao, decidido_por
+FROM cross_validation
+WHERE deadline_id = $1 AND tenant_id = $2
+`
+
+type GetCrossValidationParams struct {
+	DeadlineID uuid.UUID `json:"deadline_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+}
+
+type GetCrossValidationRow struct {
+	ID            uuid.UUID   `json:"id"`
+	DataDeclarada pgtype.Date `json:"data_declarada"`
+	DataCalculada pgtype.Date `json:"data_calculada"`
+	DifDias       *int32      `json:"dif_dias"`
+	Resultado     *string     `json:"resultado"`
+	CausaProvavel *string     `json:"causa_provavel"`
+	Decisao       *string     `json:"decisao"`
+	DecididoPor   pgtype.UUID `json:"decidido_por"`
+}
+
+// ── V1 apuração (human decision on a_apurar prazos) ─────────────────────────
+// POST /v1/prazos/:id/apurar-divergencia | .../apurar-tipo (apurar.go). Both flip selo
+// a_apurar → confiavel; origem is NEVER touched here (immutable after creation — only the
+// creation path in domain.go writes it). The deadline row itself is patched via the ALREADY
+// existing UpdateDeadlineAdjust (ajuste_manual path) or UpdateDeadlineEndDate (aceita_declarado
+// path) below; aceita_calculado writes nothing (the stored end_date already IS the calculado
+// date).
+// Read the declared×calculado cross-validation for one deadline (apurar-divergencia gate:
+// resultado must be "divergente" AND decisao must still be "" — the idempotency guard). Scoped
+// to tenant_id (barrier 1, on top of RLS barrier 2). A missing row (no prazo_declarado at birth,
+// so nothing was ever cross-checked) → pgx.ErrNoRows → typed ErrCrossValidationNotFound at the
+// mapper (→ 404), never (nil, nil). $1 = deadline_id, $2 = tenant_id.
+func (q *Queries) GetCrossValidation(ctx context.Context, arg GetCrossValidationParams) (GetCrossValidationRow, error) {
+	row := q.db.QueryRow(ctx, getCrossValidation, arg.DeadlineID, arg.TenantID)
+	var i GetCrossValidationRow
+	err := row.Scan(
+		&i.ID,
+		&i.DataDeclarada,
+		&i.DataCalculada,
+		&i.DifDias,
+		&i.Resultado,
+		&i.CausaProvavel,
+		&i.Decisao,
+		&i.DecididoPor,
+	)
+	return i, err
+}
+
 const getDeadlineEndDate = `-- name: GetDeadlineEndDate :one
 SELECT end_date
 FROM deadline
@@ -192,7 +296,7 @@ func (q *Queries) GetDeadlineEndDate(ctx context.Context, arg GetDeadlineEndDate
 
 const getDeadlineForAdjust = `-- name: GetDeadlineForAdjust :one
 SELECT id, court_record_id, notification_id, start_date, status, kind, days, counting, doubled,
-       doubled_reason, anchor_event, manual_extra_days
+       doubled_reason, anchor_event, manual_extra_days, origem, selo
 FROM deadline
 WHERE id = $1 AND tenant_id = $2
 `
@@ -215,6 +319,8 @@ type GetDeadlineForAdjustRow struct {
 	DoubledReason   *string     `json:"doubled_reason"`
 	AnchorEvent     string      `json:"anchor_event"`
 	ManualExtraDays int32       `json:"manual_extra_days"`
+	Origem          *string     `json:"origem"`
+	Selo            *string     `json:"selo"`
 }
 
 // Load a prazo's FULL adjustable state — the F2 ajuste manual (§9: PATCH /v1/prazos/:id)
@@ -222,9 +328,11 @@ type GetDeadlineForAdjustRow struct {
 // from, court_record_id feeds the court lookup (recompute UF), and the CURRENT
 // {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
 // over (a field absent from the body keeps its stored value). status gates the ajuste (only
-// a PENDING/OPEN prazo is adjustable). Keyed by id and scoped to tenant_id (barrier 1, on top
-// of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at
-// the mapper (→ 404), never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
+// a PENDING/OPEN prazo is adjustable). origem/selo (V1) ride along for apurar.go — origem is
+// immutable (only stamped onto deadline.seal_assigned), selo gates apurar-tipo. Keyed by id
+// and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing id in the tenant →
+// pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper (→ 404), never (nil, nil). $1 = id,
+// $2 = tenant_id (from the principal).
 func (q *Queries) GetDeadlineForAdjust(ctx context.Context, arg GetDeadlineForAdjustParams) (GetDeadlineForAdjustRow, error) {
 	row := q.db.QueryRow(ctx, getDeadlineForAdjust, arg.ID, arg.TenantID)
 	var i GetDeadlineForAdjustRow
@@ -241,6 +349,8 @@ func (q *Queries) GetDeadlineForAdjust(ctx context.Context, arg GetDeadlineForAd
 		&i.DoubledReason,
 		&i.AnchorEvent,
 		&i.ManualExtraDays,
+		&i.Origem,
+		&i.Selo,
 	)
 	return i, err
 }
@@ -320,6 +430,29 @@ func (q *Queries) GetDeadlineForConfirm(ctx context.Context, arg GetDeadlineForC
 		&i.StartDate,
 		&i.LegalCitation,
 	)
+	return i, err
+}
+
+const getDeadlinePolicy = `-- name: GetDeadlinePolicy :one
+SELECT tenant_id, confirmacao_obrigatoria
+FROM deadline_policy
+WHERE tenant_id = $1
+`
+
+type GetDeadlinePolicyRow struct {
+	TenantID               uuid.UUID `json:"tenant_id"`
+	ConfirmacaoObrigatoria bool      `json:"confirmacao_obrigatoria"`
+}
+
+// Read the tenant's deadline confirmation policy. Returns the row when it exists;
+// the caller maps pgx.ErrNoRows to the default policy (confirmacao_obrigatoria =
+// false) so a tenant without an explicit row gets the seletiva default. Scoped
+// to tenant_id (barrier 1, on top of RLS barrier 2).
+// $1 = tenant_id.
+func (q *Queries) GetDeadlinePolicy(ctx context.Context, tenantID uuid.UUID) (GetDeadlinePolicyRow, error) {
+	row := q.db.QueryRow(ctx, getDeadlinePolicy, tenantID)
+	var i GetDeadlinePolicyRow
+	err := row.Scan(&i.TenantID, &i.ConfirmacaoObrigatoria)
 	return i, err
 }
 
@@ -610,39 +743,190 @@ func (q *Queries) HasResponseMovement(ctx context.Context, arg HasResponseMoveme
 	return has_response, err
 }
 
+const insertAppliedHoliday = `-- name: InsertAppliedHoliday :one
+INSERT INTO applied_holiday (
+    tenant_id, calc_memory_id, data, nome, ambito, comarca
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+RETURNING id
+`
+
+type InsertAppliedHolidayParams struct {
+	TenantID     uuid.UUID   `json:"tenant_id"`
+	CalcMemoryID uuid.UUID   `json:"calc_memory_id"`
+	Data         pgtype.Date `json:"data"`
+	Nome         *string     `json:"nome"`
+	Ambito       *string     `json:"ambito"`
+	Comarca      *string     `json:"comarca"`
+}
+
+// Persist one holiday snapshot applied to a calculation (same tx as calc_memory).
+// applied_holiday is 1:N with calc_memory (each holiday the motor skipped).
+// Returns the DB-assigned id so the caller can build the full audit trail.
+// $1 = tenant_id, $2 = calc_memory_id, $3 = data, $4 = nome, $5 = ambito, $6 = comarca.
+func (q *Queries) InsertAppliedHoliday(ctx context.Context, arg InsertAppliedHolidayParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertAppliedHoliday,
+		arg.TenantID,
+		arg.CalcMemoryID,
+		arg.Data,
+		arg.Nome,
+		arg.Ambito,
+		arg.Comarca,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const insertCalcMemory = `-- name: InsertCalcMemory :one
+
+INSERT INTO calc_memory (
+    tenant_id, deadline_id,
+    prazo_base, prazo_base_fonte, termo_inicial_regra, dias_uteis,
+    dobra_motivo, tabela_legal_ref, ia_tipo_inferido, ia_confianca,
+    calendar_provider_version
+) VALUES (
+    $1, $2,
+    $3, $4, $5, $6,
+    $7, $8, $9, $10,
+    $11
+)
+ON CONFLICT (deadline_id) DO NOTHING
+RETURNING id
+`
+
+type InsertCalcMemoryParams struct {
+	TenantID                uuid.UUID `json:"tenant_id"`
+	DeadlineID              uuid.UUID `json:"deadline_id"`
+	PrazoBase               *string   `json:"prazo_base"`
+	PrazoBaseFonte          *string   `json:"prazo_base_fonte"`
+	TermoInicialRegra       *string   `json:"termo_inicial_regra"`
+	DiasUteis               *bool     `json:"dias_uteis"`
+	DobraMotivo             *string   `json:"dobra_motivo"`
+	TabelaLegalRef          *string   `json:"tabela_legal_ref"`
+	IaTipoInferido          *string   `json:"ia_tipo_inferido"`
+	IaConfianca             *float64  `json:"ia_confianca"`
+	CalendarProviderVersion *string   `json:"calendar_provider_version"`
+}
+
+// ── V1 Motor de Prazos persistence ─────────────────────────────────────────
+// The V1 motor audit trail: calc_memory, applied_holiday, cross_validation,
+// deadline_event, and deadline_policy. All run inside the use case's tx so RLS
+// scopes them to the event's tenant (barrier 2) on top of the explicit tenant
+// filter (barrier 1).
+// Persist the deterministic calculation audit trail alongside the deadline (same
+// tx). deadline_id is UNIQUE (1:1 per deadline) so ON CONFLICT DO NOTHING yields
+// no row on a re-derivation, mapped to ErrCalcMemoryExists at the mapper. All
+// nullable text columns map to NULL via textToNull. Returns the DB-assigned id.
+// $1 = tenant_id, $2 = deadline_id, then the audit fields.
+func (q *Queries) InsertCalcMemory(ctx context.Context, arg InsertCalcMemoryParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertCalcMemory,
+		arg.TenantID,
+		arg.DeadlineID,
+		arg.PrazoBase,
+		arg.PrazoBaseFonte,
+		arg.TermoInicialRegra,
+		arg.DiasUteis,
+		arg.DobraMotivo,
+		arg.TabelaLegalRef,
+		arg.IaTipoInferido,
+		arg.IaConfianca,
+		arg.CalendarProviderVersion,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const insertCrossValidation = `-- name: InsertCrossValidation :one
+INSERT INTO cross_validation (
+    tenant_id, deadline_id,
+    data_declarada, data_calculada, dif_dias,
+    resultado, causa_provavel, decisao, decidido_por
+) VALUES (
+    $1, $2,
+    $3, $4, $5,
+    $6, $7, $8, $9
+)
+ON CONFLICT (deadline_id) DO NOTHING
+RETURNING id
+`
+
+type InsertCrossValidationParams struct {
+	TenantID      uuid.UUID   `json:"tenant_id"`
+	DeadlineID    uuid.UUID   `json:"deadline_id"`
+	DataDeclarada pgtype.Date `json:"data_declarada"`
+	DataCalculada pgtype.Date `json:"data_calculada"`
+	DifDias       *int32      `json:"dif_dias"`
+	Resultado     *string     `json:"resultado"`
+	CausaProvavel *string     `json:"causa_provavel"`
+	Decisao       *string     `json:"decisao"`
+	DecididoPor   pgtype.UUID `json:"decidido_por"`
+}
+
+// Persist the declared vs calculated date cross-validation result (same tx as
+// deadline). deadline_id is UNIQUE (1:1 per deadline) so ON CONFLICT DO NOTHING
+// yields no row on a re-derivation, mapped to ErrCrossValidationExists at the
+// mapper. decidido_por is nullable (NULL when system-decided).
+// $1 = tenant_id, $2 = deadline_id, $3 = data_declarada, $4 = data_calculada,
+// $5 = dif_dias, $6 = resultado, $7 = causa_provavel, $8 = decisao, $9 = decidido_por.
+func (q *Queries) InsertCrossValidation(ctx context.Context, arg InsertCrossValidationParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertCrossValidation,
+		arg.TenantID,
+		arg.DeadlineID,
+		arg.DataDeclarada,
+		arg.DataCalculada,
+		arg.DifDias,
+		arg.Resultado,
+		arg.CausaProvavel,
+		arg.Decisao,
+		arg.DecididoPor,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const insertDeadline = `-- name: InsertDeadline :one
 INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
     start_date, end_date, days, counting, doubled, doubled_reason,
     holidays_applied, status, source, kind, rules_version,
-    anchor_event, legal_citation
+    anchor_event, legal_citation,
+    origem, selo, confirmacao_exigida, prazo_interno
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6, $7, $8, $9,
     $10, $11, $12, $13, $14,
-    $15, $16
+    $15, $16,
+    $17, $18, $19, $20
 )
 ON CONFLICT (notification_id) DO NOTHING
 RETURNING id
 `
 
 type InsertDeadlineParams struct {
-	TenantID        uuid.UUID   `json:"tenant_id"`
-	CourtRecordID   uuid.UUID   `json:"court_record_id"`
-	NotificationID  uuid.UUID   `json:"notification_id"`
-	StartDate       pgtype.Date `json:"start_date"`
-	EndDate         pgtype.Date `json:"end_date"`
-	Days            int32       `json:"days"`
-	Counting        string      `json:"counting"`
-	Doubled         bool        `json:"doubled"`
-	DoubledReason   *string     `json:"doubled_reason"`
-	HolidaysApplied []byte      `json:"holidays_applied"`
-	Status          string      `json:"status"`
-	Source          string      `json:"source"`
-	Kind            *string     `json:"kind"`
-	RulesVersion    string      `json:"rules_version"`
-	AnchorEvent     string      `json:"anchor_event"`
-	LegalCitation   *string     `json:"legal_citation"`
+	TenantID           uuid.UUID   `json:"tenant_id"`
+	CourtRecordID      uuid.UUID   `json:"court_record_id"`
+	NotificationID     uuid.UUID   `json:"notification_id"`
+	StartDate          pgtype.Date `json:"start_date"`
+	EndDate            pgtype.Date `json:"end_date"`
+	Days               int32       `json:"days"`
+	Counting           string      `json:"counting"`
+	Doubled            bool        `json:"doubled"`
+	DoubledReason      *string     `json:"doubled_reason"`
+	HolidaysApplied    []byte      `json:"holidays_applied"`
+	Status             string      `json:"status"`
+	Source             string      `json:"source"`
+	Kind               *string     `json:"kind"`
+	RulesVersion       string      `json:"rules_version"`
+	AnchorEvent        string      `json:"anchor_event"`
+	LegalCitation      *string     `json:"legal_citation"`
+	Origem             *string     `json:"origem"`
+	Selo               *string     `json:"selo"`
+	ConfirmacaoExigida *bool       `json:"confirmacao_exigida"`
+	PrazoInterno       pgtype.Date `json:"prazo_interno"`
 }
 
 // Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
@@ -669,6 +953,44 @@ func (q *Queries) InsertDeadline(ctx context.Context, arg InsertDeadlineParams) 
 		arg.RulesVersion,
 		arg.AnchorEvent,
 		arg.LegalCitation,
+		arg.Origem,
+		arg.Selo,
+		arg.ConfirmacaoExigida,
+		arg.PrazoInterno,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const insertDeadlineEvent = `-- name: InsertDeadlineEvent :one
+INSERT INTO deadline_event (
+    tenant_id, deadline_id, tipo, detalhe, ator_id
+) VALUES (
+    $1, $2, $3, $4, $5
+)
+RETURNING id
+`
+
+type InsertDeadlineEventParams struct {
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	DeadlineID uuid.UUID   `json:"deadline_id"`
+	Tipo       string      `json:"tipo"`
+	Detalhe    *string     `json:"detalhe"`
+	AtorID     pgtype.UUID `json:"ator_id"`
+}
+
+// Append one event to the deadline's append-only audit trail (same tx as the
+// mutation it records). deadline_event never overwrites; it adds. ator_id is
+// nullable (NULL when the system is the actor). Returns the id for log/telemetry.
+// $1 = tenant_id, $2 = deadline_id, $3 = tipo, $4 = detalhe, $5 = ator_id.
+func (q *Queries) InsertDeadlineEvent(ctx context.Context, arg InsertDeadlineEventParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertDeadlineEvent,
+		arg.TenantID,
+		arg.DeadlineID,
+		arg.Tipo,
+		arg.Detalhe,
+		arg.AtorID,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)
@@ -1345,6 +1667,76 @@ func (q *Queries) TaskExistsInTenant(ctx context.Context, arg TaskExistsInTenant
 	return id, err
 }
 
+const updateCalcMemoryTipoConfirmation = `-- name: UpdateCalcMemoryTipoConfirmation :one
+UPDATE calc_memory
+SET ia_tipo_inferido = $3,
+    ia_confianca = $4
+WHERE deadline_id = $1 AND tenant_id = $2
+RETURNING id
+`
+
+type UpdateCalcMemoryTipoConfirmationParams struct {
+	DeadlineID     uuid.UUID `json:"deadline_id"`
+	TenantID       uuid.UUID `json:"tenant_id"`
+	IaTipoInferido *string   `json:"ia_tipo_inferido"`
+	IaConfianca    *float64  `json:"ia_confianca"`
+}
+
+// Record the human's confirmation/reclassification of the IA-inferred tipo de ato
+// (apurar-tipo, confirmar|reclassificar): ia_tipo_inferido becomes the confirmed/overridden
+// tipo, ia_confianca becomes 1.0 (human-confirmed, full confidence) — an UPDATE, not an INSERT
+// (the row already exists since InsertCalcMemory ran at birth). Scoped to tenant_id (barrier
+// 1). A no-match → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper. $1 = deadline_id,
+// $2 = tenant_id, $3 = ia_tipo_inferido, $4 = ia_confianca.
+func (q *Queries) UpdateCalcMemoryTipoConfirmation(ctx context.Context, arg UpdateCalcMemoryTipoConfirmationParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, updateCalcMemoryTipoConfirmation,
+		arg.DeadlineID,
+		arg.TenantID,
+		arg.IaTipoInferido,
+		arg.IaConfianca,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const updateCrossValidationDecision = `-- name: UpdateCrossValidationDecision :one
+UPDATE cross_validation
+SET decisao = $3,
+    decidido_por = $4
+WHERE deadline_id = $1 AND tenant_id = $2 AND decisao IS NULL
+RETURNING id
+`
+
+type UpdateCrossValidationDecisionParams struct {
+	DeadlineID  uuid.UUID   `json:"deadline_id"`
+	TenantID    uuid.UUID   `json:"tenant_id"`
+	Decisao     *string     `json:"decisao"`
+	DecididoPor pgtype.UUID `json:"decidido_por"`
+}
+
+// Record the human decision on a divergência (aceita_declarado | aceita_calculado |
+// ajuste_manual) — an UPDATE, not an INSERT: the row already exists since InsertCrossValidation
+// ran at birth (docs §"Validação cruzada"). Scoped to tenant_id (barrier 1). The `decisao IS
+// NULL` guard makes the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor,
+// mirroring MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller
+// pre-checks decisao=="" before calling, and this guard defends the write against a racing
+// second apuração on the SAME divergência — a no-match (the row vanished mid-tx, OR a
+// concurrent apuração already decided it) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the
+// mapper (never a silent overwrite of the first decision). $1 = deadline_id, $2 = tenant_id, $3
+// = decisao, $4 = decidido_por.
+func (q *Queries) UpdateCrossValidationDecision(ctx context.Context, arg UpdateCrossValidationDecisionParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, updateCrossValidationDecision,
+		arg.DeadlineID,
+		arg.TenantID,
+		arg.Decisao,
+		arg.DecididoPor,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const updateDeadlineAdjust = `-- name: UpdateDeadlineAdjust :one
 UPDATE deadline
 SET kind              = $3,
@@ -1356,7 +1748,8 @@ SET kind              = $3,
     holidays_applied  = $9,
     start_date        = $10,
     anchor_event      = $11,
-    manual_extra_days = $12
+    manual_extra_days = $12,
+    prazo_interno     = $13
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, court_record_id
 `
@@ -1374,6 +1767,7 @@ type UpdateDeadlineAdjustParams struct {
 	StartDate       pgtype.Date `json:"start_date"`
 	AnchorEvent     string      `json:"anchor_event"`
 	ManualExtraDays int32       `json:"manual_extra_days"`
+	PrazoInterno    pgtype.Date `json:"prazo_interno"`
 }
 
 type UpdateDeadlineAdjustRow struct {
@@ -1383,11 +1777,14 @@ type UpdateDeadlineAdjustRow struct {
 
 // Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
 // patched {kind, days, counting, doubled, doubled_reason, anchor_event, manual_extra_days} and
-// the RECOMPUTED {end_date, holidays_applied, start_date}, keyed by id and scoped to tenant_id
-// (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays
-// PENDING, an OPEN stays OPEN — the use case already refused a terminal prazo); source/
-// rules_version/confirmed_* are untouched. start_date IS written now (the panel may re-anchor via
-// anchor_event → a different intimação date). A no-match (the
+// the RECOMPUTED {end_date, holidays_applied, prazo_interno, start_date}, keyed by id and
+// scoped to tenant_id (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle
+// (a PENDING stays PENDING, an OPEN stays OPEN — the use case already refused a terminal
+// prazo); source/rules_version/confirmed_* are untouched. V1 fields (origem/selo/
+// confirmacao_exigida) are SET ONLY at birth and preserved through all subsequent operations —
+// they are never overwritten by confirm or adjust. start_date IS written now (the panel may
+// re-anchor via anchor_event → a different intimação date); prazo_interno is recomputed in
+// lockstep with end_date (never left stale against it). A no-match (the
 // row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
 // and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
 func (q *Queries) UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAdjustParams) (UpdateDeadlineAdjustRow, error) {
@@ -1404,10 +1801,87 @@ func (q *Queries) UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAd
 		arg.StartDate,
 		arg.AnchorEvent,
 		arg.ManualExtraDays,
+		arg.PrazoInterno,
 	)
 	var i UpdateDeadlineAdjustRow
 	err := row.Scan(&i.ID, &i.CourtRecordID)
 	return i, err
+}
+
+const updateDeadlineEndDate = `-- name: UpdateDeadlineEndDate :one
+UPDATE deadline
+SET end_date      = $3,
+    prazo_interno = $4
+WHERE id = $1 AND tenant_id = $2
+RETURNING id
+`
+
+type UpdateDeadlineEndDateParams struct {
+	ID           uuid.UUID   `json:"id"`
+	TenantID     uuid.UUID   `json:"tenant_id"`
+	EndDate      pgtype.Date `json:"end_date"`
+	PrazoInterno pgtype.Date `json:"prazo_interno"`
+}
+
+// Overwrite end_date AND prazo_interno — the "aceita_declarado" apuração: the human picked the
+// declared date over the calculado one, so end_date becomes data_declarada with NO recompute of
+// days/counting/holidays_applied (kept as audit of the deterministic calc); prazo_interno IS
+// recomputed by the caller from the new end_date (same buffer motor as everywhere else) so it
+// never drifts against the human-picked date. Scoped to tenant_id (barrier 1). A no-match →
+// pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper. $1 = id, $2 = tenant_id, $3 =
+// end_date, $4 = prazo_interno.
+func (q *Queries) UpdateDeadlineEndDate(ctx context.Context, arg UpdateDeadlineEndDateParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, updateDeadlineEndDate,
+		arg.ID,
+		arg.TenantID,
+		arg.EndDate,
+		arg.PrazoInterno,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const updateDeadlineSelo = `-- name: UpdateDeadlineSelo :one
+UPDATE deadline
+SET selo         = $3,
+    confirmed_by = $4,
+    confirmed_at = $5
+WHERE id = $1 AND tenant_id = $2 AND selo = 'a_apurar'
+RETURNING id
+`
+
+type UpdateDeadlineSeloParams struct {
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	Selo        *string            `json:"selo"`
+	ConfirmedBy pgtype.UUID        `json:"confirmed_by"`
+	ConfirmedAt pgtype.Timestamptz `json:"confirmed_at"`
+}
+
+// Flip the confidence selo (a_apurar → confiavel) AND stamp who/when confirmed it — the shared
+// write both apurar-divergencia and apurar-tipo end with, after the divergência/tipo decision is
+// recorded (Architect decisão: "apurar também confirma", reusing the confirmed_by/confirmed_at
+// columns from migration 0024 — the SAME human-approval stamp F2's ConfirmDeadline/MarkNoDeadline
+// already write, now also written on THIS confirmation path). origem is NEVER written here
+// (immutable after creation). Scoped to tenant_id (barrier 1). The `selo = 'a_apurar'` guard makes
+// the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor, mirroring
+// MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller pre-checks the
+// selo before calling, and this guard defends the write against a racing second apuração on the
+// SAME prazo — a no-match (the row vanished mid-tx, OR a concurrent apuração already sealed it
+// confiavel) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the mapper (never a silent no-op
+// re-seal). $1 = id, $2 = tenant_id, $3 = selo, $4 = confirmed_by, $5 = confirmed_at.
+func (q *Queries) UpdateDeadlineSelo(ctx context.Context, arg UpdateDeadlineSeloParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, updateDeadlineSelo,
+		arg.ID,
+		arg.TenantID,
+		arg.Selo,
+		arg.ConfirmedBy,
+		arg.ConfirmedAt,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const updateTask = `-- name: UpdateTask :one

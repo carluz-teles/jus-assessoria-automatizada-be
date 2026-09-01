@@ -98,8 +98,15 @@ SELECT count(*) FROM deadline WHERE tenant_id = @tenant_id::uuid;
 -- name: GetPrazo :one
 -- The audit/detail view of one prazo (GET /v1/prazos/:id): every field the "por quê"
 -- popover needs — the full holidays_applied, the rules_version that derived the days,
--- the origin intimation_id, and start/end/days/counting/doubled. Tenant-scoped (barrier
--- 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
+-- the origin intimation_id, and start/end/days/counting/doubled. V1 adds the full memória de
+-- cálculo: origem/selo/confirmacao_exigida off the deadline row, prazo_interno (the internal
+-- safety buffer, COALESCEd to end_date for a pré-migration row that never had it recomputed),
+-- and the 1:1 calc_memory +
+-- cross_validation LEFT JOINed in (a pre-V1 or not-yet-derived prazo has neither row, so every
+-- cm./cv. column comes back NULL — the mapper degrades to nil, never an error). applied_holiday
+-- is 1:N so it is NOT joined here (would multiply the deadline row); ListAppliedHolidaysByCalc
+-- Memory reads it separately, keyed by calc_memory_id, only when cm.id is present. Tenant-scoped
+-- (barrier 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
 -- at the repo, never (nil, nil).
 SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
        (d.end_date - CURRENT_DATE)::int AS days_left,
@@ -108,10 +115,30 @@ SELECT d.id, d.court_record_id, d.kind, d.start_date, d.end_date,
        (d.confirmed_by IS NOT NULL) AS confirmed,
        d.anchor_event, d.legal_citation, d.manual_extra_days,
        d.confirmed_by, d.confirmed_at,
-       au.name AS confirmed_by_name
+       au.name AS confirmed_by_name,
+       d.origem, d.selo, d.confirmacao_exigida,
+       COALESCE(d.prazo_interno, d.end_date) AS prazo_interno,
+       cm.id AS calc_memory_id, cm.prazo_base, cm.prazo_base_fonte, cm.termo_inicial_regra,
+       cm.dias_uteis, cm.dobra_motivo, cm.tabela_legal_ref, cm.ia_tipo_inferido, cm.ia_confianca,
+       cm.calendar_provider_version,
+       cv.data_declarada, cv.data_calculada, cv.dif_dias, cv.resultado, cv.causa_provavel,
+       cv.decisao, cv.decidido_por
 FROM deadline d
 LEFT JOIN app_user au ON au.id = d.confirmed_by
+LEFT JOIN calc_memory cm ON cm.deadline_id = d.id
+LEFT JOIN cross_validation cv ON cv.deadline_id = d.id
 WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid;
+
+-- name: ListAppliedHolidaysByCalcMemory :many
+-- The 1:N feriados snapshot applied to one calc_memory (GET /v1/prazos/:id memória de
+-- cálculo). Kept as a companion query to GetPrazo (not joined there) so a prazo with N applied
+-- holidays never multiplies the deadline row. Scoped to tenant_id (barrier 1, on top of RLS
+-- barrier 2). No holidays applied (a dias corridos calc, or a short prazo that skipped none)
+-- yields an empty slice, never an error. $1 = calc_memory_id, $2 = tenant_id.
+SELECT id, data, nome, ambito, comarca
+FROM applied_holiday
+WHERE calc_memory_id = $1 AND tenant_id = $2
+ORDER BY data ASC;
 
 -- name: GetPrazoSuggestContext :one
 -- The advisory CASE CONTEXT for one prazo — the input the AI "intimação → tarefas sugeridas"

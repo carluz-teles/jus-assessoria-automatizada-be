@@ -663,6 +663,53 @@ func (q *Queries) ListAndamentosByProcesso(ctx context.Context, arg ListAndament
 	return items, nil
 }
 
+const listDeadlineEventsByDeadlineID = `-- name: ListDeadlineEventsByDeadlineID :many
+SELECT em, detalhe
+FROM deadline_event
+WHERE deadline_id = $1 AND tenant_id = $2
+ORDER BY em
+`
+
+type ListDeadlineEventsByDeadlineIDParams struct {
+	DeadlineID uuid.UUID `json:"deadline_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+}
+
+type ListDeadlineEventsByDeadlineIDRow struct {
+	Em      pgtype.Timestamptz `json:"em"`
+	Detalhe *string            `json:"detalhe"`
+}
+
+// The deadline_event audit trail for one prazo (deadline slice's table — acquisition already
+// reads `deadline` directly for other GetIntimacao fields, e.g. confirmed_at/confirmed_by_name
+// above, the same precedent: read the table, never import the deadline package). GetIntimacao
+// merges these into the intimação's unified Trilha (IntimacaoHistoryEntry) alongside the
+// capture/confirmation/analysis signals — every "calculado"/"validado"/"confirmado" moment the
+// apuração flow (deadline slice's apurar.go) recorded. Ordered ASC by em (the caller merges +
+// re-sorts the WHOLE timeline anyway, but an already-ordered result keeps this query useful
+// standalone). Scoped to (deadline_id, tenant_id) (barrier 1, on top of RLS barrier 2). No rows
+// (a prazo with no recorded events, or none at all when the intimação has no prazo yet) yields an
+// empty slice, never an error. $1 = deadline_id, $2 = tenant_id.
+func (q *Queries) ListDeadlineEventsByDeadlineID(ctx context.Context, arg ListDeadlineEventsByDeadlineIDParams) ([]ListDeadlineEventsByDeadlineIDRow, error) {
+	rows, err := q.db.Query(ctx, listDeadlineEventsByDeadlineID, arg.DeadlineID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDeadlineEventsByDeadlineIDRow
+	for rows.Next() {
+		var i ListDeadlineEventsByDeadlineIDRow
+		if err := rows.Scan(&i.Em, &i.Detalhe); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listIntimacaoCourts = `-- name: ListIntimacaoCourts :many
 SELECT court
 FROM (

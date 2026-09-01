@@ -293,6 +293,11 @@ const (
 	// escopo + kind/instruction, returns 1..N SectionChange objects with
 	// category + explanation + new_paragraphs. Synchronous LLM call.
 	AgentDraftIterate = "draft_iterate"
+	// AgentClassifyIntimationType is the Motor de Prazos V1 omissa-intimação fallback (the
+	// ONLY point of IA in the whole motor, docs/design-motor-de-prazos-v1.md §"Fallback IA").
+	// Given a case context with no prazo_declarado, classifies the tipo de ato + confiança —
+	// NEVER a date. Called synchronously at ingest (internal/deadline classify.go).
+	AgentClassifyIntimationType = "classify_intimation_type"
 )
 
 // suggestTasksVersion is the pinned version of the suggest_tasks template. BUMP IT whenever the
@@ -354,6 +359,11 @@ const reviewMinutaVersion = "review_minuta/v1"
 // changes so the feedback delta of the OLD prompt stays attributable.
 const draftIterateVersion = "draft_iterate/v1"
 
+// classifyIntimationTypeVersion is the pinned version of the classify_intimation_type
+// template (Motor de Prazos V1 omissa fallback, docs/design-motor-de-prazos-v1.md §"Fallback
+// IA"). BUMP IT whenever the template text changes.
+const classifyIntimationTypeVersion = "classify_intimation_type/v1"
+
 // TemplateComposer is the deterministic v0 composer: templates + context injection, no LLM. It is
 // stateless.
 type TemplateComposer struct{}
@@ -371,6 +381,8 @@ func (*TemplateComposer) Compose(agent string, c CaseContext) (Composed, error) 
 		return composeSuggestTasks(c), nil
 	case AgentAnalyzeIntimation:
 		return composeAnalyzeIntimation(c), nil
+	case AgentClassifyIntimationType:
+		return composeClassifyType(c), nil
 	default:
 		return Composed{}, apperr.NewInvalid("advisory: unknown prompt agent " + agent)
 	}
@@ -862,6 +874,57 @@ func composeSuggestTasks(c CaseContext) Composed {
 	usr.WriteString("\n\nProduza o resumo, a recomendação e as tarefas sugeridas.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: suggestTasksVersion}
+}
+
+// composeClassifyType renders the classify_intimation_type instruction-set (Motor de Prazos V1
+// omissa fallback, docs/design-motor-de-prazos-v1.md §"Fallback IA" — the ONLY point of IA in
+// the whole motor). It is deliberately narrow: the model classifies WHICH tipo de ato the
+// intimação demands (so the deadline's origem can move from "calculado" to "ia" and the confidence
+// selo lands on a_apurar) — it NEVER computes a date. The deterministic tabela legal (rule.Kind/
+// Days, resolved separately from ev.Type/ev.Court) is the sole source of the actual prazo days;
+// this classification is provenance/audit only.
+func composeClassifyType(c CaseContext) Composed {
+	var sys strings.Builder
+	sys.WriteString(
+		"Você é um assistente jurídico brasileiro. A intimação a seguir NÃO declara um prazo " +
+			"explícito. A partir do contexto do processo, classifique o TIPO DE ATO que a intimação " +
+			"exige da parte (ex.: \"Contestação\", \"Manifestação\", \"Recurso\", \"Cumprimento de " +
+			"sentença\", \"Ciência\"). Responda com três campos: `tipo` (string, o tipo de ato em " +
+			"1-3 palavras, no substantivo), `confianca` (número entre 0 e 1, sua confiança na " +
+			"classificação) e `alternativa` (string, um segundo tipo plausível quando houver ambiguidade " +
+			"real, ou string vazia quando não houver dúvida razoável). NUNCA calcule ou sugira uma data " +
+			"ou quantidade de dias — isso é decidido por uma tabela legal determinística, fora do seu " +
+			"escopo. Se o contexto for insuficiente para classificar com confiança razoável, responda " +
+			"com `tipo` vazio em vez de supor — nunca invente um tipo que o contexto não sustenta.",
+	)
+	if pb := strings.TrimSpace(c.Playbook); pb != "" {
+		sys.WriteString("\n\nSiga o playbook do escritório (exemplos e preferências):\n")
+		sys.WriteString(pb)
+	}
+
+	lines := make([]string, 0, 5)
+	add := func(label, value string) {
+		if v := strings.TrimSpace(value); v != "" {
+			lines = append(lines, label+": "+v)
+		}
+	}
+	add("Tribunal", c.Court)
+	add("Grau", c.Degree)
+	add("Classe/rito", c.Class)
+	add("Assunto", c.Subject)
+	add("Tipo de intimação (DJEN)", c.IntimationType)
+	add("Teor da intimação", c.IntimationText)
+
+	var usr strings.Builder
+	usr.WriteString("Contexto:\n")
+	if len(lines) == 0 {
+		usr.WriteString("(sem contexto adicional)")
+	} else {
+		usr.WriteString(strings.Join(lines, "\n"))
+	}
+	usr.WriteString("\n\nClassifique o tipo de ato.")
+
+	return Composed{System: sys.String(), User: usr.String(), PromptVersion: classifyIntimationTypeVersion}
 }
 
 // composeChatGrounding renders the chat_grounding instruction-set. The assistant answers

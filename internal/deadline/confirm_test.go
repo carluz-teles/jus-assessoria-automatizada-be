@@ -71,8 +71,9 @@ func TestConfirm_RecomputesBusinessAndFlipsOpen(t *testing.T) {
 	holiday := time.Date(2024, 1, 25, 0, 0, 0, 0, time.UTC)
 	confirmedAt := time.Date(2024, 1, 17, 9, 30, 0, 0, time.UTC)
 
+	prazoInterno := time.Date(2024, 2, 2, 0, 0, 0, 0, time.UTC)
 	repo := confirmRepo(p, start, "TJSP")
-	cal := &fakeCalendar{endDate: end, holidays: []time.Time{holiday}}
+	cal := &fakeCalendar{endDate: end, holidays: []time.Time{holiday}, subtractEndDate: prazoInterno}
 	outbox := &fakeOutbox{}
 	uow := &fakeUOW{}
 	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, uow, WithClock(func() time.Time { return confirmedAt }))
@@ -112,6 +113,15 @@ func TestConfirm_RecomputesBusinessAndFlipsOpen(t *testing.T) {
 	}
 	if !cp.EndDate.Equal(end) || len(cp.HolidaysApplied) != 1 || !cp.HolidaysApplied[0].Equal(holiday) {
 		t.Errorf("confirm end/holidays = %v/%v, want %v/[%v]", cp.EndDate, cp.HolidaysApplied, end, holiday)
+	}
+	// The internal safety buffer is recomputed in lockstep with the recomputed end_date, via
+	// the SAME uf/court the recompute used — never stale, never crude date arithmetic.
+	if !cp.PrazoInterno.Equal(prazoInterno) {
+		t.Errorf("confirm prazo_interno = %v, want %v", cp.PrazoInterno, prazoInterno)
+	}
+	if cal.subtractCalls != 1 || !cal.gotSubtractArgs.start.Equal(end) || cal.gotSubtractArgs.n != internalBufferBusinessDays {
+		t.Errorf("SubtractBusinessDays calls=%d start=%v n=%d, want 1 call from end_date %v with n=%d",
+			cal.subtractCalls, cal.gotSubtractArgs.start, cal.gotSubtractArgs.n, end, internalBufferBusinessDays)
 	}
 	if cp.ConfirmedBy != p.userID || !cp.ConfirmedAt.Equal(confirmedAt) {
 		t.Errorf("confirmed_by/at = %q/%v, want %q/%v", cp.ConfirmedBy, cp.ConfirmedAt, p.userID, confirmedAt)

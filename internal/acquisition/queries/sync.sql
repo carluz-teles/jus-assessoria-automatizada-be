@@ -252,10 +252,10 @@ WITH upserted AS (
         cancel_reason = EXCLUDED.cancel_reason,
         type          = EXCLUDED.type,
         source_url    = EXCLUDED.source_url
-    RETURNING id, court_record_id, type, status, deadline_start_at,
+    RETURNING id, court_record_id, type, status, deadline_start_at, content,
               cancel_reason, (xmax = 0) AS inserted
 )
-SELECT u.id, u.court_record_id, u.type, u.status, u.deadline_start_at,
+SELECT u.id, u.court_record_id, u.type, u.status, u.deadline_start_at, u.content,
        u.cancel_reason, u.inserted, cr.court, cr.case_id,
        COALESCE((SELECT old.status FROM intimation old WHERE old.id = u.id), '')::text AS old_status
 FROM upserted u

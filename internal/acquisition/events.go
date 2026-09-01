@@ -216,6 +216,11 @@ type IntimationObserved struct {
 	Court           string `json:"court"`
 	UF              string `json:"uf"`
 	DeadlineStartAt string `json:"deadline_start_at"`
+	// PrazoDeclarado is the declared day count extracted deterministically from the
+	// intimação's teor (extractPrazoDeclarado), e.g. "5 dias" — "" when the teor carries
+	// no recognizable prazo mention (the deadline slice then derives it purely from the
+	// V0 rule table, never guessing).
+	PrazoDeclarado string `json:"prazo_declarado"`
 }
 
 var _ events.Event = IntimationObserved{}

@@ -80,6 +80,56 @@ type PrazoDetailView struct {
 	ConfirmedByID   string     `json:"confirmed_by_id,omitempty"`
 	ConfirmedByName string     `json:"confirmed_by_name,omitempty"`
 	ConfirmedAt     *time.Time `json:"confirmed_at"`
+	// V1 memória de cálculo (docs/design-motor-de-prazos-v1.md): the full "por que essa data?"
+	// trail. CalcMemory/CrossValidation are nil for a pré-V1 prazo (no calc_memory/cross_
+	// validation row was ever written) — the LEFT JOINs in GetPrazo degrade gracefully, never an
+	// error. PrazoInterno is the persisted internal safety buffer (deadline.prazo_interno,
+	// internalBufferBusinessDays business days before EndDate), COALESCEd to EndDate at the SQL
+	// layer for a pré-migration row that never had it recomputed.
+	Origem             string               `json:"origem,omitempty"`
+	Selo               string               `json:"selo,omitempty"`
+	ConfirmacaoExigida bool                 `json:"confirmacao_exigida"`
+	PrazoInterno       time.Time            `json:"prazo_interno"`
+	CalcMemory         *CalcMemoryView      `json:"calc_memory,omitempty"`
+	AppliedHoliday     []AppliedHolidayView `json:"applied_holiday,omitempty"`
+	CrossValidation    *CrossValidationView `json:"cross_validation,omitempty"`
+}
+
+// CalcMemoryView is the deterministic calculation audit trail (calc_memory, V1) — the "por que
+// essa data?" answer. Nil on PrazoDetailView when the prazo predates V1 (no row ever written).
+type CalcMemoryView struct {
+	// ID is internal (feeds ListAppliedHolidaysByCalcMemory) — never serialized.
+	ID                      string  `json:"-"`
+	PrazoBase               string  `json:"prazo_base"`
+	PrazoBaseFonte          string  `json:"prazo_base_fonte"`
+	TermoInicialRegra       string  `json:"termo_inicial_regra"`
+	DiasUteis               bool    `json:"dias_uteis"`
+	DobraMotivo             string  `json:"dobra_motivo,omitempty"`
+	TabelaLegalRef          string  `json:"tabela_legal_ref,omitempty"`
+	IATipoInferido          string  `json:"ia_tipo_inferido,omitempty"`
+	IAConfianca             float64 `json:"ia_confianca,omitempty"`
+	CalendarProviderVersion string  `json:"calendar_provider_version,omitempty"`
+}
+
+// AppliedHolidayView is one feriado snapshot applied to the calculation (applied_holiday, V1),
+// 1:N under CalcMemory.
+type AppliedHolidayView struct {
+	Data    time.Time `json:"data"`
+	Nome    string    `json:"nome,omitempty"`
+	Ambito  string    `json:"ambito,omitempty"`
+	Comarca string    `json:"comarca,omitempty"`
+}
+
+// CrossValidationView is the declared×calculado cross-validation (cross_validation, V1). Nil on
+// PrazoDetailView when the prazo had no prazo_declarado to cross-check.
+type CrossValidationView struct {
+	DataDeclarada time.Time `json:"data_declarada"`
+	DataCalculada time.Time `json:"data_calculada"`
+	DifDias       int       `json:"dif_dias"`
+	Resultado     string    `json:"resultado"`
+	CausaProvavel string    `json:"causa_provavel,omitempty"`
+	Decisao       string    `json:"decisao,omitempty"`
+	DecididoPor   string    `json:"decidido_por,omitempty"`
 }
 
 // PrazoSuggestContext is the advisory case context the AI suggester (suggest.go) composes the
@@ -381,6 +431,11 @@ type readRepo interface {
 	ListPrazosByIntimacao(ctx context.Context, tenantID, intimationID string) ([]AgendaPrazoView, error)
 	CountPrazos(ctx context.Context, q PrazosQuery) (totalCount, total int64, err error)
 	GetPrazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error)
+	// ListAppliedHolidaysByCalcMemory reads the 1:N feriados snapshot for one calc_memory,
+	// scoped to tenantID (barrier 1). Called by ReadUseCase.Prazo only when GetPrazo returned a
+	// CalcMemory (a pré-V1 prazo has none, so this never runs for it). No holidays applied
+	// yields an empty slice, never an error.
+	ListAppliedHolidaysByCalcMemory(ctx context.Context, tenantID, calcMemoryID string) ([]AppliedHolidayView, error)
 	// GetPrazoSuggestContext reads the advisory case context for one prazo (the AI suggester's
 	// dedicated read: prazo signals + court_record + intimação teor), scoped to tenantID (barrier
 	// 1). A miss is the typed ErrDeadlineNotFound (→ 404).
@@ -524,9 +579,25 @@ func (uc *ReadUseCase) PrazosByIntimacao(ctx context.Context, tenantID, intimati
 }
 
 // Prazo returns one prazo's audit detail, or the repo's typed ErrDeadlineNotFound (→
-// 404) when the id resolves to no row in the tenant.
+// 404) when the id resolves to no row in the tenant. PrazoInterno now comes straight off the
+// SQL row (GetPrazo COALESCEs the persisted column to EndDate), so no in-memory stamp is
+// needed. When the prazo has a calc_memory (V1-derived), it also loads the applied_holiday
+// trail — the 1:N companion read GetPrazo deliberately does NOT join (it would multiply the
+// deadline row). A pré-V1 prazo (nil CalcMemory) skips this read entirely, never an error.
 func (uc *ReadUseCase) Prazo(ctx context.Context, tenantID, id string) (PrazoDetailView, error) {
-	return uc.repo.GetPrazo(ctx, tenantID, id)
+	p, err := uc.repo.GetPrazo(ctx, tenantID, id)
+	if err != nil {
+		return PrazoDetailView{}, err
+	}
+
+	if p.CalcMemory != nil {
+		holidays, err := uc.repo.ListAppliedHolidaysByCalcMemory(ctx, tenantID, p.CalcMemory.ID)
+		if err != nil {
+			return PrazoDetailView{}, err
+		}
+		p.AppliedHoliday = holidays
+	}
+	return p, nil
 }
 
 // SuggestContext returns the advisory case context the AI suggester composes the meta-prompt from

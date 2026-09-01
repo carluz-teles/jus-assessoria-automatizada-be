@@ -510,6 +510,17 @@ type Querier interface {
 	// DAILY_CAPTURE/ENRICHMENT nunca têm uma OAB única a atribuir (NULL). Bounded por $2
 	// (sem paginação v0).
 	ListCaptureRuns(ctx context.Context, arg ListCaptureRunsParams) ([]ListCaptureRunsRow, error)
+	// The deadline_event audit trail for one prazo (deadline slice's table — acquisition already
+	// reads `deadline` directly for other GetIntimacao fields, e.g. confirmed_at/confirmed_by_name
+	// above, the same precedent: read the table, never import the deadline package). GetIntimacao
+	// merges these into the intimação's unified Trilha (IntimacaoHistoryEntry) alongside the
+	// capture/confirmation/analysis signals — every "calculado"/"validado"/"confirmado" moment the
+	// apuração flow (deadline slice's apurar.go) recorded. Ordered ASC by em (the caller merges +
+	// re-sorts the WHOLE timeline anyway, but an already-ordered result keeps this query useful
+	// standalone). Scoped to (deadline_id, tenant_id) (barrier 1, on top of RLS barrier 2). No rows
+	// (a prazo with no recorded events, or none at all when the intimação has no prazo yet) yields an
+	// empty slice, never an error. $1 = deadline_id, $2 = tenant_id.
+	ListDeadlineEventsByDeadlineID(ctx context.Context, arg ListDeadlineEventsByDeadlineIDParams) ([]ListDeadlineEventsByDeadlineIDRow, error)
 	// All of a tenant's integrations, oldest first. tenant_id filter is isolation
 	// barrier 1 (the app layer); RLS is barrier 2.
 	ListIntegrations(ctx context.Context, tenantID uuid.UUID) ([]Integration, error)

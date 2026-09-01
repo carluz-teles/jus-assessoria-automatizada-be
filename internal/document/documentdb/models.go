@@ -37,6 +37,17 @@ type AppUser struct {
 	Phone       *string            `json:"phone"`
 }
 
+type AppliedHoliday struct {
+	ID           uuid.UUID          `json:"id"`
+	TenantID     uuid.UUID          `json:"tenant_id"`
+	CalcMemoryID uuid.UUID          `json:"calc_memory_id"`
+	Data         pgtype.Date        `json:"data"`
+	Nome         *string            `json:"nome"`
+	Ambito       *string            `json:"ambito"`
+	Comarca      *string            `json:"comarca"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type BackfillJob struct {
 	ID            uuid.UUID          `json:"id"`
 	TenantID      uuid.UUID          `json:"tenant_id"`
@@ -50,6 +61,22 @@ type BackfillJob struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	TriggerReason *string            `json:"trigger_reason"`
 	TriggerOabs   []string           `json:"trigger_oabs"`
+}
+
+type CalcMemory struct {
+	ID                      uuid.UUID          `json:"id"`
+	TenantID                uuid.UUID          `json:"tenant_id"`
+	DeadlineID              uuid.UUID          `json:"deadline_id"`
+	PrazoBase               *string            `json:"prazo_base"`
+	PrazoBaseFonte          *string            `json:"prazo_base_fonte"`
+	TermoInicialRegra       *string            `json:"termo_inicial_regra"`
+	DiasUteis               *bool              `json:"dias_uteis"`
+	DobraMotivo             *string            `json:"dobra_motivo"`
+	TabelaLegalRef          *string            `json:"tabela_legal_ref"`
+	IaTipoInferido          *string            `json:"ia_tipo_inferido"`
+	IaConfianca             *float64           `json:"ia_confianca"`
+	CalendarProviderVersion *string            `json:"calendar_provider_version"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
 }
 
 type CaptureRun struct {
@@ -192,6 +219,20 @@ type CourtRecord struct {
 	ClaimValue            pgtype.Numeric     `json:"claim_value"`
 }
 
+type CrossValidation struct {
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	DeadlineID    uuid.UUID          `json:"deadline_id"`
+	DataDeclarada pgtype.Date        `json:"data_declarada"`
+	DataCalculada pgtype.Date        `json:"data_calculada"`
+	DifDias       *int32             `json:"dif_dias"`
+	Resultado     *string            `json:"resultado"`
+	CausaProvavel *string            `json:"causa_provavel"`
+	Decisao       *string            `json:"decisao"`
+	DecididoPor   pgtype.UUID        `json:"decidido_por"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
 type Deadline struct {
 	ID                   uuid.UUID          `json:"id"`
 	CourtRecordID        uuid.UUID          `json:"court_record_id"`
@@ -217,6 +258,30 @@ type Deadline struct {
 	AnchorEvent          string             `json:"anchor_event"`
 	ManualExtraDays      int32              `json:"manual_extra_days"`
 	LegalCitation        *string            `json:"legal_citation"`
+	Origem               *string            `json:"origem"`
+	Selo                 *string            `json:"selo"`
+	ConfirmacaoExigida   *bool              `json:"confirmacao_exigida"`
+	Providencia          *string            `json:"providencia"`
+	ConfirmadoPor        pgtype.UUID        `json:"confirmado_por"`
+	ConfirmadoEm         pgtype.Timestamptz `json:"confirmado_em"`
+	PrazoInterno         pgtype.Date        `json:"prazo_interno"`
+}
+
+type DeadlineEvent struct {
+	ID         uuid.UUID          `json:"id"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	DeadlineID uuid.UUID          `json:"deadline_id"`
+	Tipo       string             `json:"tipo"`
+	Detalhe    *string            `json:"detalhe"`
+	AtorID     pgtype.UUID        `json:"ator_id"`
+	Em         pgtype.Timestamptz `json:"em"`
+}
+
+type DeadlinePolicy struct {
+	TenantID               uuid.UUID          `json:"tenant_id"`
+	ConfirmacaoObrigatoria bool               `json:"confirmacao_obrigatoria"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
 }
 
 type DeadlineRule struct {

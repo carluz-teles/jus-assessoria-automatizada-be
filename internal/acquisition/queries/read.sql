@@ -246,6 +246,22 @@ LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
 LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.id = $1 AND i.tenant_id = $2;
 
+-- name: ListDeadlineEventsByDeadlineID :many
+-- The deadline_event audit trail for one prazo (deadline slice's table — acquisition already
+-- reads `deadline` directly for other GetIntimacao fields, e.g. confirmed_at/confirmed_by_name
+-- above, the same precedent: read the table, never import the deadline package). GetIntimacao
+-- merges these into the intimação's unified Trilha (IntimacaoHistoryEntry) alongside the
+-- capture/confirmation/analysis signals — every "calculado"/"validado"/"confirmado" moment the
+-- apuração flow (deadline slice's apurar.go) recorded. Ordered ASC by em (the caller merges +
+-- re-sorts the WHOLE timeline anyway, but an already-ordered result keeps this query useful
+-- standalone). Scoped to (deadline_id, tenant_id) (barrier 1, on top of RLS barrier 2). No rows
+-- (a prazo with no recorded events, or none at all when the intimação has no prazo yet) yields an
+-- empty slice, never an error. $1 = deadline_id, $2 = tenant_id.
+SELECT em, detalhe
+FROM deadline_event
+WHERE deadline_id = $1 AND tenant_id = $2
+ORDER BY em;
+
 -- name: CountProcessosFiltered :one
 -- The filtered "X" of the processes screen's "X de Y" counter: how many court records
 -- match the active filters (search on cnj_number ILIKE, court, degree, lifecycle, and

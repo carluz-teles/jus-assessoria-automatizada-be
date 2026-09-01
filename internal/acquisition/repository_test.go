@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pashagolub/pgxmock/v4"
+
+	"github.com/jusassessoria/platform/internal/acquisition/acquisitiondb"
 )
 
 // jsonbContains is a pgxmock argument matcher asserting the BatchUpsertIntimations jsonb
@@ -162,12 +164,12 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 				WithArgs(pgxmock.AnyArg(), jsonbContains{tt.wantJSON}).
 				WillReturnRows(
 					pgxmock.NewRows([]string{
-						"id", "court_record_id", "type", "status", "deadline_start_at",
+						"id", "court_record_id", "type", "status", "deadline_start_at", "content",
 						"cancel_reason", "inserted", "court", "case_id", "old_status",
 					}).AddRow(
 						uuid.New(), uuid.New(), (*string)(nil), tt.newStatus,
 						pgtype.Date{Time: time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC), Valid: true},
-						(*string)(nil), tt.inserted, "TJSP", uuid.New(), tt.oldStatus,
+						"", (*string)(nil), tt.inserted, "TJSP", uuid.New(), tt.oldStatus,
 					),
 				)
 
@@ -186,5 +188,53 @@ func TestPgRepositoryUpsertIntimations(t *testing.T) {
 				t.Errorf("unmet expectations: %v", err)
 			}
 		})
+	}
+}
+
+// TestBuildIntimacaoHistory proves the unified Trilha (Architect decisão 2): deadline_event
+// rows merge into the SAME chronological timeline as the existing capture/confirmation/analysis
+// signals — interleaved by occurred_at, not appended after them.
+func TestBuildIntimacaoHistory(t *testing.T) {
+	t.Parallel()
+
+	captured := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)
+	calculado := time.Date(2024, 3, 2, 9, 0, 0, 0, time.UTC)
+	confirmed := time.Date(2024, 3, 5, 14, 0, 0, 0, time.UTC)
+	validado := time.Date(2024, 3, 6, 10, 0, 0, 0, time.UTC)
+	analyzed := time.Date(2024, 3, 10, 8, 0, 0, 0, time.UTC)
+
+	got := buildIntimacaoHistory(
+		pgtype.Date{Time: captured, Valid: true},
+		pgtype.Timestamptz{Time: confirmed, Valid: true},
+		strPtr("Dra. Ana"),
+		strPtr("OPEN"),
+		pgtype.Timestamptz{Time: analyzed, Valid: true},
+		[]acquisitiondb.ListDeadlineEventsByDeadlineIDRow{
+			// Deliberately unordered — the function must re-sort, not trust append order.
+			{Em: pgtype.Timestamptz{Time: validado, Valid: true}, Detalhe: strPtr("divergência apurada: aceita_calculado")},
+			{Em: pgtype.Timestamptz{Time: calculado, Valid: true}, Detalhe: strPtr("prazo calculado: 15 dias úteis")},
+			{Em: pgtype.Timestamptz{}, Detalhe: strPtr("skipped: em is NULL")}, // invalid Em must be dropped
+		},
+	)
+
+	wantLabels := []string{
+		"Capturada do DJEN",                     // captured
+		"prazo calculado: 15 dias úteis",        // calculado
+		"Prazo confirmado por Dra. Ana",         // confirmed
+		"divergência apurada: aceita_calculado", // validado
+		"Providências geradas",                  // analyzed
+	}
+	if len(got) != len(wantLabels) {
+		t.Fatalf("entries = %d, want %d (got %+v)", len(got), len(wantLabels), got)
+	}
+	for i, label := range wantLabels {
+		if got[i].Label != label {
+			t.Errorf("entries[%d].Label = %q, want %q", i, got[i].Label, label)
+		}
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].OccurredAt.Before(got[i-1].OccurredAt) {
+			t.Errorf("entries not sorted ASC by occurred_at: [%d]=%v before [%d]=%v", i, got[i].OccurredAt, i-1, got[i-1].OccurredAt)
+		}
 	}
 }
