@@ -195,7 +195,9 @@ type PartyCounselParams struct {
 // (a join in the query) so the producer derives UF via ufFromTribunal at emission
 // and hands the deadline slice everything it needs — no cross-slice read-back.
 // DeadlineStartAt is the wire date (2006-01-02); CancelReason is set only on a
-// cancellation.
+// cancellation. PrazoDeclarado is extracted deterministically from the row's teor
+// (extractPrazoDeclarado) by the repository — "" when the teor carries no recognizable
+// prazo mention.
 type IntimationChange struct {
 	ID              string
 	CourtRecordID   string
@@ -204,6 +206,7 @@ type IntimationChange struct {
 	Court           string
 	DeadlineStartAt string
 	CancelReason    string
+	PrazoDeclarado  string
 }
 
 // syncRepo is the narrow persistence port the sync use case drives.
@@ -961,6 +964,7 @@ func newIntimationObserved(ev SyncRequested, n IntimationChange) IntimationObser
 		Court:           n.Court,
 		UF:              tribunal.UF(n.Court),
 		DeadlineStartAt: n.DeadlineStartAt,
+		PrazoDeclarado:  n.PrazoDeclarado,
 	}
 }
 

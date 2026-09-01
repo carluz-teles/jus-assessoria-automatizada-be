@@ -46,7 +46,7 @@ func (uc *UseCase) OnActionItemConfirmed(ctx context.Context, ev ActionItemFact)
 //
 // Every providência gets a task, gera_peca or not (docs §2: "há o quê fazer: dar-se por
 // ciente" — a ciência-only item still needs a task, just with draft_id left NULL, which is a
-// LATER slice's concern; this slice never sets draft_id). Idempotent via 0079's UNIQUE
+// LATER slice's concern; this slice never sets draft_id). Idempotent via 0087's UNIQUE
 // (action_item_id): a redelivered event that got past the dedup mark (e.g. a crash between
 // commit and ack) still cannot mint a second task — InsertTask's ON CONFLICT DO NOTHING
 // yields ErrTaskExistsForActionItem, treated here as a safe no-op.

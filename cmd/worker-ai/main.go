@@ -16,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/advisory"
+	"github.com/jusassessoria/platform/internal/aiusage"
 	"github.com/jusassessoria/platform/internal/draft"
 	"github.com/jusassessoria/platform/internal/indexing"
 	"github.com/jusassessoria/platform/lib/config"
@@ -99,7 +100,9 @@ func run(logger *slog.Logger) error {
 		repo := draft.NewRepository()
 		dedup := draft.NewGenerateDeduper()
 
-		// LLM generator (OpenRouter). nil when the key is absent.
+		// LLM generator (OpenRouter). nil when the key is absent. The usage recorder
+		// (cost/tokens per call, best-effort) is always wired — it degrades to a no-op
+		// insert failure (logged, never propagated) if the pool is unreachable.
 		var gen llm.Generator
 		if cfg.OpenRouterAPIKey != "" {
 			httpClient := &http.Client{Timeout: 2 * time.Minute}
@@ -108,6 +111,7 @@ func run(logger *slog.Logger) error {
 				cfg.OpenRouterBaseURL,
 				cfg.OpenRouterModel,
 				httpClient,
+				aiusage.NewRecorder(pool),
 			)
 			if err != nil {
 				return fmt.Errorf("init openrouter generator: %w", err)

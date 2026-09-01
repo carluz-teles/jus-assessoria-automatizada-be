@@ -364,3 +364,22 @@ func TestOnDocumentUploaded_TenantScopedTx(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeExtractedText(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name, in, want string }{
+		{"strips NUL", "abc\x00def", "abcdef"},
+		{"keeps tab/newline/cr", "a\tb\nc\rd", "a\tb\nc\rd"},
+		{"drops other control chars", "a\x01b\x1fc\x7fd", "abcd"},
+		{"replaces invalid utf8", "abc\xffdef", "abcdef"},
+		{"plain text untouched", "Petição inicial · pág. 3", "Petição inicial · pág. 3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := sanitizeExtractedText(tt.in); got != tt.want {
+				t.Errorf("sanitizeExtractedText(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

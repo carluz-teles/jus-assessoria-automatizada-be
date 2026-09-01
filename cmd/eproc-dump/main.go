@@ -2,28 +2,50 @@
 // It is what a human runs the moment a real lawyer credential is available (Portão B):
 // it authenticates against the TJSP eproc portal, reuses the session, lists one process
 // + its events, downloads one document to disk, and prints the evidence the spike needs
-// to resolve its two UNKNOWNs —
+// to resolve its two original UNKNOWNs —
 //
 //  1. does the portal expose CPF/CNPJ of parties (in clear, masked, or absent) without a
 //     procuração? → we print the RAW document field of every party, verbatim.
 //  2. does a captcha/MFA appear at login or in the autos? → we print whether the flow hit
 //     a challenge.
 //
-// It reads everything from the environment; it NEVER logs the credential (not even in
-// debug). The Chrome uTLS transport (lib/transport) is built HERE and injected into the
-// pure lib/eproc client — the lib stays free of the transport dependency.
+// It reads everything from the environment; it NEVER logs a credential or private key
+// (not even in debug). The Chrome uTLS transport (lib/transport) is built HERE and
+// injected into the pure lib/eproc client — the lib stays free of the transport
+// dependency, and stays free of internal/certificate too (it never sees key material,
+// only the *http.Client the caller hands it — already mTLS-authenticated when cert mode
+// is used).
+//
+// Two auth modes, mutually exclusive:
+//
+//   - Password: EPROC_USERNAME/EPROC_PASSWORD (the original D0 mode).
+//   - Certificate (new UNKNOWN #3 — eproc's real mechanism for "Certificado Digital"
+//     login, per TJSP's own manuals, is mutual TLS: the browser's native certificate
+//     picker is what a server-requested client cert triggers): EPROC_CERT_TENANT_ID +
+//     EPROC_CERT_ID identify a row already in this box's `certificate` table (KMS-backed
+//     vault — see internal/certificate); the tool opens the vault, builds a *tls.
+//     Certificate from the leaf+chain+crypto.Signer, and hands it to
+//     transport.ChromeTransport so the mTLS handshake presents it. Needs DATABASE_URL,
+//     GCP_KMS_KEY_NAME and GOOGLE_APPLICATION_CREDENTIALS pointed at whatever KMS key
+//     actually wraps that certificate's DEK.
 //
 // Usage:
 //
-//	EPROC_USERNAME=... EPROC_PASSWORD=... \
-//	  [EPROC_PROXY_URL=http://user:pass@host:port] \
-//	  [EPROC_BASE_URL=https://eproc1g.tjsp.jus.br] \
-//	  [EPROC_CNJ=1234567-89.2026.8.26.0100] \
+//	# password mode
+//	EPROC_USERNAME=... EPROC_PASSWORD=... EPROC_CNJ=1234567-89.2026.8.26.0100 \
 //	  go run ./cmd/eproc-dump
+//
+//	# certificate mode
+//	DATABASE_URL=... GCP_KMS_KEY_NAME=... GOOGLE_APPLICATION_CREDENTIALS=... \
+//	  EPROC_CERT_TENANT_ID=... EPROC_CERT_ID=... EPROC_CNJ=4013029-38.2026.8.26.0196 \
+//	  go run ./cmd/eproc-dump
+//
+// Both modes accept: EPROC_PROXY_URL, EPROC_BASE_URL.
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -34,7 +56,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/jusassessoria/platform/internal/certificate"
+	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/eproc"
+	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/transport"
 )
 
@@ -47,40 +74,42 @@ func main() {
 }
 
 func run() error {
-	username := os.Getenv("EPROC_USERNAME")
-	password := os.Getenv("EPROC_PASSWORD")
-	if username == "" || password == "" {
-		return fmt.Errorf("EPROC_USERNAME and EPROC_PASSWORD are required (never printed)")
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	cnj := os.Getenv("EPROC_CNJ")
 	if cnj == "" {
 		return fmt.Errorf("EPROC_CNJ is required (the process number to dump)")
 	}
 
-	// Build the Chrome uTLS transport (with the optional residential/BR proxy), same
-	// anti-bot posture the DJEN connector proved necessary. This is the ONE place that
-	// knows about lib/transport; the eproc client stays pure.
 	proxyURL, err := parseProxy(os.Getenv("EPROC_PROXY_URL"))
 	if err != nil {
 		return fmt.Errorf("EPROC_PROXY_URL: %w", err)
 	}
+
+	authOpt, clientCert, err := resolveAuth(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Build the Chrome uTLS transport (with the optional residential/BR proxy and,
+	// in certificate mode, the mTLS client cert), same anti-bot posture the DJEN
+	// connector proved necessary. This is the ONE place that knows about
+	// lib/transport; the eproc client stays pure.
 	hc := &http.Client{
 		Timeout:   90 * time.Second,
-		Transport: transport.ChromeTransport(proxyURL),
+		Transport: transport.ChromeTransport(proxyURL, clientCert),
 	}
 
 	client := eproc.NewEprocClient(hc,
-		eproc.WithCredentials(eproc.Credentials{Username: username, Password: password}),
+		authOpt,
 		eproc.WithBaseURL(os.Getenv("EPROC_BASE_URL")), // empty keeps the default
 	)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	fmt.Println("== eproc-dump (D0 spike) ==")
 	fmt.Printf("proxy: %s\n", proxyLabel(proxyURL))
 	fmt.Printf("cnj:   %s\n", cnj)
+	fmt.Printf("auth:  %s\n", authLabel(clientCert))
 	fmt.Println()
 
 	// --- Login -----------------------------------------------------------------------
@@ -89,7 +118,7 @@ func run() error {
 	if err := client.Login(ctx); err != nil {
 		if eproc.IsForbidden(err) {
 			challengeSeen = true
-			fmt.Println("LOGIN: BLOCKED by captcha/MFA challenge (UNKNOWN #2 answered: YES)")
+			fmt.Println("LOGIN: BLOCKED by captcha/MFA challenge")
 		}
 		return fmt.Errorf("login: %w", err)
 	}
@@ -150,6 +179,77 @@ func run() error {
 	return nil
 }
 
+// resolveAuth picks the auth mode from the environment: certificate mode when
+// EPROC_CERT_TENANT_ID/EPROC_CERT_ID are set, password mode otherwise. It returns the
+// eproc.Option to configure the client plus the *tls.Certificate to hand the transport
+// (nil in password mode).
+func resolveAuth(ctx context.Context) (eproc.Option, *tls.Certificate, error) {
+	tenantID := os.Getenv("EPROC_CERT_TENANT_ID")
+	certID := os.Getenv("EPROC_CERT_ID")
+	if tenantID == "" && certID == "" {
+		username := os.Getenv("EPROC_USERNAME")
+		password := os.Getenv("EPROC_PASSWORD")
+		if username == "" || password == "" {
+			return nil, nil, fmt.Errorf("set EPROC_USERNAME+EPROC_PASSWORD, or EPROC_CERT_TENANT_ID+EPROC_CERT_ID for certificate mode")
+		}
+		return eproc.WithCredentials(eproc.Credentials{Username: username, Password: password}), nil, nil
+	}
+	if tenantID == "" || certID == "" {
+		return nil, nil, fmt.Errorf("EPROC_CERT_TENANT_ID and EPROC_CERT_ID must both be set")
+	}
+
+	clientCert, info, err := loadClientCertificate(ctx, tenantID, certID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load certificate from vault: %w", err)
+	}
+	fmt.Printf("certificate: CN=%q OAB=%q (loaded from vault, never printed: key material)\n", info.SubjectCN, info.OAB)
+	return eproc.WithCertificateAuth(), clientCert, nil
+}
+
+// loadClientCertificate opens the KMS-backed certificate vault (internal/certificate)
+// and builds a *tls.Certificate ready for mutual TLS: Certificate is the DER chain
+// (leaf first, matching crypto/tls's own convention), PrivateKey is the KMS-backed
+// crypto.Signer — the raw key never leaves the vault's process boundary, only sign
+// operations do (see certificate.UseCase.NewSigner).
+func loadClientCertificate(ctx context.Context, tenantID, certID string) (*tls.Certificate, certificate.SignerInfo, error) {
+	dsn := os.Getenv("DATABASE_URL")
+	kekName := os.Getenv("GCP_KMS_KEY_NAME")
+	if dsn == "" || kekName == "" {
+		return nil, certificate.SignerInfo{}, fmt.Errorf("DATABASE_URL and GCP_KMS_KEY_NAME are required in certificate mode")
+	}
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, certificate.SignerInfo{}, fmt.Errorf("pool: %w", err)
+	}
+	defer pool.Close()
+
+	cipher, err := certificate.NewEnvelopeCipher(ctx, kekName)
+	if err != nil {
+		return nil, certificate.SignerInfo{}, fmt.Errorf("KMS envelope cipher: %w", err)
+	}
+
+	repo := certificate.NewRepository()
+	uow := database.NewUnitOfWork(pool)
+	uc := certificate.NewUseCase(repo, uow, cipher, events.NewOutbox())
+
+	signer, leaf, intermediates, info, err := uc.NewSigner(ctx, tenantID, certID)
+	if err != nil {
+		return nil, certificate.SignerInfo{}, err
+	}
+
+	chain := make([][]byte, 0, 1+len(intermediates))
+	chain = append(chain, leaf.Raw)
+	for _, ic := range intermediates {
+		chain = append(chain, ic.Raw)
+	}
+	return &tls.Certificate{
+		Certificate: chain,
+		PrivateKey:  signer,
+		Leaf:        leaf,
+	}, info, nil
+}
+
 // downloadToTemp streams the document to a temp file (never buffering it whole) and
 // returns its path and byte count.
 func downloadToTemp(ctx context.Context, client *eproc.Client, docID string) (string, int64, error) {
@@ -181,6 +281,14 @@ func proxyLabel(u *url.URL) string {
 	}
 	// Redact userinfo — only the host is safe to print.
 	return u.Scheme + "://" + u.Host
+}
+
+// authLabel describes which auth mode is active, without ever printing a secret.
+func authLabel(clientCert *tls.Certificate) string {
+	if clientCert != nil {
+		return "certificate (mutual TLS)"
+	}
+	return "password"
 }
 
 // classifyDocument describes the shape of a CPF/CNPJ field so the human sees at a glance

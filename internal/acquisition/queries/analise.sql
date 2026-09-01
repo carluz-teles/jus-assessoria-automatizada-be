@@ -36,16 +36,20 @@ WHERE m.tenant_id = $1 AND m.status = 'ACTIVE'
 ORDER BY u.name, u.id;
 
 -- name: SetIntimationAIAnalysis :one
--- Persists (OVERWRITES) the AI analysis of one intimation's ai_summary/ai_analyzed_at. Unlike
--- SetCourtRecordAIResume there is NO write-once guard — the analysis is re-executable ("Gerar
--- novamente"). Scoped by tenant_id (barrier 1). Degraded mode passes ai_summary=''.
--- RETURNING court_record_id so the caller can log a process_activity_log row in the SAME
--- tx, without a second round-trip to look up the owning court record.
+-- Persists (OVERWRITES) the AI analysis of one intimation's ai_summary/ai_act/ai_analyzed_at.
+-- Unlike SetCourtRecordAIResume there is NO write-once guard — the analysis is re-executable
+-- ("Gerar novamente"). ai_providencias (migration 0051) is NO LONGER written here — the
+-- providência candidates travel on acquisition.intimation.analyzed instead (see
+-- analise_store.go), materialized by the actionitem slice into real action_item rows. Scoped
+-- by tenant_id (barrier 1). Degraded mode passes ai_summary='' and ai_act=NULL. RETURNING
+-- court_record_id so the caller can log a process_activity_log row in the SAME tx, without a
+-- second round-trip to look up the owning court record.
 UPDATE intimation
 SET ai_summary      = $1,
+    ai_act          = $2,
     ai_analyzed_at  = now()
-WHERE id = $2
-  AND tenant_id = $3
+WHERE id = $3
+  AND tenant_id = $4
 RETURNING court_record_id;
 
 -- name: InsertProcessActivityLog :exec

@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/jusassessoria/platform/lib/apperr"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // openrouter.go is the concrete Generator — the OpenRouter chat-completions adapter, stdlib
@@ -43,6 +45,11 @@ type OpenRouterGenerator struct {
 	baseURL      string
 	defaultModel string
 	client       *http.Client
+	// recorder is the optional cost/usage telemetry sink — nil skips recording (same
+	// nil-safe optional-dependency shape as every other optional port in this codebase,
+	// e.g. draft.GenerateUseCase's emb/chunkPub). A recorder fault is logged, never
+	// propagated: telemetry must never cost the caller its generation.
+	recorder UsageRecorder
 }
 
 var _ Generator = (*OpenRouterGenerator)(nil)
@@ -51,8 +58,9 @@ var _ Generator = (*OpenRouterGenerator)(nil)
 // surfaced at construction as an apperr.Invalid — so the binary that WANTS to generate fails loudly
 // at wiring; a binary that has no key simply does not build this adapter (see cmd/api wiring, which
 // injects nil when the key is unset). defaultModel/baseURL default in config. The http.Client is
-// the caller's (share one) or nil to use http.DefaultClient.
-func NewOpenRouterGenerator(apiKey, baseURL, defaultModel string, client *http.Client) (*OpenRouterGenerator, error) {
+// the caller's (share one) or nil to use http.DefaultClient. recorder may be nil (no usage/cost
+// telemetry persisted).
+func NewOpenRouterGenerator(apiKey, baseURL, defaultModel string, client *http.Client, recorder UsageRecorder) (*OpenRouterGenerator, error) {
 	if apiKey == "" {
 		return nil, apperr.NewInvalid("openrouter: api key is required")
 	}
@@ -70,7 +78,31 @@ func NewOpenRouterGenerator(apiKey, baseURL, defaultModel string, client *http.C
 		baseURL:      strings.TrimRight(baseURL, "/"),
 		defaultModel: defaultModel,
 		client:       client,
+		recorder:     recorder,
 	}, nil
+}
+
+// recordUsage persists u as a UsageEvent attributed to req/model, best-effort: a recorder
+// fault is logged and swallowed — cost telemetry must never fail the generation it describes.
+// A nil recorder (not wired) or a zero-value usage (nothing parsed from the response) is a
+// silent no-op.
+func (g *OpenRouterGenerator) recordUsage(ctx context.Context, req Request, model string, u Usage, latency time.Duration) {
+	if g.recorder == nil || u.TotalTokens == 0 {
+		return
+	}
+	ev := UsageEvent{
+		TenantID:  req.TenantID,
+		UseCase:   req.UseCase,
+		Provider:  "openrouter",
+		Model:     model,
+		Usage:     u,
+		LatencyMs: latency.Milliseconds(),
+		TraceID:   trace.SpanContextFromContext(ctx).TraceID().String(),
+	}
+	if err := g.recorder.RecordUsage(ctx, ev); err != nil {
+		slog.WarnContext(ctx, "openrouter: record usage failed",
+			slog.String("use_case", req.UseCase), slog.Any("error", err))
+	}
 }
 
 // chatMessage is one OpenAI-compatible message (role + content).
@@ -111,19 +143,40 @@ type chatRequest struct {
 }
 
 // chatResponse is the parsed reply. choices[0].message.content is a STRING containing the JSON
-// that matches the schema — the caller unmarshals those bytes. usage carries token counts (kept
-// for observability/cost, though this adapter does not surface it yet).
+// that matches the schema — the caller unmarshals those bytes. usage carries token counts and
+// cost — OpenRouter includes it in every response by default (the older usage.include /
+// stream_options.include_usage request opt-ins are deprecated), so no request change is needed
+// to get it.
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
+	Usage usagePayload `json:"usage"`
+}
+
+// usagePayload is OpenRouter's usage object, shared by the sync response and the final SSE
+// chunk of a stream.
+type usagePayload struct {
+	PromptTokens        int     `json:"prompt_tokens"`
+	CompletionTokens    int     `json:"completion_tokens"`
+	TotalTokens         int     `json:"total_tokens"`
+	Cost                float64 `json:"cost"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// toUsage converts the wire payload to the port's Usage type.
+func (p usagePayload) toUsage() Usage {
+	return Usage{
+		PromptTokens:     p.PromptTokens,
+		CompletionTokens: p.CompletionTokens,
+		TotalTokens:      p.TotalTokens,
+		CachedTokens:     p.PromptTokensDetails.CachedTokens,
+		CostUSD:          p.Cost,
+	}
 }
 
 // GenerateJSONStream é a variante SSE do GenerateJSON. Faz o POST com
@@ -183,8 +236,13 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 
 	// Parse SSE inline. Cada evento é `data: {json}\n` seguido de linha em
 	// branco. `data: [DONE]\n` fecha o stream. Cada json tem
-	// choices[0].delta.content — o delta parcial que juntamos.
+	// choices[0].delta.content — o delta parcial que juntamos. O usage (tokens/cost)
+	// chega no ÚLTIMO evento de conteúdo, que tipicamente tem choices=[] — por isso o
+	// usage é lido ANTES do `continue` de choices vazio, senão o custo do streaming
+	// nunca é capturado.
 	var full strings.Builder
+	var usage Usage
+	start := time.Now()
 	reader := &sseReader{buf: make([]byte, 0, 4096), src: resp.Body}
 	for {
 		event, err := reader.next(ctx)
@@ -207,10 +265,14 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
+			Usage usagePayload `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(event), &chunk); err != nil {
 			// Alguns providers mandam eventos comentários (`: ping`) ou não-JSON — ignora.
 			continue
+		}
+		if chunk.Usage.TotalTokens > 0 {
+			usage = chunk.Usage.toUsage()
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -226,6 +288,7 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 			}
 		}
 	}
+	g.recordUsage(ctx, req, model, usage, time.Since(start))
 	return []byte(full.String()), nil
 }
 
@@ -315,10 +378,12 @@ func (g *OpenRouterGenerator) GenerateJSON(ctx context.Context, req Request) ([]
 
 	url := g.baseURL + completionsPath
 
+	start := time.Now()
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		content, retryable, err := g.doOnce(ctx, url, body)
+		content, usage, retryable, err := g.doOnce(ctx, url, body)
 		if err == nil {
+			g.recordUsage(ctx, req, model, usage, time.Since(start))
 			return content, nil
 		}
 		lastErr = err
@@ -340,13 +405,14 @@ func (g *OpenRouterGenerator) GenerateJSON(ctx context.Context, req Request) ([]
 	return nil, lastErr
 }
 
-// doOnce runs a single request attempt. It returns the JSON content bytes on success, or an error
-// plus a retryable flag: a network fault, a body-read fault, or an HTTP 429/5xx is retryable
-// (infra); a 4xx is terminal (invalid); a malformed/empty success body is a terminal infra fault.
-func (g *OpenRouterGenerator) doOnce(ctx context.Context, url string, body []byte) ([]byte, bool, error) {
+// doOnce runs a single request attempt. It returns the JSON content bytes and the parsed usage on
+// success, or an error plus a retryable flag: a network fault, a body-read fault, or an HTTP
+// 429/5xx is retryable (infra); a 4xx is terminal (invalid); a malformed/empty success body is a
+// terminal infra fault.
+func (g *OpenRouterGenerator) doOnce(ctx context.Context, url string, body []byte) ([]byte, Usage, bool, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, false, apperr.NewInfra("openrouter: build request", err)
+		return nil, Usage{}, false, apperr.NewInfra("openrouter: build request", err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+g.apiKey)
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -354,30 +420,30 @@ func (g *OpenRouterGenerator) doOnce(ctx context.Context, url string, body []byt
 	resp, err := g.client.Do(httpReq)
 	if err != nil {
 		// A transport error (dial/timeout/reset) is a transient blip — retryable.
-		return nil, true, apperr.NewInfra("openrouter: request failed", err)
+		return nil, Usage{}, true, apperr.NewInfra("openrouter: request failed", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, true, apperr.NewInfra("openrouter: read response", err)
+		return nil, Usage{}, true, apperr.NewInfra("openrouter: read response", err)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		// 429 (overloaded/rate-limited) and 5xx are TRANSIENT — retryable.
-		return nil, true, apperr.NewInfra("openrouter: transient upstream error", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody)))
+		return nil, Usage{}, true, apperr.NewInfra("openrouter: transient upstream error", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody)))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Any other non-2xx (4xx bad request/auth) is a terminal caller/config fault — no retry.
-		return nil, false, apperr.NewInvalid(fmt.Sprintf("openrouter: bad request (status %d): %s", resp.StatusCode, string(respBody)))
+		return nil, Usage{}, false, apperr.NewInvalid(fmt.Sprintf("openrouter: bad request (status %d): %s", resp.StatusCode, string(respBody)))
 	}
 
 	var parsed chatResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, false, apperr.NewInfra("openrouter: decode response", fmt.Errorf("%w: body=%s", err, string(respBody)))
+		return nil, Usage{}, false, apperr.NewInfra("openrouter: decode response", fmt.Errorf("%w: body=%s", err, string(respBody)))
 	}
 	if len(parsed.Choices) == 0 || parsed.Choices[0].Message.Content == "" {
-		return nil, false, apperr.NewInfra("openrouter: empty completion", fmt.Errorf("no choices/content in body=%s", string(respBody)))
+		return nil, Usage{}, false, apperr.NewInfra("openrouter: empty completion", fmt.Errorf("no choices/content in body=%s", string(respBody)))
 	}
-	return []byte(parsed.Choices[0].Message.Content), false, nil
+	return []byte(parsed.Choices[0].Message.Content), parsed.Usage.toUsage(), false, nil
 }

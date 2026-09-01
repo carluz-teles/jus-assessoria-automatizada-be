@@ -145,7 +145,7 @@ func draftFromInsertRow(r draftdb.InsertDraftRow) *Draft {
 
 // draftFromGetByTaskIDRow maps the GetDraftByTaskID row to a *Draft entity — the
 // idempotent-fetch counterpart of draftFromGetByIntimationRow for the task-sourced
-// path (migration 0080).
+// path (migration 0088).
 func draftFromGetByTaskIDRow(r draftdb.GetDraftByTaskIDRow) *Draft {
 	return &Draft{
 		ID:                r.ID.String(),

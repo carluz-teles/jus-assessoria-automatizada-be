@@ -42,7 +42,7 @@ func NewAnaliseStore(uow database.UnitOfWork, outbox publisher) analiseStore {
 	return &pgAnaliseStore{uow: uow, outbox: outbox}
 }
 
-// SaveAnalise overwrites the intimation's ai_summary/ai_analyzed_at and publishes
+// SaveAnalise overwrites the intimation's ai_summary/ai_act/ai_analyzed_at and publishes
 // acquisition.intimation.analyzed carrying p.Providencias, in one tx. summary="" is the
 // valid degraded write (analysed, IA unavailable) — the event still publishes (with
 // whatever candidates are given, possibly none), so the actionitem listener's guard
@@ -62,10 +62,17 @@ func (s *pgAnaliseStore) SaveAnalise(ctx context.Context, p SaveAnaliseParams) e
 	// The column is text NULL; an empty summary is stored as "" (not NULL) so ai_analyzed_at
 	// being set is the sole "analysed" signal — degraded and rich analyses both stamp it.
 	sum := p.Summary
+	// ai_act: NULL quando não classificado (degradado/vazio), senão o ato — o read
+	// model cai no class+subject quando NULL.
+	var act *string
+	if p.Ato != "" {
+		act = &p.Ato
+	}
 
 	return s.uow.Do(ctx, p.TenantID, func(tx database.Tx) error {
 		courtRecordID, err := acquisitiondb.New(tx).SetIntimationAIAnalysis(ctx, acquisitiondb.SetIntimationAIAnalysisParams{
 			AiSummary: &sum,
+			AiAct:     act,
 			ID:        iid,
 			TenantID:  tid,
 		})

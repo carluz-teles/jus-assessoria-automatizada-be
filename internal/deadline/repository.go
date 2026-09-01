@@ -104,22 +104,26 @@ func (r *pgRepository) InsertDeadline(ctx context.Context, tx database.Tx, d *De
 	}
 
 	id, err := deadlinedb.New(tx).InsertDeadline(ctx, deadlinedb.InsertDeadlineParams{
-		TenantID:        tenantID,
-		CourtRecordID:   courtRecordID,
-		NotificationID:  intimationID,
-		StartDate:       pgDate(d.StartDate),
-		EndDate:         pgDate(d.EndDate),
-		Days:            int32(d.Days),
-		Counting:        string(d.Counting),
-		Doubled:         d.Doubled,
-		DoubledReason:   textToNull(d.DoubledReason),
-		HolidaysApplied: holidays,
-		Status:          string(d.Status),
-		Source:          string(d.Source),
-		Kind:            textToNull(d.Kind),
-		RulesVersion:    d.RulesVersion,
-		AnchorEvent:     string(d.AnchorEvent),
-		LegalCitation:   textToNull(d.LegalCitation),
+		TenantID:           tenantID,
+		CourtRecordID:      courtRecordID,
+		NotificationID:     intimationID,
+		StartDate:          pgDate(d.StartDate),
+		EndDate:            pgDate(d.EndDate),
+		PrazoInterno:       pgDate(d.PrazoInterno),
+		Days:               int32(d.Days),
+		Counting:           string(d.Counting),
+		Doubled:            d.Doubled,
+		DoubledReason:      textToNull(d.DoubledReason),
+		HolidaysApplied:    holidays,
+		Status:             string(d.Status),
+		Source:             string(d.Source),
+		Kind:               textToNull(d.Kind),
+		RulesVersion:       d.RulesVersion,
+		AnchorEvent:        string(d.AnchorEvent),
+		LegalCitation:      textToNull(d.LegalCitation),
+		Origem:             textToNull(string(d.Origem)),
+		Selo:               textToNull(string(d.Seal)),
+		ConfirmacaoExigida: &d.ConfirmacaoExigida,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeadlineExists
@@ -325,6 +329,7 @@ func (r *pgRepository) ConfirmDeadline(ctx context.Context, tx database.Tx, p Co
 		Doubled:         p.Doubled,
 		DoubledReason:   textToNull(p.DoubledReason),
 		EndDate:         pgDate(p.EndDate),
+		PrazoInterno:    pgDate(p.PrazoInterno),
 		HolidaysApplied: holidays,
 		ConfirmedBy:     confirmedBy,
 		ConfirmedAt:     pgTimestamptz(p.ConfirmedAt),
@@ -426,7 +431,7 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		// ON CONFLICT (action_item_id) DO NOTHING yielded no row: a task already exists for
-		// this providência (0079's UNIQUE). Only reachable when t.ActionItemID is set — the
+		// this providência (0087's UNIQUE). Only reachable when t.ActionItemID is set — the
 		// manual/avulsa path's action_item_id is always NULL, which never conflicts.
 		return nil, ErrTaskExistsForActionItem
 	}
@@ -742,6 +747,8 @@ func (r *pgRepository) GetDeadlineForAdjust(ctx context.Context, tx database.Tx,
 		DoubledReason:   derefString(row.DoubledReason),
 		AnchorEvent:     AnchorEvent(row.AnchorEvent),
 		ManualExtraDays: int(row.ManualExtraDays),
+		Origem:          Origem(derefString(row.Origem)),
+		Selo:            Seal(derefString(row.Selo)),
 	}, nil
 }
 
@@ -773,6 +780,7 @@ func (r *pgRepository) UpdateDeadlineAdjust(ctx context.Context, tx database.Tx,
 		Doubled:         p.Doubled,
 		DoubledReason:   textToNull(p.DoubledReason),
 		EndDate:         pgDate(p.EndDate),
+		PrazoInterno:    pgDate(p.PrazoInterno),
 		HolidaysApplied: holidays,
 		StartDate:       pgDate(p.StartDate),
 		AnchorEvent:     string(p.AnchorEvent),
@@ -1321,4 +1329,398 @@ func (r *pgRepository) GetLatestSuggestion(ctx context.Context, tx database.Tx, 
 		Model:         row.Model,
 		Tasks:         tasks,
 	}, true, nil
+}
+
+// InsertCalcMemory persists the deterministic calculation audit trail inside the
+// caller's tx, 1:1 on deadline_id. The ON CONFLICT DO NOTHING on the UNIQUE
+// deadline_id means a re-derivation yields NO row → pgx.ErrNoRows → typed
+// ErrCalcMemoryExists at the mapper, so the use case no-ops instead of poisoning the
+// tx with a constraint error. The mapper absorbs the entity's value types into the
+// generated param struct; nullable bool (*bool) maps directly from the entity.
+func (r *pgRepository) InsertCalcMemory(ctx context.Context, tx database.Tx, m *CalcMemory) (*CalcMemory, error) {
+	tenantID, err := parseUUID(m.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	deadlineID, err := parseUUID(m.DeadlineID)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := deadlinedb.New(tx).InsertCalcMemory(ctx, deadlinedb.InsertCalcMemoryParams{
+		TenantID:                tenantID,
+		DeadlineID:              deadlineID,
+		PrazoBase:               textToNull(m.PrazoBase),
+		PrazoBaseFonte:          textToNull(m.PrazoBaseFonte),
+		TermoInicialRegra:       textToNull(m.TermoInicialRegra),
+		DiasUteis:               optionalBool(m.DiasUteis),
+		DobraMotivo:             textToNull(m.DobraMotivo),
+		TabelaLegalRef:          textToNull(m.TabelaLegalRef),
+		IaTipoInferido:          textToNull(m.IATipoInferido),
+		IaConfianca:             &m.IAConfianca,
+		CalendarProviderVersion: textToNull(m.CalendarProviderVersion),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCalcMemoryExists
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	saved := *m
+	saved.ID = id.String()
+	return &saved, nil
+}
+
+// InsertAppliedHoliday persists one holiday snapshot inside the caller's tx, 1:N
+// under the parent calc_memory. The mapper absorbs the entity's value types;
+// nullable text columns map via textToNull; the date maps via pgDate.
+func (r *pgRepository) InsertAppliedHoliday(ctx context.Context, tx database.Tx, h *AppliedHoliday) (*AppliedHoliday, error) {
+	tenantID, err := parseUUID(h.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	calcMemoryID, err := parseUUID(h.CalcMemoryID)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := deadlinedb.New(tx).InsertAppliedHoliday(ctx, deadlinedb.InsertAppliedHolidayParams{
+		TenantID:     tenantID,
+		CalcMemoryID: calcMemoryID,
+		Data:         pgDate(h.Data),
+		Nome:         textToNull(h.Nome),
+		Ambito:       textToNull(h.Ambito),
+		Comarca:      textToNull(h.Comarca),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	saved := *h
+	saved.ID = id.String()
+	return &saved, nil
+}
+
+// InsertCrossValidation persists the declared vs calculated cross-validation result
+// inside the caller's tx, 1:1 on deadline_id. The ON CONFLICT DO NOTHING on the
+// UNIQUE deadline_id means a re-derivation yields NO row → pgx.ErrNoRows → typed
+// ErrCrossValidationExists at the mapper, so the use case no-ops. decidido_por is
+// nullable (NULL when the system decided), mapped via pgOptionalUUID.
+func (r *pgRepository) InsertCrossValidation(ctx context.Context, tx database.Tx, cv *CrossValidation) (*CrossValidation, error) {
+	tenantID, err := parseUUID(cv.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	deadlineID, err := parseUUID(cv.DeadlineID)
+	if err != nil {
+		return nil, err
+	}
+	decididoPor, err := pgOptionalUUID(cv.DecididoPor)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := deadlinedb.New(tx).InsertCrossValidation(ctx, deadlinedb.InsertCrossValidationParams{
+		TenantID:      tenantID,
+		DeadlineID:    deadlineID,
+		DataDeclarada: pgDate(cv.DataDeclarada),
+		DataCalculada: pgDate(cv.DataCalculada),
+		DifDias:       optionalInt32(cv.DifDias),
+		Resultado:     textToNull(cv.Resultado),
+		CausaProvavel: textToNull(cv.CausaProvavel),
+		Decisao:       textToNull(cv.Decisao),
+		DecididoPor:   decididoPor,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCrossValidationExists
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	saved := *cv
+	saved.ID = id.String()
+	return &saved, nil
+}
+
+// InsertDeadlineEvent appends one event to the deadline's append-only audit trail
+// inside the caller's tx. deadline_event never overwrites; it adds — history is
+// auditable. ator_id is nullable (NULL when the system is the actor), mapped via
+// pgOptionalUUID. The caller does not need the row back (the audit trail re-reads
+// the whole log), so it returns only the error.
+func (r *pgRepository) InsertDeadlineEvent(ctx context.Context, tx database.Tx, e *DeadlineEvent) error {
+	tenantID, err := parseUUID(e.TenantID)
+	if err != nil {
+		return err
+	}
+	deadlineID, err := parseUUID(e.DeadlineID)
+	if err != nil {
+		return err
+	}
+	atorID, err := pgOptionalUUID(e.AtorID)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).InsertDeadlineEvent(ctx, deadlinedb.InsertDeadlineEventParams{
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+		Tipo:       e.Tipo,
+		Detalhe:    textToNull(e.Detalhe),
+		AtorID:     atorID,
+	})
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// GetPolicy reads the tenant's deadline confirmation policy inside the caller's tx.
+// A row that exists returns the stored policy; the absence of a row (no explicit
+// opt-in) is NOT an error — it returns the seletiva default (ConfirmacaoObrigatoria
+// = false), because the absence means the tenant never chose strict mode. This maps
+// pgx.ErrNoRows to a default value rather than a typed not-found, which is a deliberate
+// divergence from the usual "absence = error" pattern: the policy is configuration, not
+// a domain entity, and every tenant always has a policy (the default is the policy).
+func (r *pgRepository) GetPolicy(ctx context.Context, tx database.Tx, tenantID string) (DeadlinePolicy, error) {
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return DeadlinePolicy{}, err
+	}
+
+	row, err := deadlinedb.New(tx).GetDeadlinePolicy(ctx, tenant)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DeadlinePolicy{
+			TenantID:               tenantID,
+			ConfirmacaoObrigatoria: false,
+		}, nil
+	}
+	if err != nil {
+		return DeadlinePolicy{}, database.WrapInfra(err)
+	}
+
+	return DeadlinePolicy{
+		TenantID:               row.TenantID.String(),
+		ConfirmacaoObrigatoria: row.ConfirmacaoObrigatoria,
+	}, nil
+}
+
+// GetCrossValidation reads the declared×calculado cross-validation for one deadline inside the
+// caller's tx, scoped to tenantID (barrier 1). A missing row (no prazo_declarado at birth, so
+// nothing was ever cross-checked) maps to the typed ErrCrossValidationNotFound (never nil, nil).
+func (r *pgRepository) GetCrossValidation(ctx context.Context, tx database.Tx, tenantID, deadlineID string) (*CrossValidation, error) {
+	deadline, err := parseUUID(deadlineID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).GetCrossValidation(ctx, deadlinedb.GetCrossValidationParams{
+		DeadlineID: deadline,
+		TenantID:   tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCrossValidationNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &CrossValidation{
+		ID:            row.ID.String(),
+		TenantID:      tenantID,
+		DeadlineID:    deadlineID,
+		DataDeclarada: row.DataDeclarada.Time,
+		DataCalculada: row.DataCalculada.Time,
+		DifDias:       derefInt32(row.DifDias),
+		Resultado:     derefString(row.Resultado),
+		CausaProvavel: derefString(row.CausaProvavel),
+		Decisao:       derefString(row.Decisao),
+		DecididoPor:   uuidText(row.DecididoPor),
+	}, nil
+}
+
+// UpdateCrossValidationDecision records the human's divergência decision inside the caller's tx,
+// keyed by deadline_id and scoped to tenantID (barrier 1). An UPDATE (the row already exists
+// since InsertCrossValidation ran at birth). The query's `decisao IS NULL` guard is the
+// concurrency floor (mirroring MarkTaskStatus/MarkDeadlineStatus's `status = current_status`
+// guard): the use case pre-checks decisao=="" before calling, and this guard defends the write
+// against a racing second apuração on the SAME divergência. By the time this runs,
+// GetCrossValidation has already confirmed the row exists, so a no-match here can only mean a
+// concurrent apuração already decided it — mapped to the typed ErrDeadlineNotDivergent (never a
+// silent overwrite of the first decision).
+func (r *pgRepository) UpdateCrossValidationDecision(ctx context.Context, tx database.Tx, tenantID, deadlineID, decisao, decididoPor string) error {
+	deadline, err := parseUUID(deadlineID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	decidedBy, err := pgOptionalUUID(decididoPor)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).UpdateCrossValidationDecision(ctx, deadlinedb.UpdateCrossValidationDecisionParams{
+		DeadlineID:  deadline,
+		TenantID:    tenant,
+		Decisao:     textToNull(decisao),
+		DecididoPor: decidedBy,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDeadlineNotDivergent
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// UpdateDeadlineEndDate overwrites end_date AND prazo_interno inside the caller's tx, keyed by
+// the prazo id and scoped to tenantID (barrier 1) — the "aceita_declarado" apuração write (no
+// recompute of days/counting/holidays_applied; prazo_interno is the caller's recompute from the
+// new end_date, so it never drifts). A no-match maps to the typed ErrDeadlineNotFound.
+func (r *pgRepository) UpdateDeadlineEndDate(ctx context.Context, tx database.Tx, tenantID, deadlineID string, endDate, prazoInterno time.Time) error {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).UpdateDeadlineEndDate(ctx, deadlinedb.UpdateDeadlineEndDateParams{
+		ID:           id,
+		TenantID:     tenant,
+		EndDate:      pgDate(endDate),
+		PrazoInterno: pgDate(prazoInterno),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDeadlineNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// UpdateDeadlineSelo flips the confidence selo AND stamps confirmed_by/confirmed_at inside the
+// caller's tx, keyed by the prazo id and scoped to tenantID (barrier 1) — origem is NEVER written
+// here (immutable after creation). The query's `selo = 'a_apurar'` guard is the concurrency floor
+// (mirroring MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the use case
+// pre-checks the selo before calling, and this guard defends the write against a racing second
+// apuração on the SAME prazo. By the time this runs, GetDeadlineForAdjust has already confirmed
+// the row exists, so a no-match here can only mean a concurrent apuração already sealed it
+// confiavel — mapped to the typed ErrDeadlineNotDivergent (never a silent no-op re-seal).
+func (r *pgRepository) UpdateDeadlineSelo(ctx context.Context, tx database.Tx, tenantID, deadlineID string, selo Seal, confirmedBy string, confirmedAt time.Time) error {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	by, err := pgUUID(confirmedBy)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).UpdateDeadlineSelo(ctx, deadlinedb.UpdateDeadlineSeloParams{
+		ID:          id,
+		TenantID:    tenant,
+		Selo:        textToNull(string(selo)),
+		ConfirmedBy: by,
+		ConfirmedAt: pgTimestamptz(confirmedAt),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrDeadlineNotDivergent
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// GetCalcMemory reads one deadline's calc_memory inside the caller's tx, scoped to tenantID
+// (barrier 1). A missing row maps to the typed ErrCalcMemoryNotFound (never nil, nil).
+func (r *pgRepository) GetCalcMemory(ctx context.Context, tx database.Tx, tenantID, deadlineID string) (*CalcMemory, error) {
+	deadline, err := parseUUID(deadlineID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := deadlinedb.New(tx).GetCalcMemory(ctx, deadlinedb.GetCalcMemoryParams{
+		DeadlineID: deadline,
+		TenantID:   tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrCalcMemoryNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &CalcMemory{
+		ID:                      row.ID.String(),
+		TenantID:                tenantID,
+		DeadlineID:              deadlineID,
+		PrazoBase:               derefString(row.PrazoBase),
+		PrazoBaseFonte:          derefString(row.PrazoBaseFonte),
+		TermoInicialRegra:       derefString(row.TermoInicialRegra),
+		DiasUteis:               derefBool(row.DiasUteis),
+		DobraMotivo:             derefString(row.DobraMotivo),
+		TabelaLegalRef:          derefString(row.TabelaLegalRef),
+		IATipoInferido:          derefString(row.IaTipoInferido),
+		IAConfianca:             derefFloat64(row.IaConfianca),
+		CalendarProviderVersion: derefString(row.CalendarProviderVersion),
+	}, nil
+}
+
+// UpdateCalcMemoryTipoConfirmation records the human's confirmed/reclassified tipo de ato inside
+// the caller's tx, keyed by deadline_id and scoped to tenantID (barrier 1). An UPDATE (the row
+// already exists since InsertCalcMemory ran at birth). A no-match maps to the typed
+// ErrCalcMemoryNotFound.
+func (r *pgRepository) UpdateCalcMemoryTipoConfirmation(ctx context.Context, tx database.Tx, tenantID, deadlineID, tipo string, confianca float64) error {
+	deadline, err := parseUUID(deadlineID)
+	if err != nil {
+		return err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+
+	_, err = deadlinedb.New(tx).UpdateCalcMemoryTipoConfirmation(ctx, deadlinedb.UpdateCalcMemoryTipoConfirmationParams{
+		DeadlineID:     deadline,
+		TenantID:       tenant,
+		IaTipoInferido: textToNull(tipo),
+		IaConfianca:    &confianca,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCalcMemoryNotFound
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// optionalInt32 lifts a Go int to a *int32 for a nullable integer column.
+// cross_validation.dif_dias is nullable (NULL when there is no declared date to
+// compare against), but the mapper provides the value explicitly.
+func optionalInt32(v int) *int32 {
+	n := int32(v)
+	return &n
 }

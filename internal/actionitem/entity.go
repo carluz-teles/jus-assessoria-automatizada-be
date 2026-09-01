@@ -46,7 +46,7 @@ const (
 // ActionItem is the Providência aggregate: the diagnostic that decides WHAT to do about
 // one intimação (§1) and, when it generates a peça, WHICH tipo (§3). CourtRecordID,
 // PieceProfileKey, DeadlineID and TaskID are all optional (empty string / nil), mirroring
-// the nullable FKs of migration 0078. entity.go holds only the aggregate and its value
+// the nullable FKs of migration 0086. entity.go holds only the aggregate and its value
 // types — it imports no repository/handler/lib (the slice's inward dependency rule).
 type ActionItem struct {
 	ID              string
@@ -77,7 +77,7 @@ const (
 	TipoCiencia    = "ciencia"
 )
 
-// knownPieceProfileKeys is the v1 catalog seeded by migration 0077 (docs/erd-tipos-de-
+// knownPieceProfileKeys is the v1 catalog seeded by migration 0085 (docs/erd-tipos-de-
 // peca.md §6). It is a local, hardcoded allowlist — NOT a query against piece_profile —
 // because this slice never imports pieceprofile's package (slices talk by event/SQL-read,
 // never by importing another slice's domain) and the FK already enforces the real

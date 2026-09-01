@@ -316,6 +316,7 @@ func (r *pgRepository) UpsertIntimations(ctx context.Context, tx database.Tx, pa
 			Court:           row.Court,
 			DeadlineStartAt: dateOrEmpty(row.DeadlineStartAt),
 			CancelReason:    derefString(row.CancelReason),
+			PrazoDeclarado:  extractPrazoDeclarado(row.Content),
 		}
 		switch {
 		case row.Inserted:

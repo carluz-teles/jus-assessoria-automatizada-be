@@ -148,7 +148,7 @@ type CreateCommand struct {
 	CaseID       string
 	PieceType    string
 	Title        string
-	// TaskID (migration 0080, docs/erd-costura-providencia-tarefa-peca.md §3):
+	// TaskID (migration 0088, docs/erd-costura-providencia-tarefa-peca.md §3):
 	// when present, Create runs the task-sourced flow — it takes precedence over
 	// Source and the intimation/case/piece_type it would otherwise resolve. Empty
 	// for every pre-existing caller (source=intimation/processo/blank).
@@ -182,7 +182,7 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 		}
 
 		if cmd.TaskID != "" {
-			// Task-sourced (migration 0080, docs §3): bypasses Source entirely —
+			// Task-sourced (migration 0088, docs §3): bypasses Source entirely —
 			// the draft's intimation/case/piece_type come from the providência the
 			// task stems from, never from the body.
 			if err := uc.populateFromTask(ctx, tx, cmd.TenantID, cmd.TaskID, d); err != nil {
@@ -227,7 +227,7 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 		if err != nil {
 			if errors.Is(err, ErrDraftAlreadyExists) {
 				// Idempotent: fetch and return the existing row (→ 200 at the edge).
-				// Task-sourced and legacy hit different unique indexes (0080), so
+				// Task-sourced and legacy hit different unique indexes (0088), so
 				// they fetch back through different keys.
 				var existing *Draft
 				var fetchErr error
@@ -272,7 +272,7 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 	return result, nil
 }
 
-// populateFromTask implements the task-sourced Create flow (migration 0080,
+// populateFromTask implements the task-sourced Create flow (migration 0088,
 // docs/erd-costura-providencia-tarefa-peca.md §3): the draft INHERITS its
 // intimation, case, and piece_type from the providência (action_item) the task
 // stems from — it never re-chooses the type, so any cmd.PieceType the caller sent

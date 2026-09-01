@@ -1,4 +1,4 @@
--- 0080: draft.task_id + draft.piece_profile_key (docs/erd-costura-providencia-tarefa-
+-- 0088: draft.task_id + draft.piece_profile_key (docs/erd-costura-providencia-tarefa-
 -- peca.md §2/§3) — the task-sourced Create flow (POST /v1/pecas with a task_id body
 -- field) inherits its piece_type from the providência (action_item) the task stems
 -- from, never re-choosing it (§3, "a Minuta herda, não re-escolhe"). Also adds
@@ -9,7 +9,7 @@
 --   * task_id references task(id) — nullable: only Create's task-sourced path sets
 --     it; every existing draft (source=intimation/processo/blank) leaves it NULL.
 --   * piece_profile_key references piece_profile(key) — nullable, mirrors
---     action_item.piece_profile_key (0078): a draft always has a piece_type (text,
+--     action_item.piece_profile_key (0086): a draft always has a piece_type (text,
 --     free-form label), but only a task-sourced draft also carries the STRUCTURED
 --     catalog key it was derived from.
 --   * superseded_at/superseded_by_draft_id: nullable, self-referential FK. Future

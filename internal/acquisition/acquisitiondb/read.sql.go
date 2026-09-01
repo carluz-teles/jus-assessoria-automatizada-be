@@ -152,6 +152,7 @@ const countIntimacoesFiltered = `-- name: CountIntimacoesFiltered :one
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.tenant_id = $1
   AND (
     $2::text = ''
@@ -166,17 +167,29 @@ WHERE i.tenant_id = $1
     $6::uuid IS NULL
     OR i.assignee_user_id = $6::uuid
   )
+  -- Status = work_stage (CASE espelha deriveWorkStage; igual ao ListIntimacoes).
   AND (
     $7::text = ''
-    OR ($7::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($7::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($7::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($7::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($7::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($7::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($7::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (CASE
+      WHEN dr.filed_at IS NOT NULL THEN 'FILED'
+      WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
+      WHEN dr.status = 'DRAFT' THEN 'DRAFTING'
+      WHEN d.id IS NULL THEN 'RECEIVED'
+      WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
+      ELSE 'AWAITING_CONFIRMATION'
+    END) = $7::text
   )
-  AND ($8::bool = false OR d.status = 'PENDING')
+  AND (
+    $8::text = ''
+    OR ($8::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($8::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($8::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($8::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($8::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($8::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($8::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+  )
+  AND ($9::bool = false OR d.status = 'PENDING')
 `
 
 type CountIntimacoesFilteredParams struct {
@@ -186,6 +199,7 @@ type CountIntimacoesFilteredParams struct {
 	UserStatus    string      `json:"user_status"`
 	Court         string      `json:"court"`
 	AssigneeID    pgtype.UUID `json:"assignee_id"`
+	WorkStage     string      `json:"work_stage"`
 	Urgencia      string      `json:"urgencia"`
 	NaoConfirmado bool        `json:"nao_confirmado"`
 }
@@ -204,6 +218,7 @@ func (q *Queries) CountIntimacoesFiltered(ctx context.Context, arg CountIntimaco
 		arg.UserStatus,
 		arg.Court,
 		arg.AssigneeID,
+		arg.WorkStage,
 		arg.Urgencia,
 		arg.NaoConfirmado,
 	)
@@ -286,9 +301,10 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        -- detail pra alimentar a linha "Distribuição" da barra rica.
        cr.filed_at AS distribution_date,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
-       -- ai_providencias NÃO é mais lida aqui (0078) — as providências materializadas
-       -- vivem em action_item; ver ListActionItemsByIntimation abaixo.
-       i.ai_summary, i.ai_analyzed_at,
+       -- ai_providencias NÃO é mais lida aqui (0086) — as providências materializadas
+       -- vivem em action_item; ver ListActionItemsByIntimation abaixo. ai_act (0082) =
+       -- o ato classificado pela IA (título do detalhe + pill "Ato").
+       i.ai_summary, i.ai_analyzed_at, i.ai_act,
        -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
        i.assignee_user_id,
        ua.name                                                                     AS assignee_user_name,
@@ -302,12 +318,19 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed,
        -- histórico derivado: confirmed_at + confirmer name (para label "Prazo confirmado por X")
        d.confirmed_at                                                             AS prazo_confirmed_at,
-       ucf.name                                                                   AS prazo_confirmed_by_name
+       ucf.name                                                                   AS prazo_confirmed_by_name,
+       -- peça (draft) desta intimação — no máximo uma (unique parcial em
+       -- (tenant_id, intimation_id), migration 0042). status + filed_at posicionam
+       -- o work_stage nas etapas de peticionamento (DRAFTING/PARTNER_REVIEW/FILED).
+       -- NULL/false quando a intimação ainda não tem peça.
+       dr.status                                                                  AS draft_status,
+       dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua  ON ua.id = i.assignee_user_id
 LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.id = $1 AND i.tenant_id = $2
 `
 
@@ -340,6 +363,7 @@ type GetIntimacaoRow struct {
 	DistributionDate     pgtype.Date        `json:"distribution_date"`
 	AiSummary            *string            `json:"ai_summary"`
 	AiAnalyzedAt         pgtype.Timestamptz `json:"ai_analyzed_at"`
+	AiAct                *string            `json:"ai_act"`
 	AssigneeUserID       pgtype.UUID        `json:"assignee_user_id"`
 	AssigneeUserName     *string            `json:"assignee_user_name"`
 	PrazoDeadlineID      pgtype.UUID        `json:"prazo_deadline_id"`
@@ -349,6 +373,8 @@ type GetIntimacaoRow struct {
 	PrazoConfirmed       interface{}        `json:"prazo_confirmed"`
 	PrazoConfirmedAt     pgtype.Timestamptz `json:"prazo_confirmed_at"`
 	PrazoConfirmedByName *string            `json:"prazo_confirmed_by_name"`
+	DraftStatus          *string            `json:"draft_status"`
+	DraftFiledAt         pgtype.Timestamptz `json:"draft_filed_at"`
 }
 
 // One intimation by id, for the FE deep-link into the inbox DETAIL screen (an intimation
@@ -395,6 +421,7 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 		&i.DistributionDate,
 		&i.AiSummary,
 		&i.AiAnalyzedAt,
+		&i.AiAct,
 		&i.AssigneeUserID,
 		&i.AssigneeUserName,
 		&i.PrazoDeadlineID,
@@ -404,6 +431,8 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 		&i.PrazoConfirmed,
 		&i.PrazoConfirmedAt,
 		&i.PrazoConfirmedByName,
+		&i.DraftStatus,
+		&i.DraftFiledAt,
 	)
 	return i, err
 }
@@ -411,6 +440,8 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 const getProcesso = `-- name: GetProcesso :one
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
        -- an unassigned case still returns the record with NULL assigned_user_id/name.
        cc.assigned_user_id, au.name AS assigned_user_name,
@@ -460,6 +491,8 @@ type GetProcessoRow struct {
 	Secrecy              string             `json:"secrecy"`
 	Lifecycle            string             `json:"lifecycle"`
 	Completeness         float32            `json:"completeness"`
+	Phase                *string            `json:"phase"`
+	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
 	LastMovementText     string             `json:"last_movement_text"`
@@ -492,6 +525,8 @@ func (q *Queries) GetProcesso(ctx context.Context, arg GetProcessoParams) (GetPr
 		&i.Secrecy,
 		&i.Lifecycle,
 		&i.Completeness,
+		&i.Phase,
+		&i.ClaimValue,
 		&i.AssignedUserID,
 		&i.AssignedUserName,
 		&i.LastMovementText,
@@ -622,7 +657,7 @@ func (q *Queries) ListActionItemsByIntimation(ctx context.Context, arg ListActio
 }
 
 const listAndamentosByProcesso = `-- name: ListAndamentosByProcesso :many
-SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.source, de.fidelity
+SELECT de.id, de.occurred_at, de.observed_at, de.tpu_code, de.text, de.complements, de.source, de.fidelity
 FROM docket_entry de
 JOIN court_record cr ON cr.id = de.court_record_id
 WHERE de.court_record_id = $1::uuid
@@ -641,13 +676,14 @@ type ListAndamentosByProcessoParams struct {
 }
 
 type ListAndamentosByProcessoRow struct {
-	ID         uuid.UUID          `json:"id"`
-	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
-	ObservedAt pgtype.Timestamptz `json:"observed_at"`
-	TpuCode    *int32             `json:"tpu_code"`
-	Text       string             `json:"text"`
-	Source     string             `json:"source"`
-	Fidelity   int32              `json:"fidelity"`
+	ID          uuid.UUID          `json:"id"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+	ObservedAt  pgtype.Timestamptz `json:"observed_at"`
+	TpuCode     *int32             `json:"tpu_code"`
+	Text        string             `json:"text"`
+	Complements []byte             `json:"complements"`
+	Source      string             `json:"source"`
+	Fidelity    int32              `json:"fidelity"`
 }
 
 // The "Andamentos" tab of one process: the court record's docket entries, newest
@@ -676,9 +712,57 @@ func (q *Queries) ListAndamentosByProcesso(ctx context.Context, arg ListAndament
 			&i.ObservedAt,
 			&i.TpuCode,
 			&i.Text,
+			&i.Complements,
 			&i.Source,
 			&i.Fidelity,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDeadlineEventsByDeadlineID = `-- name: ListDeadlineEventsByDeadlineID :many
+SELECT em, detalhe
+FROM deadline_event
+WHERE deadline_id = $1 AND tenant_id = $2
+ORDER BY em
+`
+
+type ListDeadlineEventsByDeadlineIDParams struct {
+	DeadlineID uuid.UUID `json:"deadline_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+}
+
+type ListDeadlineEventsByDeadlineIDRow struct {
+	Em      pgtype.Timestamptz `json:"em"`
+	Detalhe *string            `json:"detalhe"`
+}
+
+// The deadline_event audit trail for one prazo (deadline slice's table — acquisition already
+// reads `deadline` directly for other GetIntimacao fields, e.g. confirmed_at/confirmed_by_name
+// above, the same precedent: read the table, never import the deadline package). GetIntimacao
+// merges these into the intimação's unified Trilha (IntimacaoHistoryEntry) alongside the
+// capture/confirmation/analysis signals — every "calculado"/"validado"/"confirmado" moment the
+// apuração flow (deadline slice's apurar.go) recorded. Ordered ASC by em (the caller merges +
+// re-sorts the WHOLE timeline anyway, but an already-ordered result keeps this query useful
+// standalone). Scoped to (deadline_id, tenant_id) (barrier 1, on top of RLS barrier 2). No rows
+// (a prazo with no recorded events, or none at all when the intimação has no prazo yet) yields an
+// empty slice, never an error. $1 = deadline_id, $2 = tenant_id.
+func (q *Queries) ListDeadlineEventsByDeadlineID(ctx context.Context, arg ListDeadlineEventsByDeadlineIDParams) ([]ListDeadlineEventsByDeadlineIDRow, error) {
+	rows, err := q.db.Query(ctx, listDeadlineEventsByDeadlineID, arg.DeadlineID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDeadlineEventsByDeadlineIDRow
+	for rows.Next() {
+		var i ListDeadlineEventsByDeadlineIDRow
+		if err := rows.Scan(&i.Em, &i.Detalhe); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -734,11 +818,15 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        d.end_date                                                                 AS prazo_end_date,
        CASE WHEN d.id IS NOT NULL THEN (d.end_date - CURRENT_DATE)::int END       AS prazo_days_left,
        d.status                                                                   AS prazo_status,
-       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed
+       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed,
+       -- peça (draft) da intimação → work_stage (mesmo join do GetIntimacao).
+       dr.status                                                                  AS draft_status,
+       dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.tenant_id = $1
   AND (
     $3::text = ''
@@ -753,21 +841,34 @@ WHERE i.tenant_id = $1
     $7::uuid IS NULL
     OR i.assignee_user_id = $7::uuid
   )
+  -- Status = work_stage derivado. O CASE ESPELHA deriveWorkStage (read.go) — mesma
+  -- precedência marco-mais-avançado-vence. Manter os dois em sincronia.
   AND (
     $8::text = ''
-    OR ($8::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($8::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($8::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($8::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($8::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($8::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
-    OR ($8::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR (CASE
+      WHEN dr.filed_at IS NOT NULL THEN 'FILED'
+      WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
+      WHEN dr.status = 'DRAFT' THEN 'DRAFTING'
+      WHEN d.id IS NULL THEN 'RECEIVED'
+      WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
+      ELSE 'AWAITING_CONFIRMATION'
+    END) = $8::text
+  )
+  AND (
+    $9::text = ''
+    OR ($9::text = 'atraso'             AND (d.end_date - CURRENT_DATE) < 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($9::text = 'hoje'               AND (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($9::text = 'proximos_dois_dias' AND (d.end_date - CURRENT_DATE) BETWEEN 1 AND 2 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($9::text = 'semana'             AND (d.end_date - CURRENT_DATE) BETWEEN 3 AND 7 AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($9::text = 'este_mes'           AND (d.end_date - CURRENT_DATE) > 7 AND d.end_date <= (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($9::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
+    OR ($9::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
   )
   -- "Não confirmadas" triage toggle (?nao_confirmado): server-side, combines with any
   -- temporal tab. Reuses the former nao_confirmado predicate — a suggested (not yet
   -- human-confirmed) deadline has d.status = 'PENDING'. When off, no extra filter.
-  AND ($9::bool = false OR d.status = 'PENDING')
-  AND (i.made_available_at, i.id) < ($10::date, $11::uuid)
+  AND ($10::bool = false OR d.status = 'PENDING')
+  AND (i.made_available_at, i.id) < ($11::date, $12::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2
 `
@@ -780,6 +881,7 @@ type ListIntimacoesParams struct {
 	UserStatus        string      `json:"user_status"`
 	Court             string      `json:"court"`
 	AssigneeID        pgtype.UUID `json:"assignee_id"`
+	WorkStage         string      `json:"work_stage"`
 	Urgencia          string      `json:"urgencia"`
 	NaoConfirmado     bool        `json:"nao_confirmado"`
 	LastMadeAvailable pgtype.Date `json:"last_made_available"`
@@ -811,6 +913,8 @@ type ListIntimacoesRow struct {
 	PrazoDaysLeft    interface{}        `json:"prazo_days_left"`
 	PrazoStatus      *string            `json:"prazo_status"`
 	PrazoConfirmed   interface{}        `json:"prazo_confirmed"`
+	DraftStatus      *string            `json:"draft_status"`
+	DraftFiledAt     pgtype.Timestamptz `json:"draft_filed_at"`
 }
 
 // The intimações inbox: the tenant's intimations, newest availability first, with
@@ -833,6 +937,7 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 		arg.UserStatus,
 		arg.Court,
 		arg.AssigneeID,
+		arg.WorkStage,
 		arg.Urgencia,
 		arg.NaoConfirmado,
 		arg.LastMadeAvailable,
@@ -870,6 +975,8 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 			&i.PrazoDaysLeft,
 			&i.PrazoStatus,
 			&i.PrazoConfirmed,
+			&i.DraftStatus,
+			&i.DraftFiledAt,
 		); err != nil {
 			return nil, err
 		}
@@ -884,9 +991,17 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 const listIntimacoesByProcesso = `-- name: ListIntimacoesByProcesso :many
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
-       cr.cnj_number, cr.court, cr.degree, cr.class, cr.id AS court_record_id
+       cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id,
+       i.ai_analyzed_at, i.assignee_user_id, ua.name AS assignee_user_name,
+       d.id                                                                 AS prazo_deadline_id,
+       d.end_date                                                           AS prazo_end_date,
+       CASE WHEN d.id IS NOT NULL THEN (d.end_date - CURRENT_DATE)::int END AS prazo_days_left,
+       d.status                                                             AS prazo_status,
+       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END     AS prazo_confirmed
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
 WHERE i.court_record_id = $1::uuid
   AND i.tenant_id = $2::uuid
   AND (i.made_available_at, i.id) < ($3::date, $4::uuid)
@@ -903,21 +1018,30 @@ type ListIntimacoesByProcessoParams struct {
 }
 
 type ListIntimacoesByProcessoRow struct {
-	ID              uuid.UUID   `json:"id"`
-	MadeAvailableAt pgtype.Date `json:"made_available_at"`
-	PublishedAt     pgtype.Date `json:"published_at"`
-	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
-	Content         string      `json:"content"`
-	Type            *string     `json:"type"`
-	Status          string      `json:"status"`
-	UserStatus      string      `json:"user_status"`
-	Source          string      `json:"source"`
-	SourceUrl       *string     `json:"source_url"`
-	CnjNumber       string      `json:"cnj_number"`
-	Court           string      `json:"court"`
-	Degree          string      `json:"degree"`
-	Class           *string     `json:"class"`
-	CourtRecordID   uuid.UUID   `json:"court_record_id"`
+	ID               uuid.UUID          `json:"id"`
+	MadeAvailableAt  pgtype.Date        `json:"made_available_at"`
+	PublishedAt      pgtype.Date        `json:"published_at"`
+	DeadlineStartAt  pgtype.Date        `json:"deadline_start_at"`
+	Content          string             `json:"content"`
+	Type             *string            `json:"type"`
+	Status           string             `json:"status"`
+	UserStatus       string             `json:"user_status"`
+	Source           string             `json:"source"`
+	SourceUrl        *string            `json:"source_url"`
+	CnjNumber        string             `json:"cnj_number"`
+	Court            string             `json:"court"`
+	Degree           string             `json:"degree"`
+	Class            *string            `json:"class"`
+	Subject          *string            `json:"subject"`
+	CourtRecordID    uuid.UUID          `json:"court_record_id"`
+	AiAnalyzedAt     pgtype.Timestamptz `json:"ai_analyzed_at"`
+	AssigneeUserID   pgtype.UUID        `json:"assignee_user_id"`
+	AssigneeUserName *string            `json:"assignee_user_name"`
+	PrazoDeadlineID  pgtype.UUID        `json:"prazo_deadline_id"`
+	PrazoEndDate     pgtype.Date        `json:"prazo_end_date"`
+	PrazoDaysLeft    interface{}        `json:"prazo_days_left"`
+	PrazoStatus      *string            `json:"prazo_status"`
+	PrazoConfirmed   interface{}        `json:"prazo_confirmed"`
 }
 
 // The "Intimações" tab of one process: the intimations filed on this court record,
@@ -927,6 +1051,9 @@ type ListIntimacoesByProcessoRow struct {
 // tenant's record) matches nothing. Descending keyset on (made_available_at, id) —
 // served by intimation(court_record_id, made_available_at DESC) — the first page
 // passes the max sentinel ('9999-12-31', max-uuid).
+// MESMA projeção do ListIntimacoes (inbox): traz o responsável (assignee_user_id/name)
+// e o prazo derivado (LEFT JOINs deadline + app_user), pra o card de intimação do cockpit
+// renderizar "resp." e o prazo/fatal como no design.
 func (q *Queries) ListIntimacoesByProcesso(ctx context.Context, arg ListIntimacoesByProcessoParams) ([]ListIntimacoesByProcessoRow, error) {
 	rows, err := q.db.Query(ctx, listIntimacoesByProcesso,
 		arg.CourtRecordID,
@@ -957,7 +1084,16 @@ func (q *Queries) ListIntimacoesByProcesso(ctx context.Context, arg ListIntimaco
 			&i.Court,
 			&i.Degree,
 			&i.Class,
+			&i.Subject,
 			&i.CourtRecordID,
+			&i.AiAnalyzedAt,
+			&i.AssigneeUserID,
+			&i.AssigneeUserName,
+			&i.PrazoDeadlineID,
+			&i.PrazoEndDate,
+			&i.PrazoDaysLeft,
+			&i.PrazoStatus,
+			&i.PrazoConfirmed,
 		); err != nil {
 			return nil, err
 		}
@@ -1145,6 +1281,8 @@ const listProcessos = `-- name: ListProcessos :many
 
 SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
        cr.judging_body, cr.filed_at, cr.secrecy, cr.lifecycle, cr.completeness,
+       -- fase EFETIVA (override manual vence a derivada) + valor da causa (manual).
+       COALESCE(cr.phase_override, cr.phase) AS phase, cr.claim_value,
        -- responsável do processo: assigned at case level (court_case), shared across
        -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
        -- leaves assigned_user_id/name NULL, never dropping the record from the list.
@@ -1211,6 +1349,8 @@ type ListProcessosRow struct {
 	Secrecy              string             `json:"secrecy"`
 	Lifecycle            string             `json:"lifecycle"`
 	Completeness         float32            `json:"completeness"`
+	Phase                *string            `json:"phase"`
+	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
 	LastMovementText     string             `json:"last_movement_text"`
@@ -1270,6 +1410,8 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 			&i.Secrecy,
 			&i.Lifecycle,
 			&i.Completeness,
+			&i.Phase,
+			&i.ClaimValue,
 			&i.AssignedUserID,
 			&i.AssignedUserName,
 			&i.LastMovementText,

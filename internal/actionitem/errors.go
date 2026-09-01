@@ -41,7 +41,7 @@ var (
 
 	// errInvalidTipoOrigem/errInvalidTipoStatus/errGeraPecaWithoutProfile/
 	// errProfileWithoutGeraPeca/errConfiancaWithoutIA back ActionItem.validate()'s
-	// belt-and-suspenders checks (validation.go) — the same invariants migration 0078's
+	// belt-and-suspenders checks (validation.go) — the same invariants migration 0086's
 	// CHECK constraints enforce at the DB layer. Unexported: these never cross the
 	// materialization listener as a client-facing response, only as a defensive guard
 	// against a bug in this slice's own construction of the entity.

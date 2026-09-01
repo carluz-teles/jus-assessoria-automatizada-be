@@ -535,7 +535,7 @@ func TestReclassificar(t *testing.T) {
 		// "Confianca reset" assertion below pass vacuously (nil stays nil) without ever
 		// exercising the reset. Seeding a real score here is what makes this a meaningful
 		// proof that Reclassificar's result carries confianca=nil, not just an artifact of
-		// the zero value. The REAL reset (migration 0078's action_item_check1: tipo_origem =
+		// the zero value. The REAL reset (migration 0086's action_item_check1: tipo_origem =
 		// 'ia' OR confianca IS NULL) only bites at the SQL layer — proven against a real
 		// Postgres by TestReclassify_IAOrigemWithConfianca_ResetsConfiancaAndSatisfiesCheck
 		// in test/integration/action_item_reclassify_test.go.

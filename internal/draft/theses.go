@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -266,7 +267,7 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 	// comprometer grounding (empiricamente as top-5 respondem a 90%+ das
 	// teses; chunks 6-8 raramente aparecem citados). Ganho: 400-800ms no LLM
 	// quando o corpus está indexado. Em dev sem chunks é no-op.
-	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, queryText, 5)
+	chunks, chunkHits, grounded := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, queryText, 5)
 
 	draftCtx := buildDraftContext(d, intimation, parties, chunks)
 	composed, err := uc.composer.ComposeTheses(advisory.AgentSuggestTheses, draftCtx)
@@ -286,6 +287,8 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		SchemaName: "suggest_theses",
 		Model:      model,
 		MaxTokens:  2048,
+		UseCase:    "draft.theses",
+		TenantID:   cmd.TenantID,
 	})
 	llmMs := time.Since(llmStart).Milliseconds()
 	if err != nil {
@@ -317,13 +320,123 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		}
 	}
 
+	// Source attribution: tie each thesis's literal evidence back to the autos
+	// document it was retrieved from (the LLM returns only quotes, not ids), so the
+	// peça screen can show "esta tese se apoia na Petição inicial · pág. 3" instead
+	// of only the teor. Post-hoc match against the RAG hits — no extra LLM call.
+	attributed := 0
+	for i := range theses {
+		attributeThesisSource(&theses[i], chunkHits)
+		if theses[i].SourceDocumentID != "" {
+			attributed++
+		}
+	}
+
 	slog.InfoContext(ctx, "draft theses suggestion completed",
 		slog.String("draft_id", cmd.DraftID),
 		slog.String("model", model),
 		slog.Int64("llm_ms", llmMs),
 		slog.Int("theses", len(theses)),
 		slog.Int("alta_downgraded", downgraded),
+		slog.Int("source_attributed", attributed),
 		slog.Bool("grounded", grounded),
 	)
 	return &SuggestThesesResult{Theses: theses}, nil
+}
+
+// minEvidenceMatchLen guards against a too-short evidence excerpt (e.g. "art. 5º")
+// spuriously matching many chunks — only excerpts of real substance attribute a
+// source. 24 normalized chars ≈ a short sentence fragment.
+const minEvidenceMatchLen = 24
+
+// attributeThesisSource ties a thesis to the autos document its literal Evidence was
+// retrieved from: it substring-matches each evidence against the RAG chunk hits
+// (normalized: lowercased, whitespace-collapsed — the LLM quotes verbatim FROM the
+// chunk, so a real quote is a substring of it), and attributes the thesis to the
+// document cited by the MOST evidence (tiebreak: highest chunk score). Evidence that
+// matches no retrieved chunk (teor-only or doctrinal) leaves the source empty — the
+// caller/FE falls back to the teor, the pre-existing behavior. Mirrors the chat's
+// validateChatCitations philosophy: grounding only in what was actually retrieved.
+func attributeThesisSource(t *Thesis, hits []indexing.ChunkHit) {
+	if len(t.Evidence) == 0 || len(hits) == 0 {
+		return
+	}
+
+	type docAgg struct {
+		count     int
+		bestScore float64
+		hit       indexing.ChunkHit
+		excerpt   string
+	}
+	byDoc := map[string]*docAgg{}
+
+	for _, ev := range t.Evidence {
+		nev := normalizeForMatch(ev)
+		if len(nev) < minEvidenceMatchLen {
+			continue
+		}
+		// Best hit for THIS evidence: a chunk whose text contains the quote, highest score.
+		var best *indexing.ChunkHit
+		for i := range hits {
+			if hits[i].DocumentID == "" {
+				continue
+			}
+			if !strings.Contains(normalizeForMatch(hits[i].Text), nev) {
+				continue
+			}
+			if best == nil || hits[i].Score > best.Score {
+				best = &hits[i]
+			}
+		}
+		if best == nil {
+			continue
+		}
+		a := byDoc[best.DocumentID]
+		if a == nil {
+			a = &docAgg{}
+			byDoc[best.DocumentID] = a
+		}
+		a.count++
+		if best.Score >= a.bestScore {
+			a.bestScore = best.Score
+			a.hit = *best
+			a.excerpt = ev
+		}
+	}
+
+	var win *docAgg
+	for _, a := range byDoc {
+		if win == nil || a.count > win.count || (a.count == win.count && a.bestScore > win.bestScore) {
+			win = a
+		}
+	}
+	if win == nil {
+		return
+	}
+	t.SourceDocumentID = win.hit.DocumentID
+	t.SourcePage = win.hit.Page
+	t.SourceExcerpt = win.excerpt
+	t.SourceLabel = thesisSourceLabel(win.hit)
+}
+
+// thesisSourceLabel renders a human "documento · pág. N" label from a chunk hit,
+// preferring the document title, then its type, then a generic fallback.
+func thesisSourceLabel(h indexing.ChunkHit) string {
+	name := strings.TrimSpace(h.DocumentTitle)
+	if name == "" {
+		name = strings.TrimSpace(h.DocumentType)
+	}
+	if name == "" {
+		name = "Documento dos autos"
+	}
+	if h.Page > 0 {
+		return fmt.Sprintf("%s · pág. %d", name, h.Page)
+	}
+	return name
+}
+
+// normalizeForMatch lowercases and collapses runs of whitespace so a literal quote
+// matches its source chunk despite trivial formatting differences.
+func normalizeForMatch(s string) string {
+	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
 }

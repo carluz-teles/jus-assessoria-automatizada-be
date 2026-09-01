@@ -97,6 +97,10 @@ func (f *fakeHandlerUC) AssignResponsible(_ context.Context, tenantID, courtReco
 	return f.assignErr
 }
 
+func (f *fakeHandlerUC) UpdateProcessoManual(_ context.Context, _, _ string, _ *string, _ *float64) error {
+	return nil
+}
+
 func (f *fakeHandlerUC) BulkAssignResponsible(_ context.Context, tenantID string, all bool, q ProcessosQuery, ids []string, assignedUserID *string) (int64, error) {
 	f.gotBulkTenant = tenantID
 	f.gotBulkAll = all

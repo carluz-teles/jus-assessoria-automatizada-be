@@ -1,4 +1,4 @@
--- 0078: action_item — the Providência (docs/erd-costura-providencia-tarefa-peca.md §2).
+-- 0086: action_item — the Providência (docs/erd-costura-providencia-tarefa-peca.md §2).
 -- Bridges notification (intimação, 1:N) → action_item → task (1:1, created by a later
 -- fatia's deadline listener) → draft (herda o piece_profile da providência). Tenant-scoped
 -- (RLS, CLAUDE.md inegociável) via tenant_id.

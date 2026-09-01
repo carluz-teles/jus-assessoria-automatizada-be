@@ -31,7 +31,10 @@ import (
 // IntimacaoAnaliseView is the wire DTO returned by POST /v1/intimacoes/:id/analise.
 // Providencias is always initialized so it serializes as [], never null.
 type IntimacaoAnaliseView struct {
-	Summary      string                   `json:"summary"`
+	Summary string `json:"summary"`
+	// Ato é o ato principal classificado pela IA (ex.: "Contestação") — vira o TÍTULO
+	// do detalhe e o pill "Ato". "" no modo degradado / análise antiga.
+	Ato          string                   `json:"ato"`
 	Providencias []AnaliseProvidenciaView `json:"providencias"`
 	AnalyzedAt   time.Time                `json:"analyzed_at"`
 }
@@ -105,6 +108,9 @@ type SaveAnaliseParams struct {
 	TenantID     string
 	IntimationID string
 	Summary      string
+	// Ato é o ato principal classificado pela IA (ex.: "Contestação") — persistido em
+	// intimation.ai_act (migration 0082). "" na escrita degradada.
+	Ato          string
 	DeadlineID   string
 	Providencias []ProvidenciaCandidate
 	LogActivity  bool
@@ -151,6 +157,7 @@ var intimationAnalysisSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
     "summary": { "type": "string" },
+    "ato": { "type": "string" },
     "providencias": {
       "type": "array",
       "items": {
@@ -172,7 +179,7 @@ var intimationAnalysisSchema = json.RawMessage(`{
       }
     }
   },
-  "required": ["summary", "providencias"],
+  "required": ["summary", "ato", "providencias"],
   "additionalProperties": false
 }`)
 
@@ -198,20 +205,20 @@ func (uc *AnaliseUseCase) Analisar(ctx context.Context, tenantID, intimationID s
 		return uc.persistDegraded(ctx, tenantID, intimationID, ctxData.DeadlineID), nil
 	}
 
-	view, ok := uc.generate(ctx, intimationID, ctxData)
+	view, ok := uc.generate(ctx, tenantID, intimationID, ctxData)
 	if !ok {
 		// Any LLM/compose/parse fault degrades — never a 5xx on the analyze button.
 		return uc.persistDegraded(ctx, tenantID, intimationID, ctxData.DeadlineID), nil
 	}
 
 	// Persist best-effort (OVERWRITE). A store fault must not cost the answer — log and keep it.
-	uc.persist(ctx, tenantID, intimationID, view.Summary, ctxData.DeadlineID, candidatesFromView(view.Providencias), true)
+	uc.persist(ctx, tenantID, intimationID, view.Summary, view.Ato, ctxData.DeadlineID, candidatesFromView(view.Providencias), true)
 	return view, nil
 }
 
 // generate composes the prompt, calls the LLM, parses+sanitizes the output. ok=false on any
 // fault (the caller degrades). Never returns an error — faults are logged here.
-func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctxData IntimacaoAnaliseCtx) (IntimacaoAnaliseView, bool) {
+func (uc *AnaliseUseCase) generate(ctx context.Context, tenantID, intimationID string, ctxData IntimacaoAnaliseCtx) (IntimacaoAnaliseView, bool) {
 	members := make([]advisory.MemberCtx, 0, len(ctxData.Members))
 	for _, m := range ctxData.Members {
 		members = append(members, advisory.MemberCtx{UserID: m.UserID, Name: m.Name})
@@ -239,6 +246,8 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctx
 		SchemaName: "intimation_analysis",
 		Model:      uc.model, // "" = cai no default do generator
 		MaxTokens:  1500,
+		UseCase:    "acquisition.analyze_intimation",
+		TenantID:   tenantID,
 	})
 	if err != nil {
 		slog.WarnContext(ctx, "acquisition: intimation analysis generation failed",
@@ -248,6 +257,7 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctx
 
 	var parsed struct {
 		Summary      string `json:"summary"`
+		Ato          string `json:"ato"`
 		Providencias []struct {
 			Title                   string   `json:"title"`
 			Description             string   `json:"description"`
@@ -290,7 +300,12 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctx
 			Confianca:               confianca,
 		})
 	}
-	return IntimacaoAnaliseView{Summary: parsed.Summary, Providencias: prov, AnalyzedAt: time.Now()}, true
+	return IntimacaoAnaliseView{
+		Summary:      parsed.Summary,
+		Ato:          strings.TrimSpace(parsed.Ato),
+		Providencias: prov,
+		AnalyzedAt:   time.Now(),
+	}, true
 }
 
 // normalizeTipo trims/lowercases the model's tipo so a trivial casing/whitespace quirk does
@@ -372,7 +387,7 @@ func clampDueDate(due *string, endDate string) *string {
 // persistDegraded writes+returns the empty analysis (summary="", providencias=[]) with a
 // fresh analyzed_at, so the FE moves to pós-análise and shows the "IA indisponível" state.
 func (uc *AnaliseUseCase) persistDegraded(ctx context.Context, tenantID, intimationID, deadlineID string) IntimacaoAnaliseView {
-	uc.persist(ctx, tenantID, intimationID, "", deadlineID, nil, false)
+	uc.persist(ctx, tenantID, intimationID, "", "", deadlineID, nil, false)
 	return IntimacaoAnaliseView{Summary: "", Providencias: []AnaliseProvidenciaView{}, AnalyzedAt: time.Now()}
 }
 
@@ -380,7 +395,7 @@ func (uc *AnaliseUseCase) persistDegraded(ctx context.Context, tenantID, intimat
 // keeps the answer even if the row didn't update / the event didn't publish). logActivity=
 // true only on a real analysis — the degraded write (no LLM / LLM fault) never logs a
 // process activity row.
-func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary, deadlineID string, candidates []ProvidenciaCandidate, logActivity bool) {
+func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary, ato, deadlineID string, candidates []ProvidenciaCandidate, logActivity bool) {
 	if uc.store == nil {
 		return
 	}
@@ -388,6 +403,7 @@ func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, s
 		TenantID:     tenantID,
 		IntimationID: intimationID,
 		Summary:      summary,
+		Ato:          ato,
 		DeadlineID:   deadlineID,
 		Providencias: candidates,
 		LogActivity:  logActivity,

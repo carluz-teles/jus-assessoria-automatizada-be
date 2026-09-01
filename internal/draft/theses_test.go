@@ -233,3 +233,113 @@ func TestThesesUseCase_WithIntimation_CRIDResolved(t *testing.T) {
 		t.Errorf("theses = %d, want 2", len(result.Theses))
 	}
 }
+
+// --- attributeThesisSource / thesisSourceLabel -------------------------------
+
+func TestAttributeThesisSource(t *testing.T) {
+	t.Parallel()
+
+	// Quotes long enough to clear minEvidenceMatchLen, each a verbatim substring of
+	// its chunk (the LLM quotes a subset of the chunk, so evidence ⊆ chunk text).
+	const quotePet = "o réu confessou a dívida em audiência de conciliação"
+	const quoteContrA = "a sociedade foi constituída por prazo indeterminado conforme cláusula"
+	const quoteContrB = "o capital social integralizado em moeda corrente nacional"
+
+	hits := []indexing.ChunkHit{
+		{DocumentID: "doc-pet", Page: 3, Text: "Trecho: " + quotePet + " e nada pagou.", Score: 0.91, DocumentTitle: "Petição inicial", DocumentType: "PET"},
+		{DocumentID: "doc-contr", Page: 1, Text: quoteContrA + ", com " + quoteContrB + ".", Score: 0.70, DocumentTitle: "", DocumentType: "CONTRSOCIAL"},
+	}
+
+	tests := []struct {
+		name      string
+		evidence  []string
+		hits      []indexing.ChunkHit
+		wantDocID string
+		wantPage  int
+		wantLabel string
+	}{
+		{
+			name:      "evidence matches a chunk verbatim → attributed to that document",
+			evidence:  []string{quotePet},
+			hits:      hits,
+			wantDocID: "doc-pet",
+			wantPage:  3,
+			wantLabel: "Petição inicial · pág. 3",
+		},
+		{
+			name:      "document cited by MORE evidence wins the tie-break by count",
+			evidence:  []string{quoteContrA, quoteContrB, quotePet},
+			hits:      hits,
+			wantDocID: "doc-contr",
+			wantPage:  1,
+			wantLabel: "CONTRSOCIAL · pág. 1", // no title → falls back to type
+		},
+		{
+			name:      "evidence too short to match → no attribution",
+			evidence:  []string{"art. 5º"},
+			hits:      hits,
+			wantDocID: "",
+		},
+		{
+			name:      "evidence not present in any chunk (teor-only) → no attribution",
+			evidence:  []string{"tese puramente doutrinária sem lastro no corpus recuperado"},
+			hits:      hits,
+			wantDocID: "",
+		},
+		{
+			name:      "no hits at all → no attribution",
+			evidence:  []string{quotePet},
+			hits:      nil,
+			wantDocID: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			th := &Thesis{Label: "t", Evidence: tt.evidence}
+			attributeThesisSource(th, tt.hits)
+
+			if th.SourceDocumentID != tt.wantDocID {
+				t.Fatalf("SourceDocumentID = %q, want %q", th.SourceDocumentID, tt.wantDocID)
+			}
+			if tt.wantDocID == "" {
+				if th.SourceLabel != "" || th.SourceExcerpt != "" || th.SourcePage != 0 {
+					t.Errorf("expected empty source, got label=%q excerpt=%q page=%d", th.SourceLabel, th.SourceExcerpt, th.SourcePage)
+				}
+				return
+			}
+			if th.SourcePage != tt.wantPage {
+				t.Errorf("SourcePage = %d, want %d", th.SourcePage, tt.wantPage)
+			}
+			if th.SourceLabel != tt.wantLabel {
+				t.Errorf("SourceLabel = %q, want %q", th.SourceLabel, tt.wantLabel)
+			}
+			if th.SourceExcerpt == "" {
+				t.Error("SourceExcerpt should carry the matched evidence, got empty")
+			}
+		})
+	}
+}
+
+func TestThesisSourceLabel_FallbacksAndPage(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		hit  indexing.ChunkHit
+		want string
+	}{
+		{"title + page", indexing.ChunkHit{DocumentTitle: "Petição inicial", Page: 5}, "Petição inicial · pág. 5"},
+		{"type fallback when no title", indexing.ChunkHit{DocumentType: "CERT", Page: 2}, "CERT · pág. 2"},
+		{"generic fallback when neither", indexing.ChunkHit{Page: 1}, "Documento dos autos · pág. 1"},
+		{"no page → no suffix", indexing.ChunkHit{DocumentTitle: "Contrato"}, "Contrato"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := thesisSourceLabel(tt.hit); got != tt.want {
+				t.Errorf("thesisSourceLabel = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -52,6 +52,26 @@ func (r AssignResponsibleRequest) Validate() error {
 	)
 }
 
+// UpdateProcessoManualRequest é o corpo do PATCH /v1/processos/:id: os campos que o
+// advogado preenche à mão no cockpit — a fase (override manual, vence a derivada) e o valor
+// da causa. Ambos *ponteiro: omitir deixa o campo como está (PATCH parcial). tenant_id vem do
+// principal, nunca do body.
+type UpdateProcessoManualRequest struct {
+	Phase      *string  `json:"phase"`
+	ClaimValue *float64 `json:"claim_value"`
+}
+
+// Validate: quando presente, a fase tem que estar no conjunto fechado do stepper e o valor
+// da causa não pode ser negativo (400 na borda). Ambos nil é válido (no-op).
+func (r UpdateProcessoManualRequest) Validate() error {
+	return validation.ValidateStruct(&r,
+		validation.Field(&r.Phase, validation.In(
+			FaseConhecimento, FaseInstrucao, FaseSentenca, FaseRecurso, FaseExecucao,
+		)),
+		validation.Field(&r.ClaimValue, validation.Min(0.0)),
+	)
+}
+
 // BulkAssignResponsibleRequest é o corpo de POST /v1/processos/bulk/responsavel:
 // atribui o responsável a vários processos. Dois modos: All=true aplica a TODA a
 // faixa/filtro atual (filtros espelham o GET /processos; inclui os itens ainda não

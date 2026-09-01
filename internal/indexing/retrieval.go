@@ -35,6 +35,12 @@ type ChunkHit struct {
 	Page       int
 	Text       string
 	Score      float64
+	// DocumentTitle/DocumentType come from the JOINed document row — enough for a
+	// caller to attribute a retrieved chunk to a human-readable source (e.g.
+	// draft.SuggestTheses labels a thesis's evidence with the autos document it
+	// came from) without a second query.
+	DocumentTitle string
+	DocumentType  string
 }
 
 // searchChunksSQL ranks chunks by cosine distance to the query vector (embedding <=> $1, the
@@ -42,7 +48,7 @@ type ChunkHit struct {
 // isolation (document.tenant_id = $2 — a chunk carries no tenant_id, so this is the ONLY barrier)
 // and optionally scopes to one process (document.court_record_id = $3 when $3 is non-null).
 // Soft-deleted documents are excluded. Score is 1 - distance (cosine similarity). $4 is topK.
-const searchChunksSQL = `SELECT c.document_id, c.page, c.text, 1 - (c.embedding <=> $1) AS score
+const searchChunksSQL = `SELECT c.document_id, c.page, c.text, 1 - (c.embedding <=> $1) AS score, COALESCE(d.title, '') AS title, COALESCE(d.document_type, '') AS document_type
 	FROM chunk c
 	JOIN document d ON d.id = c.document_id
 	WHERE d.tenant_id = $2
@@ -78,7 +84,7 @@ func SearchChunks(ctx context.Context, deps SearchDeps, tenantID string, courtRe
 	var hits []ChunkHit
 	for rows.Next() {
 		var h ChunkHit
-		if err := rows.Scan(&h.DocumentID, &h.Page, &h.Text, &h.Score); err != nil {
+		if err := rows.Scan(&h.DocumentID, &h.Page, &h.Text, &h.Score, &h.DocumentTitle, &h.DocumentType); err != nil {
 			return nil, database.WrapInfra(err)
 		}
 		hits = append(hits, h)

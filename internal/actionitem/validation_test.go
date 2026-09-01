@@ -85,7 +85,7 @@ func TestSanitizeCandidate(t *testing.T) {
 }
 
 // TestActionItem_Validate covers the belt-and-suspenders checks that mirror migration
-// 0078's CHECK constraints.
+// 0086's CHECK constraints.
 func TestActionItem_Validate(t *testing.T) {
 	t.Parallel()
 

@@ -134,7 +134,7 @@ func TestActionItemTask_FullLoop_AgainstRealDB(t *testing.T) {
 }
 
 // AIT2: idempotency — redelivering the SAME actionitem.created event never mints a second
-// task (the dedup mark), and even if the mark were somehow bypassed, the 0079 UNIQUE
+// task (the dedup mark), and even if the mark were somehow bypassed, the 0087 UNIQUE
 // (action_item_id) would still bar a second row (ErrTaskExistsForActionItem, absorbed as a
 // no-op).
 func TestActionItemTask_RedeliveredActionItemCreated_NeverDuplicatesTask(t *testing.T) {

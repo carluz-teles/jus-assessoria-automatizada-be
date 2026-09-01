@@ -115,7 +115,7 @@ func sanitizeCandidate(tipo string, geraPeca bool, pieceProfileKey string) (stri
 	return tipo, true, pieceProfileKey
 }
 
-// validate enforces the insert-time invariants migration 0078's CHECKs also enforce
+// validate enforces the insert-time invariants migration 0086's CHECKs also enforce
 // (belt-and-suspenders, same posture as every other slice's entity.validate()):
 // gera_peca and piece_profile_key travel together, and confianca only accompanies an
 // ia-derived classification.

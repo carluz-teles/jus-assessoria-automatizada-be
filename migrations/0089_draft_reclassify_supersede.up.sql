@@ -1,8 +1,8 @@
--- 0081: restrict draft_task_id_uidx to the VIGENTE draft per task (fatia 5, docs/erd-
+-- 0089: restrict draft_task_id_uidx to the VIGENTE draft per task (fatia 5, docs/erd-
 -- costura-providencia-tarefa-peca.md §7 questão 4 — "reclassificação depois de gerada a
 -- peça" — the Architect's decision: descartar e recomeçar, never mutate the peça in place).
 --
--- 0080's draft_task_id_uidx enforces "at most one draft per (tenant, task_id)" — correct
+-- 0088's draft_task_id_uidx enforces "at most one draft per (tenant, task_id)" — correct
 -- until a providência can be reclassified AFTER its peça exists. When that happens, the OLD
 -- draft is superseded (superseded_at = now(), never deleted — internal/draft's
 -- SupersedeDraftForTask) and a fresh POST /v1/pecas {task_id} must be able to mint the

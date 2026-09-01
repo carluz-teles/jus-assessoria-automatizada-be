@@ -62,7 +62,7 @@ type Querier interface {
 	// questão 4): overrides tipo/piece_profile_key with tipo_origem='manual'/
 	// tipo_status='confiavel' (the same override precedence §3's motor already uses) and FORCES
 	// gera_peca=true — this endpoint only covers "ainda gera peça, tipo diferente"; converting to
-	// ciência is a future fatia's scope. confianca is reset to NULL: migration 0078's CHECK
+	// ciência is a future fatia's scope. confianca is reset to NULL: migration 0086's CHECK
 	// (tipo_origem = 'ia' OR confianca IS NULL) would otherwise reject overriding an
 	// ia-classified item's tipo_origem away from 'ia' while its old confidence score lingers.
 	// Guarded by `status <> 'DISCARDED'` — mirrors ConfirmActionItem/DiscardActionItem's

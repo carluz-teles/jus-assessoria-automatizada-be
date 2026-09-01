@@ -7,10 +7,10 @@
 -- Persist a new peça (DRAFT status, CREATED saga_state). Returns all columns so the
 -- handler renders the 201 response without a follow-up read. storage_key is NULL for
 -- Fatia 1 (content lives in the column, not in S3). task_id/piece_profile_key
--- (migration 0080) are set only by the task-sourced Create flow; every other path
+-- (migration 0088) are set only by the task-sourced Create flow; every other path
 -- leaves them NULL.
 --
--- ON CONFLICT DO NOTHING with NO target: since migration 0080 there are TWO partial
+-- ON CONFLICT DO NOTHING with NO target: since migration 0088 there are TWO partial
 -- unique indexes that can fire — draft_intimation_id_uidx (tenant_id, intimation_id
 -- WHERE intimation_id IS NOT NULL AND task_id IS NULL, the legacy path) and
 -- draft_task_id_uidx (tenant_id, task_id WHERE task_id IS NOT NULL, the task-sourced
@@ -60,9 +60,9 @@ WHERE tenant_id = $1 AND intimation_id = $2;
 -- name: GetDraftByTaskID :one
 -- Fetch the draft that already exists for the (tenant_id, task_id) pair — used by
 -- the idempotent POST path (task-sourced Create) when the INSERT hits the NEW
--- draft_task_id_uidx (migration 0080). Filters by tenant (barrier 1).
+-- draft_task_id_uidx (migration 0088). Filters by tenant (barrier 1).
 --
--- superseded_at IS NULL (fatia 5, migration 0081): only the VIGENTE draft counts as "the
+-- superseded_at IS NULL (fatia 5, migration 0089): only the VIGENTE draft counts as "the
 -- existing draft" for this task — once a providência is reclassified, the OLD draft is
 -- superseded (never deleted) and the idempotency guard must resolve to the NEW one, not
 -- get an arbitrary pick between two rows sharing the same task_id.

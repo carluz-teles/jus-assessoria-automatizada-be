@@ -3,12 +3,17 @@ package eproc
 import (
 	"bytes"
 	"context"
+	"encoding/base32"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/jusassessoria/platform/lib/totp"
 )
 
 // stubPortal is an httptest-backed fake of the eproc portal + SSO. It counts logins and
@@ -66,20 +71,50 @@ func (s *stubPortal) handler() http.Handler {
 		_, _ = io.WriteString(w, payload)
 	}
 
-	mux.HandleFunc("/api/processo/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/eventos") {
-			dataFunc(w, r, `[{"id":"e1","data":"2026-01-02T10:00:00Z","descricao":"Distribuído","documentos":[{"id":"d1","rotulo":"Inicial","mime_type":"application/pdf"}]}]`)
-			return
+	// The REAL quick-search flow (CONFIRMED live, 2026-08-31 — see wiring.go's
+	// fetchProcessPage): GET processo_selecionar_publica returns a page with the
+	// session-bound formPesquisaRapida action; POSTing that returns the result
+	// page GetProcess/ListEvents actually parse. Shaped like the real page's
+	// confirmed structure (#txtClasse, #tblEventos with a trEventoNN row), not a
+	// byte-for-byte copy.
+	mux.HandleFunc("/eproc/controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("acao") {
+		case "processo_selecionar_publica":
+			dataFunc(w, r, `<html><body>
+<form id="formPesquisaRapida" action="controlador.php?acao=processo_pesquisa_rapida&amp;hash=stubhash123"></form>
+</body></html>`)
+		case "processo_pesquisa_rapida":
+			dataFunc(w, r, stubProcessResultHTML)
+		case "acessar_documento":
+			// Step 1 (CONFIRMED live 2026-08-31): acessar_documento returns an HTML
+			// wrapper whose iframe#conteudoIframe src points at the real content.
+			dataFunc(w, r, `<html><body><iframe id="conteudoIframe" src="controlador.php?acao=acessar_documento_implementacao&amp;doc=d1&amp;key=k2"></iframe></body></html>`)
+		case "acessar_documento_implementacao":
+			// Step 2: the iframe content — the real document bytes.
+			dataFunc(w, r, "%PDF-1.4 fake bytes")
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		dataFunc(w, r, `{"numero_cnj":"1234567-89.2026.8.26.0100","classe":"Cumprimento de Sentença","orgao_julgador":"1ª Vara JEC Franca","partes":[{"nome":"Fulano","polo":"ativo","documento":"123.456.789-00"}]}`)
-	})
-
-	mux.HandleFunc("/api/documento/", func(w http.ResponseWriter, r *http.Request) {
-		dataFunc(w, r, "%PDF-1.4 fake bytes")
 	})
 
 	return mux
 }
+
+// stubProcessResultHTML mirrors the CONFIRMED shape of the real result page
+// (#txtClasse for the class, #tblEventos with trEventoNN rows — see wiring.go's
+// parseProcessHTML/parseEventsHTML doc) — a minimal fixture, not a byte-for-byte
+// copy of the real (328KB) page.
+const stubProcessResultHTML = `<html><body>
+<span id="txtClasse">Cumprimento de Sentença</span>
+<table id="tblEventos">
+<tr id="trEvento1" class="infraTrClara">
+<td>1</td><td>02/01/2026 10:00:00</td>
+<td><label class="infraEventoDescricao">Distribuído</label> - texto extra</td>
+<td>usuario</td>
+<td><a class="infraLinkDocumento" href="controlador.php?acao=acessar_documento&amp;doc=d1" data-doc="d1" data-nome="Inicial" data-mimetype="application/pdf">Inicial</a></td>
+</tr>
+</table>
+</body></html>`
 
 // rewriteTransport redirects the absolute SSO login URL to the test server, so the
 // client's real login flow runs against the stub without changing production code.
@@ -283,6 +318,456 @@ func TestClient_MissingCredentialsIsInvalid(t *testing.T) {
 	}
 }
 
+// certificadoSSORewriteTransport redirects any request targeting certificadoSSOHost to
+// a fixed path on the test server, regardless of the incoming query string — mirroring
+// what the real "Certificado Digital" button's host-swap does, but the stub doesn't need
+// to echo back the Keycloak nonce/state/session_code it would carry in production.
+type certificadoSSORewriteTransport struct {
+	base   http.RoundTripper
+	server string
+}
+
+func (t *certificadoSSORewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == certificadoSSOHost {
+		u, _ := req.URL.Parse(t.server + "/certificado-sso-confirm")
+		req = req.Clone(req.Context())
+		req.URL = u
+		req.Host = u.Host
+	}
+	return t.base.RoundTrip(req)
+}
+
+func newRealCertTestClient(t *testing.T, srv *httptest.Server, opts ...Option) *Client {
+	t.Helper()
+	hc := &http.Client{
+		Transport: &certificadoSSORewriteTransport{base: http.DefaultTransport, server: srv.URL},
+	}
+	allOpts := append([]Option{WithBaseURL(srv.URL), WithCertificateAuth()}, opts...)
+	return NewEprocClient(hc, allOpts...)
+}
+
+// x509AcceptedStub serves Keycloak's own hidden "kc-x509-login-info" confirm form —
+// what its built-in X.509 authenticator renders after reading an accepted certificate
+// off the (real, in production) mTLS handshake. The action must be absolute (Keycloak's
+// own form actions always are — see extractX509ConfirmAction's doc), so it's a
+// parameter rather than a hardcoded relative path.
+func x509AcceptedStub(confirmURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<html><body onload="document.getElementById('kc-x509-login-info').submit()">
+<form id="kc-x509-login-info" method="post" action="%s">
+<input type="submit" name="login" value="Continuar"/>
+</form></body></html>`, confirmURL)
+	}
+}
+
+// x509RejectedStub serves a body with NO "kc-x509-login-info" form — what Keycloak
+// renders when its X.509 authenticator does not recognize/accept the certificate.
+func x509RejectedStub(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.WriteString(w, `<html><body>certificado não reconhecido</body></html>`)
+}
+
+// x509ConfirmStub serves the eproc/Keycloak side of the confirm POST with a
+// configurable status/body — the final hop after Keycloak's X.509 authenticator has
+// already vouched for the certificate.
+func x509ConfirmStub(status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if status != 0 {
+			w.WriteHeader(status)
+		}
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+// TestClient_CertLogin_Success proves the real (primary) flow end to end: the SSO
+// bounce lands on a Keycloak URL, re-issuing it against certificadoSSOHost (the client
+// certificate presented during that TLS handshake, in production) gets the
+// "kc-x509-login-info" confirm form, and posting it lands on a 2xx with no
+// challenge/redirect marker — CONNECTED. No username/password ever leaves the client.
+func TestClient_CertLogin_Success(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page (unswapped host, not used further)</html>")
+	})
+	var confirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", x509ConfirmStub(0, "<html>bem-vindo</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+
+	c := newRealCertTestClient(t, srv)
+
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login = %v, want nil", err)
+	}
+	if c.Status() != StatusConnected {
+		t.Fatalf("Status = %v, want CONNECTED", c.Status())
+	}
+}
+
+// TestClient_CertLogin_MFARequired proves the expected TOTP step (documented in TJSP's
+// own eproc manuals as mandatory after certificate recognition, and confirmed live as a
+// "kc-otp-login-form") surfaces as Forbidden, distinct from a rejected certificate —
+// Keycloak's X.509 authenticator already vouched for the cert; the challenge appears in
+// the confirm response.
+func TestClient_CertLogin_MFARequired(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", x509ConfirmStub(0, `<html>kc-otp-login-form: Digite o código de verificação</html>`))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+
+	c := newRealCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsForbidden(err) {
+		t.Fatalf("Login err = %v, want Forbidden (MFA/TOTP required)", err)
+	}
+}
+
+// TestClient_CertLogin_RejectedByKeycloak proves Keycloak's X.509 authenticator never
+// rendering the confirm form (the certificate itself was not recognized/is expired) is
+// Unauthorized — the confirm POST is never even sent.
+func TestClient_CertLogin_RejectedByKeycloak(t *testing.T) {
+	t.Parallel()
+
+	calledConfirm := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	mux.HandleFunc("/certificado-sso-confirm", x509RejectedStub)
+	mux.HandleFunc("/x509-confirm", func(w http.ResponseWriter, r *http.Request) {
+		calledConfirm = true
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newRealCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("Login err = %v, want Unauthorized", err)
+	}
+	if calledConfirm {
+		t.Error("confirm POST was sent despite Keycloak never rendering the X.509 confirm form")
+	}
+}
+
+// TestClient_CertLogin_RejectedByConfirm proves a 401 from the confirm POST (Keycloak's
+// X.509 authenticator vouched for the cert, but the confirm step itself is rejected) is
+// Unauthorized too, distinctly from a Keycloak-side rejection.
+func TestClient_CertLogin_RejectedByConfirm(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", x509ConfirmStub(http.StatusUnauthorized, "<html>token inválido</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+
+	c := newRealCertTestClient(t, srv)
+
+	err := c.Login(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("Login err = %v, want Unauthorized", err)
+	}
+}
+
+// testTOTPSecret is a fixed RFC 4226 Appendix D test secret, base32-encoded — good
+// enough for these tests since only the wiring (does the right code reach the right
+// field) is under test, not the RFC 6238 math itself (see lib/totp's own tests for that).
+func testTOTPSecret() string {
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte("12345678901234567890"))
+}
+
+// otpFormStub serves the "kc-otp-login-form" the real portal renders for the TOTP
+// challenge — its action is the only thing extractOTPConfirmAction reads.
+func otpFormStub(confirmURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<html><body>
+<form id="kc-otp-login-form" method="post" action="%s">
+<input type="text" name="otp"/>
+<input type="submit" name="login" value="Continuar"/>
+</form></body></html>`, confirmURL)
+	}
+}
+
+// TestClient_CertLogin_TOTPAutoCompletes proves the whole point of WithTOTPSeed: the
+// client reaches the "kc-otp-login-form" challenge and, WITHOUT any human/phone,
+// generates the correct RFC 6238 code and completes the login — CONNECTED, no
+// Forbidden ever surfaced to the caller.
+func TestClient_CertLogin_TOTPAutoCompletes(t *testing.T) {
+	t.Parallel()
+
+	secret := testTOTPSecret()
+	fixedNow := time.Unix(1_700_000_000, 0).UTC()
+	wantCode, err := totp.GenerateCode(secret, fixedNow)
+	if err != nil {
+		t.Fatalf("totp.GenerateCode: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL, otpConfirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", func(w http.ResponseWriter, r *http.Request) {
+		otpFormStub(otpConfirmURL)(w, r)
+	})
+	mux.HandleFunc("/otp-confirm", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse OTP confirm form: %v", err)
+		}
+		if got := r.FormValue("otp"); got != wantCode {
+			t.Errorf("submitted otp = %q, want %q", got, wantCode)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, "<html>bem-vindo</html>")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+	otpConfirmURL = srv.URL + "/otp-confirm"
+
+	c := newRealCertTestClient(t, srv, WithTOTPSeed(secret), WithClock(func() time.Time { return fixedNow }))
+
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login = %v, want nil (TOTP should auto-complete)", err)
+	}
+	if c.Status() != StatusConnected {
+		t.Fatalf("Status = %v, want CONNECTED", c.Status())
+	}
+}
+
+// TestClient_CertLogin_TOTPWrongCodeDoesNotLoop proves that if the OTP confirm step
+// itself lands on another challenge (expired/rate-limited/wrong seed — not expected in
+// practice, but the server is not ours to trust blindly), the client tries exactly once
+// and surfaces Forbidden instead of looping.
+func TestClient_CertLogin_TOTPWrongCodeDoesNotLoop(t *testing.T) {
+	t.Parallel()
+
+	secret := testTOTPSecret()
+	otpConfirmHits := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/kc/auth", http.StatusFound)
+	})
+	mux.HandleFunc("/kc/auth", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "<html>login page</html>")
+	})
+	var confirmURL, otpConfirmURL string
+	mux.HandleFunc("/certificado-sso-confirm", func(w http.ResponseWriter, r *http.Request) {
+		x509AcceptedStub(confirmURL)(w, r)
+	})
+	mux.HandleFunc("/x509-confirm", func(w http.ResponseWriter, r *http.Request) {
+		otpFormStub(otpConfirmURL)(w, r)
+	})
+	mux.HandleFunc("/otp-confirm", func(w http.ResponseWriter, r *http.Request) {
+		otpConfirmHits++
+		// Still the OTP challenge — as if the code were rejected.
+		otpFormStub(otpConfirmURL)(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	confirmURL = srv.URL + "/x509-confirm"
+	otpConfirmURL = srv.URL + "/otp-confirm"
+
+	c := newRealCertTestClient(t, srv, WithTOTPSeed(secret))
+
+	err := c.Login(context.Background())
+	if !IsForbidden(err) {
+		t.Fatalf("Login err = %v, want Forbidden", err)
+	}
+	if otpConfirmHits != 1 {
+		t.Errorf("otp confirm hits = %d, want exactly 1 (no retry loop)", otpConfirmHits)
+	}
+}
+
+// certisignRewriteTransport redirects the absolute Certisign URL to the test server, so
+// the client's real certLogin flow runs against the stub without changing production
+// code — mirroring rewriteTransport's role for the SSO login URL above.
+type certisignRewriteTransport struct {
+	base   http.RoundTripper
+	server string
+}
+
+func (t *certisignRewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Host, "certisign.com.br") {
+		u, _ := req.URL.Parse(t.server + "/certisign-login")
+		req = req.Clone(req.Context())
+		req.URL = u
+		req.Host = u.Host
+	}
+	return t.base.RoundTrip(req)
+}
+
+func newCertTestClient(t *testing.T, srv *httptest.Server) *Client {
+	t.Helper()
+	hc := &http.Client{
+		Transport: &certisignRewriteTransport{base: http.DefaultTransport, server: srv.URL},
+	}
+	return NewEprocClient(hc, WithBaseURL(srv.URL), WithCertificateAuth())
+}
+
+// certisignAcceptedStub serves the auto-submitting form Certisign returns when it
+// accepts the certificate presented during the (real) mTLS handshake — the "cb" token
+// certLogin extracts and redeems at the callback path.
+func certisignAcceptedStub(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.WriteString(w, `<html><body onload="document.getElementById('f').submit()">
+<form id="f" method="post" action="https://eproc1g.tjsp.jus.br/eproc/externo_controlador.php?acao=entrar_certificado_certisign">
+<input type="hidden" name="cb" value="opaque-test-token"/>
+</form></body></html>`)
+}
+
+// certisignRejectedStub serves a body with NO "cb" field — what Certisign returns when
+// the certificate is not recognized (no auto-submit form appears at all).
+func certisignRejectedStub(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.WriteString(w, `<html><body>certificado não reconhecido</body></html>`)
+}
+
+// eprocCallbackStub serves the eproc side of certisignCallbackPath with a configurable
+// status/body — the second hop, after Certisign has already vouched for the cert.
+func eprocCallbackStub(status int, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if status != 0 {
+			w.WriteHeader(status)
+		}
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+// TestClient_CertLoginCertisignFallback_Success proves the fallback's full two-hop flow:
+// Certisign accepts the certificate (served the "cb" token), the fallback redeems it at
+// eproc's callback, and a 2xx with no challenge/redirect marker establishes the (legacy)
+// session — no username/password ever leaves the client (there is no SSO endpoint
+// registered in this stub at all). certLoginCertisignFallback is called directly since
+// c.Login() now uses the primary certLogin (certificadoSSOHost), not this fallback.
+func TestClient_CertLoginCertisignFallback_Success(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignAcceptedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", eprocCallbackStub(0, "<html>bem-vindo</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	if err := c.certLoginCertisignFallback(context.Background()); err != nil {
+		t.Fatalf("certLoginCertisignFallback = %v, want nil", err)
+	}
+	if c.Status() != StatusConnected {
+		t.Fatalf("Status = %v, want CONNECTED", c.Status())
+	}
+}
+
+// TestClient_CertLoginCertisignFallback_MFARequired proves the expected TOTP step
+// surfaces as Forbidden, distinct from a rejected certificate — Certisign still accepted
+// the cert; the challenge appears on the eproc side of the callback.
+func TestClient_CertLoginCertisignFallback_MFARequired(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignAcceptedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", eprocCallbackStub(0, `<html>Digite o código de verificação</html>`))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	err := c.certLoginCertisignFallback(context.Background())
+	if !IsForbidden(err) {
+		t.Fatalf("certLoginCertisignFallback err = %v, want Forbidden (MFA/TOTP required)", err)
+	}
+}
+
+// TestClient_CertLoginCertisignFallback_RejectedByCertisign proves Certisign never
+// issuing a "cb" token (the certificate itself was not recognized/is expired) is
+// Unauthorized — the eproc callback is never even called.
+func TestClient_CertLoginCertisignFallback_RejectedByCertisign(t *testing.T) {
+	t.Parallel()
+
+	calledEproc := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignRejectedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", func(w http.ResponseWriter, r *http.Request) {
+		calledEproc = true
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	err := c.certLoginCertisignFallback(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("certLoginCertisignFallback err = %v, want Unauthorized", err)
+	}
+	if calledEproc {
+		t.Error("eproc callback was called despite Certisign never issuing a cb token")
+	}
+}
+
+// TestClient_CertLoginCertisignFallback_RejectedByEprocCallback proves a 401 from
+// eproc's callback (Certisign vouched for the cert, but eproc itself rejects the token)
+// is Unauthorized too, distinctly from a Certisign-side rejection.
+func TestClient_CertLoginCertisignFallback_RejectedByEprocCallback(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/certisign-login", certisignAcceptedStub)
+	mux.HandleFunc("/eproc/externo_controlador.php", eprocCallbackStub(http.StatusUnauthorized, "<html>token inválido</html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := newCertTestClient(t, srv)
+
+	err := c.certLoginCertisignFallback(context.Background())
+	if !IsUnauthorized(err) {
+		t.Fatalf("certLoginCertisignFallback err = %v, want Unauthorized", err)
+	}
+}
+
 // TestClient_DownloadStreamsToWriter proves the download writes the document bytes to the
 // provided writer (streamed) and reports the byte count.
 func TestClient_DownloadStreamsToWriter(t *testing.T) {
@@ -295,7 +780,10 @@ func TestClient_DownloadStreamsToWriter(t *testing.T) {
 	c := newTestClient(t, srv, validCreds())
 
 	var buf bytes.Buffer
-	n, err := c.DownloadDocument(context.Background(), "d1", &buf)
+	// A realistic page-relative href (what parseEventsHTML captures) — resolves
+	// under /eproc/ to the stub's acessar_documento route.
+	href := "controlador.php?acao=acessar_documento&doc=d1&evento=e1&key=abc&mesmoGrau=S&&hash=xyz"
+	n, err := c.DownloadDocument(context.Background(), href, &buf)
 	if err != nil {
 		t.Fatalf("DownloadDocument: %v", err)
 	}
@@ -309,18 +797,77 @@ func TestClient_DownloadStreamsToWriter(t *testing.T) {
 
 // TestParseProcess_CarriesRawDocumentVerbatim proves the CPF/CNPJ field is carried
 // exactly as received — the spike must not normalize away what Portão B needs to observe.
-func TestParseProcess_CarriesRawDocumentVerbatim(t *testing.T) {
+func TestParseProcessHTML_ExtractsClasse(t *testing.T) {
 	t.Parallel()
 
-	raw := `{"numero_cnj":"1-1.1.1.1.1","classe":"c","orgao_julgador":"o","partes":[{"nome":"n","polo":"ativo","documento":"123.***.***-00"}]}`
-	proc, err := parseProcess(strings.NewReader(raw))
+	proc, err := parseProcessHTML([]byte(stubProcessResultHTML))
 	if err != nil {
-		t.Fatalf("parseProcess: %v", err)
+		t.Fatalf("parseProcessHTML: %v", err)
 	}
-	if len(proc.Parties) != 1 {
-		t.Fatalf("parties = %d, want 1", len(proc.Parties))
+	if proc.Class != "Cumprimento de Sentença" {
+		t.Errorf("Class = %q, want %q", proc.Class, "Cumprimento de Sentença")
 	}
-	if got := proc.Parties[0].RawDocument; got != "123.***.***-00" {
-		t.Errorf("RawDocument = %q, want the verbatim masked value", got)
+}
+
+func TestParseEventsHTML_ExtractsRowsAndDocuments(t *testing.T) {
+	t.Parallel()
+
+	events, err := parseEventsHTML([]byte(stubProcessResultHTML))
+	if err != nil {
+		t.Fatalf("parseEventsHTML: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.ExternalID != "1" {
+		t.Errorf("ExternalID = %q, want %q", ev.ExternalID, "1")
+	}
+	if ev.Description != "Distribuído" {
+		t.Errorf("Description = %q, want %q (only the short label, not the trailing text)", ev.Description, "Distribuído")
+	}
+	want := time.Date(2026, 1, 2, 10, 0, 0, 0, eprocTZ)
+	if !ev.Date.Equal(want) {
+		t.Errorf("Date = %v, want %v", ev.Date, want)
+	}
+	if len(ev.Documents) != 1 || ev.Documents[0].ExternalID != "d1" || ev.Documents[0].Label != "Inicial" {
+		t.Errorf("Documents = %+v, want one doc {ExternalID:d1 Label:Inicial}", ev.Documents)
+	}
+	// The href (with &amp; decoded) is the session-bound download path — the ONLY
+	// way to fetch the bytes, so the parser must carry it whole.
+	if got := ev.Documents[0].DownloadPath; got != "controlador.php?acao=acessar_documento&doc=d1" {
+		t.Errorf("DownloadPath = %q, want the decoded acessar_documento href", got)
+	}
+}
+
+func TestParseEventsHTML_NoTableReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	events, err := parseEventsHTML([]byte(`<html><body>no docket here</body></html>`))
+	if err != nil {
+		t.Fatalf("parseEventsHTML: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("events = %d, want 0", len(events))
+	}
+}
+
+func TestFormatCNJ(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"raw 20 digits", "40130293820268260196", "4013029-38.2026.8.26.0196"},
+		{"already dashed passes through", "4013029-38.2026.8.26.0196", "4013029-38.2026.8.26.0196"},
+		{"unrecognized shape passes through", "not-a-cnj", "not-a-cnj"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatCNJ(tt.input); got != tt.want {
+				t.Errorf("formatCNJ(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }

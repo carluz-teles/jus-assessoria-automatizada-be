@@ -51,7 +51,7 @@ type fakeRepo struct {
 	getIntimationResult *IntimationContext
 	getIntimationErr    error
 
-	// GetActionItemForTask (Costura Providência↔Tarefa↔Minuta, migration 0080)
+	// GetActionItemForTask (Costura Providência↔Tarefa↔Minuta, migration 0088)
 	getActionItemForTaskResult *ActionItemForTask
 	getActionItemForTaskErr    error
 
@@ -603,7 +603,7 @@ func TestUseCase_Create(t *testing.T) {
 			wantPiece: PieceTypeOther,
 		},
 
-		// ── Task-sourced (migration 0080, docs/erd-costura-providencia-tarefa-
+		// ── Task-sourced (migration 0088, docs/erd-costura-providencia-tarefa-
 		// peca.md §3) — the draft inherits intimation/case/piece_type from the
 		// providência the task stems from, bypassing Source entirely. ──────────
 		{

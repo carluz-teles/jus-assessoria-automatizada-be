@@ -176,8 +176,11 @@ UPDATE court_record SET
     lifecycle = CASE
         WHEN lifecycle = 'SUPERSEDED' THEN lifecycle
         ELSE COALESCE(NULLIF($10, ''), lifecycle)
-    END
-WHERE id = $11 AND tenant_id = $12
+    END,
+    -- phase: refresh the DERIVED value; keep the existing one when the grade carries none
+    -- (empty). phase_override (the manual correction) is a separate column, never touched here.
+    phase = COALESCE(NULLIF($11, ''), phase)
+WHERE id = $12 AND tenant_id = $13
 RETURNING id, case_id
 `
 
@@ -192,6 +195,7 @@ type UpdateCourtRecordGradeParams struct {
 	Completeness  float32            `json:"completeness"`
 	NextSyncAt    pgtype.Timestamptz `json:"next_sync_at"`
 	Lifecycle     interface{}        `json:"lifecycle"`
+	Phase         interface{}        `json:"phase"`
 	CourtRecordID uuid.UUID          `json:"court_record_id"`
 	TenantID      uuid.UUID          `json:"tenant_id"`
 }
@@ -243,6 +247,7 @@ func (q *Queries) UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRec
 		arg.Completeness,
 		arg.NextSyncAt,
 		arg.Lifecycle,
+		arg.Phase,
 		arg.CourtRecordID,
 		arg.TenantID,
 	)

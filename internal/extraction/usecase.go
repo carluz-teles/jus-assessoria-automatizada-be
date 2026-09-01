@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -268,6 +269,13 @@ func (uc *UseCase) extract(ctx context.Context, ev DocumentUploaded) (textKey st
 	if err != nil {
 		return "", 0, false, "", durationMS, err
 	}
+	// Sanitize once at the extraction chokepoint (covers every extractor): OCR (tesseract)
+	// output in particular can carry NUL/other control bytes that Postgres rejects on the
+	// downstream chunk insert ("invalid byte sequence for encoding UTF8: 0x00"). Do it before
+	// the text JSON is stored so both the stored artifact and the indexed chunks are clean.
+	for i := range pageTexts {
+		pageTexts[i].Text = sanitizeExtractedText(pageTexts[i].Text)
+	}
 
 	textKey = ev.StorageKey + textKeySuffix
 	body, err := json.Marshal(textDocument{ExtractorVersion: version, Pages: pageTexts})
@@ -278,6 +286,23 @@ func (uc *UseCase) extract(ctx context.Context, ev DocumentUploaded) (textKey st
 		return "", 0, false, "", durationMS, err
 	}
 	return textKey, len(pageTexts), hasTextLayer, version, durationMS, nil
+}
+
+// sanitizeExtractedText strips bytes a Postgres text column can't hold: it replaces invalid
+// UTF-8 and drops NUL + other C0 control characters (keeping tab/newline/carriage return). A
+// noisy OCR transcription can carry a stray 0x00 that would otherwise fail the downstream chunk
+// insert (SQLSTATE 22021); real content and whitespace structure are preserved.
+func sanitizeExtractedText(s string) string {
+	s = strings.ToValidUTF8(s, "")
+	return strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || r == '\r' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1 // drop the control char
+		}
+		return r
+	}, s)
 }
 
 // fail records the terminal FAILED state for the document and emits document.failed, then

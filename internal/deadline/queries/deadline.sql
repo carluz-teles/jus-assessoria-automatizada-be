@@ -49,12 +49,14 @@ INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
     start_date, end_date, days, counting, doubled, doubled_reason,
     holidays_applied, status, source, kind, rules_version,
-    anchor_event, legal_citation
+    anchor_event, legal_citation,
+    origem, selo, confirmacao_exigida, prazo_interno
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6, $7, $8, $9,
     $10, $11, $12, $13, $14,
-    $15, $16
+    $15, $16,
+    $17, $18, $19, $20
 )
 ON CONFLICT (notification_id) DO NOTHING
 RETURNING id;
@@ -120,16 +122,19 @@ WHERE id = $1 AND tenant_id = $2;
 -- name: ConfirmDeadline :one
 -- The F2 confirmation (§9: "Aprovar tudo" grava o deadline PENDING→OPEN recalculado).
 -- Flips the prazo to OPEN with the human-approved {kind, days, counting, doubled,
--- doubled_reason} and the RECOMPUTED {end_date, holidays_applied}, stamping who/when
--- (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
+-- doubled_reason} and the RECOMPUTED {end_date, holidays_applied, prazo_interno}, stamping
+-- who/when (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
 -- 1). IDEMPOTENT on the deadline: re-confirming the same intimação re-UPDATEs the one row
 -- (the 1:1 notification_id) — it never opens a second prazo. source/rules_version are LEFT
 -- AS-IS: source keeps its provenance (RULE/AI) and rules_version still records which rule set
 -- first derived the prazo even when the human overrode the days. start_date IS written now: the
 -- confirmation panel may re-anchor (anchor_event → a different intimação date), and
--- anchor_event/manual_extra_days/legal_citation persist the panel's choices. A no-match yields
--- NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id, $2 =
--- tenant_id, then the confirmed fields.
+-- anchor_event/manual_extra_days/legal_citation persist the panel's choices. prazo_interno is
+-- recomputed in lockstep with end_date (never left stale against it). V1 fields
+-- (origem/selo/confirmacao_exigida) are SET ONLY at birth and preserved through all
+-- subsequent operations — they are never overwritten by confirm or adjust. A no-match
+-- yields NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id,
+-- $2 = tenant_id, then the confirmed fields.
 UPDATE deadline
 SET status            = 'OPEN',
     kind              = $3,
@@ -144,7 +149,8 @@ SET status            = 'OPEN',
     start_date        = sqlc.arg(start_date),
     anchor_event      = sqlc.arg(anchor_event),
     manual_extra_days = sqlc.arg(manual_extra_days),
-    legal_citation    = sqlc.arg(legal_citation)
+    legal_citation    = sqlc.arg(legal_citation),
+    prazo_interno     = sqlc.arg(prazo_interno)
 WHERE notification_id = $1 AND tenant_id = $2
 RETURNING id, court_record_id;
 
@@ -153,8 +159,8 @@ RETURNING id, court_record_id;
 -- a confirmed providência drives (fatia 3, docs/erd-costura-providencia-tarefa-peca.md §2/§6):
 -- action_item_id is NULL for the former, set for the latter. Born status='OPEN'; source is
 -- 'MANUAL' (a human created it) or 'RULE' (derived from a confiável action_item) — AI-suggested
--- tasks are a later slice. All FKs but tenant_id are nullable per the 0024/0079 schema.
--- Idempotent on the action_item path via ON CONFLICT (action_item_id) DO NOTHING (0079's
+-- tasks are a later slice. All FKs but tenant_id are nullable per the 0024/0087 schema.
+-- Idempotent on the action_item path via ON CONFLICT (action_item_id) DO NOTHING (0087's
 -- UNIQUE): a redelivered actionitem.created/confirmed yields NO row (RETURNING is empty),
 -- which the mapper reads as "already created" instead of minting a second task. Multiple NULLs
 -- are always distinct, so the manual/avulsa path (action_item_id always NULL) never conflicts.
@@ -354,22 +360,27 @@ RETURNING id;
 -- from, court_record_id feeds the court lookup (recompute UF), and the CURRENT
 -- {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
 -- over (a field absent from the body keeps its stored value). status gates the ajuste (only
--- a PENDING/OPEN prazo is adjustable). Keyed by id and scoped to tenant_id (barrier 1, on top
--- of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at
--- the mapper (→ 404), never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
+-- a PENDING/OPEN prazo is adjustable). origem/selo (V1) ride along for apurar.go — origem is
+-- immutable (only stamped onto deadline.seal_assigned), selo gates apurar-tipo. Keyed by id
+-- and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing id in the tenant →
+-- pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper (→ 404), never (nil, nil). $1 = id,
+-- $2 = tenant_id (from the principal).
 SELECT id, court_record_id, notification_id, start_date, status, kind, days, counting, doubled,
-       doubled_reason, anchor_event, manual_extra_days
+       doubled_reason, anchor_event, manual_extra_days, origem, selo
 FROM deadline
 WHERE id = $1 AND tenant_id = $2;
 
 -- name: UpdateDeadlineAdjust :one
 -- Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
 -- patched {kind, days, counting, doubled, doubled_reason, anchor_event, manual_extra_days} and
--- the RECOMPUTED {end_date, holidays_applied, start_date}, keyed by id and scoped to tenant_id
--- (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays
--- PENDING, an OPEN stays OPEN — the use case already refused a terminal prazo); source/
--- rules_version/confirmed_* are untouched. start_date IS written now (the panel may re-anchor via
--- anchor_event → a different intimação date). A no-match (the
+-- the RECOMPUTED {end_date, holidays_applied, prazo_interno, start_date}, keyed by id and
+-- scoped to tenant_id (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle
+-- (a PENDING stays PENDING, an OPEN stays OPEN — the use case already refused a terminal
+-- prazo); source/rules_version/confirmed_* are untouched. V1 fields (origem/selo/
+-- confirmacao_exigida) are SET ONLY at birth and preserved through all subsequent operations —
+-- they are never overwritten by confirm or adjust. start_date IS written now (the panel may
+-- re-anchor via anchor_event → a different intimação date); prazo_interno is recomputed in
+-- lockstep with end_date (never left stale against it). A no-match (the
 -- row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
 -- and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
 UPDATE deadline
@@ -382,7 +393,8 @@ SET kind              = $3,
     holidays_applied  = $9,
     start_date        = sqlc.arg(start_date),
     anchor_event      = sqlc.arg(anchor_event),
-    manual_extra_days = sqlc.arg(manual_extra_days)
+    manual_extra_days = sqlc.arg(manual_extra_days),
+    prazo_interno     = sqlc.arg(prazo_interno)
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, court_record_id;
 
@@ -560,6 +572,85 @@ WHERE intimation_id = $1 AND tenant_id = $2
 ORDER BY created_at DESC
 LIMIT 1;
 
+-- ── V1 Motor de Prazos persistence ─────────────────────────────────────────
+-- The V1 motor audit trail: calc_memory, applied_holiday, cross_validation,
+-- deadline_event, and deadline_policy. All run inside the use case's tx so RLS
+-- scopes them to the event's tenant (barrier 2) on top of the explicit tenant
+-- filter (barrier 1).
+
+-- name: InsertCalcMemory :one
+-- Persist the deterministic calculation audit trail alongside the deadline (same
+-- tx). deadline_id is UNIQUE (1:1 per deadline) so ON CONFLICT DO NOTHING yields
+-- no row on a re-derivation, mapped to ErrCalcMemoryExists at the mapper. All
+-- nullable text columns map to NULL via textToNull. Returns the DB-assigned id.
+-- $1 = tenant_id, $2 = deadline_id, then the audit fields.
+INSERT INTO calc_memory (
+    tenant_id, deadline_id,
+    prazo_base, prazo_base_fonte, termo_inicial_regra, dias_uteis,
+    dobra_motivo, tabela_legal_ref, ia_tipo_inferido, ia_confianca,
+    calendar_provider_version
+) VALUES (
+    $1, $2,
+    $3, $4, $5, $6,
+    $7, $8, $9, $10,
+    $11
+)
+ON CONFLICT (deadline_id) DO NOTHING
+RETURNING id;
+
+-- name: InsertAppliedHoliday :one
+-- Persist one holiday snapshot applied to a calculation (same tx as calc_memory).
+-- applied_holiday is 1:N with calc_memory (each holiday the motor skipped).
+-- Returns the DB-assigned id so the caller can build the full audit trail.
+-- $1 = tenant_id, $2 = calc_memory_id, $3 = data, $4 = nome, $5 = ambito, $6 = comarca.
+INSERT INTO applied_holiday (
+    tenant_id, calc_memory_id, data, nome, ambito, comarca
+) VALUES (
+    $1, $2, $3, $4, $5, $6
+)
+RETURNING id;
+
+-- name: InsertCrossValidation :one
+-- Persist the declared vs calculated date cross-validation result (same tx as
+-- deadline). deadline_id is UNIQUE (1:1 per deadline) so ON CONFLICT DO NOTHING
+-- yields no row on a re-derivation, mapped to ErrCrossValidationExists at the
+-- mapper. decidido_por is nullable (NULL when system-decided).
+-- $1 = tenant_id, $2 = deadline_id, $3 = data_declarada, $4 = data_calculada,
+-- $5 = dif_dias, $6 = resultado, $7 = causa_provavel, $8 = decisao, $9 = decidido_por.
+INSERT INTO cross_validation (
+    tenant_id, deadline_id,
+    data_declarada, data_calculada, dif_dias,
+    resultado, causa_provavel, decisao, decidido_por
+) VALUES (
+    $1, $2,
+    $3, $4, $5,
+    $6, $7, $8, $9
+)
+ON CONFLICT (deadline_id) DO NOTHING
+RETURNING id;
+
+-- name: InsertDeadlineEvent :one
+-- Append one event to the deadline's append-only audit trail (same tx as the
+-- mutation it records). deadline_event never overwrites; it adds. ator_id is
+-- nullable (NULL when the system is the actor). Returns the id for log/telemetry.
+-- $1 = tenant_id, $2 = deadline_id, $3 = tipo, $4 = detalhe, $5 = ator_id.
+INSERT INTO deadline_event (
+    tenant_id, deadline_id, tipo, detalhe, ator_id
+) VALUES (
+    $1, $2, $3, $4, $5
+)
+RETURNING id;
+
+-- name: GetDeadlinePolicy :one
+-- Read the tenant's deadline confirmation policy. Returns the row when it exists;
+-- the caller maps pgx.ErrNoRows to the default policy (confirmacao_obrigatoria =
+-- false) so a tenant without an explicit row gets the seletiva default. Scoped
+-- to tenant_id (barrier 1, on top of RLS barrier 2).
+-- $1 = tenant_id.
+SELECT tenant_id, confirmacao_obrigatoria
+FROM deadline_policy
+WHERE tenant_id = $1;
+
 -- name: SetDeadlineAISummary :execrows
 -- Write-through, best-effort persist of the "O que aconteceu"/"O que fazer" summary
 -- (migration 0036), called from the read path (GET /v1/prazos/:id/suggested-tasks) right
@@ -574,3 +665,95 @@ SET ai_summary = $1,
     ai_recommendation = $2,
     ai_summary_generated_at = now()
 WHERE id = $3 AND tenant_id = $4 AND ai_summary IS NULL;
+
+-- ── V1 apuração (human decision on a_apurar prazos) ─────────────────────────
+-- POST /v1/prazos/:id/apurar-divergencia | .../apurar-tipo (apurar.go). Both flip selo
+-- a_apurar → confiavel; origem is NEVER touched here (immutable after creation — only the
+-- creation path in domain.go writes it). The deadline row itself is patched via the ALREADY
+-- existing UpdateDeadlineAdjust (ajuste_manual path) or UpdateDeadlineEndDate (aceita_declarado
+-- path) below; aceita_calculado writes nothing (the stored end_date already IS the calculado
+-- date).
+
+-- name: GetCrossValidation :one
+-- Read the declared×calculado cross-validation for one deadline (apurar-divergencia gate:
+-- resultado must be "divergente" AND decisao must still be "" — the idempotency guard). Scoped
+-- to tenant_id (barrier 1, on top of RLS barrier 2). A missing row (no prazo_declarado at birth,
+-- so nothing was ever cross-checked) → pgx.ErrNoRows → typed ErrCrossValidationNotFound at the
+-- mapper (→ 404), never (nil, nil). $1 = deadline_id, $2 = tenant_id.
+SELECT id, data_declarada, data_calculada, dif_dias, resultado, causa_provavel, decisao, decidido_por
+FROM cross_validation
+WHERE deadline_id = $1 AND tenant_id = $2;
+
+-- name: UpdateCrossValidationDecision :one
+-- Record the human decision on a divergência (aceita_declarado | aceita_calculado |
+-- ajuste_manual) — an UPDATE, not an INSERT: the row already exists since InsertCrossValidation
+-- ran at birth (docs §"Validação cruzada"). Scoped to tenant_id (barrier 1). The `decisao IS
+-- NULL` guard makes the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor,
+-- mirroring MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller
+-- pre-checks decisao=="" before calling, and this guard defends the write against a racing
+-- second apuração on the SAME divergência — a no-match (the row vanished mid-tx, OR a
+-- concurrent apuração already decided it) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the
+-- mapper (never a silent overwrite of the first decision). $1 = deadline_id, $2 = tenant_id, $3
+-- = decisao, $4 = decidido_por.
+UPDATE cross_validation
+SET decisao = $3,
+    decidido_por = $4
+WHERE deadline_id = $1 AND tenant_id = $2 AND decisao IS NULL
+RETURNING id;
+
+-- name: UpdateDeadlineEndDate :one
+-- Overwrite end_date AND prazo_interno — the "aceita_declarado" apuração: the human picked the
+-- declared date over the calculado one, so end_date becomes data_declarada with NO recompute of
+-- days/counting/holidays_applied (kept as audit of the deterministic calc); prazo_interno IS
+-- recomputed by the caller from the new end_date (same buffer motor as everywhere else) so it
+-- never drifts against the human-picked date. Scoped to tenant_id (barrier 1). A no-match →
+-- pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper. $1 = id, $2 = tenant_id, $3 =
+-- end_date, $4 = prazo_interno.
+UPDATE deadline
+SET end_date      = $3,
+    prazo_interno = $4
+WHERE id = $1 AND tenant_id = $2
+RETURNING id;
+
+-- name: UpdateDeadlineSelo :one
+-- Flip the confidence selo (a_apurar → confiavel) AND stamp who/when confirmed it — the shared
+-- write both apurar-divergencia and apurar-tipo end with, after the divergência/tipo decision is
+-- recorded (Architect decisão: "apurar também confirma", reusing the confirmed_by/confirmed_at
+-- columns from migration 0024 — the SAME human-approval stamp F2's ConfirmDeadline/MarkNoDeadline
+-- already write, now also written on THIS confirmation path). origem is NEVER written here
+-- (immutable after creation). Scoped to tenant_id (barrier 1). The `selo = 'a_apurar'` guard makes
+-- the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor, mirroring
+-- MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller pre-checks the
+-- selo before calling, and this guard defends the write against a racing second apuração on the
+-- SAME prazo — a no-match (the row vanished mid-tx, OR a concurrent apuração already sealed it
+-- confiavel) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the mapper (never a silent no-op
+-- re-seal). $1 = id, $2 = tenant_id, $3 = selo, $4 = confirmed_by, $5 = confirmed_at.
+UPDATE deadline
+SET selo         = $3,
+    confirmed_by = $4,
+    confirmed_at = $5
+WHERE id = $1 AND tenant_id = $2 AND selo = 'a_apurar'
+RETURNING id;
+
+-- name: GetCalcMemory :one
+-- Read one deadline's calc_memory (apurar-tipo: the IA's inferred tipo/confiança the human
+-- confirms or overrides). Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing
+-- row → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper (→ 404), never (nil, nil).
+-- $1 = deadline_id, $2 = tenant_id.
+SELECT id, prazo_base, prazo_base_fonte, termo_inicial_regra, dias_uteis, dobra_motivo,
+       tabela_legal_ref, ia_tipo_inferido, ia_confianca, calendar_provider_version
+FROM calc_memory
+WHERE deadline_id = $1 AND tenant_id = $2;
+
+-- name: UpdateCalcMemoryTipoConfirmation :one
+-- Record the human's confirmation/reclassification of the IA-inferred tipo de ato
+-- (apurar-tipo, confirmar|reclassificar): ia_tipo_inferido becomes the confirmed/overridden
+-- tipo, ia_confianca becomes 1.0 (human-confirmed, full confidence) — an UPDATE, not an INSERT
+-- (the row already exists since InsertCalcMemory ran at birth). Scoped to tenant_id (barrier
+-- 1). A no-match → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper. $1 = deadline_id,
+-- $2 = tenant_id, $3 = ia_tipo_inferido, $4 = ia_confianca.
+UPDATE calc_memory
+SET ia_tipo_inferido = $3,
+    ia_confianca = $4
+WHERE deadline_id = $1 AND tenant_id = $2
+RETURNING id;

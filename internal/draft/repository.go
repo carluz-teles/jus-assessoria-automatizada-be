@@ -46,8 +46,8 @@ type Repository interface {
 
 	// GetDraftByTaskID returns the existing VIGENTE draft for the (tenant, task) pair —
 	// the idempotent path after InsertDraft hits the NEW draft_task_id_uidx (migration
-	// 0080, task-sourced Create redelivered/duplicated). Filters superseded_at IS NULL
-	// (migration 0081, fatia 5) so a reclassified task always resolves to its CURRENT
+	// 0088, task-sourced Create redelivered/duplicated). Filters superseded_at IS NULL
+	// (migration 0089, fatia 5) so a reclassified task always resolves to its CURRENT
 	// draft, never the superseded one. A miss is ErrDraftNotFound.
 	GetDraftByTaskID(ctx context.Context, tx database.Tx, tenantID, taskID string) (*Draft, error)
 
@@ -354,7 +354,7 @@ func (r *pgRepository) GetActionItemForTask(ctx context.Context, tx database.Tx,
 }
 
 // GetDraftByTaskID is the idempotent-fetch counterpart of GetDraftByIntimationID
-// for the task-sourced path (migration 0080's draft_task_id_uidx).
+// for the task-sourced path (migration 0088's draft_task_id_uidx).
 func (r *pgRepository) GetDraftByTaskID(ctx context.Context, tx database.Tx, tenantID, taskID string) (*Draft, error) {
 	tid, err := parseUUID(tenantID)
 	if err != nil {

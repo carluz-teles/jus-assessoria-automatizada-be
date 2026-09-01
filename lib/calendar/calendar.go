@@ -32,6 +32,7 @@ const maxScan = 400
 // it.
 type HolidaySource interface {
 	IsHoliday(ctx context.Context, day time.Time, uf, court string) (bool, error)
+	LookupHolidays(ctx context.Context, days []time.Time, uf, court string) (map[time.Time]Holiday, error)
 }
 
 // Calendar derives judicial business days from a HolidaySource plus the fixed
@@ -114,6 +115,45 @@ func (c *Calendar) AddBusinessDays(ctx context.Context, start time.Time, n int, 
 	return d, skipped, nil
 }
 
+// SubtractBusinessDays walks start BACKWARD by n business days and returns the resulting
+// date plus the non-weekend non-working days skipped along the way (holidays and recess
+// days), mirroring AddBusinessDays' audit shape. It follows the same CPC art. 224
+// exclusion as AddBusinessDays (the start day is EXCLUDED, walking backward one calendar
+// day at a time via d.AddDate(0, 0, -1)) so the internal deadline's buffer counts back
+// from end_date the same way the forward count reaches it. n must be >= 0; n == 0
+// returns start unchanged with no skips.
+func (c *Calendar) SubtractBusinessDays(ctx context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error) {
+	if n < 0 {
+		return time.Time{}, nil, fmt.Errorf("SubtractBusinessDays: n must be >= 0, got %d", n)
+	}
+	d := dateOnly(start)
+	if n == 0 {
+		return d, nil, nil
+	}
+
+	var skipped []time.Time
+	counted := 0
+	for scan := 0; counted < n; scan++ {
+		if scan >= maxScan+n {
+			return time.Time{}, nil, fmt.Errorf("SubtractBusinessDays: exceeded %d-day scan from %s", maxScan+n, dateOnly(start).Format(time.DateOnly))
+		}
+		d = d.AddDate(0, 0, -1)
+		ok, err := c.IsBusinessDay(ctx, d, uf, court)
+		if err != nil {
+			return time.Time{}, nil, err
+		}
+		switch {
+		case ok:
+			counted++
+		case !isWeekend(d):
+			// A holiday or recess day between start and end — recorded for the
+			// auditable holidays_applied. Weekends are the norm, not audited.
+			skipped = append(skipped, d)
+		}
+	}
+	return d, skipped, nil
+}
+
 // AddCalendarDays advances start by n CALENDAR (corridos) days and returns the
 // resulting date plus the days that PUSHED that date forward (the prorrogação
 // audit, for holidays_applied). It is the counterpart of AddBusinessDays for the
@@ -167,6 +207,18 @@ func (c *Calendar) AddCalendarDays(ctx context.Context, start time.Time, n int, 
 		d = d.AddDate(0, 0, 1)
 	}
 	return time.Time{}, nil, fmt.Errorf("AddCalendarDays: exceeded %d-day scan from %s", maxScan, dateOnly(start).Format(time.DateOnly))
+}
+
+// LookupHolidays resolves the registered name/scope for each of the given dates — the
+// applied_holiday audit label. Deliberately separate from AddBusinessDays/AddCalendarDays
+// (whose []time.Time return is used pervasively across the deadline domain and must not
+// change); a date with no matching row is simply absent from the map.
+func (c *Calendar) LookupHolidays(ctx context.Context, days []time.Time, uf, court string) (map[time.Time]Holiday, error) {
+	norm := make([]time.Time, len(days))
+	for i, d := range days {
+		norm[i] = dateOnly(d)
+	}
+	return c.src.LookupHolidays(ctx, norm, uf, court)
 }
 
 // dateOnly pins a value to midnight UTC, taking the year/month/day from the

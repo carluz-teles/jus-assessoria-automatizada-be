@@ -151,6 +151,11 @@ type ParsedCourtRecord struct {
 	// enrichment use case writes it to court_record, but NEVER downgrades an
 	// already-SUPERSEDED row.
 	Lifecycle string
+	// Phase is the derived procedural phase (Conhecimento→…→Execução), from the classe
+	// + movimentos via faseFromClassAndMovimentos. Empty when the source carries no
+	// movimentos (DJEN discovery); the enrichment path owns it. It refreshes
+	// court_record.phase (the auto value); the user's manual phase_override wins over it.
+	Phase string
 }
 
 // ParsedDocketEntry is one andamento. Hash is the source-computed dedup key

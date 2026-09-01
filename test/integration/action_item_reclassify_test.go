@@ -163,7 +163,7 @@ func TestReclassify_FullCycle_AgainstRealDB(t *testing.T) {
 		t.Fatalf("old draft superseded_by_draft_id = %v, want nil (no successor yet)", oldFields.supersededByDraftID)
 	}
 
-	// Step 4: a fresh POST /v1/pecas {task_id} — the unique index (0081) now allows it,
+	// Step 4: a fresh POST /v1/pecas {task_id} — the unique index (0089) now allows it,
 	// since the old row fell outside its WHERE (superseded_at IS NOT NULL).
 	second, err := draftUC.Create(ctx, draft.CreateCommand{TenantID: tenantID, TaskID: taskID})
 	if err != nil {
@@ -344,7 +344,7 @@ func TestReclassify_Listener_RaceDefense(t *testing.T) {
 
 // AR5: the QA gap this file was missing — reclassifying an action_item that is
 // tipo_origem='ia' with a non-nil confianca (e.g. 0.8) into tipo_origem='manual' must reset
-// confianca to NULL in the SAME UPDATE, against a REAL Postgres. Migration 0078's
+// confianca to NULL in the SAME UPDATE, against a REAL Postgres. Migration 0086's
 // action_item_check1 (CHECK (tipo_origem = 'ia' OR confianca IS NULL)) rejects the row the
 // instant tipo_origem flips away from 'ia' while the old score lingers — this is exactly the
 // scenario the QA's throwaway test proved (positive+negative) and then deleted: neither the

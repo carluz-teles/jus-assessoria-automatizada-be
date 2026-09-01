@@ -385,7 +385,7 @@ func TestOnActionItemCreated_Dedup(t *testing.T) {
 }
 
 // TestOnActionItemCreated_IdempotentOnTaskConflict proves the DB-level idempotency floor
-// (0079's UNIQUE): if InsertTask's ON CONFLICT DO NOTHING reports ErrTaskExistsForActionItem
+// (0087's UNIQUE): if InsertTask's ON CONFLICT DO NOTHING reports ErrTaskExistsForActionItem
 // (a redelivery that got past the dedup mark), the use case treats it as a safe no-op — no
 // error, no re-emitted task.created.
 func TestOnActionItemCreated_IdempotentOnTaskConflict(t *testing.T) {

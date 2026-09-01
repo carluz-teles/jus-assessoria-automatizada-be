@@ -17,7 +17,7 @@ const (
 )
 
 // ComplianceRule is a global catalog row (docs/erd-tipos-de-peca.md §2) — no
-// created_at/updated_at columns on compliance_rule (migration 0077): it is seed
+// created_at/updated_at columns on compliance_rule (migration 0085): it is seed
 // data (cadastro), not an audited per-tenant record, so the entity carries no
 // audit timestamps either.
 type ComplianceRule struct {

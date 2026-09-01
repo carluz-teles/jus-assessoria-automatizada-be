@@ -204,10 +204,10 @@ WITH upserted AS (
         cancel_reason = EXCLUDED.cancel_reason,
         type          = EXCLUDED.type,
         source_url    = EXCLUDED.source_url
-    RETURNING id, court_record_id, type, status, deadline_start_at,
+    RETURNING id, court_record_id, type, status, deadline_start_at, content,
               cancel_reason, (xmax = 0) AS inserted
 )
-SELECT u.id, u.court_record_id, u.type, u.status, u.deadline_start_at,
+SELECT u.id, u.court_record_id, u.type, u.status, u.deadline_start_at, u.content,
        u.cancel_reason, u.inserted, cr.court, cr.case_id,
        COALESCE((SELECT old.status FROM intimation old WHERE old.id = u.id), '')::text AS old_status
 FROM upserted u
@@ -225,6 +225,7 @@ type BatchUpsertIntimationsRow struct {
 	Type            *string     `json:"type"`
 	Status          string      `json:"status"`
 	DeadlineStartAt pgtype.Date `json:"deadline_start_at"`
+	Content         string      `json:"content"`
 	CancelReason    *string     `json:"cancel_reason"`
 	Inserted        bool        `json:"inserted"`
 	Court           string      `json:"court"`
@@ -264,6 +265,7 @@ func (q *Queries) BatchUpsertIntimations(ctx context.Context, arg BatchUpsertInt
 			&i.Type,
 			&i.Status,
 			&i.DeadlineStartAt,
+			&i.Content,
 			&i.CancelReason,
 			&i.Inserted,
 			&i.Court,

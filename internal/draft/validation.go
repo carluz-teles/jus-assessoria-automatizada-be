@@ -32,7 +32,7 @@ type CreateRequest struct {
 	PieceType string `json:"piece_type"`
 	// Title is optional; defaults to "" (the editor sets it on first autosave).
 	Title string `json:"title"`
-	// TaskID is optional (migration 0080): when present, the BE resolves
+	// TaskID is optional (migration 0088): when present, the BE resolves
 	// intimation_id/case_id/piece_type from the task's providência instead of from
 	// Source/IntimationID/PieceType — the task-sourced flow.
 	TaskID string `json:"task_id"`

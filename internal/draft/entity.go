@@ -35,7 +35,7 @@ type Draft struct {
 	// avatar/nome no card. Vazio pra peças criadas antes da migration.
 	CreatedBy string
 
-	// ── Costura Providência↔Tarefa↔Minuta (migration 0080) ────────────────────
+	// ── Costura Providência↔Tarefa↔Minuta (migration 0088) ────────────────────
 
 	// TaskID is the task this draft was created FROM (task-sourced Create,
 	// docs/erd-costura-providencia-tarefa-peca.md §2/§3). Empty for every
@@ -313,6 +313,17 @@ type Thesis struct {
 	Reference  string   `json:"reference"`  // jurisprudência ou dispositivo legal, texto livre
 	Foundation string   `json:"foundation"`
 	Evidence   []string `json:"evidence"`
+
+	// Source* attribute the thesis back to the AUTOS document its evidence was
+	// retrieved from — populated post-hoc by matching Evidence against the RAG chunk
+	// hits (the LLM returns only literal quotes, not document ids), NOT part of the
+	// LLM contract (json:"-"). Empty when no evidence matched a retrieved chunk (the
+	// thesis is grounded only in the teor or is doctrinal); the FE then falls back to
+	// the teor. This is what surfaces "esta tese se apoia na Petição inicial · pág. 3".
+	SourceDocumentID string `json:"-"`
+	SourceLabel      string `json:"-"`
+	SourceExcerpt    string `json:"-"`
+	SourcePage       int    `json:"-"`
 }
 
 // ThesisConfidence closed set.
@@ -568,7 +579,7 @@ func containsAny(s string, subs ...string) bool {
 }
 
 // pieceTypeByProfileKey is a LOCAL, hardcoded copy of the v1 piece_profile catalog
-// (migration 0077, docs/erd-tipos-de-peca.md §6) mapping each known catalog key to
+// (migration 0085, docs/erd-tipos-de-peca.md §6) mapping each known catalog key to
 // the draft.piece_type (the closed set above) it corresponds to. Copied — not a
 // query against piece_profile — for the same reason internal/actionitem/entity.go's
 // knownPieceProfileKeys is local: this slice never imports actionitem/pieceprofile

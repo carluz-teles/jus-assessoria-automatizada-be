@@ -1,6 +1,6 @@
 //go:build integration
 
-// Fatia 4 (docs/erd-costura-providencia-tarefa-peca.md §2/§3, migration 0080) integration
+// Fatia 4 (docs/erd-costura-providencia-tarefa-peca.md §2/§3, migration 0088) integration
 // tests: prove the task-sourced POST /v1/pecas flow against a REAL Postgres, specifically
 // the constraint rework that draft_intimation_id_uidx alone could not survive:
 //
@@ -83,7 +83,7 @@ func seedAvulsaTask(t *testing.T, pool *pgxpool.Pool, tenantID string) string {
 
 // TestDraft_TaskSourced_TwoTasksSameIntimation_EachGetsOwnDraft is the ERD §1 central
 // example proven against the real DB: 1 intimação → 2 providências (contestação +
-// impugnação ao valor) → 2 tasks → 2 DISTINCT drafts. Before migration 0080 this would
+// impugnação ao valor) → 2 tasks → 2 DISTINCT drafts. Before migration 0088 this would
 // 23505 on the second INSERT (draft_intimation_id_uidx had no task_id scoping).
 func TestDraft_TaskSourced_TwoTasksSameIntimation_EachGetsOwnDraft(t *testing.T) {
 	pool := newPool(t)

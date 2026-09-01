@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,6 +101,11 @@ type Repository interface {
 	ResolveCaseIDByCourtRecord(ctx context.Context, tx database.Tx, tenantID, courtRecordID string) (caseID string, err error)
 	AppUserInTenant(ctx context.Context, tx database.Tx, tenantID, appUserID string) (bool, error)
 	AssignCaseResponsible(ctx context.Context, tx database.Tx, tenantID, caseID string, assignedUserID *string) error
+
+	// UpdateProcessoManualFields grava os campos que o advogado preenche à mão no cockpit
+	// — a fase (phase_override) e o valor da causa (claim_value) — no court_record. PATCH
+	// parcial: um argumento nil deixa o campo como está.
+	UpdateProcessoManualFields(ctx context.Context, tx database.Tx, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error
 
 	// CascadeCaseResponsibleToIntimations propagates the case's responsável to every
 	// intimação already anchored under it (via court_record_id → court_record.case_id), in
@@ -1522,6 +1528,9 @@ func (r *pgRepository) UpdateCourtRecordGrade(ctx context.Context, tx database.T
 		// Empty string when graded.Lifecycle is unset: the SQL NULLIF('')→NULL and
 		// COALESCE falls back to the existing lifecycle column value (preserves SUPERSEDED).
 		Lifecycle: params.Lifecycle,
+		// Empty when the source carries no movimentos (DJEN): NULLIF('')→NULL, COALESCE
+		// keeps the existing derived phase. phase_override is untouched here.
+		Phase: params.Phase,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrCourtRecordNotFound
@@ -1699,6 +1708,32 @@ func (r *pgRepository) AssignCaseResponsible(ctx context.Context, tx database.Tx
 		TenantID:       tid,
 	})
 	return database.WrapInfra(err)
+}
+
+// UpdateProcessoManualFields writes the hand-entered fase/valor onto the court_record.
+// A nil phaseOverride/claimValue leaves that column untouched (the SQL COALESCE keeps the
+// current value), so the same endpoint serves "set only the fase" and "set only o valor".
+func (r *pgRepository) UpdateProcessoManualFields(ctx context.Context, tx database.Tx, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	rid, err := uuid.Parse(courtRecordID)
+	if err != nil {
+		return apperr.NewInvalid("id de processo inválido")
+	}
+	var cv pgtype.Numeric
+	if claimValue != nil {
+		if err := cv.Scan(strconv.FormatFloat(*claimValue, 'f', 2, 64)); err != nil {
+			return database.WrapInfra(err)
+		}
+	}
+	return database.WrapInfra(acquisitiondb.New(tx).UpdateProcessoManualFields(ctx, acquisitiondb.UpdateProcessoManualFieldsParams{
+		PhaseOverride: phaseOverride,
+		ClaimValue:    cv,
+		CourtRecordID: rid,
+		TenantID:      tid,
+	}))
 }
 
 // CascadeCaseResponsibleToIntimations propagates a court_case's responsável to every
@@ -1917,6 +1952,8 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 			Secrecy:          row.Secrecy,
 			Lifecycle:        row.Lifecycle,
 			Completeness:     row.Completeness,
+			Phase:            row.Phase,
+			ClaimValue:       numericToFloatPtr(row.ClaimValue),
 			AssignedUserID:   uuidStrPtr(row.AssignedUserID),
 			AssignedUserName: row.AssignedUserName,
 			LastMovementText: row.LastMovementText,
@@ -1961,6 +1998,8 @@ func (r *pgRepository) GetProcesso(ctx context.Context, tenantID, id string) (Pr
 		Secrecy:          row.Secrecy,
 		Lifecycle:        row.Lifecycle,
 		Completeness:     row.Completeness,
+		Phase:            row.Phase,
+		ClaimValue:       numericToFloatPtr(row.ClaimValue),
 		AssignedUserID:   uuidStrPtr(row.AssignedUserID),
 		AssignedUserName: row.AssignedUserName,
 		LastMovementText: row.LastMovementText,
@@ -1993,6 +2032,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		Court:             q.Court,
 		AssigneeID:        nullUUID(q.Assignee),
 		Urgencia:          q.Urgencia,
+		WorkStage:         q.WorkStage,
 		NaoConfirmado:     q.NaoConfirmado,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
@@ -2002,6 +2042,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	}
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
+		prazo := mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed)
 		out = append(out, IntimacaoView{
 			ID:               row.ID.String(),
 			CNJNumber:        row.CnjNumber,
@@ -2019,10 +2060,11 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 			PublishedAt:      row.PublishedAt.Time,
 			DeadlineStartAt:  row.DeadlineStartAt.Time,
 			ContentPreview:   contentPreview(row.Content),
-			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			Prazo:            prazo,
 			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 			AssigneeUserID:   uuidPtrFromPgtype(row.AssigneeUserID),
 			AssigneeUserName: row.AssigneeUserName,
+			WorkStage:        deriveWorkStage(prazo, deref(row.DraftStatus), row.DraftFiledAt.Valid),
 		})
 	}
 	return out, nil
@@ -2050,11 +2092,31 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		return IntimacaoDetailView{}, database.WrapInfra(err)
 	}
 	assigneeID := uuidPtrFromPgtype(row.AssigneeUserID)
-	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt)
+
+	// Trilha unificada (Architect decisão 2): merge the deadline slice's own audit trail
+	// (deadline_event — "calculado"/"validado"/"confirmado" from the apuração flow) into the
+	// intimação's derived Histórico. Only fetched when a prazo exists (row.PrazoDeadlineID is
+	// the LEFT JOIN deadline's id, nullable) — no prazo means no events to merge.
+	var deadlineEvents []acquisitiondb.ListDeadlineEventsByDeadlineIDRow
+	if row.PrazoDeadlineID.Valid {
+		deadlineEvents, err = r.q.ListDeadlineEventsByDeadlineID(ctx, acquisitiondb.ListDeadlineEventsByDeadlineIDParams{
+			DeadlineID: uuid.UUID(row.PrazoDeadlineID.Bytes),
+			TenantID:   tid,
+		})
+		if err != nil {
+			return IntimacaoDetailView{}, database.WrapInfra(err)
+		}
+	}
+	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt, deadlineEvents)
+
+	// Prazo derivado + work_stage: o estágio é projeção do prazo (confirmado?) e da
+	// peça desta intimação (draft.status + filed_at) — fonte única do stepper.
+	prazo := mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed)
+	workStage := deriveWorkStage(prazo, deref(row.DraftStatus), row.DraftFiledAt.Valid)
 
 	// Cross-slice READ (SQL only, no Go import of internal/actionitem — decisão P1): the
 	// providências materialized by the actionitem listener, replacing the old
-	// ai_providencias jsonb decode (0078).
+	// ai_providencias jsonb decode (0086).
 	actionItems, err := r.q.ListActionItemsByIntimation(ctx, acquisitiondb.ListActionItemsByIntimationParams{TenantID: tid, IntimationID: iid})
 	if err != nil {
 		return IntimacaoDetailView{}, database.WrapInfra(err)
@@ -2080,10 +2142,11 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			// The detail carries the FULL teor below, but ContentPreview stays populated so
 			// the embedded IntimacaoView is a complete list row (nothing the FE reads breaks).
 			ContentPreview:   contentPreview(row.Content),
-			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			Prazo:            prazo,
 			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 			AssigneeUserID:   assigneeID,
 			AssigneeUserName: row.AssigneeUserName,
+			WorkStage:        workStage,
 		},
 		Content:          row.Content,
 		JudgingBody:      deref(row.JudgingBody),
@@ -2091,6 +2154,7 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		Recipients:       rawArrayOrEmpty(json.RawMessage(row.Recipients)),
 		History:          history,
 		AISummary:        deref(row.AiSummary),
+		AIAct:            deref(row.AiAct),
 		AIProvidencias:   mapActionItemRows(actionItems),
 		AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 		Plaintiffs:       stringsOrEmpty(row.Plaintiffs),
@@ -2246,7 +2310,7 @@ func (r *pgRepository) ListAndamentosByProcesso(ctx context.Context, q Andamento
 			OccurredAt: row.OccurredAt.Time,
 			ObservedAt: row.ObservedAt.Time,
 			TPUCode:    intPtr(row.TpuCode),
-			Text:       row.Text,
+			Text:       enrichAndamentoText(row.Text, row.Complements),
 			Source:     row.Source,
 			Fidelity:   int(row.Fidelity),
 		})
@@ -2459,21 +2523,26 @@ func (r *pgRepository) ListIntimacoesByProcesso(ctx context.Context, q Intimacoe
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, IntimacaoView{
-			ID:              row.ID.String(),
-			CNJNumber:       row.CnjNumber,
-			Class:           deref(row.Class),
-			CourtRecordID:   row.CourtRecordID.String(),
-			Court:           row.Court,
-			Degree:          row.Degree,
-			Type:            deref(row.Type),
-			Status:          row.Status,
-			UserStatus:      row.UserStatus,
-			Source:          row.Source,
-			SourceURL:       deref(row.SourceUrl),
-			MadeAvailableAt: row.MadeAvailableAt.Time,
-			PublishedAt:     row.PublishedAt.Time,
-			DeadlineStartAt: row.DeadlineStartAt.Time,
-			ContentPreview:  contentPreview(row.Content),
+			ID:               row.ID.String(),
+			CNJNumber:        row.CnjNumber,
+			Class:            deref(row.Class),
+			Subject:          deref(row.Subject),
+			CourtRecordID:    row.CourtRecordID.String(),
+			Court:            row.Court,
+			Degree:           row.Degree,
+			Type:             deref(row.Type),
+			Status:           row.Status,
+			UserStatus:       row.UserStatus,
+			Source:           row.Source,
+			SourceURL:        deref(row.SourceUrl),
+			MadeAvailableAt:  row.MadeAvailableAt.Time,
+			PublishedAt:      row.PublishedAt.Time,
+			DeadlineStartAt:  row.DeadlineStartAt.Time,
+			ContentPreview:   contentPreview(row.Content),
+			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
+			AssigneeUserID:   uuidPtrFromPgtype(row.AssigneeUserID),
+			AssigneeUserName: row.AssigneeUserName,
 		})
 	}
 	return out, nil
@@ -2586,6 +2655,7 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, q IntimacoesQuery) (
 		Court:         q.Court,
 		AssigneeID:    nullUUID(q.Assignee),
 		Urgencia:      q.Urgencia,
+		WorkStage:     q.WorkStage,
 		NaoConfirmado: q.NaoConfirmado,
 	})
 	if err != nil {
@@ -2927,6 +2997,21 @@ func datePtr(d pgtype.Date) *time.Time {
 	return &t
 }
 
+// numericToFloatPtr converts a nullable numeric (valor da causa) to *float64 — nil when
+// SQL NULL. The values are money in reais (well within float64's exact-integer range at
+// two decimals), so the FE can format/edit them as a number.
+func numericToFloatPtr(n pgtype.Numeric) *float64 {
+	if !n.Valid {
+		return nil
+	}
+	f, err := n.Float64Value()
+	if err != nil || !f.Valid {
+		return nil
+	}
+	v := f.Float64
+	return &v
+}
+
 func timestampPtr(ts pgtype.Timestamptz) *time.Time {
 	if !ts.Valid {
 		return nil
@@ -3131,18 +3216,23 @@ func uuidPtrFromPgtype(u pgtype.UUID) *string {
 //     status is OPEN (confirmed) or NO_DEADLINE; label includes the confirmer name when
 //     available. Absent when there is no deadline or it is not yet confirmed.
 //  3. Providências geradas: ai_analyzed_at, when the analysis has run at least once.
+//  4. deadlineEvents: the deadline slice's OWN audit trail (deadline_event — every
+//     "calculado"/"validado"/"confirmado" moment the derivation + apuração flow recorded,
+//     Architect decisão 2 "Trilha unificada"), merged in verbatim (em → OccurredAt, detalhe →
+//     Label). Empty when the intimação has no prazo yet, or the prazo has no recorded events.
 //
-// Ordered ASC by occurred_at (the three sources don't have a fixed relative order — a
-// re-analysis can happen before or after the prazo is confirmed — so the slice is sorted
-// after assembly rather than relying on append order).
+// Ordered ASC by occurred_at (the sources don't have a fixed relative order — a re-analysis
+// can happen before or after the prazo is confirmed, and a deadline_event can land anywhere
+// in between — so the slice is sorted after assembly rather than relying on append order).
 func buildIntimacaoHistory(
 	madeAvailableAt pgtype.Date,
 	confirmedAt pgtype.Timestamptz,
 	confirmedByName *string,
 	deadlineStatus *string,
 	aiAnalyzedAt pgtype.Timestamptz,
+	deadlineEvents []acquisitiondb.ListDeadlineEventsByDeadlineIDRow,
 ) []IntimacaoHistoryEntry {
-	entries := make([]IntimacaoHistoryEntry, 0, 3)
+	entries := make([]IntimacaoHistoryEntry, 0, 3+len(deadlineEvents))
 
 	// 1. Captura — made_available_at is always present (NOT NULL column).
 	if madeAvailableAt.Valid {
@@ -3181,6 +3271,18 @@ func buildIntimacaoHistory(
 		entries = append(entries, IntimacaoHistoryEntry{
 			OccurredAt: aiAnalyzedAt.Time,
 			Label:      "Providências geradas",
+		})
+	}
+
+	// 4. deadline_event — the deadline slice's own audit trail merged verbatim (em → OccurredAt,
+	// detalhe → Label). Chronological re-sort below interleaves these with 1-3 correctly.
+	for _, e := range deadlineEvents {
+		if !e.Em.Valid {
+			continue
+		}
+		entries = append(entries, IntimacaoHistoryEntry{
+			OccurredAt: e.Em.Time,
+			Label:      derefString(e.Detalhe),
 		})
 	}
 

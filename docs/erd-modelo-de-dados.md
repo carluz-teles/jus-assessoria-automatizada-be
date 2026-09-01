@@ -579,6 +579,33 @@ CREATE TABLE backfill_job (
 ```
 O `UPDATE ... RETURNING` atômico sobre `slices_ok` é o que evita corrida na conclusão.
 
+## ai_usage_event [v0]
+Custo/uso de UMA chamada LLM (OpenRouter). Gravado best-effort pelo `lib/llm.OpenRouterGenerator`
+fora da tx de domínio — telemetria nunca pode derrubar a geração que descreve. `use_case` identifica
+o slice/ação que disparou a chamada (ex.: `draft.generate`, `acquisition.analyze_intimation`),
+sem FK pra intimação/peça específica ainda (fatia futura, se um relatório por processo precisar).
+`cost_usd` vem direto do `usage.cost` que a OpenRouter reporta (USD, já pelo preço vigente do
+modelo — não mantemos tabela de preço própria).
+
+```sql
+CREATE TABLE ai_usage_event (
+  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id         uuid NOT NULL REFERENCES tenant(id),
+  use_case          text NOT NULL,
+  provider          text NOT NULL DEFAULT 'openrouter',
+  model             text NOT NULL,
+  prompt_tokens     integer NOT NULL DEFAULT 0,
+  completion_tokens integer NOT NULL DEFAULT 0,
+  total_tokens      integer NOT NULL DEFAULT 0,
+  cached_tokens     integer NOT NULL DEFAULT 0,
+  cost_usd          numeric(12, 6) NOT NULL DEFAULT 0,
+  latency_ms        integer NOT NULL DEFAULT 0,
+  trace_id          text,
+  created_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON ai_usage_event (tenant_id, use_case, created_at);
+```
+
 ---
 
 # 10. Tabela-resumo
@@ -607,6 +634,7 @@ O `UPDATE ... RETURNING` atômico sobre `slices_ok` é o que evita corrida na co
 | `outbox` | Infra | ✅ | **muito** | purgar publicados |
 | `processed_event` | Infra | ✅ | **muito** | purgar antigos |
 | `backfill_job` | Infra | ✅ | não | saga de onboarding |
+| `ai_usage_event` | Infra | ✅ | **muito** | custo/uso por chamada LLM, gravado best-effort |
 
 **Atenção de crescimento:** `docket_entry` e `chunk` particionam; `outbox` e `processed_event` são purgáveis; `sync_run` vai para retenção curta (30-90 dias).
 

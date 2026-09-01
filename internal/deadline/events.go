@@ -35,6 +35,7 @@ type IntimationObserved struct {
 	Court           string `json:"court"`
 	UF              string `json:"uf"`
 	DeadlineStartAt string `json:"deadline_start_at"`
+	PrazoDeclarado  string `json:"prazo_declarado"` // V1: declarado text from notification
 }
 
 // TypeIntimationCancelled is the SECOND dotted id this slice CONSUMES: the retraction
@@ -672,5 +673,118 @@ func newSuggestionFeedback(deadlineID, intimationID string, d SuggestionDelta) S
 		Kept:           d.Kept,
 		Removed:        d.Removed,
 		Added:          d.Added,
+	}
+}
+
+// ─── V1 Events — fired alongside V0 events for V1 consumers ─────────────────
+
+// TypeDeadlineCalculated is emitted when a deadline is derived (V1). It fires
+// alongside deadline.opened for V1 consumers that need the Origem field.
+const TypeDeadlineCalculated = "deadline.calculated"
+
+// DeadlineCalculated announces a freshly calculated deadline with its Origem.
+// It carries what a V1 consumer needs without reading back the row: the prazo and
+// its origin ids, the Origem, and the computed EndDate.
+type DeadlineCalculated struct {
+	events.Base
+	DeadlineID    string `json:"deadline_id"`
+	CourtRecordID string `json:"court_record_id"`
+	IntimationID  string `json:"intimation_id"`
+	Origem        string `json:"origem"`
+	EndDate       string `json:"end_date"`
+}
+
+var _ events.Event = DeadlineCalculated{}
+
+func (DeadlineCalculated) Type() string          { return TypeDeadlineCalculated }
+func (DeadlineCalculated) AggregateType() string { return aggregateTypeDeadline }
+
+func newDeadlineCalculated(d *Deadline) DeadlineCalculated {
+	return DeadlineCalculated{
+		Base:          events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: d.ID},
+		DeadlineID:    d.ID,
+		CourtRecordID: d.CourtRecordID,
+		IntimationID:  d.IntimationID,
+		Origem:        string(d.Origem),
+		EndDate:       d.EndDate.Format(time.DateOnly),
+	}
+}
+
+// TypeDeadlineSealAssigned is emitted when a confidence seal is assigned to a
+// deadline (V1). The seal is orthogonal to the operational state.
+const TypeDeadlineSealAssigned = "deadline.seal_assigned"
+
+// DeadlineSealAssigned announces a seal assignment. Consumers (read models,
+// notifications) use it to update the confidence badge.
+type DeadlineSealAssigned struct {
+	events.Base
+	DeadlineID string `json:"deadline_id"`
+	Seal       string `json:"seal"`
+	Origem     string `json:"origem"`
+}
+
+var _ events.Event = DeadlineSealAssigned{}
+
+func (DeadlineSealAssigned) Type() string          { return TypeDeadlineSealAssigned }
+func (DeadlineSealAssigned) AggregateType() string { return aggregateTypeDeadline }
+
+func newDeadlineSealAssigned(d *Deadline) DeadlineSealAssigned {
+	return DeadlineSealAssigned{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: d.ID},
+		DeadlineID: d.ID,
+		Seal:       string(d.Seal),
+		Origem:     string(d.Origem),
+	}
+}
+
+// TypeDeadlineConfirmationRequired is emitted when a deadline requires human
+// confirmation (V1) — either seal=A_APURAR (the floor) or the tenant policy is strict.
+const TypeDeadlineConfirmationRequired = "deadline.confirmation_required"
+
+// DeadlineConfirmationRequired announces that a deadline needs human review.
+// TenantID scopes the future consumer; DeadlineID is the prazo.
+type DeadlineConfirmationRequired struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
+
+var _ events.Event = DeadlineConfirmationRequired{}
+
+func (DeadlineConfirmationRequired) Type() string          { return TypeDeadlineConfirmationRequired }
+func (DeadlineConfirmationRequired) AggregateType() string { return aggregateTypeDeadline }
+
+func newDeadlineConfirmationRequired(tenantID, deadlineID string) DeadlineConfirmationRequired {
+	return DeadlineConfirmationRequired{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+	}
+}
+
+// TypeDeadlineRecalculated is emitted when a deadline is recalculated due to a
+// supervenient movement (V1). It is additive — never overwrites the previous state.
+const TypeDeadlineRecalculated = "deadline.recalculated"
+
+// DeadlineRecalculated announces a recalculation. The old state is preserved in
+// deadline_event (audit trail); this event carries the new EndDate and the reason.
+type DeadlineRecalculated struct {
+	events.Base
+	DeadlineID string `json:"deadline_id"`
+	EndDate    string `json:"end_date"`
+	Reason     string `json:"reason"`
+}
+
+var _ events.Event = DeadlineRecalculated{}
+
+func (DeadlineRecalculated) Type() string          { return TypeDeadlineRecalculated }
+func (DeadlineRecalculated) AggregateType() string { return aggregateTypeDeadline }
+
+func newDeadlineRecalculated(d *Deadline, reason string) DeadlineRecalculated {
+	return DeadlineRecalculated{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: d.ID},
+		DeadlineID: d.ID,
+		EndDate:    d.EndDate.Format(time.DateOnly),
+		Reason:     reason,
 	}
 }

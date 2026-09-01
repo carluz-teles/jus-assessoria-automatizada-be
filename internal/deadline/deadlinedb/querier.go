@@ -14,16 +14,19 @@ import (
 type Querier interface {
 	// The F2 confirmation (§9: "Aprovar tudo" grava o deadline PENDING→OPEN recalculado).
 	// Flips the prazo to OPEN with the human-approved {kind, days, counting, doubled,
-	// doubled_reason} and the RECOMPUTED {end_date, holidays_applied}, stamping who/when
-	// (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
+	// doubled_reason} and the RECOMPUTED {end_date, holidays_applied, prazo_interno}, stamping
+	// who/when (confirmed_by/at). Keyed by the 1:1 notification_id and scoped to tenant_id (barrier
 	// 1). IDEMPOTENT on the deadline: re-confirming the same intimação re-UPDATEs the one row
 	// (the 1:1 notification_id) — it never opens a second prazo. source/rules_version are LEFT
 	// AS-IS: source keeps its provenance (RULE/AI) and rules_version still records which rule set
 	// first derived the prazo even when the human overrode the days. start_date IS written now: the
 	// confirmation panel may re-anchor (anchor_event → a different intimação date), and
-	// anchor_event/manual_extra_days/legal_citation persist the panel's choices. A no-match yields
-	// NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id, $2 =
-	// tenant_id, then the confirmed fields.
+	// anchor_event/manual_extra_days/legal_citation persist the panel's choices. prazo_interno is
+	// recomputed in lockstep with end_date (never left stale against it). V1 fields
+	// (origem/selo/confirmacao_exigida) are SET ONLY at birth and preserved through all
+	// subsequent operations — they are never overwritten by confirm or adjust. A no-match
+	// yields NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id,
+	// $2 = tenant_id, then the confirmed fields.
 	ConfirmDeadline(ctx context.Context, arg ConfirmDeadlineParams) (ConfirmDeadlineRow, error)
 	// The filtered "X" of the agenda's "X de Y" counter: how many prazos match the active
 	// @status / @kind / @court / end_date window. Called only when a filter is present; the
@@ -59,6 +62,11 @@ type Querier interface {
 	// be NULL (mapped to ""); a missing/foreign action_item id is pgx.ErrNoRows → the typed
 	// ErrActionItemNotFound at the mapper.
 	GetActionItemCourtRecordID(ctx context.Context, arg GetActionItemCourtRecordIDParams) (pgtype.UUID, error)
+	// Read one deadline's calc_memory (apurar-tipo: the IA's inferred tipo/confiança the human
+	// confirms or overrides). Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing
+	// row → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper (→ 404), never (nil, nil).
+	// $1 = deadline_id, $2 = tenant_id.
+	GetCalcMemory(ctx context.Context, arg GetCalcMemoryParams) (GetCalcMemoryRow, error)
 	// deadline slice queries (the prazos CREATION path). Every write and read runs inside
 	// the use case's transaction so RLS scopes it to the event's tenant (barrier 2) on top
 	// of the explicit tenant filter (barrier 1). Absence is a typed error at the mapper,
@@ -77,6 +85,19 @@ type Querier interface {
 	// missing record → pgx.ErrNoRows → typed not-found at the mapper. court is NOT NULL.
 	// $1 = id, $2 = tenant_id, both from the trusted principal's request context.
 	GetCourtRecordCourt(ctx context.Context, arg GetCourtRecordCourtParams) (string, error)
+	// ── V1 apuração (human decision on a_apurar prazos) ─────────────────────────
+	// POST /v1/prazos/:id/apurar-divergencia | .../apurar-tipo (apurar.go). Both flip selo
+	// a_apurar → confiavel; origem is NEVER touched here (immutable after creation — only the
+	// creation path in domain.go writes it). The deadline row itself is patched via the ALREADY
+	// existing UpdateDeadlineAdjust (ajuste_manual path) or UpdateDeadlineEndDate (aceita_declarado
+	// path) below; aceita_calculado writes nothing (the stored end_date already IS the calculado
+	// date).
+	// Read the declared×calculado cross-validation for one deadline (apurar-divergencia gate:
+	// resultado must be "divergente" AND decisao must still be "" — the idempotency guard). Scoped
+	// to tenant_id (barrier 1, on top of RLS barrier 2). A missing row (no prazo_declarado at birth,
+	// so nothing was ever cross-checked) → pgx.ErrNoRows → typed ErrCrossValidationNotFound at the
+	// mapper (→ 404), never (nil, nil). $1 = deadline_id, $2 = tenant_id.
+	GetCrossValidation(ctx context.Context, arg GetCrossValidationParams) (GetCrossValidationRow, error)
 	// Read ONLY a prazo's end_date by id, scoped to tenant_id (barrier 1, on top of RLS barrier 2).
 	// The task write path (POST /v1/tasks, PATCH /v1/tasks/:id) reads it inside its tx to enforce
 	// ERD §4's task invariant: a task's due_date cannot fall after its prazo's end_date. It is a
@@ -89,9 +110,11 @@ type Querier interface {
 	// from, court_record_id feeds the court lookup (recompute UF), and the CURRENT
 	// {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
 	// over (a field absent from the body keeps its stored value). status gates the ajuste (only
-	// a PENDING/OPEN prazo is adjustable). Keyed by id and scoped to tenant_id (barrier 1, on top
-	// of RLS barrier 2). A missing id in the tenant → pgx.ErrNoRows → typed ErrDeadlineNotFound at
-	// the mapper (→ 404), never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
+	// a PENDING/OPEN prazo is adjustable). origem/selo (V1) ride along for apurar.go — origem is
+	// immutable (only stamped onto deadline.seal_assigned), selo gates apurar-tipo. Keyed by id
+	// and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing id in the tenant →
+	// pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper (→ 404), never (nil, nil). $1 = id,
+	// $2 = tenant_id (from the principal).
 	GetDeadlineForAdjust(ctx context.Context, arg GetDeadlineForAdjustParams) (GetDeadlineForAdjustRow, error)
 	// Re-read a prazo at a scheduled mark's fire time (deadline.reminder_check): the CURRENT
 	// status the fire handler branches on, plus the end_date and the context (kind, counting,
@@ -109,6 +132,12 @@ type Querier interface {
 	// never (nil, nil): confirming an intimação with no derived prazo is a 404 at the edge.
 	// $1 = intimation_id (the notification_id column), $2 = tenant_id (from the principal).
 	GetDeadlineForConfirm(ctx context.Context, arg GetDeadlineForConfirmParams) (GetDeadlineForConfirmRow, error)
+	// Read the tenant's deadline confirmation policy. Returns the row when it exists;
+	// the caller maps pgx.ErrNoRows to the default policy (confirmacao_obrigatoria =
+	// false) so a tenant without an explicit row gets the seletiva default. Scoped
+	// to tenant_id (barrier 1, on top of RLS barrier 2).
+	// $1 = tenant_id.
+	GetDeadlinePolicy(ctx context.Context, tenantID uuid.UUID) (GetDeadlinePolicyRow, error)
 	// Load the three observed dates of the intimação the confirmation panel can re-anchor a prazo
 	// on (§3 "termo inicial"): made_available_at (disponibilização), published_at (publicação) and
 	// deadline_start_at (início da contagem — the legacy anchor). All three are NOT NULL date
@@ -132,8 +161,15 @@ type Querier interface {
 	GetLatestTaskSuggestion(ctx context.Context, arg GetLatestTaskSuggestionParams) (GetLatestTaskSuggestionRow, error)
 	// The audit/detail view of one prazo (GET /v1/prazos/:id): every field the "por quê"
 	// popover needs — the full holidays_applied, the rules_version that derived the days,
-	// the origin intimation_id, and start/end/days/counting/doubled. Tenant-scoped (barrier
-	// 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
+	// the origin intimation_id, and start/end/days/counting/doubled. V1 adds the full memória de
+	// cálculo: origem/selo/confirmacao_exigida off the deadline row, prazo_interno (the internal
+	// safety buffer, COALESCEd to end_date for a pré-migration row that never had it recomputed),
+	// and the 1:1 calc_memory +
+	// cross_validation LEFT JOINed in (a pre-V1 or not-yet-derived prazo has neither row, so every
+	// cm./cv. column comes back NULL — the mapper degrades to nil, never an error). applied_holiday
+	// is 1:N so it is NOT joined here (would multiply the deadline row); ListAppliedHolidaysByCalc
+	// Memory reads it separately, keyed by calc_memory_id, only when cm.id is present. Tenant-scoped
+	// (barrier 1): a foreign id resolves to no row → pgx.ErrNoRows → typed ErrDeadlineNotFound (404)
 	// at the repo, never (nil, nil).
 	GetPrazo(ctx context.Context, arg GetPrazoParams) (GetPrazoRow, error)
 	// The advisory CASE CONTEXT for one prazo — the input the AI "intimação → tarefas sugeridas"
@@ -219,6 +255,29 @@ type Querier interface {
 	// ao início do prazo não o cumpre. Returns a bool (EXISTS), never (nil, nil). $1 =
 	// court_record_id, $2 = tenant_id, $3 = start_date, $4 = tpu_codes (int[]).
 	HasResponseMovement(ctx context.Context, arg HasResponseMovementParams) (bool, error)
+	// Persist one holiday snapshot applied to a calculation (same tx as calc_memory).
+	// applied_holiday is 1:N with calc_memory (each holiday the motor skipped).
+	// Returns the DB-assigned id so the caller can build the full audit trail.
+	// $1 = tenant_id, $2 = calc_memory_id, $3 = data, $4 = nome, $5 = ambito, $6 = comarca.
+	InsertAppliedHoliday(ctx context.Context, arg InsertAppliedHolidayParams) (uuid.UUID, error)
+	// ── V1 Motor de Prazos persistence ─────────────────────────────────────────
+	// The V1 motor audit trail: calc_memory, applied_holiday, cross_validation,
+	// deadline_event, and deadline_policy. All run inside the use case's tx so RLS
+	// scopes them to the event's tenant (barrier 2) on top of the explicit tenant
+	// filter (barrier 1).
+	// Persist the deterministic calculation audit trail alongside the deadline (same
+	// tx). deadline_id is UNIQUE (1:1 per deadline) so ON CONFLICT DO NOTHING yields
+	// no row on a re-derivation, mapped to ErrCalcMemoryExists at the mapper. All
+	// nullable text columns map to NULL via textToNull. Returns the DB-assigned id.
+	// $1 = tenant_id, $2 = deadline_id, then the audit fields.
+	InsertCalcMemory(ctx context.Context, arg InsertCalcMemoryParams) (uuid.UUID, error)
+	// Persist the declared vs calculated date cross-validation result (same tx as
+	// deadline). deadline_id is UNIQUE (1:1 per deadline) so ON CONFLICT DO NOTHING
+	// yields no row on a re-derivation, mapped to ErrCrossValidationExists at the
+	// mapper. decidido_por is nullable (NULL when system-decided).
+	// $1 = tenant_id, $2 = deadline_id, $3 = data_declarada, $4 = data_calculada,
+	// $5 = dif_dias, $6 = resultado, $7 = causa_provavel, $8 = decisao, $9 = decidido_por.
+	InsertCrossValidation(ctx context.Context, arg InsertCrossValidationParams) (uuid.UUID, error)
 	// Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
 	// notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO row on a re-derivation, so
 	// the mapper reads pgx.ErrNoRows as "already exists" (ErrDeadlineExists) instead of
@@ -226,12 +285,17 @@ type Querier interface {
 	// yet — that is the F2 slice). Returns the DB-assigned id; the repo maps the rest from
 	// the input entity.
 	InsertDeadline(ctx context.Context, arg InsertDeadlineParams) (uuid.UUID, error)
+	// Append one event to the deadline's append-only audit trail (same tx as the
+	// mutation it records). deadline_event never overwrites; it adds. ator_id is
+	// nullable (NULL when the system is the actor). Returns the id for log/telemetry.
+	// $1 = tenant_id, $2 = deadline_id, $3 = tipo, $4 = detalhe, $5 = ator_id.
+	InsertDeadlineEvent(ctx context.Context, arg InsertDeadlineEventParams) (uuid.UUID, error)
 	// Persist one task — the manual/F2 path (§4: 1 legal prazo → N tasks) OR the automatic path
 	// a confirmed providência drives (fatia 3, docs/erd-costura-providencia-tarefa-peca.md §2/§6):
 	// action_item_id is NULL for the former, set for the latter. Born status='OPEN'; source is
 	// 'MANUAL' (a human created it) or 'RULE' (derived from a confiável action_item) — AI-suggested
-	// tasks are a later slice. All FKs but tenant_id are nullable per the 0024/0079 schema.
-	// Idempotent on the action_item path via ON CONFLICT (action_item_id) DO NOTHING (0079's
+	// tasks are a later slice. All FKs but tenant_id are nullable per the 0024/0087 schema.
+	// Idempotent on the action_item path via ON CONFLICT (action_item_id) DO NOTHING (0087's
 	// UNIQUE): a redelivered actionitem.created/confirmed yields NO row (RETURNING is empty),
 	// which the mapper reads as "already created" instead of minting a second task. Multiple NULLs
 	// are always distinct, so the manual/avulsa path (action_item_id always NULL) never conflicts.
@@ -267,6 +331,12 @@ type Querier interface {
 	// (suggested jsonb: [{title, kind}, …]). É best-effort — uma falha aqui não quebra o F2.
 	// Retorna o id para log/telemetria. $1..$6 são as colunas na ordem do INSERT.
 	InsertTaskSuggestion(ctx context.Context, arg InsertTaskSuggestionParams) (uuid.UUID, error)
+	// The 1:N feriados snapshot applied to one calc_memory (GET /v1/prazos/:id memória de
+	// cálculo). Kept as a companion query to GetPrazo (not joined there) so a prazo with N applied
+	// holidays never multiplies the deadline row. Scoped to tenant_id (barrier 1, on top of RLS
+	// barrier 2). No holidays applied (a dias corridos calc, or a short prazo that skipped none)
+	// yields an empty slice, never an error. $1 = calc_memory_id, $2 = tenant_id.
+	ListAppliedHolidaysByCalcMemory(ctx context.Context, arg ListAppliedHolidaysByCalcMemoryParams) ([]ListAppliedHolidaysByCalcMemoryRow, error)
 	// Selectable ?court values for the prazos agenda: the distinct courts of the tenant's
 	// intimated court records (the same join the list uses), ordered by name
 	// (case-insensitive). Same DISTINCT-inner / ORDER BY-outer shape as ListPrazoKinds.
@@ -468,16 +538,58 @@ type Querier interface {
 	// checks it BEFORE inserting so a foreign/unknown :id is a typed ErrTaskNotFound (→ 404) at
 	// the mapper, not a phantom item on nothing (or a raw FK error). $1 = id, $2 = tenant_id.
 	TaskExistsInTenant(ctx context.Context, arg TaskExistsInTenantParams) (uuid.UUID, error)
+	// Record the human's confirmation/reclassification of the IA-inferred tipo de ato
+	// (apurar-tipo, confirmar|reclassificar): ia_tipo_inferido becomes the confirmed/overridden
+	// tipo, ia_confianca becomes 1.0 (human-confirmed, full confidence) — an UPDATE, not an INSERT
+	// (the row already exists since InsertCalcMemory ran at birth). Scoped to tenant_id (barrier
+	// 1). A no-match → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper. $1 = deadline_id,
+	// $2 = tenant_id, $3 = ia_tipo_inferido, $4 = ia_confianca.
+	UpdateCalcMemoryTipoConfirmation(ctx context.Context, arg UpdateCalcMemoryTipoConfirmationParams) (uuid.UUID, error)
+	// Record the human decision on a divergência (aceita_declarado | aceita_calculado |
+	// ajuste_manual) — an UPDATE, not an INSERT: the row already exists since InsertCrossValidation
+	// ran at birth (docs §"Validação cruzada"). Scoped to tenant_id (barrier 1). The `decisao IS
+	// NULL` guard makes the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor,
+	// mirroring MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller
+	// pre-checks decisao=="" before calling, and this guard defends the write against a racing
+	// second apuração on the SAME divergência — a no-match (the row vanished mid-tx, OR a
+	// concurrent apuração already decided it) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the
+	// mapper (never a silent overwrite of the first decision). $1 = deadline_id, $2 = tenant_id, $3
+	// = decisao, $4 = decidido_por.
+	UpdateCrossValidationDecision(ctx context.Context, arg UpdateCrossValidationDecisionParams) (uuid.UUID, error)
 	// Ajuste manual do prazo legal (§9: PATCH /v1/prazos/:id → recalcula datas). Writes the
 	// patched {kind, days, counting, doubled, doubled_reason, anchor_event, manual_extra_days} and
-	// the RECOMPUTED {end_date, holidays_applied, start_date}, keyed by id and scoped to tenant_id
-	// (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle (a PENDING stays
-	// PENDING, an OPEN stays OPEN — the use case already refused a terminal prazo); source/
-	// rules_version/confirmed_* are untouched. start_date IS written now (the panel may re-anchor via
-	// anchor_event → a different intimação date). A no-match (the
+	// the RECOMPUTED {end_date, holidays_applied, prazo_interno, start_date}, keyed by id and
+	// scoped to tenant_id (barrier 1). status is LEFT AS-IS: the ajuste never changes the lifecycle
+	// (a PENDING stays PENDING, an OPEN stays OPEN — the use case already refused a terminal
+	// prazo); source/rules_version/confirmed_* are untouched. V1 fields (origem/selo/
+	// confirmacao_exigida) are SET ONLY at birth and preserved through all subsequent operations —
+	// they are never overwritten by confirm or adjust. start_date IS written now (the panel may
+	// re-anchor via anchor_event → a different intimação date); prazo_interno is recomputed in
+	// lockstep with end_date (never left stale against it). A no-match (the
 	// row vanished mid-tx) → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. Returns the prazo id
 	// and the record it hangs on. $1 = id, $2 = tenant_id, then the patched fields.
 	UpdateDeadlineAdjust(ctx context.Context, arg UpdateDeadlineAdjustParams) (UpdateDeadlineAdjustRow, error)
+	// Overwrite end_date AND prazo_interno — the "aceita_declarado" apuração: the human picked the
+	// declared date over the calculado one, so end_date becomes data_declarada with NO recompute of
+	// days/counting/holidays_applied (kept as audit of the deterministic calc); prazo_interno IS
+	// recomputed by the caller from the new end_date (same buffer motor as everywhere else) so it
+	// never drifts against the human-picked date. Scoped to tenant_id (barrier 1). A no-match →
+	// pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper. $1 = id, $2 = tenant_id, $3 =
+	// end_date, $4 = prazo_interno.
+	UpdateDeadlineEndDate(ctx context.Context, arg UpdateDeadlineEndDateParams) (uuid.UUID, error)
+	// Flip the confidence selo (a_apurar → confiavel) AND stamp who/when confirmed it — the shared
+	// write both apurar-divergencia and apurar-tipo end with, after the divergência/tipo decision is
+	// recorded (Architect decisão: "apurar também confirma", reusing the confirmed_by/confirmed_at
+	// columns from migration 0024 — the SAME human-approval stamp F2's ConfirmDeadline/MarkNoDeadline
+	// already write, now also written on THIS confirmation path). origem is NEVER written here
+	// (immutable after creation). Scoped to tenant_id (barrier 1). The `selo = 'a_apurar'` guard makes
+	// the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor, mirroring
+	// MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller pre-checks the
+	// selo before calling, and this guard defends the write against a racing second apuração on the
+	// SAME prazo — a no-match (the row vanished mid-tx, OR a concurrent apuração already sealed it
+	// confiavel) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the mapper (never a silent no-op
+	// re-seal). $1 = id, $2 = tenant_id, $3 = selo, $4 = confirmed_by, $5 = confirmed_at.
+	UpdateDeadlineSelo(ctx context.Context, arg UpdateDeadlineSeloParams) (uuid.UUID, error)
 	// Manual ajuste of a task (§9: PATCH /v1/tasks/:id → editar tarefa). Writes the merged
 	// {title, description, kind, due_date, assignee_user_id} (already merged over the stored
 	// values by the use case), keyed by id and scoped to tenant_id (barrier 1). status/source/

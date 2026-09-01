@@ -1,4 +1,4 @@
--- 0077: Tipos de Peça — catálogo de perfis de geração + regras de conformidade + modelo de teses.
+-- 0085: Tipos de Peça — catálogo de perfis de geração + regras de conformidade + modelo de teses.
 -- Reference tables (global, no tenant_id): base_skeleton, matter, format_profile, compliance_rule.
 -- Catalog tables (also global in v1 — docs/erd-tipos-de-peca.md §7.1, "cadastro de dados", no
 -- tenant_id): piece_profile, profile_section, profile_requirement, profile_rule, section_rule,

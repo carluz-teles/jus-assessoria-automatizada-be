@@ -223,7 +223,7 @@ func (r *pgRepository) ExistsActionItemByTipo(ctx context.Context, tx database.T
 }
 
 func (r *pgRepository) HasFiledDraftForActionItem(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (bool, error) {
-	// ActionItemID binds against task.action_item_id (nullable, migration 0079), so sqlc
+	// ActionItemID binds against task.action_item_id (nullable, migration 0087), so sqlc
 	// infers a pgtype.UUID param — not the plain uuid.UUID a required/PK column would get.
 	itemID, err := parseUUID(actionItemID)
 	if err != nil {

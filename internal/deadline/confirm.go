@@ -48,14 +48,17 @@ type ConfirmCommand struct {
 // (not the Deadline aggregate) because confirm updates a subset of columns and leaves
 // source/rules_version untouched. start_date IS written (the panel may re-anchor it).
 type ConfirmDeadlineParams struct {
-	IntimationID    string
-	TenantID        string
-	Kind            string
-	Days            int
-	Counting        Counting
-	Doubled         bool
-	DoubledReason   string
-	EndDate         time.Time
+	IntimationID  string
+	TenantID      string
+	Kind          string
+	Days          int
+	Counting      Counting
+	Doubled       bool
+	DoubledReason string
+	EndDate       time.Time
+	// PrazoInterno is the recomputed internal safety buffer (internalBufferBusinessDays
+	// business days before EndDate), kept in sync with the recomputed EndDate.
+	PrazoInterno    time.Time
 	HolidaysApplied []time.Time
 	ConfirmedBy     string
 	ConfirmedAt     time.Time
@@ -165,6 +168,13 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 			return apperr.NewInvalid("deadline end date must be after start date")
 		}
 
+		// V1: recompute the internal safety buffer in lockstep with EndDate, via the SAME
+		// uf/court already resolved above — never left stale against the recomputed EndDate.
+		prazoInterno, _, err := uc.cal.SubtractBusinessDays(ctx, endDate, internalBufferBusinessDays, uf, court)
+		if err != nil {
+			return err
+		}
+
 		confirmedAt := uc.now()
 		deadlineID, courtRecordID, err := uc.repo.ConfirmDeadline(ctx, tx, ConfirmDeadlineParams{
 			IntimationID:    cmd.IntimationID,
@@ -175,6 +185,7 @@ func (uc *UseCase) Confirm(ctx context.Context, cmd ConfirmCommand) (ConfirmResu
 			Doubled:         cmd.Doubled,
 			DoubledReason:   cmd.DoubledReason,
 			EndDate:         endDate,
+			PrazoInterno:    prazoInterno,
 			HolidaysApplied: holidays,
 			ConfirmedBy:     cmd.UserID,
 			ConfirmedAt:     confirmedAt,

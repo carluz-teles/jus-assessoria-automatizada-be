@@ -35,9 +35,14 @@ type Deadline struct {
 	HolidaysApplied []time.Time
 	StartDate       time.Time
 	EndDate         time.Time
-	Status          Status
-	Source          Source
-	RulesVersion    string
+	// PrazoInterno is the internal safety buffer — internalBufferBusinessDays (2) business
+	// days before EndDate — recomputed at the same 4 points EndDate is (birth, confirm,
+	// adjust, and the aceita_declarado apuração). Persisted (deadline.prazo_interno), not a
+	// read-time placeholder.
+	PrazoInterno time.Time
+	Status       Status
+	Source       Source
+	RulesVersion string
 	// AnchorEvent is which observed intimação date the start_date was anchored on. The creation
 	// path is born on the derived deadline_start_at (AnchorDeadlineStart); the confirmation panel
 	// may re-anchor it later.
@@ -46,6 +51,81 @@ type Deadline struct {
 	// resolved deadline_rule at derivation — distinct from DoubledReason. "" when the rule has no
 	// citation (the catch-all / generic rules).
 	LegalCitation string
+	// V1 fields — precedência de fontes, selo de confiança e proveniência
+	Origem             Origem     // precedência de fontes (declarado > calculado > ia)
+	Seal               Seal       // confiança ortogonal ao estado
+	ConfirmacaoExigida bool       // true se seal=A_APURAR OU política estrita
+	Providencia        string     // tipo de ato (parte da chave 1:N)
+	ConfirmedBy        *string    // nullable, quem confirmou
+	ConfirmedAt        *time.Time // nullable, quando confirmou
+}
+
+// CalcMemory stores the deterministic calculation provenance (V1). It answers "por
+// que essa data?" — the auditable trail of every number that fed the computation.
+// Persisted snapshot, never recomputed (the calendar provider may change).
+type CalcMemory struct {
+	ID                      string
+	TenantID                string
+	DeadlineID              string
+	PrazoBase               string
+	PrazoBaseFonte          string
+	TermoInicialRegra       string
+	DiasUteis               bool
+	DobraMotivo             string
+	TabelaLegalRef          string
+	IATipoInferido          string
+	IAConfianca             float64
+	CalendarProviderVersion string
+}
+
+// AppliedHoliday is a snapshot of a feriado applied to a calculation (V1). The
+// calendar is a licensed external service; we persist what was applied, not the
+// source — proveniência, not ownership.
+type AppliedHoliday struct {
+	ID           string
+	TenantID     string
+	CalcMemoryID string
+	Data         time.Time
+	Nome         string
+	Ambito       string
+	Comarca      string
+}
+
+// CrossValidation records declared vs calculated validation (V1). Optional — only
+// exists when there is a declared date AND a calculated date. The divergence
+// resolution is persisted with who decided.
+type CrossValidation struct {
+	ID            string
+	TenantID      string
+	DeadlineID    string
+	DataDeclarada time.Time
+	DataCalculada time.Time
+	DifDias       int
+	Resultado     string // convergente | divergente
+	CausaProvavel string
+	Decisao       string // aceita_declarado | aceita_calculado | ajuste_manual
+	DecididoPor   string
+}
+
+// DeadlineEvent is one row in the audit trail (V1). Append-only — recálculo por
+// movimento superveniente never overwrites; it adds a new event. History is auditable.
+type DeadlineEvent struct {
+	ID         string
+	TenantID   string
+	DeadlineID string
+	Tipo       string // calculado | validado | confirmado | recalculado | em_risco | cumprido | override
+	Detalhe    string
+	AtorID     string
+	Em         time.Time
+}
+
+// DeadlinePolicy is the per-tenant confirmation policy (V1). The default is seletiva
+// (ConfirmacaoObrigatoria=false): system assumes confiável deadlines; IA and
+// divergent always require human (the non-negotiable floor). Strict mode
+// (ConfirmacaoObrigatoria=true) raises the bar for ALL deadlines.
+type DeadlinePolicy struct {
+	TenantID               string
+	ConfirmacaoObrigatoria bool
 }
 
 // Counting is how the days are counted. Cível/CPC counts in dias úteis (art. 219);
@@ -136,6 +216,28 @@ const (
 	SourceManual Source = "MANUAL"
 )
 
+// Origem records the precedência de fontes (V1). Replaces Source semantically:
+// declarado > calculado > ia. The hierarchy of origin is the hierarchy of risk.
+type Origem string
+
+const (
+	OrigemDeclarado  Origem = "declarado"
+	OrigemValidado   Origem = "validado"
+	OrigemCalculado  Origem = "calculado"
+	OrigemDivergente Origem = "divergente"
+	OrigemIA         Origem = "ia"
+	OrigemManual     Origem = "manual"
+)
+
+// Seal is the confidence seal, orthogonal to the operational state (V1). A deadline
+// can be ACTIVE and COUNTING while still requiring human confirmation.
+type Seal string
+
+const (
+	SealConfiavel Seal = "confiavel"
+	SealAApurar   Seal = "a_apurar"
+)
+
 // Task is one actionable work item (docs/erd-prazos.md §4/§10) — the checklist of steps
 // toward the legal prazo. 1 legal prazo (Deadline) → N tasks; a task can also be avulsa
 // (POST /v1/tasks, no deadline). The assignee lives on the task, not the prazo (the prazo
@@ -161,7 +263,7 @@ type Task struct {
 	CompletedAt    *time.Time // stamped when the task is marked DONE; NULL while OPEN/DISMISSED
 	// ActionItemID is "" for a manual/avulsa task (POST /v1/tasks) and set only when the task
 	// was born automatically from a confiável providência (docs/erd-costura-providencia-
-	// tarefa-peca.md §2/§6, fatia 3: actionitem.created/confirmed → task). migration 0079's
+	// tarefa-peca.md §2/§6, fatia 3: actionitem.created/confirmed → task). migration 0087's
 	// UNIQUE constraint on the column is the idempotency floor InsertTask's ON CONFLICT relies
 	// on.
 	ActionItemID string
@@ -388,6 +490,11 @@ type DeadlineForAdjust struct {
 	DoubledReason   string
 	AnchorEvent     AnchorEvent
 	ManualExtraDays int
+	// Origem/Selo (V1) ride along so the apurar.go use cases (ApurarDivergencia/ApurarTipo) can
+	// gate on the current selo and stamp the UNCHANGED origem onto the deadline.seal_assigned
+	// event without a second read — origem is immutable after creation (only selo flips).
+	Origem Origem
+	Selo   Seal
 }
 
 // Kind constants — the legible prazo kinds the v0 rules layer emits (docs/erd-prazos.md

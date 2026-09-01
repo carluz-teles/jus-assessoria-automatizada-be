@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
@@ -46,6 +51,11 @@ var responseTPUCodes = []int32{85, 118, 383, 433, 235}
 // derived prazo records it (rules_version) so "por que 15 dias?" is answerable and the
 // rule set can evolve without touching this code (docs §8).
 const rulesVersion = "v0"
+
+// internalBufferBusinessDays is the fixed "folga de segurança" — the internal prazo
+// (deadline.prazo_interno) is always this many business days BEFORE the fatal EndDate,
+// recomputed everywhere EndDate is (docs/design-motor-de-prazos-v1.md).
+const internalBufferBusinessDays = 2
 
 // Repository is the persistence port the use case depends on (never the concrete impl,
 // docs §2.5). Every method takes the caller's tx so it participates in the use case's
@@ -253,6 +263,68 @@ type Repository interface {
 	// suggester existed) simply has no suggestion, so it returns ok=false, nil — the confirm
 	// then emits no feedback event. Read inside the confirm's tx so it sees the same snapshot.
 	GetLatestSuggestion(ctx context.Context, tx database.Tx, tenantID, intimationID string) (rec SuggestionRecord, ok bool, err error)
+
+	// ── V1 Motor de Prazos persistence ──────────────────────────────────────────
+
+	// InsertCalcMemory persists the deterministic calculation audit trail in the same tx as
+	// the deadline (1:1 on deadline_id). The memory answers "por que essa data?" — every
+	// number that fed the computation. Idempotent on deadline_id (ON CONFLICT DO NOTHING):
+	// a re-derivation yields no row, mapped to ErrCalcMemoryExists so the use case no-ops.
+	InsertCalcMemory(ctx context.Context, tx database.Tx, m *CalcMemory) (*CalcMemory, error)
+	// InsertAppliedHoliday persists one holiday snapshot applied to a calculation in the same
+	// tx as the calc_memory. applied_holiday is 1:N with calc_memory (each holiday the motor
+	// skipped); the caller iterates the holidays and calls this per row. Returns the DB-
+	// assigned id so the caller can build the full audit trail.
+	InsertAppliedHoliday(ctx context.Context, tx database.Tx, h *AppliedHoliday) (*AppliedHoliday, error)
+	// InsertCrossValidation persists the declared vs calculated date cross-validation result
+	// in the same tx as the deadline (1:1 on deadline_id). Idempotent on deadline_id (ON
+	// CONFLICT DO NOTHING): a re-derivation yields no row, mapped to
+	// ErrCrossValidationExists so the use case no-ops.
+	InsertCrossValidation(ctx context.Context, tx database.Tx, cv *CrossValidation) (*CrossValidation, error)
+	// InsertDeadlineEvent appends one event to the deadline's append-only audit trail in the
+	// same tx as the mutation it records. deadline_event never overwrites; it adds. History
+	// is auditable. Returns only the error — the caller does not need the row back.
+	InsertDeadlineEvent(ctx context.Context, tx database.Tx, e *DeadlineEvent) error
+	// GetPolicy reads the tenant's deadline confirmation policy. Returns the stored policy
+	// when a row exists; when no row exists for the tenant, returns the default seletiva
+	// policy (ConfirmacaoObrigatoria = false) — NOT an error, because the absence of a
+	// row means the tenant never opted into strict mode (the safe default).
+	GetPolicy(ctx context.Context, tx database.Tx, tenantID string) (DeadlinePolicy, error)
+
+	// ── V1 apuração (human decision on a_apurar prazos, apurar.go) ─────────────────────
+
+	// GetCrossValidation reads the declared×calculado cross-validation for one deadline,
+	// scoped to tenantID (barrier 1). ApurarDivergencia gates on Resultado=="divergente" AND
+	// Decisao=="" (the idempotency guard: an already-decided divergência is refused, not
+	// reprocessed). A deadline with no cross_validation row (no prazo_declarado at birth) is
+	// ErrCrossValidationNotFound (→ 404), never (nil, nil).
+	GetCrossValidation(ctx context.Context, tx database.Tx, tenantID, deadlineID string) (*CrossValidation, error)
+	// UpdateCrossValidationDecision records the human's divergência decision (aceita_declarado |
+	// aceita_calculado | ajuste_manual) + who decided, keyed by deadline_id and scoped to
+	// tenantID (barrier 1). An UPDATE, not an INSERT — the row already exists since
+	// InsertCrossValidation ran at birth. A no-match is ErrCrossValidationNotFound.
+	UpdateCrossValidationDecision(ctx context.Context, tx database.Tx, tenantID, deadlineID, decisao, decididoPor string) error
+	// UpdateDeadlineEndDate overwrites end_date AND prazo_interno, keyed by the prazo id and
+	// scoped to tenantID (barrier 1) — the "aceita_declarado" apuração write (no recompute of
+	// days/counting/holidays_applied — left as the deterministic calc's audit; prazo_interno IS
+	// recomputed by the caller from the new end_date so the buffer never drifts). A no-match is
+	// ErrDeadlineNotFound.
+	UpdateDeadlineEndDate(ctx context.Context, tx database.Tx, tenantID, deadlineID string, endDate, prazoInterno time.Time) error
+	// UpdateDeadlineSelo flips the confidence selo AND stamps who/when confirmed it
+	// (confirmed_by/confirmed_at, reusing the migration 0024 columns), keyed by the prazo id and
+	// scoped to tenantID (barrier 1) — the shared write both ApurarDivergencia and ApurarTipo end
+	// with ("apurar também confirma"). origem is NEVER written here (immutable after creation). A
+	// no-match is ErrDeadlineNotDivergent (a racing apuração already sealed it).
+	UpdateDeadlineSelo(ctx context.Context, tx database.Tx, tenantID, deadlineID string, selo Seal, confirmedBy string, confirmedAt time.Time) error
+	// GetCalcMemory reads one deadline's calc_memory, scoped to tenantID (barrier 1).
+	// ApurarTipo reads it to confirm/override the IA-inferred tipo/confiança. A missing row is
+	// ErrCalcMemoryNotFound (→ 404), never (nil, nil).
+	GetCalcMemory(ctx context.Context, tx database.Tx, tenantID, deadlineID string) (*CalcMemory, error)
+	// UpdateCalcMemoryTipoConfirmation records the human's confirmed/reclassified tipo de ato
+	// (ia_tipo_inferido) + the resulting confiança (1.0, human-confirmed), keyed by deadline_id
+	// and scoped to tenantID (barrier 1). An UPDATE, not an INSERT — the row already exists
+	// since InsertCalcMemory ran at birth. A no-match is ErrCalcMemoryNotFound.
+	UpdateCalcMemoryTipoConfirmation(ctx context.Context, tx database.Tx, tenantID, deadlineID, tipo string, confianca float64) error
 }
 
 // deduper is the consumer-side idempotency guard port. It marks (consumer, eventID)
@@ -276,6 +348,19 @@ type publisher interface {
 type businessCalendar interface {
 	AddBusinessDays(ctx context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error)
 	AddCalendarDays(ctx context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error)
+	// SubtractBusinessDays walks backward from a fixed date (typically EndDate) by n
+	// business days — the internal safety buffer's motor. Symmetric to AddBusinessDays.
+	SubtractBusinessDays(ctx context.Context, start time.Time, n int, uf, court string) (time.Time, []time.Time, error)
+	LookupHolidays(ctx context.Context, days []time.Time, uf, court string) (map[time.Time]calendar.Holiday, error)
+}
+
+// typeClassifier is the narrow IA port OnIntimationObserved calls for an omissa intimação (no
+// prazo_declarado) — the single point of IA in the whole motor (docs/design-motor-de-prazos-
+// v1.md §"Fallback IA"): classify the tipo de ato, NEVER a date. Optional — nil (no LLM wired,
+// the worker composition's default) means an omissa intimação stays on the deterministic
+// "calculado" origem (never chuta). *ClassifyUseCase (classify.go) satisfies it.
+type typeClassifier interface {
+	ClassifyType(ctx context.Context, tenantID string, c advisory.CaseContext) (ClassifiedType, error)
 }
 
 // UseCase derives a prazo from an observed intimação and drives its scheduled marks. It
@@ -294,6 +379,10 @@ type UseCase struct {
 	// LOCAL — the same posture as the read models). nil disables Preview (the composition always
 	// injects it via WithPreviewPool in the api).
 	pool database.Tx
+	// classifier is the optional omissa-fallback IA port (WithClassifier). nil disables it —
+	// OnIntimationObserved then leaves an omissa intimação on the "calculado" origem instead of
+	// failing the ingest (the LLM is never on the critical path of "prazo sempre nasce").
+	classifier typeClassifier
 }
 
 // Option configures a UseCase at construction. Kept as functional options so the clock
@@ -305,6 +394,13 @@ type Option func(*UseCase)
 // it to assert deterministically which D-N marks a given end_date schedules.
 func WithClock(now func() time.Time) Option {
 	return func(uc *UseCase) { uc.now = now }
+}
+
+// WithClassifier injects the omissa-fallback IA port (classify.go's *ClassifyUseCase in
+// production). The api/worker composition leaves it unset (nil) when OpenRouter is
+// unconfigured, so OnIntimationObserved degrades gracefully instead of failing the ingest.
+func WithClassifier(c typeClassifier) Option {
+	return func(uc *UseCase) { uc.classifier = c }
 }
 
 // WithPreviewPool injects the connection pool the read-only Preview uses (as a database.Tx) so
@@ -387,6 +483,70 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 			return err
 		}
 
+		// V1: the internal safety buffer — internalBufferBusinessDays business days before
+		// the fatal EndDate, via the SAME calendar (uf/court), never crude date arithmetic.
+		prazoInterno, _, err := uc.cal.SubtractBusinessDays(ctx, endDate, internalBufferBusinessDays, ev.UF, ev.Court)
+		if err != nil {
+			return err
+		}
+
+		// V1: Read the tenant's confirmation policy before deriving ConfirmacaoExigida.
+		policy, err := uc.repo.GetPolicy(ctx, tx, ev.TenantID)
+		if err != nil {
+			return err
+		}
+
+		// V1: Validação cruzada (declarado × calculado). Only possible when the intimação
+		// DECLARES a prazo AND that declaration parses to a day count (a free-text
+		// "prazo_declarado" the DJEN extractor could not resolve is simply skipped — the
+		// deadline still opens on the deterministic calculado date, just without a
+		// cross-validation row). causaProvavelDivergencia is a determinística heurística over
+		// the SAME applied_holiday snapshot the calc just produced — never an LLM call
+		// (docs/design-motor-de-prazos-v1.md §"Validação cruzada").
+		var crossVal *CrossValidation
+		divergent := false
+		if declaredDays, ok := parseDeclaradoDays(ev.PrazoDeclarado); ok {
+			declaredEnd, _, err := uc.compute(ctx, counting, start, declaredDays, ev.UF, ev.Court)
+			if err != nil {
+				return err
+			}
+			crossVal = buildCrossValidation(ev.TenantID, declaredEnd, endDate, holidays)
+			divergent = crossVal.Resultado == crossValidationDivergente
+		}
+
+		// V1: Fallback IA — the ÚNICO ponto de IA do motor (docs §"Fallback IA"): an omissa
+		// intimação (no prazo_declarado at all) gets its tipo de ato classified so origem can
+		// derive "ia" instead of staying silently "calculado". NEVER a date — the deterministic
+		// rule.Kind/Days above already stand regardless of what the classifier answers. A nil
+		// classifier (LLM unconfigured) or a classification failure/timeout is swallowed here
+		// (logged, not propagated): the design's non-negotiable floor is "prazo sempre nasce",
+		// so an ingest never fails because the OPTIONAL enrichment call did.
+		usedIA := false
+		var iaTipo string
+		var iaConfianca float64
+		if ev.PrazoDeclarado == "" && uc.classifier != nil {
+			ct, err := uc.classifier.ClassifyType(ctx, ev.TenantID, advisory.CaseContext{
+				Court:          ev.Court,
+				Class:          class,
+				IntimationType: ev.Type,
+			})
+			switch {
+			case err == nil:
+				usedIA = true
+				iaTipo, iaConfianca = ct.Tipo, ct.Confianca
+			case errors.Is(err, ErrClassifierUnavailable):
+				// no-op: never chuta — the prazo stays on the deterministic "calculado" origem.
+			default:
+				slog.WarnContext(ctx, "deadline: classify type failed",
+					slog.String("intimation_id", ev.IntimationID), slog.Any("error", err))
+			}
+		}
+
+		// V1: Compute Origem, Seal, ConfirmacaoExigida and persist them on the deadline row.
+		origem := deriveOrigem(ev.PrazoDeclarado != "", usedIA)
+		seal := deriveSeal(origem, divergent)
+		confirmacao := deriveConfirmacaoExigida(seal, policy.ConfirmacaoObrigatoria)
+
 		// Um prazo NASCIDO já vencido — a carência D+1 (startOfDay(end)+1) já passou no
 		// momento da criação, típico do backfill de uma intimação histórica — nasce
 		// MISSED, não PENDING. Sem isto o carência missed_check (agendado só para ETAs
@@ -400,21 +560,25 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 		}
 
 		d := &Deadline{
-			TenantID:        ev.TenantID,
-			CourtRecordID:   ev.CourtRecordID,
-			IntimationID:    ev.IntimationID,
-			Kind:            rule.Kind,
-			Days:            rule.Days,
-			Counting:        counting,
-			Doubled:         rule.Doubled,
-			HolidaysApplied: holidays,
-			StartDate:       start,
-			EndDate:         endDate,
-			Status:          status,
-			Source:          SourceRule,
-			RulesVersion:    rule.RulesVersion,
-			AnchorEvent:     AnchorDeadlineStart, // born on the derived deadline_start_at anchor
-			LegalCitation:   rule.LegalCitation,  // snapshot the rule's citation at derivation
+			TenantID:           ev.TenantID,
+			CourtRecordID:      ev.CourtRecordID,
+			IntimationID:       ev.IntimationID,
+			Kind:               rule.Kind,
+			Days:               rule.Days,
+			Counting:           counting,
+			Doubled:            rule.Doubled,
+			HolidaysApplied:    holidays,
+			StartDate:          start,
+			EndDate:            endDate,
+			PrazoInterno:       prazoInterno,
+			Status:             status,
+			Source:             SourceRule,
+			RulesVersion:       rule.RulesVersion,
+			AnchorEvent:        AnchorDeadlineStart, // born on the derived deadline_start_at anchor
+			LegalCitation:      rule.LegalCitation,  // snapshot the rule's citation at derivation
+			Origem:             origem,
+			Seal:               seal,
+			ConfirmacaoExigida: confirmacao,
 		}
 		if err := d.validate(); err != nil {
 			return err
@@ -432,6 +596,83 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 		}
 
 		if err := uc.outbox.Publish(ctx, tx, newDeadlineOpened(saved)); err != nil {
+			return err
+		}
+
+		if err := uc.outbox.Publish(ctx, tx, newDeadlineCalculated(saved)); err != nil {
+			return err
+		}
+		if err := uc.outbox.Publish(ctx, tx, newDeadlineSealAssigned(saved)); err != nil {
+			return err
+		}
+		if confirmacao {
+			if err := uc.outbox.Publish(ctx, tx, newDeadlineConfirmationRequired(saved.TenantID, saved.ID)); err != nil {
+				return err
+			}
+		}
+
+		// V1: Persist the cross-validation result computed above, now that saved.ID exists.
+		if crossVal != nil {
+			crossVal.DeadlineID = saved.ID
+			if _, err := uc.repo.InsertCrossValidation(ctx, tx, crossVal); err != nil {
+				return err
+			}
+		}
+
+		// V1: Persist calc_memory audit trail
+		calcMem := &CalcMemory{
+			TenantID:                ev.TenantID,
+			DeadlineID:              saved.ID,
+			PrazoBase:               fmt.Sprintf("%d %s", rule.Days, countingLabel(counting)),
+			PrazoBaseFonte:          prazoBaseFonteLabel(rule.LegalCitation),
+			TermoInicialRegra:       anchorEventLabel(d.AnchorEvent),
+			DiasUteis:               counting == CountingBusiness,
+			IATipoInferido:          iaTipo,
+			IAConfianca:             iaConfianca,
+			CalendarProviderVersion: "v1",
+		}
+		savedCalcMem, err := uc.repo.InsertCalcMemory(ctx, tx, calcMem)
+		if err != nil {
+			return err
+		}
+
+		// V1: Persist applied holidays. The name/scope is resolved from the calendar's
+		// registered holiday rows (the "por que essa data?" audit label) — a lookup skipped
+		// entirely when nothing was skipped, to avoid an empty-array query.
+		var labels map[time.Time]calendar.Holiday
+		if len(holidays) > 0 {
+			labels, err = uc.cal.LookupHolidays(ctx, holidays, ev.UF, ev.Court)
+			if err != nil {
+				return err
+			}
+		}
+		for _, h := range holidays {
+			name, ambito := "Feriado ou suspensão", "nacional" // fallback defensivo (drift IsHoliday↔LookupHolidays)
+			if hol, ok := labels[h]; ok {
+				name = hol.Name
+				ambito = ambitoLabel(hol.Scope)
+			}
+			applied := &AppliedHoliday{
+				TenantID:     ev.TenantID,
+				CalcMemoryID: savedCalcMem.ID,
+				Data:         h,
+				Nome:         name,
+				Ambito:       ambito,
+			}
+			if _, err := uc.repo.InsertAppliedHoliday(ctx, tx, applied); err != nil {
+				return err
+			}
+		}
+
+		// V1: Append deadline event
+		de := &DeadlineEvent{
+			TenantID:   ev.TenantID,
+			DeadlineID: saved.ID,
+			Tipo:       "calculado",
+			Detalhe:    fmt.Sprintf("Prazo calculado: %d %s", rule.Days, countingLabel(counting)),
+			Em:         uc.now(),
+		}
+		if err := uc.repo.InsertDeadlineEvent(ctx, tx, de); err != nil {
 			return err
 		}
 
@@ -675,6 +916,97 @@ func isLaborRite(court, class string) bool {
 	return strings.Contains(strings.ToUpper(class), "TRABALH")
 }
 
+// deriveOrigem determines the source precedence from the creation context.
+func deriveOrigem(hasDeclarado bool, usedIA bool) Origem {
+	if hasDeclarado {
+		return OrigemDeclarado
+	}
+	if usedIA {
+		return OrigemIA
+	}
+	return OrigemCalculado
+}
+
+// deriveSeal determines the confidence seal from the origem and cross-validation.
+// Floor: IA and divergent ALWAYS require human (piso inegociável).
+func deriveSeal(origem Origem, divergent bool) Seal {
+	if divergent || origem == OrigemIA {
+		return SealAApurar
+	}
+	return SealConfiavel
+}
+
+// deriveConfirmacaoExigida determines if human confirmation is required.
+// Floor: seal=A_APURAR always requires confirmation regardless of policy.
+func deriveConfirmacaoExigida(seal Seal, policyObrigatoria bool) bool {
+	if seal == SealAApurar {
+		return true // piso inegociável
+	}
+	return policyObrigatoria
+}
+
+// crossValidationConvergente/crossValidationDivergente are the two cross_validation.resultado
+// values the V1 design distinguishes (docs/design-motor-de-prazos-v1.md §"Validação cruzada").
+const (
+	crossValidationConvergente = "convergente"
+	crossValidationDivergente  = "divergente"
+)
+
+// declaradoDaysRe extracts the LEADING integer of a free-text "prazo_declarado" (e.g. "5 dias",
+// "15 dias úteis"). It is the extractor's day-count signal, not a date: the declared END DATE is
+// derived by running the SAME calendar motor (uc.compute) over it from the SAME start_date, so a
+// declared "5 dias" and a calculado "5 dias úteis" land on comparable dates.
+var declaradoDaysRe = regexp.MustCompile(`^\s*(\d+)`)
+
+// parseDeclaradoDays extracts the declared day count from ev.PrazoDeclarado. ok=false when the
+// text carries no leading integer (or is empty) — the caller then skips cross-validation
+// entirely rather than guessing a comparison; the origem still derives "declarado" (the
+// intimação DID declare something), it is only the cross-check that is unavailable.
+func parseDeclaradoDays(s string) (int, bool) {
+	m := declaradoDaysRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// buildCrossValidation compares the declared vs calculated end dates and produces the
+// cross_validation row (DeadlineID is filled in by the caller once the prazo's id exists).
+// causa_provavel is a determinística heurística over the SAME applied_holiday snapshot the calc
+// just produced — text, never an LLM call (docs §"Validação cruzada").
+func buildCrossValidation(tenantID string, declared, calculated time.Time, holidays []time.Time) *CrossValidation {
+	difDias := int(calculated.Sub(declared).Hours() / 24)
+	resultado := crossValidationConvergente
+	causa := ""
+	if !declared.Equal(calculated) {
+		resultado = crossValidationDivergente
+		causa = causaProvavelDivergencia(holidays, difDias)
+	}
+	return &CrossValidation{
+		TenantID:      tenantID,
+		DataDeclarada: declared,
+		DataCalculada: calculated,
+		DifDias:       difDias,
+		Resultado:     resultado,
+		CausaProvavel: causa,
+	}
+}
+
+// causaProvavelDivergencia is the deterministic (never LLM) heuristic for "por que divergiu":
+// it points at the SAME applied_holiday snapshot the calc just produced. Present holidays are
+// the likely (if unproven) cause; their absence rules that explanation out, leaving the
+// divergência attributable to the extractor/regra mismatch instead.
+func causaProvavelDivergencia(holidays []time.Time, difDias int) string {
+	if len(holidays) > 0 {
+		return fmt.Sprintf("%d feriado(s) aplicado(s) no cálculo podem explicar a diferença de %d dia(s)", len(holidays), difDias)
+	}
+	return fmt.Sprintf("declarado e calculado divergem em %d dia(s), sem feriados aplicados no intervalo", difDias)
+}
+
 // compute runs the chosen lib/calendar motor: dias corridos for CALENDAR, dias úteis
 // otherwise. Both exclude the start day and return the auditable holidays_applied.
 func (uc *UseCase) compute(ctx context.Context, counting Counting, start time.Time, n int, uf, court string) (time.Time, []time.Time, error) {
@@ -718,4 +1050,46 @@ func parseWireDate(s string) (time.Time, error) {
 		return time.Time{}, apperr.NewInvalid(fmt.Sprintf("invalid deadline_start_at %q", s))
 	}
 	return t, nil
+}
+
+// ambitoLabel maps a calendar.Holiday scope to the human "por que essa data?" âmbito —
+// never the raw internal scope constant.
+func ambitoLabel(scope string) string {
+	switch scope {
+	case calendar.ScopeState:
+		return "estadual"
+	case calendar.ScopeCourt:
+		return "tribunal"
+	default:
+		return "nacional"
+	}
+}
+
+// anchorEventLabel is the human "por que essa data" phrase for termo_inicial_regra —
+// never the raw AnchorEvent enum.
+func anchorEventLabel(a AnchorEvent) string {
+	switch a {
+	case AnchorMadeAvailable:
+		return "Disponibilização no DJEN — data bruta do ato, sem ajuste para dia útil (art. 224, §2º, CPC)."
+	case AnchorPublished:
+		return "Publicação no DJEN — 1º dia útil seguinte à disponibilização (art. 224, §3º, CPC)."
+	default: // AnchorDeadlineStart
+		return "Publicação no DJEN → contagem inicia no 1º dia útil seguinte (art. 224, §3º · 231, CPC)."
+	}
+}
+
+// prazoBaseFonteLabel formats the calc_memory prazo_base_fonte from the rule's citation —
+// always the rule table at this insertion point (PrazoBase is never the declared count here).
+func prazoBaseFonteLabel(legalCitation string) string {
+	if legalCitation == "" {
+		return "Tabela legal"
+	}
+	return legalCitation + " · Tabela legal"
+}
+
+func countingLabel(c Counting) string {
+	if c == CountingCalendar {
+		return "dias corridos"
+	}
+	return "dias úteis"
 }

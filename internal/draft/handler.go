@@ -413,7 +413,7 @@ type draftResponse struct {
 	SagaState    string  `json:"saga_state"`
 	CreatedAt    string  `json:"created_at"`
 	UpdatedAt    string  `json:"updated_at"`
-	// TaskID/PieceProfileKey (migration 0080) are non-empty only for a
+	// TaskID/PieceProfileKey (migration 0088) are non-empty only for a
 	// task-sourced peça (POST /v1/pecas {task_id}).
 	TaskID          string `json:"task_id,omitempty"`
 	PieceProfileKey string `json:"piece_profile_key,omitempty"`
@@ -843,13 +843,20 @@ func (h *Handler) thesesFromIntimation(c *fiber.Ctx) error {
 	})
 }
 
-// thesisResponse is one item in the /theses response.
+// thesisResponse is one item in the /theses response. The source_* fields attribute
+// the thesis to the autos document its evidence came from (empty when grounded only
+// in the teor — the FE then shows the teor as source, the pre-existing behavior). The
+// snake_case names match the FE's ThesisAPI (pecas-v2) so no mapper change is needed.
 type thesisResponse struct {
-	Label      string   `json:"label"`
-	Confidence string   `json:"confidence"`
-	Reference  string   `json:"reference"`
-	Foundation string   `json:"foundation"`
-	Evidence   []string `json:"evidence"`
+	Label            string   `json:"label"`
+	Confidence       string   `json:"confidence"`
+	Reference        string   `json:"reference"`
+	Foundation       string   `json:"foundation"`
+	Evidence         []string `json:"evidence"`
+	SourceDocumentID string   `json:"source_document_id,omitempty"`
+	SourceLabel      string   `json:"source_label,omitempty"`
+	SourceExcerpt    string   `json:"source_excerpt,omitempty"`
+	SourcePage       int      `json:"source_page,omitempty"`
 }
 
 func thesesToResponse(theses []Thesis) []thesisResponse {
@@ -860,11 +867,15 @@ func thesesToResponse(theses []Thesis) []thesisResponse {
 			ev = []string{} // wire: nunca null (JSON contract)
 		}
 		out = append(out, thesisResponse{
-			Label:      t.Label,
-			Confidence: t.Confidence,
-			Reference:  t.Reference,
-			Foundation: t.Foundation,
-			Evidence:   ev,
+			Label:            t.Label,
+			Confidence:       t.Confidence,
+			Reference:        t.Reference,
+			Foundation:       t.Foundation,
+			Evidence:         ev,
+			SourceDocumentID: t.SourceDocumentID,
+			SourceLabel:      t.SourceLabel,
+			SourceExcerpt:    t.SourceExcerpt,
+			SourcePage:       t.SourcePage,
 		})
 	}
 	return out
