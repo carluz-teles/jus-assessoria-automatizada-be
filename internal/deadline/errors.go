@@ -67,4 +67,18 @@ var (
 	// is unknown/foreign on a create (POST /v1/tasks/:id/items). Typed not-found (→ 404), never
 	// (nil, nil): a foreign or cross-task itemId is a client-facing miss, not a swallowed empty.
 	ErrTaskItemNotFound = apperr.NewNotFound("task item not found")
+
+	// ErrActionItemNotFound — an actionitem.created/confirmed event's action_item_id resolves
+	// to no row in the tenant (GetActionItemCourtRecordID, fatia 3). It should not happen (the
+	// producer emits the id it just committed, and a confiável item is never deleted by
+	// actionitem's own re-analysis guard), so it surfaces as a typed not-found — terminal
+	// (isTerminal), the same treatment as ErrCourtRecordNotFound.
+	ErrActionItemNotFound = apperr.NewNotFound("action item not found")
+
+	// ErrTaskExistsForActionItem — InsertTask's ON CONFLICT (action_item_id) DO NOTHING
+	// (0079's UNIQUE) found a task already bound to this providência. The use case treats this
+	// as an idempotent no-op (a redelivered actionitem.created/confirmed never mints a second
+	// task), not an error — CONFLICT kind only for symmetry with ErrDeadlineExists, since the
+	// caller never surfaces it past the use case.
+	ErrTaskExistsForActionItem = apperr.NewConflict("task already exists for action item")
 )

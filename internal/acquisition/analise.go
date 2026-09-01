@@ -19,13 +19,46 @@ import (
 // mode (gen==nil or an LLM/parse fault) persists+returns summary="" + providencias=[] with
 // a fresh analyzed_at, so the FE distinguishes "not analysed" (analyzed_at nil) from
 // "analysed but IA unavailable" (analyzed_at set, summary empty).
+//
+// docs/erd-costura-providencia-tarefa-peca.md: this use case NO LONGER persists the
+// providências as jsonb on the intimation row — it publishes acquisition.intimation.
+// analyzed (in the SAME tx as the ai_summary write) carrying the providência candidates,
+// and the actionitem slice's listener materializes real action_item rows from it. This
+// slice never imports actionitem's entity/repo (slices talk by event, decisão P1); the
+// authoritative tipo/piece_profile_key sanitization also lives there (single source of
+// truth) — this use case only normalizes (trim/lowercase) what it forwards.
 
 // IntimacaoAnaliseView is the wire DTO returned by POST /v1/intimacoes/:id/analise.
 // Providencias is always initialized so it serializes as [], never null.
 type IntimacaoAnaliseView struct {
-	Summary      string                     `json:"summary"`
-	Providencias []IntimacaoProvidenciaView `json:"providencias"`
-	AnalyzedAt   time.Time                  `json:"analyzed_at"`
+	Summary      string                   `json:"summary"`
+	Providencias []AnaliseProvidenciaView `json:"providencias"`
+	AnalyzedAt   time.Time                `json:"analyzed_at"`
+}
+
+// AnaliseProvidenciaView is one providência CANDIDATE the IA identified — the immediate
+// response of "Analisar", BEFORE materialization. It is intentionally richer than the
+// persisted action_item row (Title/Description/SuggestedAssignee/DueDate exist only here,
+// for the analysis card's display — action_item carries no such columns, docs §2) and
+// intentionally thinner on identity (no id/status/task_id: those only exist once the
+// actionitem listener has materialized the candidate, which happens asynchronously after
+// this response is already on the wire).
+type AnaliseProvidenciaView struct {
+	Title                   string  `json:"title"`
+	Description             string  `json:"description"`
+	SuggestedAssigneeUserID *string `json:"suggested_assignee_user_id"`
+	SuggestedAssigneeName   *string `json:"suggested_assignee_name"`
+	DueDate                 *string `json:"due_date"` // "2006-01-02" or null
+	// Tipo/GeraPeca/PieceProfileKey/Declarado/Confianca are the classification the
+	// actionitem slice's listener turns into an action_item row (docs §3's motor de
+	// precedência): Declarado marks a teor that stated the tipo explicitly (→
+	// tipo_origem=declarado, confiável); otherwise the IA inferred it (→ tipo_origem=ia,
+	// a_confirmar) and Confianca carries its confidence.
+	Tipo            string   `json:"tipo"`
+	GeraPeca        bool     `json:"gera_peca"`
+	PieceProfileKey *string  `json:"piece_profile_key"`
+	Declarado       bool     `json:"declarado"`
+	Confianca       *float64 `json:"confianca"`
 }
 
 // IntimacaoAnaliseCtx is the raw context the repo returns for the analysis prompt: the
@@ -33,14 +66,18 @@ type IntimacaoAnaliseView struct {
 // (when a deadline exists — the horizon the IA must keep every due_date at or before), and
 // the firm's active members (so the IA can pick a real responsável by id). Type is a pointer
 // (the column is nullable); DeadlineEndDate is "" when the intimation has no prazo yet.
+// CourtRecordID/DeadlineID ("" when no prazo yet) are carried through unchanged onto the
+// acquisition.intimation.analyzed event — the actionitem slice's materialized rows need both.
 type IntimacaoAnaliseCtx struct {
 	Content         string
 	Type            *string
+	CourtRecordID   string
 	CNJNumber       string
 	Court           string
 	Degree          string
 	Class           string
 	Subject         string
+	DeadlineID      string      // "" when no deadline yet
 	DeadlineEndDate string      // "2006-01-02" or "" when no deadline
 	Members         []MemberCtx // active app_users of the tenant (id + name)
 }
@@ -59,12 +96,24 @@ type analiseReader interface {
 	GetIntimacaoAnaliseContext(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseCtx, error)
 }
 
-// analiseStore persists the AI analysis (OVERWRITE — re-executable). nil skips the write.
-// logActivity tells the store whether this write should also append a process activity log
-// row (true on a real/successful analysis, false on the degraded write — a degraded analysis
-// is not something to surface on the process timeline).
+// SaveAnaliseParams is the analiseStore.SaveAnalise input: the intimation's fresh
+// ai_summary + the providência candidates to publish on acquisition.intimation.analyzed, in
+// one tx. DeadlineID/CourtRecordID ride through from IntimacaoAnaliseCtx untouched — the
+// store has no other way to know them. LogActivity=true also appends a process_activity_log
+// row (a real, successful analysis); false is the degraded write (no LLM / LLM fault).
+type SaveAnaliseParams struct {
+	TenantID     string
+	IntimationID string
+	Summary      string
+	DeadlineID   string
+	Providencias []ProvidenciaCandidate
+	LogActivity  bool
+}
+
+// analiseStore persists the AI analysis (OVERWRITE — re-executable) and publishes
+// acquisition.intimation.analyzed in the SAME tx. nil skips both.
 type analiseStore interface {
-	SaveAnalise(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error
+	SaveAnalise(ctx context.Context, p SaveAnaliseParams) error
 }
 
 // AnaliseUseCase composes the intimation context, calls the LLM for the analysis, persists
@@ -88,10 +137,16 @@ func NewAnaliseUseCase(reader analiseReader, composer advisory.PromptComposer, g
 }
 
 // intimationAnalysisSchema constrains the model's output to {summary, providencias:[{title,
-// description, suggested_assignee_user_id, due_date}]} via OpenRouter's json_schema structured
-// output (strict). suggested_assignee_user_id / due_date are nullable strings — the model may
-// emit null when it can't pick a member or a date; the use case then leaves them nil. status is
-// NOT in the schema — every generated providência is server-stamped SUGGESTED (§1).
+// description, suggested_assignee_user_id, due_date, tipo, gera_peca, piece_profile_key,
+// declarado, confianca}]} via OpenRouter's json_schema structured output (strict). tipo is
+// the providência classification (docs §2: contestar|recorrer|manifestar|cumprir|ciencia);
+// gera_peca + piece_profile_key name the tipo de peça when one is required; declarado marks
+// whether the teor STATED the tipo explicitly (vs. the model inferring it); confianca is the
+// model's confidence in ITS OWN inference (only meaningful when declarado is false — the
+// use case ignores it otherwise). suggested_assignee_user_id / due_date / piece_profile_key /
+// confianca are nullable — the model may emit null when it can't pick a member/date/tipo de
+// peça, or when declarado is true. status is NOT in the schema — providência lifecycle is
+// owned by the actionitem slice, not this analysis.
 var intimationAnalysisSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -104,9 +159,15 @@ var intimationAnalysisSchema = json.RawMessage(`{
           "title": { "type": "string" },
           "description": { "type": "string" },
           "suggested_assignee_user_id": { "type": ["string", "null"] },
-          "due_date": { "type": ["string", "null"] }
+          "due_date": { "type": ["string", "null"] },
+          "tipo": { "type": "string", "enum": ["contestar", "recorrer", "manifestar", "cumprir", "ciencia"] },
+          "gera_peca": { "type": "boolean" },
+          "piece_profile_key": { "type": ["string", "null"] },
+          "declarado": { "type": "boolean" },
+          "confianca": { "type": ["number", "null"] }
         },
-        "required": ["title", "description", "suggested_assignee_user_id", "due_date"],
+        "required": ["title", "description", "suggested_assignee_user_id", "due_date",
+          "tipo", "gera_peca", "piece_profile_key", "declarado", "confianca"],
         "additionalProperties": false
       }
     }
@@ -123,7 +184,9 @@ const maxProvidencias = 12
 // With no generator configured it persists+returns the degraded DTO (no LLM call).
 // An LLM/parse fault ALSO degrades (log-not-fail): the lawyer still gets a pós-análise
 // state, just empty — a failed analysis must not 5xx the button. The analysis is
-// re-executable: every call OVERWRITES the persisted columns.
+// re-executable: every call OVERWRITES the persisted columns and re-publishes
+// acquisition.intimation.analyzed (the actionitem listener's guard aditivo decides what a
+// re-run may replace — see internal/actionitem/domain.go).
 func (uc *AnaliseUseCase) Analisar(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseView, error) {
 	ctxData, err := uc.reader.GetIntimacaoAnaliseContext(ctx, tenantID, intimationID)
 	if err != nil {
@@ -132,21 +195,17 @@ func (uc *AnaliseUseCase) Analisar(ctx context.Context, tenantID, intimationID s
 
 	// No generator configured → degraded (persist empty, return empty).
 	if uc.gen == nil {
-		return uc.persistDegraded(ctx, tenantID, intimationID), nil
+		return uc.persistDegraded(ctx, tenantID, intimationID, ctxData.DeadlineID), nil
 	}
 
 	view, ok := uc.generate(ctx, intimationID, ctxData)
 	if !ok {
 		// Any LLM/compose/parse fault degrades — never a 5xx on the analyze button.
-		return uc.persistDegraded(ctx, tenantID, intimationID), nil
+		return uc.persistDegraded(ctx, tenantID, intimationID, ctxData.DeadlineID), nil
 	}
 
 	// Persist best-effort (OVERWRITE). A store fault must not cost the answer — log and keep it.
-	rawProv, err := json.Marshal(view.Providencias)
-	if err != nil {
-		rawProv = []byte("[]")
-	}
-	uc.persist(ctx, tenantID, intimationID, view.Summary, rawProv, true)
+	uc.persist(ctx, tenantID, intimationID, view.Summary, ctxData.DeadlineID, candidatesFromView(view.Providencias), true)
 	return view, nil
 }
 
@@ -190,10 +249,15 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctx
 	var parsed struct {
 		Summary      string `json:"summary"`
 		Providencias []struct {
-			Title                   string  `json:"title"`
-			Description             string  `json:"description"`
-			SuggestedAssigneeUserID *string `json:"suggested_assignee_user_id"`
-			DueDate                 *string `json:"due_date"`
+			Title                   string   `json:"title"`
+			Description             string   `json:"description"`
+			SuggestedAssigneeUserID *string  `json:"suggested_assignee_user_id"`
+			DueDate                 *string  `json:"due_date"`
+			Tipo                    string   `json:"tipo"`
+			GeraPeca                bool     `json:"gera_peca"`
+			PieceProfileKey         *string  `json:"piece_profile_key"`
+			Declarado               bool     `json:"declarado"`
+			Confianca               *float64 `json:"confianca"`
 		} `json:"providencias"`
 	}
 	if err := json.Unmarshal(out, &parsed); err != nil {
@@ -202,22 +266,69 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, intimationID string, ctx
 		return IntimacaoAnaliseView{}, false
 	}
 
-	prov := make([]IntimacaoProvidenciaView, 0, len(parsed.Providencias))
+	prov := make([]AnaliseProvidenciaView, 0, len(parsed.Providencias))
 	for i, p := range parsed.Providencias {
 		if i >= maxProvidencias {
 			break
 		}
 		assigneeID, assigneeName := resolveAssignee(p.SuggestedAssigneeUserID, ctxData.Members)
-		prov = append(prov, IntimacaoProvidenciaView{
+		confianca := p.Confianca
+		if p.Declarado {
+			// A declared tipo needs no confidence score — the teor said it outright.
+			confianca = nil
+		}
+		prov = append(prov, AnaliseProvidenciaView{
 			Title:                   p.Title,
 			Description:             p.Description,
 			SuggestedAssigneeUserID: assigneeID,
 			SuggestedAssigneeName:   assigneeName,
 			DueDate:                 clampDueDate(p.DueDate, ctxData.DeadlineEndDate),
-			Status:                  ProvidenciaStatusSuggested,
+			Tipo:                    normalizeTipo(p.Tipo),
+			GeraPeca:                p.GeraPeca,
+			PieceProfileKey:         normalizeOptional(p.PieceProfileKey),
+			Declarado:               p.Declarado,
+			Confianca:               confianca,
 		})
 	}
 	return IntimacaoAnaliseView{Summary: parsed.Summary, Providencias: prov, AnalyzedAt: time.Now()}, true
+}
+
+// normalizeTipo trims/lowercases the model's tipo so a trivial casing/whitespace quirk does
+// not fail actionitem's closed-set check downstream. It performs NO validation itself — the
+// actionitem slice owns the authoritative closed set + the safe-degrade fallback (single
+// source of truth), since acquisition never imports it.
+func normalizeTipo(t string) string {
+	return strings.ToLower(strings.TrimSpace(t))
+}
+
+// normalizeOptional trims a nullable string field, collapsing a blank result to nil so an
+// empty piece_profile_key round-trips as JSON null rather than "".
+func normalizeOptional(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	v := strings.TrimSpace(*s)
+	if v == "" {
+		return nil
+	}
+	return &v
+}
+
+// candidatesFromView narrows the rich response DTO to the minimal event payload
+// (acquisition.intimation.analyzed carries only what actionitem needs — docs handoff
+// "Payload mínimo"): tipo, gera_peca, piece_profile_key, confianca, declarado.
+func candidatesFromView(prov []AnaliseProvidenciaView) []ProvidenciaCandidate {
+	out := make([]ProvidenciaCandidate, 0, len(prov))
+	for _, p := range prov {
+		out = append(out, ProvidenciaCandidate{
+			Tipo:            p.Tipo,
+			GeraPeca:        p.GeraPeca,
+			PieceProfileKey: p.PieceProfileKey,
+			Declarado:       p.Declarado,
+			Confianca:       p.Confianca,
+		})
+	}
+	return out
 }
 
 // resolveAssignee accepts the model's suggested id ONLY when it matches a real firm member
@@ -260,19 +371,28 @@ func clampDueDate(due *string, endDate string) *string {
 
 // persistDegraded writes+returns the empty analysis (summary="", providencias=[]) with a
 // fresh analyzed_at, so the FE moves to pós-análise and shows the "IA indisponível" state.
-func (uc *AnaliseUseCase) persistDegraded(ctx context.Context, tenantID, intimationID string) IntimacaoAnaliseView {
-	uc.persist(ctx, tenantID, intimationID, "", []byte("[]"), false)
-	return IntimacaoAnaliseView{Summary: "", Providencias: []IntimacaoProvidenciaView{}, AnalyzedAt: time.Now()}
+func (uc *AnaliseUseCase) persistDegraded(ctx context.Context, tenantID, intimationID, deadlineID string) IntimacaoAnaliseView {
+	uc.persist(ctx, tenantID, intimationID, "", deadlineID, nil, false)
+	return IntimacaoAnaliseView{Summary: "", Providencias: []AnaliseProvidenciaView{}, AnalyzedAt: time.Now()}
 }
 
-// persistWrite write-throughs best-effort; a store fault is logged, never returned (the lawyer
-// keeps the answer even if the row didn't update). logActivity=true only on a real analysis —
-// the degraded write (no LLM / LLM fault) never logs a process activity row.
-func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) {
+// persist write-throughs best-effort; a store fault is logged, never returned (the lawyer
+// keeps the answer even if the row didn't update / the event didn't publish). logActivity=
+// true only on a real analysis — the degraded write (no LLM / LLM fault) never logs a
+// process activity row.
+func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary, deadlineID string, candidates []ProvidenciaCandidate, logActivity bool) {
 	if uc.store == nil {
 		return
 	}
-	if err := uc.store.SaveAnalise(ctx, tenantID, intimationID, summary, providencias, logActivity); err != nil {
+	err := uc.store.SaveAnalise(ctx, SaveAnaliseParams{
+		TenantID:     tenantID,
+		IntimationID: intimationID,
+		Summary:      summary,
+		DeadlineID:   deadlineID,
+		Providencias: candidates,
+		LogActivity:  logActivity,
+	})
+	if err != nil {
 		slog.WarnContext(ctx, "acquisition: persist intimation analysis failed",
 			slog.String("intimation_id", intimationID), slog.Any("error", err))
 	}

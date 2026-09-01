@@ -117,6 +117,13 @@ type mockRepo struct {
 	deadlineEndDate    time.Time
 	deadlineEndDateErr error
 
+	// action_item → task automatic creation path (fatia 3)
+	actionItemCourtRecordID    string
+	actionItemCourtRecordIDErr error
+	gotActionItemCourtRecordID string
+	gotActionItemTenantID      string
+	actionItemCourtRecordCalls int
+
 	// herança intimação → tarefa (POST /v1/tasks snapshot). intimationAssignee backs
 	// GetIntimationAssignee's answer (nil = unassigned intimação); intimationAssigneeErr
 	// forces the not-found branch.
@@ -249,6 +256,18 @@ func (m *mockRepo) RevokeDeadlineByIntimation(_ context.Context, _ database.Tx, 
 	m.gotRevokeIntimationID = intimationID
 	m.gotRevokeTenantID = tenantID
 	return m.revokeResult, m.revokeErr
+}
+
+// GetActionItemCourtRecordID returns the configured court_record_id, recording the (id,
+// tenant) it was asked for — backs the fatia 3 automatic task-creation tests.
+func (m *mockRepo) GetActionItemCourtRecordID(_ context.Context, _ database.Tx, tenantID, actionItemID string) (string, error) {
+	m.actionItemCourtRecordCalls++
+	m.gotActionItemTenantID = tenantID
+	m.gotActionItemCourtRecordID = actionItemID
+	if m.actionItemCourtRecordIDErr != nil {
+		return "", m.actionItemCourtRecordIDErr
+	}
+	return m.actionItemCourtRecordID, nil
 }
 
 func (m *mockRepo) GetLatestSuggestion(_ context.Context, _ database.Tx, _, _ string) (SuggestionRecord, bool, error) {

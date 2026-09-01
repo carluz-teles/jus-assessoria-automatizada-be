@@ -239,6 +239,13 @@ type Repository interface {
 	// safe no-op. On a hit it returns the revoked prazo so deadline.revoked commits in the
 	// same tx.
 	RevokeDeadlineByIntimation(ctx context.Context, tx database.Tx, intimationID, tenantID string) (*RevokedDeadline, error)
+	// GetActionItemCourtRecordID reads ONLY action_item.court_record_id, scoped to tenantID
+	// (barrier 1) — fatia 3's automatic task creation needs it because actionitem.created/
+	// confirmed's payload does not carry court_record_id (decisão P1: read the table directly,
+	// never import internal/actionitem). "" when the column is NULL; a missing/foreign
+	// action_item id is ErrActionItemNotFound, never (empty, nil).
+	GetActionItemCourtRecordID(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (string, error)
+
 	// GetLatestSuggestion loads the most recent AI suggestion for the prazo (by the 1:1
 	// intimação, scoped to tenantID — barrier 1) so the F2 confirm can diff it against the
 	// human's confirmed tasks (feedback loop, camada 2). Unlike the other reads a MISS is

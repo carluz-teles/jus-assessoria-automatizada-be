@@ -64,6 +64,21 @@ func TestCreateRequest_Validate(t *testing.T) {
 			req:     CreateRequest{Source: SourceBlank, PieceType: ""},
 			wantErr: false,
 		},
+		{
+			name:    "task_id present exempts source=intimation from requiring intimation_id",
+			req:     CreateRequest{Source: SourceIntimation, TaskID: validUUID},
+			wantErr: false,
+		},
+		{
+			name:    "task_id with invalid UUID is rejected",
+			req:     CreateRequest{Source: SourceBlank, TaskID: "not-a-uuid"},
+			wantErr: true,
+		},
+		{
+			name:    "source=intimation without task_id still requires intimation_id (regression)",
+			req:     CreateRequest{Source: SourceIntimation, TaskID: ""},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -248,6 +263,33 @@ func TestInferPieceType(t *testing.T) {
 			got := inferPieceType(tt.it)
 			if got != tt.want {
 				t.Errorf("inferPieceType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPieceTypeFromProfileKey(t *testing.T) {
+	tests := []struct {
+		name   string
+		key    string
+		want   string
+		wantOK bool
+	}{
+		{"peticao_inicial → COMPLAINT", "peticao_inicial", PieceTypeComplaint, true},
+		{"contestacao → DEFENSE", "contestacao", PieceTypeDefense, true},
+		{"apelacao → APPEAL", "apelacao", PieceTypeAppeal, true},
+		{"empty key → not ok (gera_peca=false)", "", "", false},
+		{"unknown catalog key → not ok (fallback to inferPieceType)", "reconvencao", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := pieceTypeFromProfileKey(tt.key)
+			if ok != tt.wantOK {
+				t.Errorf("pieceTypeFromProfileKey(%q) ok = %v, want %v", tt.key, ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("pieceTypeFromProfileKey(%q) = %q, want %q", tt.key, got, tt.want)
 			}
 		})
 	}

@@ -51,6 +51,14 @@ type Querier interface {
 	// typed ErrTaskItemNotFound at the mapper (→ 404), never a silent 204 on nothing. $1 = id,
 	// $2 = task_id, $3 = tenant_id.
 	DeleteTaskItem(ctx context.Context, arg DeleteTaskItemParams) (uuid.UUID, error)
+	// Reads ONLY action_item.court_record_id, scoped to tenantID (barrier 1) — the one cross-
+	// table read the automatic task-creation path needs (fatia 3): actionitem.created/confirmed's
+	// payload does not carry court_record_id (it was never part of that frozen contract), so this
+	// mirrors GetCourtRecordClass's decisão P1 (read the table directly, never import the owning
+	// slice's package) applied to action_item instead of court_record. court_record_id itself may
+	// be NULL (mapped to ""); a missing/foreign action_item id is pgx.ErrNoRows → the typed
+	// ErrActionItemNotFound at the mapper.
+	GetActionItemCourtRecordID(ctx context.Context, arg GetActionItemCourtRecordIDParams) (pgtype.UUID, error)
 	// deadline slice queries (the prazos CREATION path). Every write and read runs inside
 	// the use case's transaction so RLS scopes it to the event's tenant (barrier 2) on top
 	// of the explicit tenant filter (barrier 1). Absence is a typed error at the mapper,
@@ -218,12 +226,16 @@ type Querier interface {
 	// yet — that is the F2 slice). Returns the DB-assigned id; the repo maps the rest from
 	// the input entity.
 	InsertDeadline(ctx context.Context, arg InsertDeadlineParams) (uuid.UUID, error)
-	// Persist one F2 action item (§4: 1 legal prazo → N tasks, gravadas na MESMA tx do
-	// confirm). Born status='OPEN', source='MANUAL' (a human created it at confirmation —
-	// AI-suggested tasks are a later slice). All FKs but tenant_id are nullable per the 0024
-	// schema, but confirm always fills court_record_id/deadline_id/intimation_id/created_by
-	// (the prazo's context); assignee_user_id/due_date/description/kind are optional. Returns
-	// the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
+	// Persist one task — the manual/F2 path (§4: 1 legal prazo → N tasks) OR the automatic path
+	// a confirmed providência drives (fatia 3, docs/erd-costura-providencia-tarefa-peca.md §2/§6):
+	// action_item_id is NULL for the former, set for the latter. Born status='OPEN'; source is
+	// 'MANUAL' (a human created it) or 'RULE' (derived from a confiável action_item) — AI-suggested
+	// tasks are a later slice. All FKs but tenant_id are nullable per the 0024/0079 schema.
+	// Idempotent on the action_item path via ON CONFLICT (action_item_id) DO NOTHING (0079's
+	// UNIQUE): a redelivered actionitem.created/confirmed yields NO row (RETURNING is empty),
+	// which the mapper reads as "already created" instead of minting a second task. Multiple NULLs
+	// are always distinct, so the manual/avulsa path (action_item_id always NULL) never conflicts.
+	// Returns the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
 	InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UUID, error)
 	// ── task_activity write path (audit log, §4/§10) ─────────────────────────────
 	// The Tarefa detail's Atividade tab: every meaningful mutation appends ONE row here, IN THE SAME

@@ -17,8 +17,10 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/actionitem"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/deadline"
+	"github.com/jusassessoria/platform/internal/draft"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
@@ -306,6 +308,16 @@ func run(logger *slog.Logger) error {
 	activityUC := acquisition.NewActivityUseCase(repo, acquisition.NewActivityDeduper(), acquisition.NewActivityLogWriter(), uow)
 	acquisition.NewActivityListener(activityUC).Register(mux)
 
+	// actionitem (docs/erd-costura-providencia-tarefa-peca.md): consume acquisition.
+	// intimation.analyzed and materialize the providência candidates as real action_item
+	// rows. acquisition.* events route to the "ingestao" queue (lib/events' queueFor), so
+	// this rides the SAME main mux as acquisition's own listeners — no dedicated server.
+	// Register also mounts the fatia 3 task.created consumer (the reverse half of the
+	// providência→tarefa loop, §6): "task" also routes to "ingestao" (queueFor), so it rides
+	// this SAME mux too.
+	actionItemUC := actionitem.NewUseCase(actionitem.NewRepository(), outbox, actionitem.NewDedup(), uow)
+	actionitem.NewListener(actionItemUC).Register(mux)
+
 	// billing (fatia 2): consume identity.tenant_provisioned (start the tenant's trial)
 	// and the scheduled billing.trial_ending_soon_check (re-check + warn). This is the
 	// FIRST asynq consumer billing needs (it was webhook-only until now); both types
@@ -320,7 +332,10 @@ func run(logger *slog.Logger) error {
 	// deterministically (rules layer → the shared judicial calendar `cal`), persisting it
 	// PENDING and emitting deadline.opened in one idempotent tx. The use case is built here,
 	// but its listener mounts on the DEDICATED deadline server below (not this main mux): the
-	// prazo flow moved off "ingestao" so it stops being starved by the enrichment flood.
+	// prazo flow moved off "ingestao" so it stops being starved by the enrichment flood. Its
+	// Register also mounts the fatia 3 actionitem.created/confirmed consumers (docs/erd-
+	// costura-providencia-tarefa-peca.md §6, "Listener-driven" task creation) — both route to
+	// the SAME dedicated "deadline" queue (queueFor) for the same starvation reason.
 	deadlineUC := deadline.NewUseCase(deadline.NewRepository(), cal, outbox, deadline.NewDedup(), uow)
 
 	if err := srv.Start(mux); err != nil {
@@ -363,6 +378,12 @@ func run(logger *slog.Logger) error {
 	deadlineMux := asynq.NewServeMux()
 	deadlineMux.Use(events.Observe(logger))
 	deadline.NewListener(deadlineUC).Register(deadlineMux)
+	// draft's reclassify listener (fatia 5, docs/erd-costura-providencia-tarefa-peca.md §7
+	// questão 4): consumes actionitem.reclassified, which lib/events' queueFor routes to
+	// this SAME dedicated "deadline" queue (same starvation-avoidance reasoning as
+	// actionitem.created/confirmed above) — mounts on the SAME mux, not a new server.
+	draftReclassifyUC := draft.NewReclassifyUseCase(uow, draft.NewRepository(), draft.NewReclassifyDeduper())
+	draft.NewReclassifyListener(draftReclassifyUC).Register(deadlineMux)
 	if err := deadlineSrv.Start(deadlineMux); err != nil {
 		return fmt.Errorf("start deadline asynq server: %w", err)
 	}

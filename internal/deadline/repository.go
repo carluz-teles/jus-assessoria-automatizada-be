@@ -395,7 +395,15 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 	if err != nil {
 		return nil, err
 	}
-	createdBy, err := pgUUID(t.CreatedBy)
+	// created_by is OPTIONAL (task.created_by is nullable, 0024): every manual/F2 path fills
+	// it with the principal, but fatia 3's automatic path (createTaskFromActionItem) has no
+	// human creator — pgOptionalUUID ("" → NULL), not pgUUID, so that path never fails here.
+	createdBy, err := pgOptionalUUID(t.CreatedBy)
+	if err != nil {
+		return nil, err
+	}
+
+	actionItemID, err := pgOptionalUUID(t.ActionItemID)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +422,14 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 		Source:         string(t.Source),
 		AssigneeUserID: assignee,
 		CreatedBy:      createdBy,
+		ActionItemID:   actionItemID,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// ON CONFLICT (action_item_id) DO NOTHING yielded no row: a task already exists for
+		// this providência (0079's UNIQUE). Only reachable when t.ActionItemID is set — the
+		// manual/avulsa path's action_item_id is always NULL, which never conflicts.
+		return nil, ErrTaskExistsForActionItem
+	}
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
@@ -422,6 +437,33 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 	saved := *t
 	saved.ID = id.String()
 	return &saved, nil
+}
+
+// GetActionItemCourtRecordID reads action_item.court_record_id inside the caller's tx,
+// filtered by tenantID (barrier 1) — fatia 3's decisão P1 read (see the Repository doc). A
+// missing/foreign action_item id maps to the typed ErrActionItemNotFound (never "", nil); a
+// present row with a NULL court_record_id returns "".
+func (r *pgRepository) GetActionItemCourtRecordID(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (string, error) {
+	id, err := parseUUID(actionItemID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	courtRecordID, err := deadlinedb.New(tx).GetActionItemCourtRecordID(ctx, deadlinedb.GetActionItemCourtRecordIDParams{
+		ID:       id,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrActionItemNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return uuidText(courtRecordID), nil
 }
 
 // GetTaskForUpdate loads a task's editable state by its id inside the caller's tx, filtered

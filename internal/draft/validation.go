@@ -27,15 +27,22 @@ type CreateRequest struct {
 	// CaseID is used when Source=processo to inherit the process context.
 	CaseID string `json:"case_id"`
 	// PieceType is optional; when absent the BE infers it from the intimation type.
+	// Ignored by the domain when TaskID is present (the peça inherits the tipo from
+	// the providência — docs/erd-costura-providencia-tarefa-peca.md §3).
 	PieceType string `json:"piece_type"`
 	// Title is optional; defaults to "" (the editor sets it on first autosave).
 	Title string `json:"title"`
+	// TaskID is optional (migration 0080): when present, the BE resolves
+	// intimation_id/case_id/piece_type from the task's providência instead of from
+	// Source/IntimationID/PieceType — the task-sourced flow.
+	TaskID string `json:"task_id"`
 }
 
 // Validate enforces the edge boundary rules via ozzo (method-based, not struct tags):
-// source is required and must be in the closed set; when source=intimation,
-// intimation_id must be a valid UUID; piece_type, when present, must be in the
-// closed set.
+// source is required and must be in the closed set; when source=intimation AND no
+// task_id was supplied, intimation_id must be a valid UUID (a task-sourced request
+// resolves it server-side, so the body never needs to carry it); task_id, when
+// present, must be a valid UUID; piece_type, when present, must be in the closed set.
 func (r CreateRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Source,
@@ -43,11 +50,14 @@ func (r CreateRequest) Validate() error {
 			validation.In(SourceIntimation, SourceProcesso, SourceBlank),
 		),
 		validation.Field(&r.IntimationID,
-			validation.When(r.Source == SourceIntimation,
+			validation.When(r.Source == SourceIntimation && r.TaskID == "",
 				validation.Required, validation.By(isUUID)),
 		),
 		validation.Field(&r.CaseID,
 			validation.When(r.CaseID != "", validation.By(isUUID)),
+		),
+		validation.Field(&r.TaskID,
+			validation.When(r.TaskID != "", validation.By(isUUID)),
 		),
 		validation.Field(&r.PieceType,
 			validation.When(r.PieceType != "",

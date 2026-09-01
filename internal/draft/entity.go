@@ -35,10 +35,34 @@ type Draft struct {
 	// avatar/nome no card. Vazio pra peças criadas antes da migration.
 	CreatedBy string
 
+	// ── Costura Providência↔Tarefa↔Minuta (migration 0080) ────────────────────
+
+	// TaskID is the task this draft was created FROM (task-sourced Create,
+	// docs/erd-costura-providencia-tarefa-peca.md §2/§3). Empty for every
+	// pre-existing path (source=intimation/processo/blank) — those never set it.
+	TaskID string
+	// PieceProfileKey is the structured catalog key (piece_profile.key) the
+	// providência behind TaskID named — the draft INHERITS it, never re-chooses
+	// (§3). Empty when the draft has no task_id, or when the providência's
+	// piece_profile_key itself was empty (gera_peca=false, ciência).
+	PieceProfileKey string
+
 	// FilingNumber é o número/protocolo do tribunal (migration 0060), gravado
 	// via MarkFiled quando o advogado marca a peça como protocolada. Vazio =
 	// pré-protocolo OU protocolado sem número informado.
 	FilingNumber string
+
+	// SupersededAt (fatia 5, docs §7 questão 4 — "reclassificação depois de gerada a
+	// peça"): quando a providência de origem é reclassificada DEPOIS de a peça já
+	// existir, esta peça é marcada superseded (nunca editada/apagada — "descartar e
+	// recomeçar", a decisão do Architect). nil para toda peça vigente (a esmagadora
+	// maioria).
+	SupersededAt *time.Time
+	// SupersededByDraftID aponta a peça NOVA que substituiu esta. Vazio até o
+	// backfill de Create (populateFromTask) rodar — há uma janela curta entre a
+	// providência ser reclassificada e a peça nova existir, em que SupersededAt já
+	// está setado mas SupersededByDraftID ainda não.
+	SupersededByDraftID string
 
 	// ── Generation params (Fatia 5 — teses/tom/instruções) ────────────────────
 	// Chosen on POST /v1/pecas/:id/generate and persisted on the row (not on the
@@ -164,6 +188,20 @@ type IntimationContext struct {
 	// Recipients is the raw jsonb from intimation.recipients ([]djenRecipient shape).
 	// Parsed by the mapper to resolve the signing lawyer (matched=true recipient).
 	Recipients []byte
+}
+
+// ActionItemForTask is the data the task-sourced Create flow reads from the
+// task→action_item join (docs/erd-costura-providencia-tarefa-peca.md §3) when
+// POST /v1/pecas carries a task_id: the providência's piece_profile_key (the
+// peça TYPE, inherited — never re-chosen) plus the intimation/case context
+// needed to populate the draft the same way the source=intimation path does.
+type ActionItemForTask struct {
+	IntimationID string
+	// CaseID is "" when the providência's court_record has no case link.
+	CaseID string
+	// PieceProfileKey is "" when the providência doesn't generate a peça
+	// (gera_peca=false, ciência) — Create falls back to inferPieceType.
+	PieceProfileKey string
 }
 
 // PartyCounselInfo is one advogado aggregated under a party. OAB and UF are the
@@ -527,6 +565,32 @@ func containsAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// pieceTypeByProfileKey is a LOCAL, hardcoded copy of the v1 piece_profile catalog
+// (migration 0077, docs/erd-tipos-de-peca.md §6) mapping each known catalog key to
+// the draft.piece_type (the closed set above) it corresponds to. Copied — not a
+// query against piece_profile — for the same reason internal/actionitem/entity.go's
+// knownPieceProfileKeys is local: this slice never imports actionitem/pieceprofile
+// (slices never import another slice's domain), and the piece_profile FK is the
+// real source of truth at insert time. Extend this map when the catalog grows
+// (docs/erd-tipos-de-peca.md §6) — divergence here only falls back to
+// inferPieceType, it never breaks the FK.
+var pieceTypeByProfileKey = map[string]string{
+	"peticao_inicial": PieceTypeComplaint,
+	"contestacao":     PieceTypeDefense,
+	"apelacao":        PieceTypeAppeal,
+}
+
+// pieceTypeFromProfileKey resolves the draft.piece_type the task-sourced Create
+// flow should use for a given piece_profile_key — the providência's TYPE,
+// INHERITED, never re-chosen (docs/erd-costura-providencia-tarefa-peca.md §3). ok
+// is false when key is not in the local map (empty key — gera_peca=false — or a
+// catalog key this slice doesn't know about yet); the caller falls back to
+// inferPieceType in that case.
+func pieceTypeFromProfileKey(key string) (pieceType string, ok bool) {
+	pieceType, ok = pieceTypeByProfileKey[key]
+	return pieceType, ok
 }
 
 // ── Petition (Fatia 4 — peticionamento) ─────────────────────────────────────

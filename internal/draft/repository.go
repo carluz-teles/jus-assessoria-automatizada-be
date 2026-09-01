@@ -35,6 +35,37 @@ type Repository interface {
 	// ErrIntimationNotFound (→ 404).
 	GetIntimationForDraft(ctx context.Context, tx database.Tx, tenantID, intimationID string) (*IntimationContext, error)
 
+	// GetActionItemForTask loads the providência (action_item) context for the
+	// task-sourced Create flow (docs/erd-costura-providencia-tarefa-peca.md §3):
+	// task_id → the piece_profile_key the draft inherits, plus intimation_id/case_id.
+	// Reads cross-slice directly (task/action_item, owned by other slices) via a
+	// JOIN — never a Go import, same pattern as GetIntimationForDraft. A miss
+	// (unknown task, foreign tenant, or a task with no linked action_item) is
+	// ErrTaskNotFound (→ 404).
+	GetActionItemForTask(ctx context.Context, tx database.Tx, tenantID, taskID string) (*ActionItemForTask, error)
+
+	// GetDraftByTaskID returns the existing VIGENTE draft for the (tenant, task) pair —
+	// the idempotent path after InsertDraft hits the NEW draft_task_id_uidx (migration
+	// 0080, task-sourced Create redelivered/duplicated). Filters superseded_at IS NULL
+	// (migration 0081, fatia 5) so a reclassified task always resolves to its CURRENT
+	// draft, never the superseded one. A miss is ErrDraftNotFound.
+	GetDraftByTaskID(ctx context.Context, tx database.Tx, tenantID, taskID string) (*Draft, error)
+
+	// ── Reclassificação (fatia 5, docs §7 questão 4) ─────────────────────────
+
+	// GetTaskIDForActionItem resolves the task bound to a providência — a cross-slice
+	// read (action_item owned by internal/actionitem, no Go import). "" when the
+	// providência has no task yet.
+	GetTaskIDForActionItem(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (string, error)
+	// SupersedeDraftForTask marks the task's CURRENT vigente draft as superseded
+	// (superseded_at = now()), guarded IN SQL by superseded_at IS NULL AND
+	// filed_at IS NULL. Zero rows affected is a valid no-op — never an error.
+	SupersedeDraftForTask(ctx context.Context, tx database.Tx, tenantID, taskID string) error
+	// LinkSupersededDraft backfills the OLD (just-superseded) draft's
+	// superseded_by_draft_id once the NEW draft for the same task is inserted (Create's
+	// task-sourced flow). A no-candidate result is a valid no-op — never an error.
+	LinkSupersededDraft(ctx context.Context, tx database.Tx, tenantID, taskID, newDraftID string) error
+
 	// GetPartiesForDraft loads the parties (PLAINTIFF/DEFENDANT/THIRD_PARTY) and
 	// their aggregated counsels for a given case, tenant-scoped (barrier 1). Used
 	// by the generation pipeline to inject structured party data into the AI prompt.
@@ -273,13 +304,15 @@ func (r *pgRepository) InsertDraft(ctx context.Context, tx database.Tx, d *Draft
 	// mantendo compat com callers que ainda não passam o principal.
 	createdByRaw, _ := parseUUID(d.CreatedBy)
 	row, err := draftdb.New(tx).InsertDraft(ctx, draftdb.InsertDraftParams{
-		TenantID:     tenantID,
-		CaseID:       optUUID(d.CaseID),
-		IntimationID: optUUID(d.IntimationID),
-		PieceType:    d.PieceType,
-		Title:        d.Title,
-		Content:      textToNull(d.Content),
-		Column7:      createdByRaw,
+		TenantID:        tenantID,
+		CaseID:          optUUID(d.CaseID),
+		IntimationID:    optUUID(d.IntimationID),
+		PieceType:       d.PieceType,
+		Title:           d.Title,
+		Content:         textToNull(d.Content),
+		Column7:         createdByRaw,
+		TaskID:          optUUID(d.TaskID),
+		PieceProfileKey: textToNull(d.PieceProfileKey),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDraftAlreadyExists
@@ -288,6 +321,137 @@ func (r *pgRepository) InsertDraft(ctx context.Context, tx database.Tx, d *Draft
 		return nil, database.WrapInfra(err)
 	}
 	return draftFromInsertRow(row), nil
+}
+
+// GetActionItemForTask implements the task-sourced Create flow's cross-slice read
+// (docs/erd-costura-providencia-tarefa-peca.md §3): a plain JOIN across task and
+// action_item — tables owned by other slices — never a Go import of their packages.
+func (r *pgRepository) GetActionItemForTask(ctx context.Context, tx database.Tx, tenantID, taskID string) (*ActionItemForTask, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	tskID, err := parseUUID(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := draftdb.New(tx).GetActionItemForTask(ctx, draftdb.GetActionItemForTaskParams{
+		ID:       tskID,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return &ActionItemForTask{
+		IntimationID:    row.IntimationID.String(),
+		CaseID:          pgUUIDToString(row.CaseID),
+		PieceProfileKey: derefString(row.PieceProfileKey),
+	}, nil
+}
+
+// GetDraftByTaskID is the idempotent-fetch counterpart of GetDraftByIntimationID
+// for the task-sourced path (migration 0080's draft_task_id_uidx).
+func (r *pgRepository) GetDraftByTaskID(ctx context.Context, tx database.Tx, tenantID, taskID string) (*Draft, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	tskID := optUUID(taskID)
+
+	row, err := draftdb.New(tx).GetDraftByTaskID(ctx, draftdb.GetDraftByTaskIDParams{
+		TenantID: tid,
+		TaskID:   tskID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDraftNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return draftFromGetByTaskIDRow(row), nil
+}
+
+// ── Reclassificação repository methods (fatia 5, docs §7 questão 4) ─────────────
+
+// GetTaskIDForActionItem implements the reclassify listener's cross-slice read: a plain
+// SELECT against action_item.task_id (owned by internal/actionitem) — no Go import, same
+// pattern as GetActionItemForTask above.
+func (r *pgRepository) GetTaskIDForActionItem(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (string, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+	aid, err := parseUUID(actionItemID)
+	if err != nil {
+		return "", err
+	}
+
+	taskID, err := draftdb.New(tx).GetTaskIDForActionItem(ctx, draftdb.GetTaskIDForActionItemParams{
+		ID:       aid,
+		TenantID: tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil // unknown/foreign action_item_id — safe no-op signal, never an error
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return pgUUIDToString(taskID), nil
+}
+
+// SupersedeDraftForTask marks the task's current vigente draft as superseded. The SQL's
+// own WHERE (superseded_at IS NULL AND filed_at IS NULL) makes zero rows affected a valid,
+// silent no-op — never surfaced as an error.
+func (r *pgRepository) SupersedeDraftForTask(ctx context.Context, tx database.Tx, tenantID, taskID string) error {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	tskID, err := parseUUID(taskID)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).SupersedeDraftForTask(ctx, draftdb.SupersedeDraftForTaskParams{
+		TenantID: tid,
+		TaskID:   pgtype.UUID{Bytes: [16]byte(tskID), Valid: true},
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// LinkSupersededDraft backfills the OLD draft's superseded_by_draft_id once the NEW
+// draft for the same task commits. pgx.ErrNoRows means no pending-link candidate existed
+// (the common case — most drafts are never reclassified) — a valid no-op, never an error.
+func (r *pgRepository) LinkSupersededDraft(ctx context.Context, tx database.Tx, tenantID, taskID, newDraftID string) error {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	tskID, err := parseUUID(taskID)
+	if err != nil {
+		return err
+	}
+	newID, err := parseUUID(newDraftID)
+	if err != nil {
+		return err
+	}
+	_, err = draftdb.New(tx).LinkSupersededDraft(ctx, draftdb.LinkSupersededDraftParams{
+		TenantID:            tid,
+		TaskID:              pgtype.UUID{Bytes: [16]byte(tskID), Valid: true},
+		SupersededByDraftID: pgtype.UUID{Bytes: [16]byte(newID), Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }
 
 func (r *pgRepository) GetDraftByIntimationID(ctx context.Context, tx database.Tx, tenantID, intimationID string) (*Draft, error) {

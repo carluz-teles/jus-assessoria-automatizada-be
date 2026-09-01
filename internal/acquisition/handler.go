@@ -3,7 +3,6 @@ package acquisition
 import (
 	"context"
 	"errors"
-	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -98,31 +97,24 @@ type analyzer interface {
 	Analisar(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseView, error)
 }
 
-// providenciaActions is the port for the aprovar/descartar buttons on the analysis card. It
-// flips ONE AI-suggested providência's status by index (APPROVED/DISCARDED) and returns the
-// refreshed analysis view. Optional (nil when the slice isn't wired for LLM analyses) — the
-// routes then answer the same typed 501 as the analyze route.
-type providenciaActions interface {
-	Aprovar(ctx context.Context, tenantID, intimationID string, idx int, taskID string) (IntimacaoAnaliseView, error)
-	Descartar(ctx context.Context, tenantID, intimationID string, idx int) (IntimacaoAnaliseView, error)
-}
-
 // Handler is the acquisition HTTP surface. It owns its routing; the api only
 // composes by calling RegisterV1.
 type Handler struct {
-	uc          handlerUC
-	reader      reader
-	resumer     resumer            // nil when no LLM summary port is wired
-	analyzer    analyzer           // nil when no LLM intimation-analysis port is wired
-	providencia providenciaActions // nil when no LLM intimation-analysis port is wired
-	lawyers     LawyerLookup       // nil when the DJEN connector isn't wired (same optional-port pattern as resumer)
+	uc       handlerUC
+	reader   reader
+	resumer  resumer      // nil when no LLM summary port is wired
+	analyzer analyzer     // nil when no LLM intimation-analysis port is wired
+	lawyers  LawyerLookup // nil when the DJEN connector isn't wired (same optional-port pattern as resumer)
 }
 
 // NewHandler wires the handler to the acquisition write and read use cases.
-// resumer, analyzer, providencia and lawyers are optional — nil disables their route surface
-// with a typed 501 (/resume, /intimacoes/:id/analise[+providencias] and /oab-lookup).
-func NewHandler(uc handlerUC, reader reader, resumer resumer, analyzer analyzer, providencia providenciaActions, lawyers LawyerLookup) *Handler {
-	return &Handler{uc: uc, reader: reader, resumer: resumer, analyzer: analyzer, providencia: providencia, lawyers: lawyers}
+// resumer, analyzer and lawyers are optional — nil disables their route surface with a
+// typed 501 (/resume, /intimacoes/:id/analise and /oab-lookup). The aprovar/descartar
+// buttons that used to live here moved to internal/actionitem's own confirmar/descartar
+// endpoints (docs/erd-costura-providencia-tarefa-peca.md) — this slice no longer owns that
+// lifecycle.
+func NewHandler(uc handlerUC, reader reader, resumer resumer, analyzer analyzer, lawyers LawyerLookup) *Handler {
+	return &Handler{uc: uc, reader: reader, resumer: resumer, analyzer: analyzer, lawyers: lawyers}
 }
 
 // RegisterV1 mounts acquisition's authenticated routes on the /v1 group. The
@@ -159,8 +151,6 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/intimacoes/:id/ignore", h.ignoreIntimacao)
 	r.Post("/intimacoes/:id/reopen", h.reopenIntimacao)
 	r.Post("/intimacoes/:id/analise", h.analisarIntimacao)
-	r.Post("/intimacoes/:id/providencias/:idx/aprovar", h.aprovarProvidencia)
-	r.Post("/intimacoes/:id/providencias/:idx/descartar", h.descartarProvidencia)
 	r.Put("/intimacoes/:id/responsavel", h.assignIntimacaoResponsavel)
 	r.Post("/intimacoes/bulk/responsavel", h.bulkAssignIntimacaoResponsavel)
 }
@@ -811,52 +801,6 @@ func (h *Handler) analisarIntimacao(c *fiber.Ctx) error {
 	}
 	tenantID := httpx.TenantFromCtx(c)
 	view, err := h.analyzer.Analisar(c.UserContext(), tenantID, c.Params("id"))
-	if err != nil {
-		return httpx.WriteError(c, err)
-	}
-	return c.Status(fiber.StatusOK).JSON(view)
-}
-
-// aprovarProvidencia handles POST /v1/intimacoes/:id/providencias/:idx/aprovar: marks the AI
-// providência at :idx APPROVED and returns the refreshed analysis. The REAL task is created by
-// the FE via POST /v1/tasks BEFORE this call (acquisition never imports the deadline entity) —
-// this endpoint only flips the status. Idempotent; tenant_id comes from the principal. A nil
-// providencia port (slice not wired for LLM) is the same typed 501 as the analyze route.
-func (h *Handler) aprovarProvidencia(c *fiber.Ctx) error {
-	return h.providenciaAction(c, true)
-}
-
-// descartarProvidencia handles POST /v1/intimacoes/:id/providencias/:idx/descartar: marks the
-// AI providência at :idx DISCARDED and returns the refreshed analysis. Idempotent.
-func (h *Handler) descartarProvidencia(c *fiber.Ctx) error {
-	return h.providenciaAction(c, false)
-}
-
-// providenciaAction is the shared body of aprovar/descartar: guards the port, parses :idx,
-// dispatches to the use case, and returns the refreshed analysis view.
-func (h *Handler) providenciaAction(c *fiber.Ctx, approve bool) error {
-	if h.providencia == nil {
-		return httpx.WriteError(c, apperr.NewUnavailable("análise de intimação indisponível: provisor não configurado", errAnalyzerNotWired))
-	}
-	idx, err := strconv.Atoi(c.Params("idx"))
-	if err != nil {
-		return httpx.WriteError(c, apperr.NewInvalid("índice de providência inválido"))
-	}
-	tenantID := httpx.TenantFromCtx(c)
-	id := c.Params("id")
-
-	var view IntimacaoAnaliseView
-	if approve {
-		// Optional body {task_id}: the id of the real task the FE just created, so the
-		// approved row can link back to it. Absent/blank body is fine (idempotent re-approve).
-		var body struct {
-			TaskID string `json:"task_id"`
-		}
-		_ = c.BodyParser(&body)
-		view, err = h.providencia.Aprovar(c.UserContext(), tenantID, id, idx, body.TaskID)
-	} else {
-		view, err = h.providencia.Descartar(c.UserContext(), tenantID, id, idx)
-	}
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}

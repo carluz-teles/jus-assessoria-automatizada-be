@@ -159,6 +159,12 @@ type Task struct {
 	AssigneeUserID string // optional responsável ("meus prazos")
 	CreatedBy      string
 	CompletedAt    *time.Time // stamped when the task is marked DONE; NULL while OPEN/DISMISSED
+	// ActionItemID is "" for a manual/avulsa task (POST /v1/tasks) and set only when the task
+	// was born automatically from a confiável providência (docs/erd-costura-providencia-
+	// tarefa-peca.md §2/§6, fatia 3: actionitem.created/confirmed → task). migration 0079's
+	// UNIQUE constraint on the column is the idempotency floor InsertTask's ON CONFLICT relies
+	// on.
+	ActionItemID string
 }
 
 // TaskStatus is the task lifecycle, a closed set the DB CHECK (0024) also enforces. A

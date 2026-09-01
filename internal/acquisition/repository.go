@@ -2052,6 +2052,14 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 	assigneeID := uuidPtrFromPgtype(row.AssigneeUserID)
 	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt)
 
+	// Cross-slice READ (SQL only, no Go import of internal/actionitem — decisão P1): the
+	// providências materialized by the actionitem listener, replacing the old
+	// ai_providencias jsonb decode (0078).
+	actionItems, err := r.q.ListActionItemsByIntimation(ctx, acquisitiondb.ListActionItemsByIntimationParams{TenantID: tid, IntimationID: iid})
+	if err != nil {
+		return IntimacaoDetailView{}, database.WrapInfra(err)
+	}
+
 	return IntimacaoDetailView{
 		IntimacaoView: IntimacaoView{
 			ID:              row.ID.String(),
@@ -2083,7 +2091,7 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		Recipients:       rawArrayOrEmpty(json.RawMessage(row.Recipients)),
 		History:          history,
 		AISummary:        deref(row.AiSummary),
-		AIProvidencias:   decodeProvidencias(row.AiProvidencias),
+		AIProvidencias:   mapActionItemRows(actionItems),
 		AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 		Plaintiffs:       stringsOrEmpty(row.Plaintiffs),
 		Defendants:       stringsOrEmpty(row.Defendants),
@@ -2109,16 +2117,24 @@ func dateStringOrEmpty(d pgtype.Date) string {
 	return d.Time.Format("2006-01-02")
 }
 
-// decodeProvidencias unmarshals the intimation.ai_providencias jsonb into the wire slice.
-// A NULL/empty column (pré-análise) or a malformed value yields an initialized empty slice
-// (never null) so the FE always maps over an array.
-func decodeProvidencias(raw []byte) []IntimacaoProvidenciaView {
-	out := []IntimacaoProvidenciaView{}
-	if len(raw) == 0 {
-		return out
-	}
-	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
-		return []IntimacaoProvidenciaView{}
+// mapActionItemRows projects the cross-slice ListActionItemsByIntimation rows into the wire
+// shape (read.go's IntimacaoProvidenciaView). Always returns an initialized slice (never
+// nil) so the FE always maps over an array, mirroring the old decodeProvidencias contract.
+func mapActionItemRows(rows []acquisitiondb.ListActionItemsByIntimationRow) []IntimacaoProvidenciaView {
+	out := make([]IntimacaoProvidenciaView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, IntimacaoProvidenciaView{
+			ID:              row.ID.String(),
+			Tipo:            row.Tipo,
+			GeraPeca:        row.GeraPeca,
+			PieceProfileKey: row.PieceProfileKey,
+			TipoOrigem:      row.TipoOrigem,
+			TipoStatus:      row.TipoStatus,
+			Confianca:       row.Confianca,
+			Status:          row.Status,
+			TaskID:          uuidPtrFromPgtype(row.TaskID),
+			DeadlineID:      uuidPtrFromPgtype(row.DeadlineID),
+		})
 	}
 	return out
 }
@@ -2147,6 +2163,10 @@ func (r *pgRepository) GetIntimacaoAnaliseContext(ctx context.Context, tenantID,
 	if row.DeadlineEndDate.Valid {
 		endDate = row.DeadlineEndDate.Time.Format(dateLayout)
 	}
+	deadlineID := ""
+	if row.DeadlineID.Valid {
+		deadlineID = uuid.UUID(row.DeadlineID.Bytes).String()
+	}
 
 	members, err := r.ListActiveMembers(ctx, tenantID)
 	if err != nil {
@@ -2156,11 +2176,13 @@ func (r *pgRepository) GetIntimacaoAnaliseContext(ctx context.Context, tenantID,
 	return IntimacaoAnaliseCtx{
 		Content:         row.Content,
 		Type:            row.Type,
+		CourtRecordID:   row.CourtRecordID.String(),
 		CNJNumber:       row.CnjNumber,
 		Court:           row.Court,
 		Degree:          row.Degree,
 		Class:           deref(row.Class),
 		Subject:         deref(row.Subject),
+		DeadlineID:      deadlineID,
 		DeadlineEndDate: endDate,
 		Members:         members,
 	}, nil

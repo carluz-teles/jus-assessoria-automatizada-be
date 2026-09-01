@@ -21,9 +21,11 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/actionitem"
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/certificate"
+	"github.com/jusassessoria/platform/internal/compliancerule"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -32,6 +34,8 @@ import (
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/internal/onboarding"
+	"github.com/jusassessoria/platform/internal/pieceprofile"
+	"github.com/jusassessoria/platform/internal/thesis"
 	"github.com/jusassessoria/platform/lib/calendar"
 	"github.com/jusassessoria/platform/lib/config"
 	"github.com/jusassessoria/platform/lib/database"
@@ -212,14 +216,15 @@ func run(logger *slog.Logger) error {
 		acquisition.NewReadUseCase(acquisitionRepo),
 		advisory.NewTemplateComposer(),
 		taskGenerator,
-		acquisition.NewAnaliseStore(uow),
+		// The store now also publishes acquisition.intimation.analyzed in the same tx (docs/
+		// erd-costura-providencia-tarefa-peca.md) — the actionitem slice's listener
+		// materializes real action_item rows from it. The aprovar/descartar buttons that used
+		// to live in this slice (ProvidenciaActionUseCase) moved to actionitem's own
+		// confirmar/descartar endpoints, wired below.
+		acquisition.NewAnaliseStore(uow, events.NewOutbox()),
 		// QUALITY: providências viram tasks reais no calendário — falso positivo custa.
 		cfg.OpenRouterModelQuality,
 	)
-	// Providência actions (aprovar/descartar) on the analysis card — flip one suggested
-	// providência's status by index over the unit of work. The real task is created by the FE
-	// via POST /v1/tasks (deadline slice) before the aprovar call, so this stays decoupled.
-	providenciaUC := acquisition.NewProvidenciaActionUseCase(uow)
 	// OAB name lookup (GET /v1/acquisition/oab-lookup, onboarding/Termos best-effort
 	// auto-fill): its own DJENConnector instance — no free public OAB registry API
 	// exists (the OAB's own CNA web service requires an institutional Authentication
@@ -258,7 +263,6 @@ func run(logger *slog.Logger) error {
 			acquisition.WithCaptureDailyTime(cfg.CaptureDailyTime)),
 		resumoUC,
 		analiseUC,
-		providenciaUC,
 		djenLookupConnector,
 	)
 	// The suggester also captures provenance (feedback loop, camada 1): every suggestion batch
@@ -327,6 +331,25 @@ func run(logger *slog.Logger) error {
 	// domain repo/outbox from those slices is injected here, only pool + the
 	// shared unit of work.
 	onboardingHandler := onboarding.NewHandler(onboarding.NewUseCase(onboarding.NewRepository(pool), uow))
+
+	// Tipos de Peça wiring (docs/erd-tipos-de-peca.md, docs/erd-costura-providencia-
+	// tarefa-peca.md): pieceprofile owns the catalog (piece_profile + sections +
+	// versions + reference tables), compliancerule owns compliance_rule and its
+	// profile_rule/section_rule links, thesis owns the tese↔peça contract. All three
+	// are global-catalog/tenant-scoped-via-draft, sharing the same uow/pool/outbox as
+	// every other slice.
+	pieceProfileUC := pieceprofile.NewUseCase(uow, pieceprofile.NewRepository(), pieceprofile.WithOutbox(events.NewOutbox()))
+	pieceProfileHandler := pieceprofile.NewHandler(pieceProfileUC, pieceProfileUC)
+	complianceRuleHandler := compliancerule.NewHandler(compliancerule.NewUseCase(compliancerule.NewRepository(pool)))
+	thesisHandler := thesis.NewHandler(thesis.NewUseCase(uow, thesis.NewRepository(), events.NewOutbox()))
+
+	// Providência (docs/erd-costura-providencia-tarefa-peca.md §2/§3): actionitem's only
+	// synchronous HTTP surface is confirmar/descartar (POST /v1/action-items/:id/...) — the
+	// materialization itself (OnIntimationAnalyzed) is async, wired on the worker's mux, not
+	// here. Same repo/outbox/uow composition every other slice uses.
+	actionItemHandler := actionitem.NewHandler(actionitem.NewUseCase(
+		actionitem.NewRepository(), events.NewOutbox(), actionitem.NewDedup(), uow,
+	))
 
 	// Storage is optional at v0: only wired when S3 is fully configured. The Documentos
 	// slice (Fatia 1) consumes it — the presigned upload/download — so when storage is
@@ -566,6 +589,10 @@ func run(logger *slog.Logger) error {
 		lookup:               lookupHandler,
 		certificate:          certificateHandler,
 		onboarding:           onboardingHandler,
+		pieceprofile:         pieceProfileHandler,
+		compliancerule:       complianceRuleHandler,
+		thesis:               thesisHandler,
+		actionitem:           actionItemHandler,
 		vault:                vlt,
 		streamTokenStore:     streamTokenStore,
 	})

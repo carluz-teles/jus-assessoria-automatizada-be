@@ -226,7 +226,7 @@ func newAppWithReader(uc handlerUC, rd reader, role, tenant string) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: role, tenant: tenant}))
-	NewHandler(uc, rd, nil, nil, nil, nil).RegisterV1(v1)
+	NewHandler(uc, rd, nil, nil, nil).RegisterV1(v1)
 	return app
 }
 
@@ -383,7 +383,7 @@ func newAppWithLawyers(lawyers LawyerLookup, role, tenant string) *fiber.App {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: role, tenant: tenant}))
-	NewHandler(&fakeHandlerUC{}, fakeReader{}, nil, nil, nil, lawyers).RegisterV1(v1)
+	NewHandler(&fakeHandlerUC{}, fakeReader{}, nil, nil, lawyers).RegisterV1(v1)
 	return app
 }
 
@@ -1918,7 +1918,7 @@ func TestHandler_Resume_OK(t *testing.T) {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: "LAWYER", tenant: "tenant-9"}))
-	NewHandler(&fakeHandlerUC{}, &recordingReader{}, rs, nil, nil, nil).RegisterV1(v1)
+	NewHandler(&fakeHandlerUC{}, &recordingReader{}, rs, nil, nil).RegisterV1(v1)
 
 	status, body := do(t, app, http.MethodGet, "/v1/processos/rec-1/resume", "", "jwt")
 	if status != http.StatusOK {
@@ -1944,7 +1944,7 @@ func TestHandler_Resume_NoResumer_501(t *testing.T) {
 		ErrorHandler: func(c *fiber.Ctx, err error) error { return httpx.WriteError(c, err) },
 	})
 	v1 := app.Group("/v1", middleware.Auth(stubVerifier{}, stubResolver{role: "LAWYER", tenant: "tenant-9"}))
-	NewHandler(&fakeHandlerUC{}, &recordingReader{}, nil, nil, nil, nil).RegisterV1(v1)
+	NewHandler(&fakeHandlerUC{}, &recordingReader{}, nil, nil, nil).RegisterV1(v1)
 
 	status, body := do(t, app, http.MethodGet, "/v1/processos/rec-1/resume", "", "jwt")
 	if status != http.StatusServiceUnavailable {

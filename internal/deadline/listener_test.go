@@ -24,6 +24,10 @@ type stubUC struct {
 	missedCalls    int
 	docketErr      error
 	docketCalls    int
+	createdErr     error
+	createdCalls   int
+	confirmedErr   error
+	confirmedCalls int
 }
 
 func (s *stubUC) OnIntimationObserved(context.Context, IntimationObserved) error {
@@ -49,6 +53,16 @@ func (s *stubUC) OnMissedCheck(context.Context, DeadlineMissedCheck) error {
 func (s *stubUC) OnDocketEntryObserved(context.Context, DocketEntryObserved) error {
 	s.docketCalls++
 	return s.docketErr
+}
+
+func (s *stubUC) OnActionItemCreated(context.Context, ActionItemFact) error {
+	s.createdCalls++
+	return s.createdErr
+}
+
+func (s *stubUC) OnActionItemConfirmed(context.Context, ActionItemFact) error {
+	s.confirmedCalls++
+	return s.confirmedErr
 }
 
 // TestListener_handleIntimationObserved covers the listener's contract: a terminal
@@ -347,6 +361,123 @@ func TestListener_handleDocketEntryObserved_decodeFault(t *testing.T) {
 
 	if stub.docketCalls != 0 {
 		t.Errorf("use case called on decode fault (calls = %d)", stub.docketCalls)
+	}
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Errorf("decode fault not archived: %v", err)
+	}
+}
+
+// TestListener_handleActionItemCreated covers the fatia 3 handler's contract: a terminal
+// domain error (the gone-action_item KindNotFound) is wrapped with SkipRetry; an infra/unknown
+// error stays retryable. Mirrors handleIntimationObserved's table shape.
+func TestListener_handleActionItemCreated(t *testing.T) {
+	task := asynq.NewTask(TypeActionItemCreated, []byte(`{}`))
+
+	tests := []struct {
+		name     string
+		ucErr    error
+		wantSkip bool
+	}{
+		{name: "success acks", ucErr: nil, wantSkip: false},
+		{name: "gone action item is terminal", ucErr: ErrActionItemNotFound, wantSkip: true},
+		{name: "infra error stays retryable", ucErr: apperr.NewInfra("db down", errors.New("boom")), wantSkip: false},
+		{name: "unknown error stays retryable", ucErr: errors.New("opaque"), wantSkip: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubUC{createdErr: tt.ucErr}
+			l := NewListener(stub)
+
+			err := l.handleActionItemCreated(context.Background(), task)
+
+			if stub.createdCalls != 1 {
+				t.Fatalf("use case calls = %d, want 1", stub.createdCalls)
+			}
+			if tt.ucErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.ucErr) {
+				t.Errorf("original error dropped from chain: %v", err)
+			}
+			if got := errors.Is(err, asynq.SkipRetry); got != tt.wantSkip {
+				t.Errorf("SkipRetry = %v, want %v (err = %v)", got, tt.wantSkip, err)
+			}
+		})
+	}
+}
+
+// TestListener_handleActionItemCreated_decodeFault proves a malformed payload is archived at
+// decode, before the use case runs.
+func TestListener_handleActionItemCreated_decodeFault(t *testing.T) {
+	stub := &stubUC{}
+	l := NewListener(stub)
+
+	err := l.handleActionItemCreated(context.Background(), asynq.NewTask(TypeActionItemCreated, []byte(`{`)))
+
+	if stub.createdCalls != 0 {
+		t.Errorf("use case called on decode fault (calls = %d)", stub.createdCalls)
+	}
+	if !errors.Is(err, asynq.SkipRetry) {
+		t.Errorf("decode fault not archived: %v", err)
+	}
+}
+
+// TestListener_handleActionItemConfirmed mirrors TestListener_handleActionItemCreated for the
+// confirmed counterpart — both funnel into the same use-case core, but the listener wiring is
+// independent and needs its own contract guard.
+func TestListener_handleActionItemConfirmed(t *testing.T) {
+	task := asynq.NewTask(TypeActionItemConfirmed, []byte(`{}`))
+
+	tests := []struct {
+		name     string
+		ucErr    error
+		wantSkip bool
+	}{
+		{name: "success acks", ucErr: nil, wantSkip: false},
+		{name: "gone action item is terminal", ucErr: ErrActionItemNotFound, wantSkip: true},
+		{name: "infra error stays retryable", ucErr: apperr.NewInfra("db down", errors.New("boom")), wantSkip: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &stubUC{confirmedErr: tt.ucErr}
+			l := NewListener(stub)
+
+			err := l.handleActionItemConfirmed(context.Background(), task)
+
+			if stub.confirmedCalls != 1 {
+				t.Fatalf("use case calls = %d, want 1", stub.confirmedCalls)
+			}
+			if tt.ucErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tt.ucErr) {
+				t.Errorf("original error dropped from chain: %v", err)
+			}
+			if got := errors.Is(err, asynq.SkipRetry); got != tt.wantSkip {
+				t.Errorf("SkipRetry = %v, want %v (err = %v)", got, tt.wantSkip, err)
+			}
+		})
+	}
+}
+
+// TestListener_handleActionItemConfirmed_decodeFault proves a malformed payload is archived
+// at decode, before the use case runs.
+func TestListener_handleActionItemConfirmed_decodeFault(t *testing.T) {
+	stub := &stubUC{}
+	l := NewListener(stub)
+
+	err := l.handleActionItemConfirmed(context.Background(), asynq.NewTask(TypeActionItemConfirmed, []byte(`{`)))
+
+	if stub.confirmedCalls != 0 {
+		t.Errorf("use case called on decode fault (calls = %d)", stub.confirmedCalls)
 	}
 	if !errors.Is(err, asynq.SkipRetry) {
 		t.Errorf("decode fault not archived: %v", err)

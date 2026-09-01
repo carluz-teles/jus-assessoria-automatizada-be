@@ -51,6 +51,30 @@ type fakeRepo struct {
 	getIntimationResult *IntimationContext
 	getIntimationErr    error
 
+	// GetActionItemForTask (Costura Providência↔Tarefa↔Minuta, migration 0080)
+	getActionItemForTaskResult *ActionItemForTask
+	getActionItemForTaskErr    error
+
+	// GetDraftByTaskID
+	getByTaskResult *Draft
+	getByTaskErr    error
+
+	// ── Reclassificação stubs (fatia 5, docs §7 questão 4) ──────────────────
+
+	// GetTaskIDForActionItem
+	getTaskIDForActionItemResult string
+	getTaskIDForActionItemErr    error
+
+	// SupersedeDraftForTask
+	supersedeDraftForTaskErr   error
+	supersedeDraftForTaskCalls int
+
+	// LinkSupersededDraft
+	linkSupersededDraftErr       error
+	linkSupersededDraftCalls     int
+	lastLinkSupersededTaskID     string
+	lastLinkSupersededNewDraftID string
+
 	// UpdateDraftContent
 	updateResult *PatchResult
 	updateErr    error
@@ -156,6 +180,35 @@ func (r *fakeRepo) GetDraftByID(_ context.Context, _ database.Tx, _, _ string) (
 
 func (r *fakeRepo) GetIntimationForDraft(_ context.Context, _ database.Tx, _, _ string) (*IntimationContext, error) {
 	return r.getIntimationResult, r.getIntimationErr
+}
+
+func (r *fakeRepo) GetActionItemForTask(_ context.Context, _ database.Tx, _, _ string) (*ActionItemForTask, error) {
+	return r.getActionItemForTaskResult, r.getActionItemForTaskErr
+}
+
+func (r *fakeRepo) GetDraftByTaskID(_ context.Context, _ database.Tx, _, _ string) (*Draft, error) {
+	return r.getByTaskResult, r.getByTaskErr
+}
+
+// ── Reclassificação stubs (fatia 5, docs §7 questão 4) ──────────────────────────
+
+func (r *fakeRepo) GetTaskIDForActionItem(_ context.Context, _ database.Tx, _, _ string) (string, error) {
+	return r.getTaskIDForActionItemResult, r.getTaskIDForActionItemErr
+}
+
+func (r *fakeRepo) SupersedeDraftForTask(_ context.Context, _ database.Tx, _, _ string) error {
+	r.supersedeDraftForTaskCalls++
+	return r.supersedeDraftForTaskErr
+}
+
+// LinkSupersededDraft records every (taskID, newDraftID) pair Create's backfill calls it
+// with — TestCreate_TaskSourced_LinksSupersededDraft asserts it fires exactly once, scoped
+// to the right ids.
+func (r *fakeRepo) LinkSupersededDraft(_ context.Context, _ database.Tx, _, taskID, newDraftID string) error {
+	r.linkSupersededDraftCalls++
+	r.lastLinkSupersededTaskID = taskID
+	r.lastLinkSupersededNewDraftID = newDraftID
+	return r.linkSupersededDraftErr
 }
 
 func (r *fakeRepo) UpdateDraftContent(_ context.Context, _ database.Tx, _, _, _ string, _ *string, _ *StructuredContent) (*PatchResult, error) {
@@ -438,6 +491,7 @@ func TestUseCase_Create(t *testing.T) {
 	tenantID := newTenantID()
 	intimID := newIntimID()
 	caseID := uuid.New().String()
+	taskID := uuid.New().String()
 
 	tests := []struct {
 		name      string
@@ -447,6 +501,11 @@ func TestUseCase_Create(t *testing.T) {
 		wantErr   bool
 		errTarget error
 		wantPiece string
+		// wantTaskSourced gates the task-sourced-only assertions below (TaskID and
+		// PieceProfileKey on the inserted draft) — the legacy cases leave both "".
+		wantTaskSourced bool
+		wantTaskID      string
+		wantProfileKey  string
 	}{
 		{
 			name: "source=intimation creates draft with inferred DEFENSE piece_type",
@@ -543,6 +602,113 @@ func TestUseCase_Create(t *testing.T) {
 			wantNew:   true,
 			wantPiece: PieceTypeOther,
 		},
+
+		// ── Task-sourced (migration 0080, docs/erd-costura-providencia-tarefa-
+		// peca.md §3) — the draft inherits intimation/case/piece_type from the
+		// providência the task stems from, bypassing Source entirely. ──────────
+		{
+			name: "task-sourced: inherits contestacao→DEFENSE, ignores conflicting cmd.PieceType",
+			cmd: CreateCommand{
+				TenantID:  tenantID,
+				TaskID:    taskID,
+				PieceType: PieceTypeAppeal, // must be IGNORED — the peça inherits, never re-chooses
+			},
+			repo: &fakeRepo{
+				getActionItemForTaskResult: &ActionItemForTask{
+					IntimationID: intimID, CaseID: caseID, PieceProfileKey: "contestacao",
+				},
+				insertDraftResult: stubDraft(tenantID, intimID),
+			},
+			wantNew:         true,
+			wantPiece:       PieceTypeDefense,
+			wantTaskSourced: true,
+			wantTaskID:      taskID,
+			wantProfileKey:  "contestacao",
+		},
+		{
+			name: "task-sourced: inherits peticao_inicial→COMPLAINT",
+			cmd: CreateCommand{
+				TenantID: tenantID,
+				TaskID:   taskID,
+			},
+			repo: &fakeRepo{
+				getActionItemForTaskResult: &ActionItemForTask{
+					IntimationID: intimID, CaseID: caseID, PieceProfileKey: "peticao_inicial",
+				},
+				insertDraftResult: stubDraft(tenantID, intimID),
+			},
+			wantNew:         true,
+			wantPiece:       PieceTypeComplaint,
+			wantTaskSourced: true,
+			wantTaskID:      taskID,
+			wantProfileKey:  "peticao_inicial",
+		},
+		{
+			name: "task-sourced: inherits apelacao→APPEAL",
+			cmd: CreateCommand{
+				TenantID: tenantID,
+				TaskID:   taskID,
+			},
+			repo: &fakeRepo{
+				getActionItemForTaskResult: &ActionItemForTask{
+					IntimationID: intimID, CaseID: caseID, PieceProfileKey: "apelacao",
+				},
+				insertDraftResult: stubDraft(tenantID, intimID),
+			},
+			wantNew:         true,
+			wantPiece:       PieceTypeAppeal,
+			wantTaskSourced: true,
+			wantTaskID:      taskID,
+			wantProfileKey:  "apelacao",
+		},
+		{
+			name: "task-sourced: unknown/empty piece_profile_key falls back to inferPieceType via loaded intimation",
+			cmd: CreateCommand{
+				TenantID: tenantID,
+				TaskID:   taskID,
+			},
+			repo: &fakeRepo{
+				getActionItemForTaskResult: &ActionItemForTask{
+					IntimationID: intimID, CaseID: caseID, PieceProfileKey: "",
+				},
+				getIntimationResult: &IntimationContext{
+					IntimationID: intimID, CaseID: caseID, Type: "CITACAO",
+				},
+				insertDraftResult: stubDraft(tenantID, intimID),
+			},
+			wantNew:         true,
+			wantPiece:       PieceTypeDefense, // CITACAO → DEFENSE, same as inferPieceType's own test
+			wantTaskSourced: true,
+			wantTaskID:      taskID,
+			wantProfileKey:  "",
+		},
+		{
+			name: "task-sourced: task not found → ErrTaskNotFound",
+			cmd: CreateCommand{
+				TenantID: tenantID,
+				TaskID:   taskID,
+			},
+			repo: &fakeRepo{
+				getActionItemForTaskErr: ErrTaskNotFound,
+			},
+			wantErr:   true,
+			errTarget: ErrTaskNotFound,
+		},
+		{
+			name: "task-sourced idempotent: existing draft returned as 200 when unique constraint hit",
+			cmd: CreateCommand{
+				TenantID: tenantID,
+				TaskID:   taskID,
+			},
+			repo: &fakeRepo{
+				getActionItemForTaskResult: &ActionItemForTask{
+					IntimationID: intimID, CaseID: caseID, PieceProfileKey: "contestacao",
+				},
+				insertDraftErr:  ErrDraftAlreadyExists,
+				getByTaskResult: stubDraft(tenantID, intimID),
+			},
+			wantNew: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -581,7 +747,93 @@ func TestUseCase_Create(t *testing.T) {
 						tt.repo.lastInsertedDraft.PieceType, tt.wantPiece)
 				}
 			}
+			// Task-sourced cases: verify TaskID/PieceProfileKey were set on the
+			// inserted draft (and that a conflicting cmd.PieceType was overwritten,
+			// covered by wantPiece above).
+			if tt.wantTaskSourced && tt.repo.lastInsertedDraft != nil {
+				if tt.repo.lastInsertedDraft.TaskID != tt.wantTaskID {
+					t.Errorf("Create() inserted TaskID = %q, want %q",
+						tt.repo.lastInsertedDraft.TaskID, tt.wantTaskID)
+				}
+				if tt.repo.lastInsertedDraft.PieceProfileKey != tt.wantProfileKey {
+					t.Errorf("Create() inserted PieceProfileKey = %q, want %q",
+						tt.repo.lastInsertedDraft.PieceProfileKey, tt.wantProfileKey)
+				}
+			}
 		})
+	}
+}
+
+// TestUseCase_Create_TaskSourced_BackfillsSupersededDraft proves Create's task-sourced
+// flow (fatia 5, docs §7 questão 4) calls LinkSupersededDraft exactly once, scoped to
+// cmd.TaskID and the FRESHLY inserted draft's id — the pointer-chain backfill that closes
+// the reclassify loop old→new. Runs in the SAME uow.Do call as InsertDraft (single fakeUOW
+// scope), never as a separate transaction.
+func TestUseCase_Create_TaskSourced_BackfillsSupersededDraft(t *testing.T) {
+	t.Parallel()
+
+	tenantID := newTenantID()
+	intimID := newIntimID()
+	caseID := uuid.New().String()
+	taskID := uuid.New().String()
+	newDraft := stubDraft(tenantID, intimID)
+
+	repo := &fakeRepo{
+		getActionItemForTaskResult: &ActionItemForTask{
+			IntimationID: intimID, CaseID: caseID, PieceProfileKey: "contestacao",
+		},
+		insertDraftResult: newDraft,
+	}
+	uc := NewUseCase(&fakeUOW{}, repo)
+
+	result, err := uc.Create(context.Background(), CreateCommand{TenantID: tenantID, TaskID: taskID})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if !result.IsNewDraft {
+		t.Fatal("Create() IsNewDraft = false, want true")
+	}
+	if repo.linkSupersededDraftCalls != 1 {
+		t.Fatalf("LinkSupersededDraft calls = %d, want 1", repo.linkSupersededDraftCalls)
+	}
+	if repo.lastLinkSupersededTaskID != taskID {
+		t.Errorf("LinkSupersededDraft taskID = %q, want %q", repo.lastLinkSupersededTaskID, taskID)
+	}
+	if repo.lastLinkSupersededNewDraftID != newDraft.ID {
+		t.Errorf("LinkSupersededDraft newDraftID = %q, want %q (the just-inserted draft)", repo.lastLinkSupersededNewDraftID, newDraft.ID)
+	}
+}
+
+// TestUseCase_Create_Idempotent_NeverBackfillsSupersededDraft proves the idempotent-fetch
+// branch (INSERT hit draft_task_id_uidx, existing row returned) never calls
+// LinkSupersededDraft — that backfill only makes sense for a FRESH insert; re-linking an
+// already-existing draft would be wrong (it did not just replace anything).
+func TestUseCase_Create_Idempotent_NeverBackfillsSupersededDraft(t *testing.T) {
+	t.Parallel()
+
+	tenantID := newTenantID()
+	intimID := newIntimID()
+	caseID := uuid.New().String()
+	taskID := uuid.New().String()
+
+	repo := &fakeRepo{
+		getActionItemForTaskResult: &ActionItemForTask{
+			IntimationID: intimID, CaseID: caseID, PieceProfileKey: "contestacao",
+		},
+		insertDraftErr:  ErrDraftAlreadyExists,
+		getByTaskResult: stubDraft(tenantID, intimID),
+	}
+	uc := NewUseCase(&fakeUOW{}, repo)
+
+	result, err := uc.Create(context.Background(), CreateCommand{TenantID: tenantID, TaskID: taskID})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if result.IsNewDraft {
+		t.Fatal("Create() IsNewDraft = true, want false (idempotent path)")
+	}
+	if repo.linkSupersededDraftCalls != 0 {
+		t.Errorf("LinkSupersededDraft calls = %d, want 0 (no fresh insert to backfill from)", repo.linkSupersededDraftCalls)
 	}
 }
 

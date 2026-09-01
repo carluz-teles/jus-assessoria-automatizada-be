@@ -1,15 +1,21 @@
 -- analise.sql — queries for the AI analysis of one intimation (POST /v1/intimacoes/:id/analise).
 -- GetIntimacaoAnaliseContext reads the teor + the court context the prompt needs; the write
--- query OVERWRITES the three ai_* columns (re-executable — "Gerar novamente" re-runs it).
+-- query OVERWRITES the ai_summary/ai_analyzed_at columns (re-executable — "Gerar novamente"
+-- re-runs it). The providências themselves are NO LONGER persisted here as jsonb — Analisar
+-- publishes acquisition.intimation.analyzed instead, and the actionitem slice's listener
+-- materializes real action_item rows from it (docs/erd-costura-providencia-tarefa-peca.md).
 
 -- name: GetIntimacaoAnaliseContext :one
 -- One intimation's teor plus its court record's identification and the derived prazo end_date
 -- (LEFT JOIN deadline on notification_id — NULL when no prazo yet; the IA uses it as the ceiling
--- for suggested due_dates). Scoped by tenant_id + intimation id (barrier 1). A miss/foreign row →
--- pgx.ErrNoRows → ErrIntimationNotFound (the same 404 semantics as GetIntimacao). type is nullable.
+-- for suggested due_dates). court_record_id/deadline_id are carried through so the caller can
+-- stamp them onto the acquisition.intimation.analyzed event without a second round-trip — the
+-- actionitem slice's materialized action_item rows need both. Scoped by tenant_id + intimation
+-- id (barrier 1). A miss/foreign row → pgx.ErrNoRows → ErrIntimationNotFound (the same 404
+-- semantics as GetIntimacao). type is nullable.
 SELECT i.content, i.type,
-       cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
-       d.end_date AS deadline_end_date
+       cr.id AS court_record_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject,
+       d.id AS deadline_id, d.end_date AS deadline_end_date
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
@@ -29,35 +35,17 @@ JOIN app_user u ON u.id = m.app_user_id AND u.tenant_id = m.tenant_id
 WHERE m.tenant_id = $1 AND m.status = 'ACTIVE'
 ORDER BY u.name, u.id;
 
--- name: GetIntimationProvidenciasForUpdate :one
--- Reads the ai_providencias jsonb + ai_analyzed_at of one intimation, locking the row
--- (FOR UPDATE) so an aprovar/descartar read-modify-write is serialized. NULL ai_analyzed_at
--- (never analysed) vs a set stamp lets the use case reject a status change on an un-analysed
--- intimation. Scoped by tenant_id (barrier 1); a miss/foreign row → pgx.ErrNoRows.
-SELECT ai_providencias, ai_analyzed_at
-FROM intimation
-WHERE id = $1 AND tenant_id = $2
-FOR UPDATE;
-
--- name: SetIntimationProvidencias :exec
--- Overwrites ONLY the ai_providencias jsonb (leaves ai_summary / ai_analyzed_at untouched) —
--- the write half of the aprovar/descartar status flip. Scoped by tenant_id (barrier 1).
-UPDATE intimation
-SET ai_providencias = $1
-WHERE id = $2 AND tenant_id = $3;
-
 -- name: SetIntimationAIAnalysis :one
--- Persists (OVERWRITES) the AI analysis of one intimation. Unlike SetCourtRecordAIResume
--- there is NO write-once guard — the analysis is re-executable ("Gerar novamente"). Scoped
--- by tenant_id (barrier 1). Degraded mode passes ai_summary='' + ai_providencias='[]'.
+-- Persists (OVERWRITES) the AI analysis of one intimation's ai_summary/ai_analyzed_at. Unlike
+-- SetCourtRecordAIResume there is NO write-once guard — the analysis is re-executable ("Gerar
+-- novamente"). Scoped by tenant_id (barrier 1). Degraded mode passes ai_summary=''.
 -- RETURNING court_record_id so the caller can log a process_activity_log row in the SAME
 -- tx, without a second round-trip to look up the owning court record.
 UPDATE intimation
 SET ai_summary      = $1,
-    ai_providencias = $2,
     ai_analyzed_at  = now()
-WHERE id = $3
-  AND tenant_id = $4
+WHERE id = $2
+  AND tenant_id = $3
 RETURNING court_record_id;
 
 -- name: InsertProcessActivityLog :exec

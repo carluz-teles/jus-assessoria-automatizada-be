@@ -105,35 +105,33 @@ type IntimacaoHistoryEntry struct {
 	Label      string    `json:"label"`
 }
 
-// Providência statuses — the lifecycle of one AI-suggested providência. Born SUGGESTED;
-// "Aprovar e atribuir" promotes it to APPROVED (after the FE has created the real task),
-// "Descartar" moves it to DISCARDED. Only SUGGESTED items carry the actionable buttons in
-// the FE (APPROVED/DISCARDED are terminal). text + app-level CHECK (never a DB enum).
+// ActionItem statuses — the providência's own lifecycle (migration 0078), independent of
+// its tipo classification's confidence gate (tipo_status). Born SUGGESTED; "Descartar"
+// moves it to DISCARDED. CONFIRMED is reserved for a future fatia (the point at which a
+// task is actually bound) — this slice's actionitem listener never writes it, but the read
+// model surfaces it if a later slice does.
 const (
-	ProvidenciaStatusSuggested = "SUGGESTED"
-	ProvidenciaStatusApproved  = "APPROVED"
-	ProvidenciaStatusDiscarded = "DISCARDED"
+	ActionItemStatusSuggested = "SUGGESTED"
+	ActionItemStatusConfirmed = "CONFIRMED"
+	ActionItemStatusDiscarded = "DISCARDED"
 )
 
-// IntimacaoProvidenciaView is one derived providência of the AI analysis: a short
-// imperative title (the IA already embeds the legal citation in the title, e.g. "Redigir
-// defesa (art. 919, CPC)") plus an actionable description, an IA-suggested responsável and
-// due date (both nullable — the model may omit them, then the FE shows "—"), and a lifecycle
-// Status (SUGGESTED|APPROVED|DISCARDED). Serialized inside the detail view's ai_providencias
-// jsonb array. The suggested_assignee_user_id is one of the firm's real app_user ids (chosen
-// by the model from the member list injected into the prompt); the FE resolves the name from
-// the row's suggested_assignee_name (or re-resolves via the members directory).
+// IntimacaoProvidenciaView is one materialized action_item of the intimação (docs/erd-
+// costura-providencia-tarefa-peca.md §2), read via the cross-slice ListActionItemsByIntimation
+// query (repository.go's mapActionItemRows) — NOT the ephemeral AI candidate returned by POST
+// /v1/intimacoes/:id/analise (see analise.go's AnaliseProvidenciaView for that). PieceProfileKey/
+// Confianca/TaskID/DeadlineID are nullable, mirroring the action_item columns.
 type IntimacaoProvidenciaView struct {
-	Title                   string  `json:"title"`
-	Description             string  `json:"description"`
-	SuggestedAssigneeUserID *string `json:"suggested_assignee_user_id"`
-	SuggestedAssigneeName   *string `json:"suggested_assignee_name"`
-	DueDate                 *string `json:"due_date"` // "2006-01-02" or null
-	Status                  string  `json:"status"`   // SUGGESTED|APPROVED|DISCARDED
-	// TaskID is the real task created when the providência was APPROVED (the FE creates the
-	// task via POST /v1/tasks, then passes its id to the aprovar endpoint so the approved row
-	// can link back to it). Null for SUGGESTED/DISCARDED, or when the client omitted it.
-	TaskID *string `json:"task_id"`
+	ID              string   `json:"id"`
+	Tipo            string   `json:"tipo"`
+	GeraPeca        bool     `json:"gera_peca"`
+	PieceProfileKey *string  `json:"piece_profile_key"`
+	TipoOrigem      string   `json:"tipo_origem"` // declarado|ia|manual
+	TipoStatus      string   `json:"tipo_status"` // confiavel|a_confirmar
+	Confianca       *float64 `json:"confianca"`
+	Status          string   `json:"status"` // SUGGESTED|CONFIRMED|DISCARDED
+	TaskID          *string  `json:"task_id"`
+	DeadlineID      *string  `json:"deadline_id"`
 }
 
 // IntimacaoDetailView is the deep-link detail of one intimation (GET

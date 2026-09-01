@@ -148,6 +148,11 @@ type CreateCommand struct {
 	CaseID       string
 	PieceType    string
 	Title        string
+	// TaskID (migration 0080, docs/erd-costura-providencia-tarefa-peca.md §3):
+	// when present, Create runs the task-sourced flow — it takes precedence over
+	// Source and the intimation/case/piece_type it would otherwise resolve. Empty
+	// for every pre-existing caller (source=intimation/processo/blank).
+	TaskID string
 }
 
 // CreateResult carries the response body for a POST /v1/pecas: the created or found
@@ -176,28 +181,37 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 			Title:     cmd.Title,
 		}
 
-		switch cmd.Source {
-		case SourceIntimation:
-			intimation, err := uc.rw.GetIntimationForDraft(ctx, tx, cmd.TenantID, cmd.IntimationID)
-			if err != nil {
+		if cmd.TaskID != "" {
+			// Task-sourced (migration 0080, docs §3): bypasses Source entirely —
+			// the draft's intimation/case/piece_type come from the providência the
+			// task stems from, never from the body.
+			if err := uc.populateFromTask(ctx, tx, cmd.TenantID, cmd.TaskID, d); err != nil {
 				return err
 			}
-			d.IntimationID = intimation.IntimationID
-			d.CaseID = intimation.CaseID
-			// Infer piece_type from the intimation (content-first) when not supplied.
-			if d.PieceType == "" {
-				d.PieceType = inferPieceType(intimation)
-			}
+		} else {
+			switch cmd.Source {
+			case SourceIntimation:
+				intimation, err := uc.rw.GetIntimationForDraft(ctx, tx, cmd.TenantID, cmd.IntimationID)
+				if err != nil {
+					return err
+				}
+				d.IntimationID = intimation.IntimationID
+				d.CaseID = intimation.CaseID
+				// Infer piece_type from the intimation (content-first) when not supplied.
+				if d.PieceType == "" {
+					d.PieceType = inferPieceType(intimation)
+				}
 
-		case SourceProcesso:
-			d.CaseID = cmd.CaseID
-			if d.PieceType == "" {
-				d.PieceType = PieceTypeOther
-			}
+			case SourceProcesso:
+				d.CaseID = cmd.CaseID
+				if d.PieceType == "" {
+					d.PieceType = PieceTypeOther
+				}
 
-		default: // SourceBlank
-			if d.PieceType == "" {
-				d.PieceType = PieceTypeOther
+			default: // SourceBlank
+				if d.PieceType == "" {
+					d.PieceType = PieceTypeOther
+				}
 			}
 		}
 
@@ -213,7 +227,15 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 		if err != nil {
 			if errors.Is(err, ErrDraftAlreadyExists) {
 				// Idempotent: fetch and return the existing row (→ 200 at the edge).
-				existing, fetchErr := uc.rw.GetDraftByIntimationID(ctx, tx, cmd.TenantID, cmd.IntimationID)
+				// Task-sourced and legacy hit different unique indexes (0080), so
+				// they fetch back through different keys.
+				var existing *Draft
+				var fetchErr error
+				if cmd.TaskID != "" {
+					existing, fetchErr = uc.rw.GetDraftByTaskID(ctx, tx, cmd.TenantID, cmd.TaskID)
+				} else {
+					existing, fetchErr = uc.rw.GetDraftByIntimationID(ctx, tx, cmd.TenantID, cmd.IntimationID)
+				}
 				if fetchErr != nil {
 					return fetchErr
 				}
@@ -229,6 +251,18 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 		// listener is in place and lib/events/relay.go's queueFor routes "draft" to
 		// the correct queue.
 
+		// Fatia 5 (docs §7 questão 4): backfill the pointer chain old→new for the
+		// reclassify loop. Only the task-sourced flow can ever have a superseded
+		// predecessor to link — the legacy source=intimation/processo/blank paths never
+		// set task_id, so they never have one. Same tx as InsertDraft (atomic: either
+		// both commit or neither does). A no-candidate result (the common case — most
+		// drafts are never reclassified) is a silent no-op inside LinkSupersededDraft.
+		if cmd.TaskID != "" {
+			if err := uc.rw.LinkSupersededDraft(ctx, tx, cmd.TenantID, cmd.TaskID, created.ID); err != nil {
+				return err
+			}
+		}
+
 		result = CreateResult{Draft: created, IsNewDraft: true}
 		return nil
 	})
@@ -236,6 +270,38 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 		return CreateResult{}, err
 	}
 	return result, nil
+}
+
+// populateFromTask implements the task-sourced Create flow (migration 0080,
+// docs/erd-costura-providencia-tarefa-peca.md §3): the draft INHERITS its
+// intimation, case, and piece_type from the providência (action_item) the task
+// stems from — it never re-chooses the type, so any cmd.PieceType the caller sent
+// is overwritten here even when non-empty.
+func (uc *UseCase) populateFromTask(ctx context.Context, tx database.Tx, tenantID, taskID string, d *Draft) error {
+	item, err := uc.rw.GetActionItemForTask(ctx, tx, tenantID, taskID)
+	if err != nil {
+		return err
+	}
+	d.TaskID = taskID
+	d.IntimationID = item.IntimationID
+	d.CaseID = item.CaseID
+	d.PieceProfileKey = item.PieceProfileKey
+
+	if pieceType, ok := pieceTypeFromProfileKey(d.PieceProfileKey); ok {
+		d.PieceType = pieceType
+		return nil
+	}
+
+	// Fallback defensivo: piece_profile_key desconhecido do mapa local (não deveria
+	// acontecer — o FK+CHECK de action_item da fatia 2 já garantem uma key válida do
+	// catálogo — mas uma peça nunca deve ficar sem tipo). Reusa o MESMO classificador
+	// de conteúdo do caminho source=intimation.
+	intimation, err := uc.rw.GetIntimationForDraft(ctx, tx, tenantID, d.IntimationID)
+	if err != nil {
+		return err
+	}
+	d.PieceType = inferPieceType(intimation)
+	return nil
 }
 
 // PatchCommand is the input for PATCH /v1/pecas/:id.

@@ -12,64 +12,76 @@ import (
 )
 
 // analise_store.go is the analiseStore adapter — the write half of the intimation AI
-// analysis (migration 0051). Like pgResumoStore it opens its own tenant-scoped tx via the
-// unit of work (RLS barrier 2) instead of enrolling in a caller's tx. Unlike pgResumoStore
-// the UPDATE has NO `IS NULL` guard: the analysis is re-executable ("Gerar novamente"
-// OVERWRITES), so every call updates the row.
+// analysis (migration 0051, now also publishing acquisition.intimation.analyzed per
+// docs/erd-costura-providencia-tarefa-peca.md instead of persisting ai_providencias jsonb).
+// Like pgResumoStore it opens its own tenant-scoped tx via the unit of work (RLS barrier 2)
+// instead of enrolling in a caller's tx. Unlike pgResumoStore the UPDATE has NO `IS NULL`
+// guard: the analysis is re-executable ("Gerar novamente" OVERWRITES), so every call
+// updates the row.
 //
 // On a SUCCESSFUL (non-degraded) analysis it also appends one process_activity_log row
 // (migration 0073) in the SAME tx as the UPDATE — see activity.go. The degraded write
 // (logActivity=false) never logs: an "IA indisponível" write is not something to surface on
-// the process timeline.
+// the process timeline. The event publishes regardless of logActivity — even a degraded
+// re-run must tell the actionitem listener to clear the previous run's still-pending
+// suggestions (its guard aditivo, internal/actionitem/domain.go).
 
-// pgAnaliseStore persists the intimation AI analysis over the unit of work (pool).
+// pgAnaliseStore persists the intimation AI analysis over the unit of work (pool) and
+// publishes acquisition.intimation.analyzed in the same tx.
 type pgAnaliseStore struct {
-	uow database.UnitOfWork
+	uow    database.UnitOfWork
+	outbox publisher
 }
 
 var _ analiseStore = (*pgAnaliseStore)(nil)
 
-// NewAnaliseStore returns the analiseStore over the unit of work. Each call overwrites the
-// three ai_* columns of one intimation inside its own tenant-scoped tx.
-func NewAnaliseStore(uow database.UnitOfWork) analiseStore { return &pgAnaliseStore{uow: uow} }
+// NewAnaliseStore returns the analiseStore over the unit of work + outbox. Each call
+// overwrites the intimation's ai_summary/ai_analyzed_at and publishes the analysis event,
+// inside its own tenant-scoped tx.
+func NewAnaliseStore(uow database.UnitOfWork, outbox publisher) analiseStore {
+	return &pgAnaliseStore{uow: uow, outbox: outbox}
+}
 
-// SaveAnalise overwrites the intimation's ai_summary/ai_providencias/ai_analyzed_at.
-// summary "" + providencias "[]" is the valid degraded write (analysed, IA unavailable).
-// logActivity=true also appends a process_activity_log row (INTIMATION_ANALYSIS_COMPLETED)
-// in the same tx — a failure to log is LOG-NOT-FAIL: it never rolls back the analysis, which
-// already committed the columns above.
-func (s *pgAnaliseStore) SaveAnalise(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error {
-	tid, err := uuid.Parse(tenantID)
+// SaveAnalise overwrites the intimation's ai_summary/ai_analyzed_at and publishes
+// acquisition.intimation.analyzed carrying p.Providencias, in one tx. summary="" is the
+// valid degraded write (analysed, IA unavailable) — the event still publishes (with
+// whatever candidates are given, possibly none), so the actionitem listener's guard
+// aditivo runs even on a degraded re-run. logActivity=true also appends a
+// process_activity_log row (INTIMATION_ANALYSIS_COMPLETED) in the same tx — a failure to
+// log is LOG-NOT-FAIL: it never rolls back the analysis, which already committed.
+func (s *pgAnaliseStore) SaveAnalise(ctx context.Context, p SaveAnaliseParams) error {
+	tid, err := uuid.Parse(p.TenantID)
 	if err != nil {
 		return apperr.NewInvalid("tenant id inválido")
 	}
-	iid, err := uuid.Parse(intimationID)
+	iid, err := uuid.Parse(p.IntimationID)
 	if err != nil {
 		return apperr.NewInvalid("id de intimação inválido")
-	}
-	if len(providencias) == 0 {
-		providencias = []byte("[]")
 	}
 
 	// The column is text NULL; an empty summary is stored as "" (not NULL) so ai_analyzed_at
 	// being set is the sole "analysed" signal — degraded and rich analyses both stamp it.
-	sum := summary
+	sum := p.Summary
 
-	return s.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+	return s.uow.Do(ctx, p.TenantID, func(tx database.Tx) error {
 		courtRecordID, err := acquisitiondb.New(tx).SetIntimationAIAnalysis(ctx, acquisitiondb.SetIntimationAIAnalysisParams{
-			AiSummary:      &sum,
-			AiProvidencias: providencias,
-			ID:             iid,
-			TenantID:       tid,
+			AiSummary: &sum,
+			ID:        iid,
+			TenantID:  tid,
 		})
 		if err != nil {
 			return database.WrapInfra(err)
 		}
 
-		if !logActivity {
+		ev := newIntimationAnalyzed(p.TenantID, p.IntimationID, courtRecordID.String(), p.DeadlineID, p.Providencias)
+		if err := s.outbox.Publish(ctx, tx, ev); err != nil {
+			return err
+		}
+
+		if !p.LogActivity {
 			return nil
 		}
-		payload, err := json.Marshal(activityIntimationAnalysisPayload{IntimationID: intimationID})
+		payload, err := json.Marshal(activityIntimationAnalysisPayload{IntimationID: p.IntimationID})
 		if err != nil {
 			payload = []byte("{}")
 		}

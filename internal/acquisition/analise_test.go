@@ -49,22 +49,14 @@ func (f *fakeAnaliseGen) GenerateJSONStream(_ context.Context, req llm.Request, 
 
 // fakeAnaliseStore records the persisted analysis and can be told to fail.
 type fakeAnaliseStore struct {
-	calls          int
-	gotTenantID    string
-	gotIntimID     string
-	gotSummary     string
-	gotProvJSON    []byte
-	gotLogActivity bool
-	err            error
+	calls    int
+	gotParam SaveAnaliseParams
+	err      error
 }
 
-func (f *fakeAnaliseStore) SaveAnalise(_ context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error {
+func (f *fakeAnaliseStore) SaveAnalise(_ context.Context, p SaveAnaliseParams) error {
 	f.calls++
-	f.gotTenantID = tenantID
-	f.gotIntimID = intimationID
-	f.gotSummary = summary
-	f.gotProvJSON = providencias
-	f.gotLogActivity = logActivity
+	f.gotParam = p
 	return f.err
 }
 
@@ -80,12 +72,24 @@ func analiseCtx() IntimacaoAnaliseCtx {
 	}
 }
 
+// providenciaJSON builds one schema-shaped providência item; opts overrides individual
+// fields onto sane defaults so each test only spells out what it cares about.
+func providenciaJSON(fields string) string {
+	base := `{"title":"t","description":"d","suggested_assignee_user_id":null,"due_date":null,` +
+		`"tipo":"contestar","gera_peca":true,"piece_profile_key":"contestacao","declarado":true,"confianca":null}`
+	if fields == "" {
+		return base
+	}
+	return strings.TrimSuffix(base, "}") + "," + fields + "}"
+}
+
 // Happy path: the generator returns schema-constrained JSON; it parses into the view and
-// the store persists the summary + providências.
+// the store persists the summary + providência candidates.
 func TestAnalisar_HappyPath_ParsesAndPersists(t *testing.T) {
 	t.Parallel()
 
-	gen := &fakeAnaliseGen{out: []byte(`{"summary":"A ré foi intimada para contestar em 15 dias.","providencias":[{"title":"Protocolar contestação","description":"Elaborar e protocolar a contestação dentro do prazo legal."}]}`)}
+	gen := &fakeAnaliseGen{out: []byte(`{"summary":"A ré foi intimada para contestar em 15 dias.","providencias":[` +
+		providenciaJSON("") + `]}`)}
 	store := &fakeAnaliseStore{}
 	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store, "")
 
@@ -112,24 +116,20 @@ func TestAnalisar_HappyPath_ParsesAndPersists(t *testing.T) {
 	if store.calls != 1 {
 		t.Fatalf("store calls = %d, want 1", store.calls)
 	}
-	if store.gotTenantID != "t" || store.gotIntimID != "i" {
-		t.Errorf("store ids = {%q, %q}, want {t, i}", store.gotTenantID, store.gotIntimID)
+	if store.gotParam.TenantID != "t" || store.gotParam.IntimationID != "i" {
+		t.Errorf("store ids = {%q, %q}, want {t, i}", store.gotParam.TenantID, store.gotParam.IntimationID)
 	}
-	if !store.gotLogActivity {
+	if !store.gotParam.LogActivity {
 		t.Error("logActivity = false, want true on the success path (INTIMATION_ANALYSIS_COMPLETED)")
 	}
-	// The persisted providências must be the parsed+sanitized list, as JSON.
-	var persisted []IntimacaoProvidenciaView
-	if err := json.Unmarshal(store.gotProvJSON, &persisted); err != nil {
-		t.Fatalf("persisted providencias not valid JSON: %v", err)
-	}
-	if len(persisted) != 1 {
-		t.Errorf("persisted providencias = %d, want 1", len(persisted))
+	if len(store.gotParam.Providencias) != 1 {
+		t.Errorf("persisted providencias = %d, want 1", len(store.gotParam.Providencias))
 	}
 }
 
 // Degraded (nil generator): no LLM call, persists+returns an empty analysis with a fresh
-// analyzed_at (the FE moves to pós-análise and shows "IA indisponível").
+// analyzed_at (the FE moves to pós-análise and shows "IA indisponível"). The event still
+// publishes (empty candidates) so the actionitem listener's guard aditivo runs.
 func TestAnalisar_NilGenerator_PersistsDegraded(t *testing.T) {
 	t.Parallel()
 
@@ -149,10 +149,11 @@ func TestAnalisar_NilGenerator_PersistsDegraded(t *testing.T) {
 	if view.AnalyzedAt.IsZero() {
 		t.Error("analyzed_at = zero, want now (degraded is still 'analysed')")
 	}
-	if store.calls != 1 || store.gotSummary != "" || string(store.gotProvJSON) != "[]" {
-		t.Errorf("degraded persist = {calls:%d, summary:%q, prov:%s}, want {1, \"\", []}", store.calls, store.gotSummary, store.gotProvJSON)
+	if store.calls != 1 || store.gotParam.Summary != "" || len(store.gotParam.Providencias) != 0 {
+		t.Errorf("degraded persist = {calls:%d, summary:%q, prov:%v}, want {1, \"\", []}",
+			store.calls, store.gotParam.Summary, store.gotParam.Providencias)
 	}
-	if store.gotLogActivity {
+	if store.gotParam.LogActivity {
 		t.Error("logActivity = true, want false on the degraded path (no LLM configured)")
 	}
 
@@ -185,7 +186,7 @@ func TestAnalisar_LLMFault_Degrades(t *testing.T) {
 	if store.calls != 1 {
 		t.Errorf("store calls = %d, want 1 (degraded still persists)", store.calls)
 	}
-	if store.gotLogActivity {
+	if store.gotParam.LogActivity {
 		t.Error("logActivity = true, want false on the degraded path (LLM fault)")
 	}
 }
@@ -205,7 +206,7 @@ func TestAnalisar_MalformedJSON_Degrades(t *testing.T) {
 	if view.Summary != "" || len(view.Providencias) != 0 {
 		t.Errorf("view = %#v, want the degraded empty analysis", view)
 	}
-	if store.gotLogActivity {
+	if store.gotParam.LogActivity {
 		t.Error("logActivity = true, want false on the degraded path (parse fault)")
 	}
 }
@@ -214,16 +215,13 @@ func TestAnalisar_MalformedJSON_Degrades(t *testing.T) {
 func TestAnalisar_CapsProvidencias(t *testing.T) {
 	t.Parallel()
 
-	items := make([]IntimacaoProvidenciaView, maxProvidencias+5)
+	items := make([]string, maxProvidencias+5)
 	for i := range items {
-		items[i] = IntimacaoProvidenciaView{Title: "t", Description: "d"}
+		items[i] = providenciaJSON("")
 	}
-	payload, _ := json.Marshal(struct {
-		Summary      string                     `json:"summary"`
-		Providencias []IntimacaoProvidenciaView `json:"providencias"`
-	}{Summary: "s", Providencias: items})
+	payload := `{"summary":"s","providencias":[` + strings.Join(items, ",") + `]}`
 
-	gen := &fakeAnaliseGen{out: payload}
+	gen := &fakeAnaliseGen{out: []byte(payload)}
 	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, nil, "")
 
 	view, err := uc.Analisar(context.Background(), "t", "i")
@@ -252,9 +250,9 @@ func TestAnalisar_StoreFault_KeepsFreshAnswer(t *testing.T) {
 	}
 }
 
-// Every generated providência is server-stamped SUGGESTED, a valid suggested_assignee_user_id
-// (matching a real member) is kept + its name resolved, and a due_date ≤ the prazo end_date is
-// kept. This is the enriched shape the FE renders on the analysis card.
+// Every generated providência resolves a valid suggested_assignee_user_id (matching a real
+// member) and its name, and keeps a due_date ≤ the prazo end_date. This is the enriched
+// shape the FE renders on the analysis card.
 func TestAnalisar_EnrichesProvidencias(t *testing.T) {
 	t.Parallel()
 
@@ -263,7 +261,8 @@ func TestAnalisar_EnrichesProvidencias(t *testing.T) {
 	ctx.Members = []MemberCtx{{UserID: "u-luan", Name: "Luan"}, {UserID: "u-ana", Name: "Ana"}}
 
 	gen := &fakeAnaliseGen{out: []byte(`{"summary":"s","providencias":[
-		{"title":"Redigir defesa (art. 919, CPC)","description":"d","suggested_assignee_user_id":"u-ana","due_date":"2026-08-25"}
+		{"title":"Redigir defesa (art. 919, CPC)","description":"d","suggested_assignee_user_id":"u-ana","due_date":"2026-08-25",
+		 "tipo":"contestar","gera_peca":true,"piece_profile_key":"contestacao","declarado":true,"confianca":null}
 	]}`)}
 	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: ctx}, advisory.NewTemplateComposer(), gen, nil, "")
 
@@ -272,9 +271,6 @@ func TestAnalisar_EnrichesProvidencias(t *testing.T) {
 		t.Fatalf("err = %v, want nil", err)
 	}
 	p := view.Providencias[0]
-	if p.Status != ProvidenciaStatusSuggested {
-		t.Errorf("status = %q, want SUGGESTED", p.Status)
-	}
 	if p.SuggestedAssigneeUserID == nil || *p.SuggestedAssigneeUserID != "u-ana" {
 		t.Errorf("assignee id = %v, want u-ana", p.SuggestedAssigneeUserID)
 	}
@@ -296,7 +292,8 @@ func TestAnalisar_RejectsBadAssigneeAndLateDueDate(t *testing.T) {
 	ctx.Members = []MemberCtx{{UserID: "u-luan", Name: "Luan"}}
 
 	gen := &fakeAnaliseGen{out: []byte(`{"summary":"s","providencias":[
-		{"title":"t","description":"d","suggested_assignee_user_id":"u-ghost","due_date":"2026-09-15"}
+		{"title":"t","description":"d","suggested_assignee_user_id":"u-ghost","due_date":"2026-09-15",
+		 "tipo":"ciencia","gera_peca":false,"piece_profile_key":null,"declarado":false,"confianca":0.4}
 	]}`)}
 	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: ctx}, advisory.NewTemplateComposer(), gen, nil, "")
 
@@ -311,8 +308,66 @@ func TestAnalisar_RejectsBadAssigneeAndLateDueDate(t *testing.T) {
 	if p.DueDate != nil {
 		t.Errorf("due_date = %v, want nil (after end_date rejected)", *p.DueDate)
 	}
-	if p.Status != ProvidenciaStatusSuggested {
-		t.Errorf("status = %q, want SUGGESTED", p.Status)
+}
+
+// A teor declarado carries no confidence score, even if the model attaches one — the
+// classification is a fact from the text, not an inference (docs §3).
+func TestAnalisar_DeclaradoDropsConfianca(t *testing.T) {
+	t.Parallel()
+
+	gen := &fakeAnaliseGen{out: []byte(`{"summary":"s","providencias":[
+		{"title":"t","description":"d","suggested_assignee_user_id":null,"due_date":null,
+		 "tipo":"contestar","gera_peca":true,"piece_profile_key":"contestacao","declarado":true,"confianca":0.9}
+	]}`)}
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, nil, "")
+
+	view, err := uc.Analisar(context.Background(), "t", "i")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	p := view.Providencias[0]
+	if !p.Declarado {
+		t.Error("declarado = false, want true")
+	}
+	if p.Confianca != nil {
+		t.Errorf("confianca = %v, want nil on a declarado item", *p.Confianca)
+	}
+	if p.Tipo != "contestar" || !p.GeraPeca || p.PieceProfileKey == nil || *p.PieceProfileKey != "contestacao" {
+		t.Errorf("classification = %+v, want {contestar, true, contestacao}", p)
+	}
+}
+
+// An IA-inferred (não declarado) providência keeps its confidence score, normalized
+// (trimmed/lowercased) tipo, and its candidates are exactly what reaches the event —
+// verified via the store's recorded ProvidenciaCandidate (candidatesFromView's contract).
+func TestAnalisar_InferidoKeepsConfiancaAndNarrowsEventPayload(t *testing.T) {
+	t.Parallel()
+
+	gen := &fakeAnaliseGen{out: []byte(`{"summary":"s","providencias":[
+		{"title":"t","description":"d","suggested_assignee_user_id":null,"due_date":null,
+		 "tipo":"  Manifestar  ","gera_peca":false,"piece_profile_key":null,"declarado":false,"confianca":0.62}
+	]}`)}
+	store := &fakeAnaliseStore{}
+	uc := NewAnaliseUseCase(fakeAnaliseReader{ctx: analiseCtx()}, advisory.NewTemplateComposer(), gen, store, "")
+
+	view, err := uc.Analisar(context.Background(), "t", "i")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	p := view.Providencias[0]
+	if p.Tipo != "manifestar" {
+		t.Errorf("tipo = %q, want normalized %q", p.Tipo, "manifestar")
+	}
+	if p.Confianca == nil || *p.Confianca != 0.62 {
+		t.Errorf("confianca = %v, want 0.62", p.Confianca)
+	}
+
+	if len(store.gotParam.Providencias) != 1 {
+		t.Fatalf("event candidates = %d, want 1", len(store.gotParam.Providencias))
+	}
+	c := store.gotParam.Providencias[0]
+	if c.Tipo != "manifestar" || c.GeraPeca || c.PieceProfileKey != nil || c.Declarado || c.Confianca == nil || *c.Confianca != 0.62 {
+		t.Errorf("event candidate = %+v, want {manifestar, false, nil, false, 0.62}", c)
 	}
 }
 

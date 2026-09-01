@@ -195,7 +195,9 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        -- detail pra alimentar a linha "Distribuição" da barra rica.
        cr.filed_at AS distribution_date,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
-       i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
+       -- ai_providencias NÃO é mais lida aqui (0078) — as providências materializadas
+       -- vivem em action_item; ver ListActionItemsByIntimation abaixo.
+       i.ai_summary, i.ai_analyzed_at,
        -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
        i.assignee_user_id,
        ua.name                                                                     AS assignee_user_name,
@@ -216,6 +218,19 @@ LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua  ON ua.id = i.assignee_user_id
 LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
 WHERE i.id = $1 AND i.tenant_id = $2;
+
+-- name: ListActionItemsByIntimation :many
+-- Cross-slice READ (SQL only, no Go import of internal/actionitem — same pattern as the
+-- LEFT JOIN deadline above, and ListProcessos'/GetProcesso's LATERAL deadline join): the
+-- providências derived from this intimação's last "Analisar" run, materialized as real
+-- action_item rows by the actionitem slice's listener (acquisition.intimation.analyzed
+-- consumer). Ordered by created_at so the analysis card renders in materialization order.
+-- Scoped by tenant_id (barrier 1).
+SELECT id, tipo, gera_peca, piece_profile_key, tipo_origem, tipo_status, confianca,
+       status, task_id, deadline_id
+FROM action_item
+WHERE tenant_id = $1 AND intimation_id = $2
+ORDER BY created_at ASC;
 
 -- name: CountProcessosFiltered :one
 -- The filtered "X" of the processes screen's "X de Y" counter: how many court records

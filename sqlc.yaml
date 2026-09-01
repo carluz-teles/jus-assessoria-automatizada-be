@@ -195,6 +195,78 @@ sql:
               import: "github.com/google/uuid"
               type: "UUID"
 
+  # ── pieceprofile (Tipos de Peça — catálogo): piece_profile + section + version ─
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/pieceprofile/queries"
+    gen:
+      go:
+        package: "pieceprofiledb"
+        out: "internal/pieceprofile/pieceprofiledb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
+  # ── compliancerule (regras de conformidade + vínculo perfil/seção) ──────────
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/compliancerule/queries"
+    gen:
+      go:
+        package: "complianceruledb"
+        out: "internal/compliancerule/complianceruledb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
+  # ── thesis (contrato tese↔peça: anchors + segmentos + cobertura) ────────────
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/thesis/queries"
+    gen:
+      go:
+        package: "thesisdb"
+        out: "internal/thesis/thesisdb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
+  # ── actionitem (Providência: costura intimação→providência→tarefa→peça) ────
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/actionitem/queries"
+    gen:
+      go:
+        package: "actionitemdb"
+        out: "internal/actionitem/actionitemdb"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+
   # Bloco-modelo (copiar ao criar o próximo slice):
   # - engine: "postgresql"
   #   schema: "migrations"

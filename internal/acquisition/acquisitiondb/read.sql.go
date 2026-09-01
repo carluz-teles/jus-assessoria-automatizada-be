@@ -286,7 +286,9 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        -- detail pra alimentar a linha "Distribuição" da barra rica.
        cr.filed_at AS distribution_date,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
-       i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
+       -- ai_providencias NÃO é mais lida aqui (0078) — as providências materializadas
+       -- vivem em action_item; ver ListActionItemsByIntimation abaixo.
+       i.ai_summary, i.ai_analyzed_at,
        -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
        i.assignee_user_id,
        ua.name                                                                     AS assignee_user_name,
@@ -337,7 +339,6 @@ type GetIntimacaoRow struct {
 	Defendants           []string           `json:"defendants"`
 	DistributionDate     pgtype.Date        `json:"distribution_date"`
 	AiSummary            *string            `json:"ai_summary"`
-	AiProvidencias       []byte             `json:"ai_providencias"`
 	AiAnalyzedAt         pgtype.Timestamptz `json:"ai_analyzed_at"`
 	AssigneeUserID       pgtype.UUID        `json:"assignee_user_id"`
 	AssigneeUserName     *string            `json:"assignee_user_name"`
@@ -393,7 +394,6 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 		&i.Defendants,
 		&i.DistributionDate,
 		&i.AiSummary,
-		&i.AiProvidencias,
 		&i.AiAnalyzedAt,
 		&i.AssigneeUserID,
 		&i.AssigneeUserName,
@@ -556,6 +556,69 @@ func (q *Queries) GetReconciliation(ctx context.Context, arg GetReconciliationPa
 		&i.FinishedAt,
 	)
 	return i, err
+}
+
+const listActionItemsByIntimation = `-- name: ListActionItemsByIntimation :many
+SELECT id, tipo, gera_peca, piece_profile_key, tipo_origem, tipo_status, confianca,
+       status, task_id, deadline_id
+FROM action_item
+WHERE tenant_id = $1 AND intimation_id = $2
+ORDER BY created_at ASC
+`
+
+type ListActionItemsByIntimationParams struct {
+	TenantID     uuid.UUID `json:"tenant_id"`
+	IntimationID uuid.UUID `json:"intimation_id"`
+}
+
+type ListActionItemsByIntimationRow struct {
+	ID              uuid.UUID   `json:"id"`
+	Tipo            string      `json:"tipo"`
+	GeraPeca        bool        `json:"gera_peca"`
+	PieceProfileKey *string     `json:"piece_profile_key"`
+	TipoOrigem      string      `json:"tipo_origem"`
+	TipoStatus      string      `json:"tipo_status"`
+	Confianca       *float64    `json:"confianca"`
+	Status          string      `json:"status"`
+	TaskID          pgtype.UUID `json:"task_id"`
+	DeadlineID      pgtype.UUID `json:"deadline_id"`
+}
+
+// Cross-slice READ (SQL only, no Go import of internal/actionitem — same pattern as the
+// LEFT JOIN deadline above, and ListProcessos'/GetProcesso's LATERAL deadline join): the
+// providências derived from this intimação's last "Analisar" run, materialized as real
+// action_item rows by the actionitem slice's listener (acquisition.intimation.analyzed
+// consumer). Ordered by created_at so the analysis card renders in materialization order.
+// Scoped by tenant_id (barrier 1).
+func (q *Queries) ListActionItemsByIntimation(ctx context.Context, arg ListActionItemsByIntimationParams) ([]ListActionItemsByIntimationRow, error) {
+	rows, err := q.db.Query(ctx, listActionItemsByIntimation, arg.TenantID, arg.IntimationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListActionItemsByIntimationRow
+	for rows.Next() {
+		var i ListActionItemsByIntimationRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Tipo,
+			&i.GeraPeca,
+			&i.PieceProfileKey,
+			&i.TipoOrigem,
+			&i.TipoStatus,
+			&i.Confianca,
+			&i.Status,
+			&i.TaskID,
+			&i.DeadlineID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listAndamentosByProcesso = `-- name: ListAndamentosByProcesso :many

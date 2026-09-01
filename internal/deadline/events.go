@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/actionitem"
 	"github.com/jusassessoria/platform/lib/events"
 )
 
@@ -79,6 +80,39 @@ type DocketEntryObserved struct {
 	events.Base
 	TenantID      string `json:"tenant_id"`
 	CourtRecordID string `json:"court_record_id"`
+}
+
+// TypeActionItemCreated/TypeActionItemConfirmed are the two dotted ids this slice CONSUMES
+// from actionitem (docs/erd-costura-providencia-tarefa-peca.md §2/§3/§6, fatia 3, "Listener-
+// driven"): both fire once a providência's tipo turns confiável — a declarado/manual item is
+// born ready (created); an ia-inferred one only turns confiável when the lawyer confirms it
+// (confirmed). Either way the downstream effect is the SAME: create the task right away.
+// Only the consts cross the boundary from actionitem (the producer); the payload SHAPE is
+// redefined LOCALLY as ActionItemFact below, so this slice never imports actionitem's event
+// struct or its ActionItem entity/repo. A contract round-trip test (actionitem_task_test.go)
+// marshals the producer's struct and unmarshals it here, guarding against silent field drift.
+const (
+	TypeActionItemCreated   = actionitem.TypeActionItemCreated
+	TypeActionItemConfirmed = actionitem.TypeActionItemConfirmed
+)
+
+// ActionItemFact is the LOCAL decode shape shared by actionitem.created AND
+// actionitem.confirmed — both events carry the IDENTICAL payload shape on the producer side
+// (actionitem's actionItemEventPayload), so one local struct decodes either. PieceProfileKey/
+// DeadlineID ride as pointers so an absent value round-trips as JSON null, not "" (mirrors
+// acquisition's ProvidenciaCandidate). The payload does NOT carry court_record_id (never part
+// of that frozen contract) — GetActionItemCourtRecordID reads it directly off the action_item
+// table instead (decisão P1, mirroring GetCourtRecordClass). Base yields the event id for
+// dedup.
+type ActionItemFact struct {
+	events.Base
+	ActionItemID    string  `json:"action_item_id"`
+	TenantID        string  `json:"tenant_id"`
+	IntimationID    string  `json:"intimation_id"`
+	Tipo            string  `json:"tipo"`
+	GeraPeca        bool    `json:"gera_peca"`
+	PieceProfileKey *string `json:"piece_profile_key"`
+	DeadlineID      *string `json:"deadline_id"`
 }
 
 // TypeDeadlineOpened is the dotted id this slice PRODUCES when a prazo is derived. Its
@@ -470,16 +504,23 @@ const TypeTaskCreated = "task.created"
 // deadline.* facts which order by the deadline id.
 const aggregateTypeTask = "task"
 
-// TaskCreated announces one freshly created action item. DueDate is the wire date
-// (2006-01-02), omitted when the task has none; AssigneeUserID is omitted when unassigned.
-// The aggregate is the task, so its stream orders by the task id.
+// TaskCreated announces one freshly created action item. TenantID lets internal/actionitem's
+// task.created listener (fatia 3) scope its own RLS-bound tx without a re-read; DueDate is the
+// wire date (2006-01-02), omitted when the task has none; AssigneeUserID is omitted when
+// unassigned. ActionItemID is omitted for a manual/avulsa task (POST /v1/tasks) and set ONLY
+// when the task was born automatically from a confiável providência (docs/erd-costura-
+// providencia-tarefa-peca.md §2/§6, fatia 3) — that is the field actionitem's listener filters
+// on to write its own reverse pointer. The aggregate is the task, so its stream orders by the
+// task id.
 type TaskCreated struct {
 	events.Base
 	TaskID         string `json:"task_id"`
+	TenantID       string `json:"tenant_id"`
 	DeadlineID     string `json:"deadline_id"`
 	CourtRecordID  string `json:"court_record_id"`
 	DueDate        string `json:"due_date,omitempty"`
 	AssigneeUserID string `json:"assignee_user_id,omitempty"`
+	ActionItemID   string `json:"action_item_id,omitempty"`
 }
 
 var _ events.Event = TaskCreated{}
@@ -487,26 +528,24 @@ var _ events.Event = TaskCreated{}
 func (TaskCreated) Type() string          { return TypeTaskCreated }
 func (TaskCreated) AggregateType() string { return aggregateTypeTask }
 
-// newTaskCreatedFromTask builds the produced event from a persisted *Task — the CREATE path
-// (POST /v1/tasks). Tasks are created only there now (the F2 confirm no longer creates them),
-// so this is the single construction site for task.created.
+// newTaskCreatedFromTask builds the produced event from a persisted *Task — REUSED by both the
+// manual CREATE path (POST /v1/tasks, ActionItemID empty) and the automatic path a confirmed
+// providência drives (fatia 3, ActionItemID set): one construction site for task.created,
+// never two parallel builders. aggregate_id is the task id (a uuid, satisfying the outbox's
+// uuid NOT NULL); the event id is a fresh uuid v7 (the consumer dedup key). DueDate is
+// formatted only when set, so an undated task emits no date.
 func newTaskCreatedFromTask(t *Task) TaskCreated {
-	return taskCreatedEvent(t.ID, t.DeadlineID, t.CourtRecordID, t.AssigneeUserID, t.DueDate)
-}
-
-// taskCreatedEvent is the shared builder for task.created. aggregate_id is the task id (a
-// uuid, satisfying the outbox's uuid NOT NULL); the event id is a fresh uuid v7 (the consumer
-// dedup key). DueDate is formatted only when set, so an undated task emits no date.
-func taskCreatedEvent(taskID, deadlineID, courtRecordID, assignee string, due *time.Time) TaskCreated {
 	ev := TaskCreated{
-		Base:           events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: taskID},
-		TaskID:         taskID,
-		DeadlineID:     deadlineID,
-		CourtRecordID:  courtRecordID,
-		AssigneeUserID: assignee,
+		Base:           events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: t.ID},
+		TaskID:         t.ID,
+		TenantID:       t.TenantID,
+		DeadlineID:     t.DeadlineID,
+		CourtRecordID:  t.CourtRecordID,
+		AssigneeUserID: t.AssigneeUserID,
+		ActionItemID:   t.ActionItemID,
 	}
-	if due != nil {
-		ev.DueDate = due.Format(time.DateOnly)
+	if t.DueDate != nil {
+		ev.DueDate = t.DueDate.Format(time.DateOnly)
 	}
 	return ev
 }

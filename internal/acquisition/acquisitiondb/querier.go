@@ -307,17 +307,18 @@ type Querier interface {
 	GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error)
 	// analise.sql — queries for the AI analysis of one intimation (POST /v1/intimacoes/:id/analise).
 	// GetIntimacaoAnaliseContext reads the teor + the court context the prompt needs; the write
-	// query OVERWRITES the three ai_* columns (re-executable — "Gerar novamente" re-runs it).
+	// query OVERWRITES the ai_summary/ai_analyzed_at columns (re-executable — "Gerar novamente"
+	// re-runs it). The providências themselves are NO LONGER persisted here as jsonb — Analisar
+	// publishes acquisition.intimation.analyzed instead, and the actionitem slice's listener
+	// materializes real action_item rows from it (docs/erd-costura-providencia-tarefa-peca.md).
 	// One intimation's teor plus its court record's identification and the derived prazo end_date
 	// (LEFT JOIN deadline on notification_id — NULL when no prazo yet; the IA uses it as the ceiling
-	// for suggested due_dates). Scoped by tenant_id + intimation id (barrier 1). A miss/foreign row →
-	// pgx.ErrNoRows → ErrIntimationNotFound (the same 404 semantics as GetIntimacao). type is nullable.
+	// for suggested due_dates). court_record_id/deadline_id are carried through so the caller can
+	// stamp them onto the acquisition.intimation.analyzed event without a second round-trip — the
+	// actionitem slice's materialized action_item rows need both. Scoped by tenant_id + intimation
+	// id (barrier 1). A miss/foreign row → pgx.ErrNoRows → ErrIntimationNotFound (the same 404
+	// semantics as GetIntimacao). type is nullable.
 	GetIntimacaoAnaliseContext(ctx context.Context, arg GetIntimacaoAnaliseContextParams) (GetIntimacaoAnaliseContextRow, error)
-	// Reads the ai_providencias jsonb + ai_analyzed_at of one intimation, locking the row
-	// (FOR UPDATE) so an aprovar/descartar read-modify-write is serialized. NULL ai_analyzed_at
-	// (never analysed) vs a set stamp lets the use case reject a status change on an un-analysed
-	// intimation. Scoped by tenant_id (barrier 1); a miss/foreign row → pgx.ErrNoRows.
-	GetIntimationProvidenciasForUpdate(ctx context.Context, arg GetIntimationProvidenciasForUpdateParams) (GetIntimationProvidenciasForUpdateRow, error)
 	// The tenant's most recent backfill job — status + tallies — for the import-status
 	// read (the FE banner "importando seus processos…"). Newest job wins (a re-activation
 	// opens a new job). No job ever → no row; the read use case maps that to NONE (not
@@ -475,6 +476,13 @@ type Querier interface {
 	// toggle re-enable path — see SyncRequested.CatchUpOABKey); NULL for every other
 	// run (daily, backfill-windowed, scheduler), which have no single OAB to attribute.
 	InsertSyncRun(ctx context.Context, arg InsertSyncRunParams) (uuid.UUID, error)
+	// Cross-slice READ (SQL only, no Go import of internal/actionitem — same pattern as the
+	// LEFT JOIN deadline above, and ListProcessos'/GetProcesso's LATERAL deadline join): the
+	// providências derived from this intimação's last "Analisar" run, materialized as real
+	// action_item rows by the actionitem slice's listener (acquisition.intimation.analyzed
+	// consumer). Ordered by created_at so the analysis card renders in materialization order.
+	// Scoped by tenant_id (barrier 1).
+	ListActionItemsByIntimation(ctx context.Context, arg ListActionItemsByIntimationParams) ([]ListActionItemsByIntimationRow, error)
 	// The tenant's ACTIVE firm members (internal app_user id + name) — the assignable responsáveis
 	// the analyze_intimation prompt lists so the IA suggests a real assignee. Same join as identity's
 	// ListOrgMembers (membership status ACTIVE), projected to just id+name; ordered by name for a
@@ -682,15 +690,12 @@ type Querier interface {
 	// the write idempotent at the DB layer — a race between two first-opens updates 0
 	// rows on the loser, which is NOT an error (write-once by design).
 	SetCourtRecordAIResume(ctx context.Context, arg SetCourtRecordAIResumeParams) error
-	// Persists (OVERWRITES) the AI analysis of one intimation. Unlike SetCourtRecordAIResume
-	// there is NO write-once guard — the analysis is re-executable ("Gerar novamente"). Scoped
-	// by tenant_id (barrier 1). Degraded mode passes ai_summary='' + ai_providencias='[]'.
+	// Persists (OVERWRITES) the AI analysis of one intimation's ai_summary/ai_analyzed_at. Unlike
+	// SetCourtRecordAIResume there is NO write-once guard — the analysis is re-executable ("Gerar
+	// novamente"). Scoped by tenant_id (barrier 1). Degraded mode passes ai_summary=''.
 	// RETURNING court_record_id so the caller can log a process_activity_log row in the SAME
 	// tx, without a second round-trip to look up the owning court record.
 	SetIntimationAIAnalysis(ctx context.Context, arg SetIntimationAIAnalysisParams) (uuid.UUID, error)
-	// Overwrites ONLY the ai_providencias jsonb (leaves ai_summary / ai_analyzed_at untouched) —
-	// the write half of the aprovar/descartar status flip. Scoped by tenant_id (barrier 1).
-	SetIntimationProvidencias(ctx context.Context, arg SetIntimationProvidenciasParams) error
 	// triagem da intimação — the write path for POST /v1/intimacoes/:id/{resolve,
 	// ignore,reopen}. The user drives the intimation's workflow state (user_status,
 	// 0030), SEPARATE from the DJEN cancellation `status`. Runs inside the caller's tx

@@ -8,8 +8,10 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/jusassessoria/platform/internal/acquisition"
+	"github.com/jusassessoria/platform/internal/actionitem"
 	"github.com/jusassessoria/platform/internal/billing"
 	"github.com/jusassessoria/platform/internal/certificate"
+	"github.com/jusassessoria/platform/internal/compliancerule"
 	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/internal/document"
 	"github.com/jusassessoria/platform/internal/draft"
@@ -17,6 +19,8 @@ import (
 	"github.com/jusassessoria/platform/internal/lookup"
 	"github.com/jusassessoria/platform/internal/notifications"
 	"github.com/jusassessoria/platform/internal/onboarding"
+	"github.com/jusassessoria/platform/internal/pieceprofile"
+	"github.com/jusassessoria/platform/internal/thesis"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/httpx/middleware"
 	"github.com/jusassessoria/platform/lib/vault"
@@ -60,6 +64,10 @@ type routerDeps struct {
 	lookup               *lookup.Handler
 	certificate          *certificate.Handler
 	onboarding           *onboarding.Handler
+	pieceprofile         *pieceprofile.Handler
+	compliancerule       *compliancerule.Handler
+	thesis               *thesis.Handler
+	actionitem           *actionitem.Handler
 	// vault is the optional envelope-encryption adapter (lib/vault). It is nil
 	// when VAULT_KEK_BASE64 is unset. S1 carries it here so S2 (court_connection
 	// credential wiring) can extend routerDeps without touching main.go's boot
@@ -255,6 +263,33 @@ func newRouter(deps routerDeps) *fiber.App {
 	// case, like the others.
 	if deps.onboarding != nil {
 		deps.onboarding.Register(v1)
+	}
+
+	// pieceprofile owns its /v1/piece-profiles + reference-catalog routes (matters,
+	// base-skeletons, format-profiles) and mounts them via RegisterV1 — the api only
+	// composes. Nil-guarded like the others.
+	if deps.pieceprofile != nil {
+		deps.pieceprofile.RegisterV1(v1)
+	}
+
+	// compliancerule owns its /v1/compliance-rules routes and the /v1/piece-profiles/
+	// :key/(sections/:sectionId)/rules sub-resources — the api only composes.
+	// Nil-guarded.
+	if deps.compliancerule != nil {
+		deps.compliancerule.RegisterV1(v1)
+	}
+
+	// thesis owns its /v1/thesis routes (create, approve, discard, coverage) plus the
+	// /v1/pecas/:id/(theses|segments|coverage) sub-resources — the api only composes.
+	// Nil-guarded.
+	if deps.thesis != nil {
+		deps.thesis.RegisterV1(v1)
+	}
+
+	// actionitem owns its /v1/action-items/:id/(confirmar|descartar) routes — the api only
+	// composes. Nil-guarded like the others.
+	if deps.actionitem != nil {
+		deps.actionitem.RegisterV1(v1)
 	}
 
 	return app

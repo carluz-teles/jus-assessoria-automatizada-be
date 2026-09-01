@@ -113,6 +113,31 @@ func (q *Queries) DeleteTaskItem(ctx context.Context, arg DeleteTaskItemParams) 
 	return id, err
 }
 
+const getActionItemCourtRecordID = `-- name: GetActionItemCourtRecordID :one
+SELECT court_record_id
+FROM action_item
+WHERE id = $1 AND tenant_id = $2
+`
+
+type GetActionItemCourtRecordIDParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Reads ONLY action_item.court_record_id, scoped to tenantID (barrier 1) — the one cross-
+// table read the automatic task-creation path needs (fatia 3): actionitem.created/confirmed's
+// payload does not carry court_record_id (it was never part of that frozen contract), so this
+// mirrors GetCourtRecordClass's decisão P1 (read the table directly, never import the owning
+// slice's package) applied to action_item instead of court_record. court_record_id itself may
+// be NULL (mapped to ""); a missing/foreign action_item id is pgx.ErrNoRows → the typed
+// ErrActionItemNotFound at the mapper.
+func (q *Queries) GetActionItemCourtRecordID(ctx context.Context, arg GetActionItemCourtRecordIDParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getActionItemCourtRecordID, arg.ID, arg.TenantID)
+	var court_record_id pgtype.UUID
+	err := row.Scan(&court_record_id)
+	return court_record_id, err
+}
+
 const getCourtRecordClass = `-- name: GetCourtRecordClass :one
 
 SELECT class
@@ -678,11 +703,14 @@ func (q *Queries) InsertDeadline(ctx context.Context, arg InsertDeadlineParams) 
 const insertTask = `-- name: InsertTask :one
 INSERT INTO task (
     tenant_id, court_record_id, deadline_id, intimation_id,
-    title, description, kind, priority, due_date, status, source, assignee_user_id, created_by
+    title, description, kind, priority, due_date, status, source, assignee_user_id, created_by,
+    action_item_id
 ) VALUES (
     $1, $2, $3, $4,
-    $5, $6, $7, $8, $9, $10, $11, $12, $13
+    $5, $6, $7, $8, $9, $10, $11, $12, $13,
+    $14
 )
+ON CONFLICT (action_item_id) DO NOTHING
 RETURNING id
 `
 
@@ -700,14 +728,19 @@ type InsertTaskParams struct {
 	Source         string      `json:"source"`
 	AssigneeUserID pgtype.UUID `json:"assignee_user_id"`
 	CreatedBy      pgtype.UUID `json:"created_by"`
+	ActionItemID   pgtype.UUID `json:"action_item_id"`
 }
 
-// Persist one F2 action item (§4: 1 legal prazo → N tasks, gravadas na MESMA tx do
-// confirm). Born status='OPEN', source='MANUAL' (a human created it at confirmation —
-// AI-suggested tasks are a later slice). All FKs but tenant_id are nullable per the 0024
-// schema, but confirm always fills court_record_id/deadline_id/intimation_id/created_by
-// (the prazo's context); assignee_user_id/due_date/description/kind are optional. Returns
-// the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
+// Persist one task — the manual/F2 path (§4: 1 legal prazo → N tasks) OR the automatic path
+// a confirmed providência drives (fatia 3, docs/erd-costura-providencia-tarefa-peca.md §2/§6):
+// action_item_id is NULL for the former, set for the latter. Born status='OPEN'; source is
+// 'MANUAL' (a human created it) or 'RULE' (derived from a confiável action_item) — AI-suggested
+// tasks are a later slice. All FKs but tenant_id are nullable per the 0024/0079 schema.
+// Idempotent on the action_item path via ON CONFLICT (action_item_id) DO NOTHING (0079's
+// UNIQUE): a redelivered actionitem.created/confirmed yields NO row (RETURNING is empty),
+// which the mapper reads as "already created" instead of minting a second task. Multiple NULLs
+// are always distinct, so the manual/avulsa path (action_item_id always NULL) never conflicts.
+// Returns the DB-assigned id so task.created commits with it in the SAME tx. $1.. are the columns.
 func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertTask,
 		arg.TenantID,
@@ -723,6 +756,7 @@ func (q *Queries) InsertTask(ctx context.Context, arg InsertTaskParams) (uuid.UU
 		arg.Source,
 		arg.AssigneeUserID,
 		arg.CreatedBy,
+		arg.ActionItemID,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)

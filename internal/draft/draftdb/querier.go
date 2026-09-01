@@ -8,6 +8,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
@@ -31,6 +32,16 @@ type Querier interface {
 	// tenant via GetDraftByID(tenantID, draftID) earlier in the same tx. Do NOT "fix"
 	// this with a JOIN — the app-layer barrier is intentional (see 0044_review_status).
 	DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error
+	// Load the providência (action_item) context for the task-sourced Create flow
+	// (docs/erd-costura-providencia-tarefa-peca.md §3): task_id → the piece_profile_key
+	// the draft INHERITS (never re-chosen), plus intimation_id/case_id so the draft is
+	// populated the same way the source=intimation path is. Reads cross-slice directly —
+	// task and action_item are owned by other slices (deadline/actionitem) — via a plain
+	// JOIN, never a Go import; same pattern GetIntimationForDraft already uses for
+	// court_record. Filtered by task.id and task.tenant_id (barrier 1). A miss (unknown
+	// task, foreign tenant, or a task with no linked action_item — e.g. an avulsa task)
+	// → pgx.ErrNoRows → ErrTaskNotFound (→ 404).
+	GetActionItemForTask(ctx context.Context, arg GetActionItemForTaskParams) (GetActionItemForTaskRow, error)
 	// Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
 	// pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
 	GetActiveEsajCredential(ctx context.Context, arg GetActiveEsajCredentialParams) (GetActiveEsajCredentialRow, error)
@@ -71,6 +82,15 @@ type Querier interface {
 	// used by the idempotent POST path when the INSERT fails with 23505. Filters by
 	// tenant (barrier 1).
 	GetDraftByIntimationID(ctx context.Context, arg GetDraftByIntimationIDParams) (GetDraftByIntimationIDRow, error)
+	// Fetch the draft that already exists for the (tenant_id, task_id) pair — used by
+	// the idempotent POST path (task-sourced Create) when the INSERT hits the NEW
+	// draft_task_id_uidx (migration 0080). Filters by tenant (barrier 1).
+	//
+	// superseded_at IS NULL (fatia 5, migration 0081): only the VIGENTE draft counts as "the
+	// existing draft" for this task — once a providência is reclassified, the OLD draft is
+	// superseded (never deleted) and the idempotency guard must resolve to the NEW one, not
+	// get an arbitrary pick between two rows sharing the same task_id.
+	GetDraftByTaskID(ctx context.Context, arg GetDraftByTaskIDParams) (GetDraftByTaskIDRow, error)
 	// Read model for GET /v1/pecas/:id: a JOIN over draft, intimation (optional),
 	// court_record (via intimation), and deadline (via intimation 1:1 UNIQUE). All
 	// intimation/process/deadline columns are NULLable (a draft without an intimation
@@ -115,6 +135,15 @@ type Querier interface {
 	// Read cross-slice directly (same pattern as GetDraftDetail reading court_record
 	// and party without importing acquisition — see docs §5b.2).
 	GetProvidencesForIntimation(ctx context.Context, arg GetProvidencesForIntimationParams) ([]GetProvidencesForIntimationRow, error)
+	// Cross-slice read (action_item owned by internal/actionitem — no Go import, same pattern
+	// as GetActionItemForTask above): resolves the task bound to a providência so the reclassify
+	// listener (reclassify.go, fatia 5) knows which draft to supersede. actionitem.reclassified's
+	// payload carries only action_item_id (the FROZEN shape it shares with created/confirmed),
+	// so task_id is resolved here rather than widening that shared contract. Returns NULL
+	// task_id when the providência has no task yet (a providência reclassified before ever
+	// reaching the task stage) — the caller's mapper collapses that to "", a safe no-op signal,
+	// never an error.
+	GetTaskIDForActionItem(ctx context.Context, arg GetTaskIDForActionItemParams) (pgtype.UUID, error)
 	// ── Chat queries (Peticionamento Fatia 3b) ───────────────────────────────────
 	// Isolation: no tenant_id on chat_message — barrier 1 is enforced by the caller
 	// first tenant-guarding the draft (same pattern as review, documented in 0044 and 0045).
@@ -128,14 +157,22 @@ type Querier interface {
 	// never (nil, nil).
 	// Persist a new peça (DRAFT status, CREATED saga_state). Returns all columns so the
 	// handler renders the 201 response without a follow-up read. storage_key is NULL for
-	// Fatia 1 (content lives in the column, not in S3).
+	// Fatia 1 (content lives in the column, not in S3). task_id/piece_profile_key
+	// (migration 0080) are set only by the task-sourced Create flow; every other path
+	// leaves them NULL.
 	//
-	// ON CONFLICT DO NOTHING targets the partial unique index
-	// (tenant_id, intimation_id WHERE intimation_id IS NOT NULL). When the row already
-	// exists the RETURNING clause yields zero rows (pgx.ErrNoRows), which the repository
-	// maps to ErrDraftAlreadyExists so the use case can fetch the existing row for 200.
-	// This avoids a 23505 error that would abort the current transaction (25P02), making
-	// subsequent queries in the same tx impossible without a SAVEPOINT.
+	// ON CONFLICT DO NOTHING with NO target: since migration 0080 there are TWO partial
+	// unique indexes that can fire — draft_intimation_id_uidx (tenant_id, intimation_id
+	// WHERE intimation_id IS NOT NULL AND task_id IS NULL, the legacy path) and
+	// draft_task_id_uidx (tenant_id, task_id WHERE task_id IS NOT NULL, the task-sourced
+	// path). Omitting the conflict target is valid Postgres for DO NOTHING (unlike DO
+	// UPDATE) and absorbs a violation of EITHER — the repository cannot know in advance
+	// which one a given INSERT will hit. When the row already exists the RETURNING
+	// clause yields zero rows (pgx.ErrNoRows), mapped to ErrDraftAlreadyExists so the use
+	// case fetches the existing row for 200 (GetDraftByIntimationID or GetDraftByTaskID,
+	// picked by which field the caller supplied). This avoids a 23505 error that would
+	// abort the current transaction (25P02), making subsequent queries in the same tx
+	// impossible without a SAVEPOINT.
 	InsertDraft(ctx context.Context, arg InsertDraftParams) (InsertDraftRow, error)
 	// ── draft_attachment queries (Peticionamento Fatia 2) ────────────────────────
 	// All writes run inside the use case's transaction (RLS barrier 2 + explicit
@@ -162,6 +199,15 @@ type Querier interface {
 	// caller already tenant-guarded the draft before calling this). ON CONFLICT is absent
 	// (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
 	InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error)
+	// Backfills the OLD draft's superseded_by_draft_id once Create's task-sourced flow (fatia 4's
+	// populateFromTask path) mints the corrected draft (fatia 5's pointer chain: old → new). Runs
+	// in the SAME tx as InsertDraft. The CTE picks AT MOST ONE candidate (the most recently
+	// superseded pending-link row for this task) so the UPDATE can never touch more than the one
+	// row Create just replaced, even if — contrary to the expected invariant of one supersede per
+	// reclassify round — more than one pending-link row existed. Zero rows (no pending-link
+	// candidate — the common case, since most drafts are never reclassified) is a valid, silent
+	// no-op: mapped by the repo to (nil, nil), never an error.
+	LinkSupersededDraft(ctx context.Context, arg LinkSupersededDraftParams) (uuid.UUID, error)
 	// Paginated list of all peças for a tenant, ordered by (created_at DESC,
 	// id DESC). Filtros opcionais: piece_type, status, workflow_state (aguardando_assinatura),
 	// urgencia (atraso, hoje), assignee_id (d.created_by — o chip "Minhas"; NULL = todos os
@@ -213,6 +259,14 @@ type Querier interface {
 	// SignDraft porque também popula signed_pdf_key. Idempotente: re-assinar
 	// devolve nil (a UI trata via Idempot flag).
 	SignDraftWithPDF(ctx context.Context, arg SignDraftWithPDFParams) (SignDraftWithPDFRow, error)
+	// Marks the task's CURRENT vigente draft as superseded (fatia 5, docs §7 questão 4): the
+	// reclassify listener calls this when a providência's tipo/piece_profile_key changes after
+	// its peça may already exist. Guarded IN SQL (not just Go) by superseded_at IS NULL AND
+	// filed_at IS NULL — closes the race against a concurrent File call: a draft that reaches
+	// FILED between the use case's read and this UPDATE is never retroactively superseded (the
+	// protocolo already happened; freezing/re-deriving now would be wrong). Zero rows affected
+	// is a valid no-op — no vigente draft, already superseded, or already filed.
+	SupersedeDraftForTask(ctx context.Context, arg SupersedeDraftForTaskParams) error
 	// Change the category of an existing attachment, scoped to (id, draft_id, tenant_id).
 	// A no-match (wrong id, wrong draft, or foreign tenant) → pgx.ErrNoRows →
 	// ErrAttachmentNotFound (→ 404).

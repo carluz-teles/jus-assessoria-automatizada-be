@@ -47,6 +47,13 @@ type DraftDetailView struct {
 	// o cliente nunca vê o key cru. Vazio antes de assinar.
 	SignedPDFKey string
 
+	// SupersededAt/SupersededByDraftID (fatia 5, docs §7 questão 4): quando a
+	// providência de origem é reclassificada depois de a peça já existir, esta
+	// peça vira superseded e o FE deve mostrar "esta peça foi substituída — ver a
+	// nova" com um link pra SupersededByDraftID. nil/"" para toda peça vigente.
+	SupersededAt        *time.Time
+	SupersededByDraftID string
+
 	// Intimation is nil for blank/processo drafts.
 	Intimation *IntimationView
 	// Process is nil when no intimation (and therefore no court_record) is linked.
@@ -116,25 +123,27 @@ type DeadlineView struct {
 // yield NULLs for a blank/processo draft).
 func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 	view := &DraftDetailView{
-		ID:                r.ID.String(),
-		PieceType:         r.PieceType,
-		Title:             r.Title,
-		Content:           derefString(r.Content),
-		Status:            r.Status,
-		SagaState:         r.SagaState,
-		CreatedAt:         timestamptzToTime(r.CreatedAt),
-		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
-		StructuredContent: structuredContentFromJSON(r.StructuredContent),
-		ContentHtml:       r.ContentHtml,
-		Authorship:        r.Authorship,
-		Attachments:       []Attachment{}, // never nil — serializes as [] not null
-		Providences:       []Providence{}, // never nil
-		Parties:           []PartyInfo{},  // never nil
-		SentToSigningAt:   pgTimestamptzPtr(r.SentToSigningAt),
-		SignedAt:          pgTimestamptzPtr(r.SignedAt),
-		FiledAt:           pgTimestamptzPtr(r.FiledAt),
-		FilingNumber:      derefString(r.FilingNumber),
-		SignedPDFKey:      derefString(r.SignedPdfKey),
+		ID:                  r.ID.String(),
+		PieceType:           r.PieceType,
+		Title:               r.Title,
+		Content:             derefString(r.Content),
+		Status:              r.Status,
+		SagaState:           r.SagaState,
+		CreatedAt:           timestamptzToTime(r.CreatedAt),
+		UpdatedAt:           timestamptzToTime(r.UpdatedAt),
+		StructuredContent:   structuredContentFromJSON(r.StructuredContent),
+		ContentHtml:         r.ContentHtml,
+		Authorship:          r.Authorship,
+		Attachments:         []Attachment{}, // never nil — serializes as [] not null
+		Providences:         []Providence{}, // never nil
+		Parties:             []PartyInfo{},  // never nil
+		SentToSigningAt:     pgTimestamptzPtr(r.SentToSigningAt),
+		SignedAt:            pgTimestamptzPtr(r.SignedAt),
+		FiledAt:             pgTimestamptzPtr(r.FiledAt),
+		FilingNumber:        derefString(r.FilingNumber),
+		SignedPDFKey:        derefString(r.SignedPdfKey),
+		SupersededAt:        pgTimestamptzPtr(r.SupersededAt),
+		SupersededByDraftID: pgUUIDToString(r.SupersededByDraftID),
 	}
 
 	// Intimation — only when the draft has an intimation_id (LEFT JOIN yields a

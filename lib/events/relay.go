@@ -285,6 +285,23 @@ func queueFor(typ string) string {
 		// no-op handler (deadline.Listener) — cheap, no retry, no queue clog.
 		return "deadline"
 	}
+	// actionitem.created/confirmed (fatia 3, docs/erd-costura-providencia-tarefa-peca.md §6):
+	// deadline's listener reacts to either by creating a task right away — fast (DB + outbox),
+	// the SAME starvation argument as the intimation events above, so it rides the SAME
+	// dedicated "deadline" queue rather than "ingestao" (where the enrichment flood would
+	// starve it) or "default" (the actionitem prefix's unrouted fallback, which no worker
+	// drains). String literals, not internal/actionitem's consts: queueFor cannot import
+	// internal/actionitem (it already avoids internal/deadline for the same reason above).
+	// Must match worker-ingestao's deadlineQueue and the dedicated server's Queues.
+	//
+	// actionitem.reclassified (fatia 5, docs §7 questão 4) joins them here for the SAME
+	// reason: internal/draft's reclassify listener (reclassify.go) just supersedes a draft
+	// row — fast (DB only, no LLM) — so it must not queue behind the enrichment flood on
+	// "ingestao" either. Mounted on the SAME dedicated "deadline" mux as deadline's own
+	// actionitem.created/confirmed handlers, alongside internal/draft's ReclassifyListener.
+	if typ == "actionitem.created" || typ == "actionitem.confirmed" || typ == "actionitem.reclassified" {
+		return "deadline"
+	}
 	// deadline.due_soon/missed are NOT consumed by the deadline server — they are consumed by
 	// the NOTIFICATIONS listener, which runs on the main server (it serves "notifications").
 	// Route them to that queue so the reminder/miss avisos are delivered, not to "deadline"
@@ -338,14 +355,19 @@ func queueFor(typ string) string {
 		// they land in "default", which no worker consumes — the whole async
 		// discovery/enrichment chain silently stalls.
 		return "ingestao"
-	case "deadline":
+	case "deadline", "task":
 		// The deadline slice's CONSUMED events (reminder_check/missed_check + high-volume
-		// deadline.opened → "deadline"; due_soon/missed → "notifications") are special-cased
-		// above. What reaches here is the LOW-VOLUME rest — deadline.revoked/updated/met and
-		// task.* — with no async consumer today. Keep it on "ingestao" (archived as
-		// handler-not-found), NOT "default", so the rows don't pile up in a Redis queue no
-		// worker drains. If any of these ever goes high-volume, give it a no-op handler and
-		// route it to "deadline" too (see deadline.opened).
+		// deadline.opened → "deadline"; due_soon/missed → "notifications"; actionitem.created/
+		// confirmed → "deadline") are special-cased above. What reaches here via "deadline" is
+		// the LOW-VOLUME rest — deadline.revoked/updated/met — with no async consumer today;
+		// kept on "ingestao" (archived as handler-not-found), NOT "default", so the rows don't
+		// pile up in a Redis queue no worker drains.
+		//
+		// "task" (task.created/updated/completed/dismissed) rides the SAME "ingestao" queue:
+		// task.created is now a REAL consumer (fatia 3 — internal/actionitem's listener, mounted
+		// on worker-ingestao's main mux, writes the reverse action_item.task_id pointer when the
+		// event carries an action_item_id); the other three stay orphan-for-now (archived as
+		// handler-not-found), same as the deadline.* rest above.
 		return "ingestao"
 	case "documents", "document":
 		// The document slice PRODUCES document.* (singular prefix: document.uploaded,

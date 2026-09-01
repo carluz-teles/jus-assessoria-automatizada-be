@@ -305,6 +305,19 @@ func TestQueueFor(t *testing.T) {
 		{"deadline.opened", "deadline"},
 		{"deadline.revoked", "ingestao"},
 		{"deadline.task.created", "ingestao"},
+		// actionitem.created/confirmed (fatia 3) get the SAME dedicated queue as the intimation
+		// events — deadline's listener creates a task fast, must not queue behind enrichment.
+		{"actionitem.created", "deadline"},
+		{"actionitem.confirmed", "deadline"},
+		// actionitem.reclassified (fatia 5) joins them — draft's reclassify listener just
+		// supersedes a row, same starvation-avoidance reasoning.
+		{"actionitem.reclassified", "deadline"},
+		// task.* (fatia 3): task.created now has a real consumer (internal/actionitem, on the
+		// main worker's "ingestao" mux); the other three stay orphan-for-now on the same queue.
+		{"task.created", "ingestao"},
+		{"task.updated", "ingestao"},
+		{"task.completed", "ingestao"},
+		{"task.dismissed", "ingestao"},
 		{"documents.file.extracted", "documents"},
 		// The document slice's pipeline events (singular prefix) route to the same queue.
 		{"document.uploaded", "documents"},

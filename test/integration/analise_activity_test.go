@@ -17,6 +17,7 @@ import (
 	"github.com/jusassessoria/platform/internal/acquisition"
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/lib/database"
+	"github.com/jusassessoria/platform/lib/events"
 	"github.com/jusassessoria/platform/lib/llm"
 )
 
@@ -58,7 +59,7 @@ func TestAnalisar_LogsProcessActivity(t *testing.T) {
 	intimationID := seedIntimationReturningID(t, pool, tenantID, caseID, recordID)
 
 	reader := acquisition.NewReadUseCase(acquisition.NewRepository(pool))
-	store := acquisition.NewAnaliseStore(database.NewUnitOfWork(pool))
+	store := acquisition.NewAnaliseStore(database.NewUnitOfWork(pool), events.NewOutbox())
 	uc := acquisition.NewAnaliseUseCase(reader, advisory.NewTemplateComposer(), fakeAnaliseGen{}, store, "")
 
 	view, err := uc.Analisar(ctx, tenantID, intimationID)
@@ -71,6 +72,15 @@ func TestAnalisar_LogsProcessActivity(t *testing.T) {
 
 	if got := countProcessActivityLog(t, pool, recordID, "INTIMATION_ANALYSIS_COMPLETED"); got != 1 {
 		t.Errorf("process_activity_log rows = %d, want 1", got)
+	}
+
+	// The analysis also publishes acquisition.intimation.analyzed in the SAME tx (docs/erd-
+	// costura-providencia-tarefa-peca.md) — the actionitem slice's listener materializes
+	// action_item rows from it.
+	if got := countRows(t, pool,
+		`SELECT count(*) FROM outbox WHERE type=$1 AND payload->>'intimation_id'=$2`,
+		acquisition.TypeIntimationAnalyzed, intimationID); got != 1 {
+		t.Errorf("intimation.analyzed outbox rows = %d, want 1", got)
 	}
 }
 
@@ -87,7 +97,7 @@ func TestAnalisar_Degraded_DoesNotLogActivity(t *testing.T) {
 	intimationID := seedIntimationReturningID(t, pool, tenantID, caseID, recordID)
 
 	reader := acquisition.NewReadUseCase(acquisition.NewRepository(pool))
-	store := acquisition.NewAnaliseStore(database.NewUnitOfWork(pool))
+	store := acquisition.NewAnaliseStore(database.NewUnitOfWork(pool), events.NewOutbox())
 	// gen=nil → degraded path (no LLM configured).
 	uc := acquisition.NewAnaliseUseCase(reader, advisory.NewTemplateComposer(), nil, store, "")
 
@@ -101,5 +111,13 @@ func TestAnalisar_Degraded_DoesNotLogActivity(t *testing.T) {
 
 	if got := countProcessActivityLog(t, pool, recordID, "INTIMATION_ANALYSIS_COMPLETED"); got != 0 {
 		t.Errorf("process_activity_log rows = %d, want 0 (degraded write must not log)", got)
+	}
+
+	// The event STILL publishes on a degraded write (empty candidates) — the actionitem
+	// listener's guard aditivo must run even when a re-run comes back empty.
+	if got := countRows(t, pool,
+		`SELECT count(*) FROM outbox WHERE type=$1 AND payload->>'intimation_id'=$2`,
+		acquisition.TypeIntimationAnalyzed, intimationID); got != 1 {
+		t.Errorf("intimation.analyzed outbox rows = %d, want 1 (degraded still publishes)", got)
 	}
 }

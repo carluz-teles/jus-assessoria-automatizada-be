@@ -240,6 +240,65 @@ var _ events.Event = IntimationCancelled{}
 func (IntimationCancelled) Type() string          { return TypeIntimationCancelled }
 func (IntimationCancelled) AggregateType() string { return aggregateTypeIntimation }
 
+// TypeIntimationAnalyzed is the dotted id of the event AnaliseUseCase.Analisar publishes,
+// in the SAME tx as the ai_summary/ai_analyzed_at write, every time POST
+// /v1/intimacoes/:id/analise runs (docs/erd-costura-providencia-tarefa-peca.md). It carries
+// the providência CANDIDATES the IA identified — tipo, gera_peca, piece_profile_key sugerido,
+// confiança, and whether the teor DECLAROU o tipo explicitamente — so the actionitem slice's
+// listener can materialize real action_item rows without acquisition ever importing that
+// slice's entity/repo (slices talk by event, decisão P1). A degraded analysis (no LLM, or an
+// LLM/parse fault) publishes it too, with an empty Providencias slice.
+const TypeIntimationAnalyzed = "acquisition.intimation.analyzed"
+
+// ProvidenciaCandidate is one providência the IA identified in one intimação's teor — the
+// analysis-time shape, BEFORE it becomes a real action_item row. PieceProfileKey is a
+// pointer so "no peça suggested" round-trips as JSON null; Confianca likewise (only set
+// when Declarado is false — the classifier's own inference carries a confidence score, a
+// teor that declares the tipo explicitly does not need one).
+type ProvidenciaCandidate struct {
+	Tipo            string   `json:"tipo"`
+	GeraPeca        bool     `json:"gera_peca"`
+	PieceProfileKey *string  `json:"piece_profile_key"`
+	Declarado       bool     `json:"declarado"`
+	Confianca       *float64 `json:"confianca"`
+}
+
+// IntimationAnalyzed announces that ONE intimação's AI analysis just ran (successfully or
+// degraded) and carries the providência candidates it identified. DeadlineID is the prazo
+// already derived for this intimação at analysis time ("" when none exists yet) — the
+// actionitem listener copies it onto every materialized action_item. Aggregate id is the
+// intimation id (same aggregate as IntimationObserved/IntimationCancelled).
+type IntimationAnalyzed struct {
+	events.Base
+	TenantID      string                 `json:"tenant_id"`
+	IntimationID  string                 `json:"intimation_id"`
+	CourtRecordID string                 `json:"court_record_id"`
+	DeadlineID    string                 `json:"deadline_id,omitempty"`
+	Providencias  []ProvidenciaCandidate `json:"providencias"`
+}
+
+var _ events.Event = IntimationAnalyzed{}
+
+func (IntimationAnalyzed) Type() string          { return TypeIntimationAnalyzed }
+func (IntimationAnalyzed) AggregateType() string { return aggregateTypeIntimation }
+
+// newIntimationAnalyzed builds the event, minting a fresh v7 event id (the actionitem
+// listener's dedup key). candidates is always a non-nil (possibly empty) slice so the wire
+// payload serializes providencias:[], never null.
+func newIntimationAnalyzed(tenantID, intimationID, courtRecordID, deadlineID string, candidates []ProvidenciaCandidate) IntimationAnalyzed {
+	if candidates == nil {
+		candidates = []ProvidenciaCandidate{}
+	}
+	return IntimationAnalyzed{
+		Base:          events.Base{EventID: newEventID(), Aggregate: intimationID},
+		TenantID:      tenantID,
+		IntimationID:  intimationID,
+		CourtRecordID: courtRecordID,
+		DeadlineID:    deadlineID,
+		Providencias:  candidates,
+	}
+}
+
 // SyncCompleted closes a successful run with its item tallies (new vs. deduped),
 // so the backfill slice can advance its slice counters (a later sub-slice).
 // Aggregate id is the sync_run id.

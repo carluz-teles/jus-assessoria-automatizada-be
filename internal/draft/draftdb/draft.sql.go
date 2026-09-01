@@ -124,6 +124,44 @@ func (q *Queries) DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) 
 	return err
 }
 
+const getActionItemForTask = `-- name: GetActionItemForTask :one
+SELECT
+    ai.intimation_id     AS intimation_id,
+    cr.case_id           AS case_id,
+    ai.piece_profile_key AS piece_profile_key
+FROM task t
+JOIN action_item ai ON ai.id = t.action_item_id
+LEFT JOIN court_record cr ON cr.id = ai.court_record_id
+WHERE t.id = $1 AND t.tenant_id = $2
+`
+
+type GetActionItemForTaskParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetActionItemForTaskRow struct {
+	IntimationID    uuid.UUID   `json:"intimation_id"`
+	CaseID          pgtype.UUID `json:"case_id"`
+	PieceProfileKey *string     `json:"piece_profile_key"`
+}
+
+// Load the providência (action_item) context for the task-sourced Create flow
+// (docs/erd-costura-providencia-tarefa-peca.md §3): task_id → the piece_profile_key
+// the draft INHERITS (never re-chosen), plus intimation_id/case_id so the draft is
+// populated the same way the source=intimation path is. Reads cross-slice directly —
+// task and action_item are owned by other slices (deadline/actionitem) — via a plain
+// JOIN, never a Go import; same pattern GetIntimationForDraft already uses for
+// court_record. Filtered by task.id and task.tenant_id (barrier 1). A miss (unknown
+// task, foreign tenant, or a task with no linked action_item — e.g. an avulsa task)
+// → pgx.ErrNoRows → ErrTaskNotFound (→ 404).
+func (q *Queries) GetActionItemForTask(ctx context.Context, arg GetActionItemForTaskParams) (GetActionItemForTaskRow, error) {
+	row := q.db.QueryRow(ctx, getActionItemForTask, arg.ID, arg.TenantID)
+	var i GetActionItemForTaskRow
+	err := row.Scan(&i.IntimationID, &i.CaseID, &i.PieceProfileKey)
+	return i, err
+}
+
 const getActiveEsajCredential = `-- name: GetActiveEsajCredential :one
 SELECT id, tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref, terms_version
 FROM esaj_credential
@@ -415,7 +453,8 @@ SELECT id, tenant_id, case_id, intimation_id,
        created_at, updated_at,
        tone, instructions, selected_theses,
        structured_content, authorship,
-       filing_number
+       filing_number,
+       superseded_at, superseded_by_draft_id
 FROM draft
 WHERE id = $1 AND tenant_id = $2
 `
@@ -426,23 +465,25 @@ type GetDraftByIDParams struct {
 }
 
 type GetDraftByIDRow struct {
-	ID                uuid.UUID          `json:"id"`
-	TenantID          uuid.UUID          `json:"tenant_id"`
-	CaseID            pgtype.UUID        `json:"case_id"`
-	IntimationID      pgtype.UUID        `json:"intimation_id"`
-	PieceType         string             `json:"piece_type"`
-	Title             string             `json:"title"`
-	Content           *string            `json:"content"`
-	Status            string             `json:"status"`
-	SagaState         string             `json:"saga_state"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	Tone              string             `json:"tone"`
-	Instructions      *string            `json:"instructions"`
-	SelectedTheses    []string           `json:"selected_theses"`
-	StructuredContent []byte             `json:"structured_content"`
-	Authorship        string             `json:"authorship"`
-	FilingNumber      *string            `json:"filing_number"`
+	ID                  uuid.UUID          `json:"id"`
+	TenantID            uuid.UUID          `json:"tenant_id"`
+	CaseID              pgtype.UUID        `json:"case_id"`
+	IntimationID        pgtype.UUID        `json:"intimation_id"`
+	PieceType           string             `json:"piece_type"`
+	Title               string             `json:"title"`
+	Content             *string            `json:"content"`
+	Status              string             `json:"status"`
+	SagaState           string             `json:"saga_state"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	Tone                string             `json:"tone"`
+	Instructions        *string            `json:"instructions"`
+	SelectedTheses      []string           `json:"selected_theses"`
+	StructuredContent   []byte             `json:"structured_content"`
+	Authorship          string             `json:"authorship"`
+	FilingNumber        *string            `json:"filing_number"`
+	SupersededAt        pgtype.Timestamptz `json:"superseded_at"`
+	SupersededByDraftID pgtype.UUID        `json:"superseded_by_draft_id"`
 }
 
 // Load the full peça aggregate by id, filtered by tenant (barrier 1). A miss or
@@ -471,6 +512,8 @@ func (q *Queries) GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (Get
 		&i.StructuredContent,
 		&i.Authorship,
 		&i.FilingNumber,
+		&i.SupersededAt,
+		&i.SupersededByDraftID,
 	)
 	return i, err
 }
@@ -530,6 +573,71 @@ func (q *Queries) GetDraftByIntimationID(ctx context.Context, arg GetDraftByInti
 	return i, err
 }
 
+const getDraftByTaskID = `-- name: GetDraftByTaskID :one
+SELECT id, tenant_id, case_id, intimation_id,
+       piece_type, title, content,
+       status, saga_state,
+       created_at, updated_at,
+       structured_content, authorship,
+       task_id, piece_profile_key
+FROM draft
+WHERE tenant_id = $1 AND task_id = $2 AND superseded_at IS NULL
+`
+
+type GetDraftByTaskIDParams struct {
+	TenantID uuid.UUID   `json:"tenant_id"`
+	TaskID   pgtype.UUID `json:"task_id"`
+}
+
+type GetDraftByTaskIDRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	CaseID            pgtype.UUID        `json:"case_id"`
+	IntimationID      pgtype.UUID        `json:"intimation_id"`
+	PieceType         string             `json:"piece_type"`
+	Title             string             `json:"title"`
+	Content           *string            `json:"content"`
+	Status            string             `json:"status"`
+	SagaState         string             `json:"saga_state"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	StructuredContent []byte             `json:"structured_content"`
+	Authorship        string             `json:"authorship"`
+	TaskID            pgtype.UUID        `json:"task_id"`
+	PieceProfileKey   *string            `json:"piece_profile_key"`
+}
+
+// Fetch the draft that already exists for the (tenant_id, task_id) pair — used by
+// the idempotent POST path (task-sourced Create) when the INSERT hits the NEW
+// draft_task_id_uidx (migration 0080). Filters by tenant (barrier 1).
+//
+// superseded_at IS NULL (fatia 5, migration 0081): only the VIGENTE draft counts as "the
+// existing draft" for this task — once a providência is reclassified, the OLD draft is
+// superseded (never deleted) and the idempotency guard must resolve to the NEW one, not
+// get an arbitrary pick between two rows sharing the same task_id.
+func (q *Queries) GetDraftByTaskID(ctx context.Context, arg GetDraftByTaskIDParams) (GetDraftByTaskIDRow, error) {
+	row := q.db.QueryRow(ctx, getDraftByTaskID, arg.TenantID, arg.TaskID)
+	var i GetDraftByTaskIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.CaseID,
+		&i.IntimationID,
+		&i.PieceType,
+		&i.Title,
+		&i.Content,
+		&i.Status,
+		&i.SagaState,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.StructuredContent,
+		&i.Authorship,
+		&i.TaskID,
+		&i.PieceProfileKey,
+	)
+	return i, err
+}
+
 const getDraftDetail = `-- name: GetDraftDetail :one
 SELECT
     d.id,
@@ -552,6 +660,13 @@ SELECT
     -- storage key do PDF assinado (Fatia 2b — 0061). NULL antes de assinar.
     -- O handler transforma em presigned URL antes de devolver ao cliente.
     d.signed_pdf_key,
+
+    -- reclassificação (fatia 5, docs §7 questão 4): superseded_at não-NULL diz ao FE "esta
+    -- peça foi substituída"; superseded_by_draft_id aponta a NOVA peça (NULL até Create's
+    -- backfill rodar — há uma janela curta entre a providência ser reclassificada e a nova
+    -- peça existir).
+    d.superseded_at,
+    d.superseded_by_draft_id,
 
     -- intimation fields (NULL when draft has no intimation_id)
     i.id            AS intimation_id,
@@ -618,6 +733,8 @@ type GetDraftDetailRow struct {
 	FiledAt                   pgtype.Timestamptz `json:"filed_at"`
 	FilingNumber              *string            `json:"filing_number"`
 	SignedPdfKey              *string            `json:"signed_pdf_key"`
+	SupersededAt              pgtype.Timestamptz `json:"superseded_at"`
+	SupersededByDraftID       pgtype.UUID        `json:"superseded_by_draft_id"`
 	IntimationID              pgtype.UUID        `json:"intimation_id"`
 	IntimationType            *string            `json:"intimation_type"`
 	IntimationContent         *string            `json:"intimation_content"`
@@ -664,6 +781,8 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.FiledAt,
 		&i.FilingNumber,
 		&i.SignedPdfKey,
+		&i.SupersededAt,
+		&i.SupersededByDraftID,
 		&i.IntimationID,
 		&i.IntimationType,
 		&i.IntimationContent,
@@ -1036,6 +1155,30 @@ func (q *Queries) GetProvidencesForIntimation(ctx context.Context, arg GetProvid
 	return items, nil
 }
 
+const getTaskIDForActionItem = `-- name: GetTaskIDForActionItem :one
+SELECT task_id FROM action_item WHERE id = $1 AND tenant_id = $2
+`
+
+type GetTaskIDForActionItemParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Cross-slice read (action_item owned by internal/actionitem — no Go import, same pattern
+// as GetActionItemForTask above): resolves the task bound to a providência so the reclassify
+// listener (reclassify.go, fatia 5) knows which draft to supersede. actionitem.reclassified's
+// payload carries only action_item_id (the FROZEN shape it shares with created/confirmed),
+// so task_id is resolved here rather than widening that shared contract. Returns NULL
+// task_id when the providência has no task yet (a providência reclassified before ever
+// reaching the task stage) — the caller's mapper collapses that to "", a safe no-op signal,
+// never an error.
+func (q *Queries) GetTaskIDForActionItem(ctx context.Context, arg GetTaskIDForActionItemParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getTaskIDForActionItem, arg.ID, arg.TenantID)
+	var task_id pgtype.UUID
+	err := row.Scan(&task_id)
+	return task_id, err
+}
+
 const insertChatMessage = `-- name: InsertChatMessage :one
 
 INSERT INTO chat_message (draft_id, role, content, citations, grounded, model_version)
@@ -1088,30 +1231,35 @@ INSERT INTO draft (
     piece_type, title, content,
     status, saga_state,
     created_by,
+    task_id, piece_profile_key,
     created_at, updated_at
 ) VALUES (
     $1, $2, $3,
     $4, $5, $6,
     'DRAFT', 'CREATED',
     NULLIF($7, '00000000-0000-0000-0000-000000000000'::uuid),
+    $8, $9,
     now(), now()
 )
-ON CONFLICT (tenant_id, intimation_id) WHERE intimation_id IS NOT NULL DO NOTHING
+ON CONFLICT DO NOTHING
 RETURNING id, tenant_id, case_id, intimation_id,
           piece_type, title, content,
           status, saga_state,
           created_at, updated_at,
-          structured_content, authorship
+          structured_content, authorship,
+          task_id, piece_profile_key
 `
 
 type InsertDraftParams struct {
-	TenantID     uuid.UUID   `json:"tenant_id"`
-	CaseID       pgtype.UUID `json:"case_id"`
-	IntimationID pgtype.UUID `json:"intimation_id"`
-	PieceType    string      `json:"piece_type"`
-	Title        string      `json:"title"`
-	Content      *string     `json:"content"`
-	Column7      interface{} `json:"column_7"`
+	TenantID        uuid.UUID   `json:"tenant_id"`
+	CaseID          pgtype.UUID `json:"case_id"`
+	IntimationID    pgtype.UUID `json:"intimation_id"`
+	PieceType       string      `json:"piece_type"`
+	Title           string      `json:"title"`
+	Content         *string     `json:"content"`
+	Column7         interface{} `json:"column_7"`
+	TaskID          pgtype.UUID `json:"task_id"`
+	PieceProfileKey *string     `json:"piece_profile_key"`
 }
 
 type InsertDraftRow struct {
@@ -1128,6 +1276,8 @@ type InsertDraftRow struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 	StructuredContent []byte             `json:"structured_content"`
 	Authorship        string             `json:"authorship"`
+	TaskID            pgtype.UUID        `json:"task_id"`
+	PieceProfileKey   *string            `json:"piece_profile_key"`
 }
 
 // draft slice queries (peticionamento Fatia 1). Every write runs inside the use
@@ -1136,14 +1286,22 @@ type InsertDraftRow struct {
 // never (nil, nil).
 // Persist a new peça (DRAFT status, CREATED saga_state). Returns all columns so the
 // handler renders the 201 response without a follow-up read. storage_key is NULL for
-// Fatia 1 (content lives in the column, not in S3).
+// Fatia 1 (content lives in the column, not in S3). task_id/piece_profile_key
+// (migration 0080) are set only by the task-sourced Create flow; every other path
+// leaves them NULL.
 //
-// ON CONFLICT DO NOTHING targets the partial unique index
-// (tenant_id, intimation_id WHERE intimation_id IS NOT NULL). When the row already
-// exists the RETURNING clause yields zero rows (pgx.ErrNoRows), which the repository
-// maps to ErrDraftAlreadyExists so the use case can fetch the existing row for 200.
-// This avoids a 23505 error that would abort the current transaction (25P02), making
-// subsequent queries in the same tx impossible without a SAVEPOINT.
+// ON CONFLICT DO NOTHING with NO target: since migration 0080 there are TWO partial
+// unique indexes that can fire — draft_intimation_id_uidx (tenant_id, intimation_id
+// WHERE intimation_id IS NOT NULL AND task_id IS NULL, the legacy path) and
+// draft_task_id_uidx (tenant_id, task_id WHERE task_id IS NOT NULL, the task-sourced
+// path). Omitting the conflict target is valid Postgres for DO NOTHING (unlike DO
+// UPDATE) and absorbs a violation of EITHER — the repository cannot know in advance
+// which one a given INSERT will hit. When the row already exists the RETURNING
+// clause yields zero rows (pgx.ErrNoRows), mapped to ErrDraftAlreadyExists so the use
+// case fetches the existing row for 200 (GetDraftByIntimationID or GetDraftByTaskID,
+// picked by which field the caller supplied). This avoids a 23505 error that would
+// abort the current transaction (25P02), making subsequent queries in the same tx
+// impossible without a SAVEPOINT.
 func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (InsertDraftRow, error) {
 	row := q.db.QueryRow(ctx, insertDraft,
 		arg.TenantID,
@@ -1153,6 +1311,8 @@ func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (Inser
 		arg.Title,
 		arg.Content,
 		arg.Column7,
+		arg.TaskID,
+		arg.PieceProfileKey,
 	)
 	var i InsertDraftRow
 	err := row.Scan(
@@ -1169,6 +1329,8 @@ func (q *Queries) InsertDraft(ctx context.Context, arg InsertDraftParams) (Inser
 		&i.UpdatedAt,
 		&i.StructuredContent,
 		&i.Authorship,
+		&i.TaskID,
+		&i.PieceProfileKey,
 	)
 	return i, err
 }
@@ -1421,6 +1583,42 @@ func (q *Queries) InsertReview(ctx context.Context, arg InsertReviewParams) (Ins
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const linkSupersededDraft = `-- name: LinkSupersededDraft :one
+WITH candidate AS (
+    SELECT draft.id AS id FROM draft
+    WHERE draft.tenant_id = $1 AND draft.task_id = $2
+      AND draft.superseded_at IS NOT NULL AND draft.superseded_by_draft_id IS NULL
+    ORDER BY draft.superseded_at DESC
+    LIMIT 1
+)
+UPDATE draft d
+SET superseded_by_draft_id = $3
+FROM candidate c
+WHERE d.id = c.id
+RETURNING d.id
+`
+
+type LinkSupersededDraftParams struct {
+	TenantID            uuid.UUID   `json:"tenant_id"`
+	TaskID              pgtype.UUID `json:"task_id"`
+	SupersededByDraftID pgtype.UUID `json:"superseded_by_draft_id"`
+}
+
+// Backfills the OLD draft's superseded_by_draft_id once Create's task-sourced flow (fatia 4's
+// populateFromTask path) mints the corrected draft (fatia 5's pointer chain: old → new). Runs
+// in the SAME tx as InsertDraft. The CTE picks AT MOST ONE candidate (the most recently
+// superseded pending-link row for this task) so the UPDATE can never touch more than the one
+// row Create just replaced, even if — contrary to the expected invariant of one supersede per
+// reclassify round — more than one pending-link row existed. Zero rows (no pending-link
+// candidate — the common case, since most drafts are never reclassified) is a valid, silent
+// no-op: mapped by the repo to (nil, nil), never an error.
+func (q *Queries) LinkSupersededDraft(ctx context.Context, arg LinkSupersededDraftParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, linkSupersededDraft, arg.TenantID, arg.TaskID, arg.SupersededByDraftID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const listDraftsAll = `-- name: ListDraftsAll :many
@@ -2031,6 +2229,29 @@ func (q *Queries) SignDraftWithPDF(ctx context.Context, arg SignDraftWithPDFPara
 		&i.SignedAt,
 	)
 	return i, err
+}
+
+const supersedeDraftForTask = `-- name: SupersedeDraftForTask :exec
+UPDATE draft
+SET superseded_at = now()
+WHERE tenant_id = $1 AND task_id = $2 AND superseded_at IS NULL AND filed_at IS NULL
+`
+
+type SupersedeDraftForTaskParams struct {
+	TenantID uuid.UUID   `json:"tenant_id"`
+	TaskID   pgtype.UUID `json:"task_id"`
+}
+
+// Marks the task's CURRENT vigente draft as superseded (fatia 5, docs §7 questão 4): the
+// reclassify listener calls this when a providência's tipo/piece_profile_key changes after
+// its peça may already exist. Guarded IN SQL (not just Go) by superseded_at IS NULL AND
+// filed_at IS NULL — closes the race against a concurrent File call: a draft that reaches
+// FILED between the use case's read and this UPDATE is never retroactively superseded (the
+// protocolo already happened; freezing/re-deriving now would be wrong). Zero rows affected
+// is a valid no-op — no vigente draft, already superseded, or already filed.
+func (q *Queries) SupersedeDraftForTask(ctx context.Context, arg SupersedeDraftForTaskParams) error {
+	_, err := q.db.Exec(ctx, supersedeDraftForTask, arg.TenantID, arg.TaskID)
+	return err
 }
 
 const updateAttachmentCategory = `-- name: UpdateAttachmentCategory :one

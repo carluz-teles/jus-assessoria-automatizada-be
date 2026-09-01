@@ -10,6 +10,24 @@ import (
 	"github.com/pgvector/pgvector-go"
 )
 
+type ActionItem struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	IntimationID    uuid.UUID          `json:"intimation_id"`
+	CourtRecordID   pgtype.UUID        `json:"court_record_id"`
+	Tipo            string             `json:"tipo"`
+	GeraPeca        bool               `json:"gera_peca"`
+	PieceProfileKey *string            `json:"piece_profile_key"`
+	TipoOrigem      string             `json:"tipo_origem"`
+	TipoStatus      string             `json:"tipo_status"`
+	DeadlineID      pgtype.UUID        `json:"deadline_id"`
+	Confianca       *float64           `json:"confianca"`
+	Status          string             `json:"status"`
+	TaskID          pgtype.UUID        `json:"task_id"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type AppUser struct {
 	ID          uuid.UUID          `json:"id"`
 	ClerkUserID string             `json:"clerk_user_id"`
@@ -34,6 +52,11 @@ type BackfillJob struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	TriggerReason *string            `json:"trigger_reason"`
 	TriggerOabs   []string           `json:"trigger_oabs"`
+}
+
+type BaseSkeleton struct {
+	Key   string `json:"key"`
+	Slots []byte `json:"slots"`
 }
 
 type CaptureRun struct {
@@ -108,6 +131,14 @@ type Chunk struct {
 	EmbeddingModel *string          `json:"embedding_model"`
 	Dim            *int32           `json:"dim"`
 	ChunkHash      *string          `json:"chunk_hash"`
+}
+
+type ComplianceRule struct {
+	Key         string  `json:"key"`
+	Descricao   string  `json:"descricao"`
+	Severidade  string  `json:"severidade"`
+	FonteLegal  *string `json:"fonte_legal"`
+	Verificacao string  `json:"verificacao"`
 }
 
 type CourtCase struct {
@@ -244,9 +275,13 @@ type Draft struct {
 	FilingNumber      *string            `json:"filing_number"`
 	FiledAt           pgtype.Timestamptz `json:"filed_at"`
 	// HTML rico do editor Tiptap. NULL = usar structured_content como fonte.
-	ContentHtml  *string     `json:"content_html"`
-	CreatedBy    pgtype.UUID `json:"created_by"`
-	SignedPdfKey *string     `json:"signed_pdf_key"`
+	ContentHtml         *string            `json:"content_html"`
+	CreatedBy           pgtype.UUID        `json:"created_by"`
+	SignedPdfKey        *string            `json:"signed_pdf_key"`
+	TaskID              pgtype.UUID        `json:"task_id"`
+	PieceProfileKey     *string            `json:"piece_profile_key"`
+	SupersededAt        pgtype.Timestamptz `json:"superseded_at"`
+	SupersededByDraftID pgtype.UUID        `json:"superseded_by_draft_id"`
 }
 
 type DraftAttachment struct {
@@ -257,6 +292,16 @@ type DraftAttachment struct {
 	Category   string             `json:"category"`
 	Position   int32              `json:"position"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+type DraftSegment struct {
+	ID               uuid.UUID          `json:"id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	DraftID          uuid.UUID          `json:"draft_id"`
+	ThesisID         uuid.UUID          `json:"thesis_id"`
+	ProfileSectionID pgtype.UUID        `json:"profile_section_id"`
+	Conteudo         string             `json:"conteudo"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
 type EsajCredential struct {
@@ -290,6 +335,18 @@ type FilingAttempt struct {
 	FailureReason  *string            `json:"failure_reason"`
 	FilingNumber   *string            `json:"filing_number"`
 	ScreenshotKeys []string           `json:"screenshot_keys"`
+}
+
+type FormatProfile struct {
+	Key                 string `json:"key"`
+	Fonte               string `json:"fonte"`
+	TamanhoCorpo        int32  `json:"tamanho_corpo"`
+	TamanhoCitacaoLonga int32  `json:"tamanho_citacao_longa"`
+	Espacamento         string `json:"espacamento"`
+	Alinhamento         string `json:"alinhamento"`
+	Margens             []byte `json:"margens"`
+	CitacaoLonga        []byte `json:"citacao_longa"`
+	Export              string `json:"export"`
 }
 
 type Holiday struct {
@@ -334,6 +391,11 @@ type Intimation struct {
 	AiSummary       *string            `json:"ai_summary"`
 	AiProvidencias  []byte             `json:"ai_providencias"`
 	AiAnalyzedAt    pgtype.Timestamptz `json:"ai_analyzed_at"`
+}
+
+type Matter struct {
+	Key  string `json:"key"`
+	Nome string `json:"nome"`
 }
 
 type Membership struct {
@@ -439,6 +501,27 @@ type Petition struct {
 	ObservedResult *string            `json:"observed_result"`
 }
 
+type PieceProfile struct {
+	Key              string             `json:"key"`
+	Nome             string             `json:"nome"`
+	Polo             string             `json:"polo"`
+	MatterKey        string             `json:"matter_key"`
+	BaseSkeletonKey  string             `json:"base_skeleton_key"`
+	FormatProfileKey *string            `json:"format_profile_key"`
+	VersionAtual     string             `json:"version_atual"`
+	FonteLegal       []byte             `json:"fonte_legal"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PieceProfileVersion struct {
+	ID              uuid.UUID          `json:"id"`
+	PieceProfileKey string             `json:"piece_profile_key"`
+	Version         string             `json:"version"`
+	VigenteDesde    pgtype.Timestamptz `json:"vigente_desde"`
+	Snapshot        []byte             `json:"snapshot"`
+}
+
 type Plan struct {
 	ID                   uuid.UUID          `json:"id"`
 	Code                 string             `json:"code"`
@@ -467,6 +550,33 @@ type ProcessedEvent struct {
 	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
 }
 
+type ProfileRequirement struct {
+	ID              uuid.UUID `json:"id"`
+	PieceProfileKey string    `json:"piece_profile_key"`
+	Campo           string    `json:"campo"`
+	Obrigatorio     bool      `json:"obrigatorio"`
+	FonteLegal      *string   `json:"fonte_legal"`
+}
+
+type ProfileRule struct {
+	ID                 uuid.UUID `json:"id"`
+	PieceProfileKey    string    `json:"piece_profile_key"`
+	ComplianceRuleKey  string    `json:"compliance_rule_key"`
+	OverrideSeveridade *string   `json:"override_severidade"`
+}
+
+type ProfileSection struct {
+	ID              uuid.UUID `json:"id"`
+	PieceProfileKey string    `json:"piece_profile_key"`
+	Key             string    `json:"key"`
+	Titulo          string    `json:"titulo"`
+	Ordem           int32     `json:"ordem"`
+	Obrigatoria     string    `json:"obrigatoria"`
+	Origem          string    `json:"origem"`
+	AceitaTeses     bool      `json:"aceita_teses"`
+	FonteLegal      *string   `json:"fonte_legal"`
+}
+
 type Publication struct {
 	ID              uuid.UUID          `json:"id"`
 	Hash            string             `json:"hash"`
@@ -488,6 +598,19 @@ type Review struct {
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 	Status       string             `json:"status"`
 	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
+}
+
+type SectionRule struct {
+	ID                uuid.UUID `json:"id"`
+	ProfileSectionID  uuid.UUID `json:"profile_section_id"`
+	ComplianceRuleKey string    `json:"compliance_rule_key"`
+}
+
+type SegmentAnchor struct {
+	ID             uuid.UUID `json:"id"`
+	DraftSegmentID uuid.UUID `json:"draft_segment_id"`
+	ThesisAnchorID uuid.UUID `json:"thesis_anchor_id"`
+	Status         string    `json:"status"`
 }
 
 type SigningEvent struct {
@@ -557,6 +680,7 @@ type Task struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 	Priority       *string            `json:"priority"`
+	ActionItemID   pgtype.UUID        `json:"action_item_id"`
 }
 
 type TaskActivity struct {
@@ -624,6 +748,36 @@ type TenantSecret struct {
 	DekNonce   []byte             `json:"dek_nonce"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type Thesis struct {
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	DraftID         uuid.UUID          `json:"draft_id"`
+	PieceProfileKey *string            `json:"piece_profile_key"`
+	NotificationID  pgtype.UUID        `json:"notification_id"`
+	Enunciado       string             `json:"enunciado"`
+	Forca           string             `json:"forca"`
+	Estado          string             `json:"estado"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type ThesisAnchor struct {
+	ID            uuid.UUID   `json:"id"`
+	ThesisID      uuid.UUID   `json:"thesis_id"`
+	Tipo          string      `json:"tipo"`
+	AlvoDocumento pgtype.UUID `json:"alvo_documento"`
+	AlvoFonte     *string     `json:"alvo_fonte"`
+	Motivo        string      `json:"motivo"`
+	Status        string      `json:"status"`
+}
+
+type ThesisCoverage struct {
+	ID        uuid.UUID          `json:"id"`
+	ThesisID  uuid.UUID          `json:"thesis_id"`
+	Resultado string             `json:"resultado"`
+	Detalhe   *string            `json:"detalhe"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type TrialPolicy struct {

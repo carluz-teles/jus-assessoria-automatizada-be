@@ -283,6 +283,7 @@ func (h *Handler) createPeca(c *fiber.Ctx) error {
 		CaseID:       req.CaseID,
 		PieceType:    req.PieceType,
 		Title:        req.Title,
+		TaskID:       req.TaskID,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -412,6 +413,10 @@ type draftResponse struct {
 	SagaState    string  `json:"saga_state"`
 	CreatedAt    string  `json:"created_at"`
 	UpdatedAt    string  `json:"updated_at"`
+	// TaskID/PieceProfileKey (migration 0080) are non-empty only for a
+	// task-sourced peça (POST /v1/pecas {task_id}).
+	TaskID          string `json:"task_id,omitempty"`
+	PieceProfileKey string `json:"piece_profile_key,omitempty"`
 }
 
 func draftToResponse(d *Draft) draftResponse {
@@ -421,17 +426,19 @@ func draftToResponse(d *Draft) draftResponse {
 		content = &c
 	}
 	return draftResponse{
-		ID:           d.ID,
-		TenantID:     d.TenantID,
-		CaseID:       d.CaseID,
-		IntimationID: d.IntimationID,
-		PieceType:    d.PieceType,
-		Title:        d.Title,
-		Content:      content,
-		Status:       d.Status,
-		SagaState:    d.SagaState,
-		CreatedAt:    d.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:    d.UpdatedAt.Format(time.RFC3339),
+		ID:              d.ID,
+		TenantID:        d.TenantID,
+		CaseID:          d.CaseID,
+		IntimationID:    d.IntimationID,
+		PieceType:       d.PieceType,
+		Title:           d.Title,
+		Content:         content,
+		Status:          d.Status,
+		SagaState:       d.SagaState,
+		CreatedAt:       d.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:       d.UpdatedAt.Format(time.RFC3339),
+		TaskID:          d.TaskID,
+		PieceProfileKey: d.PieceProfileKey,
 	}
 }
 
@@ -491,6 +498,12 @@ type detailResponse struct {
 
 	// Review is the latest AI review, or null when no generation has been run.
 	Review *reviewResponse `json:"review"`
+
+	// Reclassificação (fatia 5, docs §7 questão 4): superseded_at não-null diz ao FE
+	// "esta peça foi substituída"; superseded_by_draft_id (quando presente) aponta a
+	// peça nova. Ambos null pra toda peça vigente.
+	SupersededAt        *string `json:"superseded_at"`
+	SupersededByDraftID *string `json:"superseded_by_draft_id"`
 }
 
 // reviewResponse is the nested review shape in GET /v1/pecas/:id.
@@ -565,21 +578,23 @@ type counselResponse struct {
 
 func detailToResponse(v *DraftDetailView) detailResponse {
 	resp := detailResponse{
-		ID:                v.ID,
-		PieceType:         v.PieceType,
-		Title:             v.Title,
-		Content:           v.Content,
-		Status:            v.Status,
-		SagaState:         v.SagaState,
-		CreatedAt:         v.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:         v.UpdatedAt.Format(time.RFC3339),
-		StructuredContent: v.StructuredContent,
-		ContentHTML:       v.ContentHtml,
-		Authorship:        v.Authorship,
-		SentToSigningAt:   timePtrToRFC3339(v.SentToSigningAt),
-		SignedAt:          timePtrToRFC3339(v.SignedAt),
-		FiledAt:           timePtrToRFC3339(v.FiledAt),
-		FilingNumber:      v.FilingNumber,
+		ID:                  v.ID,
+		PieceType:           v.PieceType,
+		Title:               v.Title,
+		Content:             v.Content,
+		Status:              v.Status,
+		SagaState:           v.SagaState,
+		CreatedAt:           v.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:           v.UpdatedAt.Format(time.RFC3339),
+		StructuredContent:   v.StructuredContent,
+		ContentHTML:         v.ContentHtml,
+		Authorship:          v.Authorship,
+		SentToSigningAt:     timePtrToRFC3339(v.SentToSigningAt),
+		SignedAt:            timePtrToRFC3339(v.SignedAt),
+		FiledAt:             timePtrToRFC3339(v.FiledAt),
+		FilingNumber:        v.FilingNumber,
+		SupersededAt:        timePtrToRFC3339(v.SupersededAt),
+		SupersededByDraftID: stringPtrOrNil(v.SupersededByDraftID),
 	}
 
 	if v.Intimation != nil {
@@ -1657,6 +1672,16 @@ func timePtrToRFC3339(t *time.Time) *string {
 		return nil
 	}
 	s := t.Format(time.RFC3339)
+	return &s
+}
+
+// stringPtrOrNil lifts an entity's "" == absent convention to a JSON-nullable *string —
+// used for SupersededByDraftID (fatia 5), where "" means "not linked yet" and must render
+// as null, never an empty string, to the FE.
+func stringPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
 	return &s
 }
 

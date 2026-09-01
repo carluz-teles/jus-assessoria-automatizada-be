@@ -138,11 +138,15 @@ func draftFromInsertRow(r draftdb.InsertDraftRow) *Draft {
 		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
 		StructuredContent: structuredContentFromJSON(r.StructuredContent),
 		Authorship:        r.Authorship,
+		TaskID:            pgUUIDToString(r.TaskID),
+		PieceProfileKey:   derefString(r.PieceProfileKey),
 	}
 }
 
-// draftFromGetByIDRow maps the GetDraftByID row to a *Draft entity.
-func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
+// draftFromGetByTaskIDRow maps the GetDraftByTaskID row to a *Draft entity — the
+// idempotent-fetch counterpart of draftFromGetByIntimationRow for the task-sourced
+// path (migration 0080).
+func draftFromGetByTaskIDRow(r draftdb.GetDraftByTaskIDRow) *Draft {
 	return &Draft{
 		ID:                r.ID.String(),
 		TenantID:          r.TenantID.String(),
@@ -155,12 +159,35 @@ func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
 		SagaState:         r.SagaState,
 		CreatedAt:         timestamptzToTime(r.CreatedAt),
 		UpdatedAt:         timestamptzToTime(r.UpdatedAt),
-		Tone:              r.Tone,
-		Instructions:      derefString(r.Instructions),
-		SelectedTheses:    derefStringSlice(r.SelectedTheses),
 		StructuredContent: structuredContentFromJSON(r.StructuredContent),
 		Authorship:        r.Authorship,
-		FilingNumber:      derefString(r.FilingNumber),
+		TaskID:            pgUUIDToString(r.TaskID),
+		PieceProfileKey:   derefString(r.PieceProfileKey),
+	}
+}
+
+// draftFromGetByIDRow maps the GetDraftByID row to a *Draft entity.
+func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
+	return &Draft{
+		ID:                  r.ID.String(),
+		TenantID:            r.TenantID.String(),
+		CaseID:              pgUUIDToString(r.CaseID),
+		IntimationID:        pgUUIDToString(r.IntimationID),
+		PieceType:           r.PieceType,
+		Title:               r.Title,
+		Content:             derefString(r.Content),
+		Status:              r.Status,
+		SagaState:           r.SagaState,
+		CreatedAt:           timestamptzToTime(r.CreatedAt),
+		UpdatedAt:           timestamptzToTime(r.UpdatedAt),
+		Tone:                r.Tone,
+		Instructions:        derefString(r.Instructions),
+		SelectedTheses:      derefStringSlice(r.SelectedTheses),
+		StructuredContent:   structuredContentFromJSON(r.StructuredContent),
+		Authorship:          r.Authorship,
+		FilingNumber:        derefString(r.FilingNumber),
+		SupersededAt:        pgTimestamptzPtr(r.SupersededAt),
+		SupersededByDraftID: pgUUIDToString(r.SupersededByDraftID),
 	}
 }
 

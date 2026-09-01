@@ -41,6 +41,12 @@ var (
 	// not-found (→ 404), never (nil, nil).
 	ErrIntimationNotFound = apperr.NewNotFound("intimation not found")
 
+	// ErrTaskNotFound — the task-sourced POST (task_id present) supplied a task_id
+	// that resolves to no row in the tenant, or a task with no linked action_item
+	// (e.g. an avulsa/manual task — it never produces a peça through this flow).
+	// Typed not-found (→ 404), never (nil, nil).
+	ErrTaskNotFound = apperr.NewNotFound("task not found")
+
 	// ── Fatia 4 — peticionamento errors ─────────────────────────────────────
 
 	// ErrInvalidStatusForSign — POST /v1/pecas/:id/sign called when draft.status is
