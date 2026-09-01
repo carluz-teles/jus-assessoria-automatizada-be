@@ -127,11 +127,15 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        d.end_date                                                                 AS prazo_end_date,
        CASE WHEN d.id IS NOT NULL THEN (d.end_date - CURRENT_DATE)::int END       AS prazo_days_left,
        d.status                                                                   AS prazo_status,
-       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed
+       CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed,
+       -- peça (draft) da intimação → work_stage (mesmo join do GetIntimacao).
+       dr.status                                                                  AS draft_status,
+       dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.tenant_id = $1
   AND (
     @search::text = ''
@@ -145,6 +149,19 @@ WHERE i.tenant_id = $1
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
     OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
+  )
+  -- Status = work_stage derivado. O CASE ESPELHA deriveWorkStage (read.go) — mesma
+  -- precedência marco-mais-avançado-vence. Manter os dois em sincronia.
+  AND (
+    @work_stage::text = ''
+    OR (CASE
+      WHEN dr.filed_at IS NOT NULL THEN 'FILED'
+      WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
+      WHEN dr.status = 'DRAFT' THEN 'DRAFTING'
+      WHEN d.id IS NULL THEN 'RECEIVED'
+      WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
+      ELSE 'AWAITING_CONFIRMATION'
+    END) = @work_stage::text
   )
   AND (
     @urgencia::text = ''
@@ -199,7 +216,8 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        -- detail pra alimentar a linha "Distribuição" da barra rica.
        cr.filed_at AS distribution_date,
        -- análise IA (0051): NULLs = pré-análise; ai_analyzed_at NOT NULL = pós-análise.
-       i.ai_summary, i.ai_providencias, i.ai_analyzed_at,
+       -- ai_act (0082) = o ato classificado pela IA (título do detalhe + pill "Ato").
+       i.ai_summary, i.ai_providencias, i.ai_analyzed_at, i.ai_act,
        -- responsável (0057, ex-conductor/reviewer): nullable — id + name via LEFT JOIN app_user.
        i.assignee_user_id,
        ua.name                                                                     AS assignee_user_name,
@@ -213,12 +231,19 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        CASE WHEN d.id IS NOT NULL THEN (d.confirmed_by IS NOT NULL) END           AS prazo_confirmed,
        -- histórico derivado: confirmed_at + confirmer name (para label "Prazo confirmado por X")
        d.confirmed_at                                                             AS prazo_confirmed_at,
-       ucf.name                                                                   AS prazo_confirmed_by_name
+       ucf.name                                                                   AS prazo_confirmed_by_name,
+       -- peça (draft) desta intimação — no máximo uma (unique parcial em
+       -- (tenant_id, intimation_id), migration 0042). status + filed_at posicionam
+       -- o work_stage nas etapas de peticionamento (DRAFTING/PARTNER_REVIEW/FILED).
+       -- NULL/false quando a intimação ainda não tem peça.
+       dr.status                                                                  AS draft_status,
+       dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua  ON ua.id = i.assignee_user_id
 LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.id = $1 AND i.tenant_id = $2;
 
 -- name: CountProcessosFiltered :one
@@ -255,6 +280,7 @@ SELECT count(*) FROM court_record WHERE tenant_id = $1 AND lifecycle = $2;
 SELECT count(*) FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
+LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
 WHERE i.tenant_id = $1
   AND (
     @search::text = ''
@@ -268,6 +294,18 @@ WHERE i.tenant_id = $1
   AND (
     sqlc.narg('assignee_id')::uuid IS NULL
     OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
+  )
+  -- Status = work_stage (CASE espelha deriveWorkStage; igual ao ListIntimacoes).
+  AND (
+    @work_stage::text = ''
+    OR (CASE
+      WHEN dr.filed_at IS NOT NULL THEN 'FILED'
+      WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
+      WHEN dr.status = 'DRAFT' THEN 'DRAFTING'
+      WHEN d.id IS NULL THEN 'RECEIVED'
+      WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
+      ELSE 'AWAITING_CONFIRMATION'
+    END) = @work_stage::text
   )
   AND (
     @urgencia::text = ''

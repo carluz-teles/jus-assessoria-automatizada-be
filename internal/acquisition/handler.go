@@ -188,7 +188,7 @@ const (
 // documented mechanisms; body/other params never read query strings.
 var (
 	processosListParams  = paramSet("limit", "cursor", "search", "court", "lifecycle", "degree", "assignee")
-	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia", "nao_confirmado", "assignee")
+	intimacoesListParams = paramSet("limit", "cursor", "search", "type", "user_status", "court", "urgencia", "work_stage", "nao_confirmado", "assignee")
 )
 
 // paramSet builds the route allowlist used by httpx.RejectUnknownParams.
@@ -267,6 +267,18 @@ func isKnownUrgencia(v string) bool {
 	case UrgenciaAtraso, UrgenciaHoje, UrgenciaProximosDoisDias, UrgenciaSemana,
 		UrgenciaEsteMes, UrgenciaMaisAdiante, UrgenciaSemDataDefinida,
 		UrgenciaSemProvidencia:
+		return true
+	default:
+		return false
+	}
+}
+
+// isKnownWorkStage valida o ?work_stage contra o conjunto fechado dos WorkStage*
+// (o filtro de Status da inbox). Vazio = sem filtro (tratado antes de chamar).
+func isKnownWorkStage(v string) bool {
+	switch v {
+	case WorkStageReceived, WorkStageAwaitingConfirmation, WorkStageConfirmed,
+		WorkStageDrafting, WorkStagePartnerReview, WorkStageFiled:
 		return true
 	default:
 		return false
@@ -588,6 +600,10 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	if urgencia == UrgenciaSemProvidencia {
 		urgencia = ""
 	}
+	workStage := c.Query("work_stage")
+	if workStage != "" && !isKnownWorkStage(workStage) {
+		return httpx.WriteError(c, apperr.NewInvalid("invalid work_stage filter"))
+	}
 	naoConfirmado := c.Query("nao_confirmado") == "true" || c.Query("nao_confirmado") == "1"
 	p, ok := httpx.PrincipalFromCtx(c)
 	if !ok {
@@ -614,6 +630,7 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 		UserStatus:    userStatus,
 		Court:         c.Query("court"),
 		Urgencia:      urgencia,
+		WorkStage:     workStage,
 		NaoConfirmado: naoConfirmado,
 		Assignee:      assignee,
 	})

@@ -23,7 +23,10 @@ import (
 // IntimacaoAnaliseView is the wire DTO returned by POST /v1/intimacoes/:id/analise.
 // Providencias is always initialized so it serializes as [], never null.
 type IntimacaoAnaliseView struct {
-	Summary      string                     `json:"summary"`
+	Summary string `json:"summary"`
+	// Ato é o ato principal classificado pela IA (ex.: "Contestação") — vira o TÍTULO
+	// do detalhe e o pill "Ato". "" no modo degradado / análise antiga.
+	Ato          string                     `json:"ato"`
 	Providencias []IntimacaoProvidenciaView `json:"providencias"`
 	AnalyzedAt   time.Time                  `json:"analyzed_at"`
 }
@@ -64,7 +67,7 @@ type analiseReader interface {
 // row (true on a real/successful analysis, false on the degraded write — a degraded analysis
 // is not something to surface on the process timeline).
 type analiseStore interface {
-	SaveAnalise(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error
+	SaveAnalise(ctx context.Context, tenantID, intimationID, summary, ato string, providencias []byte, logActivity bool) error
 }
 
 // AnaliseUseCase composes the intimation context, calls the LLM for the analysis, persists
@@ -96,6 +99,7 @@ var intimationAnalysisSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
     "summary": { "type": "string" },
+    "ato": { "type": "string" },
     "providencias": {
       "type": "array",
       "items": {
@@ -103,15 +107,16 @@ var intimationAnalysisSchema = json.RawMessage(`{
         "properties": {
           "title": { "type": "string" },
           "description": { "type": "string" },
+          "kind": { "type": "string", "enum": ["PECA", "CIENCIA"] },
           "suggested_assignee_user_id": { "type": ["string", "null"] },
           "due_date": { "type": ["string", "null"] }
         },
-        "required": ["title", "description", "suggested_assignee_user_id", "due_date"],
+        "required": ["title", "description", "kind", "suggested_assignee_user_id", "due_date"],
         "additionalProperties": false
       }
     }
   },
-  "required": ["summary", "providencias"],
+  "required": ["summary", "ato", "providencias"],
   "additionalProperties": false
 }`)
 
@@ -146,7 +151,7 @@ func (uc *AnaliseUseCase) Analisar(ctx context.Context, tenantID, intimationID s
 	if err != nil {
 		rawProv = []byte("[]")
 	}
-	uc.persist(ctx, tenantID, intimationID, view.Summary, rawProv, true)
+	uc.persist(ctx, tenantID, intimationID, view.Summary, view.Ato, rawProv, true)
 	return view, nil
 }
 
@@ -191,9 +196,11 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, tenantID, intimationID s
 
 	var parsed struct {
 		Summary      string `json:"summary"`
+		Ato          string `json:"ato"`
 		Providencias []struct {
 			Title                   string  `json:"title"`
 			Description             string  `json:"description"`
+			Kind                    string  `json:"kind"`
 			SuggestedAssigneeUserID *string `json:"suggested_assignee_user_id"`
 			DueDate                 *string `json:"due_date"`
 		} `json:"providencias"`
@@ -213,13 +220,33 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, tenantID, intimationID s
 		prov = append(prov, IntimacaoProvidenciaView{
 			Title:                   p.Title,
 			Description:             p.Description,
+			Kind:                    normalizeProvidenciaKind(p.Kind),
 			SuggestedAssigneeUserID: assigneeID,
 			SuggestedAssigneeName:   assigneeName,
 			DueDate:                 clampDueDate(p.DueDate, ctxData.DeadlineEndDate),
 			Status:                  ProvidenciaStatusSuggested,
 		})
 	}
-	return IntimacaoAnaliseView{Summary: parsed.Summary, Providencias: prov, AnalyzedAt: time.Now()}, true
+	return IntimacaoAnaliseView{
+		Summary:      parsed.Summary,
+		Ato:          strings.TrimSpace(parsed.Ato),
+		Providencias: prov,
+		AnalyzedAt:   time.Now(),
+	}, true
+}
+
+// normalizeProvidenciaKind mantém só os valores conhecidos ("PECA"|"CIENCIA") — o
+// schema já restringe o enum, mas isto blinda contra caixa/valor inesperado (degrada
+// para "" = sem chip de tipo, nunca lixo na UI).
+func normalizeProvidenciaKind(kind string) string {
+	switch strings.ToUpper(strings.TrimSpace(kind)) {
+	case ProvidenciaKindPeca:
+		return ProvidenciaKindPeca
+	case ProvidenciaKindCiencia:
+		return ProvidenciaKindCiencia
+	default:
+		return ""
+	}
 }
 
 // resolveAssignee accepts the model's suggested id ONLY when it matches a real firm member
@@ -263,18 +290,18 @@ func clampDueDate(due *string, endDate string) *string {
 // persistDegraded writes+returns the empty analysis (summary="", providencias=[]) with a
 // fresh analyzed_at, so the FE moves to pós-análise and shows the "IA indisponível" state.
 func (uc *AnaliseUseCase) persistDegraded(ctx context.Context, tenantID, intimationID string) IntimacaoAnaliseView {
-	uc.persist(ctx, tenantID, intimationID, "", []byte("[]"), false)
+	uc.persist(ctx, tenantID, intimationID, "", "", []byte("[]"), false)
 	return IntimacaoAnaliseView{Summary: "", Providencias: []IntimacaoProvidenciaView{}, AnalyzedAt: time.Now()}
 }
 
 // persistWrite write-throughs best-effort; a store fault is logged, never returned (the lawyer
 // keeps the answer even if the row didn't update). logActivity=true only on a real analysis —
 // the degraded write (no LLM / LLM fault) never logs a process activity row.
-func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) {
+func (uc *AnaliseUseCase) persist(ctx context.Context, tenantID, intimationID, summary, ato string, providencias []byte, logActivity bool) {
 	if uc.store == nil {
 		return
 	}
-	if err := uc.store.SaveAnalise(ctx, tenantID, intimationID, summary, providencias, logActivity); err != nil {
+	if err := uc.store.SaveAnalise(ctx, tenantID, intimationID, summary, ato, providencias, logActivity); err != nil {
 		slog.WarnContext(ctx, "acquisition: persist intimation analysis failed",
 			slog.String("intimation_id", intimationID), slog.Any("error", err))
 	}

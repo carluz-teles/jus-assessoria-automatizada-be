@@ -383,6 +383,7 @@ type Intimation struct {
 	AiSummary       *string            `json:"ai_summary"`
 	AiProvidencias  []byte             `json:"ai_providencias"`
 	AiAnalyzedAt    pgtype.Timestamptz `json:"ai_analyzed_at"`
+	AiAct           *string            `json:"ai_act"`
 }
 
 type Membership struct {

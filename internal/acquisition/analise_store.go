@@ -38,7 +38,7 @@ func NewAnaliseStore(uow database.UnitOfWork) analiseStore { return &pgAnaliseSt
 // logActivity=true also appends a process_activity_log row (INTIMATION_ANALYSIS_COMPLETED)
 // in the same tx — a failure to log is LOG-NOT-FAIL: it never rolls back the analysis, which
 // already committed the columns above.
-func (s *pgAnaliseStore) SaveAnalise(ctx context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error {
+func (s *pgAnaliseStore) SaveAnalise(ctx context.Context, tenantID, intimationID, summary, ato string, providencias []byte, logActivity bool) error {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
 		return apperr.NewInvalid("tenant id inválido")
@@ -54,11 +54,18 @@ func (s *pgAnaliseStore) SaveAnalise(ctx context.Context, tenantID, intimationID
 	// The column is text NULL; an empty summary is stored as "" (not NULL) so ai_analyzed_at
 	// being set is the sole "analysed" signal — degraded and rich analyses both stamp it.
 	sum := summary
+	// ai_act: NULL quando não classificado (degradado/vazio), senão o ato — o read
+	// model cai no class+subject quando NULL.
+	var act *string
+	if ato != "" {
+		act = &ato
+	}
 
 	return s.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		courtRecordID, err := acquisitiondb.New(tx).SetIntimationAIAnalysis(ctx, acquisitiondb.SetIntimationAIAnalysisParams{
 			AiSummary:      &sum,
 			AiProvidencias: providencias,
+			AiAct:          act,
 			ID:             iid,
 			TenantID:       tid,
 		})

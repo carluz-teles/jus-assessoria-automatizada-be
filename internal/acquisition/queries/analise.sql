@@ -55,9 +55,10 @@ WHERE id = $2 AND tenant_id = $3;
 UPDATE intimation
 SET ai_summary      = $1,
     ai_providencias = $2,
+    ai_act          = $3,
     ai_analyzed_at  = now()
-WHERE id = $3
-  AND tenant_id = $4
+WHERE id = $4
+  AND tenant_id = $5
 RETURNING court_record_id;
 
 -- name: InsertProcessActivityLog :exec

@@ -53,16 +53,18 @@ type fakeAnaliseStore struct {
 	gotTenantID    string
 	gotIntimID     string
 	gotSummary     string
+	gotAto         string
 	gotProvJSON    []byte
 	gotLogActivity bool
 	err            error
 }
 
-func (f *fakeAnaliseStore) SaveAnalise(_ context.Context, tenantID, intimationID, summary string, providencias []byte, logActivity bool) error {
+func (f *fakeAnaliseStore) SaveAnalise(_ context.Context, tenantID, intimationID, summary, ato string, providencias []byte, logActivity bool) error {
 	f.calls++
 	f.gotTenantID = tenantID
 	f.gotIntimID = intimationID
 	f.gotSummary = summary
+	f.gotAto = ato
 	f.gotProvJSON = providencias
 	f.gotLogActivity = logActivity
 	return f.err

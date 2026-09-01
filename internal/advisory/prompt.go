@@ -387,14 +387,21 @@ func composeAnalyzeIntimation(c CaseContext) Composed {
 	var sys strings.Builder
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro. A partir do TEOR de uma intimação/publicação " +
-			"e do contexto do processo, produza NA MESMA resposta um JSON com exatamente dois campos:\n" +
+			"e do contexto do processo, produza NA MESMA resposta um JSON com exatamente três campos:\n" +
 			"1. `summary` (string): \"O que aconteceu\" — um resumo objetivo, em português jurídico " +
 			"conciso (2–4 frases), do que a publicação comunica (a decisão, o despacho, a intimação e seu " +
 			"efeito prático para a parte).\n" +
-			"2. `providencias` (array): as PROVIDÊNCIAS a cumprir em razão da intimação. Cada item tem:\n" +
+			"2. `ato` (string): o ATO PRINCIPAL que a intimação exige da parte, em 1–3 palavras, no " +
+			"substantivo (ex.: \"Contestação\", \"Manifestação\", \"Recurso de apelação\", \"Cumprimento " +
+			"de sentença\", \"Ciência\"). É o rótulo curto que titula a intimação — NÃO uma frase.\n" +
+			"3. `providencias` (array): as PROVIDÊNCIAS a cumprir em razão da intimação. Cada item tem:\n" +
 			"   - `title` curto e imperativo, JÁ COM a citação legal quando cabível (ex.: \"Redigir defesa " +
 			"(art. 919, CPC)\", \"Protocolar contestação (art. 335, CPC)\");\n" +
 			"   - `description` curta e acionável explicando a providência;\n" +
+			"   - `kind`: a natureza da providência — \"PECA\" quando exige redigir/protocolar uma peça " +
+			"processual (contestação, recurso, manifestação escrita, embargos); \"CIENCIA\" quando é " +
+			"comunicação/ciência ou providência de apoio de fluxo curto (dar ciência ao cliente, juntar " +
+			"documentos, anotar prazo). Use EXATAMENTE um desses dois valores;\n" +
 			"   - `suggested_assignee_user_id`: o id de UM membro do escritório (da lista \"Membros do " +
 			"escritório\" fornecida no contexto) a quem esta providência deve ser atribuída — use " +
 			"EXATAMENTE um dos ids listados, ou null se nenhum couber ou se a lista estiver vazia. NUNCA " +
@@ -444,7 +451,7 @@ func composeAnalyzeIntimation(c CaseContext) Composed {
 	} else {
 		usr.WriteString(strings.Join(lines, "\n"))
 	}
-	usr.WriteString("\n\nProduza o resumo (\"O que aconteceu\") e as providências derivadas.")
+	usr.WriteString("\n\nProduza o resumo (\"O que aconteceu\"), o ato principal e as providências derivadas.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: analyzeIntimationVersion}
 }

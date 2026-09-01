@@ -2032,6 +2032,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		Court:             q.Court,
 		AssigneeID:        nullUUID(q.Assignee),
 		Urgencia:          q.Urgencia,
+		WorkStage:         q.WorkStage,
 		NaoConfirmado:     q.NaoConfirmado,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
@@ -2041,6 +2042,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	}
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
+		prazo := mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed)
 		out = append(out, IntimacaoView{
 			ID:               row.ID.String(),
 			CNJNumber:        row.CnjNumber,
@@ -2058,10 +2060,11 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 			PublishedAt:      row.PublishedAt.Time,
 			DeadlineStartAt:  row.DeadlineStartAt.Time,
 			ContentPreview:   contentPreview(row.Content),
-			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			Prazo:            prazo,
 			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 			AssigneeUserID:   uuidPtrFromPgtype(row.AssigneeUserID),
 			AssigneeUserName: row.AssigneeUserName,
+			WorkStage:        deriveWorkStage(prazo, deref(row.DraftStatus), row.DraftFiledAt.Valid),
 		})
 	}
 	return out, nil
@@ -2091,6 +2094,11 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 	assigneeID := uuidPtrFromPgtype(row.AssigneeUserID)
 	history := buildIntimacaoHistory(row.MadeAvailableAt, row.PrazoConfirmedAt, row.PrazoConfirmedByName, row.PrazoStatus, row.AiAnalyzedAt)
 
+	// Prazo derivado + work_stage: o estágio é projeção do prazo (confirmado?) e da
+	// peça desta intimação (draft.status + filed_at) — fonte única do stepper.
+	prazo := mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed)
+	workStage := deriveWorkStage(prazo, deref(row.DraftStatus), row.DraftFiledAt.Valid)
+
 	return IntimacaoDetailView{
 		IntimacaoView: IntimacaoView{
 			ID:              row.ID.String(),
@@ -2111,10 +2119,11 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			// The detail carries the FULL teor below, but ContentPreview stays populated so
 			// the embedded IntimacaoView is a complete list row (nothing the FE reads breaks).
 			ContentPreview:   contentPreview(row.Content),
-			Prazo:            mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed),
+			Prazo:            prazo,
 			AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 			AssigneeUserID:   assigneeID,
 			AssigneeUserName: row.AssigneeUserName,
+			WorkStage:        workStage,
 		},
 		Content:          row.Content,
 		JudgingBody:      deref(row.JudgingBody),
@@ -2122,6 +2131,7 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		Recipients:       rawArrayOrEmpty(json.RawMessage(row.Recipients)),
 		History:          history,
 		AISummary:        deref(row.AiSummary),
+		AIAct:            deref(row.AiAct),
 		AIProvidencias:   decodeProvidencias(row.AiProvidencias),
 		AIAnalyzedAt:     timestampPtr(row.AiAnalyzedAt),
 		Plaintiffs:       stringsOrEmpty(row.Plaintiffs),
@@ -2608,6 +2618,7 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, q IntimacoesQuery) (
 		Court:         q.Court,
 		AssigneeID:    nullUUID(q.Assignee),
 		Urgencia:      q.Urgencia,
+		WorkStage:     q.WorkStage,
 		NaoConfirmado: q.NaoConfirmado,
 	})
 	if err != nil {
