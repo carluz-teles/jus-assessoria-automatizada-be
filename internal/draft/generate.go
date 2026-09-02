@@ -371,32 +371,38 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	// resposta completa (idêntica ao modo batch) pra fazer json.Unmarshal.
 	// Se o Publisher não foi wireado (uc.chunkPub == nil), degrada pra batch
 	// mode (mesmo comportamento anterior).
-	var rawBytes []byte
-	var err3 error
-	if uc.chunkPub != nil {
+	// callLLM roda UMA geração (streaming quando o Publisher está wireado, senão
+	// batch). Extraído num closure porque a geração é RE-EXECUTÁVEL: o Gemini, sob
+	// structured output, às vezes encerra a string do JSON cedo (finish_reason=stop,
+	// peça truncada mid-frase). O reset do stream roda a cada tentativa — sem isso um
+	// retry APENDARIA à saída truncada anterior no canal SSE.
+	// SEM Schema → TEXTO LIVRE (markdown puro). Structured output (json_schema) com
+	// uma string gigante truncava de forma intermitente (o modelo encerrava a string
+	// do JSON cedo); markdown puro não tem string JSON pra cortar. O prompt já pede
+	// markdown sem code fence; o parser de seções abaixo é o mesmo.
+	req := llm.Request{
+		System:    composed.System,
+		User:      composed.User,
+		Model:     uc.model,
+		MaxTokens: 16000,
+		UseCase:   "draft.generate",
+		TenantID:  ev.TenantID,
+	}
+	callLLM := func() ([]byte, error) {
+		if uc.chunkPub == nil {
+			return uc.gen.GenerateJSON(ctx, req)
+		}
 		channel := chunkChannel(ev.DraftID)
-		// Reset do stream antes de começar a publicar — sem isso, um cliente
-		// SSE que abre a conexão logo em seguida receberia replay dos chunks
-		// da geração ANTERIOR (o TTL do stream é 10min, insuficiente pra
-		// gerações consecutivas). Ignora erro: DEL não-existente é no-op.
+		// Reset do stream antes de publicar — sem isso um cliente SSE recém-conectado
+		// receberia replay dos chunks da geração anterior (TTL 10min). Ignora erro.
 		if resetErr := uc.chunkPub.XReset(ctx, channel); resetErr != nil {
 			slog.WarnContext(ctx, "draft chunk stream reset failed",
 				slog.String("draft_id", ev.DraftID),
 				slog.String("err", resetErr.Error()))
 		}
-		rawBytes, err3 = uc.gen.GenerateJSONStream(ctx, llm.Request{
-			System:     composed.System,
-			User:       composed.User,
-			Schema:     generateSchema,
-			SchemaName: "draft_minuta",
-			Model:      uc.model,
-			MaxTokens:  16000,
-			UseCase:    "draft.generate",
-			TenantID:   ev.TenantID,
-		}, func(chunk string) error {
-			// Best-effort: erro no XADD não aborta geração. Cliente que
-			// reconecta usa Last-Event-ID pra retomar; se o key expirou,
-			// faz refetch do content_html quando saga_state=DRAFTED.
+		return uc.gen.GenerateJSONStream(ctx, req, func(chunk string) error {
+			// Best-effort: erro no XADD não aborta. Cliente que reconecta usa
+			// Last-Event-ID; se o key expirou, faz refetch quando saga=DRAFTED.
 			if _, pubErr := uc.chunkPub.XPublish(ctx, channel, []byte(chunk)); pubErr != nil {
 				slog.WarnContext(ctx, "draft chunk publish failed",
 					slog.String("draft_id", ev.DraftID),
@@ -404,17 +410,37 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			}
 			return nil
 		})
-	} else {
-		rawBytes, err3 = uc.gen.GenerateJSON(ctx, llm.Request{
-			System:     composed.System,
-			User:       composed.User,
-			Schema:     generateSchema,
-			SchemaName: "draft_minuta",
-			Model:      uc.model,
-			MaxTokens:  16000,
-			UseCase:    "draft.generate",
-			TenantID:   ev.TenantID,
-		})
+	}
+
+	// Guarda de robustez: até maxGenAttempts, refaz a geração quando a saída volta
+	// TRUNCADA (JSON não-parseável OU sem o fecho "Pede deferimento" que toda peça
+	// completa tem). Cobre o early-stop intermitente do modelo sem falhar a peça.
+	const maxGenAttempts = 2
+	var rawBytes []byte
+	var err3 error
+	var out generatedOutput
+	for attempt := 1; attempt <= maxGenAttempts; attempt++ {
+		rawBytes, err3 = callLLM()
+		if err3 != nil {
+			break // erro real de LLM — tratado abaixo (terminal vs retryable)
+		}
+		// Texto livre: o corpo JÁ é o markdown. Limpa code fence acidental.
+		out = generatedOutput{DraftMarkdown: stripCodeFence(string(rawBytes))}
+		if genOutputComplete(out.DraftMarkdown) {
+			break // peça completa (chegou no fecho)
+		}
+		if attempt < maxGenAttempts {
+			slog.WarnContext(ctx, "draft generate: saída truncada (fecho ausente), refazendo",
+				slog.String("draft_id", ev.DraftID),
+				slog.Int("attempt", attempt),
+				slog.Int("markdown_len", len(out.DraftMarkdown)))
+			continue
+		}
+		// Esgotou as tentativas ainda truncado — persiste o parcial (melhor que
+		// FAILED; o advogado revisa/refaz) mas registra pra observabilidade.
+		slog.WarnContext(ctx, "draft generate: ainda truncada após retries, persistindo parcial",
+			slog.String("draft_id", ev.DraftID),
+			slog.Int("markdown_len", len(out.DraftMarkdown)))
 	}
 	if err3 != nil {
 		// Transient LLM errors stay retryable; terminal (bad key / parse) become FAILED.
@@ -422,11 +448,6 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("llm: %v", err3))
 		}
 		return fmt.Errorf("draft generate: llm call: %w", err3)
-	}
-
-	var out generatedOutput
-	if err4 := json.Unmarshal(rawBytes, &out); err4 != nil {
-		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("parse llm output: %v", err4))
 	}
 
 	// ── 6. Persist success in ONE tx ──────────────────────────────────────────
@@ -625,6 +646,31 @@ func selectedThesesForGen(theses []SuggestedThesis) []SuggestedThesis {
 // parties may be nil/empty (non-fatal degraded path); the signing lawyer is resolved
 // from the matched recipient in intimation.recipients (nil recipients → zero-value).
 //
+// genOutputComplete reports whether the generated markdown reached the FECHO. Toda
+// peça completa termina no "Pede deferimento." (fecho do base_skeleton, v6); quando o
+// modelo encerra cedo (early-stop intermitente sob structured output, finish_reason=
+// stop mid-frase), o fecho não aparece — sinal determinístico de truncamento. Case-
+// insensitive e por "deferimento" pra cobrir variações ("requer o deferimento",
+// "termos em que ... pede deferimento").
+func genOutputComplete(markdown string) bool {
+	return strings.Contains(strings.ToLower(markdown), "deferimento")
+}
+
+// stripCodeFence remove um code fence markdown acidental (```markdown ... ``` ou
+// ``` ... ```) que o modelo às vezes envolve, apesar da instrução de markdown puro.
+// Sem fence → devolve o texto apenas trimado.
+func stripCodeFence(s string) string {
+	t := strings.TrimSpace(s)
+	if !strings.HasPrefix(t, "```") {
+		return t
+	}
+	if nl := strings.IndexByte(t, '\n'); nl >= 0 {
+		t = t[nl+1:]
+	}
+	t = strings.TrimSuffix(strings.TrimSpace(t), "```")
+	return strings.TrimSpace(t)
+}
+
 // selectedTheses are the RICH selected theses (state included/pending_add, Position-
 // ordered) mapped to advisory.SelectedThesisCtx. When it is empty BUT d.SelectedTheses
 // (legacy label-only, Fatia 5) is non-empty, this builds ctx com só o Label preenchido —

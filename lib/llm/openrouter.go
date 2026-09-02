@@ -131,14 +131,35 @@ type jsonSchemaSpec struct {
 	Schema json.RawMessage `json:"schema"`
 }
 
+// responseFormatFor devolve o response_format strict (json_schema) quando o Request
+// traz um Schema; nil quando não (→ texto livre, omitido do body). Um único ponto
+// pra os dois modos de geração (stream e batch).
+func responseFormatFor(req Request) *responseFormat {
+	if len(req.Schema) == 0 {
+		return nil
+	}
+	return &responseFormat{
+		Type: "json_schema",
+		JSONSchema: jsonSchemaSpec{
+			Name:   req.SchemaName,
+			Strict: true,
+			Schema: req.Schema,
+		},
+	}
+}
+
 // chatRequest is the POST body: the model, the two messages, the provider routing (require
 // structured-output support), the response_format (JSON Schema) and the token cap.
 type chatRequest struct {
 	Model          string         `json:"model"`
 	Messages       []chatMessage  `json:"messages"`
-	Provider       providerConfig `json:"provider"`
-	ResponseFormat responseFormat `json:"response_format"`
-	MaxTokens      int            `json:"max_tokens"`
+	Provider       providerConfig  `json:"provider"`
+	// ResponseFormat é ponteiro + omitempty: nil (Request.Schema vazio) → o campo
+	// some do body e o modelo devolve TEXTO LIVRE. Structured output (json_schema)
+	// com uma string gigante trunca de forma intermitente na geração de peça longa;
+	// pra ela usamos texto puro (markdown), que não tem string JSON pra cortar.
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	MaxTokens      int             `json:"max_tokens"`
 	Temperature    float64        `json:"temperature,omitempty"`
 	Stream         bool           `json:"stream,omitempty"`
 }
@@ -202,14 +223,7 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 			{Role: "user", Content: req.User},
 		},
 		Provider: providerConfig{RequireParameters: true},
-		ResponseFormat: responseFormat{
-			Type: "json_schema",
-			JSONSchema: jsonSchemaSpec{
-				Name:   req.SchemaName,
-				Strict: true,
-				Schema: req.Schema,
-			},
-		},
+		ResponseFormat: responseFormatFor(req),
 		MaxTokens:   maxTokens,
 		Temperature: req.Temperature,
 		Stream:      true,
@@ -373,14 +387,7 @@ func (g *OpenRouterGenerator) GenerateJSON(ctx context.Context, req Request) ([]
 			{Role: "user", Content: req.User},
 		},
 		Provider: providerConfig{RequireParameters: true},
-		ResponseFormat: responseFormat{
-			Type: "json_schema",
-			JSONSchema: jsonSchemaSpec{
-				Name:   req.SchemaName,
-				Strict: true,
-				Schema: req.Schema,
-			},
-		},
+		ResponseFormat: responseFormatFor(req),
 		MaxTokens:   maxTokens,
 		Temperature: req.Temperature,
 	})
