@@ -126,6 +126,11 @@ type Repository interface {
 	// id (echoing the entity, like InsertDeadline). Scoping is via the entity's TenantID + RLS.
 	// Reused by BOTH the F2 confirm (the N approved tasks) and the manual CREATE (POST /v1/tasks).
 	InsertTask(ctx context.Context, tx database.Tx, t *Task) (*Task, error)
+	// GetTaskIDByActionItem returns the id of the task already bound to actionItemID, scoped to
+	// tenantID (barrier 1) — the idempotent fallback the SYNCHRONOUS providência→tarefa path
+	// takes when InsertTask reports ErrTaskExistsForActionItem (the task exists from a prior
+	// confirm/materialization). A miss is ErrTaskNotFound, never ("", nil).
+	GetTaskIDByActionItem(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (string, error)
 	// GetTaskForUpdate loads a task's editable state (title, description, kind, due_date,
 	// assignee, status) by its id, scoped to tenantID (barrier 1). It backs PATCH /v1/tasks/:id:
 	// the partial patch is applied over these current values. A missing id in the tenant is

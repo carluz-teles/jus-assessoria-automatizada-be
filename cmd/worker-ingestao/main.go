@@ -318,7 +318,11 @@ func run(logger *slog.Logger) error {
 	// Register also mounts the fatia 3 task.created consumer (the reverse half of the
 	// providência→tarefa loop, §6): "task" also routes to "ingestao" (queueFor), so it rides
 	// this SAME mux too.
-	actionItemUC := actionitem.NewUseCase(actionitem.NewRepository(), outbox, actionitem.NewDedup(), uow)
+	// Materialization creates each declarado providência's tarefa SYNCHRONOUSLY in the same tx
+	// (no async hop): internal/deadline's adapter implements actionitem.TaskCreator, injected via
+	// WithTaskCreator.
+	actionItemUC := actionitem.NewUseCase(actionitem.NewRepository(), outbox, actionitem.NewDedup(), uow,
+		actionitem.WithTaskCreator(deadline.NewActionItemTaskCreator(deadline.NewRepository())))
 	actionitem.NewListener(actionItemUC).Register(mux)
 
 	// billing (fatia 2): consume identity.tenant_provisioned (start the tenant's trial)

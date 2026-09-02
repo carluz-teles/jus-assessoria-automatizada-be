@@ -53,6 +53,10 @@ type ActionItem struct {
 	TenantID        string
 	IntimationID    string
 	CourtRecordID   string // "" when absent
+	// Title/Description são o texto da providência gerado pela IA (migration 0090), exibido no
+	// card "Providências" do detalhe da intimação. "" quando a análise não os produziu.
+	Title           string
+	Description     string
 	Tipo            string
 	GeraPeca        bool
 	PieceProfileKey string // "" when gera_peca is false

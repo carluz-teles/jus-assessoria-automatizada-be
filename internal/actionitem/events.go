@@ -20,6 +20,10 @@ const TypeIntimationAnalyzed = acquisition.TypeIntimationAnalyzed
 // to materialize an action_item row (docs §3's precedence machine). PieceProfileKey is a
 // pointer so an absent suggestion (gera_peca=false) round-trips as JSON null, not "".
 type ProvidenciaCandidate struct {
+	// Title/Description são o texto da providência gerado pela IA — persistido no action_item
+	// (migration 0090) para o read model da intimação não depender de cache efêmero.
+	Title           string   `json:"title"`
+	Description     string   `json:"description"`
 	Tipo            string   `json:"tipo"`
 	GeraPeca        bool     `json:"gera_peca"`
 	PieceProfileKey *string  `json:"piece_profile_key"`
@@ -141,29 +145,3 @@ func newActionItemReclassified(a *ActionItem) ActionItemReclassified {
 	return ActionItemReclassified{newActionItemPayload(a)}
 }
 
-// TypeTaskCreated is the dotted id this slice CONSUMES from deadline — the OTHER half of the
-// providência→tarefa loop (docs/erd-costura-providencia-tarefa-peca.md §2/§6, fatia 3):
-// deadline's listener reacts to TypeActionItemCreated/TypeActionItemConfirmed above by
-// creating a task and announcing it here; this slice writes the reverse pointer
-// (action_item.task_id) on ITS OWN table when the event carries an action_item_id.
-//
-// This is a STRING LITERAL, not deadline.TypeTaskCreated: internal/deadline already imports
-// internal/actionitem (for the two consts above), so importing internal/deadline here would
-// create an import cycle. The literal is guarded against drift by a round-trip contract test
-// (events_test.go) that DOES import internal/deadline — safe from a _test.go file, since
-// deadline's own non-test code never depends on actionitem's tests, so no cycle exists at the
-// production build graph level.
-const TypeTaskCreated = "task.created"
-
-// TaskCreated is the LOCAL decode shape of deadline.task.created: the subset this slice's
-// listener reads. TenantID scopes the RLS-bound tx the write needs (every write in this repo
-// runs tenant-scoped, CLAUDE.md inegociável) — it rides on every task.created regardless of
-// origin, mirroring every other cross-slice event this repo consumes. ActionItemID is "" for
-// a manual/avulsa task (deadline's TaskCreated.ActionItemID is `omitempty`) — OnTaskCreated
-// skips those, since the vast majority of task.created events are NOT this origin.
-type TaskCreated struct {
-	events.Base
-	TaskID       string `json:"task_id"`
-	TenantID     string `json:"tenant_id"`
-	ActionItemID string `json:"action_item_id"`
-}

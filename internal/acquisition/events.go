@@ -261,6 +261,11 @@ const TypeIntimationAnalyzed = "acquisition.intimation.analyzed"
 // when Declarado is false — the classifier's own inference carries a confidence score, a
 // teor that declares the tipo explicitly does not need one).
 type ProvidenciaCandidate struct {
+	// Title/Description são o texto exibido no card "Providências" do detalhe da intimação —
+	// gerados pela IA e agora propagados até action_item (migration 0090) para persistir, em
+	// vez de viverem só no store efêmero da análise.
+	Title           string   `json:"title"`
+	Description     string   `json:"description"`
 	Tipo            string   `json:"tipo"`
 	GeraPeca        bool     `json:"gera_peca"`
 	PieceProfileKey *string  `json:"piece_profile_key"`

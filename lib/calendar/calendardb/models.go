@@ -26,6 +26,8 @@ type ActionItem struct {
 	TaskID          pgtype.UUID        `json:"task_id"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	Title           *string            `json:"title"`
+	Description     *string            `json:"description"`
 }
 
 type AiUsageEvent struct {

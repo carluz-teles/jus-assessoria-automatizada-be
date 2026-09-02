@@ -125,6 +125,12 @@ func TestAnalisar_HappyPath_ParsesAndPersists(t *testing.T) {
 	if len(store.gotParam.Providencias) != 1 {
 		t.Errorf("persisted providencias = %d, want 1", len(store.gotParam.Providencias))
 	}
+	// Title/Description viajam no evento (candidatesFromView) para serem persistidos no
+	// action_item (migration 0090) — não podem ser perdidos na narrowing do payload.
+	if store.gotParam.Providencias[0].Title != "t" || store.gotParam.Providencias[0].Description != "d" {
+		t.Errorf("persisted candidate title/description = {%q %q}, want {t d}",
+			store.gotParam.Providencias[0].Title, store.gotParam.Providencias[0].Description)
+	}
 }
 
 // Degraded (nil generator): no LLM call, persists+returns an empty analysis with a fresh

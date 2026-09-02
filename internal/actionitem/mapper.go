@@ -81,6 +81,8 @@ func fromRow(r actionitemdb.ActionItem) *ActionItem {
 		TenantID:        r.TenantID.String(),
 		IntimationID:    r.IntimationID.String(),
 		CourtRecordID:   uuidText(r.CourtRecordID),
+		Title:           derefString(r.Title),
+		Description:     derefString(r.Description),
 		Tipo:            r.Tipo,
 		GeraPeca:        r.GeraPeca,
 		PieceProfileKey: derefString(r.PieceProfileKey),

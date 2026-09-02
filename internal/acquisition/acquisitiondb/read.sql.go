@@ -594,8 +594,8 @@ func (q *Queries) GetReconciliation(ctx context.Context, arg GetReconciliationPa
 }
 
 const listActionItemsByIntimation = `-- name: ListActionItemsByIntimation :many
-SELECT id, tipo, gera_peca, piece_profile_key, tipo_origem, tipo_status, confianca,
-       status, task_id, deadline_id
+SELECT id, title, description, tipo, gera_peca, piece_profile_key, tipo_origem, tipo_status,
+       confianca, status, task_id, deadline_id
 FROM action_item
 WHERE tenant_id = $1 AND intimation_id = $2
 ORDER BY created_at ASC
@@ -608,6 +608,8 @@ type ListActionItemsByIntimationParams struct {
 
 type ListActionItemsByIntimationRow struct {
 	ID              uuid.UUID   `json:"id"`
+	Title           *string     `json:"title"`
+	Description     *string     `json:"description"`
 	Tipo            string      `json:"tipo"`
 	GeraPeca        bool        `json:"gera_peca"`
 	PieceProfileKey *string     `json:"piece_profile_key"`
@@ -636,6 +638,8 @@ func (q *Queries) ListActionItemsByIntimation(ctx context.Context, arg ListActio
 		var i ListActionItemsByIntimationRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.Title,
+			&i.Description,
 			&i.Tipo,
 			&i.GeraPeca,
 			&i.PieceProfileKey,

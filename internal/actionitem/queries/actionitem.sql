@@ -8,13 +8,15 @@
 -- candidate in the event payload). task_id is never set here — a future fatia's deadline
 -- listener binds it once the item is confiável and turned into work.
 INSERT INTO action_item (
-    id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_profile_key,
-    tipo_origem, tipo_status, deadline_id, confianca, status, created_at, updated_at
+    id, tenant_id, intimation_id, court_record_id, title, description, tipo, gera_peca,
+    piece_profile_key, tipo_origem, tipo_status, deadline_id, confianca, status,
+    created_at, updated_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
 )
 RETURNING id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_profile_key,
-    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at;
+    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at,
+    title, description;
 
 -- name: GetActionItem :one
 -- One action_item by id, scoped to tenantID (barrier 1). A miss/foreign row → pgx.ErrNoRows
@@ -22,7 +24,8 @@ RETURNING id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_
 -- pre-read (to classify idempotent-no-op vs terminal-conflict vs proceed) and any future
 -- direct lookup.
 SELECT id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_profile_key,
-    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at
+    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at,
+    title, description
 FROM action_item
 WHERE id = $1 AND tenant_id = $2;
 
@@ -36,7 +39,8 @@ UPDATE action_item
 SET tipo_status = 'confiavel', updated_at = now()
 WHERE id = $1 AND tenant_id = $2 AND tipo_status = 'a_confirmar' AND status <> 'DISCARDED'
 RETURNING id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_profile_key,
-    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at;
+    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at,
+    title, description;
 
 -- name: DiscardActionItem :one
 -- The guarded UPDATE behind POST /v1/action-items/:id/descartar: status → DISCARDED.
@@ -45,7 +49,8 @@ UPDATE action_item
 SET status = 'DISCARDED', updated_at = now()
 WHERE id = $1 AND tenant_id = $2 AND status <> 'DISCARDED'
 RETURNING id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_profile_key,
-    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at;
+    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at,
+    title, description;
 
 -- name: DeleteReplaceableActionItems :exec
 -- The listener's guard aditivo (OnIntimationAnalyzed, docs handoff §"Guard obrigatório"):
@@ -68,17 +73,20 @@ UPDATE action_item
 SET task_id = $3, status = 'CONFIRMED', updated_at = now()
 WHERE id = $1 AND tenant_id = $2 AND task_id IS NULL
 RETURNING id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_profile_key,
-    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at;
+    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at,
+    title, description;
 
 -- name: ExistsActionItemByTipo :one
 -- Dedup guard for the confiável (declarado/manual) candidates the delete above never
 -- clears: without it, re-running "Analisar" on an intimação whose teor keeps declaring the
--- same providência would insert a duplicate confiável row every time. Scoped by
--- (tenant, intimation, tipo, tipo_origem) — the listener skips inserting a candidate that
--- already has a committed match on all four.
+-- same providência would insert a duplicate row every time. Scoped by (tenant, intimation,
+-- tipo) — DELIBERATELY NOT by tipo_origem: a providência is unique PER TIPO for the user, so
+-- a re-analysis that reclassifies the same tipo under a different origem (declarado ⇄ ia)
+-- must NOT mint a second visible row. The surviving item (a declarado/task-bound one the
+-- delete never clears) wins; the fresh candidate of that tipo is skipped.
 SELECT EXISTS (
     SELECT 1 FROM action_item
-    WHERE tenant_id = $1 AND intimation_id = $2 AND tipo = $3 AND tipo_origem = $4
+    WHERE tenant_id = $1 AND intimation_id = $2 AND tipo = $3
 );
 
 -- name: HasFiledDraftForActionItem :one
@@ -117,4 +125,5 @@ SET piece_profile_key = $3,
     updated_at         = now()
 WHERE id = $1 AND tenant_id = $2 AND status <> 'DISCARDED'
 RETURNING id, tenant_id, intimation_id, court_record_id, tipo, gera_peca, piece_profile_key,
-    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at;
+    tipo_origem, tipo_status, deadline_id, confianca, status, task_id, created_at, updated_at,
+    title, description;

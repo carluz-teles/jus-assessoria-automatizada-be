@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jusassessoria/platform/internal/deadline/deadlinedb"
 	"github.com/jusassessoria/platform/lib/database"
@@ -442,6 +443,32 @@ func (r *pgRepository) InsertTask(ctx context.Context, tx database.Tx, t *Task) 
 	saved := *t
 	saved.ID = id.String()
 	return &saved, nil
+}
+
+// GetTaskIDByActionItem reads the id of the task already bound to actionItemID inside the
+// caller's tx, scoped to tenantID (barrier 1) — the idempotent fallback the synchronous
+// providência→tarefa path uses on ErrTaskExistsForActionItem. A miss is ErrTaskNotFound.
+func (r *pgRepository) GetTaskIDByActionItem(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (string, error) {
+	itemID, err := parseUUID(actionItemID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := deadlinedb.New(tx).GetTaskIDByActionItem(ctx, deadlinedb.GetTaskIDByActionItemParams{
+		ActionItemID: pgtype.UUID{Bytes: [16]byte(itemID), Valid: true},
+		TenantID:     tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrTaskNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return id.String(), nil
 }
 
 // GetActionItemCourtRecordID reads action_item.court_record_id inside the caller's tx,

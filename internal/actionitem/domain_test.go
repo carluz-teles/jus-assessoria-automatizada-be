@@ -158,6 +158,29 @@ func (m *mockRepo) LinkTask(_ context.Context, _ database.Tx, tenantID, id, task
 	return &cp, nil
 }
 
+// fakeTaskCreator is the SYNCHRONOUS TaskCreator port fake: it records every call and returns a
+// configured task id (or error), standing in for internal/deadline's real adapter so the use
+// case's in-tx create+link path can be exercised without a DB.
+type fakeTaskCreator struct {
+	taskID string
+	err    error
+	calls  int
+	got    ActionItemTask
+}
+
+func (f *fakeTaskCreator) CreateForActionItem(_ context.Context, _ database.Tx, in ActionItemTask) (string, error) {
+	f.calls++
+	f.got = in
+	if f.err != nil {
+		return "", f.err
+	}
+	id := f.taskID
+	if id == "" {
+		id = "task-" + in.ActionItemID
+	}
+	return id, nil
+}
+
 // HasFiledDraftForActionItem returns the fixed m.hasFiledDraft answer (or m.hasFiledDraftErr
 // when set) — the test seeds whichever scenario the guard needs, no real draft/task tables
 // to fake.
@@ -191,10 +214,10 @@ func (m *mockRepo) ReclassifyActionItem(_ context.Context, _ database.Tx, tenant
 	return &cp, nil
 }
 
-func (m *mockRepo) ExistsActionItemByTipo(_ context.Context, _ database.Tx, tenantID, intimationID, tipo string, tipoOrigem TipoOrigem) (bool, error) {
+func (m *mockRepo) ExistsActionItemByTipo(_ context.Context, _ database.Tx, tenantID, intimationID, tipo string) (bool, error) {
 	m.existsCalls++
 	for _, item := range m.items {
-		if item.TenantID == tenantID && item.IntimationID == intimationID && item.Tipo == tipo && item.TipoOrigem == tipoOrigem {
+		if item.TenantID == tenantID && item.IntimationID == intimationID && item.Tipo == tipo {
 			return true, nil
 		}
 	}
@@ -211,7 +234,9 @@ func TestOnIntimationAnalyzed_MaterializesCandidates(t *testing.T) {
 	repo := newMockRepo()
 	outbox := &recordingOutbox{}
 	uow := &fakeUOW{}
-	uc := NewUseCase(repo, outbox, &fakeDedup{}, uow, WithClock(fixedClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))))
+	tc := &fakeTaskCreator{}
+	uc := NewUseCase(repo, outbox, &fakeDedup{}, uow,
+		WithClock(fixedClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))), WithTaskCreator(tc))
 
 	profileKey := "contestacao"
 	confianca := 0.7
@@ -222,8 +247,8 @@ func TestOnIntimationAnalyzed_MaterializesCandidates(t *testing.T) {
 		CourtRecordID: "cr1",
 		DeadlineID:    "d1",
 		Providencias: []ProvidenciaCandidate{
-			{Tipo: TipoContestar, GeraPeca: true, PieceProfileKey: &profileKey, Declarado: true},
-			{Tipo: TipoManifestar, GeraPeca: false, Declarado: false, Confianca: &confianca},
+			{Title: "Apresentar contestação", Description: "Prazo de 15 dias úteis", Tipo: TipoContestar, GeraPeca: true, PieceProfileKey: &profileKey, Declarado: true},
+			{Title: "Manifestar sobre laudo", Description: "", Tipo: TipoManifestar, GeraPeca: false, Declarado: false, Confianca: &confianca},
 		},
 	}
 
@@ -255,6 +280,10 @@ func TestOnIntimationAnalyzed_MaterializesCandidates(t *testing.T) {
 	if declarado.CourtRecordID != "cr1" || declarado.DeadlineID != "d1" {
 		t.Errorf("declarado item context = {%q %q}, want {cr1 d1}", declarado.CourtRecordID, declarado.DeadlineID)
 	}
+	// Title/Description da IA são persistidos no action_item (migration 0090).
+	if declarado.Title != "Apresentar contestação" || declarado.Description != "Prazo de 15 dias úteis" {
+		t.Errorf("declarado item title/description = {%q %q}, want {Apresentar contestação, Prazo de 15 dias úteis}", declarado.Title, declarado.Description)
+	}
 	if inferido == nil || inferido.TipoOrigem != TipoOrigemIA || inferido.TipoStatus != TipoStatusAConfirmar {
 		t.Errorf("inferido item = %+v, want tipo_origem=ia tipo_status=a_confirmar", inferido)
 	}
@@ -262,16 +291,22 @@ func TestOnIntimationAnalyzed_MaterializesCandidates(t *testing.T) {
 		t.Errorf("inferido confianca = %v, want 0.7", inferido.Confianca)
 	}
 
-	// Only the confiável (declarado) item is born ready — it alone emits actionitem.created.
-	if len(outbox.published) != 1 {
-		t.Fatalf("published = %d, want 1", len(outbox.published))
+	// Only the confiável (declarado) item is born ready — it alone gets a task created+linked
+	// SYNCHRONOUSLY (no event; the IA item waits for Confirmar).
+	if tc.calls != 1 {
+		t.Fatalf("TaskCreator calls = %d, want 1 (only the declarado item)", tc.calls)
 	}
-	created, ok := outbox.published[0].(ActionItemCreated)
-	if !ok {
-		t.Fatalf("published[0] = %T, want ActionItemCreated", outbox.published[0])
+	if tc.got.ActionItemID != declarado.ID || tc.got.Tipo != TipoContestar || tc.got.CourtRecordID != "cr1" || tc.got.DeadlineID != "d1" {
+		t.Errorf("TaskCreator input = %+v, want the declarado item's ids/tipo", tc.got)
 	}
-	if created.ActionItemID != declarado.ID {
-		t.Errorf("created.ActionItemID = %q, want %q", created.ActionItemID, declarado.ID)
+	if repo.linkTaskCalls != 1 {
+		t.Errorf("LinkTask calls = %d, want 1", repo.linkTaskCalls)
+	}
+	if declarado.TaskID == "" || declarado.Status != StatusConfirmed {
+		t.Errorf("declarado item = {task %q status %q}, want a linked task + CONFIRMED", declarado.TaskID, declarado.Status)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published = %d, want 0 (task creation is synchronous, no event)", len(outbox.published))
 	}
 }
 
@@ -402,12 +437,13 @@ func TestOnIntimationAnalyzed_SanitizesInvalidCandidate(t *testing.T) {
 func TestConfirmar(t *testing.T) {
 	t.Parallel()
 
-	t.Run("a_confirmar becomes confiavel and emits", func(t *testing.T) {
+	t.Run("a_confirmar becomes confiavel and creates+links the task synchronously", func(t *testing.T) {
 		t.Parallel()
 		repo := newMockRepo()
-		repo.seed(&ActionItem{ID: "a1", TenantID: "t1", TipoOrigem: TipoOrigemIA, TipoStatus: TipoStatusAConfirmar, Status: StatusSuggested})
+		repo.seed(&ActionItem{ID: "a1", TenantID: "t1", Tipo: TipoManifestar, TipoOrigem: TipoOrigemIA, TipoStatus: TipoStatusAConfirmar, Status: StatusSuggested})
 		outbox := &recordingOutbox{}
-		uc := NewUseCase(repo, outbox, &fakeDedup{}, &fakeUOW{})
+		tc := &fakeTaskCreator{taskID: "task-1"}
+		uc := NewUseCase(repo, outbox, &fakeDedup{}, &fakeUOW{}, WithTaskCreator(tc))
 
 		item, err := uc.Confirmar(context.Background(), "t1", "a1")
 		if err != nil {
@@ -416,30 +452,37 @@ func TestConfirmar(t *testing.T) {
 		if item.TipoStatus != TipoStatusConfiavel {
 			t.Errorf("tipo_status = %q, want confiavel", item.TipoStatus)
 		}
-		if len(outbox.published) != 1 {
-			t.Fatalf("published = %d, want 1", len(outbox.published))
+		if tc.calls != 1 || tc.got.ActionItemID != "a1" || tc.got.Tipo != TipoManifestar {
+			t.Errorf("TaskCreator call = %d input %+v, want 1 call for a1/manifestar", tc.calls, tc.got)
 		}
-		if _, ok := outbox.published[0].(ActionItemConfirmed); !ok {
-			t.Errorf("published[0] = %T, want ActionItemConfirmed", outbox.published[0])
+		if item.TaskID != "task-1" || item.Status != StatusConfirmed {
+			t.Errorf("item = {task %q status %q}, want task-1/CONFIRMED (linked in-tx)", item.TaskID, item.Status)
+		}
+		if len(outbox.published) != 0 {
+			t.Errorf("published = %d, want 0 (synchronous creation, no actionitem.confirmed event)", len(outbox.published))
 		}
 	})
 
-	t.Run("already confiavel is an idempotent no-op", func(t *testing.T) {
+	t.Run("already confiavel WITH a task is an idempotent no-op", func(t *testing.T) {
 		t.Parallel()
 		repo := newMockRepo()
-		repo.seed(&ActionItem{ID: "a1", TenantID: "t1", TipoOrigem: TipoOrigemDeclarado, TipoStatus: TipoStatusConfiavel, Status: StatusSuggested})
+		repo.seed(&ActionItem{ID: "a1", TenantID: "t1", TipoOrigem: TipoOrigemDeclarado, TipoStatus: TipoStatusConfiavel, Status: StatusConfirmed, TaskID: "task-existing"})
 		outbox := &recordingOutbox{}
-		uc := NewUseCase(repo, outbox, &fakeDedup{}, &fakeUOW{})
+		tc := &fakeTaskCreator{}
+		uc := NewUseCase(repo, outbox, &fakeDedup{}, &fakeUOW{}, WithTaskCreator(tc))
 
 		item, err := uc.Confirmar(context.Background(), "t1", "a1")
 		if err != nil {
 			t.Fatalf("Confirmar() error = %v", err)
 		}
-		if item.TipoStatus != TipoStatusConfiavel {
-			t.Errorf("tipo_status = %q, want confiavel (unchanged)", item.TipoStatus)
+		if item.TipoStatus != TipoStatusConfiavel || item.TaskID != "task-existing" {
+			t.Errorf("item = {status %q task %q}, want confiavel/task-existing (unchanged)", item.TipoStatus, item.TaskID)
+		}
+		if tc.calls != 0 {
+			t.Errorf("TaskCreator calls = %d, want 0 (already linked, nothing to do)", tc.calls)
 		}
 		if len(outbox.published) != 0 {
-			t.Errorf("published = %d, want 0 (no re-emit on idempotent no-op)", len(outbox.published))
+			t.Errorf("published = %d, want 0", len(outbox.published))
 		}
 	})
 
@@ -447,7 +490,7 @@ func TestConfirmar(t *testing.T) {
 		t.Parallel()
 		repo := newMockRepo()
 		repo.seed(&ActionItem{ID: "a1", TenantID: "t1", TipoOrigem: TipoOrigemIA, TipoStatus: TipoStatusAConfirmar, Status: StatusDiscarded})
-		uc := NewUseCase(repo, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{})
+		uc := NewUseCase(repo, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithTaskCreator(&fakeTaskCreator{}))
 
 		_, err := uc.Confirmar(context.Background(), "t1", "a1")
 		if !errors.Is(err, ErrActionItemDiscarded) {
@@ -457,7 +500,7 @@ func TestConfirmar(t *testing.T) {
 
 	t.Run("missing item is a typed 404", func(t *testing.T) {
 		t.Parallel()
-		uc := NewUseCase(newMockRepo(), &recordingOutbox{}, &fakeDedup{}, &fakeUOW{})
+		uc := NewUseCase(newMockRepo(), &recordingOutbox{}, &fakeDedup{}, &fakeUOW{}, WithTaskCreator(&fakeTaskCreator{}))
 
 		_, err := uc.Confirmar(context.Background(), "t1", "ghost")
 		if !errors.Is(err, ErrActionItemNotFound) {
@@ -675,85 +718,4 @@ func TestReclassificar(t *testing.T) {
 			t.Fatalf("err = %v, want ErrActionItemNotFound", err)
 		}
 	})
-}
-
-// --- OnTaskCreated (fatia 3, the reverse pointer) ---------------------------------------
-
-// TestOnTaskCreated_LinksTaskAndConfirms is the happy path: a task.created carrying an
-// action_item_id writes task_id + status=CONFIRMED on THIS slice's own row, tenant-scoped.
-func TestOnTaskCreated_LinksTaskAndConfirms(t *testing.T) {
-	t.Parallel()
-
-	repo := newMockRepo()
-	repo.seed(&ActionItem{ID: "a1", TenantID: "t1", TipoOrigem: TipoOrigemDeclarado, TipoStatus: TipoStatusConfiavel, Status: StatusSuggested})
-	uc := NewUseCase(repo, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{})
-
-	ev := TaskCreated{Base: events.Base{EventID: uuid.NewString()}, TenantID: "t1", ActionItemID: "a1", TaskID: "task-1"}
-	if err := uc.OnTaskCreated(context.Background(), ev); err != nil {
-		t.Fatalf("OnTaskCreated() error = %v", err)
-	}
-	if repo.linkTaskCalls != 1 {
-		t.Fatalf("LinkTask calls = %d, want 1", repo.linkTaskCalls)
-	}
-	linked := repo.items["a1"]
-	if linked.TaskID != "task-1" {
-		t.Errorf("TaskID = %q, want task-1", linked.TaskID)
-	}
-	if linked.Status != StatusConfirmed {
-		t.Errorf("Status = %q, want CONFIRMED", linked.Status)
-	}
-}
-
-// TestOnTaskCreated_SkipsWhenNoActionItemID proves a manual/avulsa task.created (the vast
-// majority — no action_item_id) is skipped before any repo call or tx opens.
-func TestOnTaskCreated_SkipsWhenNoActionItemID(t *testing.T) {
-	t.Parallel()
-
-	repo := newMockRepo()
-	uow := &fakeUOW{}
-	uc := NewUseCase(repo, &recordingOutbox{}, &fakeDedup{}, uow)
-
-	ev := TaskCreated{Base: events.Base{EventID: uuid.NewString()}, TenantID: "t1", TaskID: "task-1"}
-	if err := uc.OnTaskCreated(context.Background(), ev); err != nil {
-		t.Fatalf("OnTaskCreated() error = %v", err)
-	}
-	if repo.linkTaskCalls != 0 {
-		t.Errorf("LinkTask calls = %d, want 0 (no action_item_id)", repo.linkTaskCalls)
-	}
-	if uow.scope != "" {
-		t.Errorf("uow scope = %q, want \"\" (no tx opened)", uow.scope)
-	}
-}
-
-// TestOnTaskCreated_MissingOrAlreadyLinked_IsNoOp proves a LinkTask miss (a gone id, or one
-// already linked — the repo's task_id IS NULL guard) is a safe no-op, not an error: a
-// redelivered task.created must never fail forever.
-func TestOnTaskCreated_MissingOrAlreadyLinked_IsNoOp(t *testing.T) {
-	t.Parallel()
-
-	repo := newMockRepo()
-	uc := NewUseCase(repo, &recordingOutbox{}, &fakeDedup{}, &fakeUOW{})
-
-	ev := TaskCreated{Base: events.Base{EventID: uuid.NewString()}, TenantID: "t1", ActionItemID: "ghost", TaskID: "task-1"}
-	if err := uc.OnTaskCreated(context.Background(), ev); err != nil {
-		t.Fatalf("OnTaskCreated() error = %v, want nil (safe no-op)", err)
-	}
-}
-
-// TestOnTaskCreated_Dedup proves a replayed event_id never re-calls LinkTask.
-func TestOnTaskCreated_Dedup(t *testing.T) {
-	t.Parallel()
-
-	repo := newMockRepo()
-	repo.seed(&ActionItem{ID: "a1", TenantID: "t1", TipoOrigem: TipoOrigemDeclarado, TipoStatus: TipoStatusConfiavel, Status: StatusSuggested})
-	dedup := &fakeDedup{seen: true}
-	uc := NewUseCase(repo, &recordingOutbox{}, dedup, &fakeUOW{})
-
-	ev := TaskCreated{Base: events.Base{EventID: uuid.NewString()}, TenantID: "t1", ActionItemID: "a1", TaskID: "task-1"}
-	if err := uc.OnTaskCreated(context.Background(), ev); err != nil {
-		t.Fatalf("OnTaskCreated() error = %v", err)
-	}
-	if repo.linkTaskCalls != 0 {
-		t.Errorf("LinkTask calls = %d, want 0 (a replay must not re-link)", repo.linkTaskCalls)
-	}
 }

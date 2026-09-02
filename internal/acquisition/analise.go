@@ -331,11 +331,14 @@ func normalizeOptional(s *string) *string {
 
 // candidatesFromView narrows the rich response DTO to the minimal event payload
 // (acquisition.intimation.analyzed carries only what actionitem needs — docs handoff
-// "Payload mínimo"): tipo, gera_peca, piece_profile_key, confianca, declarado.
+// "Payload mínimo"): title, description, tipo, gera_peca, piece_profile_key, confianca,
+// declarado — title/description agora viajam para serem persistidos no action_item (0090).
 func candidatesFromView(prov []AnaliseProvidenciaView) []ProvidenciaCandidate {
 	out := make([]ProvidenciaCandidate, 0, len(prov))
 	for _, p := range prov {
 		out = append(out, ProvidenciaCandidate{
+			Title:           p.Title,
+			Description:     p.Description,
 			Tipo:            p.Tipo,
 			GeraPeca:        p.GeraPeca,
 			PieceProfileKey: p.PieceProfileKey,

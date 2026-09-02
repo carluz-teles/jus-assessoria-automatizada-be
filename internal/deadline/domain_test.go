@@ -125,6 +125,8 @@ type mockRepo struct {
 	gotActionItemCourtRecordID string
 	gotActionItemTenantID      string
 	actionItemCourtRecordCalls int
+	taskIDByActionItem         string
+	taskIDByActionItemErr      error
 
 	// herança intimação → tarefa (POST /v1/tasks snapshot). intimationAssignee backs
 	// GetIntimationAssignee's answer (nil = unassigned intimação); intimationAssigneeErr
@@ -508,6 +510,12 @@ func (m *mockRepo) InsertTask(_ context.Context, _ database.Tx, t *Task) (*Task,
 	saved.ID = uuid.NewString()
 	m.insertedTasks = append(m.insertedTasks, &saved)
 	return &saved, nil
+}
+
+// GetTaskIDByActionItem returns the configured existing task id (the idempotent fallback the
+// synchronous providência→tarefa path reads on an InsertTask conflict).
+func (m *mockRepo) GetTaskIDByActionItem(_ context.Context, _ database.Tx, _, _ string) (string, error) {
+	return m.taskIDByActionItem, m.taskIDByActionItemErr
 }
 
 // GetTaskForUpdate returns the configured editable state and records the (id, tenant) scoping so

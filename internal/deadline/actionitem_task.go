@@ -4,86 +4,75 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jusassessoria/platform/internal/actionitem"
 	"github.com/jusassessoria/platform/lib/database"
 )
 
-// actionitem_task.go closes the providência → tarefa loop (docs/erd-costura-providencia-
-// tarefa-peca.md §2/§6, the Architect's "Listener-driven" decision): when actionitem.created
-// fires (a declarado/manual providência, born confiável) OR actionitem.confirmed fires (an
-// ia-inferred one just confirmed), this slice creates the task AUTOMATICALLY — no HTTP call
-// from the FE. Both events funnel through the SAME core (createTaskFromActionItem) because
-// their downstream effect is identical; only the emitting moment differs (materialization vs.
-// human confirmation). It REUSES the tasks.go write path's shape (InsertTask + task.created
-// in the SAME tx) rather than forking a parallel task-creation path.
-
-// consumerActionItemTask is the processed_event consumer this slice dedups
-// actionitem.created/confirmed under. Dedup is per-consumer (docs §4c.3), kept distinct from
-// consumerDeadline/consumerReconcile so this new consumption never collides with the
-// intimation-derived flows on the same event id space.
-const consumerActionItemTask = "deadline.action_item_task"
-
-// OnActionItemCreated is actionitem.created's handler: the providência was born already
-// confiável (declarado/manual), so its task is created right away. Delegates to the shared
-// core; see createTaskFromActionItem for the steps.
-func (uc *UseCase) OnActionItemCreated(ctx context.Context, ev ActionItemFact) error {
-	return uc.createTaskFromActionItem(ctx, ev)
-}
-
-// OnActionItemConfirmed is actionitem.confirmed's handler: an ia-inferred providência just
-// turned confiável by the lawyer's hand, so its task is created NOW (deferred from
-// materialization time). Same downstream effect as OnActionItemCreated — delegates to the
-// same shared core.
-func (uc *UseCase) OnActionItemConfirmed(ctx context.Context, ev ActionItemFact) error {
-	return uc.createTaskFromActionItem(ctx, ev)
-}
-
-// createTaskFromActionItem is the shared core behind both actionitem.created and
-// actionitem.confirmed (docs §6's fluxo): in ONE tenant-scoped tx it dedups, reads the
-// providência's court_record_id (decisão P1 — the event payload does not carry it),
-// persists a task titled after the providência's tipo, born OPEN/RULE, and emits
-// task.created carrying the action_item_id — so internal/actionitem's own listener can
-// write the reverse pointer on ITS table.
+// actionitem_task.go implements the SYNCHRONOUS half of the providência → tarefa loop
+// (docs/erd-costura-providencia-tarefa-peca.md §2/§6, revisão síncrona): internal/actionitem
+// creates the task INSIDE its own request/worker tx by calling actionitem.TaskCreator, and this
+// slice is the impl injected there (WithTaskCreator). The old async path (consume
+// actionitem.created/confirmed → InsertTask → emit task.created → actionitem consumes it to link)
+// is gone — the event hop fell into a queue nobody drained, so the task_id never got linked and a
+// user-driven confirm could stall behind backlog. Now the task write + the reverse-pointer link
+// commit in ONE tx, no fila.
 //
-// Every providência gets a task, gera_peca or not (docs §2: "há o quê fazer: dar-se por
-// ciente" — a ciência-only item still needs a task, just with draft_id left NULL, which is a
-// LATER slice's concern; this slice never sets draft_id). Idempotent via 0087's UNIQUE
-// (action_item_id): a redelivered event that got past the dedup mark (e.g. a crash between
-// commit and ack) still cannot mint a second task — InsertTask's ON CONFLICT DO NOTHING
-// yields ErrTaskExistsForActionItem, treated here as a safe no-op.
-func (uc *UseCase) createTaskFromActionItem(ctx context.Context, ev ActionItemFact) error {
-	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
-		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerActionItemTask, ev.EventID)
-		if err != nil {
-			return err
-		}
-		if seen {
-			return nil
-		}
+// It REUSES tasks.go's InsertTask write shape (born OPEN/RULE, task.action_item_id set), so an
+// automatic task and a manual one are the same row.
 
-		courtRecordID, err := uc.repo.GetActionItemCourtRecordID(ctx, tx, ev.TenantID, ev.ActionItemID)
-		if err != nil {
-			return err
-		}
+// taskCreatorRepo is the narrow subset of the deadline Repository this adapter needs — the same
+// *pgRepository the rest of the slice uses. Kept as a local interface so the adapter can be unit-
+// tested with a fake without dragging the whole Repository surface in.
+type taskCreatorRepo interface {
+	InsertTask(ctx context.Context, tx database.Tx, t *Task) (*Task, error)
+	GetTaskIDByActionItem(ctx context.Context, tx database.Tx, tenantID, actionItemID string) (string, error)
+}
 
-		saved, err := uc.repo.InsertTask(ctx, tx, &Task{
-			TenantID:      ev.TenantID,
-			CourtRecordID: courtRecordID,
-			DeadlineID:    derefString(ev.DeadlineID),
-			IntimationID:  ev.IntimationID,
-			Title:         ev.Tipo,
-			Status:        TaskStatusOpen,
-			Source:        SourceRule,
-			ActionItemID:  ev.ActionItemID,
-		})
-		if errors.Is(err, ErrTaskExistsForActionItem) {
-			// The dedup mark above still commits, so a genuine redelivery never reaches here
-			// again; this guards the rarer crash-after-commit-before-ack window.
-			return nil
-		}
-		if err != nil {
-			return err
-		}
+// ActionItemTaskCreator adapts the deadline slice to actionitem.TaskCreator: it mints (or finds)
+// the tarefa of a confiável providência inside the actionitem use case's tx. It is stateless save
+// the repo it delegates to; the api/worker composition constructs one and passes it via
+// actionitem.WithTaskCreator.
+type ActionItemTaskCreator struct {
+	repo taskCreatorRepo
+}
 
-		return uc.outbox.Publish(ctx, tx, newTaskCreatedFromTask(saved))
+// Compile-time proof the adapter satisfies the port defined in internal/actionitem.
+var _ actionitem.TaskCreator = (*ActionItemTaskCreator)(nil)
+
+// NewActionItemTaskCreator wires the adapter to a Repository (NewRepository() in production).
+func NewActionItemTaskCreator(repo taskCreatorRepo) *ActionItemTaskCreator {
+	return &ActionItemTaskCreator{repo: repo}
+}
+
+// CreateForActionItem persists the task for a confiável providência in the CALLER's tx and
+// returns its id — born OPEN/RULE, titled after the providência's tipo, inheriting the context
+// FKs the actionitem row already carries (so no cross-table read is needed: the caller passes
+// court_record_id directly, unlike the old async path that had to re-read it). Every providência
+// gets a task, gera_peca or not (docs §2: "há o quê fazer: dar-se por ciente").
+//
+// Idempotent via migration 0087's UNIQUE (action_item_id): a second call for the same
+// action_item (a re-confirm, a re-materialization that got past dedup) hits ON CONFLICT DO
+// NOTHING → ErrTaskExistsForActionItem, and this reads back the existing task id instead of
+// minting a second. No event is emitted here — the link is written synchronously by the caller
+// (actionitem.LinkTask), not by a downstream listener.
+func (c *ActionItemTaskCreator) CreateForActionItem(ctx context.Context, tx database.Tx, in actionitem.ActionItemTask) (string, error) {
+	saved, err := c.repo.InsertTask(ctx, tx, &Task{
+		TenantID:      in.TenantID,
+		CourtRecordID: in.CourtRecordID,
+		DeadlineID:    in.DeadlineID,
+		IntimationID:  in.IntimationID,
+		Title:         in.Tipo,
+		Status:        TaskStatusOpen,
+		Source:        SourceRule,
+		ActionItemID:  in.ActionItemID,
 	})
+	if errors.Is(err, ErrTaskExistsForActionItem) {
+		// The task already exists for this providência (0087's UNIQUE) — return its id so the
+		// caller links the SAME task, never a duplicate.
+		return c.repo.GetTaskIDByActionItem(ctx, tx, in.TenantID, in.ActionItemID)
+	}
+	if err != nil {
+		return "", err
+	}
+	return saved.ID, nil
 }

@@ -135,7 +135,11 @@ const (
 // the old ai_providencias-jsonb "kind" chip (PECA≈true, CIENCIA≈false) now that the providência
 // is a real relational row, not a jsonb blob — the FE derives the chip from GeraPeca.
 type IntimacaoProvidenciaView struct {
-	ID              string   `json:"id"`
+	ID string `json:"id"`
+	// Title/Description são o texto da providência gerado pela IA e persistido no action_item
+	// (migration 0090). Nullable — null para itens antigos (pré-0090) ou análise degradada.
+	Title           *string  `json:"title"`
+	Description     *string  `json:"description"`
 	Tipo            string   `json:"tipo"`
 	GeraPeca        bool     `json:"gera_peca"`
 	PieceProfileKey *string  `json:"piece_profile_key"`

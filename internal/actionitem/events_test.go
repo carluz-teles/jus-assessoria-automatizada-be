@@ -31,8 +31,8 @@ func TestIntimationAnalyzed_ContractRoundTrip(t *testing.T) {
 		CourtRecordID: uuid.NewString(),
 		DeadlineID:    uuid.NewString(),
 		Providencias: []acquisition.ProvidenciaCandidate{
-			{Tipo: "contestar", GeraPeca: true, PieceProfileKey: &profileKey, Declarado: true},
-			{Tipo: "manifestar", GeraPeca: false, PieceProfileKey: nil, Declarado: false, Confianca: &confianca},
+			{Title: "Contestar a ação", Description: "Prazo de 15 dias", Tipo: "contestar", GeraPeca: true, PieceProfileKey: &profileKey, Declarado: true},
+			{Title: "Manifestar-se", Description: "", Tipo: "manifestar", GeraPeca: false, PieceProfileKey: nil, Declarado: false, Confianca: &confianca},
 		},
 	}
 
@@ -66,6 +66,12 @@ func TestIntimationAnalyzed_ContractRoundTrip(t *testing.T) {
 	}
 	for i, want := range producer.Providencias {
 		got := got.Providencias[i]
+		if got.Title != want.Title {
+			t.Errorf("Providencias[%d].Title = %q, want %q", i, got.Title, want.Title)
+		}
+		if got.Description != want.Description {
+			t.Errorf("Providencias[%d].Description = %q, want %q", i, got.Description, want.Description)
+		}
 		if got.Tipo != want.Tipo {
 			t.Errorf("Providencias[%d].Tipo = %q, want %q", i, got.Tipo, want.Tipo)
 		}

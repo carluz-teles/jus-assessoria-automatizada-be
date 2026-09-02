@@ -229,6 +229,12 @@ type Querier interface {
 	// is carried so the edit can enforce ERD §4's due_date ≤ end_date invariant when it touches
 	// the task's own date.
 	GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdateParams) (GetTaskForUpdateRow, error)
+	// Reads the id of the task already bound to an action_item, scoped to tenant_id (barrier 1) —
+	// the idempotent read the SYNCHRONOUS providência→tarefa path falls back to when InsertTask's
+	// ON CONFLICT (action_item_id) DO NOTHING yields no row (the task exists from a prior confirm/
+	// materialization). Returns the existing task id so the caller can link it without minting a
+	// second. A miss is pgx.ErrNoRows (mapped to a typed error), never a silent "".
+	GetTaskIDByActionItem(ctx context.Context, arg GetTaskIDByActionItemParams) (uuid.UUID, error)
 	// Load a checklist item's current {title, done} before the partial PATCH (PATCH
 	// /v1/tasks/:id/items/:itemId), keyed by (item id, parent task id) and scoped to tenant_id
 	// (barrier 1). Binding task_id too means an itemId under a DIFFERENT task is a miss (→ 404),

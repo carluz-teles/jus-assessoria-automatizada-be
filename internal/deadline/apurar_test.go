@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/jusassessoria/platform/lib/apperr"
 )
 
 // --- fixtures ---------------------------------------------------------------
@@ -157,42 +159,50 @@ func TestApurarDivergencia_AceitaCalculado(t *testing.T) {
 	}
 }
 
-// TestApurarDivergencia_AjusteManual verifies the ajuste_manual branch: it merges the command's
-// partial patch over the stored state and REUSES resolveStart/computeWithExtra (via
-// UpdateDeadlineAdjust) exactly like Adjust — the SAME recompute idiom, not a raw date override.
+// TestApurarDivergencia_AjusteManual verifies the ajuste_manual branch: end_date is set DIRECTLY
+// to the lawyer-picked data fatal (no recompute from days/counting), prazo_interno is recomputed
+// from that SAME new end_date via UpdateDeadlineEndDate (exactly like aceita_declarado), the
+// decision + selo flip are recorded, and deadline.seal_assigned is emitted (confiavel).
 func TestApurarDivergencia_AjusteManual(t *testing.T) {
 	p := newAdjustParents()
 	start := time.Date(2024, 3, 4, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2024, 3, 18, 0, 0, 0, 0, time.UTC)
+	picked := time.Date(2024, 3, 20, 0, 0, 0, 0, time.UTC)
 	declared := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
 	calculated := time.Date(2024, 3, 25, 0, 0, 0, 0, time.UTC)
+	prazoInterno := time.Date(2024, 3, 18, 0, 0, 0, 0, time.UTC)
 
-	repo := apurarRepo(p, storedDeadline(p, start, StatusOpen), divergentCrossValidation(declared, calculated), "TJSP")
-	prazoInterno := time.Date(2024, 3, 14, 0, 0, 0, 0, time.UTC)
-	cal := &fakeCalendar{endDate: end, subtractEndDate: prazoInterno}
-	uc := NewUseCase(repo, cal, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+	stored := storedDeadline(p, start, StatusOpen)
+	stored.Selo = SealAApurar
+	repo := apurarRepo(p, stored, divergentCrossValidation(declared, calculated), "TJSP")
+	cal := &fakeCalendar{subtractEndDate: prazoInterno}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{})
 
 	res, err := uc.ApurarDivergencia(context.Background(), ApurarDivergenciaCommand{
 		TenantID: p.tenantID, UserID: p.userID, DeadlineID: p.deadlineID,
-		Decisao: decisaoAjusteManual, Days: ptr(10),
+		Decisao: decisaoAjusteManual, EndDate: &picked,
 	})
 	if err != nil {
 		t.Fatalf("ApurarDivergencia() error = %v", err)
 	}
-	if !res.EndDate.Equal(end) {
-		t.Errorf("EndDate = %v, want the recomputed %v", res.EndDate, end)
+	if !res.EndDate.Equal(picked) {
+		t.Errorf("EndDate = %v, want the picked data fatal %v", res.EndDate, picked)
 	}
-	if repo.updateAdjustCalls != 1 || repo.gotUpdateAdjustParams.Days != 10 {
-		t.Errorf("UpdateDeadlineAdjust calls=%d days=%d, want 1/10", repo.updateAdjustCalls, repo.gotUpdateAdjustParams.Days)
+	if repo.updateEndDateCalls != 1 || !repo.gotUpdateEndDate.Equal(picked) {
+		t.Errorf("UpdateDeadlineEndDate calls=%d got=%v, want 1 call with %v", repo.updateEndDateCalls, repo.gotUpdateEndDate, picked)
 	}
-	if !repo.gotUpdateAdjustParams.PrazoInterno.Equal(prazoInterno) {
-		t.Errorf("UpdateDeadlineAdjust prazo_interno = %v, want %v (recomputed from the SAME new end_date)", repo.gotUpdateAdjustParams.PrazoInterno, prazoInterno)
+	// The internal buffer must be recomputed from the SAME picked end_date, via the branch's uf/court.
+	if !repo.gotUpdateEndDatePrazoInterno.Equal(prazoInterno) {
+		t.Errorf("UpdateDeadlineEndDate prazo_interno = %v, want %v", repo.gotUpdateEndDatePrazoInterno, prazoInterno)
 	}
-	if cal.subtractCalls != 1 || !cal.gotSubtractArgs.start.Equal(end) {
-		t.Errorf("SubtractBusinessDays calls=%d start=%v, want 1 call from the recomputed end_date %v", cal.subtractCalls, cal.gotSubtractArgs.start, end)
+	if cal.subtractCalls != 1 || !cal.gotSubtractArgs.start.Equal(picked) {
+		t.Errorf("SubtractBusinessDays calls=%d start=%v, want 1 call from the picked end_date %v", cal.subtractCalls, cal.gotSubtractArgs.start, picked)
 	}
-	if repo.updateEndDateCalls != 0 {
-		t.Errorf("UpdateDeadlineEndDate calls = %d, want 0 (ajuste_manual writes via UpdateDeadlineAdjust)", repo.updateEndDateCalls)
+	if repo.updateAdjustCalls != 0 {
+		t.Errorf("UpdateDeadlineAdjust calls = %d, want 0 (ajuste_manual sets end_date directly, no recompute)", repo.updateAdjustCalls)
+	}
+	if repo.gotUpdateSelo != SealConfiavel {
+		t.Errorf("UpdateDeadlineSelo selo = %q, want %q", repo.gotUpdateSelo, SealConfiavel)
 	}
 	if repo.gotUpdateSeloConfirmedBy != p.userID {
 		t.Errorf("UpdateDeadlineSelo confirmedBy = %q, want the acting user %q", repo.gotUpdateSeloConfirmedBy, p.userID)
@@ -200,6 +210,47 @@ func TestApurarDivergencia_AjusteManual(t *testing.T) {
 	wantDetalhe := "Divergência apurada: ajuste manual aplicado"
 	if repo.gotDeadlineEvent == nil || repo.gotDeadlineEvent.Detalhe != wantDetalhe {
 		t.Errorf("deadline_event.Detalhe = %q, want %q", repo.gotDeadlineEvent.Detalhe, wantDetalhe)
+	}
+	if len(outbox.published) != 1 {
+		t.Fatalf("published events = %d, want 1 (deadline.seal_assigned)", len(outbox.published))
+	}
+}
+
+// TestApurarDivergencia_AjusteManual_MissingEndDate verifies a nil end_date on ajuste_manual is
+// rejected as invalid (the guard inside the branch — belt to the edge validation).
+func TestApurarDivergencia_AjusteManual_MissingEndDate(t *testing.T) {
+	p := newAdjustParents()
+	start := time.Date(2024, 3, 4, 0, 0, 0, 0, time.UTC)
+	declared := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	calculated := time.Date(2024, 3, 25, 0, 0, 0, 0, time.UTC)
+	repo := apurarRepo(p, storedDeadline(p, start, StatusOpen), divergentCrossValidation(declared, calculated), "TJSP")
+	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	_, err := uc.ApurarDivergencia(context.Background(), ApurarDivergenciaCommand{
+		TenantID: p.tenantID, UserID: p.userID, DeadlineID: p.deadlineID, Decisao: decisaoAjusteManual,
+	})
+	if ae, ok := apperr.From(err); !ok || ae.Kind != apperr.KindInvalid {
+		t.Errorf("error = %v, want a KindInvalid (end_date required)", err)
+	}
+}
+
+// TestApurarDivergencia_AjusteManual_EndDateBeforeStart verifies a picked end_date on/before the
+// termo inicial is rejected as invalid.
+func TestApurarDivergencia_AjusteManual_EndDateBeforeStart(t *testing.T) {
+	p := newAdjustParents()
+	start := time.Date(2024, 3, 4, 0, 0, 0, 0, time.UTC)
+	before := time.Date(2024, 3, 4, 0, 0, 0, 0, time.UTC) // == start, not after
+	declared := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	calculated := time.Date(2024, 3, 25, 0, 0, 0, 0, time.UTC)
+	repo := apurarRepo(p, storedDeadline(p, start, StatusOpen), divergentCrossValidation(declared, calculated), "TJSP")
+	uc := NewUseCase(repo, &fakeCalendar{}, &fakeOutbox{}, &fakeDedup{}, &fakeUOW{})
+
+	_, err := uc.ApurarDivergencia(context.Background(), ApurarDivergenciaCommand{
+		TenantID: p.tenantID, UserID: p.userID, DeadlineID: p.deadlineID,
+		Decisao: decisaoAjusteManual, EndDate: &before,
+	})
+	if ae, ok := apperr.From(err); !ok || ae.Kind != apperr.KindInvalid {
+		t.Errorf("error = %v, want a KindInvalid (end_date must be after start)", err)
 	}
 }
 

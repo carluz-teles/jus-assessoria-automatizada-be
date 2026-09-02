@@ -33,9 +33,9 @@ type Repository interface {
 	// the fresh candidates in the SAME tx.
 	DeleteReplaceableActionItems(ctx context.Context, tx database.Tx, tenantID, intimationID string) error
 	// ExistsActionItemByTipo reports whether a committed candidate already exists for
-	// (tenantID, intimationID, tipo, tipoOrigem) — the dedup guard against re-analysis
-	// duplicating a confiável (declarado/manual) item every run.
-	ExistsActionItemByTipo(ctx context.Context, tx database.Tx, tenantID, intimationID, tipo string, tipoOrigem TipoOrigem) (bool, error)
+	// (tenantID, intimationID, tipo) — the dedup guard against re-analysis duplicating a
+	// providência of the same tipo, regardless of origem (declarado ⇄ ia).
+	ExistsActionItemByTipo(ctx context.Context, tx database.Tx, tenantID, intimationID, tipo string) (bool, error)
 	// LinkTask writes the reverse pointer once deadline's listener has created the task for
 	// this providência (task.created carrying action_item_id): task_id + status→CONFIRMED,
 	// guarded by task_id IS NULL (fatia 3, docs §2/§6). A redelivered event or a missing/
@@ -78,6 +78,8 @@ func (r *pgRepository) InsertActionItem(ctx context.Context, tx database.Tx, a *
 		TenantID:        tenant,
 		IntimationID:    intimationID,
 		CourtRecordID:   pgOptionalUUID(a.CourtRecordID),
+		Title:           textToNull(a.Title),
+		Description:     textToNull(a.Description),
 		Tipo:            a.Tipo,
 		GeraPeca:        a.GeraPeca,
 		PieceProfileKey: textToNull(a.PieceProfileKey),
@@ -201,7 +203,7 @@ func (r *pgRepository) LinkTask(ctx context.Context, tx database.Tx, tenantID, a
 	return fromRow(row), nil
 }
 
-func (r *pgRepository) ExistsActionItemByTipo(ctx context.Context, tx database.Tx, tenantID, intimationID, tipo string, tipoOrigem TipoOrigem) (bool, error) {
+func (r *pgRepository) ExistsActionItemByTipo(ctx context.Context, tx database.Tx, tenantID, intimationID, tipo string) (bool, error) {
 	tenant, err := parseUUID(tenantID)
 	if err != nil {
 		return false, err
@@ -214,7 +216,6 @@ func (r *pgRepository) ExistsActionItemByTipo(ctx context.Context, tx database.T
 		TenantID:     tenant,
 		IntimationID: iid,
 		Tipo:         tipo,
-		TipoOrigem:   string(tipoOrigem),
 	})
 	if err != nil {
 		return false, database.WrapInfra(err)

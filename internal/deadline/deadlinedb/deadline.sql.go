@@ -686,6 +686,30 @@ func (q *Queries) GetTaskForUpdate(ctx context.Context, arg GetTaskForUpdatePara
 	return i, err
 }
 
+const getTaskIDByActionItem = `-- name: GetTaskIDByActionItem :one
+SELECT id
+FROM task
+WHERE action_item_id = $1
+  AND tenant_id = $2
+`
+
+type GetTaskIDByActionItemParams struct {
+	ActionItemID pgtype.UUID `json:"action_item_id"`
+	TenantID     uuid.UUID   `json:"tenant_id"`
+}
+
+// Reads the id of the task already bound to an action_item, scoped to tenant_id (barrier 1) —
+// the idempotent read the SYNCHRONOUS providência→tarefa path falls back to when InsertTask's
+// ON CONFLICT (action_item_id) DO NOTHING yields no row (the task exists from a prior confirm/
+// materialization). Returns the existing task id so the caller can link it without minting a
+// second. A miss is pgx.ErrNoRows (mapped to a typed error), never a silent "".
+func (q *Queries) GetTaskIDByActionItem(ctx context.Context, arg GetTaskIDByActionItemParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getTaskIDByActionItem, arg.ActionItemID, arg.TenantID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getTaskItemForUpdate = `-- name: GetTaskItemForUpdate :one
 SELECT id, task_id, title, done
 FROM task_item

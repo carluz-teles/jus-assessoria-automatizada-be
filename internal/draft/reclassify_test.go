@@ -184,7 +184,7 @@ func (f *fakeActionItemRepoForDraft) DeleteReplaceableActionItems(context.Contex
 	return nil
 }
 
-func (f *fakeActionItemRepoForDraft) ExistsActionItemByTipo(context.Context, database.Tx, string, string, string, actionitem.TipoOrigem) (bool, error) {
+func (f *fakeActionItemRepoForDraft) ExistsActionItemByTipo(context.Context, database.Tx, string, string, string) (bool, error) {
 	return false, nil
 }
 

@@ -36,6 +36,13 @@ type UseCase struct {
 	dedup  deduper
 	uow    UnitOfWork
 	now    func() time.Time
+	// taskCreator is the SYNCHRONOUS port that mints (or finds) the tarefa of a confiável
+	// providência inside the SAME tx — injected via WithTaskCreator by the api/worker
+	// composition (internal/deadline's ActionItemTaskCreator). When nil, the slice falls back
+	// to the legacy async path (emit actionitem.created/confirmed and let a listener create the
+	// task later); both production call sites inject it, so the fallback only survives for tests
+	// that don't wire it.
+	taskCreator TaskCreator
 }
 
 // Option configures a UseCase at construction.
@@ -45,6 +52,13 @@ type Option func(*UseCase)
 // leaves the default (time.Now); tests pin it for deterministic assertions.
 func WithClock(now func() time.Time) Option {
 	return func(uc *UseCase) { uc.now = now }
+}
+
+// WithTaskCreator injects the synchronous task-creation port (internal/deadline's adapter in
+// production). Both call sites (cmd/api confirmar, cmd/worker-ingestao materialization) pass
+// it; a UseCase built without it degrades to the legacy async event emission.
+func WithTaskCreator(tc TaskCreator) Option {
+	return func(uc *UseCase) { uc.taskCreator = tc }
 }
 
 // NewUseCase wires the use case to its repository, outbox publisher, dedup guard and unit
@@ -106,7 +120,7 @@ func (uc *UseCase) materializeCandidate(ctx context.Context, tx database.Tx, ev 
 	tipo, geraPeca, pieceProfileKey := sanitizeCandidate(c.Tipo, c.GeraPeca, derefString(c.PieceProfileKey))
 	tipoOrigem, tipoStatus := deriveTipoOrigemStatus(c.Declarado)
 
-	exists, err := uc.repo.ExistsActionItemByTipo(ctx, tx, ev.TenantID, ev.IntimationID, tipo, tipoOrigem)
+	exists, err := uc.repo.ExistsActionItemByTipo(ctx, tx, ev.TenantID, ev.IntimationID, tipo)
 	if err != nil {
 		return err
 	}
@@ -125,6 +139,8 @@ func (uc *UseCase) materializeCandidate(ctx context.Context, tx database.Tx, ev 
 		TenantID:        ev.TenantID,
 		IntimationID:    ev.IntimationID,
 		CourtRecordID:   ev.CourtRecordID,
+		Title:           c.Title,
+		Description:     c.Description,
 		Tipo:            tipo,
 		GeraPeca:        geraPeca,
 		PieceProfileKey: pieceProfileKey,
@@ -145,10 +161,52 @@ func (uc *UseCase) materializeCandidate(ctx context.Context, tx database.Tx, ev 
 		return err
 	}
 
+	// Only a confiável (declarado/manual) candidate gets its task NOW. An IA candidate
+	// (a_confirmar) waits for Confirmar. A ciência-only item still gets a task (docs §2:
+	// "há o quê fazer: dar-se por ciente").
 	if tipoStatus != TipoStatusConfiavel {
 		return nil
 	}
-	return uc.outbox.Publish(ctx, tx, newActionItemCreated(saved))
+	_, err = uc.createAndLinkTask(ctx, tx, saved)
+	return err
+}
+
+// createAndLinkTask is the SYNCHRONOUS providência→tarefa core shared by materializeCandidate
+// (declarado, born confiável) and Confirmar (IA item just confirmed): inside the caller's tx it
+// asks the injected TaskCreator to mint (or find, idempotently) the task, then writes the
+// reverse pointer onto THIS slice's row (task_id + status=CONFIRMED via LinkTask). Both the task
+// and the pointer commit together with the action_item change — no async hop, no fila that could
+// starve a user-driven action. Returns the linked item.
+//
+// Falls back to the legacy async path (emit the event) ONLY when no TaskCreator was injected —
+// production always injects one; this keeps unit tests that don't wire it source-compatible.
+func (uc *UseCase) createAndLinkTask(ctx context.Context, tx database.Tx, item *ActionItem) (*ActionItem, error) {
+	if uc.taskCreator == nil {
+		return item, uc.outbox.Publish(ctx, tx, newActionItemCreated(item))
+	}
+
+	taskID, err := uc.taskCreator.CreateForActionItem(ctx, tx, ActionItemTask{
+		TenantID:      item.TenantID,
+		ActionItemID:  item.ID,
+		CourtRecordID: item.CourtRecordID,
+		DeadlineID:    item.DeadlineID,
+		IntimationID:  item.IntimationID,
+		Tipo:          item.Tipo,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	linked, err := uc.repo.LinkTask(ctx, tx, item.TenantID, item.ID, taskID)
+	if errors.Is(err, ErrActionItemNotFound) {
+		// The row is already linked/gone — a safe no-op (mirrors the old async listener's
+		// treatment of a redelivered task.created). Return the item as it stands.
+		return item, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return linked, nil
 }
 
 // Confirmar is POST /v1/action-items/:id/confirmar: tipo_status a_confirmar → confiável,
@@ -166,19 +224,29 @@ func (uc *UseCase) Confirmar(ctx context.Context, tenantID, id string) (*ActionI
 		if item.Status == StatusDiscarded {
 			return ErrActionItemDiscarded
 		}
-		if item.TipoStatus == TipoStatusConfiavel {
+		// Already confiável WITH a task linked → nothing left to do (idempotent no-op).
+		if item.TipoStatus == TipoStatusConfiavel && item.TaskID != "" {
 			result = item
 			return nil
 		}
 
-		confirmed, err := uc.repo.ConfirmActionItem(ctx, tx, tenantID, id)
+		// Flip a_confirmar→confiável (skipped if it is already confiável but somehow unlinked —
+		// then we only need to create+link its task now).
+		confirmed := item
+		if item.TipoStatus != TipoStatusConfiavel {
+			confirmed, err = uc.repo.ConfirmActionItem(ctx, tx, tenantID, id)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Create the task and write the reverse pointer SYNCHRONOUSLY in this same tx — no
+		// actionitem.confirmed event, no async hop (the user is waiting on this action).
+		linked, err := uc.createAndLinkTask(ctx, tx, confirmed)
 		if err != nil {
 			return err
 		}
-		if err := uc.outbox.Publish(ctx, tx, newActionItemConfirmed(confirmed)); err != nil {
-			return err
-		}
-		result = confirmed
+		result = linked
 		return nil
 	})
 	if err != nil {
@@ -287,42 +355,6 @@ func (uc *UseCase) Reclassificar(ctx context.Context, tenantID, id, pieceProfile
 		return nil, err
 	}
 	return result, nil
-}
-
-// consumerTaskCreated is the processed_event consumer this slice dedups deadline's
-// task.created under (docs §4c.3) — distinct from consumerIntimationAnalyzed so marking here
-// never blocks that other consumption of a DIFFERENT event.
-const consumerTaskCreated = "actionitem.task_created"
-
-// OnTaskCreated is deadline.task.created's handler — the reverse half of the providência→
-// tarefa loop (docs §2/§6, fatia 3): when the task carries an action_item_id, this writes
-// task_id + status=CONFIRMED onto THIS slice's own action_item row (never deadline's task
-// row — each slice only ever writes its own table). A task.created with no action_item_id
-// (the vast majority: manual/avulsa tasks) is skipped before any tx opens — not this slice's
-// concern, and never worth a dedup mark.
-func (uc *UseCase) OnTaskCreated(ctx context.Context, ev TaskCreated) error {
-	if ev.ActionItemID == "" {
-		return nil
-	}
-	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
-		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerTaskCreated, ev.EventID)
-		if err != nil {
-			return err
-		}
-		if seen {
-			return nil
-		}
-
-		_, err = uc.repo.LinkTask(ctx, tx, ev.TenantID, ev.ActionItemID, ev.TaskID)
-		if errors.Is(err, ErrActionItemNotFound) {
-			// Redelivered past the dedup mark (e.g. a crash between commit and ack), or a
-			// genuinely gone action_item — either way task_id is already linked/irrelevant, a
-			// safe no-op (mirrors deadline's own OnIntimationCancelled treatment of its
-			// not-found).
-			return nil
-		}
-		return err
-	})
 }
 
 // clampConfianca keeps a classifier-reported confidence within [0, 1] — a nil input passes

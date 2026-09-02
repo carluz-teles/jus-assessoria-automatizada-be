@@ -18,9 +18,9 @@ import (
 // touched here — the Architect's decision is that origem is immutable after creation (only
 // domain.go's OnIntimationObserved writes it); apurar.go only ever reads it back to stamp the
 // unchanged value onto the event. It mirrors adjust.go's shape (a UseCase method per command,
-// the SAME uow/outbox transactional-outbox pattern) and, for the ajuste_manual decisão, REUSES
-// adjust.go's private resolveStart/computeWithExtra helpers directly (not the public Adjust())
-// because the apuração must write cross_validation in the SAME tx.
+// the SAME uow/outbox transactional-outbox pattern); the ajuste_manual decisão sets a
+// lawyer-picked data fatal (end_date) directly — the SAME shape as aceita_declarado (a chosen
+// date), recomputing only the internal safety buffer in lockstep.
 
 // apurarDecisao is the closed set POST /v1/prazos/:id/apurar-divergencia accepts.
 type apurarDecisao string
@@ -85,20 +85,15 @@ func acaoLabel(a apurarTipoAcao) string {
 }
 
 // ApurarDivergenciaCommand is the apurar-divergencia input the handler builds from the request +
-// the verified principal (TenantID/UserID NEVER from the body). The AjusteManual* fields are
-// used ONLY when Decisao=="ajuste_manual", mirroring AdjustCommand's pointer-merge idiom (nil
-// keeps the prazo's stored value — a partial patch over the CURRENT {days, counting, doubled,
-// anchor_event, manual_extra_days}).
+// the verified principal (TenantID/UserID NEVER from the body). EndDate is used ONLY when
+// Decisao=="ajuste_manual": the specific data fatal the lawyer picked, set directly (NOT
+// recomputed from days/counting) — mirroring how aceita_declarado sets a chosen date.
 type ApurarDivergenciaCommand struct {
-	TenantID        string
-	UserID          string
-	DeadlineID      string
-	Decisao         apurarDecisao
-	Days            *int
-	Counting        *Counting
-	Doubled         *bool
-	AnchorEvent     *AnchorEvent
-	ManualExtraDays *int
+	TenantID   string
+	UserID     string
+	DeadlineID string
+	Decisao    apurarDecisao
+	EndDate    *time.Time
 }
 
 // ApuradoDivergencia is the apurar-divergencia outcome: the prazo's (possibly recomputed)
@@ -131,7 +126,7 @@ type ApuradoTipo struct {
 // ApurarDivergencia resolves a declarado×calculado divergência (§"Divergência"): the human
 // picks aceita_declarado (end_date := cross_validation.data_declarada, no recompute),
 // aceita_calculado (end_date left as-is — it already IS the calculado date), or ajuste_manual
-// (a fresh recompute via the SAME resolveStart/computeWithExtra idiom Adjust uses). All three
+// (end_date := the lawyer-picked data fatal, set directly — no recompute). All three
 // branches then record the decisão + flip selo → confiavel + append a deadline_event + emit
 // deadline.seal_assigned, in ONE tenant-scoped tx.
 //
@@ -185,11 +180,27 @@ func (uc *UseCase) ApurarDivergencia(ctx context.Context, cmd ApurarDivergenciaC
 			// newEndDate already defaults to cv.DataCalculada; nothing to write — the stored
 			// end_date already IS the calculado date.
 		case decisaoAjusteManual:
-			endDate, err := uc.apurarAjusteManual(ctx, tx, cmd, cur)
+			// The lawyer picks a specific data fatal directly — set it as-is (no recompute),
+			// exactly like decisaoAceitaDeclarado sets cv.DataDeclarada.
+			if cmd.EndDate == nil {
+				return apperr.NewInvalid("end_date é obrigatório para ajuste manual")
+			}
+			newEndDate = *cmd.EndDate
+			if !newEndDate.After(cur.StartDate) {
+				return apperr.NewInvalid("a data do prazo deve ser posterior ao termo inicial")
+			}
+			court, err := uc.repo.GetCourtRecordCourt(ctx, tx, cmd.TenantID, cur.CourtRecordID)
 			if err != nil {
 				return err
 			}
-			newEndDate = endDate
+			uf := tribunal.UF(court)
+			prazoInterno, _, err := uc.cal.SubtractBusinessDays(ctx, newEndDate, internalBufferBusinessDays, uf, court)
+			if err != nil {
+				return err
+			}
+			if err := uc.repo.UpdateDeadlineEndDate(ctx, tx, cmd.TenantID, cmd.DeadlineID, newEndDate, prazoInterno); err != nil {
+				return err
+			}
 		}
 
 		if err := uc.repo.UpdateCrossValidationDecision(ctx, tx, cmd.TenantID, cmd.DeadlineID, string(cmd.Decisao), cmd.UserID); err != nil {
@@ -223,79 +234,6 @@ func (uc *UseCase) ApurarDivergencia(ctx context.Context, cmd ApurarDivergenciaC
 		return ApuradoDivergencia{}, err
 	}
 	return result, nil
-}
-
-// apurarAjusteManual is the ajuste_manual branch of ApurarDivergencia: it merges the command's
-// partial patch over cur (nil keeps the stored value, mirroring Adjust's merge), then REUSES
-// resolveStart + computeWithExtra (adjust.go/domain.go's private recompute idiom) directly —
-// NOT the public Adjust(), because ApurarDivergencia needs the SAME tx to also write
-// cross_validation, which Adjust's signature does not carry.
-func (uc *UseCase) apurarAjusteManual(ctx context.Context, tx database.Tx, cmd ApurarDivergenciaCommand, cur *DeadlineForAdjust) (time.Time, error) {
-	days := cur.Days
-	if cmd.Days != nil {
-		days = *cmd.Days
-	}
-	counting := cur.Counting
-	if cmd.Counting != nil {
-		counting = *cmd.Counting
-	}
-	doubled := cur.Doubled
-	if cmd.Doubled != nil {
-		doubled = *cmd.Doubled
-	}
-	anchorEvent := cur.AnchorEvent
-	if cmd.AnchorEvent != nil {
-		anchorEvent = *cmd.AnchorEvent
-	}
-	manualExtraDays := cur.ManualExtraDays
-	if cmd.ManualExtraDays != nil {
-		manualExtraDays = *cmd.ManualExtraDays
-	}
-
-	court, err := uc.repo.GetCourtRecordCourt(ctx, tx, cmd.TenantID, cur.CourtRecordID)
-	if err != nil {
-		return time.Time{}, err
-	}
-	uf := tribunal.UF(court)
-
-	start, err := uc.resolveStart(ctx, tx, cur.IntimationID, cmd.TenantID, anchorEvent, cur.StartDate)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	endDate, holidays, err := uc.computeWithExtra(ctx, counting, start, days, doubled, manualExtraDays, uf, court)
-	if err != nil {
-		return time.Time{}, err
-	}
-	if !endDate.After(start) {
-		return time.Time{}, apperr.NewInvalid("deadline end date must be after start date")
-	}
-
-	// V1: recompute the internal safety buffer in lockstep with EndDate, via the SAME uf/
-	// court already resolved above — never left stale against the recomputed EndDate.
-	prazoInterno, _, err := uc.cal.SubtractBusinessDays(ctx, endDate, internalBufferBusinessDays, uf, court)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	if _, _, err := uc.repo.UpdateDeadlineAdjust(ctx, tx, UpdateDeadlineAdjustParams{
-		DeadlineID:      cmd.DeadlineID,
-		TenantID:        cmd.TenantID,
-		Kind:            cur.Kind,
-		Days:            days,
-		Counting:        counting,
-		Doubled:         doubled,
-		DoubledReason:   cur.DoubledReason,
-		EndDate:         endDate,
-		PrazoInterno:    prazoInterno,
-		HolidaysApplied: holidays,
-		StartDate:       start,
-		AnchorEvent:     anchorEvent,
-		ManualExtraDays: manualExtraDays,
-	}); err != nil {
-		return time.Time{}, err
-	}
-	return endDate, nil
 }
 
 // ApurarTipo confirms or reclassifies the IA-inferred tipo de ato (§"Fallback IA"): "confirmar"

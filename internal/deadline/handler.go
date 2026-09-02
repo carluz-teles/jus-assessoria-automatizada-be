@@ -450,7 +450,11 @@ func (h *Handler) apurarDivergencia(c *fiber.Ctx) error {
 		return httpx.WriteError(c, apperr.NewUnauthorized("missing principal"))
 	}
 
-	res, err := h.writer.ApurarDivergencia(c.UserContext(), req.toApurarDivergenciaCommand(p.TenantID, p.UserID, c.Params("id")))
+	cmd, err := req.toApurarDivergenciaCommand(p.TenantID, p.UserID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	res, err := h.writer.ApurarDivergencia(c.UserContext(), cmd)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}

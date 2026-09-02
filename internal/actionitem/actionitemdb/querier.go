@@ -25,9 +25,11 @@ type Querier interface {
 	DiscardActionItem(ctx context.Context, arg DiscardActionItemParams) (ActionItem, error)
 	// Dedup guard for the confiável (declarado/manual) candidates the delete above never
 	// clears: without it, re-running "Analisar" on an intimação whose teor keeps declaring the
-	// same providência would insert a duplicate confiável row every time. Scoped by
-	// (tenant, intimation, tipo, tipo_origem) — the listener skips inserting a candidate that
-	// already has a committed match on all four.
+	// same providência would insert a duplicate row every time. Scoped by (tenant, intimation,
+	// tipo) — DELIBERATELY NOT by tipo_origem: a providência is unique PER TIPO for the user, so
+	// a re-analysis that reclassifies the same tipo under a different origem (declarado ⇄ ia)
+	// must NOT mint a second visible row. The surviving item (a declarado/task-bound one the
+	// delete never clears) wins; the fresh candidate of that tipo is skipped.
 	ExistsActionItemByTipo(ctx context.Context, arg ExistsActionItemByTipoParams) (bool, error)
 	// One action_item by id, scoped to tenantID (barrier 1). A miss/foreign row → pgx.ErrNoRows
 	// → the repo's typed ErrActionItemNotFound, never (nil, nil). Backs both confirmar/descartar's

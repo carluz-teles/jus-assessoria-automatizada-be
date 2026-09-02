@@ -173,55 +173,46 @@ func (r AdjustRequest) toAdjustCommand(tenantID, userID, deadlineID string) Adju
 
 // ApurarDivergenciaRequest is the POST /v1/prazos/:id/apurar-divergencia body (V1,
 // docs/design-motor-de-prazos-v1.md §"Divergência"): the human's decision on a declarado×
-// calculado divergência. The AjusteManual* fields are used ONLY when Decisao=="ajuste_manual"
-// (a partial patch over the prazo's CURRENT {days, counting, doubled, anchor_event,
-// manual_extra_days}, mirroring AdjustRequest). tenant_id/user/the prazo id come from the
-// principal + path, never the body.
+// calculado divergência. EndDate is the specific data fatal the lawyer picks (wire date
+// 2006-01-02); it is REQUIRED ONLY when Decisao=="ajuste_manual" and ignored on the aceita_*
+// decisions. tenant_id/user/the prazo id come from the principal + path, never the body.
 type ApurarDivergenciaRequest struct {
-	Decisao         string  `json:"decisao"`
-	Days            *int    `json:"days"`
-	Counting        *string `json:"counting"`
-	Doubled         *bool   `json:"doubled"`
-	AnchorEvent     *string `json:"anchor_event"`
-	ManualExtraDays *int    `json:"manual_extra_days"`
+	Decisao string `json:"decisao"`
+	EndDate string `json:"end_date"`
 }
 
-// Validate enforces decisao ∈ {aceita_declarado, aceita_calculado, ajuste_manual} and the SAME
-// present-field rules AdjustRequest uses for the ajuste_manual fields (a PRESENT days/counting/
-// anchor_event/manual_extra_days must be well-formed; absent ones are a no-op).
+// Validate enforces decisao ∈ {aceita_declarado, aceita_calculado, ajuste_manual} and, when
+// decisao=="ajuste_manual", a REQUIRED well-formed wire date (2006-01-02) end_date. The aceita_*
+// decisions do not require end_date.
 func (r ApurarDivergenciaRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Decisao, validation.Required, validation.In(
 			string(decisaoAceitaDeclarado), string(decisaoAceitaCalculado), string(decisaoAjusteManual))),
-		validation.Field(&r.Days, validation.By(positiveDaysIfPresent)),
-		validation.Field(&r.Counting, validation.By(validCountingIfPresent)),
-		validation.Field(&r.AnchorEvent, validation.By(validAnchorIfPresent)),
-		validation.Field(&r.ManualExtraDays, validation.By(nonNegativeExtraDaysIfPresent)),
+		validation.Field(&r.EndDate,
+			validation.When(r.Decisao == string(decisaoAjusteManual), validation.Required),
+			validation.Date(time.DateOnly)),
 	)
 }
 
 // toApurarDivergenciaCommand maps the validated request + the principal's ids + the path id into
 // the use-case command. TenantID/UserID come from the principal and DeadlineID from the path
-// (never the body).
-func (r ApurarDivergenciaRequest) toApurarDivergenciaCommand(tenantID, userID, deadlineID string) ApurarDivergenciaCommand {
+// (never the body). When decisao=="ajuste_manual" the validated wire end_date is parsed into the
+// command's EndDate (nil on the aceita_* decisions).
+func (r ApurarDivergenciaRequest) toApurarDivergenciaCommand(tenantID, userID, deadlineID string) (ApurarDivergenciaCommand, error) {
 	cmd := ApurarDivergenciaCommand{
-		TenantID:        tenantID,
-		UserID:          userID,
-		DeadlineID:      deadlineID,
-		Decisao:         apurarDecisao(r.Decisao),
-		Days:            r.Days,
-		Doubled:         r.Doubled,
-		ManualExtraDays: r.ManualExtraDays,
+		TenantID:   tenantID,
+		UserID:     userID,
+		DeadlineID: deadlineID,
+		Decisao:    apurarDecisao(r.Decisao),
 	}
-	if r.Counting != nil {
-		c := Counting(*r.Counting)
-		cmd.Counting = &c
+	if r.Decisao == string(decisaoAjusteManual) {
+		parsed, err := time.Parse(time.DateOnly, r.EndDate)
+		if err != nil {
+			return ApurarDivergenciaCommand{}, apperr.NewInvalid("invalid end_date (want YYYY-MM-DD)")
+		}
+		cmd.EndDate = &parsed
 	}
-	if r.AnchorEvent != nil {
-		a := AnchorEvent(*r.AnchorEvent)
-		cmd.AnchorEvent = &a
-	}
-	return cmd
+	return cmd, nil
 }
 
 // ApurarTipoRequest is the POST /v1/prazos/:id/apurar-tipo body (V1, docs/design-motor-de-

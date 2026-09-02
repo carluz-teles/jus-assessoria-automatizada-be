@@ -13,7 +13,6 @@ import (
 // useCase is the port the listener delegates to.
 type useCase interface {
 	OnIntimationAnalyzed(ctx context.Context, ev IntimationAnalyzed) error
-	OnTaskCreated(ctx context.Context, ev TaskCreated) error
 }
 
 // Listener is the actionitem slice's asynq consumer — its only async entry point
@@ -31,12 +30,11 @@ func NewListener(uc useCase) *Listener {
 // Register mounts the slice's task handlers on the asynq mux. acquisition.intimation.
 // analyzed routes to the "ingestao" queue (lib/events' queueFor: every acquisition.*
 // event does), so this mounts on the SAME mux as acquisition's own listeners — no
-// dedicated server needed. task.created (fatia 3, the reverse half of the providência→
-// tarefa loop) also routes to "ingestao" (lib/events' queueFor routes the "task" prefix
-// there), so it rides the same mux too.
+// dedicated server needed. The providência→tarefa link is now SYNCHRONOUS (the use case
+// creates+links the task in-tx via the injected TaskCreator), so there is no longer a
+// task.created consumer here.
 func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeIntimationAnalyzed, l.handleIntimationAnalyzed)
-	mux.HandleFunc(TypeTaskCreated, l.handleTaskCreated)
 }
 
 // handleIntimationAnalyzed is the asynq.HandlerFunc for acquisition.intimation.analyzed.
@@ -51,24 +49,6 @@ func (l *Listener) handleIntimationAnalyzed(ctx context.Context, t *asynq.Task) 
 		return err
 	}
 	if err := l.uc.OnIntimationAnalyzed(ctx, ev); err != nil {
-		if isTerminal(err) {
-			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
-		}
-		return err
-	}
-	return nil
-}
-
-// handleTaskCreated is the asynq.HandlerFunc for deadline.task.created (fatia 3). It decodes
-// the LOCAL shape and hands off to the use case, which itself skips any event without an
-// action_item_id (this handler never filters — that decision belongs to the domain, not the
-// transport). Outcome mapping mirrors handleIntimationAnalyzed.
-func (l *Listener) handleTaskCreated(ctx context.Context, t *asynq.Task) error {
-	ev, err := events.Decode[TaskCreated](t)
-	if err != nil {
-		return err
-	}
-	if err := l.uc.OnTaskCreated(ctx, ev); err != nil {
 		if isTerminal(err) {
 			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 		}

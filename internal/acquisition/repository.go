@@ -2189,6 +2189,8 @@ func mapActionItemRows(rows []acquisitiondb.ListActionItemsByIntimationRow) []In
 	for _, row := range rows {
 		out = append(out, IntimacaoProvidenciaView{
 			ID:              row.ID.String(),
+			Title:           row.Title,
+			Description:     row.Description,
 			Tipo:            row.Tipo,
 			GeraPeca:        row.GeraPeca,
 			PieceProfileKey: row.PieceProfileKey,

@@ -18,19 +18,23 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jusassessoria/platform/internal/actionitem"
+	"github.com/jusassessoria/platform/internal/deadline"
 	"github.com/jusassessoria/platform/lib/database"
 	"github.com/jusassessoria/platform/lib/events"
 )
 
 // newActionItemUC wires the real use case over the pool: sqlc repo, transactional outbox,
-// stateless dedup and the unit of work — exactly the worker's composition (mirrors
-// newDeadlineUC in deadline_listener_test.go).
+// stateless dedup, the unit of work AND the real SYNCHRONOUS TaskCreator (deadline's adapter
+// over its sqlc repo) — exactly the worker/api composition (mirrors newDeadlineUC in
+// deadline_listener_test.go). With a TaskCreator injected, a confiável providência has its
+// task minted+linked in the SAME tx (status→CONFIRMED, task_id set), no async event.
 func newActionItemUC(pool *pgxpool.Pool) *actionitem.UseCase {
 	return actionitem.NewUseCase(
 		actionitem.NewRepository(),
 		events.NewOutbox(),
 		actionitem.NewDedup(),
 		database.NewUnitOfWork(pool),
+		actionitem.WithTaskCreator(deadline.NewActionItemTaskCreator(deadline.NewRepository())),
 	)
 }
 
@@ -83,8 +87,8 @@ func TestActionItem_OnIntimationAnalyzed_DerivesPrecedenceAgainstRealDB(t *testi
 		IntimationID:  intimationID,
 		CourtRecordID: recordID,
 		Providencias: []actionitem.ProvidenciaCandidate{
-			{Tipo: actionitem.TipoContestar, GeraPeca: false, Declarado: true},
-			{Tipo: actionitem.TipoManifestar, GeraPeca: false, Declarado: false, Confianca: &confianca},
+			{Title: "Apresentar contestação", Description: "Prazo de 15 dias úteis", Tipo: actionitem.TipoContestar, GeraPeca: false, Declarado: true},
+			{Title: "Manifestar sobre laudo", Description: "", Tipo: actionitem.TipoManifestar, GeraPeca: false, Declarado: false, Confianca: &confianca},
 		},
 	}
 	if err := uc.OnIntimationAnalyzed(ctx, ev); err != nil {
@@ -98,11 +102,39 @@ func TestActionItem_OnIntimationAnalyzed_DerivesPrecedenceAgainstRealDB(t *testi
 	if declarado.tipoStatus != string(actionitem.TipoStatusConfiavel) {
 		t.Errorf("declarado.tipo_status = %q, want %q", declarado.tipoStatus, actionitem.TipoStatusConfiavel)
 	}
-	if declarado.status != string(actionitem.StatusSuggested) {
-		t.Errorf("declarado.status = %q, want SUGGESTED", declarado.status)
+	// The confiável (declarado) item has its task minted+linked SYNCHRONOUSLY in the same tx,
+	// so it is already CONFIRMED with a task_id — no async wait, no actionitem.created event.
+	if declarado.status != string(actionitem.StatusConfirmed) {
+		t.Errorf("declarado.status = %q, want CONFIRMED (task minted+linked in-tx)", declarado.status)
 	}
 	if declarado.confianca != nil {
 		t.Errorf("declarado.confianca = %v, want NULL (only ia-derived items carry a score)", *declarado.confianca)
+	}
+
+	// Title/Description da IA are persisted onto the action_item (migration 0090).
+	var declTitle, declDescription *string
+	if err := pool.QueryRow(ctx,
+		`SELECT title, description FROM action_item WHERE id = $1`, declarado.id).
+		Scan(&declTitle, &declDescription); err != nil {
+		t.Fatalf("read declarado title/description: %v", err)
+	}
+	if declTitle == nil || *declTitle != "Apresentar contestação" {
+		t.Errorf("declarado.title = %v, want %q", declTitle, "Apresentar contestação")
+	}
+	if declDescription == nil || *declDescription != "Prazo de 15 dias úteis" {
+		t.Errorf("declarado.description = %v, want %q", declDescription, "Prazo de 15 dias úteis")
+	}
+
+	// The task exists, linked back to the action_item (the reverse pointer closes in-tx).
+	var linkedTaskID string
+	if err := pool.QueryRow(ctx,
+		`SELECT task_id::text FROM action_item WHERE id = $1`, declarado.id).Scan(&linkedTaskID); err != nil {
+		t.Fatalf("read declarado task_id: %v", err)
+	}
+	if got := countRows(t, pool,
+		`SELECT count(*) FROM task WHERE id = $1 AND action_item_id = $2`,
+		linkedTaskID, declarado.id); got != 1 {
+		t.Errorf("linked task rows for declarado item = %d, want 1 (created+linked in-tx)", got)
 	}
 
 	inferido := readActionItemByTipo(t, pool, tenantID, intimationID, actionitem.TipoManifestar)
@@ -116,17 +148,21 @@ func TestActionItem_OnIntimationAnalyzed_DerivesPrecedenceAgainstRealDB(t *testi
 		t.Errorf("inferido.confianca = %v, want %v", inferido.confianca, confianca)
 	}
 
-	// Only the confiável (declarado) item is born ready — it alone emits actionitem.created,
-	// committed for real in the outbox table in the same tx as the two inserts above.
+	// Task creation is now SYNCHRONOUS (in-tx), so NO actionitem.created event is emitted for
+	// the declarado item — the reverse pointer is written in the same tx, not via the outbox.
 	if got := countRows(t, pool,
 		`SELECT count(*) FROM outbox WHERE type = $1 AND aggregate_id = $2`,
-		actionitem.TypeActionItemCreated, declarado.id); got != 1 {
-		t.Errorf("actionitem.created rows for declarado item = %d, want 1", got)
+		actionitem.TypeActionItemCreated, declarado.id); got != 0 {
+		t.Errorf("actionitem.created rows for declarado item = %d, want 0 (task creation is synchronous)", got)
+	}
+
+	// The IA (a_confirmar) item is NOT born ready — no task, still SUGGESTED, task_id NULL.
+	if inferido.status != string(actionitem.StatusSuggested) {
+		t.Errorf("inferido.status = %q, want SUGGESTED (waits for Confirmar)", inferido.status)
 	}
 	if got := countRows(t, pool,
-		`SELECT count(*) FROM outbox WHERE type = $1 AND aggregate_id = $2`,
-		actionitem.TypeActionItemCreated, inferido.id); got != 0 {
-		t.Errorf("actionitem.created rows for a_confirmar item = %d, want 0 (not born ready)", got)
+		`SELECT count(*) FROM task WHERE action_item_id = $1`, inferido.id); got != 0 {
+		t.Errorf("task rows for a_confirmar item = %d, want 0 (not born ready)", got)
 	}
 }
 

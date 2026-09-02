@@ -349,8 +349,12 @@ func run(logger *slog.Logger) error {
 	// synchronous HTTP surface is confirmar/descartar (POST /v1/action-items/:id/...) — the
 	// materialization itself (OnIntimationAnalyzed) is async, wired on the worker's mux, not
 	// here. Same repo/outbox/uow composition every other slice uses.
+	// The confirmar endpoint creates the providência's tarefa SYNCHRONOUSLY in the request tx
+	// (no async hop): internal/deadline's adapter implements actionitem.TaskCreator and is
+	// injected here via WithTaskCreator.
 	actionItemHandler := actionitem.NewHandler(actionitem.NewUseCase(
 		actionitem.NewRepository(), events.NewOutbox(), actionitem.NewDedup(), uow,
+		actionitem.WithTaskCreator(deadline.NewActionItemTaskCreator(deadline.NewRepository())),
 	))
 
 	// Storage is optional at v0: only wired when S3 is fully configured. The Documentos

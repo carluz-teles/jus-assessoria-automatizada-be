@@ -26,8 +26,6 @@ type useCase interface {
 	OnReminderCheck(ctx context.Context, ev DeadlineReminderCheck) error
 	OnMissedCheck(ctx context.Context, ev DeadlineMissedCheck) error
 	OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error
-	OnActionItemCreated(ctx context.Context, ev ActionItemFact) error
-	OnActionItemConfirmed(ctx context.Context, ev ActionItemFact) error
 }
 
 // Listener is the deadline slice's asynq consumer. It holds no transport state; the use
@@ -56,12 +54,9 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeDeadlineReminderCheck, l.handleReminderCheck)
 	mux.HandleFunc(TypeDeadlineMissedCheck, l.handleMissedCheck)
 	mux.HandleFunc(TypeDocketEntryObserved, l.handleDocketEntryObserved)
-	// actionitem.created/confirmed (fatia 3, docs/erd-costura-providencia-tarefa-peca.md §6):
-	// the same dedicated "deadline" queue as the intimation events above (lib/events'
-	// queueFor special-cases them there) — creating a task is fast (DB + outbox), so it must
-	// not queue behind the DATAJUD enrichment flood on "ingestao" either.
-	mux.HandleFunc(TypeActionItemCreated, l.handleActionItemCreated)
-	mux.HandleFunc(TypeActionItemConfirmed, l.handleActionItemConfirmed)
+	// The providência→tarefa task creation is now SYNCHRONOUS (internal/actionitem creates+links
+	// the task in-tx via the injected ActionItemTaskCreator), so this slice no longer consumes
+	// actionitem.created/confirmed to create tasks.
 	// deadline.opened has no functional consumer (read models JOIN the deadline table),
 	// but it IS produced per prazo (high-volume: a backfill mints thousands). Without a
 	// handler it fails "handler not found", retries, and — routed to the deadline queue by
@@ -170,41 +165,6 @@ func (l *Listener) handleDocketEntryObserved(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	if err := l.uc.OnDocketEntryObserved(ctx, ev); err != nil {
-		if isTerminal(err) {
-			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
-		}
-		return err
-	}
-	return nil
-}
-
-// handleActionItemCreated is the asynq.HandlerFunc for actionitem.created: a providência born
-// already confiável (declarado/manual) gets its task created right away. Decodes the shared
-// ActionItemFact shape and delegates, mapping the outcome to asynq's retry decision the same
-// way as the other handlers.
-func (l *Listener) handleActionItemCreated(ctx context.Context, t *asynq.Task) error {
-	ev, err := events.Decode[ActionItemFact](t)
-	if err != nil {
-		return err
-	}
-	if err := l.uc.OnActionItemCreated(ctx, ev); err != nil {
-		if isTerminal(err) {
-			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
-		}
-		return err
-	}
-	return nil
-}
-
-// handleActionItemConfirmed is the asynq.HandlerFunc for actionitem.confirmed: an ia-inferred
-// providência just turned confiável, so its task is created NOW. Same decode+delegate+retry
-// mapping as handleActionItemCreated — both funnel into the same use-case core.
-func (l *Listener) handleActionItemConfirmed(ctx context.Context, t *asynq.Task) error {
-	ev, err := events.Decode[ActionItemFact](t)
-	if err != nil {
-		return err
-	}
-	if err := l.uc.OnActionItemConfirmed(ctx, ev); err != nil {
 		if isTerminal(err) {
 			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 		}

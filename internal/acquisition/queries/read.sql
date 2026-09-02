@@ -255,8 +255,8 @@ WHERE i.id = $1 AND i.tenant_id = $2;
 -- action_item rows by the actionitem slice's listener (acquisition.intimation.analyzed
 -- consumer). Ordered by created_at so the analysis card renders in materialization order.
 -- Scoped by tenant_id (barrier 1).
-SELECT id, tipo, gera_peca, piece_profile_key, tipo_origem, tipo_status, confianca,
-       status, task_id, deadline_id
+SELECT id, title, description, tipo, gera_peca, piece_profile_key, tipo_origem, tipo_status,
+       confianca, status, task_id, deadline_id
 FROM action_item
 WHERE tenant_id = $1 AND intimation_id = $2
 ORDER BY created_at ASC;

@@ -177,6 +177,17 @@ INSERT INTO task (
 ON CONFLICT (action_item_id) DO NOTHING
 RETURNING id;
 
+-- name: GetTaskIDByActionItem :one
+-- Reads the id of the task already bound to an action_item, scoped to tenant_id (barrier 1) —
+-- the idempotent read the SYNCHRONOUS providência→tarefa path falls back to when InsertTask's
+-- ON CONFLICT (action_item_id) DO NOTHING yields no row (the task exists from a prior confirm/
+-- materialization). Returns the existing task id so the caller can link it without minting a
+-- second. A miss is pgx.ErrNoRows (mapped to a typed error), never a silent "".
+SELECT id
+FROM task
+WHERE action_item_id = $1
+  AND tenant_id = $2;
+
 -- name: GetActionItemCourtRecordID :one
 -- Reads ONLY action_item.court_record_id, scoped to tenantID (barrier 1) — the one cross-
 -- table read the automatic task-creation path needs (fatia 3): actionitem.created/confirmed's
