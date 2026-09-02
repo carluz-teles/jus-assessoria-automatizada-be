@@ -23,6 +23,7 @@ type fakeThesisStore struct {
 	// for intimation-scoped promotion+list tests.
 	anchors      map[string][]ThesisAnchor
 	intimAnchors map[string][]ThesisAnchor
+	segments     map[string][]ThesisSegment
 }
 
 func (f *fakeThesisStore) InsertSuggestedThesisAnchor(_ context.Context, _ database.Tx, _, thesisID string, a *ThesisAnchor, _ int) (*ThesisAnchor, error) {
@@ -39,6 +40,10 @@ func (f *fakeThesisStore) ListSuggestedThesisAnchorsByDraft(_ context.Context, _
 
 func (f *fakeThesisStore) ListSuggestedThesisAnchorsByIntimation(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisAnchor, error) {
 	return f.intimAnchors, nil
+}
+
+func (f *fakeThesisStore) ListSuggestedThesisSegmentsByDraft(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisSegment, error) {
+	return f.segments, nil
 }
 
 func (f *fakeThesisStore) InsertSuggestedThesis(_ context.Context, _ database.Tx, _ string, t *SuggestedThesis) (*SuggestedThesis, error) {

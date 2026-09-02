@@ -400,6 +400,20 @@ type ThesisAnchor struct {
 	Grounded   bool
 }
 
+// ThesisSegment is the TRECHO of the generated peça that a thesis produced
+// (suggested_thesis_segment, migration 0095). After generation the HTML is parsed
+// into sections and each selected thesis is matched to the section whose heading
+// mirrors its label. Heading is the section title (display; the FE matches it by
+// text to scroll/highlight in the editor); Conteudo is the section body text (the
+// paragraphs joined) shown when the advogado proposes removing the thesis. Empty
+// slice when no section matched (heading≠label) — the FE then falls back to the
+// thesis foundation, the pre-existing behavior.
+type ThesisSegment struct {
+	Heading  string
+	Conteudo string
+	Position int
+}
+
 // ThesisConfidence closed set.
 const (
 	ThesisConfidenceAlta  = "alta"
@@ -444,6 +458,12 @@ type SuggestedThesis struct {
 	// above mirror the PRIMARY anchor (compat with the current FE); the FE (Fase 2)
 	// consumes the full Anchors slice. Empty when grounded only in the teor.
 	Anchors []ThesisAnchor
+
+	// Segments are the TRECHOS of the generated peça this thesis produced
+	// (suggested_thesis_segment 1:N, migration 0095). Populated only after
+	// generation (thesis↔section match); empty on the partida flow (no draft yet)
+	// or when no section matched. The FE shows them when proposing removal.
+	Segments []ThesisSegment
 
 	State    string
 	Position int

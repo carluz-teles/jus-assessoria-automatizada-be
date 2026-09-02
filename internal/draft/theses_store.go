@@ -35,6 +35,7 @@ type suggestedThesisStore interface {
 	InsertSuggestedThesisAnchor(ctx context.Context, tx database.Tx, tenantID, thesisID string, a *ThesisAnchor, position int) (*ThesisAnchor, error)
 	ListSuggestedThesisAnchorsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisAnchor, error)
 	ListSuggestedThesisAnchorsByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (map[string][]ThesisAnchor, error)
+	ListSuggestedThesisSegmentsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisSegment, error)
 }
 
 // thesisGenerator is the narrow port over ThesesUseCase.SuggestTheses (the stateless
@@ -188,6 +189,24 @@ func attachDraftAnchors(ctx context.Context, tx database.Tx, store suggestedThes
 	return nil
 }
 
+// attachDraftSegments loads the segments (trechos da peça) of a draft's theses in
+// ONE query and populates each SuggestedThesis.Segments in place (avoids N+1).
+// Best-effort enrichment: a draft without a generated peça (or with no matched
+// section) simply has empty Segments.
+func attachDraftSegments(ctx context.Context, tx database.Tx, store suggestedThesisStore, tenantID, draftID string, list []SuggestedThesis) error {
+	if len(list) == 0 {
+		return nil
+	}
+	byThesis, err := store.ListSuggestedThesisSegmentsByDraft(ctx, tx, tenantID, draftID)
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		list[i].Segments = byThesis[list[i].ID]
+	}
+	return nil
+}
+
 // attachIntimationAnchors is the intimation-scoped counterpart of attachDraftAnchors.
 func attachIntimationAnchors(ctx context.Context, tx database.Tx, store suggestedThesisStore, tenantID, intimationID string, list []SuggestedThesis) error {
 	if len(list) == 0 {
@@ -324,6 +343,9 @@ func (uc *DraftThesesUseCase) ListDraftTheses(ctx context.Context, tenantID, dra
 		if err := attachDraftAnchors(ctx, tx, uc.store, tenantID, draftID, list); err != nil {
 			return err
 		}
+		if err := attachDraftSegments(ctx, tx, uc.store, tenantID, draftID, list); err != nil {
+			return err
+		}
 		out = list
 		return nil
 	}); err != nil {
@@ -345,7 +367,25 @@ func (uc *DraftThesesUseCase) UpdateThesisState(ctx context.Context, tenantID, t
 		if err != nil {
 			return err
 		}
-		out = row
+		// Re-attach the anchors + segments so the PATCH response carries the SAME
+		// read model as the list (GET). Without this the FE's setQueryData replaces
+		// the thesis with an anchor-less/segment-less object, collapsing the multi-
+		// anchor chips and the removal preview. Draft-scoped drafts carry segments;
+		// intimation-scoped theses (partida) have anchors only (no draft yet).
+		list := []SuggestedThesis{*row}
+		if row.DraftID != "" {
+			if err := attachDraftAnchors(ctx, tx, uc.store, tenantID, row.DraftID, list); err != nil {
+				return err
+			}
+			if err := attachDraftSegments(ctx, tx, uc.store, tenantID, row.DraftID, list); err != nil {
+				return err
+			}
+		} else if row.IntimationID != "" {
+			if err := attachIntimationAnchors(ctx, tx, uc.store, tenantID, row.IntimationID, list); err != nil {
+				return err
+			}
+		}
+		out = &list[0]
 		return nil
 	}); err != nil {
 		return nil, err

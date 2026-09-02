@@ -792,6 +792,17 @@ type SuggestedThesisAnchor struct {
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 }
 
+type SuggestedThesisSegment struct {
+	ID                uuid.UUID          `json:"id"`
+	SuggestedThesisID uuid.UUID          `json:"suggested_thesis_id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	DraftID           uuid.UUID          `json:"draft_id"`
+	Heading           string             `json:"heading"`
+	Conteudo          string             `json:"conteudo"`
+	Position          int32              `json:"position"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
 type SyncRun struct {
 	ID                  uuid.UUID          `json:"id"`
 	TenantID            uuid.UUID          `json:"tenant_id"`

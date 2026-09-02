@@ -957,6 +957,23 @@ func anchorsToResponse(anchors []ThesisAnchor) []anchorResponse {
 	return out
 }
 
+// segmentResponse is one TRECHO of the generated peça a thesis produced (0095).
+// The FE shows it when proposing removal ("em qual mudança isso vai implicar") and
+// matches `heading` by text to scroll/highlight the section in the editor.
+type segmentResponse struct {
+	Heading  string `json:"heading"`
+	Conteudo string `json:"conteudo"`
+}
+
+// segmentsToResponse maps the entity segments to their wire form (never null).
+func segmentsToResponse(segments []ThesisSegment) []segmentResponse {
+	out := make([]segmentResponse, 0, len(segments))
+	for _, s := range segments {
+		out = append(out, segmentResponse{Heading: s.Heading, Conteudo: s.Conteudo})
+	}
+	return out
+}
+
 func thesesToResponse(theses []Thesis) []thesisResponse {
 	out := make([]thesisResponse, 0, len(theses))
 	for _, t := range theses {
@@ -997,9 +1014,10 @@ type suggestedThesisResponse struct {
 	Grounded         bool             `json:"grounded"`
 	SourceDocumentID string           `json:"source_document_id,omitempty"`
 	SourceLabel      string           `json:"source_label,omitempty"`
-	SourceExcerpt    string           `json:"source_excerpt,omitempty"`
-	SourcePage       int              `json:"source_page,omitempty"`
-	Anchors          []anchorResponse `json:"anchors"`
+	SourceExcerpt    string            `json:"source_excerpt,omitempty"`
+	SourcePage       int               `json:"source_page,omitempty"`
+	Anchors          []anchorResponse  `json:"anchors"`
+	Segments         []segmentResponse `json:"segments"`
 }
 
 func suggestedThesisToResponse(t SuggestedThesis) suggestedThesisResponse {
@@ -1022,6 +1040,7 @@ func suggestedThesisToResponse(t SuggestedThesis) suggestedThesisResponse {
 		SourceExcerpt:    t.SourceExcerpt,
 		SourcePage:       t.SourcePage,
 		Anchors:          anchorsToResponse(t.Anchors),
+		Segments:         segmentsToResponse(t.Segments),
 	}
 }
 

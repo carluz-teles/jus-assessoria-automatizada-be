@@ -743,3 +743,11 @@ func thesisAnchorFromRow(r draftdb.SuggestedThesisAnchor) *ThesisAnchor {
 		Grounded:   r.Grounded,
 	}
 }
+
+func thesisSegmentFromRow(r draftdb.SuggestedThesisSegment) *ThesisSegment {
+	return &ThesisSegment{
+		Heading:  r.Heading,
+		Conteudo: r.Conteudo,
+		Position: int(r.Position),
+	}
+}

@@ -89,8 +89,9 @@ type fakeRepo struct {
 	promotedTheses []SuggestedThesis
 	// Multi-âncora (0094): intimAnchors seeds the partida's anchors (keyed by thesis
 	// id) for promotion; anchorsByThesis captures every inserted anchor.
-	intimAnchors    map[string][]ThesisAnchor
-	anchorsByThesis map[string][]ThesisAnchor
+	intimAnchors     map[string][]ThesisAnchor
+	anchorsByThesis  map[string][]ThesisAnchor
+	segmentsByThesis map[string][]ThesisSegment
 
 	// UpdateDraftContent
 	updateResult *PatchResult
@@ -317,6 +318,20 @@ func (r *fakeRepo) ListSuggestedThesisAnchorsByDraft(_ context.Context, _ databa
 }
 func (r *fakeRepo) ListSuggestedThesisAnchorsByIntimation(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisAnchor, error) {
 	return r.intimAnchors, nil
+}
+func (r *fakeRepo) InsertSuggestedThesisSegment(_ context.Context, _ database.Tx, _, _, thesisID string, s *ThesisSegment, _ int) (*ThesisSegment, error) {
+	if r.segmentsByThesis == nil {
+		r.segmentsByThesis = map[string][]ThesisSegment{}
+	}
+	r.segmentsByThesis[thesisID] = append(r.segmentsByThesis[thesisID], *s)
+	return s, nil
+}
+func (r *fakeRepo) ListSuggestedThesisSegmentsByDraft(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisSegment, error) {
+	return r.segmentsByThesis, nil
+}
+func (r *fakeRepo) DeleteSuggestedThesisSegmentsByDraft(_ context.Context, _ database.Tx, _, _ string) error {
+	r.segmentsByThesis = nil
+	return nil
 }
 
 // ── Fatia 3 stubs (GetLatestReview, UpdateSagaState, InsertReview) ──────────

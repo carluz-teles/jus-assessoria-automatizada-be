@@ -39,6 +39,9 @@ type Querier interface {
 	// always regenerates). Scoped by (intimation_id, tenant_id). The anchors cascade with
 	// the thesis (suggested_thesis_anchor.suggested_thesis_id ON DELETE CASCADE).
 	DeleteSuggestedThesesByIntimation(ctx context.Context, arg DeleteSuggestedThesesByIntimationParams) error
+	// Limpa os segmentos de um draft antes de re-gerar a peça (regeração sempre
+	// reescreve). Scoped por (draft_id, tenant_id) — coluna direta, sem JOIN.
+	DeleteSuggestedThesisSegmentsByDraft(ctx context.Context, arg DeleteSuggestedThesisSegmentsByDraftParams) error
 	// Load the providência (action_item) context for the task-sourced Create flow
 	// (docs/erd-costura-providencia-tarefa-peca.md §3): task_id → the piece_profile_key
 	// the draft INHERITS (never re-chosen), plus intimation_id/case_id so the draft is
@@ -246,6 +249,12 @@ type Querier interface {
 	// the SAME tx as its parent thesis, right after InsertSuggestedThesis returns the id.
 	// document_id nullable ("" → NULL via optUUID no repo).
 	InsertSuggestedThesisAnchor(ctx context.Context, arg InsertSuggestedThesisAnchorParams) (SuggestedThesisAnchor, error)
+	// suggested_thesis_segment queries (thesis↔trecho da peça, migration 0095).
+	// Draft-scoped. Escritas rodam na tx da geração (RLS scope + filtro explícito de
+	// tenant_id como barreira 1).
+	// Persiste um segmento (trecho da peça) de uma tese, escrito na MESMA tx da
+	// geração, logo após o HTML ser produzido e casado com a tese por heading.
+	InsertSuggestedThesisSegment(ctx context.Context, arg InsertSuggestedThesisSegmentParams) (SuggestedThesisSegment, error)
 	// Backfills the OLD draft's superseded_by_draft_id once Create's task-sourced flow (fatia 4's
 	// populateFromTask path) mints the corrected draft (fatia 5's pointer chain: old → new). Runs
 	// in the SAME tx as InsertDraft. The CTE picks AT MOST ONE candidate (the most recently
@@ -292,6 +301,11 @@ type Querier interface {
 	// All anchors of an intimation's theses in ONE query (avoids N+1). Same shape/order as
 	// the draft-scoped list; scoped by (intimation_id, tenant_id).
 	ListSuggestedThesisAnchorsByIntimation(ctx context.Context, arg ListSuggestedThesisAnchorsByIntimationParams) ([]SuggestedThesisAnchor, error)
+	// Todos os segmentos das teses de um draft em UMA query (evita N+1): JOIN
+	// suggested_thesis pra o caller agrupar por suggested_thesis_id em memória.
+	// Ordenado por posição da tese, depois posição do segmento. Scoped por
+	// (draft_id, tenant_id).
+	ListSuggestedThesisSegmentsByDraft(ctx context.Context, arg ListSuggestedThesisSegmentsByDraftParams) ([]SuggestedThesisSegment, error)
 	// Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
 	// opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
 	// (número do protocolo no tribunal — string livre). Requer status=SIGNED.

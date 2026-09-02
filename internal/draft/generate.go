@@ -88,6 +88,11 @@ type generationWriter interface {
 	UpdateDraftContentHtml(ctx context.Context, tx database.Tx, draftID, tenantID, html string) error
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
 	DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error
+	// Segment persistence (thesis↔trecho, 0095): DeleteSuggestedThesisSegmentsByDraft
+	// clears prior segments before a regenerate; InsertSuggestedThesisSegment persists
+	// one matched section as a thesis's segment. Both run in the generation success tx.
+	DeleteSuggestedThesisSegmentsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) error
+	InsertSuggestedThesisSegment(ctx context.Context, tx database.Tx, tenantID, draftID, thesisID string, s *ThesisSegment, position int) (*ThesisSegment, error)
 }
 
 // embedder is the narrow embedding port for RAG. Satisfied by *indexing.VoyageEmbedder
@@ -495,6 +500,21 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		}
 		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, plainText, structured); e != nil {
 			return fmt.Errorf("update saga state: %w", e)
+		}
+
+		// Map each selected thesis to the SECTION of the generated peça it produced
+		// (thesis↔segment, 0095) so the removal moldura shows the real text, not just
+		// the truncated foundation. Deterministic match (heading↔label) over the
+		// already-parsed structured content — no extra LLM call. Delete-then-insert so
+		// a regenerate replaces stale segments. Best-effort: a thesis whose heading
+		// diverges simply gets no segment (FE falls back to the foundation).
+		if e := uc.writer.DeleteSuggestedThesisSegmentsByDraft(ctx, tx, ev.TenantID, ev.DraftID); e != nil {
+			return fmt.Errorf("delete prior segments: %w", e)
+		}
+		for _, m := range matchThesisSegments(richTheses, structured) {
+			if _, e := uc.writer.InsertSuggestedThesisSegment(ctx, tx, ev.TenantID, ev.DraftID, m.ThesisID, &m.Segment, m.Segment.Position); e != nil {
+				return fmt.Errorf("insert thesis segment: %w", e)
+			}
 		}
 
 		// Announce the successful generation in the SAME tx (transactional outbox).

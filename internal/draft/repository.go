@@ -180,6 +180,18 @@ type Repository interface {
 	// ListSuggestedThesisAnchorsByIntimation is the intimation-scoped counterpart.
 	ListSuggestedThesisAnchorsByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (map[string][]ThesisAnchor, error)
 
+	// ── Suggested thesis segments (thesis↔trecho, 0095) ──────────────────────
+
+	// InsertSuggestedThesisSegment persists one segment (a section of the generated
+	// peça) of a suggested thesis in the caller's tx (same tx as the generation).
+	InsertSuggestedThesisSegment(ctx context.Context, tx database.Tx, tenantID, draftID, thesisID string, s *ThesisSegment, position int) (*ThesisSegment, error)
+	// ListSuggestedThesisSegmentsByDraft returns all segments of a draft's theses in
+	// ONE query (avoids N+1), grouped by suggested_thesis_id, tenant-scoped.
+	ListSuggestedThesisSegmentsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisSegment, error)
+	// DeleteSuggestedThesisSegmentsByDraft wipes a draft's segments before a
+	// regenerate (POST /generate always regenerates the peça).
+	DeleteSuggestedThesisSegmentsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) error
+
 	// ── AI generation methods (Fatia 3) ──────────────────────────────────────
 
 	// SetGenerationParams persists the Gerar-time generation params
@@ -2116,6 +2128,77 @@ func groupAnchorsByThesis(rows []draftdb.SuggestedThesisAnchor) map[string][]The
 	for _, row := range rows {
 		tid := row.SuggestedThesisID.String()
 		out[tid] = append(out[tid], *thesisAnchorFromRow(row))
+	}
+	return out
+}
+
+func (r *pgRepository) InsertSuggestedThesisSegment(ctx context.Context, tx database.Tx, tenantID, draftID, thesisID string, s *ThesisSegment, position int) (*ThesisSegment, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return nil, err
+	}
+	thid, err := parseUUID(thesisID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).InsertSuggestedThesisSegment(ctx, draftdb.InsertSuggestedThesisSegmentParams{
+		SuggestedThesisID: thid,
+		TenantID:          tid,
+		DraftID:           did,
+		Heading:           s.Heading,
+		Conteudo:          s.Conteudo,
+		Position:          int32(position),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return thesisSegmentFromRow(row), nil
+}
+
+func (r *pgRepository) ListSuggestedThesisSegmentsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisSegment, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := draftdb.New(tx).ListSuggestedThesisSegmentsByDraft(ctx, draftdb.ListSuggestedThesisSegmentsByDraftParams{
+		DraftID:  optUUID(draftID),
+		TenantID: tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return groupSegmentsByThesis(rows), nil
+}
+
+func (r *pgRepository) DeleteSuggestedThesisSegmentsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) error {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).DeleteSuggestedThesisSegmentsByDraft(ctx, draftdb.DeleteSuggestedThesisSegmentsByDraftParams{
+		DraftID:  did,
+		TenantID: tid,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+// groupSegmentsByThesis groups the flat segment rows by their parent thesis id,
+// preserving the query's (thesis position, segment position) ordering.
+func groupSegmentsByThesis(rows []draftdb.SuggestedThesisSegment) map[string][]ThesisSegment {
+	out := make(map[string][]ThesisSegment)
+	for _, row := range rows {
+		tid := row.SuggestedThesisID.String()
+		out[tid] = append(out[tid], *thesisSegmentFromRow(row))
 	}
 	return out
 }

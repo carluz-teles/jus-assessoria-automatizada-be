@@ -77,6 +77,7 @@ type fakeWriter struct {
 	writeErr             error
 	deleteReviewsCalled  bool
 	deleteReviewsDraftID string
+	insertedSegments     []ThesisSegment
 }
 
 func (f *fakeWriter) UpdateSagaState(_ context.Context, _ database.Tx, _, _, sagaState string, updateContent bool, content string, _ *StructuredContent) (*Draft, error) {
@@ -104,6 +105,15 @@ func (f *fakeWriter) DeleteReviewsForDraft(_ context.Context, _ database.Tx, dra
 	f.deleteReviewsCalled = true
 	f.deleteReviewsDraftID = draftID
 	return f.writeErr
+}
+
+func (f *fakeWriter) DeleteSuggestedThesisSegmentsByDraft(_ context.Context, _ database.Tx, _, _ string) error {
+	return f.writeErr
+}
+
+func (f *fakeWriter) InsertSuggestedThesisSegment(_ context.Context, _ database.Tx, _, _, thesisID string, s *ThesisSegment, _ int) (*ThesisSegment, error) {
+	f.insertedSegments = append(f.insertedSegments, *s)
+	return s, f.writeErr
 }
 
 // fakeOutbox records published events.
