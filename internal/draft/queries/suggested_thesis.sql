@@ -55,6 +55,38 @@ ORDER BY position, created_at;
 
 -- name: DeleteSuggestedThesesByIntimation :exec
 -- Wipe an intimation's suggested theses before a regenerate (POST /intimacoes/:id/theses
--- always regenerates). Scoped by (intimation_id, tenant_id).
+-- always regenerates). Scoped by (intimation_id, tenant_id). The anchors cascade with
+-- the thesis (suggested_thesis_anchor.suggested_thesis_id ON DELETE CASCADE).
 DELETE FROM suggested_thesis
 WHERE intimation_id = $1 AND tenant_id = $2;
+
+-- name: InsertSuggestedThesisAnchor :one
+-- Persist one anchor of a suggested thesis (multi-âncora, migration 0094). Written in
+-- the SAME tx as its parent thesis, right after InsertSuggestedThesis returns the id.
+-- document_id nullable ("" → NULL via optUUID no repo).
+INSERT INTO suggested_thesis_anchor (
+    suggested_thesis_id, tenant_id, document_id, page, excerpt, label,
+    source_ref, grounded, position, created_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9,
+    now()
+)
+RETURNING *;
+
+-- name: ListSuggestedThesisAnchorsByDraft :many
+-- All anchors of a draft's theses in ONE query (avoids N+1): JOIN suggested_thesis so
+-- the caller groups anchors by suggested_thesis_id in memory. Ordered by thesis position
+-- then anchor position (primária primeiro). Scoped by (draft_id, tenant_id) — both barriers.
+SELECT a.* FROM suggested_thesis_anchor a
+JOIN suggested_thesis t ON t.id = a.suggested_thesis_id
+WHERE t.draft_id = $1 AND a.tenant_id = $2
+ORDER BY t.position, a.position, a.created_at;
+
+-- name: ListSuggestedThesisAnchorsByIntimation :many
+-- All anchors of an intimation's theses in ONE query (avoids N+1). Same shape/order as
+-- the draft-scoped list; scoped by (intimation_id, tenant_id).
+SELECT a.* FROM suggested_thesis_anchor a
+JOIN suggested_thesis t ON t.id = a.suggested_thesis_id
+WHERE t.intimation_id = $1 AND a.tenant_id = $2
+ORDER BY t.position, a.position, a.created_at;

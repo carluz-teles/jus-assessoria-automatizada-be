@@ -70,10 +70,10 @@ type SuggestThesesResult struct {
 // array de trechos LITERAIS do teor/chunks que sustentam a tese — força o
 // modelo a justificar a confidence com prova concreta em vez de rotular por
 // impressão. Pode vir vazio pra teses puramente doutrinárias, mas o prompt
-// obriga confidence=baixa nesse caso. source_ref é o NÚMERO do trecho (1..N da
-// lista "Trechos relevantes dos autos") de onde a evidence foi copiada — o
-// modelo CITA a fonte em vez de re-casarmos por substring depois; 0 = tese
-// funda-se só no teor ou em doutrina. maxItems=8 capa a lista.
+// obriga confidence=baixa nesse caso. source_refs é o ARRAY de NÚMEROS de trecho
+// (1..N da lista "Trechos relevantes dos autos") que sustentam a tese — o modelo
+// CITA TODAS as fontes (multi-âncora) em vez de re-casarmos por substring depois;
+// vazio = tese funda-se só no teor ou em doutrina. maxItems=8 capa a lista.
 var thesesSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -87,10 +87,10 @@ var thesesSchema = json.RawMessage(`{
           "confidence": { "type": "string", "enum": ["alta", "media", "baixa"] },
           "reference":  { "type": "string" },
           "foundation": { "type": "string" },
-          "evidence":   { "type": "array", "items": { "type": "string" } },
-          "source_ref": { "type": "integer" }
+          "evidence":    { "type": "array", "items": { "type": "string" } },
+          "source_refs": { "type": "array", "items": { "type": "integer" } }
         },
-        "required": ["label", "confidence", "reference", "foundation", "evidence", "source_ref"],
+        "required": ["label", "confidence", "reference", "foundation", "evidence", "source_refs"],
         "additionalProperties": false
       }
     }
@@ -338,15 +338,16 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		}
 	}
 
-	// Source attribution: the LLM CITES the chunk it quoted (source_ref), so we
-	// resolve the source by an EXACT lookup into the RAG hits (hits[source_ref-1])
-	// instead of re-matching by substring. resolveThesisSource also computes
-	// Grounded: it verifies the literal evidence really is a substring of the
-	// cited chunk (or of the teor when source_ref==0), killing false-grounded /
-	// hallucinated evidence. No extra LLM call.
+	// Source attribution: the LLM CITES the chunks it quoted (source_refs), so we
+	// resolve the anchors by EXACT lookups into the RAG hits (hits[ref-1]) instead
+	// of re-matching by substring. resolveThesisAnchors builds N anchors (one per
+	// distinct document, deduped), mirrors the primary into the singular Source*
+	// fields (FE compat), and computes Grounded: it verifies the literal evidence
+	// really is a substring of a cited chunk (or of the teor when no refs), killing
+	// false-grounded / hallucinated evidence. No extra LLM call.
 	attributed, groundedCount := 0, 0
 	for i := range theses {
-		resolveThesisSource(&theses[i], chunkHits, teorText)
+		resolveThesisAnchors(&theses[i], chunkHits, teorText)
 		if theses[i].SourceDocumentID != "" {
 			attributed++
 		}
@@ -384,51 +385,100 @@ const thesesTemperature = 0.2
 // maxTheses caps the suggested-thesis list (mirrors thesesSchema maxItems).
 const maxTheses = 8
 
-// resolveThesisSource resolves a thesis's source by the LLM's OWN citation
-// (SourceRef, the 1-based chunk number) instead of re-matching evidence by
-// substring — grounding is trustworthy "by construction". It also validates the
-// evidence against what the model claimed to read and sets Grounded:
+// resolveThesisAnchors resolves a thesis's N anchors from the LLM's OWN citations
+// (SourceRefs, the 1-based chunk numbers) instead of re-matching evidence by
+// substring — grounding is trustworthy "by construction". It supports MULTI-anchor
+// (thesis_anchor 1:N): every distinct document that sustains the same thesis becomes
+// one ThesisAnchor. It also validates the evidence against what the model claimed to
+// read and sets each anchor's + the thesis's Grounded.
 //
-//   - SourceRef in [1, len(hits)] → the thesis cites a retrieved chunk.
-//     hit = hits[SourceRef-1]; Source{DocumentID,Page,Label} come from it.
-//     SourceExcerpt = the first Evidence that is a (robust) substring of hit.Text;
-//     if none matches we keep the 1st evidence but mark Grounded=false (the ref was
-//     given yet no evidence casa no trecho citado → likely wrong/hallucinated chunk).
-//     Grounded=true ONLY when some evidence really is a substring of hit.Text.
-//   - SourceRef==0 or out of range → no document. If some evidence is a substring
-//     of teorText (the intimation teor), Grounded=true (ancorada no teor, no doc —
-//     the FE falls back to the teor). If it matches nowhere → Grounded=false AND we
-//     CLEAR SourceExcerpt (never show the advogado an invented "trecho literal").
-func resolveThesisSource(t *Thesis, hits []indexing.ChunkHit, teorText string) {
-	if t.SourceRef >= 1 && t.SourceRef <= len(hits) {
-		hit := hits[t.SourceRef-1]
-		t.SourceDocumentID = hit.DocumentID
-		t.SourcePage = hit.Page
-		t.SourceLabel = thesisSourceLabel(hit)
-
+//   - For each SourceRef in [1, len(hits)]: hit = hits[ref-1] builds one candidate
+//     ThesisAnchor (DocumentID/Page/Label/SourceRef). Its Excerpt = the first Evidence
+//     that is a (robust) substring of hit.Text (Grounded=true); if none matches, the
+//     1st evidence is shown but Grounded=false (ref given yet no evidence casa → likely
+//     wrong/hallucinated chunk).
+//   - DEDUP by DocumentID: two refs pointing to the SAME document collapse into ONE
+//     anchor — keeping the grounded one (evidence matched) over an ungrounded one, then
+//     the smaller page. So N certidões of the SAME doc don't inflate the anchor list.
+//   - The thesis is Grounded=true when ANY anchor casou. When there are no valid refs,
+//     it falls back to the teor: Grounded=true if some evidence is a substring of
+//     teorText (no document — FE cai no teor); nothing matched anywhere → Grounded=false
+//     and SourceExcerpt cleared (never show an invented "trecho literal").
+//
+// COMPAT: the SINGULAR Source* fields mirror the PRIMARY anchor (the strongest — first
+// grounded, else first) so the current FE keeps working; Anchors carries all of them.
+func resolveThesisAnchors(t *Thesis, hits []indexing.ChunkHit, teorText string) {
+	// Build one candidate anchor per valid, in-range ref, deduped by document.
+	byDoc := make(map[string]int) // DocumentID → index into anchors
+	var anchors []ThesisAnchor
+	for _, ref := range t.SourceRefs {
+		if ref < 1 || ref > len(hits) {
+			continue
+		}
+		hit := hits[ref-1]
+		a := ThesisAnchor{
+			DocumentID: hit.DocumentID,
+			Page:       hit.Page,
+			Label:      thesisSourceLabel(hit),
+			SourceRef:  ref,
+		}
 		nhit := normalizeForMatch(hit.Text)
-		matched := ""
 		for _, ev := range t.Evidence {
 			if nev := normalizeForMatch(ev); nev != "" && strings.Contains(nhit, nev) {
-				matched = ev
+				a.Excerpt = ev
+				a.Grounded = true
 				break
 			}
 		}
-		if matched != "" {
-			t.SourceExcerpt = matched
-			t.Grounded = true
-			return
+		if !a.Grounded && len(t.Evidence) > 0 {
+			a.Excerpt = t.Evidence[0] // ref dado mas sem casar: mostra a 1ª evidência
 		}
-		// Ref given but no evidence casa no trecho citado: trust the ref (keep the
-		// source) but flag it as not verified. Show the 1st evidence as excerpt.
-		if len(t.Evidence) > 0 {
-			t.SourceExcerpt = t.Evidence[0]
+
+		// Dedup by document: prefer grounded, then smaller page.
+		if idx, seen := byDoc[hit.DocumentID]; seen && hit.DocumentID != "" {
+			cur := anchors[idx]
+			replace := (a.Grounded && !cur.Grounded) ||
+				(a.Grounded == cur.Grounded && a.Page < cur.Page)
+			if replace {
+				anchors[idx] = a
+			}
+			continue
 		}
-		t.Grounded = false
+		byDoc[hit.DocumentID] = len(anchors)
+		anchors = append(anchors, a)
+	}
+
+	if len(anchors) > 0 {
+		// Pick the primary: first grounded anchor, else the first.
+		primary := 0
+		for i, a := range anchors {
+			if a.Grounded {
+				primary = i
+				break
+			}
+		}
+		// Reorder so the primary is Anchors[0] (stable for the singular mirror).
+		if primary != 0 {
+			anchors[0], anchors[primary] = anchors[primary], anchors[0]
+		}
+		p := anchors[0]
+		t.Anchors = anchors
+		t.SourceDocumentID = p.DocumentID
+		t.SourcePage = p.Page
+		t.SourceLabel = p.Label
+		t.SourceExcerpt = p.Excerpt
+		t.SourceRef = p.SourceRef
+		// Grounded if any anchor matched.
+		for _, a := range anchors {
+			if a.Grounded {
+				t.Grounded = true
+				break
+			}
+		}
 		return
 	}
 
-	// No document cited (0 or out of range): try to ground in the teor.
+	// No document cited (empty/invalid refs): try to ground in the teor.
 	nteor := normalizeForMatch(teorText)
 	for _, ev := range t.Evidence {
 		if nev := normalizeForMatch(ev); nteor != "" && nev != "" && strings.Contains(nteor, nev) {

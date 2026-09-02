@@ -87,6 +87,10 @@ type fakeRepo struct {
 	// promoted insert is captured in promotedTheses so tests can assert the mapping.
 	intimTheses    []SuggestedThesis
 	promotedTheses []SuggestedThesis
+	// Multi-âncora (0094): intimAnchors seeds the partida's anchors (keyed by thesis
+	// id) for promotion; anchorsByThesis captures every inserted anchor.
+	intimAnchors    map[string][]ThesisAnchor
+	anchorsByThesis map[string][]ThesisAnchor
 
 	// UpdateDraftContent
 	updateResult *PatchResult
@@ -300,6 +304,19 @@ func (r *fakeRepo) ListSuggestedThesesByIntimation(_ context.Context, _ database
 }
 func (r *fakeRepo) DeleteSuggestedThesesByIntimation(_ context.Context, _ database.Tx, _, _ string) error {
 	return nil
+}
+func (r *fakeRepo) InsertSuggestedThesisAnchor(_ context.Context, _ database.Tx, _, thesisID string, a *ThesisAnchor, _ int) (*ThesisAnchor, error) {
+	if r.anchorsByThesis == nil {
+		r.anchorsByThesis = map[string][]ThesisAnchor{}
+	}
+	r.anchorsByThesis[thesisID] = append(r.anchorsByThesis[thesisID], *a)
+	return a, nil
+}
+func (r *fakeRepo) ListSuggestedThesisAnchorsByDraft(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisAnchor, error) {
+	return r.anchorsByThesis, nil
+}
+func (r *fakeRepo) ListSuggestedThesisAnchorsByIntimation(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisAnchor, error) {
+	return r.intimAnchors, nil
 }
 
 // ── Fatia 3 stubs (GetLatestReview, UpdateSagaState, InsertReview) ──────────

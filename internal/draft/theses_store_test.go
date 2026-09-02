@@ -19,6 +19,26 @@ type fakeThesisStore struct {
 	insertErr error
 	updateErr error
 	nextID    int
+	// Multi-âncora (0094): anchors keyed by thesis id, captured on insert / seeded
+	// for intimation-scoped promotion+list tests.
+	anchors      map[string][]ThesisAnchor
+	intimAnchors map[string][]ThesisAnchor
+}
+
+func (f *fakeThesisStore) InsertSuggestedThesisAnchor(_ context.Context, _ database.Tx, _, thesisID string, a *ThesisAnchor, _ int) (*ThesisAnchor, error) {
+	if f.anchors == nil {
+		f.anchors = map[string][]ThesisAnchor{}
+	}
+	f.anchors[thesisID] = append(f.anchors[thesisID], *a)
+	return a, nil
+}
+
+func (f *fakeThesisStore) ListSuggestedThesisAnchorsByDraft(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisAnchor, error) {
+	return f.anchors, nil
+}
+
+func (f *fakeThesisStore) ListSuggestedThesisAnchorsByIntimation(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisAnchor, error) {
+	return f.intimAnchors, nil
 }
 
 func (f *fakeThesisStore) InsertSuggestedThesis(_ context.Context, _ database.Tx, _ string, t *SuggestedThesis) (*SuggestedThesis, error) {
@@ -114,6 +134,47 @@ func TestGenerateDraftTheses_persistsWithPositionAndInitialState(t *testing.T) {
 		if got[i].State != w.state {
 			t.Errorf("thesis %d (%s): state=%q want %q", i, got[i].Label, got[i].State, w.state)
 		}
+	}
+}
+
+// TestGenerateDraftTheses_persistsAnchors covers multi-âncora (0094): each thesis's
+// Anchors are persisted in the same tx and reloaded by ListDraftTheses.
+func TestGenerateDraftTheses_persistsAnchors(t *testing.T) {
+	gen := fakeThesisGen{result: &SuggestThesesResult{Theses: []Thesis{
+		{
+			Label:      "risco de extinção",
+			Confidence: ThesisConfidenceAlta,
+			Grounded:   true,
+			Anchors: []ThesisAnchor{
+				{DocumentID: "doc-cert", Page: 5, Excerpt: "sob pena de extinção", Label: "Certidão · pág. 5", Grounded: true},
+				{DocumentID: "doc-ato", Page: 2, Excerpt: "dar andamento", Label: "Ato · pág. 2", Grounded: true},
+			},
+		},
+	}}}
+	store := &fakeThesisStore{}
+	uc := NewDraftThesesUseCase(DraftThesesUseCaseParams{UoW: fakeUoW{}, Store: store, Gen: gen})
+
+	got, err := uc.GenerateDraftTheses(context.Background(), "tenant-1", "draft-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || len(got[0].Anchors) != 2 {
+		t.Fatalf("expected 1 thesis with 2 anchors, got %+v", got)
+	}
+	// Anchors landed in the store keyed by the assigned thesis id.
+	if anchors := store.anchors[got[0].ID]; len(anchors) != 2 {
+		t.Fatalf("store.anchors[%q] = %d, want 2", got[0].ID, len(anchors))
+	}
+	// ListDraftTheses reloads the anchors from the store.
+	listed, err := uc.ListDraftTheses(context.Background(), "tenant-1", "draft-1")
+	if err != nil {
+		t.Fatalf("ListDraftTheses error: %v", err)
+	}
+	if len(listed) != 1 || len(listed[0].Anchors) != 2 {
+		t.Fatalf("ListDraftTheses expected 2 anchors, got %+v", listed)
+	}
+	if listed[0].Anchors[0].DocumentID != "doc-cert" {
+		t.Errorf("anchor[0].DocumentID = %q, want doc-cert", listed[0].Anchors[0].DocumentID)
 	}
 }
 

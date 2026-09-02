@@ -778,6 +778,20 @@ type SuggestedThesis struct {
 	IntimationID     pgtype.UUID        `json:"intimation_id"`
 }
 
+type SuggestedThesisAnchor struct {
+	ID                uuid.UUID          `json:"id"`
+	SuggestedThesisID uuid.UUID          `json:"suggested_thesis_id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	DocumentID        pgtype.UUID        `json:"document_id"`
+	Page              int32              `json:"page"`
+	Excerpt           string             `json:"excerpt"`
+	Label             string             `json:"label"`
+	SourceRef         int32              `json:"source_ref"`
+	Grounded          bool               `json:"grounded"`
+	Position          int32              `json:"position"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
 type SyncRun struct {
 	ID                  uuid.UUID          `json:"id"`
 	TenantID            uuid.UUID          `json:"tenant_id"`

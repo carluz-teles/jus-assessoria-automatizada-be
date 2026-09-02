@@ -244,7 +244,7 @@ func TestThesesUseCase_WithIntimation_CRIDResolved(t *testing.T) {
 	}
 }
 
-// --- resolveThesisSource / thesisSourceLabel ---------------------------------
+// --- resolveThesisAnchors / thesisSourceLabel --------------------------------
 
 func TestResolveThesisSource(t *testing.T) {
 	t.Parallel()
@@ -326,8 +326,13 @@ func TestResolveThesisSource(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			th := &Thesis{Label: "t", Evidence: tt.evidence, SourceRef: tt.sourceRef}
-			resolveThesisSource(th, tt.hits, teor)
+			// 0 (or negative) means "no ref" → empty SourceRefs.
+			var refs []int
+			if tt.sourceRef > 0 {
+				refs = []int{tt.sourceRef}
+			}
+			th := &Thesis{Label: "t", Evidence: tt.evidence, SourceRefs: refs}
+			resolveThesisAnchors(th, tt.hits, teor)
 
 			if th.SourceDocumentID != tt.wantDocID {
 				t.Fatalf("SourceDocumentID = %q, want %q", th.SourceDocumentID, tt.wantDocID)
@@ -354,6 +359,69 @@ func TestResolveThesisSource(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolveThesisAnchors_MultiAnchor covers the multi-âncora path: N refs across
+// distinct documents produce N anchors; the primary (first grounded) mirrors into the
+// singular Source* fields; and refs pointing to the SAME document dedup into one anchor.
+func TestResolveThesisAnchors_MultiAnchor(t *testing.T) {
+	t.Parallel()
+
+	const qCert1 = "sob pena de extincao se nao houver manifestacao no prazo legal"
+	const qAto = "intime-se a parte para dar andamento sob pena de arquivamento"
+	hits := []indexing.ChunkHit{
+		{DocumentID: "doc-cert", Page: 5, Text: "Certidão: " + qCert1, DocumentTitle: "Certidão", DocumentType: "CERT"},
+		{DocumentID: "doc-ato", Page: 2, Text: "Ato: " + qAto, DocumentTitle: "Ato ordinatório", DocumentType: "ATO"},
+		{DocumentID: "doc-cert", Page: 9, Text: "Outra parte da mesma certidão, sem a evidência.", DocumentTitle: "Certidão", DocumentType: "CERT"},
+	}
+
+	t.Run("two distinct docs → two anchors, primary is first grounded", func(t *testing.T) {
+		t.Parallel()
+		th := &Thesis{
+			Label:      "risco de extinção",
+			Evidence:   []string{qCert1, qAto},
+			SourceRefs: []int{1, 2},
+		}
+		resolveThesisAnchors(th, hits, "")
+		if len(th.Anchors) != 2 {
+			t.Fatalf("len(Anchors) = %d, want 2", len(th.Anchors))
+		}
+		if !th.Grounded {
+			t.Error("thesis should be grounded (both anchors matched)")
+		}
+		// Primary mirrors into the singular Source* fields.
+		if th.SourceDocumentID != th.Anchors[0].DocumentID || th.SourceExcerpt != th.Anchors[0].Excerpt {
+			t.Errorf("singular Source* must mirror primary anchor: got doc=%q excerpt=%q", th.SourceDocumentID, th.SourceExcerpt)
+		}
+		if th.Anchors[0].DocumentID != "doc-cert" {
+			t.Errorf("primary DocumentID = %q, want doc-cert", th.Anchors[0].DocumentID)
+		}
+		for _, a := range th.Anchors {
+			if !a.Grounded {
+				t.Errorf("anchor %q should be grounded", a.DocumentID)
+			}
+		}
+	})
+
+	t.Run("two refs same doc → dedup to one anchor (grounded, smaller page)", func(t *testing.T) {
+		t.Parallel()
+		th := &Thesis{
+			Label:      "risco de extinção",
+			Evidence:   []string{qCert1},
+			SourceRefs: []int{3, 1}, // ref 3 = doc-cert pg9 (no match); ref 1 = doc-cert pg5 (match)
+		}
+		resolveThesisAnchors(th, hits, "")
+		if len(th.Anchors) != 1 {
+			t.Fatalf("len(Anchors) = %d, want 1 (deduped by doc)", len(th.Anchors))
+		}
+		a := th.Anchors[0]
+		if a.DocumentID != "doc-cert" || a.Page != 5 || !a.Grounded {
+			t.Errorf("deduped anchor = {doc=%q page=%d grounded=%v}, want {doc-cert 5 true}", a.DocumentID, a.Page, a.Grounded)
+		}
+		if !th.Grounded {
+			t.Error("thesis should be grounded")
+		}
+	})
 }
 
 func TestThesisSourceLabel_FallbacksAndPage(t *testing.T) {

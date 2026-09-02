@@ -40,7 +40,8 @@ type DeleteSuggestedThesesByIntimationParams struct {
 }
 
 // Wipe an intimation's suggested theses before a regenerate (POST /intimacoes/:id/theses
-// always regenerates). Scoped by (intimation_id, tenant_id).
+// always regenerates). Scoped by (intimation_id, tenant_id). The anchors cascade with
+// the thesis (suggested_thesis_anchor.suggested_thesis_id ON DELETE CASCADE).
 func (q *Queries) DeleteSuggestedThesesByIntimation(ctx context.Context, arg DeleteSuggestedThesesByIntimationParams) error {
 	_, err := q.db.Exec(ctx, deleteSuggestedThesesByIntimation, arg.IntimationID, arg.TenantID)
 	return err
@@ -132,6 +133,62 @@ func (q *Queries) InsertSuggestedThesis(ctx context.Context, arg InsertSuggested
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.IntimationID,
+	)
+	return i, err
+}
+
+const insertSuggestedThesisAnchor = `-- name: InsertSuggestedThesisAnchor :one
+INSERT INTO suggested_thesis_anchor (
+    suggested_thesis_id, tenant_id, document_id, page, excerpt, label,
+    source_ref, grounded, position, created_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9,
+    now()
+)
+RETURNING id, suggested_thesis_id, tenant_id, document_id, page, excerpt, label, source_ref, grounded, position, created_at
+`
+
+type InsertSuggestedThesisAnchorParams struct {
+	SuggestedThesisID uuid.UUID   `json:"suggested_thesis_id"`
+	TenantID          uuid.UUID   `json:"tenant_id"`
+	DocumentID        pgtype.UUID `json:"document_id"`
+	Page              int32       `json:"page"`
+	Excerpt           string      `json:"excerpt"`
+	Label             string      `json:"label"`
+	SourceRef         int32       `json:"source_ref"`
+	Grounded          bool        `json:"grounded"`
+	Position          int32       `json:"position"`
+}
+
+// Persist one anchor of a suggested thesis (multi-âncora, migration 0094). Written in
+// the SAME tx as its parent thesis, right after InsertSuggestedThesis returns the id.
+// document_id nullable ("" → NULL via optUUID no repo).
+func (q *Queries) InsertSuggestedThesisAnchor(ctx context.Context, arg InsertSuggestedThesisAnchorParams) (SuggestedThesisAnchor, error) {
+	row := q.db.QueryRow(ctx, insertSuggestedThesisAnchor,
+		arg.SuggestedThesisID,
+		arg.TenantID,
+		arg.DocumentID,
+		arg.Page,
+		arg.Excerpt,
+		arg.Label,
+		arg.SourceRef,
+		arg.Grounded,
+		arg.Position,
+	)
+	var i SuggestedThesisAnchor
+	err := row.Scan(
+		&i.ID,
+		&i.SuggestedThesisID,
+		&i.TenantID,
+		&i.DocumentID,
+		&i.Page,
+		&i.Excerpt,
+		&i.Label,
+		&i.SourceRef,
+		&i.Grounded,
+		&i.Position,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -231,6 +288,99 @@ func (q *Queries) ListSuggestedThesesByIntimation(ctx context.Context, arg ListS
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.IntimationID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSuggestedThesisAnchorsByDraft = `-- name: ListSuggestedThesisAnchorsByDraft :many
+SELECT a.id, a.suggested_thesis_id, a.tenant_id, a.document_id, a.page, a.excerpt, a.label, a.source_ref, a.grounded, a.position, a.created_at FROM suggested_thesis_anchor a
+JOIN suggested_thesis t ON t.id = a.suggested_thesis_id
+WHERE t.draft_id = $1 AND a.tenant_id = $2
+ORDER BY t.position, a.position, a.created_at
+`
+
+type ListSuggestedThesisAnchorsByDraftParams struct {
+	DraftID  pgtype.UUID `json:"draft_id"`
+	TenantID uuid.UUID   `json:"tenant_id"`
+}
+
+// All anchors of a draft's theses in ONE query (avoids N+1): JOIN suggested_thesis so
+// the caller groups anchors by suggested_thesis_id in memory. Ordered by thesis position
+// then anchor position (primária primeiro). Scoped by (draft_id, tenant_id) — both barriers.
+func (q *Queries) ListSuggestedThesisAnchorsByDraft(ctx context.Context, arg ListSuggestedThesisAnchorsByDraftParams) ([]SuggestedThesisAnchor, error) {
+	rows, err := q.db.Query(ctx, listSuggestedThesisAnchorsByDraft, arg.DraftID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SuggestedThesisAnchor
+	for rows.Next() {
+		var i SuggestedThesisAnchor
+		if err := rows.Scan(
+			&i.ID,
+			&i.SuggestedThesisID,
+			&i.TenantID,
+			&i.DocumentID,
+			&i.Page,
+			&i.Excerpt,
+			&i.Label,
+			&i.SourceRef,
+			&i.Grounded,
+			&i.Position,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSuggestedThesisAnchorsByIntimation = `-- name: ListSuggestedThesisAnchorsByIntimation :many
+SELECT a.id, a.suggested_thesis_id, a.tenant_id, a.document_id, a.page, a.excerpt, a.label, a.source_ref, a.grounded, a.position, a.created_at FROM suggested_thesis_anchor a
+JOIN suggested_thesis t ON t.id = a.suggested_thesis_id
+WHERE t.intimation_id = $1 AND a.tenant_id = $2
+ORDER BY t.position, a.position, a.created_at
+`
+
+type ListSuggestedThesisAnchorsByIntimationParams struct {
+	IntimationID pgtype.UUID `json:"intimation_id"`
+	TenantID     uuid.UUID   `json:"tenant_id"`
+}
+
+// All anchors of an intimation's theses in ONE query (avoids N+1). Same shape/order as
+// the draft-scoped list; scoped by (intimation_id, tenant_id).
+func (q *Queries) ListSuggestedThesisAnchorsByIntimation(ctx context.Context, arg ListSuggestedThesisAnchorsByIntimationParams) ([]SuggestedThesisAnchor, error) {
+	rows, err := q.db.Query(ctx, listSuggestedThesisAnchorsByIntimation, arg.IntimationID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SuggestedThesisAnchor
+	for rows.Next() {
+		var i SuggestedThesisAnchor
+		if err := rows.Scan(
+			&i.ID,
+			&i.SuggestedThesisID,
+			&i.TenantID,
+			&i.DocumentID,
+			&i.Page,
+			&i.Excerpt,
+			&i.Label,
+			&i.SourceRef,
+			&i.Grounded,
+			&i.Position,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

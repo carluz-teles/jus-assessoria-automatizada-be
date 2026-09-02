@@ -169,6 +169,17 @@ type Repository interface {
 	// a regenerate, tenant-scoped. Zero rows is a valid no-op, never an error.
 	DeleteSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) error
 
+	// ── Suggested thesis anchors (multi-âncora, 0094) ────────────────────────
+
+	// InsertSuggestedThesisAnchor persists one anchor of a suggested thesis in the
+	// caller's tx (same tx as its parent thesis). Returns the persisted anchor.
+	InsertSuggestedThesisAnchor(ctx context.Context, tx database.Tx, tenantID, thesisID string, a *ThesisAnchor, position int) (*ThesisAnchor, error)
+	// ListSuggestedThesisAnchorsByDraft returns all anchors of a draft's theses in
+	// ONE query (avoids N+1), grouped by suggested_thesis_id, tenant-scoped.
+	ListSuggestedThesisAnchorsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisAnchor, error)
+	// ListSuggestedThesisAnchorsByIntimation is the intimation-scoped counterpart.
+	ListSuggestedThesisAnchorsByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (map[string][]ThesisAnchor, error)
+
 	// ── AI generation methods (Fatia 3) ──────────────────────────────────────
 
 	// SetGenerationParams persists the Gerar-time generation params
@@ -2040,4 +2051,71 @@ func (r *pgRepository) DeleteSuggestedThesesByIntimation(ctx context.Context, tx
 		return database.WrapInfra(err)
 	}
 	return nil
+}
+
+func (r *pgRepository) InsertSuggestedThesisAnchor(ctx context.Context, tx database.Tx, tenantID, thesisID string, a *ThesisAnchor, position int) (*ThesisAnchor, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	thid, err := parseUUID(thesisID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).InsertSuggestedThesisAnchor(ctx, draftdb.InsertSuggestedThesisAnchorParams{
+		SuggestedThesisID: thid,
+		TenantID:          tid,
+		DocumentID:        optUUID(a.DocumentID),
+		Page:              int32(a.Page),
+		Excerpt:           a.Excerpt,
+		Label:             a.Label,
+		SourceRef:         int32(a.SourceRef),
+		Grounded:          a.Grounded,
+		Position:          int32(position),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return thesisAnchorFromRow(row), nil
+}
+
+func (r *pgRepository) ListSuggestedThesisAnchorsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisAnchor, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := draftdb.New(tx).ListSuggestedThesisAnchorsByDraft(ctx, draftdb.ListSuggestedThesisAnchorsByDraftParams{
+		DraftID:  optUUID(draftID),
+		TenantID: tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return groupAnchorsByThesis(rows), nil
+}
+
+func (r *pgRepository) ListSuggestedThesisAnchorsByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (map[string][]ThesisAnchor, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := draftdb.New(tx).ListSuggestedThesisAnchorsByIntimation(ctx, draftdb.ListSuggestedThesisAnchorsByIntimationParams{
+		IntimationID: optUUID(intimationID),
+		TenantID:     tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return groupAnchorsByThesis(rows), nil
+}
+
+// groupAnchorsByThesis groups the flat anchor rows by their parent thesis id,
+// preserving the query's (thesis position, anchor position) ordering.
+func groupAnchorsByThesis(rows []draftdb.SuggestedThesisAnchor) map[string][]ThesisAnchor {
+	out := make(map[string][]ThesisAnchor)
+	for _, row := range rows {
+		tid := row.SuggestedThesisID.String()
+		out[tid] = append(out[tid], *thesisAnchorFromRow(row))
+	}
+	return out
 }

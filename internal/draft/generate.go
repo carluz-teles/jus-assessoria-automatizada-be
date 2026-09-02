@@ -71,6 +71,10 @@ type generationDepsReader interface {
 	// thesis state (C2): the composer's SelectedTheses is derived from the theses in
 	// state included/pending_add, not from the fragile draft.selected_theses column.
 	ListSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]SuggestedThesis, error)
+	// ListSuggestedThesisAnchorsByDraft loads the N anchors of a draft's theses in one
+	// query (multi-âncora, 0094) so the composer lists every autos document that backs
+	// each selected thesis, not only the primary.
+	ListSuggestedThesisAnchorsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisAnchor, error)
 	// GetGenerationProfile loads the piece_profile + ordered sections for the draft's
 	// piece_profile_key (PART B) so the composer renders the catalog structure. nil
 	// (unknown/empty key) → the composer falls back to the generic structure.
@@ -267,6 +271,15 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		theses, e := uc.reader.ListSuggestedThesesByDraft(ctx, tx, ev.TenantID, ev.DraftID)
 		if e != nil {
 			return e
+		}
+		// Attach the N anchors per thesis (multi-âncora, 0094) so the composer lists
+		// every autos document backing each selected tese.
+		if anchorsByThesis, ae := uc.reader.ListSuggestedThesisAnchorsByDraft(ctx, tx, ev.TenantID, ev.DraftID); ae != nil {
+			return ae
+		} else {
+			for i := range theses {
+				theses[i].Anchors = anchorsByThesis[theses[i].ID]
+			}
 		}
 		if labels := selectedThesisLabels(theses); labels != nil {
 			draft.SelectedTheses = labels
@@ -693,6 +706,13 @@ func buildDraftContext(d *Draft, i *IntimationContext, parties []PartyInfo, chun
 	case len(selectedTheses) > 0:
 		ctx := make([]advisory.SelectedThesisCtx, 0, len(selectedTheses))
 		for _, t := range selectedTheses {
+			var anchors []advisory.ThesisAnchorCtx
+			for _, a := range t.Anchors {
+				anchors = append(anchors, advisory.ThesisAnchorCtx{
+					Label:   a.Label,
+					Excerpt: a.Excerpt,
+				})
+			}
 			ctx = append(ctx, advisory.SelectedThesisCtx{
 				Label:       t.Label,
 				Foundation:  t.Foundation,
@@ -700,6 +720,7 @@ func buildDraftContext(d *Draft, i *IntimationContext, parties []PartyInfo, chun
 				Excerpt:     t.SourceExcerpt,
 				SourceLabel: t.SourceLabel,
 				Grounded:    t.Grounded,
+				Anchors:     anchors,
 			})
 		}
 		dc.SelectedTheses = ctx

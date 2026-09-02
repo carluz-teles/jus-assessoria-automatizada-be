@@ -345,30 +345,59 @@ type Thesis struct {
 	Foundation string   `json:"foundation"`
 	Evidence   []string `json:"evidence"`
 
-	// SourceRef is the LLM-cited chunk number (1..N of "Trechos relevantes dos
-	// autos" in the prompt) whose literal text sustains this thesis; 0 means the
-	// thesis is grounded only in the teor da intimação or in doctrine (no chunk).
-	// Part of the LLM contract — resolveThesisSource turns it into the Source*
-	// fields below by an EXACT lookup (hits[SourceRef-1]), not a substring guess.
-	SourceRef int `json:"source_ref"`
+	// SourceRef is the PRIMARY anchor's chunk number (the strongest/first grounded),
+	// set by resolveThesisAnchors from SourceRefs; 0 when grounded only in the teor
+	// or doctrine (no chunk). NOT emitted by the LLM anymore (the LLM emits source_refs,
+	// the array below); this singular field mirrors the primary anchor for compat.
+	SourceRef int `json:"-"`
 
-	// Source* attribute the thesis back to the AUTOS document its evidence came
-	// from — resolved by resolveThesisSource from SourceRef (exact lookup into the
-	// RAG chunk hits), NOT emitted by the LLM (json:"-"). Empty when SourceRef==0
-	// or out of range (grounded only in the teor or doctrinal); the FE then falls
-	// back to the teor. This is what surfaces "esta tese se apoia na Petição
-	// inicial · pág. 3".
+	// Source* attribute the thesis back to the PRIMARY anchor's AUTOS document —
+	// resolved by resolveThesisAnchors from SourceRefs (exact lookups into the RAG
+	// chunk hits), NOT emitted by the LLM (json:"-"). Empty when no valid ref
+	// (grounded only in the teor or doctrinal); the FE then falls back to the teor.
+	// This is what surfaces "esta tese se apoia na Petição inicial · pág. 3". The
+	// full set of anchors lives in Anchors below.
 	SourceDocumentID string `json:"-"`
 	SourceLabel      string `json:"-"`
 	SourceExcerpt    string `json:"-"`
 	SourcePage       int    `json:"-"`
 
-	// Grounded is computed by resolveThesisSource: true when a piece of Evidence
-	// is a verified literal substring of the cited chunk (SourceRef≥1) OR of the
-	// teor (SourceRef==0). false = evidence didn't match the cited source (likely
+	// SourceRefs is the LLM-cited chunk numbers (1..N of "Trechos relevantes dos
+	// autos" in the prompt) whose literal text sustains this thesis — the MULTI-
+	// anchor form. Empty/[] means the thesis is grounded only in the teor da
+	// intimação or in doctrine (no chunk). resolveThesisAnchors turns it into the
+	// Anchors slice below, one ThesisAnchor per distinct document.
+	SourceRefs []int `json:"source_refs"`
+
+	// Grounded is computed by resolveThesisAnchors: true when a piece of Evidence
+	// is a verified literal substring of ANY cited chunk (some anchor grounded) OR
+	// of the teor (no refs). false = evidence didn't match any cited source (likely
 	// wrong ref) or matched nothing at all (likely hallucinated). Wire: json
 	// "grounded" via thesisResponse. NOT the LLM contract (json:"-").
 	Grounded bool `json:"-"`
+
+	// Anchors are ALL the autos documents that sustain this thesis (thesis_anchor
+	// 1:N, docs/erd-tipos-de-peca.md §4). Resolved by resolveThesisAnchors from
+	// SourceRefs (one anchor per distinct DocumentID). The SINGULAR Source* fields
+	// above mirror the PRIMARY anchor (Anchors[0]) for FE backward-compat; the FE
+	// (Fase 2) consumes the full Anchors slice. Empty when the thesis is grounded
+	// only in the teor/doctrine (no chunk cited). NOT the LLM contract (json:"-").
+	Anchors []ThesisAnchor `json:"-"`
+}
+
+// ThesisAnchor is one autos document that sustains a thesis (thesis_anchor,
+// docs/erd-tipos-de-peca.md §4). A thesis may have N anchors — every document
+// whose literal text backs the same argument. DocumentID is "" when the anchor
+// resolves to no document (grounded in the teor). SourceRef is the LLM's 1-based
+// chunk citation the anchor was resolved from. Grounded marks that Excerpt was
+// verified as a literal substring of the cited chunk.
+type ThesisAnchor struct {
+	DocumentID string
+	Page       int
+	Excerpt    string
+	Label      string
+	SourceRef  int
+	Grounded   bool
 }
 
 // ThesisConfidence closed set.
@@ -409,6 +438,12 @@ type SuggestedThesis struct {
 	SourceExcerpt    string
 	SourceLabel      string
 	Grounded         bool
+
+	// Anchors are ALL the autos documents that sustain this persisted thesis
+	// (suggested_thesis_anchor 1:N, migration 0094). The singular Source* fields
+	// above mirror the PRIMARY anchor (compat with the current FE); the FE (Fase 2)
+	// consumes the full Anchors slice. Empty when grounded only in the teor.
+	Anchors []ThesisAnchor
 
 	State    string
 	Position int

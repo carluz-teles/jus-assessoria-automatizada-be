@@ -221,6 +221,20 @@ type SelectedThesisCtx struct {
 	Excerpt     string
 	SourceLabel string
 	Grounded    bool
+
+	// Anchors are ALL the autos documents that sustain this thesis (multi-âncora).
+	// When non-empty, composeDraftMinuta lists EVERY anchor ("Apoio nos autos:
+	// Certidão ('...'), Ato ordinatório ('...')") instead of only the primary
+	// Excerpt/SourceLabel above. Empty → the singular Excerpt/SourceLabel path
+	// (backward-compat with legacy callers).
+	Anchors []ThesisAnchorCtx
+}
+
+// ThesisAnchorCtx is one autos document backing a selected thesis, as seen by the
+// draft_minuta composer — Label ("Certidão · pág. 3") + Excerpt (literal quote).
+type ThesisAnchorCtx struct {
+	Label   string
+	Excerpt string
 }
 
 // ReviewContext is the per-draft signal the review_minuta composer uses. It carries the
@@ -411,11 +425,15 @@ const summarizeProcessVersion = "process_summary/v1"
 // (preliminar/impugnação/mérito), sem profile caem na seção "DO DIREITO" genérica — e
 // carrega Fundamento/Dispositivo/trecho ancorado de cada tese pra o LLM desenvolver do
 // material dos autos, sem inventar.
-const draftMinutaVersion = "draft_minuta/v11"
+// Bumped to v12: cada tese selecionada agora lista TODAS as suas âncoras (multi-âncora,
+// thesis_anchor 1:N) — todos os documentos dos autos que a sustentam ("Apoio nos autos:
+// Certidão ('...'); Ato ordinatório ('...')") em vez de um único trecho. Teses sem âncoras
+// caem no caminho singular (Excerpt/SourceLabel), byte-idêntico ao v11 (backward-compat).
+const draftMinutaVersion = "draft_minuta/v12"
 
 // suggestThesesVersion is the pinned version of the suggest_theses template (POST
 // /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
-const suggestThesesVersion = "suggest_theses/v3"
+const suggestThesesVersion = "suggest_theses/v4"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -810,7 +828,34 @@ func composeDraftMinuta(c DraftContext) Composed {
 				tb.WriteString(t.Reference)
 				tb.WriteString(".")
 			}
-			if t.Excerpt != "" {
+			// Multi-âncora (v12): quando a tese tem N âncoras, lista TODAS (cada
+			// documento dos autos que a sustenta) em vez de só a primária. Fallback
+			// para o Excerpt/SourceLabel singular quando não há âncoras (compat).
+			switch {
+			case len(t.Anchors) > 0:
+				tb.WriteString(" Apoio nos autos: ")
+				first := true
+				for _, a := range t.Anchors {
+					if a.Excerpt == "" {
+						continue
+					}
+					if !first {
+						tb.WriteString("; ")
+					}
+					first = false
+					if a.Label != "" {
+						tb.WriteString(a.Label)
+						tb.WriteString(" (\"")
+						tb.WriteString(a.Excerpt)
+						tb.WriteString("\")")
+					} else {
+						tb.WriteString("\"")
+						tb.WriteString(a.Excerpt)
+						tb.WriteString("\"")
+					}
+				}
+				tb.WriteString(".")
+			case t.Excerpt != "":
 				tb.WriteString(" Apoio nos autos")
 				if t.SourceLabel != "" {
 					tb.WriteString(" (")
@@ -931,7 +976,11 @@ func composeSuggestTheses(c DraftContext) Composed {
 			"- `reference`: jurisprudência ou dispositivo legal, texto livre (ex.: \"art. 206, §5º, I, CC\" ou \"STJ, REsp 1.234.567/SP\"). NÃO invente números de processo.\n" +
 			"- `foundation`: explicação CURTA (1-2 frases) de por que a tese se aplica a este caso.\n" +
 			"- `evidence`: ARRAY de trechos LITERAIS extraídos do TEOR DA INTIMAÇÃO ou dos Trechos relevantes dos autos que sustentam a tese. Cada item é um recorte curto (10-40 palavras), copiado sem alterar. NÃO parafraseie. NÃO invente. Se não houver trecho literal, deixe o array vazio — e nesse caso confidence DEVE ser baixa.\n" +
-			"- `source_ref`: o NÚMERO do trecho (1, 2, 3...) da lista \"Trechos relevantes dos autos\" de onde você copiou a `evidence` que sustenta esta tese. A `evidence` DEVE ser cópia literal EXATA desse trecho numerado. Use 0 quando a tese se fundar apenas no teor da intimação ou em doutrina/dispositivo legal (sem trecho dos autos). NUNCA aponte um número que não exista na lista.\n\n" +
+			"- `source_refs`: o ARRAY com os NÚMEROS (1, 2, 3...) de TODOS os trechos da lista \"Trechos relevantes dos autos\" que sustentam esta tese. Cada item de `evidence` DEVE ser cópia literal EXATA de um desses trechos numerados. Use array vazio `[]` quando a tese se fundar apenas no teor da intimação ou em doutrina/dispositivo legal (sem trecho dos autos). NUNCA aponte um número que não exista na lista.\n\n" +
+			"CONSOLIDAÇÃO (DEDUP) E MULTI-ÂNCORA — REGRA CRÍTICA:\n" +
+			"- Se VÁRIOS trechos sustentam a MESMA tese (o mesmo argumento jurídico, o mesmo dispositivo), produza UMA ÚNICA tese e liste em `source_refs` TODOS os números de trecho que a sustentam. NÃO repita a mesma tese com âncoras diferentes.\n" +
+			"- Exemplo: se três certidões/atos distintos advertem \"extinção se não houver manifestação\", isso é UMA tese só (ex.: risco de extinção), com `source_refs` = [os três números], NÃO três teses.\n" +
+			"- Teses são DISTINTAS apenas quando o argumento/dispositivo é diferente. Se só muda o DOCUMENTO que prova o MESMO ponto, é a MESMA tese com várias âncoras.\n\n" +
 			"CRITÉRIOS DE CONFIDENCE (siga à risca):\n" +
 			"- alta: ao menos 2 trechos literais do contexto (evidence.length ≥ 2) apoiam DIRETAMENTE a tese, e o dispositivo/precedente citado é claramente aplicável ao caso concreto.\n" +
 			"- media: 1 trecho literal apoia (evidence.length == 1), OU 2+ trechos apoiam de forma indireta (contexto sugere mas não afirma o fato-chave).\n" +

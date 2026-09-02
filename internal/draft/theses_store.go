@@ -32,6 +32,9 @@ type suggestedThesisStore interface {
 	DeleteSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) error
 	ListSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) ([]SuggestedThesis, error)
 	DeleteSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) error
+	InsertSuggestedThesisAnchor(ctx context.Context, tx database.Tx, tenantID, thesisID string, a *ThesisAnchor, position int) (*ThesisAnchor, error)
+	ListSuggestedThesisAnchorsByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) (map[string][]ThesisAnchor, error)
+	ListSuggestedThesisAnchorsByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (map[string][]ThesisAnchor, error)
 }
 
 // thesisGenerator is the narrow port over ThesesUseCase.SuggestTheses (the stateless
@@ -144,6 +147,11 @@ func (uc *DraftThesesUseCase) persistGenerated(
 			if err != nil {
 				return err
 			}
+			// Persist the N anchors of this thesis (multi-âncora, 0094) in the same tx.
+			if err := uc.insertAnchors(ctx, tx, tenantID, inserted.ID, t.Anchors); err != nil {
+				return err
+			}
+			inserted.Anchors = t.Anchors
 			persisted = append(persisted, *inserted)
 		}
 		return nil
@@ -153,6 +161,48 @@ func (uc *DraftThesesUseCase) persistGenerated(
 	return persisted, nil
 }
 
+// insertAnchors persists the N anchors of one thesis (multi-âncora, 0094) in the
+// caller's tx, position = order index. No-op for an empty slice.
+func (uc *DraftThesesUseCase) insertAnchors(ctx context.Context, tx database.Tx, tenantID, thesisID string, anchors []ThesisAnchor) error {
+	for i := range anchors {
+		if _, err := uc.store.InsertSuggestedThesisAnchor(ctx, tx, tenantID, thesisID, &anchors[i], i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// attachDraftAnchors loads the anchors of a draft's theses in ONE query and
+// populates each SuggestedThesis.Anchors in place (avoids N+1).
+func attachDraftAnchors(ctx context.Context, tx database.Tx, store suggestedThesisStore, tenantID, draftID string, list []SuggestedThesis) error {
+	if len(list) == 0 {
+		return nil
+	}
+	byThesis, err := store.ListSuggestedThesisAnchorsByDraft(ctx, tx, tenantID, draftID)
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		list[i].Anchors = byThesis[list[i].ID]
+	}
+	return nil
+}
+
+// attachIntimationAnchors is the intimation-scoped counterpart of attachDraftAnchors.
+func attachIntimationAnchors(ctx context.Context, tx database.Tx, store suggestedThesisStore, tenantID, intimationID string, list []SuggestedThesis) error {
+	if len(list) == 0 {
+		return nil
+	}
+	byThesis, err := store.ListSuggestedThesisAnchorsByIntimation(ctx, tx, tenantID, intimationID)
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		list[i].Anchors = byThesis[list[i].ID]
+	}
+	return nil
+}
+
 // ListIntimationTheses returns the persisted theses of an intimation (GET
 // /v1/intimacoes/:id/theses — fluxo da partida).
 func (uc *DraftThesesUseCase) ListIntimationTheses(ctx context.Context, tenantID, intimationID string) ([]SuggestedThesis, error) {
@@ -160,6 +210,9 @@ func (uc *DraftThesesUseCase) ListIntimationTheses(ctx context.Context, tenantID
 	if err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		list, err := uc.store.ListSuggestedThesesByIntimation(ctx, tx, tenantID, intimationID)
 		if err != nil {
+			return err
+		}
+		if err := attachIntimationAnchors(ctx, tx, uc.store, tenantID, intimationID, list); err != nil {
 			return err
 		}
 		out = list
@@ -188,6 +241,8 @@ type thesisCopyStore interface {
 	ListSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]SuggestedThesis, error)
 	ListSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) ([]SuggestedThesis, error)
 	InsertSuggestedThesis(ctx context.Context, tx database.Tx, tenantID string, t *SuggestedThesis) (*SuggestedThesis, error)
+	InsertSuggestedThesisAnchor(ctx context.Context, tx database.Tx, tenantID, thesisID string, a *ThesisAnchor, position int) (*ThesisAnchor, error)
+	ListSuggestedThesisAnchorsByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (map[string][]ThesisAnchor, error)
 }
 
 // copyIntimationThesesToDraft is the shared promotion body (see
@@ -212,6 +267,13 @@ func copyIntimationThesesToDraft(ctx context.Context, tx database.Tx, store thes
 		return nil // partida não gerou teses — nada a promover.
 	}
 
+	// Load the source theses' anchors once (multi-âncora, 0094) so the copy carries
+	// them into the draft-scoped rows.
+	anchorsByThesis, err := store.ListSuggestedThesisAnchorsByIntimation(ctx, tx, tenantID, intimationID)
+	if err != nil {
+		return err
+	}
+
 	selected := make(map[string]struct{}, len(selectedThesisIDs))
 	for _, id := range selectedThesisIDs {
 		selected[id] = struct{}{}
@@ -222,7 +284,7 @@ func copyIntimationThesesToDraft(ctx context.Context, tx database.Tx, store thes
 		if _, ok := selected[t.ID]; ok {
 			state = ThesisStateIncluded
 		}
-		if _, err := store.InsertSuggestedThesis(ctx, tx, tenantID, &SuggestedThesis{
+		inserted, err := store.InsertSuggestedThesis(ctx, tx, tenantID, &SuggestedThesis{
 			DraftID:          draftID,
 			Label:            t.Label,
 			Confidence:       t.Confidence,
@@ -237,8 +299,15 @@ func copyIntimationThesesToDraft(ctx context.Context, tx database.Tx, store thes
 			Grounded:         t.Grounded,
 			State:            state,
 			Position:         i, // preserva a ordem da partida (já ordenada).
-		}); err != nil {
+		})
+		if err != nil {
 			return err
+		}
+		// Copy the source thesis's anchors into the new draft-scoped thesis.
+		for j, a := range anchorsByThesis[t.ID] {
+			if _, err := store.InsertSuggestedThesisAnchor(ctx, tx, tenantID, inserted.ID, &a, j); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -250,6 +319,9 @@ func (uc *DraftThesesUseCase) ListDraftTheses(ctx context.Context, tenantID, dra
 	if err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
 		list, err := uc.store.ListSuggestedThesesByDraft(ctx, tx, tenantID, draftID)
 		if err != nil {
+			return err
+		}
+		if err := attachDraftAnchors(ctx, tx, uc.store, tenantID, draftID, list); err != nil {
 			return err
 		}
 		out = list

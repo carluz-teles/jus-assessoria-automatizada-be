@@ -38,8 +38,9 @@ type fakeReader struct {
 	draft      *Draft
 	intimation *IntimationContext
 	parties    []PartyInfo
-	theses     []SuggestedThesis // C2: persisted theses feeding the generation selection
-	profile    *GenerationProfile // PART B: catalog profile for generation
+	theses     []SuggestedThesis            // C2: persisted theses feeding the generation selection
+	anchors    map[string][]ThesisAnchor    // multi-âncora (0094): anchors keyed by thesis id
+	profile    *GenerationProfile           // PART B: catalog profile for generation
 	draftErr   error
 	intimErr   error
 	partiesErr error
@@ -58,6 +59,9 @@ func (f fakeReader) GetPartiesForDraft(_ context.Context, _ database.Tx, _, _ st
 }
 func (f fakeReader) ListSuggestedThesesByDraft(_ context.Context, _ database.Tx, _, _ string) ([]SuggestedThesis, error) {
 	return f.theses, f.thesesErr
+}
+func (f fakeReader) ListSuggestedThesisAnchorsByDraft(_ context.Context, _ database.Tx, _, _ string) (map[string][]ThesisAnchor, error) {
+	return f.anchors, nil
 }
 func (f fakeReader) GetGenerationProfile(_ context.Context, _ database.Tx, _ string) (*GenerationProfile, error) {
 	return f.profile, f.profileErr

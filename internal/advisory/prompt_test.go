@@ -182,8 +182,8 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
 
-	if out.PromptVersion != "draft_minuta/v11" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v11", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v12" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
 	}
 
 	// System must contain the gold rule (v4: parties + signing lawyer instruction).
@@ -274,8 +274,8 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
 	if !strings.Contains(out.User, "sem contexto adicional") {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
-	if out.PromptVersion != "draft_minuta/v11" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v11", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v12" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
 	}
 }
 
@@ -336,8 +336,8 @@ func TestTemplateComposer_ComposeDraft_v10_ProfileSectionsRendered(t *testing.T)
 	if !strings.Contains(out.System, "TESES SELECIONADAS") {
 		t.Errorf("profile prompt missing aceita_teses guidance")
 	}
-	if out.PromptVersion != "draft_minuta/v11" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v11", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v12" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
 	}
 }
 
@@ -570,6 +570,42 @@ func TestTemplateComposer_ComposeDraft_InstructionsAndTheses(t *testing.T) {
 	}
 }
 
+// TestTemplateComposer_ComposeDraft_v12_MultiAnchor verifies that a selected thesis
+// with N anchors lists EVERY autos document that backs it (multi-âncora), not only the
+// primary — and that a thesis with no anchors falls back to the singular Excerpt path.
+func TestTemplateComposer_ComposeDraft_v12_MultiAnchor(t *testing.T) {
+	c := NewTemplateComposer()
+	out, err := c.ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType: "DEFENSE",
+		SelectedTheses: []SelectedThesisCtx{
+			{
+				Label:      "Risco de extinção",
+				Foundation: "Múltiplas advertências nos autos",
+				Anchors: []ThesisAnchorCtx{
+					{Label: "Certidão · pág. 5", Excerpt: "sob pena de extinção"},
+					{Label: "Ato ordinatório · pág. 2", Excerpt: "dar andamento sob pena de arquivamento"},
+				},
+			},
+			// No anchors → singular Excerpt path (backward-compat).
+			{Label: "Excesso", Excerpt: "juros indevidos", SourceLabel: "fls. 30"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	for _, want := range []string{
+		"Apoio nos autos: Certidão · pág. 5 (\"sob pena de extinção\"); Ato ordinatório · pág. 2 (\"dar andamento sob pena de arquivamento\").",
+		"Apoio nos autos (fls. 30): \"juros indevidos\".",
+	} {
+		if !strings.Contains(out.User, want) {
+			t.Errorf("multi-anchor user prompt missing %q\n---\n%s", want, out.User)
+		}
+	}
+	if out.PromptVersion != "draft_minuta/v12" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
+	}
+}
+
 // TestTemplateComposer_ComposeTheses verifies the suggest_theses agent renders a
 // non-empty, versioned prompt with the injected case context.
 func TestTemplateComposer_ComposeTheses(t *testing.T) {
@@ -585,16 +621,22 @@ func TestTemplateComposer_ComposeTheses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComposeTheses() error = %v", err)
 	}
-	if out.PromptVersion != "suggest_theses/v3" {
-		t.Errorf("PromptVersion = %q, want suggest_theses/v3", out.PromptVersion)
+	if out.PromptVersion != "suggest_theses/v4" {
+		t.Errorf("PromptVersion = %q, want suggest_theses/v4", out.PromptVersion)
 	}
 	if strings.TrimSpace(out.System) == "" || strings.TrimSpace(out.User) == "" {
 		t.Fatalf("empty system/user: system=%q user=%q", out.System, out.User)
 	}
 	// v2: campo `evidence` obrigatório + critérios objetivos por confidence.
-	for _, want := range []string{"label", "confidence", "reference", "foundation", "evidence", "source_ref"} {
+	for _, want := range []string{"label", "confidence", "reference", "foundation", "evidence", "source_refs"} {
 		if !strings.Contains(out.System, want) {
 			t.Errorf("system prompt missing %q output field\n---\n%s", want, out.System)
+		}
+	}
+	// v4: dedup + multi-âncora instructions.
+	for _, want := range []string{"CONSOLIDAÇÃO", "UMA ÚNICA tese", "várias âncoras"} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("system prompt missing v4 dedup/multi-anchor rule %q\n---\n%s", want, out.System)
 		}
 	}
 	for _, want := range []string{"CRITÉRIOS DE CONFIDENCE", "evidence.length"} {

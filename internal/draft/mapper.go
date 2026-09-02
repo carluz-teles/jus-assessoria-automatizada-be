@@ -729,3 +729,17 @@ func suggestedThesisFromRow(r draftdb.SuggestedThesis) *SuggestedThesis {
 		Position:         int(r.Position),
 	}
 }
+
+// thesisAnchorFromRow maps a persisted suggested_thesis_anchor row to the
+// ThesisAnchor entity (multi-âncora, 0094): nullable document_id → "" on NULL,
+// int32 → int.
+func thesisAnchorFromRow(r draftdb.SuggestedThesisAnchor) *ThesisAnchor {
+	return &ThesisAnchor{
+		DocumentID: pgUUIDToString(r.DocumentID),
+		Page:       int(r.Page),
+		Excerpt:    r.Excerpt,
+		Label:      r.Label,
+		SourceRef:  int(r.SourceRef),
+		Grounded:   r.Grounded,
+	}
+}

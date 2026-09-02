@@ -919,16 +919,42 @@ func (h *Handler) thesesFromIntimation(c *fiber.Ctx) error {
 // in the teor — the FE then shows the teor as source, the pre-existing behavior). The
 // snake_case names match the FE's ThesisAPI (pecas-v2) so no mapper change is needed.
 type thesisResponse struct {
-	Label            string   `json:"label"`
-	Confidence       string   `json:"confidence"`
-	Reference        string   `json:"reference"`
-	Foundation       string   `json:"foundation"`
-	Evidence         []string `json:"evidence"`
-	Grounded         bool     `json:"grounded"`
-	SourceDocumentID string   `json:"source_document_id,omitempty"`
-	SourceLabel      string   `json:"source_label,omitempty"`
-	SourceExcerpt    string   `json:"source_excerpt,omitempty"`
-	SourcePage       int      `json:"source_page,omitempty"`
+	Label            string           `json:"label"`
+	Confidence       string           `json:"confidence"`
+	Reference        string           `json:"reference"`
+	Foundation       string           `json:"foundation"`
+	Evidence         []string         `json:"evidence"`
+	Grounded         bool             `json:"grounded"`
+	SourceDocumentID string           `json:"source_document_id,omitempty"`
+	SourceLabel      string           `json:"source_label,omitempty"`
+	SourceExcerpt    string           `json:"source_excerpt,omitempty"`
+	SourcePage       int              `json:"source_page,omitempty"`
+	Anchors          []anchorResponse `json:"anchors"`
+}
+
+// anchorResponse is one autos document sustaining a thesis (multi-âncora). The FE
+// (Fase 2) consumes the full slice; the singular source_* above mirror the primary.
+type anchorResponse struct {
+	DocumentID string `json:"document_id,omitempty"`
+	Label      string `json:"label,omitempty"`
+	Excerpt    string `json:"excerpt,omitempty"`
+	Page       int    `json:"page,omitempty"`
+	Grounded   bool   `json:"grounded"`
+}
+
+// anchorsToResponse maps the entity anchors to their wire form (never null).
+func anchorsToResponse(anchors []ThesisAnchor) []anchorResponse {
+	out := make([]anchorResponse, 0, len(anchors))
+	for _, a := range anchors {
+		out = append(out, anchorResponse{
+			DocumentID: a.DocumentID,
+			Label:      a.Label,
+			Excerpt:    a.Excerpt,
+			Page:       a.Page,
+			Grounded:   a.Grounded,
+		})
+	}
+	return out
 }
 
 func thesesToResponse(theses []Thesis) []thesisResponse {
@@ -949,6 +975,7 @@ func thesesToResponse(theses []Thesis) []thesisResponse {
 			SourceLabel:      t.SourceLabel,
 			SourceExcerpt:    t.SourceExcerpt,
 			SourcePage:       t.SourcePage,
+			Anchors:          anchorsToResponse(t.Anchors),
 		})
 	}
 	return out
@@ -959,19 +986,20 @@ func thesesToResponse(theses []Thesis) []thesisResponse {
 // pecas-v2) needs to select and keep a thesis across revisits. snake_case matches
 // the FE's ThesisAPI.
 type suggestedThesisResponse struct {
-	ID               string   `json:"id"`
-	State            string   `json:"state"`
-	Position         int      `json:"position"`
-	Label            string   `json:"label"`
-	Confidence       string   `json:"confidence"`
-	Reference        string   `json:"reference"`
-	Foundation       string   `json:"foundation"`
-	Evidence         []string `json:"evidence"`
-	Grounded         bool     `json:"grounded"`
-	SourceDocumentID string   `json:"source_document_id,omitempty"`
-	SourceLabel      string   `json:"source_label,omitempty"`
-	SourceExcerpt    string   `json:"source_excerpt,omitempty"`
-	SourcePage       int      `json:"source_page,omitempty"`
+	ID               string           `json:"id"`
+	State            string           `json:"state"`
+	Position         int              `json:"position"`
+	Label            string           `json:"label"`
+	Confidence       string           `json:"confidence"`
+	Reference        string           `json:"reference"`
+	Foundation       string           `json:"foundation"`
+	Evidence         []string         `json:"evidence"`
+	Grounded         bool             `json:"grounded"`
+	SourceDocumentID string           `json:"source_document_id,omitempty"`
+	SourceLabel      string           `json:"source_label,omitempty"`
+	SourceExcerpt    string           `json:"source_excerpt,omitempty"`
+	SourcePage       int              `json:"source_page,omitempty"`
+	Anchors          []anchorResponse `json:"anchors"`
 }
 
 func suggestedThesisToResponse(t SuggestedThesis) suggestedThesisResponse {
@@ -993,6 +1021,7 @@ func suggestedThesisToResponse(t SuggestedThesis) suggestedThesisResponse {
 		SourceLabel:      t.SourceLabel,
 		SourceExcerpt:    t.SourceExcerpt,
 		SourcePage:       t.SourcePage,
+		Anchors:          anchorsToResponse(t.Anchors),
 	}
 }
 
