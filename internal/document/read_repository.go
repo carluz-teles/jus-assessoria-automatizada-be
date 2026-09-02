@@ -108,3 +108,24 @@ func (r *pgReadRepository) GetDocument(ctx context.Context, tenantID, id string)
 	}
 	return viewFromGetRow(row), nil
 }
+
+// GetDocumentChunks reads one document's extracted page texts on the pool, ordered (page, id).
+// The chunk table has no tenant_id, so barrier 1 is enforced in-query via an EXISTS subselect on
+// the owning document (same tenant + deleted_at IS NULL scoping). An empty result is returned as
+// such — the use case disambiguates unknown-id from not-yet-extracted via GetDocument.
+func (r *pgReadRepository) GetDocumentChunks(ctx context.Context, tenantID, id string) ([]string, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	texts, err := r.q.GetDocumentChunks(ctx, documentdb.GetDocumentChunksParams{ID: did, TenantID: tid})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return texts, nil
+}

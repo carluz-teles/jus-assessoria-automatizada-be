@@ -25,16 +25,18 @@ type fakeDocumentWriter struct {
 
 type fakeDocumentWrite struct {
 	tenantID, courtRecordID, mimeType, checksum, title, documentType string
+	courtEventDate                                                   time.Time
 }
 
-func (w *fakeDocumentWriter) WriteDocument(_ context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, _ []byte) (string, error) {
+func (w *fakeDocumentWriter) WriteDocument(_ context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, courtEventDate time.Time, _ []byte) (string, error) {
 	w.calls = append(w.calls, fakeDocumentWrite{
-		tenantID:      tenantID,
-		courtRecordID: courtRecordID,
-		mimeType:      mimeType,
-		checksum:      checksum,
-		title:         title,
-		documentType:  documentType,
+		tenantID:       tenantID,
+		courtRecordID:  courtRecordID,
+		mimeType:       mimeType,
+		checksum:       checksum,
+		title:          title,
+		documentType:   documentType,
+		courtEventDate: courtEventDate,
 	})
 	if w.failTitles[title] {
 		return "", assert.AnError
@@ -106,9 +108,12 @@ func TestEprocProvider_downloadNewDocuments_SkipsEventsAtOrBeforeCursor(t *testi
 
 	assert.Equal(t, 1, downloaded)
 	require.Len(t, writer.calls, 1)
-	assert.Equal(t, "new", writer.calls[0].title)
+	// No event description and an unknown label code → humanized code as the title.
+	assert.Equal(t, "New", writer.calls[0].title)
 	assert.Equal(t, "tenant-1", writer.calls[0].tenantID)
 	assert.Equal(t, "record-1", writer.calls[0].courtRecordID)
+	// The eproc event date rides along to the writer (persisted as court_event_date).
+	assert.Equal(t, cursor.Add(time.Hour), writer.calls[0].courtEventDate)
 }
 
 func TestEprocProvider_downloadNewDocuments_ZeroCursorDownloadsEverything(t *testing.T) {
@@ -131,7 +136,7 @@ func TestEprocProvider_downloadNewDocuments_ZeroCursorDownloadsEverything(t *tes
 func TestEprocProvider_downloadNewDocuments_OneDocumentFailureDoesNotAbortTheRest(t *testing.T) {
 	srv := eprocDocumentStub(t, map[string]string{"doc-good": "%PDF good", "doc-writer-fails": "%PDF writer-fails"})
 	client := newPrimedEprocClient(t, srv.URL)
-	writer := &fakeDocumentWriter{failTitles: map[string]bool{"writer-fails": true}}
+	writer := &fakeDocumentWriter{failTitles: map[string]bool{"Writer-fails": true}}
 	p := NewEprocProvider(nil, writer)
 
 	cursor := time.Time{}
@@ -154,7 +159,7 @@ func TestEprocProvider_downloadNewDocuments_OneDocumentFailureDoesNotAbortTheRes
 	assert.Equal(t, 1, downloaded)
 	require.Len(t, writer.calls, 2) // good + writer-fails both REACHED the writer
 	titles := []string{writer.calls[0].title, writer.calls[1].title}
-	assert.ElementsMatch(t, []string{"good", "writer-fails"}, titles)
+	assert.ElementsMatch(t, []string{"Good", "Writer-fails"}, titles)
 }
 
 func TestEprocProvider_downloadNewDocuments_NilDocWriterIsNoOp(t *testing.T) {
@@ -264,28 +269,42 @@ func TestDocTitleAndType(t *testing.T) {
 		wantType      string
 	}{
 		{
-			name:      "known code maps to friendly label; type keeps the raw code",
+			name:      "event description is the PRIMARY name; type keeps the raw code",
 			code:      "SENT",
 			eventDesc: "Sentença registrada",
+			wantTitle: "Sentença registrada",
+			wantType:  "SENT",
+		},
+		{
+			name:      "no description falls back to the mapped label",
+			code:      "SENT",
+			eventDesc: "",
 			wantTitle: "Sentença",
 			wantType:  "SENT",
 		},
 		{
-			name:      "unknown code falls back to the event description",
+			name:      "no description, unknown code falls back to a humanized code",
+			code:      "PLANILHA DE CÁLCULO",
+			eventDesc: "",
+			wantTitle: "Planilha de cálculo",
+			wantType:  "PLANILHA DE CÁLCULO",
+		},
+		{
+			name:      "unknown code with a description uses the description",
 			code:      "XPTO",
 			eventDesc: "Despacho saneador",
 			wantTitle: "Despacho saneador",
 			wantType:  "XPTO",
 		},
 		{
-			name:      "unknown code with no description falls back to the raw code",
+			name:      "everything blank but the code falls back to the raw code",
 			code:      "XPTO",
 			eventDesc: "",
-			wantTitle: "XPTO",
+			wantTitle: "Xpto",
 			wantType:  "XPTO",
 		},
 		{
-			name:      "lowercase code is matched case-insensitively",
+			name:      "lowercase code is matched case-insensitively when no description",
 			code:      "contrsocial",
 			eventDesc: "",
 			wantTitle: "Contrato social",

@@ -32,6 +32,10 @@ type Repository interface {
 	// ErrDocumentNotFound. On a hit it returns the full document so document.uploaded commits with
 	// it in the same tx.
 	MarkUploaded(ctx context.Context, tx database.Tx, id, tenantID, checksum string) (*Document, error)
+	// GetDocumentForRaw loads a document's raw-proxy state (storage_key/mime_type + the display
+	// columns the inline filename derives from) scoped to tenantID (barrier 1), filtering
+	// soft-deleted. A miss → ErrDocumentNotFound (→ 404).
+	GetDocumentForRaw(ctx context.Context, tx database.Tx, id, tenantID string) (*DocumentForRaw, error)
 	// GetDocumentForDelete loads a document's origin scoped to tenantID, filtering soft-deleted. A
 	// miss → ErrDocumentNotFound (→ 404).
 	GetDocumentForDelete(ctx context.Context, tx database.Tx, id, tenantID string) (*DocumentForDelete, error)
@@ -102,6 +106,7 @@ func (r *pgRepository) InsertDocument(ctx context.Context, tx database.Tx, d *Do
 		SizeBytes:        int64ToNull(d.SizeBytes),
 		Title:            textToNull(d.Title),
 		OriginalFilename: textToNull(d.OriginalFilename),
+		CourtEventDate:   timeToTimestamptz(d.CourtEventDate),
 	})
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -168,6 +173,37 @@ func (r *pgRepository) MarkUploaded(ctx context.Context, tx database.Tx, id, ten
 		return nil, database.WrapInfra(err)
 	}
 	return documentFromUploadedRow(row), nil
+}
+
+// GetDocumentForRaw loads a document's raw-proxy state by id inside the caller's tx, filtered by
+// tenantID (barrier 1) and deleted_at IS NULL. A missing id — or one in another tenant / soft-
+// deleted — maps to the typed ErrDocumentNotFound (never nil, nil). The mapper lifts the nullable
+// storage_key/mime_type/title/original_filename to "".
+func (r *pgRepository) GetDocumentForRaw(ctx context.Context, tx database.Tx, id, tenantID string) (*DocumentForRaw, error) {
+	did, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	row, err := documentdb.New(tx).GetDocumentForRaw(ctx, documentdb.GetDocumentForRawParams{ID: did, TenantID: tenant})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDocumentNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	return &DocumentForRaw{
+		StorageKey:       derefString(row.StorageKey),
+		MimeType:         derefString(row.MimeType),
+		Title:            derefString(row.Title),
+		OriginalFilename: derefString(row.OriginalFilename),
+		DocumentType:     row.DocumentType,
+	}, nil
 }
 
 // GetDocumentForDelete loads a document's origin by id inside the caller's tx, filtered by

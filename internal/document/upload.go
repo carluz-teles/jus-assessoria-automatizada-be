@@ -2,6 +2,7 @@ package document
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/jusassessoria/platform/lib/database"
@@ -32,6 +33,9 @@ type storagePort interface {
 	PresignedPut(ctx context.Context, key, contentType string, ttl time.Duration) (string, error)
 	PresignedGet(ctx context.Context, key string, ttl time.Duration) (string, error)
 	Exists(ctx context.Context, key string) (bool, error)
+	// GetBytes reads the object bytes DIRECTLY server-side (no presigned round-trip) — the raw
+	// proxy (GET /v1/documentos/:id/raw) needs the actual bytes to stream to the browser.
+	GetBytes(ctx context.Context, key string) ([]byte, error)
 }
 
 // publisher is the transactional-outbox port — the producer half. *events.Outbox satisfies it
@@ -101,6 +105,11 @@ type StartUploadCommand struct {
 	OriginalFilename string
 	MimeType         string
 	SizeBytes        int64
+	// CourtEventDate is the eproc event date the document was juntado under — set only
+	// by the worker-court DocumentWriter adapter (origin=COURT). A human UPLOAD leaves
+	// it zero, which persists as SQL NULL (the column is nullable — only eproc docs
+	// carry it).
+	CourtEventDate time.Time
 }
 
 // StartUploadResult is what Start returns: the created document's id, the presigned PUT URL, the
@@ -149,6 +158,7 @@ func (uc *UseCase) Start(ctx context.Context, cmd StartUploadCommand) (StartUplo
 			SizeBytes:        cmd.SizeBytes,
 			Title:            title,
 			OriginalFilename: cmd.OriginalFilename,
+			CourtEventDate:   cmd.CourtEventDate,
 		})
 		if err != nil {
 			return err
@@ -255,6 +265,88 @@ func (uc *UseCase) Download(ctx context.Context, tenantID, documentID string) (D
 		return DownloadResult{}, err
 	}
 	return DownloadResult{URL: url, ExpiresIn: int(presignGetTTL.Seconds())}, nil
+}
+
+// RawFileResult is what RawFile returns: the object's bytes plus the metadata the handler turns
+// into response headers — the ContentType (the document's mime_type, defaulted to
+// application/pdf when the column is empty) and the Filename (derived title/original_filename/
+// document_type + ".pdf") for the inline Content-Disposition.
+type RawFileResult struct {
+	Bytes       []byte
+	ContentType string
+	Filename    string
+}
+
+// defaultRawContentType is the Content-Type used when a document has no mime_type recorded — the
+// esmagadora maioria dos documentos (dos autos e uploads) é PDF, so this is the safe default for a
+// browser viewer.
+const defaultRawContentType = "application/pdf"
+
+// RawFile proxies a document's object bytes so the FE can embed it in a viewer (the presigned URL
+// points at storage internal/inaccessible to the browser in dev, and we keep the token out of the
+// URL). It mirrors Download's resolution — it loads the document tenant-scoped (a miss / foreign /
+// soft-deleted id → ErrDocumentNotFound → 404), refuses a document with no storage_key (a PENDING
+// one whose bytes never landed → ErrDocumentNoStorageKey → 409) — but instead of presigning it
+// reads the bytes DIRECTLY (storage.GetBytes) so the handler streams them. The load runs in a
+// tenant-scoped tx (barrier 1 + 2); the byte fetch runs outside it. A storage miss on a resolved
+// document is a storage inconsistency (not a 404): the infra error propagates as a 5xx with the
+// cause logged, never leaking to the client.
+func (uc *UseCase) RawFile(ctx context.Context, tenantID, documentID string) (RawFileResult, error) {
+	var meta *DocumentForRaw
+	err := uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		doc, err := uc.repo.GetDocumentForRaw(ctx, tx, documentID, tenantID)
+		if err != nil {
+			return err
+		}
+		if doc.StorageKey == "" {
+			return ErrDocumentNoStorageKey
+		}
+		meta = doc
+		return nil
+	})
+	if err != nil {
+		return RawFileResult{}, err
+	}
+
+	bytes, err := uc.storage.GetBytes(ctx, meta.StorageKey)
+	if err != nil {
+		return RawFileResult{}, err
+	}
+
+	// A coluna mime_type às vezes guarda um token curto/inválido (ex.: "pdf" vindo
+	// da ingestão do eproc) em vez de um MIME real. Um Content-Type sem "/" não é
+	// um media type válido e quebra o viewer do browser (<object type="application/
+	// pdf">), então tratamos qualquer valor sem barra como ausente e caímos no PDF.
+	contentType := meta.MimeType
+	if !strings.Contains(contentType, "/") {
+		contentType = defaultRawContentType
+	}
+	return RawFileResult{
+		Bytes:       bytes,
+		ContentType: contentType,
+		Filename:    rawFilename(meta),
+	}, nil
+}
+
+// rawFilename derives the inline Content-Disposition filename: the first non-empty of title /
+// original_filename / document_type, with a ".pdf" suffix appended when it has no extension (the
+// browser viewer keys off the extension). Falls back to "document" so the header is never empty.
+func rawFilename(meta *DocumentForRaw) string {
+	name := firstNonEmpty(meta.Title, meta.OriginalFilename, meta.DocumentType, "document")
+	if !strings.Contains(name, ".") {
+		name += ".pdf"
+	}
+	return name
+}
+
+// firstNonEmpty returns the first argument that is not the empty string, or "" when all are empty.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // Delete soft-deletes an UPLOAD document (docs/erd-documentos.md §8): in ONE tenant-scoped tx it

@@ -87,6 +87,50 @@ func (q *Queries) GetDocument(ctx context.Context, arg GetDocumentParams) (GetDo
 	return i, err
 }
 
+const getDocumentChunks = `-- name: GetDocumentChunks :many
+SELECT c.text
+FROM chunk c
+WHERE c.document_id = $1::uuid
+  AND EXISTS (
+    SELECT 1 FROM document d
+    WHERE d.id = c.document_id
+      AND d.tenant_id = $2::uuid
+      AND d.deleted_at IS NULL
+  )
+ORDER BY c.page, c.id
+`
+
+type GetDocumentChunksParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// The extracted text of one document (GET /v1/documentos/:id/content), one row per page. The
+// chunk table carries no tenant_id, so barrier 1 is enforced via an EXISTS subselect on the
+// owning document (same tenant + deleted_at IS NULL scoping as the detail read). Ordered by
+// (page, id) so the caller concatenates the pages in reading order. An empty result means either
+// an unknown/foreign/soft-deleted document OR a live document not yet extracted — the use case
+// disambiguates via GetDocument.
+func (q *Queries) GetDocumentChunks(ctx context.Context, arg GetDocumentChunksParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, getDocumentChunks, arg.ID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			return nil, err
+		}
+		items = append(items, text)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listDocumentsByProcesso = `-- name: ListDocumentsByProcesso :many
 
 SELECT d.id, d.court_record_id, d.document_type, d.origin, d.title,

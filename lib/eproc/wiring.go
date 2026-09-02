@@ -11,9 +11,13 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 )
 
 // errCallbackTokenMissing signals Certisign's response carried no "cb" field — the
@@ -501,7 +505,99 @@ func parsePartiesFromRoot(root *html.Node) []Party {
 			reus = append(reus, party)
 		}
 	}
-	return append(autores, reus...)
+	return append(dedupParties(autores), dedupParties(reus)...)
+}
+
+// dedupParties collapses parties that are the SAME participant rendered under more
+// than one data-parte marker (eproc emits a marker per representation, so an autor
+// with two procurações lands as two rows — e.g. "JOSE EDEN MACIEL" with counsels and
+// "JOSé EDEN MACIEL" without). The key is the accent/case-insensitive name; entries
+// merge: the richest one (a document, then counsels) is kept as the base and every
+// other entry's counsels are unioned in (deduped by OAB|UF|name). Order is preserved
+// by first appearance. Input is a single polo — callers dedup autores and réus
+// separately so a homonym across polos is never merged.
+func dedupParties(parties []Party) []Party {
+	if len(parties) < 2 {
+		return parties
+	}
+	index := make(map[string]int, len(parties))
+	out := make([]Party, 0, len(parties))
+	for _, p := range parties {
+		key := normalizePartyName(p.Name)
+		if i, ok := index[key]; ok {
+			out[i] = mergeParties(out[i], p)
+			continue
+		}
+		index[key] = len(out)
+		out = append(out, p)
+	}
+	return out
+}
+
+// mergeParties folds b into a, keeping the richer identity: a document beats none,
+// and (document being equal) the entry that already carries counsels stays the base.
+// b's counsels are always unioned in so no advogado is lost regardless of which entry
+// won. The winner's Name is kept verbatim (either grafia is acceptable to the FE).
+func mergeParties(a, b Party) Party {
+	base, extra := a, b
+	if partyRichness(b) > partyRichness(a) {
+		base, extra = b, a
+	}
+	base.Counsels = unionCounsels(base.Counsels, extra.Counsels)
+	if base.Document == "" {
+		base.Document = extra.Document
+		base.RawDocument = extra.RawDocument
+	}
+	return base
+}
+
+// partyRichness ranks how much identifying data a party carries, so the merge keeps
+// the fullest entry: a CPF/CNPJ is worth more than any number of counsels (identity
+// over representation), then the presence of counsels breaks the tie.
+func partyRichness(p Party) int {
+	score := 0
+	if p.Document != "" {
+		score += 2
+	}
+	if len(p.Counsels) > 0 {
+		score++
+	}
+	return score
+}
+
+// unionCounsels appends b's counsels to a, skipping any already present. Identity is
+// OAB|UF when an OAB exists (the stable key), else the normalized name — so the same
+// advogado read off two markers is not duplicated.
+func unionCounsels(a, b []Counsel) []Counsel {
+	seen := make(map[string]bool, len(a)+len(b))
+	key := func(c Counsel) string {
+		if c.OAB != "" {
+			return "oab:" + strings.ToUpper(c.UF) + "|" + c.OAB
+		}
+		return "name:" + normalizePartyName(c.Name)
+	}
+	out := make([]Counsel, 0, len(a)+len(b))
+	for _, c := range append(a, b...) {
+		k := key(c)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// normalizePartyName folds a party/advogado name to a comparison key: strip diacritics
+// (NFD + drop combining marks), uppercase, and collapse whitespace. "JOSé EDEN MACIEL"
+// and "JOSE EDEN  MACIEL" both key to "JOSE EDEN MACIEL". Mirrors draft's
+// normalizeForMatch (a little copying over a cross-slice dependency).
+func normalizePartyName(s string) string {
+	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+	if out, _, err := transform.String(t, s); err == nil {
+		s = out
+	}
+	return strings.Join(strings.Fields(strings.ToUpper(s)), " ")
 }
 
 // parsePartyFromMarker builds a Party from its name marker — the element that carries

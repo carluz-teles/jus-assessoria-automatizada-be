@@ -173,3 +173,99 @@ func TestSplitOAB(t *testing.T) {
 		})
 	}
 }
+
+// TestDedupParties covers the duplicate-party bug: eproc emits one data-parte marker
+// per representation, so the SAME autor with two procurações lands as two rows with
+// different grafias ("JOSE EDEN MACIEL" with counsels, "JOSé EDEN MACIEL" without).
+// dedupParties must collapse them to one, unioning the counsels and keeping the richer
+// identity — while never merging a genuine homonym across a different key.
+func TestDedupParties(t *testing.T) {
+	t.Parallel()
+
+	cA := Counsel{Name: "Adv A", OAB: "111", UF: "SP"}
+	cB := Counsel{Name: "Adv B", OAB: "222", UF: "RJ"}
+
+	tests := []struct {
+		name string
+		in   []Party
+		want []Party
+	}{
+		{
+			name: "accent and case difference merges, counsels preserved",
+			in: []Party{
+				{Name: "JOSE EDEN MACIEL", Role: "AUTOR", Document: "111.222.333-44", Counsels: []Counsel{cA}},
+				{Name: "JOSé EDEN MACIEL", Role: "AUTOR"},
+			},
+			want: []Party{
+				{Name: "JOSE EDEN MACIEL", Role: "AUTOR", Document: "111.222.333-44", Counsels: []Counsel{cA}},
+			},
+		},
+		{
+			name: "counsels unioned from both entries, no duplicate",
+			in: []Party{
+				{Name: "MARIA", Role: "AUTOR", Counsels: []Counsel{cA}},
+				{Name: "maria", Role: "AUTOR", Counsels: []Counsel{cA, cB}},
+			},
+			want: []Party{
+				{Name: "MARIA", Role: "AUTOR", Counsels: []Counsel{cA, cB}},
+			},
+		},
+		{
+			name: "richer entry (with document) becomes base regardless of order",
+			in: []Party{
+				{Name: "JOAO", Role: "REU", Counsels: []Counsel{cA}},
+				{Name: "joão", Role: "REU", Document: "999", RawDocument: "999"},
+			},
+			want: []Party{
+				{Name: "joão", Role: "REU", Document: "999", RawDocument: "999", Counsels: []Counsel{cA}},
+			},
+		},
+		{
+			name: "distinct names are not merged",
+			in: []Party{
+				{Name: "ALICE", Role: "AUTOR"},
+				{Name: "BOB", Role: "AUTOR"},
+			},
+			want: []Party{
+				{Name: "ALICE", Role: "AUTOR"},
+				{Name: "BOB", Role: "AUTOR"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, dedupParties(tt.in))
+		})
+	}
+}
+
+// TestParsePartiesFromRoot_DeduplicatesMarkers proves the dedup runs end-to-end off the
+// real capa DOM: a second AUTOR marker for the same name (a bare name link, the "sem
+// procurador" grafia eproc renders for the extra representation) must not produce a
+// second party card.
+func TestParsePartiesFromRoot_DeduplicatesMarkers(t *testing.T) {
+	t.Parallel()
+
+	const html = `<table id="tblPartesERepresentantes">
+  <tr><td>
+    <a class="infraNomeParte" data-parte="AUTOR">JOSE EDEN MACIEL</a>
+    ( 111.222.333-44 ) - Pessoa Física
+    Fulano de Tal
+    <a onmouseover="infraTooltipMostrar('ADVOGADO','x');">SP321511</a>
+  </td></tr>
+  <tr><td>
+    <a class="infraNomeParte" data-parte="AUTOR">JOSé EDEN MACIEL</a>
+  </td></tr>
+</table>`
+	root, err := parseHTMLDocument([]byte(html))
+	require.NoError(t, err)
+
+	parties := parsePartiesFromRoot(root)
+	require.Len(t, parties, 1, "the two markers for the same autor must collapse to one party")
+	assert.Equal(t, "AUTOR", parties[0].Role)
+	assert.Equal(t, "111.222.333-44", parties[0].Document, "the richer entry's CPF is kept")
+	require.Len(t, parties[0].Counsels, 1, "the counsel from the richer marker is preserved")
+	assert.Equal(t, "321511", parties[0].Counsels[0].OAB)
+}

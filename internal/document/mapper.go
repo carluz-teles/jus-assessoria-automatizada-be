@@ -115,6 +115,26 @@ func pgTimestamptz(t time.Time) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: t, Valid: true}
 }
 
+// timeToTimestamptz lifts an OPTIONAL time to a pgtype.Timestamptz: a zero time is SQL NULL
+// (a human UPLOAD carries no court event date), anything else is the value. The inverse of
+// timestamptzToTime.
+func timeToTimestamptz(t time.Time) pgtype.Timestamptz {
+	if t.IsZero() {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: t, Valid: true}
+}
+
+// timestamptzToTime collapses a nullable timestamptz column to a plain time.Time, the zero
+// time standing in for SQL NULL (court_event_date on a human UPLOAD, or a COURT doc fetched
+// before the column existed).
+func timestamptzToTime(ts pgtype.Timestamptz) time.Time {
+	if !ts.Valid {
+		return time.Time{}
+	}
+	return ts.Time
+}
+
 // documentFromInsertRow maps the InsertDocument RETURNING row into the pure *Document entity.
 func documentFromInsertRow(row documentdb.InsertDocumentRow) *Document {
 	return &Document{
@@ -133,6 +153,7 @@ func documentFromInsertRow(row documentdb.InsertDocumentRow) *Document {
 		OriginalFilename: derefString(row.OriginalFilename),
 		Status:           Status(row.Status),
 		CreatedAt:        row.CreatedAt.Time,
+		CourtEventDate:   timestamptzToTime(row.CourtEventDate),
 	}
 }
 

@@ -40,3 +40,21 @@ SELECT d.id, d.court_record_id, d.document_type, d.origin, d.title,
        d.has_text_layer, d.checksum, d.created_at
 FROM document d
 WHERE d.id = @id::uuid AND d.tenant_id = @tenant_id::uuid AND d.deleted_at IS NULL;
+
+-- name: GetDocumentChunks :many
+-- The extracted text of one document (GET /v1/documentos/:id/content), one row per page. The
+-- chunk table carries no tenant_id, so barrier 1 is enforced via an EXISTS subselect on the
+-- owning document (same tenant + deleted_at IS NULL scoping as the detail read). Ordered by
+-- (page, id) so the caller concatenates the pages in reading order. An empty result means either
+-- an unknown/foreign/soft-deleted document OR a live document not yet extracted — the use case
+-- disambiguates via GetDocument.
+SELECT c.text
+FROM chunk c
+WHERE c.document_id = @id::uuid
+  AND EXISTS (
+    SELECT 1 FROM document d
+    WHERE d.id = c.document_id
+      AND d.tenant_id = @tenant_id::uuid
+      AND d.deleted_at IS NULL
+  )
+ORDER BY c.page, c.id;

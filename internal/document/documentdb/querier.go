@@ -28,6 +28,13 @@ type Querier interface {
 	// soft-deleted id resolves to no row → pgx.ErrNoRows → typed ErrDocumentNotFound (404) at the
 	// repo, never (nil, nil). $1 = id, $2 = tenant_id (from the principal).
 	GetDocument(ctx context.Context, arg GetDocumentParams) (GetDocumentRow, error)
+	// The extracted text of one document (GET /v1/documentos/:id/content), one row per page. The
+	// chunk table carries no tenant_id, so barrier 1 is enforced via an EXISTS subselect on the
+	// owning document (same tenant + deleted_at IS NULL scoping as the detail read). Ordered by
+	// (page, id) so the caller concatenates the pages in reading order. An empty result means either
+	// an unknown/foreign/soft-deleted document OR a live document not yet extracted — the use case
+	// disambiguates via GetDocument.
+	GetDocumentChunks(ctx context.Context, arg GetDocumentChunksParams) ([]string, error)
 	// Load a document's upload state — the complete step (POST /v1/documentos/:id/complete)
 	// reads it BEFORE the transition so it can gate on PENDING and confirm the object landed.
 	// Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2), filtering
@@ -40,6 +47,14 @@ type Querier interface {
 	// already-gone document is a 404). A miss → pgx.ErrNoRows → typed ErrDocumentNotFound at the
 	// mapper. $1 = id, $2 = tenant_id (from the principal).
 	GetDocumentForDelete(ctx context.Context, arg GetDocumentForDeleteParams) (GetDocumentForDeleteRow, error)
+	// Load the state the raw-bytes proxy (GET /v1/documentos/:id/raw) needs BEFORE it streams the
+	// object: the storage_key (the object to fetch), the mime_type (Content-Type), and the
+	// title/original_filename/document_type it derives the inline Content-Disposition filename from.
+	// Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2), filtering deleted_at
+	// IS NULL (a soft-deleted document is gone). A miss → pgx.ErrNoRows → typed ErrDocumentNotFound
+	// (→ 404) at the mapper — same resolution as GetDocumentForComplete, kept a distinct query so it
+	// can carry the display columns without widening the complete/flip read. $1 = id, $2 = tenant_id.
+	GetDocumentForRaw(ctx context.Context, arg GetDocumentForRawParams) (GetDocumentForRawRow, error)
 	// Start an upload (POST /v1/documentos): persist the document row BORN PENDING, origin
 	// UPLOAD, with the storage_key set at creation (we need it to presign the PUT). court_record_id
 	// is nullable (an avulsa upload hangs on no process); title/mime_type/size_bytes/original_filename

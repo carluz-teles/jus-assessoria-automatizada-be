@@ -34,6 +34,10 @@ type Document struct {
 	OriginalFilename string
 	Status           Status
 	CreatedAt        time.Time
+	// CourtEventDate is the eproc event date an origin=COURT document was juntado under
+	// (zero for a human UPLOAD — the column is nullable). The FE shows it apart from the
+	// name to disambiguate same-named documents (the many "Certidão").
+	CourtEventDate time.Time
 }
 
 // Status is the document pipeline saga, a closed set the DB CHECK (0033) also enforces. A
@@ -75,6 +79,19 @@ type DocumentForComplete struct {
 	Status        Status
 	StorageKey    string
 	MimeType      string
+}
+
+// DocumentForRaw is the thin state the raw-bytes proxy loads BEFORE it streams the object
+// (GetDocumentForRaw, GET /v1/documentos/:id/raw): the StorageKey (the object to fetch),
+// the MimeType (the response Content-Type; "" defaults to application/pdf) and the
+// Title/OriginalFilename/DocumentType the inline filename is derived from. A miss is
+// ErrDocumentNotFound (→ 404), never a zero value.
+type DocumentForRaw struct {
+	StorageKey       string
+	MimeType         string
+	Title            string
+	OriginalFilename string
+	DocumentType     string
 }
 
 // DocumentForDelete is the thin state the delete loads BEFORE the soft delete

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -44,6 +45,11 @@ type recordingReader struct {
 	detailErr    error
 	gotDetailTID string
 	gotDetailID  string
+
+	contentText   string
+	contentErr    error
+	gotContentTID string
+	gotContentID  string
 }
 
 func (r *recordingReader) DocumentsByProcesso(_ context.Context, q DocumentsByProcessoQuery) (DocumentsByProcessoResult, error) {
@@ -54,6 +60,11 @@ func (r *recordingReader) DocumentsByProcesso(_ context.Context, q DocumentsByPr
 func (r *recordingReader) Document(_ context.Context, tenantID, id string) (DocumentView, error) {
 	r.gotDetailTID, r.gotDetailID = tenantID, id
 	return r.detailView, r.detailErr
+}
+
+func (r *recordingReader) DocumentContent(_ context.Context, tenantID, id string) (string, error) {
+	r.gotContentTID, r.gotContentID = tenantID, id
+	return r.contentText, r.contentErr
 }
 
 // recordingWriter implements the handler's writer port, capturing the commands the handler
@@ -70,6 +81,10 @@ type recordingWriter struct {
 	gotDownloadTID, gotDownloadID string
 	downloadRes                   DownloadResult
 	downloadErr                   error
+
+	gotRawTID, gotRawID string
+	rawRes              RawFileResult
+	rawErr              error
 
 	gotDeleteTID, gotDeleteID string
 	deleteErr                 error
@@ -88,6 +103,11 @@ func (w *recordingWriter) Complete(_ context.Context, cmd CompleteCommand) (Docu
 func (w *recordingWriter) Download(_ context.Context, tenantID, id string) (DownloadResult, error) {
 	w.gotDownloadTID, w.gotDownloadID = tenantID, id
 	return w.downloadRes, w.downloadErr
+}
+
+func (w *recordingWriter) RawFile(_ context.Context, tenantID, id string) (RawFileResult, error) {
+	w.gotRawTID, w.gotRawID = tenantID, id
+	return w.rawRes, w.rawErr
 }
 
 func (w *recordingWriter) Delete(_ context.Context, tenantID, id string) error {
@@ -248,6 +268,79 @@ func TestDownload_ForwardsAndRenders(t *testing.T) {
 	}
 	if wr.gotDownloadID != "doc-1" || wr.gotDownloadTID != "tenant-9" {
 		t.Errorf("download id/tenant = %q/%q", wr.gotDownloadID, wr.gotDownloadTID)
+	}
+}
+
+// TestRaw_StreamsBytesWithHeaders proves GET /v1/documentos/:id/raw returns 200 with the object
+// bytes, the real Content-Type, an inline Content-Disposition with the derived filename, and the
+// Content-Length — forwarding the id + tenant (from the principal).
+func TestRaw_StreamsBytesWithHeaders(t *testing.T) {
+	body := []byte("%PDF-1.5 fake bytes")
+	wr := &recordingWriter{rawRes: RawFileResult{
+		Bytes: body, ContentType: "application/pdf", Filename: "peticao.pdf",
+	}}
+	app := newApp(&recordingReader{}, wr, "tenant-9")
+
+	resp := do(t, app, http.MethodGet, "/v1/documentos/doc-1/raw", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/pdf" {
+		t.Errorf("Content-Type = %q, want application/pdf", ct)
+	}
+	if cd := resp.Header.Get("Content-Disposition"); cd != `inline; filename="peticao.pdf"` {
+		t.Errorf("Content-Disposition = %q", cd)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != strconv.Itoa(len(body)) {
+		t.Errorf("Content-Length = %q, want %d", cl, len(body))
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != string(body) {
+		t.Errorf("body = %q", got)
+	}
+	if wr.gotRawID != "doc-1" || wr.gotRawTID != "tenant-9" {
+		t.Errorf("raw id/tenant = %q/%q", wr.gotRawID, wr.gotRawTID)
+	}
+}
+
+// TestRaw_NotFound maps the writer's ErrDocumentNotFound to 404 (a foreign / soft-deleted id).
+func TestRaw_NotFound(t *testing.T) {
+	wr := &recordingWriter{rawErr: ErrDocumentNotFound}
+	app := newApp(&recordingReader{}, wr, "tenant-9")
+
+	resp := do(t, app, http.MethodGet, "/v1/documentos/doc-x/raw", "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestGetContent_ForwardsAndRenders proves GET /v1/documentos/:id/content forwards id + tenant
+// and returns {content} without a list envelope.
+func TestGetContent_ForwardsAndRenders(t *testing.T) {
+	rd := &recordingReader{contentText: "page one\n\npage two"}
+	app := newApp(rd, &recordingWriter{}, "tenant-9")
+
+	resp := do(t, app, http.MethodGet, "/v1/documentos/doc-1/content", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	got := decode[documentContentResponse](t, resp)
+	if got.Content != "page one\n\npage two" {
+		t.Errorf("content = %q", got.Content)
+	}
+	if rd.gotContentID != "doc-1" || rd.gotContentTID != "tenant-9" {
+		t.Errorf("content id/tenant = %q/%q", rd.gotContentID, rd.gotContentTID)
+	}
+}
+
+// TestGetContent_NotFound maps the reader's ErrDocumentNotFound to 404.
+func TestGetContent_NotFound(t *testing.T) {
+	rd := &recordingReader{contentErr: ErrDocumentNotFound}
+	app := newApp(rd, &recordingWriter{}, "tenant-9")
+
+	resp := do(t, app, http.MethodGet, "/v1/documentos/doc-x/content", "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
 

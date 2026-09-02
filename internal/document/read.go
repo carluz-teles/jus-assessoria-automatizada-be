@@ -2,6 +2,7 @@ package document
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/jusassessoria/platform/lib/httpx"
@@ -65,6 +66,10 @@ type readRepo interface {
 	// GetDocument reads one document's detail, scoped to tenantID (barrier 1). A miss (or a
 	// foreign/soft-deleted id) is ErrDocumentNotFound (→ 404).
 	GetDocument(ctx context.Context, tenantID, id string) (DocumentView, error)
+	// GetDocumentChunks reads the extracted page texts of one document (ordered page, id),
+	// tenant-scoped via the owning document (barrier 1). An empty slice is ambiguous (unknown vs
+	// not-yet-extracted); the use case disambiguates via GetDocument.
+	GetDocumentChunks(ctx context.Context, tenantID, id string) ([]string, error)
 }
 
 // ReadUseCase serves the Documentos screen reads. It is a pagination policy over readRepo: it
@@ -103,4 +108,23 @@ func (uc *ReadUseCase) DocumentsByProcesso(ctx context.Context, q DocumentsByPro
 // the id resolves to no live row in the tenant.
 func (uc *ReadUseCase) Document(ctx context.Context, tenantID, id string) (DocumentView, error) {
 	return uc.repo.GetDocument(ctx, tenantID, id)
+}
+
+// DocumentContent returns the document's extracted text — the page chunks concatenated in reading
+// order (page, id) joined by a blank line. When no chunks exist the id is ambiguous (unknown vs a
+// live document not yet extracted): it resolves the document to decide. If GetDocument yields
+// ErrDocumentNotFound the miss propagates (→ 404); otherwise the document exists but has no text
+// yet, so an empty string is returned.
+func (uc *ReadUseCase) DocumentContent(ctx context.Context, tenantID, id string) (string, error) {
+	texts, err := uc.repo.GetDocumentChunks(ctx, tenantID, id)
+	if err != nil {
+		return "", err
+	}
+	if len(texts) == 0 {
+		if _, err := uc.repo.GetDocument(ctx, tenantID, id); err != nil {
+			return "", err
+		}
+		return "", nil
+	}
+	return strings.Join(texts, "\n\n"), nil
 }

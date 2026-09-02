@@ -52,8 +52,17 @@ type fakeStorage struct {
 	exists         bool
 	existsErr      error
 
-	gotPutKey, gotPutCT, gotGetKey, gotExistsKey string
-	putCalls, getCalls, existsCalls              int
+	getBytes    []byte
+	getBytesErr error
+
+	gotPutKey, gotPutCT, gotGetKey, gotExistsKey, gotGetBytesKey string
+	putCalls, getCalls, existsCalls, getBytesCalls               int
+}
+
+func (s *fakeStorage) GetBytes(_ context.Context, key string) ([]byte, error) {
+	s.getBytesCalls++
+	s.gotGetBytesKey = key
+	return s.getBytes, s.getBytesErr
 }
 
 func (s *fakeStorage) PresignedPut(_ context.Context, key, contentType string, _ time.Duration) (string, error) {
@@ -91,6 +100,9 @@ type fakeRepo struct {
 	uploadedErr error
 	gotChecksum string
 
+	rawDoc *DocumentForRaw
+	rawErr error
+
 	deleteDoc *DocumentForDelete
 	deleteErr error
 
@@ -126,6 +138,10 @@ func (r *fakeRepo) GetDocumentForComplete(_ context.Context, _ database.Tx, _, _
 func (r *fakeRepo) MarkUploaded(_ context.Context, _ database.Tx, _, _, checksum string) (*Document, error) {
 	r.gotChecksum = checksum
 	return r.uploaded, r.uploadedErr
+}
+
+func (r *fakeRepo) GetDocumentForRaw(_ context.Context, _ database.Tx, _, _ string) (*DocumentForRaw, error) {
+	return r.rawDoc, r.rawErr
 }
 
 func (r *fakeRepo) GetDocumentForDelete(_ context.Context, _ database.Tx, _, _ string) (*DocumentForDelete, error) {
@@ -343,6 +359,78 @@ func TestDownload_NoStorageKey(t *testing.T) {
 	}
 	if store.getCalls != 0 {
 		t.Errorf("presigned despite no storage key")
+	}
+}
+
+// --- RawFile ----------------------------------------------------------------
+
+// TestRawFile_ReadsBytesAndDerivesHeaders is the happy path: RawFile resolves the document
+// tenant-scoped, reads the bytes directly (GetBytes on the storage_key), and returns the real
+// mime_type + a filename derived from the title.
+func TestRawFile_ReadsBytesAndDerivesHeaders(t *testing.T) {
+	tenant := uuid.NewString()
+	repo := &fakeRepo{rawDoc: &DocumentForRaw{
+		StorageKey: "tenant/documents/k", MimeType: "application/pdf", Title: "Petição inicial.pdf",
+	}}
+	store := &fakeStorage{getBytes: []byte("%PDF bytes")}
+	uow := &fakeUOW{}
+	uc := NewUseCase(repo, store, &fakeOutbox{}, uow)
+
+	res, err := uc.RawFile(context.Background(), tenant, uuid.NewString())
+	if err != nil {
+		t.Fatalf("RawFile() error = %v", err)
+	}
+	if store.gotGetBytesKey != "tenant/documents/k" || string(res.Bytes) != "%PDF bytes" {
+		t.Errorf("bytes/key = %q/%q", res.Bytes, store.gotGetBytesKey)
+	}
+	if res.ContentType != "application/pdf" || res.Filename != "Petição inicial.pdf" {
+		t.Errorf("result = %+v", res)
+	}
+	if len(uow.scopes) != 1 || uow.scopes[0] != tenant {
+		t.Errorf("tx scopes = %v, want [%s]", uow.scopes, tenant)
+	}
+}
+
+// TestRawFile_DefaultsContentTypeAndFilename proves an empty mime_type defaults to
+// application/pdf and a filename with no extension gets the ".pdf" suffix (falls back through
+// title→original_filename→document_type).
+func TestRawFile_DefaultsContentTypeAndFilename(t *testing.T) {
+	repo := &fakeRepo{rawDoc: &DocumentForRaw{
+		StorageKey: "k", MimeType: "", DocumentType: "SENTENCA",
+	}}
+	store := &fakeStorage{getBytes: []byte("x")}
+	uc := NewUseCase(repo, store, &fakeOutbox{}, &fakeUOW{})
+
+	res, err := uc.RawFile(context.Background(), uuid.NewString(), uuid.NewString())
+	if err != nil {
+		t.Fatalf("RawFile() error = %v", err)
+	}
+	if res.ContentType != "application/pdf" || res.Filename != "SENTENCA.pdf" {
+		t.Errorf("result = %+v", res)
+	}
+}
+
+// TestRawFile_NoStorageKey refuses a document with no key (409) and never reads bytes.
+func TestRawFile_NoStorageKey(t *testing.T) {
+	repo := &fakeRepo{rawDoc: &DocumentForRaw{StorageKey: ""}}
+	store := &fakeStorage{}
+	uc := NewUseCase(repo, store, &fakeOutbox{}, &fakeUOW{})
+
+	if _, err := uc.RawFile(context.Background(), uuid.NewString(), uuid.NewString()); !errors.Is(err, ErrDocumentNoStorageKey) {
+		t.Fatalf("error = %v, want ErrDocumentNoStorageKey", err)
+	}
+	if store.getBytesCalls != 0 {
+		t.Errorf("read bytes despite no storage key")
+	}
+}
+
+// TestRawFile_NotFound propagates the repo's ErrDocumentNotFound (a foreign / soft-deleted id).
+func TestRawFile_NotFound(t *testing.T) {
+	repo := &fakeRepo{rawErr: ErrDocumentNotFound}
+	uc := NewUseCase(repo, &fakeStorage{}, &fakeOutbox{}, &fakeUOW{})
+
+	if _, err := uc.RawFile(context.Background(), uuid.NewString(), uuid.NewString()); !errors.Is(err, ErrDocumentNotFound) {
+		t.Fatalf("error = %v, want ErrDocumentNotFound", err)
 	}
 }
 

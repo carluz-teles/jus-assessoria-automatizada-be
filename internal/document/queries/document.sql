@@ -21,14 +21,16 @@ WHERE id = $1 AND tenant_id = $2;
 -- presign response + the use case has the created state. $1.. are the columns.
 INSERT INTO document (
     tenant_id, court_record_id, document_type, origin,
-    storage_key, status, mime_type, size_bytes, title, original_filename
+    storage_key, status, mime_type, size_bytes, title, original_filename,
+    court_event_date
 ) VALUES (
     $1, $2, $3, $4,
-    $5, $6, $7, $8, $9, $10
+    $5, $6, $7, $8, $9, $10,
+    $11
 )
 RETURNING id, tenant_id, court_record_id, document_type, origin, storage_key,
           pages, has_text_layer, mime_type, size_bytes, checksum, title,
-          original_filename, status, created_at;
+          original_filename, status, created_at, court_event_date;
 
 -- name: GetDocumentForComplete :one
 -- Load a document's upload state — the complete step (POST /v1/documentos/:id/complete)
@@ -37,6 +39,18 @@ RETURNING id, tenant_id, court_record_id, document_type, origin, storage_key,
 -- deleted_at IS NULL (a soft-deleted document is gone). A miss → pgx.ErrNoRows → typed
 -- ErrDocumentNotFound (→ 404) at the mapper. $1 = id, $2 = tenant_id (from the principal).
 SELECT id, tenant_id, court_record_id, status, storage_key, mime_type
+FROM document
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL;
+
+-- name: GetDocumentForRaw :one
+-- Load the state the raw-bytes proxy (GET /v1/documentos/:id/raw) needs BEFORE it streams the
+-- object: the storage_key (the object to fetch), the mime_type (Content-Type), and the
+-- title/original_filename/document_type it derives the inline Content-Disposition filename from.
+-- Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2), filtering deleted_at
+-- IS NULL (a soft-deleted document is gone). A miss → pgx.ErrNoRows → typed ErrDocumentNotFound
+-- (→ 404) at the mapper — same resolution as GetDocumentForComplete, kept a distinct query so it
+-- can carry the display columns without widening the complete/flip read. $1 = id, $2 = tenant_id.
+SELECT storage_key, mime_type, title, original_filename, document_type
 FROM document
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL;
 

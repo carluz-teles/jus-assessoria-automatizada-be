@@ -106,30 +106,72 @@ func (q *Queries) GetDocumentForDelete(ctx context.Context, arg GetDocumentForDe
 	return i, err
 }
 
+const getDocumentForRaw = `-- name: GetDocumentForRaw :one
+SELECT storage_key, mime_type, title, original_filename, document_type
+FROM document
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+`
+
+type GetDocumentForRawParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+type GetDocumentForRawRow struct {
+	StorageKey       *string `json:"storage_key"`
+	MimeType         *string `json:"mime_type"`
+	Title            *string `json:"title"`
+	OriginalFilename *string `json:"original_filename"`
+	DocumentType     string  `json:"document_type"`
+}
+
+// Load the state the raw-bytes proxy (GET /v1/documentos/:id/raw) needs BEFORE it streams the
+// object: the storage_key (the object to fetch), the mime_type (Content-Type), and the
+// title/original_filename/document_type it derives the inline Content-Disposition filename from.
+// Keyed by id and scoped to tenant_id (barrier 1, on top of RLS barrier 2), filtering deleted_at
+// IS NULL (a soft-deleted document is gone). A miss → pgx.ErrNoRows → typed ErrDocumentNotFound
+// (→ 404) at the mapper — same resolution as GetDocumentForComplete, kept a distinct query so it
+// can carry the display columns without widening the complete/flip read. $1 = id, $2 = tenant_id.
+func (q *Queries) GetDocumentForRaw(ctx context.Context, arg GetDocumentForRawParams) (GetDocumentForRawRow, error) {
+	row := q.db.QueryRow(ctx, getDocumentForRaw, arg.ID, arg.TenantID)
+	var i GetDocumentForRawRow
+	err := row.Scan(
+		&i.StorageKey,
+		&i.MimeType,
+		&i.Title,
+		&i.OriginalFilename,
+		&i.DocumentType,
+	)
+	return i, err
+}
+
 const insertDocument = `-- name: InsertDocument :one
 INSERT INTO document (
     tenant_id, court_record_id, document_type, origin,
-    storage_key, status, mime_type, size_bytes, title, original_filename
+    storage_key, status, mime_type, size_bytes, title, original_filename,
+    court_event_date
 ) VALUES (
     $1, $2, $3, $4,
-    $5, $6, $7, $8, $9, $10
+    $5, $6, $7, $8, $9, $10,
+    $11
 )
 RETURNING id, tenant_id, court_record_id, document_type, origin, storage_key,
           pages, has_text_layer, mime_type, size_bytes, checksum, title,
-          original_filename, status, created_at
+          original_filename, status, created_at, court_event_date
 `
 
 type InsertDocumentParams struct {
-	TenantID         uuid.UUID   `json:"tenant_id"`
-	CourtRecordID    pgtype.UUID `json:"court_record_id"`
-	DocumentType     string      `json:"document_type"`
-	Origin           string      `json:"origin"`
-	StorageKey       *string     `json:"storage_key"`
-	Status           string      `json:"status"`
-	MimeType         *string     `json:"mime_type"`
-	SizeBytes        *int64      `json:"size_bytes"`
-	Title            *string     `json:"title"`
-	OriginalFilename *string     `json:"original_filename"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	CourtRecordID    pgtype.UUID        `json:"court_record_id"`
+	DocumentType     string             `json:"document_type"`
+	Origin           string             `json:"origin"`
+	StorageKey       *string            `json:"storage_key"`
+	Status           string             `json:"status"`
+	MimeType         *string            `json:"mime_type"`
+	SizeBytes        *int64             `json:"size_bytes"`
+	Title            *string            `json:"title"`
+	OriginalFilename *string            `json:"original_filename"`
+	CourtEventDate   pgtype.Timestamptz `json:"court_event_date"`
 }
 
 type InsertDocumentRow struct {
@@ -148,6 +190,7 @@ type InsertDocumentRow struct {
 	OriginalFilename *string            `json:"original_filename"`
 	Status           string             `json:"status"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	CourtEventDate   pgtype.Timestamptz `json:"court_event_date"`
 }
 
 // Start an upload (POST /v1/documentos): persist the document row BORN PENDING, origin
@@ -168,6 +211,7 @@ func (q *Queries) InsertDocument(ctx context.Context, arg InsertDocumentParams) 
 		arg.SizeBytes,
 		arg.Title,
 		arg.OriginalFilename,
+		arg.CourtEventDate,
 	)
 	var i InsertDocumentRow
 	err := row.Scan(
@@ -186,6 +230,7 @@ func (q *Queries) InsertDocument(ctx context.Context, arg InsertDocumentParams) 
 		&i.OriginalFilename,
 		&i.Status,
 		&i.CreatedAt,
+		&i.CourtEventDate,
 	)
 	return i, err
 }

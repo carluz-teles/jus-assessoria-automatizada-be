@@ -62,8 +62,12 @@ type CourtProvider interface {
 // about both slices, same technique as courtCertSignerFunc for the
 // certificate). Returns the created document's id (informational — nothing in
 // this slice currently reads it back).
+// courtEventDate is the eproc EVENT date (infraEventoData) the document was juntado
+// under — persisted alongside the document so the FE can show it apart from the name
+// (it disambiguates the many same-named "Certidão"). It is the eproc event's date, not
+// the download time; the zero value means "unknown" (a human UPLOAD carries no event).
 type DocumentWriter interface {
-	WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, data []byte) (documentID string, err error)
+	WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, courtEventDate time.Time, data []byte) (documentID string, err error)
 }
 
 // ProcessMetadata is the capa metadata FetchAutos reads off the eproc process page

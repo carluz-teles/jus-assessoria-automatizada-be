@@ -379,15 +379,16 @@ func (a courtRecordWriterAdapter) UpdateProcessMetadata(ctx context.Context, ten
 	})
 }
 
-func (a documentWriterAdapter) WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, data []byte) (string, error) {
+func (a documentWriterAdapter) WriteDocument(ctx context.Context, tenantID, courtRecordID, mimeType, checksum, title, documentType string, courtEventDate time.Time, data []byte) (string, error) {
 	started, err := a.uc.Start(ctx, document.StartUploadCommand{
-		TenantID:      tenantID,
-		CourtRecordID: courtRecordID,
-		Origin:        document.OriginCourt,
-		Title:         title,
-		DocumentType:  documentType,
-		MimeType:      mimeType,
-		SizeBytes:     int64(len(data)),
+		TenantID:       tenantID,
+		CourtRecordID:  courtRecordID,
+		Origin:         document.OriginCourt,
+		Title:          title,
+		DocumentType:   documentType,
+		MimeType:       mimeType,
+		SizeBytes:      int64(len(data)),
+		CourtEventDate: courtEventDate,
 	})
 	if err != nil {
 		return "", fmt.Errorf("start document upload: %w", err)

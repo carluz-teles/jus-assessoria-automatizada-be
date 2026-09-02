@@ -3,6 +3,8 @@ package document
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/gofiber/fiber/v2"
@@ -24,6 +26,7 @@ import (
 type reader interface {
 	DocumentsByProcesso(ctx context.Context, q DocumentsByProcessoQuery) (DocumentsByProcessoResult, error)
 	Document(ctx context.Context, tenantID, id string) (DocumentView, error)
+	DocumentContent(ctx context.Context, tenantID, id string) (string, error)
 }
 
 // writer is the narrow port the Handler uses from the write use case — the upload start /
@@ -33,6 +36,7 @@ type writer interface {
 	Start(ctx context.Context, cmd StartUploadCommand) (StartUploadResult, error)
 	Complete(ctx context.Context, cmd CompleteCommand) (DocumentView, error)
 	Download(ctx context.Context, tenantID, documentID string) (DownloadResult, error)
+	RawFile(ctx context.Context, tenantID, documentID string) (RawFileResult, error)
 	Delete(ctx context.Context, tenantID, documentID string) error
 }
 
@@ -57,6 +61,8 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/documentos", h.startUpload)
 	r.Post("/documentos/:id/complete", h.completeUpload)
 	r.Get("/documentos/:id/download", h.downloadDocument)
+	r.Get("/documentos/:id/raw", h.rawDocument)
+	r.Get("/documentos/:id/content", h.getDocumentContent)
 	r.Get("/processos/:id/documentos", h.listDocumentsByProcesso)
 	r.Get("/documentos/:id", h.getDocument)
 	r.Delete("/documentos/:id", h.deleteDocument)
@@ -111,6 +117,27 @@ func (h *Handler) getDocument(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(view)
+}
+
+// getDocumentContent handles GET /v1/documentos/:id/content: the document's extracted text (the
+// page chunks concatenated) for the FE teor drawer. Returns 200 with {content}. A miss (or a
+// foreign / soft-deleted id with no text) is the repo's typed ErrDocumentNotFound → 404; a live
+// document not yet extracted returns 200 with an empty content. The payload is the whole body, so
+// it is returned without a list envelope (mirrors downloadResponse). tenant_id comes from the
+// principal, the id from the path.
+func (h *Handler) getDocumentContent(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	content, err := h.reader.DocumentContent(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.Status(fiber.StatusOK).JSON(documentContentResponse{Content: content})
+}
+
+// documentContentResponse is the GET /v1/documentos/:id/content payload (200): the concatenated
+// extracted text of the document.
+type documentContentResponse struct {
+	Content string `json:"content"`
 }
 
 // startUpload handles POST /v1/documentos: start an upload. It validates the body, then creates
@@ -173,6 +200,32 @@ func (h *Handler) downloadDocument(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusOK).JSON(newDownloadResponse(res))
+}
+
+// rawDocument handles GET /v1/documentos/:id/raw: authenticated PROXY of the document's object
+// bytes, so the FE can embed the PDF in a viewer (the presigned URL points at storage the browser
+// can't reach in dev, and this keeps the auth token out of the URL). It streams the bytes with the
+// real Content-Type (mime_type; application/pdf when empty) and Content-Disposition: inline (so the
+// browser embeds it, not download) with a derived filename. tenant_id comes from the principal, the
+// id from the path. A miss (foreign / soft-deleted id) is ErrDocumentNotFound → 404; a document
+// with no storage_key (still PENDING) is ErrDocumentNoStorageKey → 409; a storage miss on a
+// resolved document is an inconsistency → 5xx (cause logged, not leaked).
+func (h *Handler) rawDocument(c *fiber.Ctx) error {
+	tenantID := httpx.TenantFromCtx(c)
+	res, err := h.writer.RawFile(c.UserContext(), tenantID, c.Params("id"))
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	c.Set(fiber.HeaderContentType, res.ContentType)
+	c.Set(fiber.HeaderContentDisposition, `inline; filename="`+sanitizeFilename(res.Filename)+`"`)
+	c.Set(fiber.HeaderContentLength, strconv.Itoa(len(res.Bytes)))
+	return c.Status(fiber.StatusOK).Send(res.Bytes)
+}
+
+// sanitizeFilename strips characters that would break the quoted Content-Disposition filename
+// (double quotes, backslashes, CR/LF) so the header stays well-formed for any title.
+func sanitizeFilename(name string) string {
+	return strings.NewReplacer(`"`, "", `\`, "", "\r", "", "\n", "").Replace(name)
 }
 
 // deleteDocument handles DELETE /v1/documentos/:id: soft-delete an UPLOAD document. No body —

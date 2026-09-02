@@ -174,7 +174,7 @@ func (p *EprocProvider) downloadNewDocuments(ctx context.Context, client *eproc.
 			continue
 		}
 		for _, doc := range ev.Documents {
-			if p.downloadOneDocument(ctx, client, tenantID, courtRecordID, doc, ev.Description) {
+			if p.downloadOneDocument(ctx, client, tenantID, courtRecordID, doc, ev.Description, ev.Date) {
 				downloaded++
 			}
 		}
@@ -182,7 +182,7 @@ func (p *EprocProvider) downloadNewDocuments(ctx context.Context, client *eproc.
 	return downloaded
 }
 
-func (p *EprocProvider) downloadOneDocument(ctx context.Context, client *eproc.Client, tenantID, courtRecordID string, doc eproc.DocumentRef, eventDescription string) bool {
+func (p *EprocProvider) downloadOneDocument(ctx context.Context, client *eproc.Client, tenantID, courtRecordID string, doc eproc.DocumentRef, eventDescription string, eventDate time.Time) bool {
 	var buf bytes.Buffer
 	if _, err := client.DownloadDocument(ctx, doc.DownloadPath, &buf); err != nil {
 		return false
@@ -191,21 +191,26 @@ func (p *EprocProvider) downloadOneDocument(ctx context.Context, client *eproc.C
 	sum := sha256.Sum256(data)
 	checksum := hex.EncodeToString(sum[:])
 	title, documentType := docTitleAndType(doc.Label, eventDescription)
-	_, err := p.docWriter.WriteDocument(ctx, tenantID, courtRecordID, doc.MIMEType, checksum, title, documentType, data)
+	_, err := p.docWriter.WriteDocument(ctx, tenantID, courtRecordID, doc.MIMEType, checksum, title, documentType, eventDate, data)
 	return err == nil
 }
 
 // docTitleAndType turns the eproc document's terse code (data-nome, e.g. "PET",
 // "CONTRSOCIAL") into the pair the document row stores: a friendly pt-BR title and
-// the raw code as document_type (categorization). The title prefers the code's
-// mapped label; when the code is unknown it falls back to the event's description
-// (infraEventoDescricao — "Petição inicial", "Despacho saneador"), and only then to
-// the raw code, so a title is never blank.
+// the raw code as document_type (categorization). Product decision: the EVENT
+// DESCRIPTION (infraEventoDescricao — "Petição inicial", "Sentença", "Juntada") is
+// the PRIMARY name, since it reads richest to a lawyer; the code's mapped label
+// (DocumentTypeLabel) is the fallback, then a humanized form of the raw code
+// (HumanizeCode — "PLANILHA DE CÁLCULO" → "Planilha de cálculo"), and only then the
+// untouched code, so a title is never blank.
 func docTitleAndType(code, eventDescription string) (title, documentType string) {
 	documentType = strings.TrimSpace(code)
-	title = eproc.DocumentTypeLabel(documentType)
+	title = strings.TrimSpace(eventDescription)
 	if title == "" {
-		title = strings.TrimSpace(eventDescription)
+		title = eproc.DocumentTypeLabel(documentType)
+	}
+	if title == "" {
+		title = eproc.HumanizeCode(documentType)
 	}
 	if title == "" {
 		title = documentType
