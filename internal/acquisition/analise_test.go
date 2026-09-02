@@ -13,12 +13,18 @@ import (
 
 // fakeAnaliseReader is the analiseReader port fake — canned context or error.
 type fakeAnaliseReader struct {
-	ctx IntimacaoAnaliseCtx
-	err error
+	ctx      IntimacaoAnaliseCtx
+	err      error
+	profiles []PieceProfileOption
+	profErr  error
 }
 
 func (f fakeAnaliseReader) GetIntimacaoAnaliseContext(_ context.Context, _, _ string) (IntimacaoAnaliseCtx, error) {
 	return f.ctx, f.err
+}
+
+func (f fakeAnaliseReader) ListPieceProfiles(_ context.Context) ([]PieceProfileOption, error) {
+	return f.profiles, f.profErr
 }
 
 // fakeAnaliseGen is the llm.Generator fake for the analysis path.

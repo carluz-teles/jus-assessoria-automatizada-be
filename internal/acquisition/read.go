@@ -810,6 +810,9 @@ type readRepo interface {
 	// GetIntimacaoAnaliseContext assembles the context for the AI intimation analysis (the
 	// teor + court record identification). Used by AnaliseUseCase through the analiseReader port.
 	GetIntimacaoAnaliseContext(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseCtx, error)
+	// ListPieceProfiles returns the GLOBAL peça catalog (piece_profile — key/nome/polo, not
+	// tenant-scoped). Injected into the analyze_intimation prompt + schema by AnaliseUseCase.
+	ListPieceProfiles(ctx context.Context) ([]PieceProfileOption, error)
 }
 
 // ReadUseCase serves the screen reads. It is a pagination policy over readRepo: it
@@ -1257,6 +1260,11 @@ func (uc *ReadUseCase) GetResumoContext(ctx context.Context, tenantID, courtReco
 // port the AnaliseUseCase drives.
 func (uc *ReadUseCase) GetIntimacaoAnaliseContext(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseCtx, error) {
 	return uc.repo.GetIntimacaoAnaliseContext(ctx, tenantID, intimationID)
+}
+
+// ListPieceProfiles returns the global peça catalog, satisfying the analiseReader port.
+func (uc *ReadUseCase) ListPieceProfiles(ctx context.Context) ([]PieceProfileOption, error) {
+	return uc.repo.ListPieceProfiles(ctx)
 }
 
 // Partes returns the process's parties (behind the court_record :id), bucketed by role

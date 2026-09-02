@@ -46,8 +46,13 @@ type CreateRequest struct {
 func (r CreateRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Source,
-			validation.Required,
-			validation.In(SourceIntimation, SourceProcesso, SourceBlank),
+			// Source é obrigatório APENAS no fluxo sem task: quando TaskID está presente
+			// (fluxo task-sourced), o domínio ignora Source e resolve origem/tipo a partir
+			// da providência da tarefa — então o body não precisa carregá-lo. O enum só é
+			// checado quando Source foi de fato informado.
+			validation.When(r.TaskID == "", validation.Required),
+			validation.When(r.Source != "",
+				validation.In(SourceIntimation, SourceProcesso, SourceBlank)),
 		),
 		validation.Field(&r.IntimationID,
 			validation.When(r.Source == SourceIntimation && r.TaskID == "",

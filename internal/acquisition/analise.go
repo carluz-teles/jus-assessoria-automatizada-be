@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,10 +94,24 @@ type MemberCtx struct {
 	Name   string
 }
 
+// PieceProfileOption is one entry of the GLOBAL peça catalog (piece_profile — key/nome/polo,
+// no tenant_id). Injected into the analyze_intimation prompt as the closed list the model
+// picks piece_profile_key from, and used to build the dynamic structured-output enum for that
+// field (buildIntimationAnalysisSchema).
+type PieceProfileOption struct {
+	Key  string
+	Nome string
+	Polo string
+}
+
 // analiseReader is the narrow read the AnaliseUseCase needs — one intimation's analysis
-// context by id, tenant-scoped. The ReadUseCase satisfies it.
+// context by id, tenant-scoped, plus the GLOBAL peça catalog. The ReadUseCase satisfies it.
 type analiseReader interface {
 	GetIntimacaoAnaliseContext(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseCtx, error)
+	// ListPieceProfiles returns the global piece_profile catalog (key/nome/polo). Not
+	// tenant-scoped (the catalog is shared). A fault degrades to an empty catalog — the
+	// analysis still runs, just without the enum/list injection.
+	ListPieceProfiles(ctx context.Context) ([]PieceProfileOption, error)
 }
 
 // SaveAnaliseParams is the analiseStore.SaveAnalise input: the intimation's fresh
@@ -142,18 +157,32 @@ func NewAnaliseUseCase(reader analiseReader, composer advisory.PromptComposer, g
 	return &AnaliseUseCase{reader: reader, composer: composer, gen: gen, store: store, model: model}
 }
 
-// intimationAnalysisSchema constrains the model's output to {summary, providencias:[{title,
-// description, suggested_assignee_user_id, due_date, tipo, gera_peca, piece_profile_key,
-// declarado, confianca}]} via OpenRouter's json_schema structured output (strict). tipo is
-// the providência classification (docs §2: contestar|recorrer|manifestar|cumprir|ciencia);
-// gera_peca + piece_profile_key name the tipo de peça when one is required; declarado marks
-// whether the teor STATED the tipo explicitly (vs. the model inferring it); confianca is the
-// model's confidence in ITS OWN inference (only meaningful when declarado is false — the
-// use case ignores it otherwise). suggested_assignee_user_id / due_date / piece_profile_key /
-// confianca are nullable — the model may emit null when it can't pick a member/date/tipo de
-// peça, or when declarado is true. status is NOT in the schema — providência lifecycle is
-// owned by the actionitem slice, not this analysis.
-var intimationAnalysisSchema = json.RawMessage(`{
+// buildIntimationAnalysisSchema constrains the model's output to {summary, ato, providencias:
+// [{title, description, suggested_assignee_user_id, due_date, tipo, gera_peca,
+// piece_profile_key, declarado, confianca}]} via OpenRouter's json_schema structured output
+// (strict). tipo is the providência classification (docs §2: contestar|recorrer|manifestar|
+// cumprir|ciencia); gera_peca + piece_profile_key name the tipo de peça when one is required;
+// declarado marks whether the teor STATED the tipo explicitly (vs. the model inferring it);
+// confianca is the model's confidence in ITS OWN inference (only meaningful when declarado is
+// false — the use case ignores it otherwise). suggested_assignee_user_id / due_date /
+// piece_profile_key / confianca are nullable. status is NOT in the schema — providência
+// lifecycle is owned by the actionitem slice, not this analysis.
+//
+// piece_profile_key is DYNAMIC: when the catalog is non-empty its enum is exactly the catalog
+// keys + null, so the model can only emit a real peça key (or null). An empty catalog falls
+// back to a plain ["string","null"] with no enum (the actionitem sanitizer still degrades an
+// unknown key downstream — belt-and-suspenders).
+func buildIntimationAnalysisSchema(profiles []PieceProfileOption) json.RawMessage {
+	pieceProfileKeySchema := `{ "type": ["string", "null"] }`
+	if len(profiles) > 0 {
+		enum := make([]string, 0, len(profiles)+1)
+		for _, p := range profiles {
+			enum = append(enum, strconv.Quote(p.Key))
+		}
+		enum = append(enum, "null")
+		pieceProfileKeySchema = `{ "type": ["string", "null"], "enum": [` + strings.Join(enum, ", ") + `] }`
+	}
+	return json.RawMessage(`{
   "type": "object",
   "properties": {
     "summary": { "type": "string" },
@@ -169,7 +198,7 @@ var intimationAnalysisSchema = json.RawMessage(`{
           "due_date": { "type": ["string", "null"] },
           "tipo": { "type": "string", "enum": ["contestar", "recorrer", "manifestar", "cumprir", "ciencia"] },
           "gera_peca": { "type": "boolean" },
-          "piece_profile_key": { "type": ["string", "null"] },
+          "piece_profile_key": ` + pieceProfileKeySchema + `,
           "declarado": { "type": "boolean" },
           "confianca": { "type": ["number", "null"] }
         },
@@ -182,6 +211,7 @@ var intimationAnalysisSchema = json.RawMessage(`{
   "required": ["summary", "ato", "providencias"],
   "additionalProperties": false
 }`)
+}
 
 // maxProvidencias caps the derived list so a runaway model output can't bloat the row/UI.
 const maxProvidencias = 12
@@ -223,15 +253,31 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, tenantID, intimationID s
 	for _, m := range ctxData.Members {
 		members = append(members, advisory.MemberCtx{UserID: m.UserID, Name: m.Name})
 	}
+
+	// Fetch the global peça catalog — the closed list the prompt lists + the schema enums
+	// piece_profile_key over. A fault degrades to an empty catalog (analysis still runs; the
+	// schema falls back to string|null and the actionitem sanitizer guards downstream).
+	profiles, err := uc.reader.ListPieceProfiles(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "acquisition: list piece profiles failed (degrading to empty catalog)",
+			slog.String("intimation_id", intimationID), slog.Any("error", err))
+		profiles = nil
+	}
+	pieceProfiles := make([]advisory.PieceProfileOption, 0, len(profiles))
+	for _, p := range profiles {
+		pieceProfiles = append(pieceProfiles, advisory.PieceProfileOption{Key: p.Key, Nome: p.Nome, Polo: p.Polo})
+	}
+
 	composed, err := uc.composer.Compose(advisory.AgentAnalyzeIntimation, advisory.CaseContext{
 		Court:          ctxData.Court,
 		Degree:         ctxData.Degree,
 		Class:          ctxData.Class,
 		Subject:        ctxData.Subject,
 		IntimationType: deref(ctxData.Type),
-		IntimationText: ctxData.Content,
+		IntimationText: htmlPlaintext(ctxData.Content),
 		DeadlineDate:   ctxData.DeadlineEndDate,
 		Members:        members,
+		PieceProfiles:  pieceProfiles,
 	})
 	if err != nil {
 		slog.WarnContext(ctx, "acquisition: compose intimation analysis failed",
@@ -242,7 +288,7 @@ func (uc *AnaliseUseCase) generate(ctx context.Context, tenantID, intimationID s
 	out, err := uc.gen.GenerateJSON(ctx, llm.Request{
 		System:     composed.System,
 		User:       composed.User,
-		Schema:     intimationAnalysisSchema,
+		Schema:     buildIntimationAnalysisSchema(profiles),
 		SchemaName: "intimation_analysis",
 		Model:      uc.model, // "" = cai no default do generator
 		MaxTokens:  1500,

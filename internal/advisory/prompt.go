@@ -38,6 +38,11 @@ type CaseContext struct {
 	Phase          string      // fase processual, quando conhecida
 	DeadlineDate   string      // prazo final "2006-01-02" (analyze_intimation) — teto do due_date sugerido; "" sem prazo
 	Members        []MemberCtx // membros ativos do escritório (id+nome) para o IA sugerir responsável real
+	// PieceProfiles é o catálogo GLOBAL de perfis de peça (piece_profile — key/nome/polo),
+	// injetado no prompt do analyze_intimation como a lista fechada de onde o modelo escolhe
+	// piece_profile_key. Vazio → o bloco não é renderizado (e o schema de saída cai no
+	// string|null sem enum). O caller (acquisition) lê o catálogo e converte para este tipo.
+	PieceProfiles []PieceProfileOption
 
 	// Playbook é o ponto de injeção da "voz do escritório" (§3). v0: stub (vazio → nada é
 	// injetado). Depois: exemplos de tarefas HUMANO-APROVADAS (derivados do delta suggested×
@@ -52,6 +57,16 @@ type CaseContext struct {
 type MemberCtx struct {
 	UserID string
 	Name   string
+}
+
+// PieceProfileOption is one entry of the GLOBAL peça catalog (piece_profile) the
+// analyze_intimation prompt lists so the model returns a real piece_profile_key. Key is the
+// closed identifier the caller also enums into the structured-output schema; Nome/Polo are the
+// human-legible label + the pole (ativo|passivo|ambos) the prompt shows for context.
+type PieceProfileOption struct {
+	Key  string
+	Nome string
+	Polo string
 }
 
 // DocketEntryCtx is one recent docket entry for the process summary context.
@@ -308,7 +323,7 @@ const suggestTasksVersion = "suggest_tasks/v2"
 // analyzeIntimationVersion is the pinned version of the analyze_intimation template (the
 // "Analisar esta intimação" card: "O que aconteceu" + "Providências derivadas"). BUMP IT
 // whenever the template text changes so the feedback delta stays attributable to the version.
-const analyzeIntimationVersion = "analyze_intimation/v2"
+const analyzeIntimationVersion = "analyze_intimation/v3"
 
 // summarizeProcessVersion is the pinned version of the summarize_process template. BUMP IT
 // whenever the template text changes so the feedback delta of the OLD prompt stays attributable
@@ -410,10 +425,22 @@ func composeAnalyzeIntimation(c CaseContext) Composed {
 			"   - `title` curto e imperativo, JÁ COM a citação legal quando cabível (ex.: \"Redigir defesa " +
 			"(art. 919, CPC)\", \"Protocolar contestação (art. 335, CPC)\");\n" +
 			"   - `description` curta e acionável explicando a providência;\n" +
-			"   - `kind`: a natureza da providência — \"PECA\" quando exige redigir/protocolar uma peça " +
-			"processual (contestação, recurso, manifestação escrita, embargos); \"CIENCIA\" quando é " +
-			"comunicação/ciência ou providência de apoio de fluxo curto (dar ciência ao cliente, juntar " +
-			"documentos, anotar prazo). Use EXATAMENTE um desses dois valores;\n" +
+			"   - `tipo`: o tipo do ato — use EXATAMENTE um destes valores: \"contestar\" (apresentar " +
+			"contestação/defesa), \"recorrer\" (interpor recurso/apelação/embargos de declaração), " +
+			"\"manifestar\" (manifestação escrita, réplica, impugnação, aditamento à inicial), \"cumprir\" " +
+			"(cumprir determinação/diligência de fluxo curto que NÃO é peça — recolher custas/taxas, juntar " +
+			"documento, informar dado), \"ciencia\" (mera ciência/comunicação);\n" +
+			"   - `gera_peca` (boolean): `true` quando a providência EXIGE redigir e protocolar uma PEÇA " +
+			"processual (tipicamente tipo \"contestar\"/\"recorrer\", ou \"manifestar\" quando há redação de " +
+			"peça escrita); `false` para \"cumprir\"/\"ciencia\" e providências de fluxo curto;\n" +
+			"   - `piece_profile_key`: quando `gera_peca` for true, o identificador do TIPO DE PEÇA a redigir, " +
+			"escolhido EXATAMENTE de uma das keys da lista \"Perfis de peça disponíveis\" fornecida no " +
+			"contexto; use null quando `gera_peca` for false OU quando nenhum perfil da lista couber;\n" +
+			"   - `declarado` (boolean): `true` quando o próprio teor DECLAROU explicitamente o ato e/ou o " +
+			"prazo (ex.: \"apresente contestação no prazo de 15 dias\"); `false` quando você INFERIU o tipo a " +
+			"partir do contexto;\n" +
+			"   - `confianca` (number entre 0 e 1, ou null): sua confiança na inferência do `tipo` — só faz " +
+			"sentido quando `declarado` for false; use null quando `declarado` for true;\n" +
 			"   - `suggested_assignee_user_id`: o id de UM membro do escritório (da lista \"Membros do " +
 			"escritório\" fornecida no contexto) a quem esta providência deve ser atribuída — use " +
 			"EXATAMENTE um dos ids listados, ou null se nenhum couber ou se a lista estiver vazia. NUNCA " +
@@ -424,10 +451,17 @@ func composeAnalyzeIntimation(c CaseContext) Composed {
 			"REGRAS OBRIGATÓRIAS:\n" +
 			"- NÃO invente fatos que não estejam no teor ou no contexto; prefira providências genéricas a " +
 			"suposições.\n" +
-			"- Se o teor for insuficiente para entender o que aconteceu, mantenha `summary` como string " +
-			"vazia e `providencias` como array vazio, em vez de supor.\n" +
+			"- Só deixe `summary` e `providencias` vazios se o teor for genuinamente ilegível ou sem " +
+			"conteúdo aproveitável. Uma decisão, sentença ou despacho com um ato identificável SEMPRE gera " +
+			"ao menos UMA providência — no mínimo do tipo \"ciencia\".\n" +
 			"- Não repita providências; mantenha o tom jurídico formal brasileiro.",
 	)
+	if len(c.PieceProfiles) > 0 {
+		sys.WriteString("\n\nPerfis de peça disponíveis (use como piece_profile_key):\n")
+		for _, p := range c.PieceProfiles {
+			sys.WriteString("- " + p.Key + " — " + p.Nome + " (" + p.Polo + ")\n")
+		}
+	}
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório (exemplos e preferências):\n")
 		sys.WriteString(pb)

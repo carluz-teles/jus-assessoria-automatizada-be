@@ -172,6 +172,10 @@ func (r *recordingReadRepo) GetIntimacaoAnaliseContext(context.Context, string, 
 	return IntimacaoAnaliseCtx{}, nil
 }
 
+func (r *recordingReadRepo) ListPieceProfiles(context.Context) ([]PieceProfileOption, error) {
+	return nil, nil
+}
+
 // Captures reads — canned values the Captures/CaptureDetail use case folds together.
 // Count* return per-field canned counts; the capture rows/summary/detail are canned.
 func (r *recordingReadRepo) ListCaptureRuns(_ context.Context, tenantID string, _ int) ([]CaptureRunRow, error) {

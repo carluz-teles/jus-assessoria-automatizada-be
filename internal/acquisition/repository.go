@@ -182,6 +182,9 @@ type Repository interface {
 	// teor + the court record identification). Used by the analise use case through the
 	// analiseReader port. A miss/foreign row → ErrIntimationNotFound.
 	GetIntimacaoAnaliseContext(ctx context.Context, tenantID, intimationID string) (IntimacaoAnaliseCtx, error)
+	// ListPieceProfiles returns the GLOBAL peça catalog (piece_profile — key/nome/polo, not
+	// tenant-scoped). Injected into the analyze_intimation prompt + schema.
+	ListPieceProfiles(ctx context.Context) ([]PieceProfileOption, error)
 	GetImportStatus(ctx context.Context, tenantID string) (ImportStatusView, error)
 	GetReconciliationTotals(ctx context.Context, tenantID string) (ReconciliationTotals, error)
 	ListReconciliations(ctx context.Context, tenantID string, limit int) ([]ReconciliationView, error)
@@ -2252,6 +2255,22 @@ func (r *pgRepository) GetIntimacaoAnaliseContext(ctx context.Context, tenantID,
 		DeadlineEndDate: endDate,
 		Members:         members,
 	}, nil
+}
+
+// ListPieceProfiles reads the GLOBAL peça catalog (piece_profile — key/nome/polo) on the
+// pool. Not tenant-scoped: the catalog is shared. Injected into the analyze_intimation prompt
+// as the closed list + the piece_profile_key enum. Returns an empty slice (never nil) when the
+// catalog is empty.
+func (r *pgRepository) ListPieceProfiles(ctx context.Context) ([]PieceProfileOption, error) {
+	rows, err := r.q.ListPieceProfiles(ctx)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]PieceProfileOption, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, PieceProfileOption{Key: row.Key, Nome: row.Nome, Polo: row.Polo})
+	}
+	return out, nil
 }
 
 // ListActiveMembers reads the tenant's ACTIVE firm members (internal app_user id + name) on

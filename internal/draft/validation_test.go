@@ -70,6 +70,14 @@ func TestCreateRequest_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// O fluxo task-sourced (botão "Gerar minuta"): o FE manda só task_id, sem
+			// source — o domínio resolve origem/tipo da providência da tarefa. Source
+			// vazio + task_id presente deve ser VÁLIDO (era 400 "source cannot be blank").
+			name:    "task_id present with no source is valid (task-sourced flow)",
+			req:     CreateRequest{TaskID: validUUID},
+			wantErr: false,
+		},
+		{
 			name:    "task_id with invalid UUID is rejected",
 			req:     CreateRequest{Source: SourceBlank, TaskID: "not-a-uuid"},
 			wantErr: true,

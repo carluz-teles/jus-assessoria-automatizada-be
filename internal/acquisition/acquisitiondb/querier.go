@@ -567,6 +567,12 @@ type Querier interface {
 	// name so the caller buckets autor/réu/terceiro deterministically. counsels defaults to
 	// an empty jsonb array (never NULL) when a party has no advogado.
 	ListPartiesByProcesso(ctx context.Context, arg ListPartiesByProcessoParams) ([]ListPartiesByProcessoRow, error)
+	// The GLOBAL catalog of peça profiles (piece_profile — key/nome/polo, no tenant_id: the
+	// catalog is shared across tenants). Injected into the analyze_intimation prompt as the
+	// closed list the model must pick piece_profile_key from, and used to build the dynamic
+	// structured-output enum for that field (analise.go). Ordered by key for a stable prompt +
+	// schema. Read-only; not tenant-scoped by design.
+	ListPieceProfiles(ctx context.Context) ([]ListPieceProfilesRow, error)
 	// The process cockpit's "Atividade" timeline (migration 0073): every logged event for
 	// one court_record, newest first. Descending keyset on (occurred_at, id) — served by
 	// the migration's index on (court_record_id, occurred_at DESC, id DESC) — the first

@@ -60,3 +60,13 @@ RETURNING court_record_id;
 -- documents, so callers log-and-continue on error instead of propagating it.
 INSERT INTO process_activity_log (tenant_id, court_record_id, event_type, payload)
 VALUES ($1, $2, $3, $4);
+
+-- name: ListPieceProfiles :many
+-- The GLOBAL catalog of peça profiles (piece_profile — key/nome/polo, no tenant_id: the
+-- catalog is shared across tenants). Injected into the analyze_intimation prompt as the
+-- closed list the model must pick piece_profile_key from, and used to build the dynamic
+-- structured-output enum for that field (analise.go). Ordered by key for a stable prompt +
+-- schema. Read-only; not tenant-scoped by design.
+SELECT key, nome, polo
+FROM piece_profile
+ORDER BY key;

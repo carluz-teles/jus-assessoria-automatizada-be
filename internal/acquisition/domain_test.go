@@ -506,6 +506,10 @@ func (m *mockRepo) GetIntimacaoAnaliseContext(_ context.Context, _, _ string) (I
 	return IntimacaoAnaliseCtx{}, nil
 }
 
+func (m *mockRepo) ListPieceProfiles(_ context.Context) ([]PieceProfileOption, error) {
+	return nil, nil
+}
+
 // fakeOutbox records published events and can be told to fail one call to
 // exercise the abort path.
 type fakeOutbox struct {

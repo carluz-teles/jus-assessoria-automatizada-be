@@ -139,6 +139,43 @@ func (q *Queries) ListActiveMembers(ctx context.Context, tenantID uuid.UUID) ([]
 	return items, nil
 }
 
+const listPieceProfiles = `-- name: ListPieceProfiles :many
+SELECT key, nome, polo
+FROM piece_profile
+ORDER BY key
+`
+
+type ListPieceProfilesRow struct {
+	Key  string `json:"key"`
+	Nome string `json:"nome"`
+	Polo string `json:"polo"`
+}
+
+// The GLOBAL catalog of peça profiles (piece_profile — key/nome/polo, no tenant_id: the
+// catalog is shared across tenants). Injected into the analyze_intimation prompt as the
+// closed list the model must pick piece_profile_key from, and used to build the dynamic
+// structured-output enum for that field (analise.go). Ordered by key for a stable prompt +
+// schema. Read-only; not tenant-scoped by design.
+func (q *Queries) ListPieceProfiles(ctx context.Context) ([]ListPieceProfilesRow, error) {
+	rows, err := q.db.Query(ctx, listPieceProfiles)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPieceProfilesRow
+	for rows.Next() {
+		var i ListPieceProfilesRow
+		if err := rows.Scan(&i.Key, &i.Nome, &i.Polo); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setIntimationAIAnalysis = `-- name: SetIntimationAIAnalysis :one
 UPDATE intimation
 SET ai_summary      = $1,
