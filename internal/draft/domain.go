@@ -153,6 +153,10 @@ type CreateCommand struct {
 	// Source and the intimation/case/piece_type it would otherwise resolve. Empty
 	// for every pre-existing caller (source=intimation/processo/blank).
 	TaskID string
+	// ThesisIDs are the partida's selected suggested-thesis ids (C2). On an
+	// intimation-scoped create, Create copies the intimation's persisted theses into
+	// the new draft, marking these ids ThesisStateIncluded and the rest ThesisStateOff.
+	ThesisIDs []string
 }
 
 // CreateResult carries the response body for a POST /v1/pecas: the created or found
@@ -201,6 +205,19 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 				if d.PieceType == "" {
 					d.PieceType = inferPieceType(intimation)
 				}
+				// Resolve the piece_profile_key so a partida-created draft carries the
+				// same catalog profile the task-sourced flow does (drives the generation
+				// structure — Fatia PART A). PREFERÊNCIA: herdar do action_item que a
+				// análise já materializou pra esta intimação (a análise ESCOLHE o key,
+				// veja internal/acquisition/analise.go). FALLBACK: mapear do piece_type.
+				profileKey, pkErr := uc.rw.GetActionItemProfileKeyForIntimation(ctx, tx, cmd.TenantID, intimation.IntimationID)
+				if pkErr != nil {
+					return pkErr
+				}
+				if profileKey == "" {
+					profileKey = defaultProfileForPieceType(d.PieceType)
+				}
+				d.PieceProfileKey = profileKey
 
 			case SourceProcesso:
 				d.CaseID = cmd.CaseID
@@ -263,6 +280,16 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 			}
 		}
 
+		// C2 — promoção partida→construção: se o draft nasce de uma intimação que já
+		// tem teses da partida, copia-as pro draft (mesma tx), marcando as
+		// selecionadas (cmd.ThesisIDs) como ThesisStateIncluded e o resto ThesisStateOff.
+		// No-op quando não há intimation_id resolvido ou a intimação não gerou teses.
+		if created.IntimationID != "" {
+			if err := uc.promoteIntimationTheses(ctx, tx, cmd.TenantID, created.IntimationID, created.ID, cmd.ThesisIDs); err != nil {
+				return err
+			}
+		}
+
 		result = CreateResult{Draft: created, IsNewDraft: true}
 		return nil
 	})
@@ -270,6 +297,14 @@ func (uc *UseCase) Create(ctx context.Context, cmd CreateCommand) (CreateResult,
 		return CreateResult{}, err
 	}
 	return result, nil
+}
+
+// promoteIntimationTheses copies the intimation's partida theses into a freshly
+// created draft (C2), reusing the single-source copy body. It delegates to
+// copyIntimationThesesToDraft with uc.rw (the full Repository satisfies the copy
+// port). Same tx as InsertDraft — the draft + its promoted theses commit atomically.
+func (uc *UseCase) promoteIntimationTheses(ctx context.Context, tx database.Tx, tenantID, intimationID, draftID string, selectedThesisIDs []string) error {
+	return copyIntimationThesesToDraft(ctx, tx, uc.rw, tenantID, intimationID, draftID, selectedThesisIDs)
 }
 
 // populateFromTask implements the task-sourced Create flow (migration 0088,
@@ -381,6 +416,14 @@ func (uc *UseCase) GetDetail(ctx context.Context, tenantID, draftID string) (*Dr
 			parties, e := uc.rw.GetPartiesForDraft(ctx, tx, tenantID, v.Process.CaseID)
 			if e == nil {
 				v.Parties = parties
+			}
+
+			// ProcessDocuments: autos do processo (documentos fetchados do
+			// court_record), listados na seção "Fundada em" do editor. Non-fatal
+			// on error (same rationale as parties).
+			docs, e := uc.rw.ListProcessDocuments(ctx, tx, v.Process.CourtRecordID, tenantID)
+			if e == nil {
+				v.ProcessDocuments = docs
 			}
 		}
 

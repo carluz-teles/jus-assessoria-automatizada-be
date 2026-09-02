@@ -54,7 +54,9 @@ func runRAG(
 		return nil, nil, false
 	}
 
-	vecs, _, err := emb.Embed(ctx, []string{queryText})
+	// InputQuery — this is the RETRIEVAL side. Voyage is asymmetric; embedding the query in the
+	// query sub-space (not "document") is what makes the search recall the right chunks.
+	vecs, _, err := emb.Embed(ctx, []string{queryText}, indexing.InputQuery)
 	if err != nil || len(vecs) == 0 {
 		slog.WarnContext(ctx, "draft rag: embed failed",
 			slog.String("tenant_id", tenantID),

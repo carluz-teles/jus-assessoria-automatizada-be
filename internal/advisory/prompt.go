@@ -176,9 +176,51 @@ type DraftContext struct {
 	// Instructions is free-text advogado guidance for this generation. Empty →
 	// no extra section injected.
 	Instructions string
-	// SelectedTheses are tese labels (plain strings) the advogado picked from
-	// /theses to steer this generation. Empty → no extra section injected.
-	SelectedTheses []string
+	// SelectedTheses are the RICH theses the advogado picked from /theses to steer
+	// this generation, each carrying its Foundation/Reference/Excerpt so the LLM can
+	// DEVELOP them from the anchored material instead of inventing. Empty → no extra
+	// section injected. (Legacy Fatia 5 callers may pass ctx com só Label preenchido.)
+	SelectedTheses []SelectedThesisCtx
+
+	// ── Fatia PART B — profile-driven miolo ───────────────────────────────────
+
+	// PieceProfileKey is the catalog key of the piece_profile the draft carries
+	// (contestacao/peticao_inicial/apelacao/…). Empty → legacy draft with no
+	// profile: composeDraftMinuta renders the generic Fatos/Direito/Pedidos trio.
+	PieceProfileKey string
+	// ProfileSections are the profile's MIOLO sections, ordered by Ordem. Non-empty
+	// → composeDraftMinuta renders the real headers (Das Preliminares, Do Mérito, …)
+	// instead of the fixed trio. Empty → generic fallback.
+	ProfileSections []ProfileSectionCtx
+}
+
+// ProfileSectionCtx is one profile_section as seen by the draft_minuta composer —
+// mirrors draft.ProfileSectionInfo without importing the slice (advisory has no
+// downward dependency). Obrigatoria is the raw enum "sim"|"nao"|"condicional";
+// AceitaTeses marks the sections where selected theses go.
+type ProfileSectionCtx struct {
+	Key         string
+	Titulo      string
+	Ordem       int
+	Obrigatoria string // "sim" | "nao" | "condicional"
+	Origem      string
+	AceitaTeses bool
+}
+
+// SelectedThesisCtx is one advogado-selected thesis as seen by the draft_minuta
+// composer — mirrors draft.SuggestedThesis's generation-relevant fields without
+// importing the slice (advisory has no downward dependency). Foundation/Reference/
+// Excerpt let the LLM DEVELOP the thesis from the anchored material instead of
+// inventing; Grounded marks that Excerpt was verified against SourceLabel. Legacy
+// Fatia 5 callers may fill only Label (the rest empty) — the composer still renders
+// a valid, if leaner, block.
+type SelectedThesisCtx struct {
+	Label       string
+	Foundation  string
+	Reference   string
+	Excerpt     string
+	SourceLabel string
+	Grounded    bool
 }
 
 // ReviewContext is the per-draft signal the review_minuta composer uses. It carries the
@@ -355,11 +397,25 @@ const summarizeProcessVersion = "process_summary/v1"
 // Canvas, Claude Artifacts, Cursor). O BE converte markdown → HTML via goldmark antes
 // de persistir em content_html; o FE usa tiptap-markdown pra renderizar incrementalmente
 // no editor via streamContent().
-const draftMinutaVersion = "draft_minuta/v9"
+// Bumped to v10: quando o draft carrega um piece_profile (contestacao/peticao_inicial/
+// apelacao/…), a ESTRUTURA DO MIOLO deixa de ser o trio fixo "I–DOS FATOS / II–DO
+// DIREITO / III–DOS PEDIDOS" e passa a seguir as profile_sections do catálogo (migration
+// 0085): cabeçalhos numerados pela `ordem`, com os títulos reais ("Das Preliminares",
+// "Da Impugnação Específica dos Fatos", "Do Mérito", …). Seções condicionais só entram
+// quando há matéria; teses selecionadas caem nas seções aceita_teses=true. Sem profile
+// (draft legado), a wording permanece IDÊNTICA ao v9 (backward-compat). O fecho v6
+// não muda.
+// Bumped to v11: as TESES SELECIONADAS deixam de ser injetadas só como rótulos com
+// destino hardcoded "II – DO DIREITO" (que conflitava com o miolo dos perfis). Agora
+// o bloco é profile-aware — com profile as teses são distribuídas nas seções do miolo
+// (preliminar/impugnação/mérito), sem profile caem na seção "DO DIREITO" genérica — e
+// carrega Fundamento/Dispositivo/trecho ancorado de cada tese pra o LLM desenvolver do
+// material dos autos, sem inventar.
+const draftMinutaVersion = "draft_minuta/v11"
 
 // suggestThesesVersion is the pinned version of the suggest_theses template (POST
 // /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
-const suggestThesesVersion = "suggest_theses/v2"
+const suggestThesesVersion = "suggest_theses/v3"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -658,6 +714,15 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"minuta possível com marcador entre colchetes no que faltar — NUNCA invente fatos, valores, súmulas, " +
 			"datas ou nºs de processo que não constem do contexto.",
 	)
+	// Profile-driven miolo (v10): when the draft carries a piece_profile, the MIOLO
+	// (itens 5–7 da estrutura canônica) is OVERRIDDEN by the catalog's profile_sections
+	// — títulos reais numerados pela ordem, respeitando obrigatoriedade e aceita_teses.
+	// Empty ProfileSections → nada é anexado e a estrutura canônica genérica (o trio
+	// fixo Fatos/Direito/Pedidos) permanece, byte-identical ao v9 (backward-compat).
+	if pd := profileMioloDirective(c.ProfileSections); pd != "" {
+		sys.WriteString("\n\n")
+		sys.WriteString(pd)
+	}
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
 		sys.WriteString("\n\nSiga o playbook do escritório:\n")
 		sys.WriteString(pb)
@@ -720,11 +785,44 @@ func composeDraftMinuta(c DraftContext) Composed {
 		lines = append(lines, "Instruções específicas do advogado para esta minuta:\n"+instr)
 	}
 
-	// Selected theses (Fatia 5): tese labels picked from /theses to steer this
-	// generation. Omitted entirely when empty.
+	// Selected theses (Fatia 5): RICH theses picked from /theses to steer this
+	// generation. Profile-aware routing — com profile as teses vão distribuídas nas
+	// seções do miolo (não numa "Do Direito" avulsa, que CONFLITA com o miolo do
+	// perfil); sem profile caem na seção "DO DIREITO" genérica. Sempre com
+	// Fundamento/Dispositivo/trecho ancorado pra o LLM desenvolver sem inventar.
+	// Omitted entirely when empty.
 	if len(c.SelectedTheses) > 0 {
-		lines = append(lines, "Teses selecionadas pelo advogado (desenvolva estas no \"II – DO DIREITO\"):\n- "+
-			strings.Join(c.SelectedTheses, "\n- "))
+		var tb strings.Builder
+		if len(c.ProfileSections) > 0 {
+			tb.WriteString("TESES SELECIONADAS pelo advogado — desenvolva CADA UMA por extenso, integrada ao argumento, na seção do MIOLO onde ela se encaixa (preliminar → seção de preliminares; questão de fato → impugnação específica; mérito → mérito). NÃO crie uma seção \"Do Direito\" avulsa nem agrupe todas num único lugar. Fundamente cada tese no material indicado, SEM inventar fatos, valores ou dispositivos além dos fornecidos:")
+		} else {
+			tb.WriteString("TESES SELECIONADAS pelo advogado — desenvolva CADA UMA por extenso e integrada ao argumento, na seção \"DO DIREITO\". Fundamente no material indicado, SEM inventar fatos, valores ou dispositivos além dos fornecidos:")
+		}
+		for _, t := range c.SelectedTheses {
+			tb.WriteString("\n- ")
+			tb.WriteString(t.Label)
+			if t.Foundation != "" {
+				tb.WriteString(" — Fundamento: ")
+				tb.WriteString(t.Foundation)
+			}
+			if t.Reference != "" {
+				tb.WriteString(" Dispositivo: ")
+				tb.WriteString(t.Reference)
+				tb.WriteString(".")
+			}
+			if t.Excerpt != "" {
+				tb.WriteString(" Apoio nos autos")
+				if t.SourceLabel != "" {
+					tb.WriteString(" (")
+					tb.WriteString(t.SourceLabel)
+					tb.WriteString(")")
+				}
+				tb.WriteString(": \"")
+				tb.WriteString(t.Excerpt)
+				tb.WriteString("\".")
+			}
+		}
+		lines = append(lines, tb.String())
 	}
 
 	var usr strings.Builder
@@ -736,6 +834,59 @@ func composeDraftMinuta(c DraftContext) Composed {
 	usr.WriteString("\n\nRedija a minuta completa da peça seguindo as instruções.")
 
 	return Composed{System: sys.String(), User: usr.String(), PromptVersion: draftMinutaVersion}
+}
+
+// profileMioloDirective renders the profile-driven MIOLO override (v10) from the
+// catalog's profile_sections. It returns "" for an empty slice — the caller then
+// leaves the generic Fatos/Direito/Pedidos trio untouched (backward-compat). When
+// non-empty it instructs the LLM to replace itens 5–7 da estrutura canônica pelas
+// seções reais do perfil: cabeçalho `## N — <TÍTULO EM CAIXA ALTA>` numerado pela
+// ordem, com regras por obrigatoriedade (condicional = incluir só se houver matéria)
+// e por aceita_teses (onde as teses selecionadas entram). A moldura invariante
+// (endereçamento → preâmbulo → [miolo] → Pedidos → fecho) e o FECHO v6 não mudam —
+// esta diretiva só troca o miolo argumentativo.
+func profileMioloDirective(sections []ProfileSectionCtx) string {
+	if len(sections) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(
+		"ESTRUTURA DO MIOLO (SUBSTITUI os itens 5, 6 e 7 da estrutura canônica acima — " +
+			"o trio genérico \"I – DOS FATOS / II – DO DIREITO / III – DOS PEDIDOS\" NÃO se " +
+			"aplica a esta peça). Mantenha a moldura invariante (endereçamento → referência → " +
+			"qualificação/exórdio → [MIOLO abaixo] → fecho) e o FECHO EXATAMENTE como já " +
+			"instruído. O MIOLO desta peça tem as seções abaixo, NESTA ordem, cada uma com " +
+			"cabeçalho markdown `## N — <TÍTULO EM CAIXA ALTA>` (N em algarismo romano na " +
+			"ordem indicada):\n")
+	roman := 0
+	for _, s := range sections {
+		roman++
+		b.WriteString(strconv.Itoa(roman))
+		b.WriteString(") \"")
+		b.WriteString(strings.ToUpper(strings.TrimSpace(s.Titulo)))
+		b.WriteString("\"")
+		switch s.Obrigatoria {
+		case "condicional":
+			b.WriteString(" — CONDICIONAL: inclua esta seção APENAS quando houver matéria " +
+				"concreta para ela no caso; se não houver, PULE-A por completo (não escreva " +
+				"a seção vazia nem um cabeçalho sem conteúdo).")
+		case "nao":
+			b.WriteString(" — OPCIONAL: inclua somente se for útil ao caso.")
+		default: // "sim"
+			b.WriteString(" — OBRIGATÓRIA: sempre presente.")
+		}
+		if s.AceitaTeses {
+			b.WriteString(" As TESES SELECIONADAS pelo advogado (quando fornecidas) devem ser " +
+				"desenvolvidas nesta seção.")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(
+		"Numere os cabeçalhos das seções pela ordem EFETIVA em que aparecem na peça " +
+			"(seções condicionais puladas NÃO consomem número). Fundamente cada seção com os " +
+			"artigos de lei pertinentes ao tipo de peça. Os PEDIDOS e o FECHO seguem exatamente " +
+			"as regras já dadas na estrutura canônica.")
+	return b.String()
 }
 
 // toneDirective returns the tone-specific system directive to append for the
@@ -779,7 +930,8 @@ func composeSuggestTheses(c DraftContext) Composed {
 			"- `confidence`: um de alta|media|baixa — CLASSIFIQUE COM RIGOR conforme os critérios abaixo.\n" +
 			"- `reference`: jurisprudência ou dispositivo legal, texto livre (ex.: \"art. 206, §5º, I, CC\" ou \"STJ, REsp 1.234.567/SP\"). NÃO invente números de processo.\n" +
 			"- `foundation`: explicação CURTA (1-2 frases) de por que a tese se aplica a este caso.\n" +
-			"- `evidence`: ARRAY de trechos LITERAIS extraídos do TEOR DA INTIMAÇÃO ou dos Trechos relevantes dos autos que sustentam a tese. Cada item é um recorte curto (10-40 palavras), copiado sem alterar. NÃO parafraseie. NÃO invente. Se não houver trecho literal, deixe o array vazio — e nesse caso confidence DEVE ser baixa.\n\n" +
+			"- `evidence`: ARRAY de trechos LITERAIS extraídos do TEOR DA INTIMAÇÃO ou dos Trechos relevantes dos autos que sustentam a tese. Cada item é um recorte curto (10-40 palavras), copiado sem alterar. NÃO parafraseie. NÃO invente. Se não houver trecho literal, deixe o array vazio — e nesse caso confidence DEVE ser baixa.\n" +
+			"- `source_ref`: o NÚMERO do trecho (1, 2, 3...) da lista \"Trechos relevantes dos autos\" de onde você copiou a `evidence` que sustenta esta tese. A `evidence` DEVE ser cópia literal EXATA desse trecho numerado. Use 0 quando a tese se fundar apenas no teor da intimação ou em doutrina/dispositivo legal (sem trecho dos autos). NUNCA aponte um número que não exista na lista.\n\n" +
 			"CRITÉRIOS DE CONFIDENCE (siga à risca):\n" +
 			"- alta: ao menos 2 trechos literais do contexto (evidence.length ≥ 2) apoiam DIRETAMENTE a tese, e o dispositivo/precedente citado é claramente aplicável ao caso concreto.\n" +
 			"- media: 1 trecho literal apoia (evidence.length == 1), OU 2+ trechos apoiam de forma indireta (contexto sugere mas não afirma o fato-chave).\n" +

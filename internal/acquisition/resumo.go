@@ -352,7 +352,7 @@ func (uc *ResumoUseCase) buildProcessContext(ctx context.Context, tenantID, cour
 	var docChunks []string
 	if uc.embedder != nil && uc.indexDeps.Pool != nil {
 		queryText := ctxData.CNJNumber + " " + ctxData.Court + " " + ctxData.Class + " " + ctxData.Subject
-		if vecs, _, err := uc.embedder.Embed(ctx, []string{queryText}); err != nil {
+		if vecs, _, err := uc.embedder.Embed(ctx, []string{queryText}, indexing.InputQuery); err != nil {
 			slog.WarnContext(ctx, "acquisition: resume RAG embed skipped",
 				slog.String("court_record_id", courtRecordID), slog.Any("error", err))
 		} else if len(vecs) > 0 {

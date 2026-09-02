@@ -55,6 +55,14 @@ type fakeRepo struct {
 	getActionItemForTaskResult *ActionItemForTask
 	getActionItemForTaskErr    error
 
+	// GetActionItemProfileKeyForIntimation (PART A — source=intimation profile key)
+	actionItemProfileKeyForIntimation string
+	actionItemProfileKeyErr           error
+
+	// GetGenerationProfile (PART B — catalog profile for generation)
+	generationProfile    *GenerationProfile
+	generationProfileErr error
+
 	// GetDraftByTaskID
 	getByTaskResult *Draft
 	getByTaskErr    error
@@ -74,6 +82,11 @@ type fakeRepo struct {
 	linkSupersededDraftCalls     int
 	lastLinkSupersededTaskID     string
 	lastLinkSupersededNewDraftID string
+
+	// Suggested-thesis promotion (C2): intimTheses seeds the partida's theses; every
+	// promoted insert is captured in promotedTheses so tests can assert the mapping.
+	intimTheses    []SuggestedThesis
+	promotedTheses []SuggestedThesis
 
 	// UpdateDraftContent
 	updateResult *PatchResult
@@ -186,6 +199,14 @@ func (r *fakeRepo) GetActionItemForTask(_ context.Context, _ database.Tx, _, _ s
 	return r.getActionItemForTaskResult, r.getActionItemForTaskErr
 }
 
+func (r *fakeRepo) GetActionItemProfileKeyForIntimation(_ context.Context, _ database.Tx, _, _ string) (string, error) {
+	return r.actionItemProfileKeyForIntimation, r.actionItemProfileKeyErr
+}
+
+func (r *fakeRepo) GetGenerationProfile(_ context.Context, _ database.Tx, _ string) (*GenerationProfile, error) {
+	return r.generationProfile, r.generationProfileErr
+}
+
 func (r *fakeRepo) GetDraftByTaskID(_ context.Context, _ database.Tx, _, _ string) (*Draft, error) {
 	return r.getByTaskResult, r.getByTaskErr
 }
@@ -257,6 +278,30 @@ func (r *fakeRepo) GetDraftAttachments(_ context.Context, _ database.Tx, _, _ st
 	return r.getDraftAttachResult, r.getDraftAttachErr
 }
 
+// Suggested theses (C1) — no-op stubs so fakeRepo satisfies Repository; the
+// persisted-theses use case is exercised via fakeThesisStore (theses_store_test.go).
+func (r *fakeRepo) InsertSuggestedThesis(_ context.Context, _ database.Tx, _ string, t *SuggestedThesis) (*SuggestedThesis, error) {
+	if t.DraftID != "" {
+		r.promotedTheses = append(r.promotedTheses, *t)
+	}
+	return t, nil
+}
+func (r *fakeRepo) ListSuggestedThesesByDraft(_ context.Context, _ database.Tx, _, _ string) ([]SuggestedThesis, error) {
+	return nil, nil
+}
+func (r *fakeRepo) UpdateSuggestedThesisState(_ context.Context, _ database.Tx, _, _, _ string) (*SuggestedThesis, error) {
+	return nil, nil
+}
+func (r *fakeRepo) DeleteSuggestedThesesByDraft(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
+}
+func (r *fakeRepo) ListSuggestedThesesByIntimation(_ context.Context, _ database.Tx, _, _ string) ([]SuggestedThesis, error) {
+	return r.intimTheses, nil
+}
+func (r *fakeRepo) DeleteSuggestedThesesByIntimation(_ context.Context, _ database.Tx, _, _ string) error {
+	return nil
+}
+
 // ── Fatia 3 stubs (GetLatestReview, UpdateSagaState, InsertReview) ──────────
 // The domain_test.go tests only cover the Fatia 1–2 use cases; these stubs just
 // satisfy the interface so the existing tests continue to compile.
@@ -302,6 +347,10 @@ func (r *fakeRepo) GetProvidencesForIntimation(_ context.Context, _ database.Tx,
 
 func (r *fakeRepo) GetPartiesForDraft(_ context.Context, _ database.Tx, _, _ string) ([]PartyInfo, error) {
 	return []PartyInfo{}, nil
+}
+
+func (r *fakeRepo) ListProcessDocuments(_ context.Context, _ database.Tx, _, _ string) ([]ProcessDocument, error) {
+	return []ProcessDocument{}, nil
 }
 
 // ── Fatia 3b stubs (InsertChatMessage, GetChatThread) ────────────────────────
@@ -505,10 +554,13 @@ func TestUseCase_Create(t *testing.T) {
 		// PieceProfileKey on the inserted draft) — the legacy cases leave both "".
 		wantTaskSourced bool
 		wantTaskID      string
+		// checkProfileKey gates the PieceProfileKey assertion; wantProfileKey is the
+		// expected resolved key (PART A source=intimation OR task-sourced).
+		checkProfileKey bool
 		wantProfileKey  string
 	}{
 		{
-			name: "source=intimation creates draft with inferred DEFENSE piece_type",
+			name: "source=intimation creates draft with inferred DEFENSE piece_type + fallback profile key",
 			cmd: CreateCommand{
 				TenantID:     tenantID,
 				Source:       SourceIntimation,
@@ -518,10 +570,35 @@ func TestUseCase_Create(t *testing.T) {
 				getIntimationResult: &IntimationContext{
 					IntimationID: intimID, CaseID: caseID, Type: "CITACAO",
 				},
-				insertDraftResult: stubDraft(tenantID, intimID),
+				// No action_item key → PART A fallback: DEFENSE → "contestacao".
+				actionItemProfileKeyForIntimation: "",
+				insertDraftResult:                 stubDraft(tenantID, intimID),
 			},
-			wantNew:   true,
-			wantPiece: PieceTypeDefense,
+			wantNew:         true,
+			wantPiece:       PieceTypeDefense,
+			checkProfileKey: true,
+			wantProfileKey:  "contestacao",
+		},
+		{
+			name: "source=intimation inherits piece_profile_key from action_item (analysis' choice wins over fallback)",
+			cmd: CreateCommand{
+				TenantID:     tenantID,
+				Source:       SourceIntimation,
+				IntimationID: intimID,
+			},
+			repo: &fakeRepo{
+				getIntimationResult: &IntimationContext{
+					// CITACAO → DEFENSE (fallback would be "contestacao"), but the
+					// action_item already chose "apelacao" — that must win.
+					IntimationID: intimID, CaseID: caseID, Type: "CITACAO",
+				},
+				actionItemProfileKeyForIntimation: "apelacao",
+				insertDraftResult:                 stubDraft(tenantID, intimID),
+			},
+			wantNew:         true,
+			wantPiece:       PieceTypeDefense,
+			checkProfileKey: true,
+			wantProfileKey:  "apelacao",
 		},
 		{
 			name: "source=intimation with explicit piece_type overrides inference",
@@ -555,6 +632,9 @@ func TestUseCase_Create(t *testing.T) {
 			},
 			wantNew:   true,
 			wantPiece: PieceTypeOther,
+			// OTHER has no catalog mapping → PART A fallback resolves to "" (generic).
+			checkProfileKey: true,
+			wantProfileKey:  "",
 		},
 		{
 			name: "idempotent: existing draft returned as 200 when unique constraint hit",
@@ -622,6 +702,7 @@ func TestUseCase_Create(t *testing.T) {
 			wantNew:         true,
 			wantPiece:       PieceTypeDefense,
 			wantTaskSourced: true,
+			checkProfileKey: true,
 			wantTaskID:      taskID,
 			wantProfileKey:  "contestacao",
 		},
@@ -640,6 +721,7 @@ func TestUseCase_Create(t *testing.T) {
 			wantNew:         true,
 			wantPiece:       PieceTypeComplaint,
 			wantTaskSourced: true,
+			checkProfileKey: true,
 			wantTaskID:      taskID,
 			wantProfileKey:  "peticao_inicial",
 		},
@@ -658,6 +740,7 @@ func TestUseCase_Create(t *testing.T) {
 			wantNew:         true,
 			wantPiece:       PieceTypeAppeal,
 			wantTaskSourced: true,
+			checkProfileKey: true,
 			wantTaskID:      taskID,
 			wantProfileKey:  "apelacao",
 		},
@@ -679,6 +762,7 @@ func TestUseCase_Create(t *testing.T) {
 			wantNew:         true,
 			wantPiece:       PieceTypeDefense, // CITACAO → DEFENSE, same as inferPieceType's own test
 			wantTaskSourced: true,
+			checkProfileKey: true,
 			wantTaskID:      taskID,
 			wantProfileKey:  "",
 		},
@@ -755,6 +839,10 @@ func TestUseCase_Create(t *testing.T) {
 					t.Errorf("Create() inserted TaskID = %q, want %q",
 						tt.repo.lastInsertedDraft.TaskID, tt.wantTaskID)
 				}
+			}
+			// PieceProfileKey assertion — for BOTH the source=intimation (PART A) and
+			// the task-sourced flows: the inserted draft must carry the resolved key.
+			if tt.checkProfileKey && tt.repo.lastInsertedDraft != nil {
 				if tt.repo.lastInsertedDraft.PieceProfileKey != tt.wantProfileKey {
 					t.Errorf("Create() inserted PieceProfileKey = %q, want %q",
 						tt.repo.lastInsertedDraft.PieceProfileKey, tt.wantProfileKey)
@@ -801,6 +889,54 @@ func TestUseCase_Create_TaskSourced_BackfillsSupersededDraft(t *testing.T) {
 	}
 	if repo.lastLinkSupersededNewDraftID != newDraft.ID {
 		t.Errorf("LinkSupersededDraft newDraftID = %q, want %q (the just-inserted draft)", repo.lastLinkSupersededNewDraftID, newDraft.ID)
+	}
+}
+
+// TestUseCase_Create_PromotesIntimationTheses proves the partida→construção promotion
+// (C2): when a draft is created from an intimation that already has partida theses,
+// Create copies them into the new draft, marking the ThesisIDs the advogado selected
+// as included and the rest as off — in the same tx as InsertDraft.
+func TestUseCase_Create_PromotesIntimationTheses(t *testing.T) {
+	t.Parallel()
+
+	tenantID := newTenantID()
+	intimID := newIntimID()
+	caseID := uuid.New().String()
+
+	repo := &fakeRepo{
+		getIntimationResult: &IntimationContext{IntimationID: intimID, CaseID: caseID, Type: "CITACAO"},
+		insertDraftResult:   stubDraft(tenantID, intimID),
+		intimTheses: []SuggestedThesis{
+			{ID: "a", Label: "keep", IntimationID: intimID},
+			{ID: "b", Label: "drop", IntimationID: intimID},
+		},
+	}
+	uc := NewUseCase(&fakeUOW{}, repo)
+
+	_, err := uc.Create(context.Background(), CreateCommand{
+		TenantID:     tenantID,
+		Source:       SourceIntimation,
+		IntimationID: intimID,
+		ThesisIDs:    []string{"a"},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if len(repo.promotedTheses) != 2 {
+		t.Fatalf("promoted theses = %d, want 2", len(repo.promotedTheses))
+	}
+	got := map[string]string{}
+	for _, p := range repo.promotedTheses {
+		got[p.Label] = p.State
+		if p.DraftID == "" || p.IntimationID != "" {
+			t.Errorf("promoted %q must be draft-scoped (draft_id set, intimation_id empty), got draft=%q intim=%q", p.Label, p.DraftID, p.IntimationID)
+		}
+	}
+	if got["keep"] != ThesisStateIncluded {
+		t.Errorf("selected thesis 'keep' state = %q, want included", got["keep"])
+	}
+	if got["drop"] != ThesisStateOff {
+		t.Errorf("unselected thesis 'drop' state = %q, want off", got["drop"])
 	}
 }
 

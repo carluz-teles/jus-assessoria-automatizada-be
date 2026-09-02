@@ -1,6 +1,8 @@
 package draft
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 
 	"github.com/google/uuid"
@@ -122,6 +124,40 @@ func TestDetailToResponse_ProcessParties(t *testing.T) {
 	}
 	if resp.Process.Defendants == nil {
 		t.Error("defendants is nil, want [] so JSON is not null")
+	}
+}
+
+// TestDetailToResponse_PartyIsClient asserts is_client rides through the read model to
+// the wire: the flagged party serializes is_client=true, the other false, and the key
+// is always present (json.Marshal never omits a bool) so the FE stops guessing by role.
+func TestDetailToResponse_PartyIsClient(t *testing.T) {
+	view := &DraftDetailView{
+		ID:        uuid.NewString(),
+		PieceType: "DEFENSE",
+		Title:     "Defesa",
+		Parties: []PartyInfo{
+			{Role: "DEFENDANT", Name: "CLIENTE", IsClient: true, Counsels: []PartyCounselInfo{}},
+			{Role: "DEFENDANT", Name: "OUTRO", IsClient: false, Counsels: []PartyCounselInfo{}},
+		},
+	}
+
+	resp := detailToResponse(view)
+	if len(resp.Parties) != 2 {
+		t.Fatalf("parties = %d, want 2", len(resp.Parties))
+	}
+	if !resp.Parties[0].IsClient {
+		t.Error("first party (flagged) must be IsClient=true")
+	}
+	if resp.Parties[1].IsClient {
+		t.Error("second party must be IsClient=false")
+	}
+
+	raw, err := json.Marshal(resp.Parties[1])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"is_client":false`)) {
+		t.Errorf("is_client key must always be present in JSON, got %s", raw)
 	}
 }
 

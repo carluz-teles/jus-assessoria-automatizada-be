@@ -170,14 +170,24 @@ func TestThesesUseCase_AltaDowngradedWhenEvidenceShort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("want nil err, got %v", err)
 	}
-	if result.Theses[0].Confidence != ThesisConfidenceMedia {
-		t.Errorf("theses[0] com 1 evidência: Confidence = %q, want media (downgrade)", result.Theses[0].Confidence)
+	// A ordenação determinística (alta antes de media) sobe "Alta legítima" (2
+	// evidências, mantém alta) pro topo; as duas rebaixadas viram media e ficam
+	// abaixo, estáveis na ordem original. Asserção por label, não por índice.
+	byLabel := map[string]string{}
+	for _, th := range result.Theses {
+		byLabel[th.Label] = th.Confidence
 	}
-	if result.Theses[1].Confidence != ThesisConfidenceAlta {
-		t.Errorf("theses[1] com 2 evidências: Confidence = %q, want alta (preservada)", result.Theses[1].Confidence)
+	if byLabel["Alta suspeita"] != ThesisConfidenceMedia {
+		t.Errorf("Alta suspeita (1 evidência): Confidence = %q, want media (downgrade)", byLabel["Alta suspeita"])
 	}
-	if result.Theses[2].Confidence != ThesisConfidenceMedia {
-		t.Errorf("theses[2] com 0 evidências: Confidence = %q, want media (downgrade)", result.Theses[2].Confidence)
+	if byLabel["Alta legítima"] != ThesisConfidenceAlta {
+		t.Errorf("Alta legítima (2 evidências): Confidence = %q, want alta (preservada)", byLabel["Alta legítima"])
+	}
+	if byLabel["Alta sem prova"] != ThesisConfidenceMedia {
+		t.Errorf("Alta sem prova (0 evidências): Confidence = %q, want media (downgrade)", byLabel["Alta sem prova"])
+	}
+	if result.Theses[0].Confidence != ThesisConfidenceAlta {
+		t.Errorf("após ordenação, theses[0] deve ser alta, got %q", result.Theses[0].Confidence)
 	}
 }
 
@@ -234,89 +244,113 @@ func TestThesesUseCase_WithIntimation_CRIDResolved(t *testing.T) {
 	}
 }
 
-// --- attributeThesisSource / thesisSourceLabel -------------------------------
+// --- resolveThesisSource / thesisSourceLabel ---------------------------------
 
-func TestAttributeThesisSource(t *testing.T) {
+func TestResolveThesisSource(t *testing.T) {
 	t.Parallel()
 
-	// Quotes long enough to clear minEvidenceMatchLen, each a verbatim substring of
-	// its chunk (the LLM quotes a subset of the chunk, so evidence ⊆ chunk text).
 	const quotePet = "o réu confessou a dívida em audiência de conciliação"
-	const quoteContrA = "a sociedade foi constituída por prazo indeterminado conforme cláusula"
-	const quoteContrB = "o capital social integralizado em moeda corrente nacional"
+	const quoteContr = "a sociedade foi constituída por prazo indeterminado conforme cláusula"
+	const teorSnippet = "apresente contestação no prazo de quinze dias"
+	const teor = "Fica a parte intimada a " + teorSnippet + ", sob pena de revelia."
 
 	hits := []indexing.ChunkHit{
 		{DocumentID: "doc-pet", Page: 3, Text: "Trecho: " + quotePet + " e nada pagou.", Score: 0.91, DocumentTitle: "Petição inicial", DocumentType: "PET"},
-		{DocumentID: "doc-contr", Page: 1, Text: quoteContrA + ", com " + quoteContrB + ".", Score: 0.70, DocumentTitle: "", DocumentType: "CONTRSOCIAL"},
+		{DocumentID: "doc-contr", Page: 1, Text: quoteContr + ", com capital integralizado.", Score: 0.70, DocumentTitle: "", DocumentType: "CONTRSOCIAL"},
 	}
 
 	tests := []struct {
-		name      string
-		evidence  []string
-		hits      []indexing.ChunkHit
-		wantDocID string
-		wantPage  int
-		wantLabel string
+		name          string
+		sourceRef     int
+		evidence      []string
+		hits          []indexing.ChunkHit
+		wantDocID     string
+		wantPage      int
+		wantLabel     string
+		wantGrounded  bool
+		wantExcerpt   string // "" means assert empty
+		excerptNonNil bool   // when true, just assert non-empty
 	}{
 		{
-			name:      "evidence matches a chunk verbatim → attributed to that document",
-			evidence:  []string{quotePet},
-			hits:      hits,
-			wantDocID: "doc-pet",
-			wantPage:  3,
-			wantLabel: "Petição inicial · pág. 3",
+			name:         "ref cites chunk and evidence casa → grounded, attributed",
+			sourceRef:    1,
+			evidence:     []string{quotePet},
+			hits:         hits,
+			wantDocID:    "doc-pet",
+			wantPage:     3,
+			wantLabel:    "Petição inicial · pág. 3",
+			wantGrounded: true,
+			wantExcerpt:  quotePet,
 		},
 		{
-			name:      "document cited by MORE evidence wins the tie-break by count",
-			evidence:  []string{quoteContrA, quoteContrB, quotePet},
-			hits:      hits,
-			wantDocID: "doc-contr",
-			wantPage:  1,
-			wantLabel: "CONTRSOCIAL · pág. 1", // no title → falls back to type
+			name:         "ref cites chunk 2 (type-fallback label), diacritic-robust match",
+			sourceRef:    2,
+			evidence:     []string{"a SOCIEDADE foi constituida por prazo indeterminado conforme clausula"},
+			hits:         hits,
+			wantDocID:    "doc-contr",
+			wantPage:     1,
+			wantLabel:     "CONTRSOCIAL · pág. 1",
+			wantGrounded:  true,
+			excerptNonNil: true,
 		},
 		{
-			name:      "evidence too short to match → no attribution",
-			evidence:  []string{"art. 5º"},
-			hits:      hits,
-			wantDocID: "",
+			name:          "ref given but NO evidence casa no trecho citado → source kept, grounded=false",
+			sourceRef:     1,
+			evidence:      []string{"trecho que não aparece no chunk citado de forma alguma"},
+			hits:          hits,
+			wantDocID:     "doc-pet",
+			wantPage:      3,
+			wantLabel:     "Petição inicial · pág. 3",
+			wantGrounded:  false,
+			excerptNonNil: true, // keeps the 1st evidence as excerpt
 		},
 		{
-			name:      "evidence not present in any chunk (teor-only) → no attribution",
-			evidence:  []string{"tese puramente doutrinária sem lastro no corpus recuperado"},
-			hits:      hits,
-			wantDocID: "",
+			name:         "ref==0 and evidence casa no teor → grounded, no doc",
+			sourceRef:    0,
+			evidence:     []string{teorSnippet},
+			hits:         hits,
+			wantDocID:    "",
+			wantGrounded: true,
 		},
 		{
-			name:      "no hits at all → no attribution",
-			evidence:  []string{quotePet},
-			hits:      nil,
-			wantDocID: "",
+			name:         "ref out of range and evidence casa nowhere → hallucinated: grounded=false, excerpt cleared",
+			sourceRef:    99,
+			evidence:     []string{"evidência puramente inventada sem lastro"},
+			hits:         hits,
+			wantDocID:    "",
+			wantGrounded: false,
+			wantExcerpt:  "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			th := &Thesis{Label: "t", Evidence: tt.evidence}
-			attributeThesisSource(th, tt.hits)
+			th := &Thesis{Label: "t", Evidence: tt.evidence, SourceRef: tt.sourceRef}
+			resolveThesisSource(th, tt.hits, teor)
 
 			if th.SourceDocumentID != tt.wantDocID {
 				t.Fatalf("SourceDocumentID = %q, want %q", th.SourceDocumentID, tt.wantDocID)
 			}
-			if tt.wantDocID == "" {
-				if th.SourceLabel != "" || th.SourceExcerpt != "" || th.SourcePage != 0 {
-					t.Errorf("expected empty source, got label=%q excerpt=%q page=%d", th.SourceLabel, th.SourceExcerpt, th.SourcePage)
+			if th.Grounded != tt.wantGrounded {
+				t.Errorf("Grounded = %v, want %v", th.Grounded, tt.wantGrounded)
+			}
+			if tt.wantDocID != "" {
+				if th.SourcePage != tt.wantPage {
+					t.Errorf("SourcePage = %d, want %d", th.SourcePage, tt.wantPage)
 				}
-				return
+				if tt.wantLabel != "" && th.SourceLabel != tt.wantLabel {
+					t.Errorf("SourceLabel = %q, want %q", th.SourceLabel, tt.wantLabel)
+				}
 			}
-			if th.SourcePage != tt.wantPage {
-				t.Errorf("SourcePage = %d, want %d", th.SourcePage, tt.wantPage)
-			}
-			if th.SourceLabel != tt.wantLabel {
-				t.Errorf("SourceLabel = %q, want %q", th.SourceLabel, tt.wantLabel)
-			}
-			if th.SourceExcerpt == "" {
-				t.Error("SourceExcerpt should carry the matched evidence, got empty")
+			if tt.excerptNonNil {
+				if th.SourceExcerpt == "" {
+					t.Error("SourceExcerpt should be non-empty")
+				}
+			} else if tt.wantExcerpt != "" && th.SourceExcerpt != tt.wantExcerpt {
+				t.Errorf("SourceExcerpt = %q, want %q", th.SourceExcerpt, tt.wantExcerpt)
+			} else if tt.wantExcerpt == "" && !tt.excerptNonNil && th.SourceExcerpt != "" {
+				t.Errorf("SourceExcerpt = %q, want empty", th.SourceExcerpt)
 			}
 		})
 	}

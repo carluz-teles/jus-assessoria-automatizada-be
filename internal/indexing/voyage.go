@@ -16,8 +16,8 @@ import (
 // on it directly and tests inject a fake — the real API is NEVER called under test.
 
 // voyageEndpoint is the Voyage embeddings API. output_dimension pins the vector width to the
-// milestone's 1024 (voyage-3.5-lite's native dim), input_type "document" tells Voyage these are
-// corpus documents (the retrieval query would use "query").
+// milestone's 1024 (voyage-3.5-lite's native dim). The input_type is now per-call (InputType arg
+// on Embed): the indexing side passes InputDocument, the RAG query side InputQuery.
 const voyageEndpoint = "https://api.voyageai.com/v1/embeddings"
 
 // VoyageEmbedder embeds texts via the Voyage API. It holds the API key, the model id and the
@@ -76,16 +76,21 @@ type voyageResponse struct {
 // (for chunk.embedding_model provenance) and an error. An empty input is a no-op (no HTTP call).
 // A non-2xx or a body-read/decode fault is an infra error (retryable — a transient Voyage/network
 // blip); the pipeline's isTerminal keeps these on the retry path.
-func (e *VoyageEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, string, error) {
+func (e *VoyageEmbedder) Embed(ctx context.Context, texts []string, inputType InputType) ([][]float32, string, error) {
 	if len(texts) == 0 {
 		return nil, e.model, nil
+	}
+	if inputType == "" {
+		// Defensive default: an unset input type is treated as the corpus side, matching the
+		// pre-asymmetry behaviour so a missed call site never silently mis-embeds a document batch.
+		inputType = InputDocument
 	}
 
 	body, err := json.Marshal(voyageRequest{
 		Input:           texts,
 		Model:           e.model,
 		OutputDimension: e.dim,
-		InputType:       "document",
+		InputType:       string(inputType),
 	})
 	if err != nil {
 		return nil, "", apperr.NewInfra("voyage: marshal request", err)

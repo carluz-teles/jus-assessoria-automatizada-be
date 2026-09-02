@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jusassessoria/platform/lib/apperr"
+	"github.com/jusassessoria/platform/lib/eproc"
 	"github.com/jusassessoria/platform/lib/httpx"
 	"github.com/jusassessoria/platform/lib/pubsub"
 )
@@ -72,6 +73,18 @@ type thesisSuggester interface {
 	SuggestTheses(ctx context.Context, cmd SuggestThesesCommand) (*SuggestThesesResult, error)
 }
 
+// draftThesesStore is the narrow port for the PERSISTED thesis endpoints (Sugerir
+// Teses persistido, C1): GET (list persisted), POST (regenerate+persist), PATCH
+// (update selection state). Composed independently; requires AI config for POST.
+type draftThesesStore interface {
+	GenerateDraftTheses(ctx context.Context, tenantID, draftID string) ([]SuggestedThesis, error)
+	ListDraftTheses(ctx context.Context, tenantID, draftID string) ([]SuggestedThesis, error)
+	UpdateThesisState(ctx context.Context, tenantID, thesisID, state string) (*SuggestedThesis, error)
+	// Fluxo da partida (C2): teses persistidas intimation-scoped.
+	GenerateIntimationTheses(ctx context.Context, tenantID, intimationID string) ([]SuggestedThesis, error)
+	ListIntimationTheses(ctx context.Context, tenantID, intimationID string) ([]SuggestedThesis, error)
+}
+
 // iterator is the narrow port for POST /v1/pecas/:id/iterate (Peça v2). Composed
 // independently — it is stateless (no writer; the FE applies changes via PATCH).
 type iterator interface {
@@ -97,6 +110,7 @@ type Handler struct {
 	chat         chatter          // nil when the chat use case is not wired
 	review       reviewer         // nil when the review use case is not wired
 	theses       thesisSuggester  // nil when the theses use case is not wired (no AI key)
+	thesesStore  draftThesesStore // nil when the persisted-theses use case is not wired
 	lister       lister           // nil when the list use case is not wired
 	export       presigner        // nil when the export use case is not wired
 	iter         iterator         // nil when the iterate use case is not wired
@@ -156,6 +170,14 @@ func (h *Handler) WithReviewer(rev reviewer) *Handler {
 // cmd/api composition when the theses use case is available (requires AI config).
 func (h *Handler) WithTheses(t thesisSuggester) *Handler {
 	h.theses = t
+	return h
+}
+
+// WithThesesStore attaches the persisted-theses use case (Sugerir Teses persistido,
+// C1) to the handler. Called by cmd/api composition when the theses use case is
+// available (requires AI config for the POST/regenerate path).
+func (h *Handler) WithThesesStore(s draftThesesStore) *Handler {
+	h.thesesStore = s
 	return h
 }
 
@@ -233,11 +255,21 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	// AI review trigger (Fatia 3 — Revisar síncrono).
 	r.Post("/pecas/:id/review", h.reviewPeca)
 
-	// AI thesis suggestion (Fatia 5 — Sugerir Teses síncrono).
+	// AI thesis suggestion (Sugerir Teses persistido, C1). GET lê as teses
+	// persistidas; POST regenera (delete+gera+persiste) e devolve as persistidas;
+	// PATCH atualiza o estado de seleção de uma tese. A rota GET migrou pra cá do
+	// slice `thesis` (era listThesesByDraft, desacoplado/vazio) — agora serve a
+	// lista real do draft.
+	r.Get("/pecas/:id/theses", h.listPecaTheses)
 	r.Post("/pecas/:id/theses", h.thesesPeca)
-	// Variante pre-criação: sugere teses direto da intimação, sem draft ainda
-	// (tela /pecas/nova no FE — evita criar draft zumbi a cada clique).
-	r.Post("/theses", h.thesesFromIntimation)
+	r.Patch("/pecas/:id/theses/:thesisId", h.patchThesisState)
+	// Fluxo da PARTIDA (C2): teses PERSISTIDAS ligadas à intimação, antes do draft
+	// existir (tela /pecas/nova — evita criar draft zumbi a cada clique). GET lê as
+	// persistidas; POST regenera (delete+gera+persiste). Na promoção partida→
+	// construção (createDraft) as teses + a seleção são copiadas pro draft. Substitui
+	// a antiga POST /v1/theses stateless (removida — nada mais a consome).
+	r.Get("/intimacoes/:id/theses", h.listIntimationTheses)
+	r.Post("/intimacoes/:id/theses", h.thesesFromIntimation)
 
 	// Iteração + assumir autoria (Peça v2).
 	r.Post("/pecas/:id/iterate", h.iteratePeca)
@@ -284,6 +316,7 @@ func (h *Handler) createPeca(c *fiber.Ctx) error {
 		PieceType:    req.PieceType,
 		Title:        req.Title,
 		TaskID:       req.TaskID,
+		ThesisIDs:    req.ThesisIDs,
 	})
 	if err != nil {
 		return httpx.WriteError(c, err)
@@ -483,6 +516,10 @@ type detailResponse struct {
 	Attachments []attachmentResponse `json:"attachments"`
 	Providences []Providence         `json:"providences"`
 	Parties     []partyResponse      `json:"parties"`
+	// ProcessDocuments são os autos do processo (documentos fetchados do
+	// court_record) listados na seção "Fundada em" do editor. Sempre array
+	// (nunca null → []).
+	ProcessDocuments []processDocumentResponse `json:"process_documents"`
 
 	// Workflow steps (Fatia 2a — 0060). Cada timestamp é um fato datado; o FE
 	// deriva o step atual (Construção/Assinatura/Protocolo/Concluído). Todos
@@ -564,8 +601,14 @@ type deadlineResponse struct {
 // (PLAINTIFF | DEFENDANT | THIRD_PARTY) — the FE maps to autor/reu/procurador.
 // counsels is always an array (empty when the party has no advogado registered).
 type partyResponse struct {
-	Role     string            `json:"role"`
-	Name     string            `json:"name"`
+	Role string `json:"role"`
+	Name string `json:"name"`
+	// IsClient is TRUE when this party is the one the escritório represents — an
+	// advogado of it carries an OAB the tenant watches. Always present so the FE
+	// picks THE client by this flag instead of guessing by role (which marks
+	// every DEFENDANT a client when there are 2+ réus). FALSE for all parties
+	// when the tenant watches no OAB (FE keeps its role-based fallback then).
+	IsClient bool              `json:"is_client"`
 	Counsels []counselResponse `json:"counsels"`
 }
 
@@ -645,6 +688,11 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 	// Parties: always an array (empty when the draft has no process, or the
 	// case genuinely has no party materialized). Peça v2 FE renders bloco PARTES.
 	resp.Parties = partiesToResponse(v.Parties)
+
+	// ProcessDocuments: autos do processo (court_record) — sempre array (empty
+	// quando o draft não tem process ou o processo não tem autos). FE renderiza
+	// na seção "Fundada em" do editor.
+	resp.ProcessDocuments = processDocumentsToResponse(v.ProcessDocuments)
 
 	// Review: nil when no generation has run yet, otherwise the latest review.
 	if v.Review != nil {
@@ -764,83 +812,106 @@ func (h *Handler) reviewPeca(c *fiber.Ctx) error {
 
 // ─── POST /v1/pecas/:id/theses ────────────────────────────────────────────────
 
-// thesesPeca handles POST /v1/pecas/:id/theses (Sugerir Teses síncrono, Fatia 5).
-// Guards thesisSuggester nil, tenant, and draftID. Body is intentionally empty (no
-// input needed — same shape as /review). STATELESS: no saga_state is ever touched,
-// even on LLM failure. Returns 200 {data:{theses:[...]}}.
+// listPecaTheses handles GET /v1/pecas/:id/theses — the PERSISTED theses of a draft
+// (C1). Returns 200 {data:[...]} (empty [] when none generated yet — the FE then
+// POSTs to generate). This route migrated from the `thesis` slice (which returned a
+// decoupled, always-empty list); it now serves the real draft-scoped rows.
+func (h *Handler) listPecaTheses(c *fiber.Ctx) error {
+	if h.thesesStore == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	draftID := c.Params("id")
+	list, err := h.thesesStore.ListDraftTheses(c.UserContext(), tenantID, draftID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": suggestedThesesToResponse(list)})
+}
+
+// thesesPeca handles POST /v1/pecas/:id/theses (Sugerir Teses persistido, C1). It
+// ALWAYS regenerates: delete + gera (RAG+LLM) + persiste, returning the persisted
+// list. The FE only POSTs on the first visit (GET came back empty) or on an explicit
+// "Regenerar" — on revisits it GETs the persisted rows and does NOT regenerate.
+// Guards thesesStore nil, tenant, and draftID. Returns 200 {data:[...]}.
 func (h *Handler) thesesPeca(c *fiber.Ctx) error {
-	if h.theses == nil {
+	if h.thesesStore == nil {
 		return httpx.WriteError(c, ErrIANotConfigured)
 	}
 
 	tenantID := httpx.TenantFromCtx(c)
 	draftID := c.Params("id")
 
-	result, err := h.theses.SuggestTheses(c.UserContext(), SuggestThesesCommand{
-		TenantID: tenantID,
-		DraftID:  draftID,
-	})
+	list, err := h.thesesStore.GenerateDraftTheses(c.UserContext(), tenantID, draftID)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	return c.JSON(fiber.Map{
-		"data": fiber.Map{
-			"theses": thesesToResponse(result.Theses),
-		},
-	})
+	return c.JSON(fiber.Map{"data": suggestedThesesToResponse(list)})
 }
 
-// ─── POST /v1/theses ──────────────────────────────────────────────────────────
-
-// thesesFromIntimationRequest is the body of POST /v1/theses. piece_type é
-// obrigatório porque o use case usa como parte do query text da RAG e como
-// PieceType no DraftContext do prompt.
-//
-// ModelOverride é debug-only: se != "", ignora o cfg.OpenRouterModel e usa
-// esse slug pra esta chamada. Serve pra bateria de A/B de modelos direto do
-// FE sem re-deploy (ex: `{"model":"google/gemini-2.5-flash"}`). Remover
-// depois que o modelo default for escolhido em prod.
-type thesesFromIntimationRequest struct {
-	IntimationID  string `json:"intimation_id"`
-	PieceType     string `json:"piece_type"`
-	ModelOverride string `json:"model,omitempty"`
+// patchThesisStateRequest is the body of PATCH /v1/pecas/:id/theses/:thesisId.
+type patchThesisStateRequest struct {
+	State string `json:"state"`
 }
 
-// thesesFromIntimation handles POST /v1/theses — variante sem draft do fluxo de
-// Sugerir Teses. Usado pela tela /pecas/nova, que difere a criação do draft
-// até o commit (Gerar/Manual). Guarda thesisSuggester nil + campos obrigatórios.
-// Retorna 200 {data:{theses:[...]}}.
-func (h *Handler) thesesFromIntimation(c *fiber.Ctx) error {
-	if h.theses == nil {
+// patchThesisState handles PATCH /v1/pecas/:id/theses/:thesisId — updates one
+// persisted thesis's selection state (C1). Body {state}. Validates the enum (400 on
+// invalid), 404 on unknown id. Returns 200 {data:{...tese...}}.
+func (h *Handler) patchThesisState(c *fiber.Ctx) error {
+	if h.thesesStore == nil {
 		return httpx.WriteError(c, ErrIANotConfigured)
 	}
 	tenantID := httpx.TenantFromCtx(c)
+	thesisID := c.Params("thesisId")
 
-	var req thesesFromIntimationRequest
+	var req patchThesisStateRequest
 	if err := c.BodyParser(&req); err != nil {
 		return httpx.WriteError(c, apperr.NewInvalid("corpo inválido"))
 	}
-	if req.IntimationID == "" {
-		return httpx.WriteError(c, apperr.NewInvalid("intimation_id é obrigatório"))
-	}
-	if req.PieceType == "" {
-		return httpx.WriteError(c, apperr.NewInvalid("piece_type é obrigatório"))
-	}
-
-	result, err := h.theses.SuggestTheses(c.UserContext(), SuggestThesesCommand{
-		TenantID:      tenantID,
-		IntimationID:  req.IntimationID,
-		PieceType:     req.PieceType,
-		ModelOverride: req.ModelOverride,
-	})
+	row, err := h.thesesStore.UpdateThesisState(c.UserContext(), tenantID, thesisID, req.State)
 	if err != nil {
 		return httpx.WriteError(c, err)
 	}
-	return c.JSON(fiber.Map{
-		"data": fiber.Map{
-			"theses": thesesToResponse(result.Theses),
-		},
-	})
+	return c.JSON(fiber.Map{"data": suggestedThesisToResponse(*row)})
+}
+
+// ─── GET/POST /v1/intimacoes/:id/theses (partida, C2) ─────────────────────────
+
+// listIntimationTheses handles GET /v1/intimacoes/:id/theses — the PERSISTED theses
+// of an intimation (fluxo da partida, antes do draft existir). Same shape as the
+// draft-scoped list ({data:[...]}). The FE POSTs on the first visit (GET vazio) and
+// GETs on revisits.
+func (h *Handler) listIntimationTheses(c *fiber.Ctx) error {
+	if h.thesesStore == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	intimationID := c.Params("id")
+
+	list, err := h.thesesStore.ListIntimationTheses(c.UserContext(), tenantID, intimationID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": suggestedThesesToResponse(list)})
+}
+
+// thesesFromIntimation handles POST /v1/intimacoes/:id/theses — regenera (delete+
+// gera+persiste) as teses da partida e devolve as persistidas. Usado pela tela
+// /pecas/nova, que difere a criação do draft até o commit (Gerar/Manual); na
+// promoção (createDraft) as teses + a seleção migram pro draft. Guarda thesesStore
+// nil. Retorna 200 {data:[...]} — MESMO shape do draft (id/state/position).
+func (h *Handler) thesesFromIntimation(c *fiber.Ctx) error {
+	if h.thesesStore == nil {
+		return httpx.WriteError(c, ErrIANotConfigured)
+	}
+	tenantID := httpx.TenantFromCtx(c)
+	intimationID := c.Params("id")
+
+	list, err := h.thesesStore.GenerateIntimationTheses(c.UserContext(), tenantID, intimationID)
+	if err != nil {
+		return httpx.WriteError(c, err)
+	}
+	return c.JSON(fiber.Map{"data": suggestedThesesToResponse(list)})
 }
 
 // thesisResponse is one item in the /theses response. The source_* fields attribute
@@ -853,6 +924,7 @@ type thesisResponse struct {
 	Reference        string   `json:"reference"`
 	Foundation       string   `json:"foundation"`
 	Evidence         []string `json:"evidence"`
+	Grounded         bool     `json:"grounded"`
 	SourceDocumentID string   `json:"source_document_id,omitempty"`
 	SourceLabel      string   `json:"source_label,omitempty"`
 	SourceExcerpt    string   `json:"source_excerpt,omitempty"`
@@ -872,11 +944,62 @@ func thesesToResponse(theses []Thesis) []thesisResponse {
 			Reference:        t.Reference,
 			Foundation:       t.Foundation,
 			Evidence:         ev,
+			Grounded:         t.Grounded,
 			SourceDocumentID: t.SourceDocumentID,
 			SourceLabel:      t.SourceLabel,
 			SourceExcerpt:    t.SourceExcerpt,
 			SourcePage:       t.SourcePage,
 		})
+	}
+	return out
+}
+
+// suggestedThesisResponse is one item in the PERSISTED theses response (C1). It
+// extends thesisResponse with id/state/position — the fields the FE (mapThesisFromApi,
+// pecas-v2) needs to select and keep a thesis across revisits. snake_case matches
+// the FE's ThesisAPI.
+type suggestedThesisResponse struct {
+	ID               string   `json:"id"`
+	State            string   `json:"state"`
+	Position         int      `json:"position"`
+	Label            string   `json:"label"`
+	Confidence       string   `json:"confidence"`
+	Reference        string   `json:"reference"`
+	Foundation       string   `json:"foundation"`
+	Evidence         []string `json:"evidence"`
+	Grounded         bool     `json:"grounded"`
+	SourceDocumentID string   `json:"source_document_id,omitempty"`
+	SourceLabel      string   `json:"source_label,omitempty"`
+	SourceExcerpt    string   `json:"source_excerpt,omitempty"`
+	SourcePage       int      `json:"source_page,omitempty"`
+}
+
+func suggestedThesisToResponse(t SuggestedThesis) suggestedThesisResponse {
+	ev := t.Evidence
+	if ev == nil {
+		ev = []string{} // wire: nunca null (JSON contract)
+	}
+	return suggestedThesisResponse{
+		ID:               t.ID,
+		State:            t.State,
+		Position:         t.Position,
+		Label:            t.Label,
+		Confidence:       t.Confidence,
+		Reference:        t.Reference,
+		Foundation:       t.Foundation,
+		Evidence:         ev,
+		Grounded:         t.Grounded,
+		SourceDocumentID: t.SourceDocumentID,
+		SourceLabel:      t.SourceLabel,
+		SourceExcerpt:    t.SourceExcerpt,
+		SourcePage:       t.SourcePage,
+	}
+}
+
+func suggestedThesesToResponse(list []SuggestedThesis) []suggestedThesisResponse {
+	out := make([]suggestedThesisResponse, 0, len(list))
+	for _, t := range list {
+		out = append(out, suggestedThesisToResponse(t))
 	}
 	return out
 }
@@ -1011,6 +1134,55 @@ type attachmentResponse struct {
 	CreatedAt  string `json:"created_at"`
 }
 
+// processDocumentResponse é um auto do processo (document do court_record) na
+// seção "Fundada em" do editor em GET /v1/pecas/:id.
+type processDocumentResponse struct {
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	DocumentType string `json:"document_type"`
+	// TypeLabel is the ENRICHED friendly label for document_type (via the eproc code
+	// table, HumanizeCode fallback) so the FE renders the type chip without mapping raw
+	// codes itself. EventDate is the eproc event date (RFC3339), "" when unknown.
+	TypeLabel string `json:"type_label"`
+	Pages     int    `json:"pages"`
+	Status    string `json:"status"`
+	EventDate string `json:"event_date"`
+}
+
+func processDocumentsToResponse(docs []ProcessDocument) []processDocumentResponse {
+	out := make([]processDocumentResponse, 0, len(docs))
+	for i := range docs {
+		eventDate := ""
+		if !docs[i].EventDate.IsZero() {
+			eventDate = docs[i].EventDate.Format(time.RFC3339)
+		}
+		out = append(out, processDocumentResponse{
+			ID:           docs[i].ID,
+			Label:        docs[i].Label,
+			DocumentType: docs[i].DocumentType,
+			TypeLabel:    typeLabelFromCode(docs[i].DocumentType),
+			Pages:        docs[i].Pages,
+			Status:       docs[i].Status,
+			EventDate:    eventDate,
+		})
+	}
+	return out
+}
+
+// typeLabelFromCode resolves an eproc document_type code into its enriched friendly
+// label (the code table first, a humanized form of the raw code as fallback), so the
+// FE shows "Certidão"/"Planilha de cálculo" on the type chip without knowing any code.
+// Empty code yields "".
+func typeLabelFromCode(code string) string {
+	if code == "" {
+		return ""
+	}
+	if label := eproc.DocumentTypeLabel(code); label != "" {
+		return label
+	}
+	return eproc.HumanizeCode(code)
+}
+
 func attachmentToResponse(a *Attachment) attachmentResponse {
 	return attachmentResponse{
 		ID:         a.ID,
@@ -1038,6 +1210,7 @@ func partiesToResponse(parties []PartyInfo) []partyResponse {
 		out = append(out, partyResponse{
 			Role:     parties[i].Role,
 			Name:     parties[i].Name,
+			IsClient: parties[i].IsClient,
 			Counsels: counsels,
 		})
 	}

@@ -163,7 +163,7 @@ func (uc *UseCase) index(ctx context.Context, ev DocumentExtracted) error {
 	for i, c := range chunks {
 		texts[i] = c.Text
 	}
-	vectors, model, err := uc.embed.Embed(ctx, texts)
+	vectors, model, err := uc.embed.Embed(ctx, texts, InputDocument)
 	if err != nil {
 		return err
 	}

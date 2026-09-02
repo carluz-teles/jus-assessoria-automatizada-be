@@ -20,9 +20,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/jusassessoria/platform/internal/advisory"
 	"github.com/jusassessoria/platform/internal/indexing"
@@ -64,12 +70,16 @@ type SuggestThesesResult struct {
 // array de trechos LITERAIS do teor/chunks que sustentam a tese — força o
 // modelo a justificar a confidence com prova concreta em vez de rotular por
 // impressão. Pode vir vazio pra teses puramente doutrinárias, mas o prompt
-// obriga confidence=baixa nesse caso.
+// obriga confidence=baixa nesse caso. source_ref é o NÚMERO do trecho (1..N da
+// lista "Trechos relevantes dos autos") de onde a evidence foi copiada — o
+// modelo CITA a fonte em vez de re-casarmos por substring depois; 0 = tese
+// funda-se só no teor ou em doutrina. maxItems=8 capa a lista.
 var thesesSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
     "theses": {
       "type": "array",
+      "maxItems": 8,
       "items": {
         "type": "object",
         "properties": {
@@ -77,9 +87,10 @@ var thesesSchema = json.RawMessage(`{
           "confidence": { "type": "string", "enum": ["alta", "media", "baixa"] },
           "reference":  { "type": "string" },
           "foundation": { "type": "string" },
-          "evidence":   { "type": "array", "items": { "type": "string" } }
+          "evidence":   { "type": "array", "items": { "type": "string" } },
+          "source_ref": { "type": "integer" }
         },
-        "required": ["label", "confidence", "reference", "foundation", "evidence"],
+        "required": ["label", "confidence", "reference", "foundation", "evidence", "source_ref"],
         "additionalProperties": false
       }
     }
@@ -269,7 +280,13 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 	// quando o corpus está indexado. Em dev sem chunks é no-op.
 	chunks, chunkHits, grounded := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, queryText, 5)
 
-	draftCtx := buildDraftContext(d, intimation, parties, chunks)
+	// suggest_theses não usa a estrutura de seções do profile (só o mesmo case
+	// signal do draft_minuta) — passa nil profile.
+	draftCtx := buildDraftContext(d, intimation, parties, chunks, nil, nil)
+	// teorText is the SAME cleaned teor the prompt shows (buildDraftContext
+	// stripHTML's it into DraftContext.IntimationText) — reuse it verbatim so the
+	// grounding validation matches exactly what the LLM read.
+	teorText := draftCtx.IntimationText
 	composed, err := uc.composer.ComposeTheses(advisory.AgentSuggestTheses, draftCtx)
 	if err != nil {
 		return nil, fmt.Errorf("theses: compose prompt: %w", err)
@@ -285,10 +302,11 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		User:       composed.User,
 		Schema:     thesesSchema,
 		SchemaName: "suggest_theses",
-		Model:      model,
-		MaxTokens:  2048,
-		UseCase:    "draft.theses",
-		TenantID:   cmd.TenantID,
+		Model:       model,
+		MaxTokens:   2048,
+		Temperature: thesesTemperature,
+		UseCase:     "draft.theses",
+		TenantID:    cmd.TenantID,
 	})
 	llmMs := time.Since(llmStart).Milliseconds()
 	if err != nil {
@@ -320,16 +338,29 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		}
 	}
 
-	// Source attribution: tie each thesis's literal evidence back to the autos
-	// document it was retrieved from (the LLM returns only quotes, not ids), so the
-	// peça screen can show "esta tese se apoia na Petição inicial · pág. 3" instead
-	// of only the teor. Post-hoc match against the RAG hits — no extra LLM call.
-	attributed := 0
+	// Source attribution: the LLM CITES the chunk it quoted (source_ref), so we
+	// resolve the source by an EXACT lookup into the RAG hits (hits[source_ref-1])
+	// instead of re-matching by substring. resolveThesisSource also computes
+	// Grounded: it verifies the literal evidence really is a substring of the
+	// cited chunk (or of the teor when source_ref==0), killing false-grounded /
+	// hallucinated evidence. No extra LLM call.
+	attributed, groundedCount := 0, 0
 	for i := range theses {
-		attributeThesisSource(&theses[i], chunkHits)
+		resolveThesisSource(&theses[i], chunkHits, teorText)
 		if theses[i].SourceDocumentID != "" {
 			attributed++
 		}
+		if theses[i].Grounded {
+			groundedCount++
+		}
+	}
+
+	// Determinism: sort by confidence (alta>media>baixa) desc, then grounded-first,
+	// stable on the original order; then cap at 8 (schema maxItems already asks the
+	// model, but we enforce it defensively).
+	sortTheses(theses)
+	if len(theses) > maxTheses {
+		theses = theses[:maxTheses]
 	}
 
 	slog.InfoContext(ctx, "draft theses suggestion completed",
@@ -339,84 +370,106 @@ func (uc *ThesesUseCase) SuggestTheses(ctx context.Context, cmd SuggestThesesCom
 		slog.Int("theses", len(theses)),
 		slog.Int("alta_downgraded", downgraded),
 		slog.Int("source_attributed", attributed),
+		slog.Int("grounded_theses", groundedCount),
 		slog.Bool("grounded", grounded),
 	)
 	return &SuggestThesesResult{Theses: theses}, nil
 }
 
-// minEvidenceMatchLen guards against a too-short evidence excerpt (e.g. "art. 5º")
-// spuriously matching many chunks — only excerpts of real substance attribute a
-// source. 24 normalized chars ≈ a short sentence fragment.
-const minEvidenceMatchLen = 24
+// thesesTemperature is the low sampling temperature for the thesis-suggestion
+// call: teses são um julgamento jurídico que queremos estável e reprodutível,
+// não criativo — variância alta só produz teses que oscilam entre execuções.
+const thesesTemperature = 0.2
 
-// attributeThesisSource ties a thesis to the autos document its literal Evidence was
-// retrieved from: it substring-matches each evidence against the RAG chunk hits
-// (normalized: lowercased, whitespace-collapsed — the LLM quotes verbatim FROM the
-// chunk, so a real quote is a substring of it), and attributes the thesis to the
-// document cited by the MOST evidence (tiebreak: highest chunk score). Evidence that
-// matches no retrieved chunk (teor-only or doctrinal) leaves the source empty — the
-// caller/FE falls back to the teor, the pre-existing behavior. Mirrors the chat's
-// validateChatCitations philosophy: grounding only in what was actually retrieved.
-func attributeThesisSource(t *Thesis, hits []indexing.ChunkHit) {
-	if len(t.Evidence) == 0 || len(hits) == 0 {
+// maxTheses caps the suggested-thesis list (mirrors thesesSchema maxItems).
+const maxTheses = 8
+
+// resolveThesisSource resolves a thesis's source by the LLM's OWN citation
+// (SourceRef, the 1-based chunk number) instead of re-matching evidence by
+// substring — grounding is trustworthy "by construction". It also validates the
+// evidence against what the model claimed to read and sets Grounded:
+//
+//   - SourceRef in [1, len(hits)] → the thesis cites a retrieved chunk.
+//     hit = hits[SourceRef-1]; Source{DocumentID,Page,Label} come from it.
+//     SourceExcerpt = the first Evidence that is a (robust) substring of hit.Text;
+//     if none matches we keep the 1st evidence but mark Grounded=false (the ref was
+//     given yet no evidence casa no trecho citado → likely wrong/hallucinated chunk).
+//     Grounded=true ONLY when some evidence really is a substring of hit.Text.
+//   - SourceRef==0 or out of range → no document. If some evidence is a substring
+//     of teorText (the intimation teor), Grounded=true (ancorada no teor, no doc —
+//     the FE falls back to the teor). If it matches nowhere → Grounded=false AND we
+//     CLEAR SourceExcerpt (never show the advogado an invented "trecho literal").
+func resolveThesisSource(t *Thesis, hits []indexing.ChunkHit, teorText string) {
+	if t.SourceRef >= 1 && t.SourceRef <= len(hits) {
+		hit := hits[t.SourceRef-1]
+		t.SourceDocumentID = hit.DocumentID
+		t.SourcePage = hit.Page
+		t.SourceLabel = thesisSourceLabel(hit)
+
+		nhit := normalizeForMatch(hit.Text)
+		matched := ""
+		for _, ev := range t.Evidence {
+			if nev := normalizeForMatch(ev); nev != "" && strings.Contains(nhit, nev) {
+				matched = ev
+				break
+			}
+		}
+		if matched != "" {
+			t.SourceExcerpt = matched
+			t.Grounded = true
+			return
+		}
+		// Ref given but no evidence casa no trecho citado: trust the ref (keep the
+		// source) but flag it as not verified. Show the 1st evidence as excerpt.
+		if len(t.Evidence) > 0 {
+			t.SourceExcerpt = t.Evidence[0]
+		}
+		t.Grounded = false
 		return
 	}
 
-	type docAgg struct {
-		count     int
-		bestScore float64
-		hit       indexing.ChunkHit
-		excerpt   string
-	}
-	byDoc := map[string]*docAgg{}
-
+	// No document cited (0 or out of range): try to ground in the teor.
+	nteor := normalizeForMatch(teorText)
 	for _, ev := range t.Evidence {
-		nev := normalizeForMatch(ev)
-		if len(nev) < minEvidenceMatchLen {
-			continue
-		}
-		// Best hit for THIS evidence: a chunk whose text contains the quote, highest score.
-		var best *indexing.ChunkHit
-		for i := range hits {
-			if hits[i].DocumentID == "" {
-				continue
-			}
-			if !strings.Contains(normalizeForMatch(hits[i].Text), nev) {
-				continue
-			}
-			if best == nil || hits[i].Score > best.Score {
-				best = &hits[i]
-			}
-		}
-		if best == nil {
-			continue
-		}
-		a := byDoc[best.DocumentID]
-		if a == nil {
-			a = &docAgg{}
-			byDoc[best.DocumentID] = a
-		}
-		a.count++
-		if best.Score >= a.bestScore {
-			a.bestScore = best.Score
-			a.hit = *best
-			a.excerpt = ev
+		if nev := normalizeForMatch(ev); nteor != "" && nev != "" && strings.Contains(nteor, nev) {
+			t.Grounded = true // ancorada no teor; no SourceDocumentID (FE cai no teor)
+			return
 		}
 	}
+	// Matched nothing anywhere → evidence provavelmente alucinada.
+	t.Grounded = false
+	t.SourceExcerpt = ""
+}
 
-	var win *docAgg
-	for _, a := range byDoc {
-		if win == nil || a.count > win.count || (a.count == win.count && a.bestScore > win.bestScore) {
-			win = a
+// confidenceRank orders the closed confidence set for the deterministic sort
+// (alta first). Unknown/empty ranks last.
+func confidenceRank(c string) int {
+	switch c {
+	case ThesisConfidenceAlta:
+		return 0
+	case ThesisConfidenceMedia:
+		return 1
+	case ThesisConfidenceBaixa:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// sortTheses orders the theses deterministically: confidence (alta>media>baixa)
+// descending, then Grounded=true before false, keeping the original order stable
+// among equals (so the same input always yields the same wire order).
+func sortTheses(theses []Thesis) {
+	sort.SliceStable(theses, func(i, j int) bool {
+		ri, rj := confidenceRank(theses[i].Confidence), confidenceRank(theses[j].Confidence)
+		if ri != rj {
+			return ri < rj
 		}
-	}
-	if win == nil {
-		return
-	}
-	t.SourceDocumentID = win.hit.DocumentID
-	t.SourcePage = win.hit.Page
-	t.SourceExcerpt = win.excerpt
-	t.SourceLabel = thesisSourceLabel(win.hit)
+		if theses[i].Grounded != theses[j].Grounded {
+			return theses[i].Grounded // true sorts before false
+		}
+		return false // stable on original order
+	})
 }
 
 // thesisSourceLabel renders a human "documento · pág. N" label from a chunk hit,
@@ -435,8 +488,28 @@ func thesisSourceLabel(h indexing.ChunkHit) string {
 	return name
 }
 
-// normalizeForMatch lowercases and collapses runs of whitespace so a literal quote
-// matches its source chunk despite trivial formatting differences.
+// normalizeForMatch makes the substring-validation of evidence robust to trivial
+// formatting differences between the LLM's quote and its source text: it strips
+// diacritics (NFD + drop combining marks), lowercases, drops punctuation/quotes/
+// hyphens (curly quotes “ ” ‘ ’ included, via unicode.IsPunct), and collapses runs
+// of whitespace. So "São Paulo — 'réu'" and "sao paulo reu" compare equal.
 func normalizeForMatch(s string) string {
-	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
+	// Strip diacritics: decompose, drop combining marks, recompose.
+	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+	if out, _, err := transform.String(t, s); err == nil {
+		s = out
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case unicode.IsSpace(r):
+			b.WriteRune(' ')
+		case unicode.IsPunct(r) || unicode.IsSymbol(r):
+			// drop punctuation/quotes/hyphens/symbols
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }

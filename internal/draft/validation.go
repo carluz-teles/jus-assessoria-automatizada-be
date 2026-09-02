@@ -36,6 +36,12 @@ type CreateRequest struct {
 	// intimation_id/case_id/piece_type from the task's providência instead of from
 	// Source/IntimationID/PieceType — the task-sourced flow.
 	TaskID string `json:"task_id"`
+	// ThesisIDs are the ids of the partida's suggested theses the advogado kept
+	// selected (C2). On promotion partida→construção the BE copies the intimation's
+	// theses into the new draft; the ones listed here land as ThesisStateIncluded,
+	// the rest as ThesisStateOff. Empty = copy all as off (nothing pre-selected).
+	// Only meaningful for an intimation-scoped create (source=intimation).
+	ThesisIDs []string `json:"thesis_ids"`
 }
 
 // Validate enforces the edge boundary rules via ozzo (method-based, not struct tags):

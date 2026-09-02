@@ -17,12 +17,27 @@ import (
 // consumer of the same document.extracted event.
 const consumerIndexing = "indexing"
 
-// Embedder turns texts into embedding vectors. It returns the vectors (one per input, in order),
-// the model id that produced them (stored as chunk.embedding_model), and an error. Kept behind
-// this port so the pipeline never depends on Voyage directly — tests inject a fake and the real
-// API is never called under test.
+// InputType tells the (asymmetric) embedding model which side of the retrieval it is embedding.
+// Voyage embeds queries and documents into slightly different sub-spaces: the corpus/indexing side
+// must use InputDocument, the retrieval-query side InputQuery. Sending a query as a document (the
+// old bug) measurably hurts recall. It is a named string (not a bool) so call sites read as
+// self-documenting and a future model with more modes extends without a signature churn.
+type InputType string
+
+const (
+	// InputDocument is the indexing side — corpus chunks being embedded for storage.
+	InputDocument InputType = "document"
+	// InputQuery is the retrieval side — the RAG query being embedded to search the corpus.
+	InputQuery InputType = "query"
+)
+
+// Embedder turns texts into embedding vectors. inputType selects the query vs document sub-space
+// (Voyage is asymmetric — see InputType). It returns the vectors (one per input, in order), the
+// model id that produced them (stored as chunk.embedding_model), and an error. Kept behind this
+// port so the pipeline never depends on Voyage directly — tests inject a fake and the real API is
+// never called under test.
 type Embedder interface {
-	Embed(ctx context.Context, texts []string) ([][]float32, string, error)
+	Embed(ctx context.Context, texts []string, inputType InputType) ([][]float32, string, error)
 }
 
 // objectReader reads an object's raw bytes from storage by key. The storage lib only presigns

@@ -69,6 +69,11 @@ type DraftDetailView struct {
 	// or with no linked tasks.
 	Providences []Providence
 
+	// ProcessDocuments são os autos do processo (documentos fetchados do
+	// court_record) exibidos na seção "Fundada em" do editor. Empty slice
+	// (never nil) para drafts sem process (blank drafts) ou sem documentos.
+	ProcessDocuments []ProcessDocument
+
 	// Parties is the list of parties (autor / réu / terceiro) of the peça's case
 	// with their aggregated counsels, shown in the FE sidebar (Peça v2 — bloco
 	// PARTES). Empty slice for drafts without a process (blank drafts) or when
@@ -110,6 +115,20 @@ type ProcessView struct {
 	Defendants []string
 }
 
+// ProcessDocument é um auto do processo (documento fetchado do court_record)
+// listado na seção "Fundada em" do editor.
+type ProcessDocument struct {
+	ID           string
+	Label        string
+	DocumentType string
+	Pages        int
+	Status       string
+	// EventDate is the eproc event date (court_event_date) the doc was juntado under;
+	// zero when unknown (a human UPLOAD, or a COURT doc fetched before the column existed).
+	// The FE shows it apart from Label to disambiguate same-named documents.
+	EventDate time.Time
+}
+
 // DeadlineView is the prazo context shown in the editor header bar. DaysLeft is
 // computed at query time from end_date; the handler derives it for the response.
 type DeadlineView struct {
@@ -137,6 +156,7 @@ func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 		Attachments:         []Attachment{}, // never nil — serializes as [] not null
 		Providences:         []Providence{}, // never nil
 		Parties:             []PartyInfo{},  // never nil
+		ProcessDocuments:    []ProcessDocument{}, // never nil — serializes as [] not null
 		SentToSigningAt:     pgTimestamptzPtr(r.SentToSigningAt),
 		SignedAt:            pgTimestamptzPtr(r.SignedAt),
 		FiledAt:             pgTimestamptzPtr(r.FiledAt),

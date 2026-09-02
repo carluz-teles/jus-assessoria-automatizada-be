@@ -44,6 +44,11 @@ type Request struct {
 	SchemaName string          // e.g. "suggested_tasks" — response_format.json_schema.name
 	Model      string          // optional override; "" → the adapter's default model
 	MaxTokens  int             // 0 → a sane default (defaultMaxTokens)
+	// Temperature is the sampling temperature. 0 (the zero value) omits the field
+	// from the request entirely, so the provider default is used — callers that
+	// don't set it are unaffected. Set a small value (e.g. 0.2) for tasks that
+	// want low-variance, near-deterministic output.
+	Temperature float64
 	// UseCase labels the calling slice/use case for cost attribution (e.g.
 	// "draft.generate", "acquisition.analyze_intimation"). "" is a valid answer — the
 	// call is simply not attributed to any use case in the usage record.

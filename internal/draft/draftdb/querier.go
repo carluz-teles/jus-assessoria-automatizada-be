@@ -32,6 +32,12 @@ type Querier interface {
 	// tenant via GetDraftByID(tenantID, draftID) earlier in the same tx. Do NOT "fix"
 	// this with a JOIN — the app-layer barrier is intentional (see 0044_review_status).
 	DeleteReviewsForDraft(ctx context.Context, draftID uuid.UUID) error
+	// Wipe a draft's suggested theses before a regenerate (POST always regenerates:
+	// delete + gera + persiste). Scoped by (draft_id, tenant_id).
+	DeleteSuggestedThesesByDraft(ctx context.Context, arg DeleteSuggestedThesesByDraftParams) error
+	// Wipe an intimation's suggested theses before a regenerate (POST /intimacoes/:id/theses
+	// always regenerates). Scoped by (intimation_id, tenant_id).
+	DeleteSuggestedThesesByIntimation(ctx context.Context, arg DeleteSuggestedThesesByIntimationParams) error
 	// Load the providência (action_item) context for the task-sourced Create flow
 	// (docs/erd-costura-providencia-tarefa-peca.md §3): task_id → the piece_profile_key
 	// the draft INHERITS (never re-chosen), plus intimation_id/case_id so the draft is
@@ -42,6 +48,17 @@ type Querier interface {
 	// task, foreign tenant, or a task with no linked action_item — e.g. an avulsa task)
 	// → pgx.ErrNoRows → ErrTaskNotFound (→ 404).
 	GetActionItemForTask(ctx context.Context, arg GetActionItemForTaskParams) (GetActionItemForTaskRow, error)
+	// Resolve the piece_profile_key the ANALYSIS already chose for a peça-generating
+	// providência of a given intimation (PART A, source=intimation Create). The
+	// analyze_intimation step (internal/acquisition/analise.go) materializes
+	// action_item.piece_profile_key from the intimation's analysis; the partida-created
+	// draft INHERITS that key instead of re-deriving it. Cross-slice read (action_item
+	// owned by internal/actionitem — no Go import, same pattern as GetActionItemForTask).
+	// Filtered to gera_peca rows with a non-empty key; picks the earliest such providência
+	// (created_at) deterministically when more than one exists. A miss (no peça-generating
+	// providência yet, or none with a key) → pgx.ErrNoRows → the caller falls back to
+	// defaultProfileForPieceType, never an error.
+	GetActionItemProfileKeyByIntimation(ctx context.Context, arg GetActionItemProfileKeyByIntimationParams) (*string, error)
 	// Carrega a credencial ativa (não revogada) do usuário, INCLUINDO o envelope
 	// pra o worker decifrar a senha em memória (nunca trafega em claro no Redis/DB).
 	GetActiveEsajCredential(ctx context.Context, arg GetActiveEsajCredentialParams) (GetActiveEsajCredentialRow, error)
@@ -122,10 +139,25 @@ type Querier interface {
 	// (same pattern as GetDraftDetail for court_record). counsels defaults to an
 	// empty jsonb array (never NULL) when a party has no advogado. Ordered by
 	// role then name for deterministic iteration.
+	//
+	// is_client marks the party the escritório represents: TRUE when any of its
+	// advogados carries an OAB the tenant watches (watched_oab). The join normalizes
+	// both sides to "DIGITS|UF" — party_counsel.oab may keep formatting/leading zeros
+	// while watched_oab.oab_key is stored "NUMBER|UF" — so only the significant digits
+	// and the UF are compared. enabled is NOT filtered: a currently-disabled OAB is
+	// still the office's OAB (it just stopped capturing new intimations). FALSE when
+	// the tenant watches no OAB (the FE keeps its role-based fallback in that case).
 	GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraftParams) ([]GetPartiesForDraftRow, error)
 	// Load the existing petition for a draft, scoped to tenant via JOIN. Returns
 	// pgx.ErrNoRows when no petition exists (the caller treats nil as "not filed").
 	GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDraftIDParams) (Petition, error)
+	// Load the piece_profile row + its base_skeleton slots for the generation pipeline
+	// (PART B): given a piece_profile_key, returns the profile's nome/polo/base_skeleton_key
+	// and the base_skeleton.slots jsonb (the invariant moldura order — enderecamento,
+	// preambulo, miolo, pedidos, fecho). GLOBAL catalog tables (migration 0085 — no
+	// tenant_id, docs/erd-tipos-de-peca.md §7.1). A miss (unknown key) → pgx.ErrNoRows →
+	// the caller degrades to the generic structure, never an error.
+	GetPieceProfileForGeneration(ctx context.Context, key string) (GetPieceProfileForGenerationRow, error)
 	// Read model helper (Peça v2): providences shown on the FE sidebar are the
 	// tasks linked to the draft's intimation. Tenant-scoped (barrier 1), OPEN +
 	// DONE only (DISMISSED tasks disappear from the peça sidebar — the advogado
@@ -199,6 +231,16 @@ type Querier interface {
 	// caller already tenant-guarded the draft before calling this). ON CONFLICT is absent
 	// (multiple reviews per draft are allowed; only the LATEST is exposed by the read model).
 	InsertReview(ctx context.Context, arg InsertReviewParams) (InsertReviewRow, error)
+	// suggested_thesis queries (Sugerir Teses persistido, C1). Draft-scoped. Every
+	// write runs inside the use case's transaction so RLS scopes it to the principal's
+	// tenant (barrier 2) on top of the explicit tenant_id filter (barrier 1).
+	// Persist one generated thesis. label/confidence/reference/foundation/evidence and
+	// the source_* fields mirror the in-memory Thesis produced by SuggestTheses (RAG+LLM);
+	// state/position are assigned by the persistence use case (initial state = pre-seleção
+	// do ancorado/alta confiança). C2: draft_id E intimation_id são nullable (o repo passa
+	// um preenchido e o outro NULL); o CHECK suggested_thesis_scope_chk garante EXATAMENTE
+	// UM não-nulo na borda do banco.
+	InsertSuggestedThesis(ctx context.Context, arg InsertSuggestedThesisParams) (SuggestedThesis, error)
 	// Backfills the OLD draft's superseded_by_draft_id once Create's task-sourced flow (fatia 4's
 	// populateFromTask path) mints the corrected draft (fatia 5's pointer chain: old → new). Runs
 	// in the SAME tx as InsertDraft. The CTE picks AT MOST ONE candidate (the most recently
@@ -222,6 +264,22 @@ type Querier interface {
 	ListDraftsByProcess(ctx context.Context, arg ListDraftsByProcessParams) ([]ListDraftsByProcessRow, error)
 	// Metadados públicos (sem o envelope) das credenciais ATIVAS do tenant.
 	ListEsajCredentials(ctx context.Context, tenantID uuid.UUID) ([]ListEsajCredentialsRow, error)
+	// Os autos do processo (documentos fetchados do court_record) exibidos na "Fundada
+	// em" do editor. Leitura cross-slice do court_record (mesmo padrão do ProcessView),
+	// sem importar o slice de aquisição. Só os não-deletados, ordem estável.
+	ListProcessDocuments(ctx context.Context, arg ListProcessDocumentsParams) ([]ListProcessDocumentsRow, error)
+	// Load the profile_section rows for a piece_profile_key ORDERED by `ordem` (PART B) —
+	// the MIOLO structure the generation renders (títulos reais + obrigatoriedade +
+	// aceita_teses). GLOBAL catalog table (migration 0085 — no tenant_id). Empty result
+	// (unknown key or a profile with no sections) → the caller degrades to the generic
+	// structure, never an error.
+	ListProfileSections(ctx context.Context, pieceProfileKey string) ([]ListProfileSectionsRow, error)
+	// The persisted list for GET /v1/pecas/:id/theses. Ordered deterministically by the
+	// position assigned at generation (sortTheses), created_at as tiebreaker.
+	ListSuggestedThesesByDraft(ctx context.Context, arg ListSuggestedThesesByDraftParams) ([]SuggestedThesis, error)
+	// The persisted list for GET /v1/intimacoes/:id/theses (partida). Same shape/order as
+	// the draft-scoped list; scoped by (intimation_id, tenant_id).
+	ListSuggestedThesesByIntimation(ctx context.Context, arg ListSuggestedThesesByIntimationParams) ([]SuggestedThesis, error)
 	// Marca a peça como protocolada (Fatia 2a v0 — manual). Copia filed_at
 	// opcionalmente informado pelo cliente (senão, agora). filing_number é opcional
 	// (número do protocolo no tribunal — string livre). Requer status=SIGNED.
@@ -310,6 +368,10 @@ type Querier interface {
 	// writes BOTH content + structured_content in one tx (dual write for Peça v2).
 	// Scoped to (id, tenant_id) — barrier 1; RLS is barrier 2. No-match → ErrDraftNotFound.
 	UpdateSagaState(ctx context.Context, arg UpdateSagaStateParams) (UpdateSagaStateRow, error)
+	// Flip the selection state (off|pending_add|included|pending_remove). Scoped by
+	// (id, tenant_id) — RLS + explicit filter. Zero rows (unknown id / foreign tenant)
+	// yields pgx.ErrNoRows, mapped to ErrThesisNotFound (→ 404).
+	UpdateSuggestedThesisState(ctx context.Context, arg UpdateSuggestedThesisStateParams) (SuggestedThesis, error)
 	// Best-effort lazy backfill: when GET /v1/pecas/:id parses a plain-text `content`
 	// into a StructuredContent on the fly, this UPDATE persists the parsed shape so
 	// subsequent reads skip the parser. Two cases trigger this: structured_content

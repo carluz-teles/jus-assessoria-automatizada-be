@@ -42,11 +42,13 @@ type fakeEmbedder struct {
 	err       error
 	shortBy   int // return len(texts)-shortBy vectors to model a contract violation
 	gotBatch  [][]string
+	gotInput  []InputType
 	dimension int
 }
 
-func (e *fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float32, string, error) {
+func (e *fakeEmbedder) Embed(_ context.Context, texts []string, inputType InputType) ([][]float32, string, error) {
 	e.gotBatch = append(e.gotBatch, append([]string(nil), texts...))
+	e.gotInput = append(e.gotInput, inputType)
 	if e.err != nil {
 		return nil, "", e.err
 	}
@@ -249,6 +251,14 @@ func TestOnDocumentExtracted_HappyPath(t *testing.T) {
 	// The tx was tenant-scoped.
 	if len(uow.scopes) != 1 || uow.scopes[0] != testTenant {
 		t.Errorf("scopes = %v, want [%s]", uow.scopes, testTenant)
+	}
+
+	// The indexing side embeds as documents (never as a query) — the corpus half of the
+	// asymmetric retrieval. A regression here silently degrades RAG recall.
+	for i, it := range embed.gotInput {
+		if it != InputDocument {
+			t.Errorf("embed call %d input type = %q, want %q", i, it, InputDocument)
+		}
 	}
 }
 

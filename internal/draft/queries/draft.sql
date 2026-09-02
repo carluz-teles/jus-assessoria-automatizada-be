@@ -94,6 +94,59 @@ JOIN action_item ai ON ai.id = t.action_item_id
 LEFT JOIN court_record cr ON cr.id = ai.court_record_id
 WHERE t.id = $1 AND t.tenant_id = $2;
 
+-- name: GetActionItemProfileKeyByIntimation :one
+-- Resolve the piece_profile_key the ANALYSIS already chose for a peça-generating
+-- providência of a given intimation (PART A, source=intimation Create). The
+-- analyze_intimation step (internal/acquisition/analise.go) materializes
+-- action_item.piece_profile_key from the intimation's analysis; the partida-created
+-- draft INHERITS that key instead of re-deriving it. Cross-slice read (action_item
+-- owned by internal/actionitem — no Go import, same pattern as GetActionItemForTask).
+-- Filtered to gera_peca rows with a non-empty key; picks the earliest such providência
+-- (created_at) deterministically when more than one exists. A miss (no peça-generating
+-- providência yet, or none with a key) → pgx.ErrNoRows → the caller falls back to
+-- defaultProfileForPieceType, never an error.
+SELECT piece_profile_key
+FROM action_item
+WHERE intimation_id = $1
+  AND tenant_id = $2
+  AND piece_profile_key IS NOT NULL
+ORDER BY created_at ASC
+LIMIT 1;
+
+-- name: GetPieceProfileForGeneration :one
+-- Load the piece_profile row + its base_skeleton slots for the generation pipeline
+-- (PART B): given a piece_profile_key, returns the profile's nome/polo/base_skeleton_key
+-- and the base_skeleton.slots jsonb (the invariant moldura order — enderecamento,
+-- preambulo, miolo, pedidos, fecho). GLOBAL catalog tables (migration 0085 — no
+-- tenant_id, docs/erd-tipos-de-peca.md §7.1). A miss (unknown key) → pgx.ErrNoRows →
+-- the caller degrades to the generic structure, never an error.
+SELECT
+    pp.key                AS key,
+    pp.nome               AS nome,
+    pp.polo               AS polo,
+    pp.base_skeleton_key  AS base_skeleton_key,
+    bs.slots              AS slots
+FROM piece_profile pp
+JOIN base_skeleton bs ON bs.key = pp.base_skeleton_key
+WHERE pp.key = $1;
+
+-- name: ListProfileSections :many
+-- Load the profile_section rows for a piece_profile_key ORDERED by `ordem` (PART B) —
+-- the MIOLO structure the generation renders (títulos reais + obrigatoriedade +
+-- aceita_teses). GLOBAL catalog table (migration 0085 — no tenant_id). Empty result
+-- (unknown key or a profile with no sections) → the caller degrades to the generic
+-- structure, never an error.
+SELECT
+    key,
+    titulo,
+    ordem,
+    obrigatoria,
+    origem,
+    aceita_teses
+FROM profile_section
+WHERE piece_profile_key = $1
+ORDER BY ordem ASC;
+
 -- name: GetTaskIDForActionItem :one
 -- Cross-slice read (action_item owned by internal/actionitem — no Go import, same pattern
 -- as GetActionItemForTask above): resolves the task bound to a providência so the reclassify
@@ -146,7 +199,7 @@ RETURNING d.id;
 -- OnGenerationRequested (the async worker, which reloads the draft) has them
 -- without the event payload carrying them.
 SELECT id, tenant_id, case_id, intimation_id,
-       piece_type, title, content,
+       piece_type, piece_profile_key, title, content,
        status, saga_state,
        created_at, updated_at,
        tone, instructions, selected_theses,
@@ -262,6 +315,16 @@ LEFT JOIN intimation  i  ON i.id = d.intimation_id
 LEFT JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline    dl  ON dl.notification_id = i.id
 WHERE d.id = $1 AND d.tenant_id = $2;
+
+-- name: ListProcessDocuments :many
+-- Os autos do processo (documentos fetchados do court_record) exibidos na "Fundada
+-- em" do editor. Leitura cross-slice do court_record (mesmo padrão do ProcessView),
+-- sem importar o slice de aquisição. Só os não-deletados, ordem estável.
+SELECT id, coalesce(nullif(title, ''), nullif(original_filename, ''), document_type) AS label,
+       document_type, pages, status, court_event_date
+FROM document
+WHERE court_record_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+ORDER BY created_at;
 
 -- ── draft_attachment queries (Peticionamento Fatia 2) ────────────────────────
 -- All writes run inside the use case's transaction (RLS barrier 2 + explicit
@@ -387,6 +450,14 @@ ORDER BY
 -- (same pattern as GetDraftDetail for court_record). counsels defaults to an
 -- empty jsonb array (never NULL) when a party has no advogado. Ordered by
 -- role then name for deterministic iteration.
+--
+-- is_client marks the party the escritório represents: TRUE when any of its
+-- advogados carries an OAB the tenant watches (watched_oab). The join normalizes
+-- both sides to "DIGITS|UF" — party_counsel.oab may keep formatting/leading zeros
+-- while watched_oab.oab_key is stored "NUMBER|UF" — so only the significant digits
+-- and the UF are compared. enabled is NOT filtered: a currently-disabled OAB is
+-- still the office's OAB (it just stopped capturing new intimations). FALSE when
+-- the tenant watches no OAB (the FE keeps its role-based fallback in that case).
 SELECT p.id, p.role, p.name,
        COALESCE(
          (SELECT jsonb_agg(
@@ -396,7 +467,18 @@ SELECT p.id, p.role, p.name,
           FROM party_counsel pc
           WHERE pc.party_id = p.id AND pc.tenant_id = p.tenant_id),
          '[]'::jsonb
-       )::text AS counsels
+       )::text AS counsels,
+       EXISTS (
+         SELECT 1
+         FROM party_counsel pc
+         JOIN watched_oab wo
+           ON wo.tenant_id = pc.tenant_id
+          AND regexp_replace(pc.oab, '\D', '', 'g') <> ''
+          AND regexp_replace(pc.oab, '\D', '', 'g') || '|' || upper(pc.uf)
+              = regexp_replace(split_part(wo.oab_key, '|', 1), '\D', '', 'g')
+                || '|' || upper(split_part(wo.oab_key, '|', 2))
+         WHERE pc.party_id = p.id AND pc.tenant_id = p.tenant_id
+       ) AS is_client
 FROM party p
 WHERE p.tenant_id = $1 AND p.case_id = $2
 ORDER BY p.role, p.name;

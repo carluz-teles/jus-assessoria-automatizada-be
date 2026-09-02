@@ -47,6 +47,15 @@ var (
 	// Typed not-found (→ 404), never (nil, nil).
 	ErrTaskNotFound = apperr.NewNotFound("task not found")
 
+	// ErrSuggestedThesisNotFound — a PATCH state hit an id that resolves to no
+	// suggested_thesis in the tenant (unknown id or foreign tenant). Typed
+	// not-found (→ 404), never (nil, nil). (Sugerir Teses persistido, C1.)
+	ErrSuggestedThesisNotFound = apperr.NewNotFound("suggested thesis not found")
+
+	// ErrInvalidThesisState — the PATCH body carried a state outside the closed
+	// set (off|pending_add|included|pending_remove). Typed invalid (→ 400/422).
+	ErrInvalidThesisState = apperr.NewInvalid("invalid thesis state: must be one of off, pending_add, included, pending_remove")
+
 	// ── Fatia 4 — peticionamento errors ─────────────────────────────────────
 
 	// ErrInvalidStatusForSign — POST /v1/pecas/:id/sign called when draft.status is

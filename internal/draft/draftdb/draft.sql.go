@@ -162,6 +162,38 @@ func (q *Queries) GetActionItemForTask(ctx context.Context, arg GetActionItemFor
 	return i, err
 }
 
+const getActionItemProfileKeyByIntimation = `-- name: GetActionItemProfileKeyByIntimation :one
+SELECT piece_profile_key
+FROM action_item
+WHERE intimation_id = $1
+  AND tenant_id = $2
+  AND piece_profile_key IS NOT NULL
+ORDER BY created_at ASC
+LIMIT 1
+`
+
+type GetActionItemProfileKeyByIntimationParams struct {
+	IntimationID uuid.UUID `json:"intimation_id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+}
+
+// Resolve the piece_profile_key the ANALYSIS already chose for a peça-generating
+// providência of a given intimation (PART A, source=intimation Create). The
+// analyze_intimation step (internal/acquisition/analise.go) materializes
+// action_item.piece_profile_key from the intimation's analysis; the partida-created
+// draft INHERITS that key instead of re-deriving it. Cross-slice read (action_item
+// owned by internal/actionitem — no Go import, same pattern as GetActionItemForTask).
+// Filtered to gera_peca rows with a non-empty key; picks the earliest such providência
+// (created_at) deterministically when more than one exists. A miss (no peça-generating
+// providência yet, or none with a key) → pgx.ErrNoRows → the caller falls back to
+// defaultProfileForPieceType, never an error.
+func (q *Queries) GetActionItemProfileKeyByIntimation(ctx context.Context, arg GetActionItemProfileKeyByIntimationParams) (*string, error) {
+	row := q.db.QueryRow(ctx, getActionItemProfileKeyByIntimation, arg.IntimationID, arg.TenantID)
+	var piece_profile_key *string
+	err := row.Scan(&piece_profile_key)
+	return piece_profile_key, err
+}
+
 const getActiveEsajCredential = `-- name: GetActiveEsajCredential :one
 SELECT id, tenant_id, owner_user_id, login, ciphertext, nonce, wrapped_dek, kek_ref, terms_version
 FROM esaj_credential
@@ -448,7 +480,7 @@ func (q *Queries) GetDraftAttachments(ctx context.Context, arg GetDraftAttachmen
 
 const getDraftByID = `-- name: GetDraftByID :one
 SELECT id, tenant_id, case_id, intimation_id,
-       piece_type, title, content,
+       piece_type, piece_profile_key, title, content,
        status, saga_state,
        created_at, updated_at,
        tone, instructions, selected_theses,
@@ -470,6 +502,7 @@ type GetDraftByIDRow struct {
 	CaseID              pgtype.UUID        `json:"case_id"`
 	IntimationID        pgtype.UUID        `json:"intimation_id"`
 	PieceType           string             `json:"piece_type"`
+	PieceProfileKey     *string            `json:"piece_profile_key"`
 	Title               string             `json:"title"`
 	Content             *string            `json:"content"`
 	Status              string             `json:"status"`
@@ -500,6 +533,7 @@ func (q *Queries) GetDraftByID(ctx context.Context, arg GetDraftByIDParams) (Get
 		&i.CaseID,
 		&i.IntimationID,
 		&i.PieceType,
+		&i.PieceProfileKey,
 		&i.Title,
 		&i.Content,
 		&i.Status,
@@ -1021,7 +1055,18 @@ SELECT p.id, p.role, p.name,
           FROM party_counsel pc
           WHERE pc.party_id = p.id AND pc.tenant_id = p.tenant_id),
          '[]'::jsonb
-       )::text AS counsels
+       )::text AS counsels,
+       EXISTS (
+         SELECT 1
+         FROM party_counsel pc
+         JOIN watched_oab wo
+           ON wo.tenant_id = pc.tenant_id
+          AND regexp_replace(pc.oab, '\D', '', 'g') <> ''
+          AND regexp_replace(pc.oab, '\D', '', 'g') || '|' || upper(pc.uf)
+              = regexp_replace(split_part(wo.oab_key, '|', 1), '\D', '', 'g')
+                || '|' || upper(split_part(wo.oab_key, '|', 2))
+         WHERE pc.party_id = p.id AND pc.tenant_id = p.tenant_id
+       ) AS is_client
 FROM party p
 WHERE p.tenant_id = $1 AND p.case_id = $2
 ORDER BY p.role, p.name
@@ -1037,6 +1082,7 @@ type GetPartiesForDraftRow struct {
 	Role     string    `json:"role"`
 	Name     string    `json:"name"`
 	Counsels string    `json:"counsels"`
+	IsClient bool      `json:"is_client"`
 }
 
 // Load the parties (autor/réu/terceiro) and their advogados for a given case,
@@ -1046,6 +1092,14 @@ type GetPartiesForDraftRow struct {
 // (same pattern as GetDraftDetail for court_record). counsels defaults to an
 // empty jsonb array (never NULL) when a party has no advogado. Ordered by
 // role then name for deterministic iteration.
+//
+// is_client marks the party the escritório represents: TRUE when any of its
+// advogados carries an OAB the tenant watches (watched_oab). The join normalizes
+// both sides to "DIGITS|UF" — party_counsel.oab may keep formatting/leading zeros
+// while watched_oab.oab_key is stored "NUMBER|UF" — so only the significant digits
+// and the UF are compared. enabled is NOT filtered: a currently-disabled OAB is
+// still the office's OAB (it just stopped capturing new intimations). FALSE when
+// the tenant watches no OAB (the FE keeps its role-based fallback in that case).
 func (q *Queries) GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraftParams) ([]GetPartiesForDraftRow, error) {
 	rows, err := q.db.Query(ctx, getPartiesForDraft, arg.TenantID, arg.CaseID)
 	if err != nil {
@@ -1060,6 +1114,7 @@ func (q *Queries) GetPartiesForDraft(ctx context.Context, arg GetPartiesForDraft
 			&i.Role,
 			&i.Name,
 			&i.Counsels,
+			&i.IsClient,
 		); err != nil {
 			return nil, err
 		}
@@ -1095,6 +1150,45 @@ func (q *Queries) GetPetitionByDraftID(ctx context.Context, arg GetPetitionByDra
 		&i.FiledAt,
 		&i.Receipt,
 		&i.ObservedResult,
+	)
+	return i, err
+}
+
+const getPieceProfileForGeneration = `-- name: GetPieceProfileForGeneration :one
+SELECT
+    pp.key                AS key,
+    pp.nome               AS nome,
+    pp.polo               AS polo,
+    pp.base_skeleton_key  AS base_skeleton_key,
+    bs.slots              AS slots
+FROM piece_profile pp
+JOIN base_skeleton bs ON bs.key = pp.base_skeleton_key
+WHERE pp.key = $1
+`
+
+type GetPieceProfileForGenerationRow struct {
+	Key             string `json:"key"`
+	Nome            string `json:"nome"`
+	Polo            string `json:"polo"`
+	BaseSkeletonKey string `json:"base_skeleton_key"`
+	Slots           []byte `json:"slots"`
+}
+
+// Load the piece_profile row + its base_skeleton slots for the generation pipeline
+// (PART B): given a piece_profile_key, returns the profile's nome/polo/base_skeleton_key
+// and the base_skeleton.slots jsonb (the invariant moldura order — enderecamento,
+// preambulo, miolo, pedidos, fecho). GLOBAL catalog tables (migration 0085 — no
+// tenant_id, docs/erd-tipos-de-peca.md §7.1). A miss (unknown key) → pgx.ErrNoRows →
+// the caller degrades to the generic structure, never an error.
+func (q *Queries) GetPieceProfileForGeneration(ctx context.Context, key string) (GetPieceProfileForGenerationRow, error) {
+	row := q.db.QueryRow(ctx, getPieceProfileForGeneration, key)
+	var i GetPieceProfileForGenerationRow
+	err := row.Scan(
+		&i.Key,
+		&i.Nome,
+		&i.Polo,
+		&i.BaseSkeletonKey,
+		&i.Slots,
 	)
 	return i, err
 }
@@ -1888,6 +1982,112 @@ func (q *Queries) ListEsajCredentials(ctx context.Context, tenantID uuid.UUID) (
 			&i.TermsAcceptedBy,
 			&i.CreatedAt,
 			&i.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProcessDocuments = `-- name: ListProcessDocuments :many
+SELECT id, coalesce(nullif(title, ''), nullif(original_filename, ''), document_type) AS label,
+       document_type, pages, status, court_event_date
+FROM document
+WHERE court_record_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+ORDER BY created_at
+`
+
+type ListProcessDocumentsParams struct {
+	CourtRecordID pgtype.UUID `json:"court_record_id"`
+	TenantID      uuid.UUID   `json:"tenant_id"`
+}
+
+type ListProcessDocumentsRow struct {
+	ID             uuid.UUID          `json:"id"`
+	Label          string             `json:"label"`
+	DocumentType   string             `json:"document_type"`
+	Pages          *int32             `json:"pages"`
+	Status         string             `json:"status"`
+	CourtEventDate pgtype.Timestamptz `json:"court_event_date"`
+}
+
+// Os autos do processo (documentos fetchados do court_record) exibidos na "Fundada
+// em" do editor. Leitura cross-slice do court_record (mesmo padrão do ProcessView),
+// sem importar o slice de aquisição. Só os não-deletados, ordem estável.
+func (q *Queries) ListProcessDocuments(ctx context.Context, arg ListProcessDocumentsParams) ([]ListProcessDocumentsRow, error) {
+	rows, err := q.db.Query(ctx, listProcessDocuments, arg.CourtRecordID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListProcessDocumentsRow
+	for rows.Next() {
+		var i ListProcessDocumentsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Label,
+			&i.DocumentType,
+			&i.Pages,
+			&i.Status,
+			&i.CourtEventDate,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProfileSections = `-- name: ListProfileSections :many
+SELECT
+    key,
+    titulo,
+    ordem,
+    obrigatoria,
+    origem,
+    aceita_teses
+FROM profile_section
+WHERE piece_profile_key = $1
+ORDER BY ordem ASC
+`
+
+type ListProfileSectionsRow struct {
+	Key         string `json:"key"`
+	Titulo      string `json:"titulo"`
+	Ordem       int32  `json:"ordem"`
+	Obrigatoria string `json:"obrigatoria"`
+	Origem      string `json:"origem"`
+	AceitaTeses bool   `json:"aceita_teses"`
+}
+
+// Load the profile_section rows for a piece_profile_key ORDERED by `ordem` (PART B) —
+// the MIOLO structure the generation renders (títulos reais + obrigatoriedade +
+// aceita_teses). GLOBAL catalog table (migration 0085 — no tenant_id). Empty result
+// (unknown key or a profile with no sections) → the caller degrades to the generic
+// structure, never an error.
+func (q *Queries) ListProfileSections(ctx context.Context, pieceProfileKey string) ([]ListProfileSectionsRow, error) {
+	rows, err := q.db.Query(ctx, listProfileSections, pieceProfileKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListProfileSectionsRow
+	for rows.Next() {
+		var i ListProfileSectionsRow
+		if err := rows.Scan(
+			&i.Key,
+			&i.Titulo,
+			&i.Ordem,
+			&i.Obrigatoria,
+			&i.Origem,
+			&i.AceitaTeses,
 		); err != nil {
 			return nil, err
 		}

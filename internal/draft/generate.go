@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,14 @@ type generationDepsReader interface {
 	GetDraftByID(ctx context.Context, tx database.Tx, tenantID, draftID string) (*Draft, error)
 	GetIntimationForDraft(ctx context.Context, tx database.Tx, tenantID, intimationID string) (*IntimationContext, error)
 	GetPartiesForDraft(ctx context.Context, tx database.Tx, tenantID, caseID string) ([]PartyInfo, error)
+	// ListSuggestedThesesByDraft feeds the generation selection from the PERSISTED
+	// thesis state (C2): the composer's SelectedTheses is derived from the theses in
+	// state included/pending_add, not from the fragile draft.selected_theses column.
+	ListSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]SuggestedThesis, error)
+	// GetGenerationProfile loads the piece_profile + ordered sections for the draft's
+	// piece_profile_key (PART B) so the composer renders the catalog structure. nil
+	// (unknown/empty key) → the composer falls back to the generic structure.
+	GetGenerationProfile(ctx context.Context, tx database.Tx, pieceProfileKey string) (*GenerationProfile, error)
 }
 
 // generationWriter is the narrow write port the generation use case needs. A separate
@@ -80,7 +89,7 @@ type generationWriter interface {
 // embedder is the narrow embedding port for RAG. Satisfied by *indexing.VoyageEmbedder
 // or a test fake. nil → degraded path (no grounding).
 type embedder interface {
-	Embed(ctx context.Context, texts []string) ([][]float32, string, error)
+	Embed(ctx context.Context, texts []string, inputType indexing.InputType) ([][]float32, string, error)
 }
 
 // VoyageEmbedder is the exported type alias so cmd/worker-ai can use *indexing.VoyageEmbedder
@@ -238,6 +247,8 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	//       via errgroup, cada uma em tx própria (short reads, safe).
 	//       Reads são independentes entre si; ganho: ~15-25ms em prod.
 	var draft *Draft
+	var genProfile *GenerationProfile
+	var richTheses []SuggestedThesis
 	if err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
 		d, e := uc.reader.GetDraftByID(ctx, tx, ev.TenantID, ev.DraftID)
 		if e != nil {
@@ -248,6 +259,38 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			// Obsolete event (re-trigger while already REVIEWED/FAILED/CREATED).
 			// Treat as SkipRetry by returning a sentinel; the listener wraps it.
 			return errObsoleteSaga
+		}
+		// C2 — a seleção que alimenta o composer vem do ESTADO PERSISTIDO das teses
+		// (suggested_thesis em included/pending_add), não do frágil draft.selected_theses.
+		// Quando há teses persistidas selecionadas elas VENCEM; sem nenhuma persistida,
+		// mantém d.SelectedTheses (retrocompat com o caminho legado Fatia 5).
+		theses, e := uc.reader.ListSuggestedThesesByDraft(ctx, tx, ev.TenantID, ev.DraftID)
+		if e != nil {
+			return e
+		}
+		if labels := selectedThesisLabels(theses); labels != nil {
+			draft.SelectedTheses = labels
+		}
+		// Rich selected theses (com Foundation/Reference/Source*) pra o composer
+		// desenvolver cada tese do material ancorado, não só do rótulo. Mesmo filtro/
+		// estado que os labels acima; nil quando não há persistidas selecionadas → o
+		// buildDraftContext cai no fallback legado (só-labels de draft.SelectedTheses).
+		richTheses = selectedThesesForGen(theses)
+		// PART B — carrega o piece_profile + seções ordenadas do catálogo pra o
+		// composer renderizar o MIOLO real (Preliminares/Impugnação/Mérito/…) em vez
+		// do trio genérico. Só quando o draft tem piece_profile_key; vazio/desconhecido
+		// → gp fica nil e o composer cai no genérico (retrocompat com drafts legados).
+		// Non-fatal: profile é enriquecimento, não bloqueia a geração.
+		if d.PieceProfileKey != "" {
+			gp, e := uc.reader.GetGenerationProfile(ctx, tx, d.PieceProfileKey)
+			if e != nil {
+				slog.WarnContext(ctx, "draft generate: profile load failed",
+					slog.String("draft_id", ev.DraftID),
+					slog.String("piece_profile_key", d.PieceProfileKey),
+					slog.Any("error", e))
+			} else {
+				genProfile = gp
+			}
 		}
 		return nil
 	}); err != nil {
@@ -317,7 +360,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 	chunks, _, grounded := runRAG(ctx, uc.emb, uc.search, uc.ragCache, ev.TenantID, crid, queryText, 8)
 
 	// ── 5. Compose prompt and call LLM ────────────────────────────────────────
-	draftCtx := buildDraftContext(draft, intimation, parties, chunks)
+	draftCtx := buildDraftContext(draft, intimation, parties, chunks, genProfile, richTheses)
 	composed, err2 := uc.composer.ComposeDraft(advisory.AgentDraftMinuta, draftCtx)
 	if err2 != nil {
 		return uc.persistFailure(ctx, ev.TenantID, ev.DraftID, ev.EventID, fmt.Sprintf("compose prompt: %v", err2))
@@ -347,7 +390,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			Schema:     generateSchema,
 			SchemaName: "draft_minuta",
 			Model:      uc.model,
-			MaxTokens:  4096,
+			MaxTokens:  16000,
 			UseCase:    "draft.generate",
 			TenantID:   ev.TenantID,
 		}, func(chunk string) error {
@@ -368,7 +411,7 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			Schema:     generateSchema,
 			SchemaName: "draft_minuta",
 			Model:      uc.model,
-			MaxTokens:  4096,
+			MaxTokens:  16000,
 			UseCase:    "draft.generate",
 			TenantID:   ev.TenantID,
 		})
@@ -485,16 +528,95 @@ func (uc *GenerateUseCase) persistFailure(ctx context.Context, tenantID, draftID
 	return fmt.Errorf("draft generation failed: %s: %w", reason, errSkipRetry)
 }
 
-// buildQueryText builds the RAG query string from the draft and intimation context.
+// queryTeorMaxRunes bounds how much of the intimation teor feeds the RAG query. ~600 runes covers
+// the operative opening of a typical DJEN teor (the parties, the act, the order) — enough signal
+// to steer retrieval to the right chunks — without diluting the embedding with the boilerplate
+// tail. Runes (not bytes) so a cut never splits a UTF-8 multi-byte codepoint (acentos). The bound
+// also keeps the query DETERMINISTIC: same intimation → same query → stable RAG cache key
+// (rag_cache.go hashes queryText), so we never inject anything volatile.
+const queryTeorMaxRunes = 600
+
+// buildQueryText builds the RAG query string from the draft and intimation context. Beyond the
+// PieceType + Type it enriches the query with the CASE signal — the classe/assunto and a bounded,
+// HTML-stripped slice of the intimation teor — so the query embeds close to the autos chunks that
+// actually matter (a bare "PETICAO INTIMACAO" query recalls almost anything). Everything here is
+// deterministic and length-bounded: no timestamps, ids, or other volatile input that would poison
+// the RAG cache key.
 func buildQueryText(d *Draft, i *IntimationContext) string {
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 5)
 	parts = append(parts, d.PieceType)
 	if i != nil {
 		if i.Type != "" {
 			parts = append(parts, i.Type)
 		}
+		if i.Class != "" {
+			parts = append(parts, i.Class)
+		}
+		if i.Subject != "" {
+			parts = append(parts, i.Subject)
+		}
+		// The teor is the richest case signal. Clean it through the same stripHTML the prompt
+		// uses (single source of truth), then cap to queryTeorMaxRunes on a rune boundary.
+		if teor := boundedRunes(stripHTML(i.Content), queryTeorMaxRunes); teor != "" {
+			parts = append(parts, teor)
+		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// boundedRunes returns s truncated to at most max runes, cutting on a rune boundary (never mid
+// codepoint). A non-positive max or an already-short s returns s unchanged.
+func boundedRunes(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+// selectedThesisLabels derives the generation selection from the PERSISTED thesis
+// state (C2): the labels of the theses in state included/pending_add, in position
+// order. Returns nil when the draft has NO persisted theses at all — the caller then
+// keeps the legacy draft.selected_theses (Fatia 5 backward-compat). When the draft HAS
+// persisted theses but none is selected, it returns a non-nil empty slice so the
+// caller overrides with an empty selection (the user deselected everything).
+func selectedThesisLabels(theses []SuggestedThesis) []string {
+	if len(theses) == 0 {
+		return nil
+	}
+	labels := make([]string, 0, len(theses))
+	for _, t := range theses {
+		if t.State == ThesisStateIncluded || t.State == ThesisStatePendingAdd {
+			labels = append(labels, t.Label)
+		}
+	}
+	return labels
+}
+
+// selectedThesesForGen returns the SELECTED theses (state included/pending_add) in
+// full — same filter as selectedThesisLabels, but keeping the rich Foundation/
+// Reference/Source* fields the composer needs to develop each tese from anchored
+// material instead of only its label. Ordered by Position (deterministic). Returns
+// nil when there are no persisted theses OR none is selected — the caller then falls
+// back to the legacy label-only path (draft.SelectedTheses).
+func selectedThesesForGen(theses []SuggestedThesis) []SuggestedThesis {
+	if len(theses) == 0 {
+		return nil
+	}
+	sel := make([]SuggestedThesis, 0, len(theses))
+	for _, t := range theses {
+		if t.State == ThesisStateIncluded || t.State == ThesisStatePendingAdd {
+			sel = append(sel, t)
+		}
+	}
+	if len(sel) == 0 {
+		return nil
+	}
+	sort.SliceStable(sel, func(i, j int) bool { return sel[i].Position < sel[j].Position })
+	return sel
 }
 
 // buildDraftContext converts the loaded domain objects to the advisory DraftContext.
@@ -502,16 +624,45 @@ func buildQueryText(d *Draft, i *IntimationContext) string {
 // the prompt's add() helper drops empty labels, so the LLM still gets a clean prompt.
 // parties may be nil/empty (non-fatal degraded path); the signing lawyer is resolved
 // from the matched recipient in intimation.recipients (nil recipients → zero-value).
-func buildDraftContext(d *Draft, i *IntimationContext, parties []PartyInfo, chunks []string) advisory.DraftContext {
+//
+// selectedTheses are the RICH selected theses (state included/pending_add, Position-
+// ordered) mapped to advisory.SelectedThesisCtx. When it is empty BUT d.SelectedTheses
+// (legacy label-only, Fatia 5) is non-empty, this builds ctx com só o Label preenchido —
+// preservando o caminho legado sem quebrar. Empty em ambos → dc.SelectedTheses nil.
+func buildDraftContext(d *Draft, i *IntimationContext, parties []PartyInfo, chunks []string, profile *GenerationProfile, selectedTheses []SuggestedThesis) advisory.DraftContext {
 	dc := advisory.DraftContext{
-		PieceType: d.PieceType,
-		Chunks:    chunks,
-		// Fatia 5: tone/instructions/selected_theses are read from the draft row
-		// (not the event payload) — TriggerGeneration persisted them in the same
-		// tx it flipped saga_state to EXTRACTING.
-		Tone:           d.Tone,
-		Instructions:   d.Instructions,
-		SelectedTheses: d.SelectedTheses,
+		PieceType:       d.PieceType,
+		PieceProfileKey: d.PieceProfileKey,
+		Chunks:          chunks,
+		// Fatia 5: tone/instructions are read from the draft row (not the event
+		// payload) — TriggerGeneration persisted them in the same tx it flipped
+		// saga_state to EXTRACTING.
+		Tone:         d.Tone,
+		Instructions: d.Instructions,
+	}
+	// Selected theses — rich path (Foundation/Reference/Source*) quando há teses
+	// persistidas selecionadas; fallback legado só-com-Label a partir dos labels
+	// persistidos em draft.SelectedTheses (caminho Fatia 5). Vazio total → nil.
+	switch {
+	case len(selectedTheses) > 0:
+		ctx := make([]advisory.SelectedThesisCtx, 0, len(selectedTheses))
+		for _, t := range selectedTheses {
+			ctx = append(ctx, advisory.SelectedThesisCtx{
+				Label:       t.Label,
+				Foundation:  t.Foundation,
+				Reference:   t.Reference,
+				Excerpt:     t.SourceExcerpt,
+				SourceLabel: t.SourceLabel,
+				Grounded:    t.Grounded,
+			})
+		}
+		dc.SelectedTheses = ctx
+	case len(d.SelectedTheses) > 0:
+		ctx := make([]advisory.SelectedThesisCtx, 0, len(d.SelectedTheses))
+		for _, label := range d.SelectedTheses {
+			ctx = append(ctx, advisory.SelectedThesisCtx{Label: label})
+		}
+		dc.SelectedTheses = ctx
 	}
 	// Populate structured parties (PLAINTIFF/DEFENDANT/THIRD_PARTY).
 	if len(parties) > 0 {
@@ -524,6 +675,22 @@ func buildDraftContext(d *Draft, i *IntimationContext, parties []PartyInfo, chun
 			})
 		}
 		dc.Parties = partiesCtx
+	}
+	// PART B — profile sections (catalog MIOLO). nil profile → dc.ProfileSections
+	// stays nil and the composer renders the generic Fatos/Direito/Pedidos trio.
+	if profile != nil && len(profile.Sections) > 0 {
+		secs := make([]advisory.ProfileSectionCtx, 0, len(profile.Sections))
+		for _, s := range profile.Sections {
+			secs = append(secs, advisory.ProfileSectionCtx{
+				Key:         s.Key,
+				Titulo:      s.Titulo,
+				Ordem:       s.Ordem,
+				Obrigatoria: s.Obrigatoria,
+				Origem:      s.Origem,
+				AceitaTeses: s.AceitaTeses,
+			})
+		}
+		dc.ProfileSections = secs
 	}
 	if i == nil {
 		return dc

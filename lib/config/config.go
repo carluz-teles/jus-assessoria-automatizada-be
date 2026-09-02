@@ -175,8 +175,10 @@ type Config struct {
 	// devolve Invalid) e o binário que não gera não morre por falta dela.
 	OpenRouterAPIKey string `env:"OPENROUTER_API_KEY"`
 	// OpenRouterModel é o modelo LEGADO (usado quando FAST/QUALITY vazios) e
-	// também o baseline global. Kept as fallback pra migração suave.
-	OpenRouterModel string `env:"OPENROUTER_MODEL" envDefault:"openai/gpt-4o-mini"`
+	// também o baseline global. Kept as fallback pra migração suave. Tudo é
+	// Gemini via OpenRouter — o baseline é o tier de qualidade (gemini-2.5-flash),
+	// nunca gpt-4o-mini.
+	OpenRouterModel string `env:"OPENROUTER_MODEL" envDefault:"google/gemini-2.5-flash"`
 	// Modelos por tier (tiering do §7 do ERD): FAST pra loops iterativos
 	// curtos (teses, chat, sugerir tasks) onde velocidade > exaustividade;
 	// QUALITY pra escritas críticas (gerar minuta, iterar peça, revisar,

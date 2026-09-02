@@ -204,6 +204,32 @@ type ActionItemForTask struct {
 	PieceProfileKey string
 }
 
+// GenerationProfile is the piece_profile + its ordered sections + the
+// base_skeleton slots, loaded by the generation pipeline (PART B) to steer the
+// draft_minuta prompt from the CATALOG instead of the fixed Fatos/Direito/Pedidos
+// trio. Empty (nil Sections) when the draft has no piece_profile_key or the key
+// is unknown to the catalog — the generation then falls back to the generic
+// structure. GLOBAL catalog (migration 0085 — no tenant_id).
+type GenerationProfile struct {
+	Key      string
+	Nome     string
+	Polo     string
+	Slots    []string // base_skeleton moldura order: enderecamento, preambulo, miolo, pedidos, fecho
+	Sections []ProfileSectionInfo
+}
+
+// ProfileSectionInfo is one profile_section row (the MIOLO structure of a peça
+// type), ordered by Ordem. Obrigatoria is the raw enum "sim"|"nao"|"condicional";
+// AceitaTeses marks the sections where selected theses go.
+type ProfileSectionInfo struct {
+	Key         string
+	Titulo      string
+	Ordem       int
+	Obrigatoria string // "sim" | "nao" | "condicional"
+	Origem      string // "moldura" | "argumentativa"
+	AceitaTeses bool
+}
+
 // PartyCounselInfo is one advogado aggregated under a party. OAB and UF are the
 // stable identity (as stored by the DJEN parser); Name may be empty when absent.
 type PartyCounselInfo struct {
@@ -220,6 +246,11 @@ type PartyCounselInfo struct {
 type PartyInfo struct {
 	Role     string
 	Name     string
+	// IsClient is TRUE when one of this party's advogados carries an OAB the
+	// tenant watches (the escritório represents this party). Read model only —
+	// the FE uses it to pick THE client instead of guessing by role. FALSE when
+	// the tenant watches no OAB.
+	IsClient bool
 	Counsel  string             // first counsel formatted; "" when absent (AI prompt only)
 	Counsels []PartyCounselInfo // full list; empty slice (never nil) when absent
 }
@@ -314,16 +345,30 @@ type Thesis struct {
 	Foundation string   `json:"foundation"`
 	Evidence   []string `json:"evidence"`
 
-	// Source* attribute the thesis back to the AUTOS document its evidence was
-	// retrieved from — populated post-hoc by matching Evidence against the RAG chunk
-	// hits (the LLM returns only literal quotes, not document ids), NOT part of the
-	// LLM contract (json:"-"). Empty when no evidence matched a retrieved chunk (the
-	// thesis is grounded only in the teor or is doctrinal); the FE then falls back to
-	// the teor. This is what surfaces "esta tese se apoia na Petição inicial · pág. 3".
+	// SourceRef is the LLM-cited chunk number (1..N of "Trechos relevantes dos
+	// autos" in the prompt) whose literal text sustains this thesis; 0 means the
+	// thesis is grounded only in the teor da intimação or in doctrine (no chunk).
+	// Part of the LLM contract — resolveThesisSource turns it into the Source*
+	// fields below by an EXACT lookup (hits[SourceRef-1]), not a substring guess.
+	SourceRef int `json:"source_ref"`
+
+	// Source* attribute the thesis back to the AUTOS document its evidence came
+	// from — resolved by resolveThesisSource from SourceRef (exact lookup into the
+	// RAG chunk hits), NOT emitted by the LLM (json:"-"). Empty when SourceRef==0
+	// or out of range (grounded only in the teor or doctrinal); the FE then falls
+	// back to the teor. This is what surfaces "esta tese se apoia na Petição
+	// inicial · pág. 3".
 	SourceDocumentID string `json:"-"`
 	SourceLabel      string `json:"-"`
 	SourceExcerpt    string `json:"-"`
 	SourcePage       int    `json:"-"`
+
+	// Grounded is computed by resolveThesisSource: true when a piece of Evidence
+	// is a verified literal substring of the cited chunk (SourceRef≥1) OR of the
+	// teor (SourceRef==0). false = evidence didn't match the cited source (likely
+	// wrong ref) or matched nothing at all (likely hallucinated). Wire: json
+	// "grounded" via thesisResponse. NOT the LLM contract (json:"-").
+	Grounded bool `json:"-"`
 }
 
 // ThesisConfidence closed set.
@@ -332,6 +377,74 @@ const (
 	ThesisConfidenceMedia = "media"
 	ThesisConfidenceBaixa = "baixa"
 )
+
+// SuggestedThesis is a Thesis PERSISTED against a draft (Sugerir Teses persistido,
+// C1). It carries everything the in-memory Thesis carries (label/confidence/
+// reference/foundation/evidence + the resolved Source*/Grounded fields) plus the
+// persistence-only concerns the FE (pecas-v2) needs to select and keep the
+// advogado's choice across revisits: a stable ID, a selection State, and the
+// deterministic Position assigned at generation. Unlike Thesis (an LLM contract),
+// its Source* fields ARE wired to the FE (via suggestedThesisResponse).
+//
+// C2 will generalize this to intimation-scope (the partida flow, /pecas/nova with
+// no draft yet) by adding an IntimationID and relaxing DraftID — the shape here is
+// deliberately a superset of Thesis so that extension is additive.
+type SuggestedThesis struct {
+	ID string
+	// DraftID and IntimationID are mutually exclusive — EXACTLY ONE is set (DB CHECK
+	// suggested_thesis_scope_chk, migration 0093). Draft-scoped (construção) vs.
+	// intimation-scoped (partida, /pecas/nova antes do draft existir).
+	DraftID      string
+	IntimationID string
+
+	Label      string
+	Confidence string
+	Reference  string
+	Foundation string
+	Evidence   []string
+
+	SourceRef        int
+	SourceDocumentID string
+	SourcePage       int
+	SourceExcerpt    string
+	SourceLabel      string
+	Grounded         bool
+
+	State    string
+	Position int
+}
+
+// ThesisState closed set — the selection state machine for a persisted suggested
+// thesis. off = not selected; pending_add = pre-selected/queued to include;
+// included = part of the draft's thesis set; pending_remove = queued to drop. The
+// DB CHECK (migration 0092) mirrors this; ValidThesisState guards the app boundary.
+const (
+	ThesisStateOff           = "off"
+	ThesisStatePendingAdd    = "pending_add"
+	ThesisStateIncluded      = "included"
+	ThesisStatePendingRemove = "pending_remove"
+)
+
+// ValidThesisState reports whether s is a member of the closed ThesisState set.
+func ValidThesisState(s string) bool {
+	switch s {
+	case ThesisStateOff, ThesisStatePendingAdd, ThesisStateIncluded, ThesisStatePendingRemove:
+		return true
+	default:
+		return false
+	}
+}
+
+// initialThesisState is the pre-selection rule (produto): only the anchored or
+// high-confidence theses start queued for inclusion (pending_add); everything else
+// starts off. Grounded == true (evidence verified against the cited source) OR
+// confidence == "alta" pre-selects.
+func initialThesisState(grounded bool, confidence string) string {
+	if grounded || confidence == ThesisConfidenceAlta {
+		return ThesisStatePendingAdd
+	}
+	return ThesisStateOff
+}
 
 // ── Attachment (Fatia 2) ──────────────────────────────────────────────────────
 
@@ -602,6 +715,27 @@ var pieceTypeByProfileKey = map[string]string{
 func pieceTypeFromProfileKey(key string) (pieceType string, ok bool) {
 	pieceType, ok = pieceTypeByProfileKey[key]
 	return pieceType, ok
+}
+
+// defaultProfileByPieceType is the reverse of pieceTypeByProfileKey: the catalog
+// key a source=intimation draft should default to for a given draft.piece_type,
+// used by Create's PART A fallback when the intimation has no peça-generating
+// action_item that already chose a key. MOTION/OTHER map to no profile ("") —
+// they fall back to the generic (non-profile) generation structure. Same local-
+// copy rationale as pieceTypeByProfileKey (this slice never imports the catalog).
+var defaultProfileByPieceType = map[string]string{
+	PieceTypeDefense:   "contestacao",
+	PieceTypeComplaint: "peticao_inicial",
+	PieceTypeAppeal:    "apelacao",
+}
+
+// defaultProfileForPieceType resolves the catalog piece_profile_key a draft of the
+// given piece_type defaults to when no action_item already picked one (PART A
+// fallback). Returns "" for types with no catalog mapping (MOTION, OTHER, or any
+// unknown value) — the draft then carries no profile and the generation renders the
+// generic Fatos/Direito/Pedidos structure.
+func defaultProfileForPieceType(pieceType string) string {
+	return defaultProfileByPieceType[pieceType]
 }
 
 // ── Petition (Fatia 4 — peticionamento) ─────────────────────────────────────

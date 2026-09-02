@@ -2,6 +2,7 @@ package draft
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -44,6 +45,12 @@ type Repository interface {
 	// ErrTaskNotFound (→ 404).
 	GetActionItemForTask(ctx context.Context, tx database.Tx, tenantID, taskID string) (*ActionItemForTask, error)
 
+	// GetActionItemProfileKeyForIntimation resolves the piece_profile_key the analysis
+	// already chose for a peça-generating providência of an intimation (PART A,
+	// source=intimation Create). Returns "" when no such providência exists yet — the
+	// caller falls back to defaultProfileForPieceType. Never ErrNotFound (a miss is "").
+	GetActionItemProfileKeyForIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (string, error)
+
 	// GetDraftByTaskID returns the existing VIGENTE draft for the (tenant, task) pair —
 	// the idempotent path after InsertDraft hits the NEW draft_task_id_uidx (migration
 	// 0088, task-sourced Create redelivered/duplicated). Filters superseded_at IS NULL
@@ -71,6 +78,18 @@ type Repository interface {
 	// by the generation pipeline to inject structured party data into the AI prompt.
 	// An empty case or one with no parties returns an empty slice, never nil.
 	GetPartiesForDraft(ctx context.Context, tx database.Tx, tenantID, caseID string) ([]PartyInfo, error)
+
+	// GetGenerationProfile loads the piece_profile + its ordered profile_sections +
+	// base_skeleton slots for a piece_profile_key (PART B), so the generation renders
+	// the peça's real MIOLO structure instead of the fixed trio. GLOBAL catalog
+	// (migration 0085 — no tenant_id). Returns nil (no profile) when key is "" or
+	// unknown to the catalog — the generation degrades to the generic structure.
+	GetGenerationProfile(ctx context.Context, tx database.Tx, pieceProfileKey string) (*GenerationProfile, error)
+	// ListProcessDocuments loads the autos do processo (documents fetched from the
+	// court_record) shown in the editor's "Fundada em" section. Reads the document
+	// table cross-slice directly (same pattern as GetDraftDetail reading court_record),
+	// tenant-scoped. An empty/absent court_record returns an empty slice, never nil.
+	ListProcessDocuments(ctx context.Context, tx database.Tx, courtRecordID, tenantID string) ([]ProcessDocument, error)
 	// GetProvidencesForIntimation loads the OPEN/DONE tasks linked to the draft's
 	// intimation. Surfaced in the FE sidebar (Peça v2). Empty slice for drafts
 	// without an intimation or with no linked tasks.
@@ -122,6 +141,33 @@ type Repository interface {
 	// UPLOADED documents, ordered position ASC, created_at ASC). An empty draft
 	// returns an empty slice, never nil.
 	GetDraftAttachments(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]Attachment, error)
+
+	// ── Suggested theses (Sugerir Teses persistido, C1) ──────────────────────
+
+	// InsertSuggestedThesis persists one generated thesis against a draft, in the
+	// caller's tx. Returns the persisted entity (with its assigned id).
+	InsertSuggestedThesis(ctx context.Context, tx database.Tx, tenantID string, t *SuggestedThesis) (*SuggestedThesis, error)
+	// ListSuggestedThesesByDraft returns the persisted theses for a draft, ordered
+	// by position then created_at, tenant-scoped. An empty draft returns an empty
+	// slice, never nil.
+	ListSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]SuggestedThesis, error)
+	// UpdateSuggestedThesisState flips a thesis's selection state, scoped by
+	// (id, tenantID). A miss (unknown id / foreign tenant) is
+	// ErrSuggestedThesisNotFound (→ 404).
+	UpdateSuggestedThesisState(ctx context.Context, tx database.Tx, tenantID, thesisID, state string) (*SuggestedThesis, error)
+	// DeleteSuggestedThesesByDraft wipes a draft's suggested theses before a
+	// regenerate, tenant-scoped. Zero rows is a valid no-op, never an error.
+	DeleteSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) error
+
+	// ── Suggested theses — intimation-scoped (partida, C2) ───────────────────
+
+	// ListSuggestedThesesByIntimation returns the persisted theses of an intimation
+	// (fluxo da partida, antes do draft existir), ordered by position then created_at,
+	// tenant-scoped. An empty intimation returns an empty slice, never nil.
+	ListSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) ([]SuggestedThesis, error)
+	// DeleteSuggestedThesesByIntimation wipes an intimation's suggested theses before
+	// a regenerate, tenant-scoped. Zero rows is a valid no-op, never an error.
+	DeleteSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) error
 
 	// ── AI generation methods (Fatia 3) ──────────────────────────────────────
 
@@ -353,6 +399,76 @@ func (r *pgRepository) GetActionItemForTask(ctx context.Context, tx database.Tx,
 	}, nil
 }
 
+// GetActionItemProfileKeyForIntimation resolves the piece_profile_key the analysis
+// already chose for a peça-generating providência of the intimation (PART A). A miss
+// (no such providência yet) → "" (not an error) so the caller can fall back.
+func (r *pgRepository) GetActionItemProfileKeyForIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) (string, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+	iid, err := parseUUID(intimationID)
+	if err != nil {
+		return "", err
+	}
+	key, err := draftdb.New(tx).GetActionItemProfileKeyByIntimation(ctx, draftdb.GetActionItemProfileKeyByIntimationParams{
+		IntimationID: iid,
+		TenantID:     tid,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return derefString(key), nil
+}
+
+// GetGenerationProfile loads the piece_profile + ordered sections + skeleton slots
+// (PART B). A "" or unknown key → nil (generic fallback), never an error.
+func (r *pgRepository) GetGenerationProfile(ctx context.Context, tx database.Tx, pieceProfileKey string) (*GenerationProfile, error) {
+	if pieceProfileKey == "" {
+		return nil, nil
+	}
+	q := draftdb.New(tx)
+	prof, err := q.GetPieceProfileForGeneration(ctx, pieceProfileKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	rows, err := q.ListProfileSections(ctx, pieceProfileKey)
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	var slots []string
+	if len(prof.Slots) > 0 {
+		// base_skeleton.slots is a jsonb array of strings; ignore a malformed value
+		// (degrade to no slots — the sections alone already drive the miolo).
+		_ = json.Unmarshal(prof.Slots, &slots)
+	}
+	sections := make([]ProfileSectionInfo, 0, len(rows))
+	for _, s := range rows {
+		sections = append(sections, ProfileSectionInfo{
+			Key:         s.Key,
+			Titulo:      s.Titulo,
+			Ordem:       int(s.Ordem),
+			Obrigatoria: s.Obrigatoria,
+			Origem:      s.Origem,
+			AceitaTeses: s.AceitaTeses,
+		})
+	}
+	return &GenerationProfile{
+		Key:      prof.Key,
+		Nome:     prof.Nome,
+		Polo:     prof.Polo,
+		Slots:    slots,
+		Sections: sections,
+	}, nil
+}
+
 // GetDraftByTaskID is the idempotent-fetch counterpart of GetDraftByIntimationID
 // for the task-sourced path (migration 0088's draft_task_id_uidx).
 func (r *pgRepository) GetDraftByTaskID(ctx context.Context, tx database.Tx, tenantID, taskID string) (*Draft, error) {
@@ -557,6 +673,37 @@ func (r *pgRepository) GetPartiesForDraft(ctx context.Context, tx database.Tx, t
 		return nil, database.WrapInfra(err)
 	}
 	return partiesFromRows(rows), nil
+}
+
+func (r *pgRepository) ListProcessDocuments(ctx context.Context, tx database.Tx, courtRecordID, tenantID string) ([]ProcessDocument, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := draftdb.New(tx).ListProcessDocuments(ctx, draftdb.ListProcessDocumentsParams{
+		CourtRecordID: optUUID(courtRecordID),
+		TenantID:      tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]ProcessDocument, 0, len(rows))
+	for _, row := range rows {
+		pages := 0
+		if row.Pages != nil {
+			pages = int(*row.Pages)
+		}
+		out = append(out, ProcessDocument{
+			ID:           row.ID.String(),
+			Label:        row.Label,
+			DocumentType: row.DocumentType,
+			Pages:        pages,
+			Status:       row.Status,
+			EventDate:    timestamptzToTime(row.CourtEventDate),
+		})
+	}
+	return out, nil
 }
 
 func (r *pgRepository) GetProvidencesForIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) ([]Providence, error) {
@@ -1771,4 +1918,126 @@ func filingAttemptFromLatestRow(row draftdb.GetLatestFilingAttemptRow) *FilingAt
 		FilingNumber:   filingNumber,
 		ScreenshotKeys: keys,
 	}
+}
+
+// ── Suggested theses (Sugerir Teses persistido, C1) ──────────────────────────
+
+func (r *pgRepository) InsertSuggestedThesis(ctx context.Context, tx database.Tx, tenantID string, t *SuggestedThesis) (*SuggestedThesis, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	// draft_id XOR intimation_id — o use case garante que exatamente um vem
+	// preenchido; optUUID mapeia "" → NULL. O CHECK do banco é a rede de segurança.
+	row, err := draftdb.New(tx).InsertSuggestedThesis(ctx, draftdb.InsertSuggestedThesisParams{
+		TenantID:         tid,
+		DraftID:          optUUID(t.DraftID),
+		IntimationID:     optUUID(t.IntimationID),
+		Label:            t.Label,
+		Confidence:       t.Confidence,
+		Reference:        t.Reference,
+		Foundation:       t.Foundation,
+		Evidence:         nonNilStrings(t.Evidence),
+		SourceRef:        int32(t.SourceRef),
+		SourceDocumentID: optUUID(t.SourceDocumentID),
+		SourcePage:       int32(t.SourcePage),
+		SourceExcerpt:    t.SourceExcerpt,
+		SourceLabel:      t.SourceLabel,
+		Grounded:         t.Grounded,
+		State:            t.State,
+		Position:         int32(t.Position),
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return suggestedThesisFromRow(row), nil
+}
+
+func (r *pgRepository) ListSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) ([]SuggestedThesis, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := draftdb.New(tx).ListSuggestedThesesByDraft(ctx, draftdb.ListSuggestedThesesByDraftParams{
+		DraftID:  optUUID(draftID),
+		TenantID: tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]SuggestedThesis, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, *suggestedThesisFromRow(row))
+	}
+	return out, nil
+}
+
+func (r *pgRepository) UpdateSuggestedThesisState(ctx context.Context, tx database.Tx, tenantID, thesisID, state string) (*SuggestedThesis, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	id, err := parseUUID(thesisID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := draftdb.New(tx).UpdateSuggestedThesisState(ctx, draftdb.UpdateSuggestedThesisStateParams{
+		ID:       id,
+		TenantID: tid,
+		State:    state,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSuggestedThesisNotFound
+	}
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	return suggestedThesisFromRow(row), nil
+}
+
+func (r *pgRepository) DeleteSuggestedThesesByDraft(ctx context.Context, tx database.Tx, tenantID, draftID string) error {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).DeleteSuggestedThesesByDraft(ctx, draftdb.DeleteSuggestedThesesByDraftParams{
+		DraftID:  optUUID(draftID),
+		TenantID: tid,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func (r *pgRepository) ListSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) ([]SuggestedThesis, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := draftdb.New(tx).ListSuggestedThesesByIntimation(ctx, draftdb.ListSuggestedThesesByIntimationParams{
+		IntimationID: optUUID(intimationID),
+		TenantID:     tid,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+	out := make([]SuggestedThesis, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, *suggestedThesisFromRow(row))
+	}
+	return out, nil
+}
+
+func (r *pgRepository) DeleteSuggestedThesesByIntimation(ctx context.Context, tx database.Tx, tenantID, intimationID string) error {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).DeleteSuggestedThesesByIntimation(ctx, draftdb.DeleteSuggestedThesesByIntimationParams{
+		IntimationID: optUUID(intimationID),
+		TenantID:     tid,
+	}); err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
 }

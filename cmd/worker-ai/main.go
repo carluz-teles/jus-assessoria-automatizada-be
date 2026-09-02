@@ -109,7 +109,7 @@ func run(logger *slog.Logger) error {
 			g, err := llm.NewOpenRouterGenerator(
 				cfg.OpenRouterAPIKey,
 				cfg.OpenRouterBaseURL,
-				cfg.OpenRouterModel,
+				cfg.OpenRouterModelQuality,
 				httpClient,
 				aiusage.NewRecorder(pool),
 			)
@@ -117,7 +117,7 @@ func run(logger *slog.Logger) error {
 				return fmt.Errorf("init openrouter generator: %w", err)
 			}
 			gen = g
-			logger.Info("AI generation: OpenRouter generator configured", "model", cfg.OpenRouterModel)
+			logger.Info("AI generation: OpenRouter generator configured", "model", cfg.OpenRouterModelQuality)
 		} else {
 			logger.Warn("OPENROUTER_API_KEY unset — AI generation will mark drafts FAILED")
 		}

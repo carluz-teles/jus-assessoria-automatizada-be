@@ -299,6 +299,6 @@ type failingEmbedder struct {
 	err error
 }
 
-func (f failingEmbedder) Embed(_ context.Context, _ []string) ([][]float32, string, error) {
+func (f failingEmbedder) Embed(_ context.Context, _ []string, _ indexing.InputType) ([][]float32, string, error) {
 	return nil, "", f.err
 }

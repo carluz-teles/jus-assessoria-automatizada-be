@@ -540,6 +540,16 @@ func run(logger *slog.Logger) error {
 	})
 	draftHandler = draftHandler.WithTheses(thesesUC)
 
+	// Persisted theses (Sugerir Teses persistido, C1): wraps thesesUC (RAG+LLM,
+	// stateless) with the draft-scoped store so GET/POST/PATCH serve theses with a
+	// stable id/state/position. Reuses draftRepo (suggested_thesis methods) + uow.
+	draftThesesUC := draft.NewDraftThesesUseCase(draft.DraftThesesUseCaseParams{
+		UoW:   uow,
+		Store: draftRepo,
+		Gen:   thesesUC,
+	})
+	draftHandler = draftHandler.WithThesesStore(draftThesesUC)
+
 	// Vault is optional: only instantiated when VAULT_KEK_BASE64 is present. When
 	// absent the court-credential slice stays unmounted (S2) — same optional-adapter
 	// convention as document/S3. vault.New validates the KEK eagerly so a malformed

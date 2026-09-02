@@ -139,6 +139,7 @@ type chatRequest struct {
 	Provider       providerConfig `json:"provider"`
 	ResponseFormat responseFormat `json:"response_format"`
 	MaxTokens      int            `json:"max_tokens"`
+	Temperature    float64        `json:"temperature,omitempty"`
 	Stream         bool           `json:"stream,omitempty"`
 }
 
@@ -209,8 +210,9 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 				Schema: req.Schema,
 			},
 		},
-		MaxTokens: maxTokens,
-		Stream:    true,
+		MaxTokens:   maxTokens,
+		Temperature: req.Temperature,
+		Stream:      true,
 	})
 	if err != nil {
 		return nil, apperr.NewInfra("openrouter: marshal stream request", err)
@@ -242,6 +244,7 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 	// nunca é capturado.
 	var full strings.Builder
 	var usage Usage
+	var finishReason string
 	start := time.Now()
 	reader := &sseReader{buf: make([]byte, 0, 4096), src: resp.Body}
 	for {
@@ -277,6 +280,9 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 		if len(chunk.Choices) == 0 {
 			continue
 		}
+		if fr := chunk.Choices[0].FinishReason; fr != "" {
+			finishReason = fr
+		}
 		delta := chunk.Choices[0].Delta.Content
 		if delta == "" {
 			continue
@@ -289,6 +295,11 @@ func (g *OpenRouterGenerator) GenerateJSONStream(ctx context.Context, req Reques
 		}
 	}
 	g.recordUsage(ctx, req, model, usage, time.Since(start))
+	slog.InfoContext(ctx, "openrouter stream finished",
+		slog.String("use_case", req.UseCase),
+		slog.String("finish_reason", finishReason),
+		slog.Int("raw_len", full.Len()),
+		slog.Int("completion_tokens", usage.CompletionTokens))
 	return []byte(full.String()), nil
 }
 
@@ -370,7 +381,8 @@ func (g *OpenRouterGenerator) GenerateJSON(ctx context.Context, req Request) ([]
 				Schema: req.Schema,
 			},
 		},
-		MaxTokens: maxTokens,
+		MaxTokens:   maxTokens,
+		Temperature: req.Temperature,
 	})
 	if err != nil {
 		return nil, apperr.NewInfra("openrouter: marshal request", err)

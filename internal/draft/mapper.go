@@ -174,6 +174,7 @@ func draftFromGetByIDRow(r draftdb.GetDraftByIDRow) *Draft {
 		CaseID:              pgUUIDToString(r.CaseID),
 		IntimationID:        pgUUIDToString(r.IntimationID),
 		PieceType:           r.PieceType,
+		PieceProfileKey:     derefString(r.PieceProfileKey),
 		Title:               r.Title,
 		Content:             derefString(r.Content),
 		Status:              r.Status,
@@ -491,6 +492,7 @@ func partiesFromRows(rows []draftdb.GetPartiesForDraftRow) []PartyInfo {
 		out = append(out, PartyInfo{
 			Role:     r.Role,
 			Name:     r.Name,
+			IsClient: r.IsClient,
 			Counsel:  firstCounselLabelFrom(counsels),
 			Counsels: counsels,
 		})
@@ -701,4 +703,29 @@ func draftListItemFromAllRow(r draftdb.ListDraftsAllRow) DraftListItem {
 		item.CoverageSummary = unmarshalCoverageSummary(r.ReviewCoverage)
 	}
 	return item
+}
+
+// suggestedThesisFromRow maps a persisted suggested_thesis row (driver types) to
+// the SuggestedThesis entity — the mapper boundary where pgtype.* dies: uuid →
+// string, nullable source_document_id → "" on NULL, int32 → int, and the text[]
+// evidence normalized to a non-nil slice.
+func suggestedThesisFromRow(r draftdb.SuggestedThesis) *SuggestedThesis {
+	return &SuggestedThesis{
+		ID:               r.ID.String(),
+		DraftID:          pgUUIDToString(r.DraftID),
+		IntimationID:     pgUUIDToString(r.IntimationID),
+		Label:            r.Label,
+		Confidence:       r.Confidence,
+		Reference:        r.Reference,
+		Foundation:       r.Foundation,
+		Evidence:         nonNilStrings(r.Evidence),
+		SourceRef:        int(r.SourceRef),
+		SourceDocumentID: pgUUIDToString(r.SourceDocumentID),
+		SourcePage:       int(r.SourcePage),
+		SourceExcerpt:    r.SourceExcerpt,
+		SourceLabel:      r.SourceLabel,
+		Grounded:         r.Grounded,
+		State:            r.State,
+		Position:         int(r.Position),
+	}
 }

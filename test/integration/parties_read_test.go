@@ -201,3 +201,81 @@ func TestListPartesByProcesso_TenantScoped(t *testing.T) {
 		t.Fatalf("own read returned %d parties, want 1", len(own))
 	}
 }
+
+// seedWatchedOAB inserts one watched_oab row (owner insert, RLS bypassed) keyed
+// "NUMBER|UF" — the same shape the DJEN activation writes.
+func seedWatchedOAB(t *testing.T, pool *pgxpool.Pool, tenantID, integrationID, oabKey string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO watched_oab (tenant_id, integration_id, oab_key)
+		 VALUES ($1, $2, $3)`,
+		tenantID, integrationID, oabKey); err != nil {
+		t.Fatalf("seed watched_oab: %v", err)
+	}
+}
+
+// TestGetPartiesForDraft_IsClient proves the is_client computation against real
+// Postgres: the party whose counsel carries a watched OAB is flagged is_client=true,
+// the other réu false — the fix for "2+ réus → 2 clients". Also proves the "no watched
+// OAB" case returns is_client=false for everyone (FE keeps its role fallback).
+func TestGetPartiesForDraft_IsClient(t *testing.T) {
+	pool := newPool(t)
+	repo := draft.NewRepository()
+	uow := database.NewUnitOfWork(pool)
+	ctx := context.Background()
+
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-isclient", 0)
+	integrationID := seedIntegration(t, pool, tenantID, "DJEN")
+	_, caseID := seedCourtRecordCNJ(t, pool, tenantID, "0000031-11.2024.8.26.0300")
+
+	// The escritório watches OAB 55123/SP.
+	seedWatchedOAB(t, pool, tenantID, integrationID, "55123|SP")
+
+	// Two réus: only the first is defended by the office (its counsel holds 55123/SP).
+	clientReu := seedParty(t, pool, tenantID, caseID, "DEFENDANT", "CLIENTE REU")
+	seedCounsel(t, pool, tenantID, clientReu, "Ana Lima", "55123", "SP")
+	otherReu := seedParty(t, pool, tenantID, caseID, "DEFENDANT", "OUTRO REU")
+	seedCounsel(t, pool, tenantID, otherReu, "Outro Adv", "99999", "SP")
+
+	var parties []draft.PartyInfo
+	if err := uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		var err error
+		parties, err = repo.GetPartiesForDraft(ctx, tx, tenantID, caseID)
+		return err
+	}); err != nil {
+		t.Fatalf("GetPartiesForDraft: %v", err)
+	}
+
+	byName := map[string]draft.PartyInfo{}
+	for _, p := range parties {
+		byName[p.Name] = p
+	}
+	if !byName["CLIENTE REU"].IsClient {
+		t.Errorf("CLIENTE REU (counsel holds watched OAB) must be is_client=true")
+	}
+	if byName["OUTRO REU"].IsClient {
+		t.Errorf("OUTRO REU (no watched OAB) must be is_client=false")
+	}
+
+	// A different tenant watches nothing here → every party is_client=false.
+	tenantB := uuid.NewString()
+	seedTenant(t, pool, tenantB, "org-isclient-b", 0)
+	_, caseB := seedCourtRecordCNJ(t, pool, tenantB, "0000032-11.2024.8.26.0300")
+	reuB := seedParty(t, pool, tenantB, caseB, "DEFENDANT", "REU B")
+	seedCounsel(t, pool, tenantB, reuB, "Adv B", "55123", "SP") // same OAB number, but tenant B watches none
+
+	var partiesB []draft.PartyInfo
+	if err := uow.Do(ctx, tenantB, func(tx database.Tx) error {
+		var err error
+		partiesB, err = repo.GetPartiesForDraft(ctx, tx, tenantB, caseB)
+		return err
+	}); err != nil {
+		t.Fatalf("GetPartiesForDraft (tenant B): %v", err)
+	}
+	for _, p := range partiesB {
+		if p.IsClient {
+			t.Errorf("tenant B watches no OAB; party %q must be is_client=false", p.Name)
+		}
+	}
+}

@@ -23,7 +23,10 @@ func (h *Handler) RegisterV1(r fiber.Router) {
 	r.Post("/thesis/:id/coverage", h.checkCoverage)
 
 	r.Post("/thesis/segments", h.createSegment)
-	r.Get("/pecas/:id/theses", h.listThesesByDraft)
+	// NOTE: GET /pecas/:id/theses migrou pro slice `draft` (Sugerir Teses
+	// persistido, C1) — o draft serve a lista real (id/state/position). A versão
+	// antiga daqui (listThesesByDraft, desacoplada/vazia) foi removida pra evitar
+	// dupla-registração da mesma rota. UseCase.ListThesesByDraft segue existindo.
 	r.Get("/pecas/:id/segments", h.listSegmentsByDraft)
 	r.Get("/pecas/:id/coverage", h.getCoverageSummary)
 	r.Get("/pecas/:id/coverage/detail", h.listCoverageByDraft)
@@ -115,16 +118,6 @@ func (h *Handler) createSegment(c *fiber.Ctx) error {
 		return httpx.WriteError(c, err)
 	}
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"data": s})
-}
-
-func (h *Handler) listThesesByDraft(c *fiber.Ctx) error {
-	tenantID := httpx.TenantFromCtx(c)
-	draftID := c.Params("id")
-	theses, err := h.uc.ListThesesByDraft(c.UserContext(), tenantID, draftID)
-	if err != nil {
-		return httpx.WriteError(c, err)
-	}
-	return c.JSON(fiber.Map{"data": theses})
 }
 
 func (h *Handler) listSegmentsByDraft(c *fiber.Ctx) error {

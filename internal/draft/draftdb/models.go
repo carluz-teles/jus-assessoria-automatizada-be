@@ -366,6 +366,7 @@ type Document struct {
 	OriginalFilename *string            `json:"original_filename"`
 	Error            []byte             `json:"error"`
 	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
+	CourtEventDate   pgtype.Timestamptz `json:"court_event_date"`
 }
 
 type Draft struct {
@@ -753,6 +754,28 @@ type Subscription struct {
 	PlanID                     pgtype.UUID        `json:"plan_id"`
 	CustomPricePerProcessCents *int32             `json:"custom_price_per_process_cents"`
 	TrialEndsAt                pgtype.Timestamptz `json:"trial_ends_at"`
+}
+
+type SuggestedThesis struct {
+	ID               uuid.UUID          `json:"id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	DraftID          pgtype.UUID        `json:"draft_id"`
+	Label            string             `json:"label"`
+	Confidence       string             `json:"confidence"`
+	Reference        string             `json:"reference"`
+	Foundation       string             `json:"foundation"`
+	Evidence         []string           `json:"evidence"`
+	SourceRef        int32              `json:"source_ref"`
+	SourceDocumentID pgtype.UUID        `json:"source_document_id"`
+	SourcePage       int32              `json:"source_page"`
+	SourceExcerpt    string             `json:"source_excerpt"`
+	SourceLabel      string             `json:"source_label"`
+	Grounded         bool               `json:"grounded"`
+	State            string             `json:"state"`
+	Position         int32              `json:"position"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	IntimationID     pgtype.UUID        `json:"intimation_id"`
 }
 
 type SyncRun struct {

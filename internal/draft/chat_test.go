@@ -52,7 +52,7 @@ type fakeChatEmb struct {
 	err error
 }
 
-func (f *fakeChatEmb) Embed(_ context.Context, _ []string) ([][]float32, string, error) {
+func (f *fakeChatEmb) Embed(_ context.Context, _ []string, _ indexing.InputType) ([][]float32, string, error) {
 	if f.err != nil {
 		return nil, "", f.err
 	}

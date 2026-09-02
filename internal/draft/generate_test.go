@@ -38,9 +38,13 @@ type fakeReader struct {
 	draft      *Draft
 	intimation *IntimationContext
 	parties    []PartyInfo
+	theses     []SuggestedThesis // C2: persisted theses feeding the generation selection
+	profile    *GenerationProfile // PART B: catalog profile for generation
 	draftErr   error
 	intimErr   error
 	partiesErr error
+	thesesErr  error
+	profileErr error
 }
 
 func (f fakeReader) GetDraftByID(_ context.Context, _ database.Tx, _, _ string) (*Draft, error) {
@@ -51,6 +55,12 @@ func (f fakeReader) GetIntimationForDraft(_ context.Context, _ database.Tx, _, _
 }
 func (f fakeReader) GetPartiesForDraft(_ context.Context, _ database.Tx, _, _ string) ([]PartyInfo, error) {
 	return f.parties, f.partiesErr
+}
+func (f fakeReader) ListSuggestedThesesByDraft(_ context.Context, _ database.Tx, _, _ string) ([]SuggestedThesis, error) {
+	return f.theses, f.thesesErr
+}
+func (f fakeReader) GetGenerationProfile(_ context.Context, _ database.Tx, _ string) (*GenerationProfile, error) {
+	return f.profile, f.profileErr
 }
 
 // fakeWriter captures UpdateSagaState, InsertReview, and DeleteReviewsForDraft calls.
@@ -143,13 +153,19 @@ func (f *fakeGen) GenerateJSONStream(_ context.Context, req llm.Request, onChunk
 	return f.out, nil
 }
 
-// fakeEmbedder returns preset vectors.
+// fakeEmbedder returns preset vectors. gotInput (a pointer so value copies of the fake still
+// record into the same slice) captures the InputType each Embed call was made with — the RAG
+// query side must always pass indexing.InputQuery.
 type fakeEmbedder struct {
-	vecs [][]float32
-	err  error
+	vecs     [][]float32
+	err      error
+	gotInput *[]indexing.InputType
 }
 
-func (f fakeEmbedder) Embed(_ context.Context, _ []string) ([][]float32, string, error) {
+func (f fakeEmbedder) Embed(_ context.Context, _ []string, inputType indexing.InputType) ([][]float32, string, error) {
+	if f.gotInput != nil {
+		*f.gotInput = append(*f.gotInput, inputType)
+	}
 	return f.vecs, "model", f.err
 }
 
@@ -235,6 +251,109 @@ func TestGenerateUseCase_NilGenerator_FAILED(t *testing.T) {
 	}
 	if w.insertedReview == nil || w.insertedReview.Status != ReviewStatusFailed {
 		t.Errorf("review.Status = %q, want FAILED", w.insertedReview.Status)
+	}
+}
+
+// TestGenerateUseCase_DerivesSelectionFromPersistedTheses verifies C2: the composer's
+// selection comes from the PERSISTED thesis state (included/pending_add), not from the
+// draft.selected_theses column. Theses in state off are excluded from the prompt.
+func TestGenerateUseCase_DerivesSelectionFromPersistedTheses(t *testing.T) {
+	d := makeDraft()
+	d.SelectedTheses = []string{"legado-ignorado"} // deve ser sobrescrita pelas persistidas
+	w := &fakeWriter{returnedDraft: d}
+	ob := &fakeOutbox{}
+	gen := &fakeGen{out: []byte(cannedJSON)}
+	reader := fakeReader{draft: d, theses: []SuggestedThesis{
+		{ID: "a", Label: "Prescrição intercorrente", State: ThesisStateIncluded},
+		{ID: "b", Label: "Tese em revisão", State: ThesisStatePendingAdd},
+		{ID: "c", Label: "Tese descartada", State: ThesisStateOff},
+	}}
+
+	uc := buildUC(fakeUoW{}, reader, w, ob, fakeDedup{}, gen, nil)
+	if err := uc.OnGenerationRequested(context.Background(), ev()); err != nil {
+		t.Fatalf("want nil err, got %v", err)
+	}
+
+	prompt := gen.gotReq.User
+	if !strings.Contains(prompt, "Prescrição intercorrente") || !strings.Contains(prompt, "Tese em revisão") {
+		t.Errorf("prompt must include included/pending_add theses, got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Tese descartada") {
+		t.Error("prompt must NOT include an off thesis")
+	}
+	if strings.Contains(prompt, "legado-ignorado") {
+		t.Error("persisted selection must override the legacy draft.selected_theses")
+	}
+}
+
+// TestSelectedThesisLabels verifies the derivation helper: nil when no persisted theses
+// (legacy path preserved), non-nil empty when theses exist but none selected.
+func TestSelectedThesisLabels(t *testing.T) {
+	if got := selectedThesisLabels(nil); got != nil {
+		t.Errorf("no persisted theses must yield nil (legacy passthrough), got %v", got)
+	}
+	off := []SuggestedThesis{{Label: "x", State: ThesisStateOff}}
+	if got := selectedThesisLabels(off); got == nil || len(got) != 0 {
+		t.Errorf("theses present but none selected must yield non-nil empty, got %v", got)
+	}
+	mixed := []SuggestedThesis{
+		{Label: "in", State: ThesisStateIncluded},
+		{Label: "pend", State: ThesisStatePendingAdd},
+		{Label: "off", State: ThesisStateOff},
+	}
+	got := selectedThesisLabels(mixed)
+	if len(got) != 2 || got[0] != "in" || got[1] != "pend" {
+		t.Errorf("expected [in pend], got %v", got)
+	}
+}
+
+// TestSelectedThesesForGen verifies the rich-thesis selection helper: nil when no
+// persisted theses OR none selected (legacy fallback), and the SELECTED theses in
+// Position order otherwise (same state filter as selectedThesisLabels).
+func TestSelectedThesesForGen(t *testing.T) {
+	if got := selectedThesesForGen(nil); got != nil {
+		t.Errorf("no persisted theses must yield nil, got %v", got)
+	}
+	off := []SuggestedThesis{{Label: "x", State: ThesisStateOff}}
+	if got := selectedThesesForGen(off); got != nil {
+		t.Errorf("theses present but none selected must yield nil (legacy fallback), got %v", got)
+	}
+	mixed := []SuggestedThesis{
+		{Label: "pend", State: ThesisStatePendingAdd, Position: 2, Foundation: "F2"},
+		{Label: "in", State: ThesisStateIncluded, Position: 1, Foundation: "F1", Reference: "art. 1"},
+		{Label: "off", State: ThesisStateOff, Position: 0},
+	}
+	got := selectedThesesForGen(mixed)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 selected, got %d (%v)", len(got), got)
+	}
+	// Position-ordered: "in" (1) before "pend" (2).
+	if got[0].Label != "in" || got[1].Label != "pend" {
+		t.Errorf("expected [in pend] by Position, got [%s %s]", got[0].Label, got[1].Label)
+	}
+	if got[0].Foundation != "F1" || got[0].Reference != "art. 1" {
+		t.Errorf("rich fields not preserved: %+v", got[0])
+	}
+}
+
+// TestBuildDraftContext_RichTheses verifies the rich path: passed selectedTheses map
+// into advisory.SelectedThesisCtx (Excerpt=SourceExcerpt) and WIN over the legacy
+// draft.SelectedTheses labels.
+func TestBuildDraftContext_RichTheses(t *testing.T) {
+	d := &Draft{PieceType: PieceTypeDefense, SelectedTheses: []string{"legado-ignorado"}}
+	rich := []SuggestedThesis{
+		{Label: "Prescrição", Foundation: "Inércia 5+ anos", Reference: "art. 924 CPC", SourceExcerpt: "sem movimentação", SourceLabel: "fls. 120", Grounded: true},
+	}
+	dc := buildDraftContext(d, nil, nil, nil, nil, rich)
+	if len(dc.SelectedTheses) != 1 {
+		t.Fatalf("SelectedTheses len = %d, want 1", len(dc.SelectedTheses))
+	}
+	th := dc.SelectedTheses[0]
+	if th.Label != "Prescrição" || th.Foundation != "Inércia 5+ anos" || th.Reference != "art. 924 CPC" {
+		t.Errorf("rich thesis mismatch: %+v", th)
+	}
+	if th.Excerpt != "sem movimentação" || th.SourceLabel != "fls. 120" || !th.Grounded {
+		t.Errorf("Excerpt/SourceLabel/Grounded mismatch: %+v", th)
 	}
 }
 
@@ -576,6 +695,48 @@ func TestBuildFindings_Top10Cap(t *testing.T) {
 }
 
 // TestGenerateUseCase_WithIntimation_CRIDPropagated verifies that when a draft has an
+// TestBuildQueryText enriches the RAG query with the case signal (classe/assunto + a bounded,
+// HTML-stripped teor slice) beyond the bare PieceType+Type, and stays deterministic + bounded so
+// the RAG cache key is stable.
+func TestBuildQueryText(t *testing.T) {
+	t.Parallel()
+
+	d := &Draft{PieceType: "CONTESTACAO"}
+
+	// nil intimation → just the piece type.
+	if got := buildQueryText(d, nil); got != "CONTESTACAO" {
+		t.Errorf("nil intimation query = %q, want %q", got, "CONTESTACAO")
+	}
+
+	i := &IntimationContext{
+		Type:    "CITACAO",
+		Class:   "Procedimento Comum",
+		Subject: "Rescisão Contratual",
+		Content: "<p>Fica o réu <b>citado</b> para apresentar defesa no prazo legal.</p>",
+	}
+	got := buildQueryText(d, i)
+	for _, want := range []string{"CONTESTACAO", "CITACAO", "Procedimento Comum", "Rescisão Contratual", "citado", "defesa"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("query %q missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "<") {
+		t.Errorf("query still has HTML tags: %q", got)
+	}
+	// Deterministic: same input → same query (stable cache key).
+	if buildQueryText(d, i) != got {
+		t.Error("buildQueryText not deterministic")
+	}
+
+	// Bounded: a huge teor is capped to queryTeorMaxRunes on a rune boundary.
+	long := &IntimationContext{Content: strings.Repeat("á", queryTeorMaxRunes*3)}
+	q := buildQueryText(d, long)
+	// prefix parts + one space + at most queryTeorMaxRunes runes of teor.
+	if teorRunes := len([]rune(q)) - len([]rune(d.PieceType)) - 1; teorRunes > queryTeorMaxRunes {
+		t.Errorf("teor not bounded: %d runes > %d", teorRunes, queryTeorMaxRunes)
+	}
+}
+
 // intimation with a non-empty CourtRecordID, the generation pipeline calls runRAG
 // (via the package function) with a non-nil crid. Since runRAG degrades at the
 // pool-nil gate before calling SearchChunks, we assert grounded=false (no chunks)
@@ -659,7 +820,7 @@ func TestBuildDraftContext_WithIntimation(t *testing.T) {
 	}
 	chunks := []string{"trecho 1", "trecho 2"}
 
-	dc := buildDraftContext(d, i, parties, chunks)
+	dc := buildDraftContext(d, i, parties, chunks, nil, nil)
 
 	tests := []struct {
 		field string
@@ -745,7 +906,7 @@ func TestBuildDraftContext_TonePropagation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dc := buildDraftContext(tt.draft, nil, nil, nil)
+			dc := buildDraftContext(tt.draft, nil, nil, nil, nil, nil)
 
 			if dc.Tone != tt.wantTone {
 				t.Errorf("DraftContext.Tone = %q, want %q", dc.Tone, tt.wantTone)
@@ -753,12 +914,17 @@ func TestBuildDraftContext_TonePropagation(t *testing.T) {
 			if dc.Instructions != tt.wantInstructions {
 				t.Errorf("DraftContext.Instructions = %q, want %q", dc.Instructions, tt.wantInstructions)
 			}
+			// Legacy fallback: with no rich theses passed, buildDraftContext maps
+			// draft.SelectedTheses (labels) into SelectedThesisCtx com só Label.
 			if len(dc.SelectedTheses) != len(tt.wantTheses) {
 				t.Fatalf("DraftContext.SelectedTheses = %v, want %v", dc.SelectedTheses, tt.wantTheses)
 			}
 			for i, th := range tt.wantTheses {
-				if dc.SelectedTheses[i] != th {
-					t.Errorf("DraftContext.SelectedTheses[%d] = %q, want %q", i, dc.SelectedTheses[i], th)
+				if dc.SelectedTheses[i].Label != th {
+					t.Errorf("DraftContext.SelectedTheses[%d].Label = %q, want %q", i, dc.SelectedTheses[i].Label, th)
+				}
+				if dc.SelectedTheses[i].Foundation != "" || dc.SelectedTheses[i].Reference != "" {
+					t.Errorf("legacy fallback must leave rich fields empty, got %+v", dc.SelectedTheses[i])
 				}
 			}
 		})
@@ -806,8 +972,10 @@ func TestGenerateUseCase_OnGenerationRequested_ToneReachesComposer(t *testing.T)
 	if spy.gotCtx.Instructions != "cite jurisprudência recente do STJ" {
 		t.Errorf("composer got Instructions = %q, want the persisted instructions", spy.gotCtx.Instructions)
 	}
-	if len(spy.gotCtx.SelectedTheses) != 1 || spy.gotCtx.SelectedTheses[0] != "tese-prescricao" {
-		t.Errorf("composer got SelectedTheses = %v, want [tese-prescricao]", spy.gotCtx.SelectedTheses)
+	// No persisted suggested theses in this fake reader → legacy fallback maps the
+	// draft's SelectedTheses labels into SelectedThesisCtx com só Label.
+	if len(spy.gotCtx.SelectedTheses) != 1 || spy.gotCtx.SelectedTheses[0].Label != "tese-prescricao" {
+		t.Errorf("composer got SelectedTheses = %v, want [{Label:tese-prescricao}]", spy.gotCtx.SelectedTheses)
 	}
 }
 
@@ -834,7 +1002,7 @@ func (s *spyComposer) ComposeDraft(agent string, dc advisory.DraftContext) (advi
 // IntimationContext leaves the intimation fields empty (blank/processo draft path).
 func TestBuildDraftContext_NilIntimation(t *testing.T) {
 	d := &Draft{PieceType: PieceTypeMotion}
-	dc := buildDraftContext(d, nil, nil, nil)
+	dc := buildDraftContext(d, nil, nil, nil, nil, nil)
 
 	if dc.PieceType != PieceTypeMotion {
 		t.Errorf("PieceType = %q, want MOTION", dc.PieceType)
@@ -854,6 +1022,43 @@ func TestBuildDraftContext_NilIntimation(t *testing.T) {
 		if f.val != "" {
 			t.Errorf("nil intimation: %s = %q, want empty", f.name, f.val)
 		}
+	}
+}
+
+// TestBuildDraftContext_ProfileSections verifies PART B: when a GenerationProfile
+// with sections is passed, buildDraftContext copies PieceProfileKey + the ordered
+// sections into the DraftContext; a nil profile leaves ProfileSections nil (generic
+// fallback).
+func TestBuildDraftContext_ProfileSections(t *testing.T) {
+	d := &Draft{PieceType: PieceTypeDefense, PieceProfileKey: "contestacao"}
+	profile := &GenerationProfile{
+		Key:  "contestacao",
+		Nome: "Contestação",
+		Polo: "passivo",
+		Sections: []ProfileSectionInfo{
+			{Key: "preliminares", Titulo: "Das Preliminares", Ordem: 1, Obrigatoria: "condicional", Origem: "argumentativa", AceitaTeses: true},
+			{Key: "merito", Titulo: "Do Mérito", Ordem: 4, Obrigatoria: "sim", Origem: "argumentativa", AceitaTeses: true},
+			{Key: "pedidos", Titulo: "Dos Pedidos", Ordem: 5, Obrigatoria: "sim", Origem: "argumentativa", AceitaTeses: false},
+		},
+	}
+	dc := buildDraftContext(d, nil, nil, nil, profile, nil)
+	if dc.PieceProfileKey != "contestacao" {
+		t.Errorf("PieceProfileKey = %q, want contestacao", dc.PieceProfileKey)
+	}
+	if len(dc.ProfileSections) != 3 {
+		t.Fatalf("ProfileSections len = %d, want 3", len(dc.ProfileSections))
+	}
+	if dc.ProfileSections[0].Titulo != "Das Preliminares" || dc.ProfileSections[0].Obrigatoria != "condicional" {
+		t.Errorf("section[0] = %+v, want Das Preliminares/condicional", dc.ProfileSections[0])
+	}
+	if !dc.ProfileSections[1].AceitaTeses || dc.ProfileSections[2].AceitaTeses {
+		t.Errorf("aceita_teses mismatch: merito=%v pedidos=%v", dc.ProfileSections[1].AceitaTeses, dc.ProfileSections[2].AceitaTeses)
+	}
+
+	// nil profile → no sections.
+	dcNil := buildDraftContext(d, nil, nil, nil, nil, nil)
+	if dcNil.ProfileSections != nil {
+		t.Errorf("nil profile: ProfileSections = %v, want nil", dcNil.ProfileSections)
 	}
 }
 

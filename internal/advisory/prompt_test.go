@@ -182,8 +182,8 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
 
-	if out.PromptVersion != "draft_minuta/v9" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v9", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v11" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v11", out.PromptVersion)
 	}
 
 	// System must contain the gold rule (v4: parties + signing lawyer instruction).
@@ -274,8 +274,8 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
 	if !strings.Contains(out.User, "sem contexto adicional") {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
-	if out.PromptVersion != "draft_minuta/v9" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v9", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v11" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v11", out.PromptVersion)
 	}
 }
 
@@ -295,6 +295,70 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyFieldsDropped(t *testing.T) {
 	} {
 		if strings.Contains(out.User, absent) {
 			t.Errorf("user prompt should omit empty field label %q\n---\n%s", absent, out.User)
+		}
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v10_ProfileSectionsRendered verifies PART B:
+// when ProfileSections are supplied (contestação), the system prompt renders the
+// REAL section headers (Preliminares/Impugnação/Mérito/…) instead of the fixed trio,
+// with the conditional + aceita_teses rules, and instructs to OVERRIDE the generic
+// miolo.
+func TestTemplateComposer_ComposeDraft_v10_ProfileSectionsRendered(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType:       "DEFENSE",
+		PieceProfileKey: "contestacao",
+		ProfileSections: []ProfileSectionCtx{
+			{Key: "preliminares", Titulo: "Das Preliminares", Ordem: 1, Obrigatoria: "condicional", AceitaTeses: true},
+			{Key: "prejudiciais", Titulo: "Das Prejudiciais de Mérito", Ordem: 2, Obrigatoria: "condicional", AceitaTeses: true},
+			{Key: "impugnacao_especifica", Titulo: "Da Impugnação Específica dos Fatos", Ordem: 3, Obrigatoria: "sim", AceitaTeses: true},
+			{Key: "merito", Titulo: "Do Mérito", Ordem: 4, Obrigatoria: "sim", AceitaTeses: true},
+			{Key: "pedidos", Titulo: "Dos Pedidos", Ordem: 5, Obrigatoria: "sim", AceitaTeses: false},
+			{Key: "provas", Titulo: "Das Provas", Ordem: 6, Obrigatoria: "nao", AceitaTeses: false},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	// Real section titles (upper-cased) must appear in the system prompt.
+	for _, want := range []string{
+		"DAS PRELIMINARES", "DA IMPUGNAÇÃO ESPECÍFICA DOS FATOS", "DO MÉRITO", "DAS PROVAS",
+		"ESTRUTURA DO MIOLO", "SUBSTITUI os itens 5, 6 e 7",
+	} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("profile system prompt missing %q\n---\n%s", want, out.System)
+		}
+	}
+	// Conditional rule + aceita_teses guidance must be present.
+	if !strings.Contains(out.System, "CONDICIONAL") {
+		t.Errorf("profile prompt missing CONDICIONAL rule")
+	}
+	if !strings.Contains(out.System, "TESES SELECIONADAS") {
+		t.Errorf("profile prompt missing aceita_teses guidance")
+	}
+	if out.PromptVersion != "draft_minuta/v11" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v11", out.PromptVersion)
+	}
+}
+
+// TestTemplateComposer_ComposeDraft_v10_NoProfile_GenericFallback verifies that a
+// draft WITHOUT ProfileSections keeps the generic Fatos/Direito/Pedidos structure and
+// does NOT emit the profile-override block (backward-compat with legacy drafts).
+func TestTemplateComposer_ComposeDraft_v10_NoProfile_GenericFallback(t *testing.T) {
+	out, err := NewTemplateComposer().ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType: "DEFENSE",
+		// No ProfileSections.
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	if strings.Contains(out.System, "ESTRUTURA DO MIOLO") {
+		t.Errorf("no-profile prompt must NOT emit the profile-override block:\n%s", out.System)
+	}
+	// The generic canonical trio stays.
+	for _, want := range []string{"DOS FATOS", "DO DIREITO", "DOS PEDIDOS"} {
+		if !strings.Contains(out.System, want) {
+			t.Errorf("generic fallback missing %q", want)
 		}
 	}
 }
@@ -435,17 +499,22 @@ func TestTemplateComposer_ComposeDraft_InstructionsAndTheses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
-	for _, absent := range []string{"Instruções específicas", "Teses selecionadas"} {
+	for _, absent := range []string{"Instruções específicas", "TESES SELECIONADAS"} {
 		if strings.Contains(empty.User, absent) {
 			t.Errorf("empty context should omit %q section\n---\n%s", absent, empty.User)
 		}
 	}
 
-	// Both present → both sections appear with their content.
+	// v11: without a profile → theses go to the generic "DO DIREITO" section, each
+	// carrying its Fundamento/Dispositivo/Apoio nos autos.
+	theses := []SelectedThesisCtx{
+		{Label: "Prescrição intercorrente", Foundation: "Inércia do exequente por mais de 5 anos", Reference: "art. 924, V, CPC", Excerpt: "sem movimentação útil desde 2018", SourceLabel: "fls. 120"},
+		{Label: "Excesso de execução", Foundation: "Cálculo inclui juros indevidos"},
+	}
 	full, err := c.ComposeDraft(AgentDraftMinuta, DraftContext{
 		PieceType:      "DEFENSE",
 		Instructions:   "Enfatizar a boa-fé do réu.",
-		SelectedTheses: []string{"Prescrição intercorrente", "Excesso de execução"},
+		SelectedTheses: theses,
 	})
 	if err != nil {
 		t.Fatalf("ComposeDraft() error = %v", err)
@@ -453,13 +522,51 @@ func TestTemplateComposer_ComposeDraft_InstructionsAndTheses(t *testing.T) {
 	for _, want := range []string{
 		"Instruções específicas do advogado para esta minuta:",
 		"Enfatizar a boa-fé do réu.",
-		"Teses selecionadas pelo advogado",
+		"TESES SELECIONADAS pelo advogado",
+		"seção \"DO DIREITO\"",
 		"Prescrição intercorrente",
 		"Excesso de execução",
+		"Fundamento: Inércia do exequente por mais de 5 anos",
+		"Dispositivo: art. 924, V, CPC.",
+		"Apoio nos autos (fls. 120): \"sem movimentação útil desde 2018\".",
 	} {
 		if !strings.Contains(full.User, want) {
-			t.Errorf("user prompt missing %q\n---\n%s", want, full.User)
+			t.Errorf("no-profile user prompt missing %q\n---\n%s", want, full.User)
 		}
+	}
+	if strings.Contains(full.User, "II – DO DIREITO") {
+		t.Errorf("v11 must not hardcode the old \"II – DO DIREITO\" destination\n---\n%s", full.User)
+	}
+
+	// v11: WITH a profile → theses are routed across the miolo sections (no standalone
+	// "Do Direito" avulsa), still carrying Fundamento/Dispositivo/Apoio.
+	withProfile, err := c.ComposeDraft(AgentDraftMinuta, DraftContext{
+		PieceType:       "DEFENSE",
+		PieceProfileKey: "contestacao",
+		ProfileSections: []ProfileSectionCtx{
+			{Key: "preliminares", Titulo: "Das Preliminares", Ordem: 1, Obrigatoria: "condicional", AceitaTeses: true},
+			{Key: "merito", Titulo: "Do Mérito", Ordem: 2, Obrigatoria: "sim", AceitaTeses: true},
+		},
+		SelectedTheses: theses,
+	})
+	if err != nil {
+		t.Fatalf("ComposeDraft() error = %v", err)
+	}
+	for _, want := range []string{
+		"TESES SELECIONADAS pelo advogado",
+		"na seção do MIOLO onde ela se encaixa",
+		"Prescrição intercorrente",
+		"Fundamento: Inércia do exequente por mais de 5 anos",
+		"Dispositivo: art. 924, V, CPC.",
+		"Apoio nos autos (fls. 120): \"sem movimentação útil desde 2018\".",
+	} {
+		if !strings.Contains(withProfile.User, want) {
+			t.Errorf("profile user prompt missing %q\n---\n%s", want, withProfile.User)
+		}
+	}
+	// The theses block itself must NOT send them to a standalone "DO DIREITO".
+	if strings.Contains(withProfile.User, "desenvolva CADA UMA por extenso e integrada ao argumento, na seção \"DO DIREITO\"") {
+		t.Errorf("with profile, theses must route to miolo sections, not \"DO DIREITO\"\n---\n%s", withProfile.User)
 	}
 }
 
@@ -478,14 +585,14 @@ func TestTemplateComposer_ComposeTheses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComposeTheses() error = %v", err)
 	}
-	if out.PromptVersion != "suggest_theses/v2" {
-		t.Errorf("PromptVersion = %q, want suggest_theses/v2", out.PromptVersion)
+	if out.PromptVersion != "suggest_theses/v3" {
+		t.Errorf("PromptVersion = %q, want suggest_theses/v3", out.PromptVersion)
 	}
 	if strings.TrimSpace(out.System) == "" || strings.TrimSpace(out.User) == "" {
 		t.Fatalf("empty system/user: system=%q user=%q", out.System, out.User)
 	}
 	// v2: campo `evidence` obrigatório + critérios objetivos por confidence.
-	for _, want := range []string{"label", "confidence", "reference", "foundation", "evidence"} {
+	for _, want := range []string{"label", "confidence", "reference", "foundation", "evidence", "source_ref"} {
 		if !strings.Contains(out.System, want) {
 			t.Errorf("system prompt missing %q output field\n---\n%s", want, out.System)
 		}
