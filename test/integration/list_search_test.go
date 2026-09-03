@@ -199,6 +199,49 @@ func TestListProcessos_SearchEscapesWildcards(t *testing.T) {
 	}
 }
 
+// TestListIntimacoes_WorkStageAloneFiltersTotal covers the CountIntimacoes regression:
+// ?work_stage as the ONLY filter must still trigger the filtered COUNT — before the fix,
+// IntimacoesQuery.Filtered() ignored WorkStage, so the list came back correctly filtered
+// but total_count fell through to the tenant-wide shortcut (CountIntimationsByTenant),
+// silently returning the whole tenant's count instead of the stage's. This total feeds
+// the Pipeline board's per-stage counters.
+func TestListIntimacoes_WorkStageAloneFiltersTotal(t *testing.T) {
+	pool := newPool(t)
+	repo := acquisition.NewRepository(pool)
+	uc := acquisition.NewReadUseCase(repo)
+	ctx := context.Background()
+
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-work-stage-total", 0)
+
+	// Two RECEIVED (no deadline) + one AWAITING_CONFIRMATION (unconfirmed deadline) —
+	// deriveWorkStage's baseline vs. "prazo derivado, não confirmado" cases.
+	recA, caseA := seedCourtRecordCNJ(t, pool, tenantID, "0009001-11.2026.8.26.0001")
+	recB, caseB := seedCourtRecordCNJ(t, pool, tenantID, "0009002-22.2026.8.26.0002")
+	recC, caseC := seedCourtRecordCNJ(t, pool, tenantID, "0009003-33.2026.8.26.0003")
+	seedIntimationReturningID(t, pool, tenantID, caseA, recA)
+	seedIntimationReturningID(t, pool, tenantID, caseB, recB)
+	awaiting := seedIntimationReturningID(t, pool, tenantID, caseC, recC)
+	seedDeadlineFor(t, pool, tenantID, recC, awaiting, 10)
+
+	got, err := uc.Intimacoes(ctx, acquisition.IntimacoesQuery{
+		TenantID: tenantID, Limit: 20, LastMadeAvailable: maxDateLit, LastID: maxUUIDlit,
+		WorkStage: acquisition.WorkStageAwaitingConfirmation,
+	})
+	if err != nil {
+		t.Fatalf("Intimacoes (work_stage): %v", err)
+	}
+	if len(got.Items) != 1 || got.Items[0].ID != awaiting {
+		t.Fatalf("work_stage=AWAITING_CONFIRMATION: got %d items, want exactly [%s]", len(got.Items), awaiting)
+	}
+	if got.TotalCount != 1 {
+		t.Errorf("total_count = %d, want 1 (filtered by work_stage, not the tenant-wide 3)", got.TotalCount)
+	}
+	if got.Total != 3 {
+		t.Errorf("total = %d, want 3 (global, unfiltered)", got.Total)
+	}
+}
+
 // seedIntimationFor inserts one intimation for the record (no discovering window —
 // sync_run_id stays NULL), enough for the inbox read and its counts.
 func seedIntimationFor(t *testing.T, pool *pgxpool.Pool, tenantID, caseID, recordID string) {

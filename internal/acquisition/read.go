@@ -430,7 +430,7 @@ type IntimacoesQuery struct {
 
 // Filtered reports whether any list filter (search included) is active.
 func (q IntimacoesQuery) Filtered() bool {
-	return q.Search != "" || q.Type != "" || q.UserStatus != "" || q.Court != "" || q.Urgencia != "" || q.NaoConfirmado || q.Assignee != ""
+	return q.Search != "" || q.Type != "" || q.UserStatus != "" || q.Court != "" || q.Urgencia != "" || q.NaoConfirmado || q.Assignee != "" || q.WorkStage != ""
 }
 
 // AndamentosQuery carries the descending keyset cursor (the last row's occurred_at

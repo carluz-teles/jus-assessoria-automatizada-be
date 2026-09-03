@@ -323,6 +323,40 @@ func TestProcessosQuery_Filtered(t *testing.T) {
 	}
 }
 
+// An IntimacoesQuery is "filtered" when any selectable option — including work_stage —
+// is set; the counter then needs the filtered COUNT instead of the tenant-wide shortcut.
+// Regression: work_stage alone used to fall through Filtered() as false, so
+// GET /v1/intimacoes?work_stage=X returned a correctly filtered list but a total_count
+// for the whole tenant (feeds the Pipeline board's per-stage counts).
+func TestIntimacoesQuery_Filtered(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		q    IntimacoesQuery
+		want bool
+	}{
+		{"none", IntimacoesQuery{}, false},
+		{"search", IntimacoesQuery{Search: "x"}, true},
+		{"type", IntimacoesQuery{Type: IntimationTypeIntimacao}, true},
+		{"user_status", IntimacoesQuery{UserStatus: IntimationUserStatusPending}, true},
+		{"court", IntimacoesQuery{Court: "TJSP"}, true},
+		{"urgencia", IntimacoesQuery{Urgencia: UrgenciaAtraso}, true},
+		{"nao_confirmado", IntimacoesQuery{NaoConfirmado: true}, true},
+		{"assignee", IntimacoesQuery{Assignee: "u-1"}, true},
+		{"work_stage", IntimacoesQuery{WorkStage: WorkStageAwaitingConfirmation}, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tc.q.Filtered(); got != tc.want {
+				t.Errorf("Filtered() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // Processo (the deep-link) is a plain delegation: it forwards (tenant, id) verbatim to
 // the repo and returns the canned ProcessoView untouched (no pagination policy).
 func TestReadUseCase_Processo_ForwardsAndReturnsView(t *testing.T) {
