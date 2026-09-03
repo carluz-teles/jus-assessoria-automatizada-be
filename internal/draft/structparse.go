@@ -38,6 +38,7 @@ func ParseStructured(content string) *StructuredContent {
 	}
 
 	var current *StructuredSection
+	seen := map[string]bool{} // garante ids únicos na peça (stableSectionID)
 	for _, p := range paragraphs {
 		first := firstLine(p)
 		if m := headingRE.FindStringSubmatch(first); m != nil {
@@ -46,7 +47,7 @@ func ParseStructured(content string) *StructuredContent {
 			title := strings.TrimSpace(m[2])
 			title = normalizeTitle(title)
 			sec := StructuredSection{
-				ID:         slugTitle(title),
+				ID:         stableSectionID(roman, len(out.Sections)+1, seen),
 				Roman:      roman,
 				Title:      title,
 				ShortTitle: shortTitleOf(title),
@@ -101,30 +102,6 @@ func normalizeTitle(t string) string {
 	return strings.TrimSpace(t)
 }
 
-// slugTitle converts "Dos fatos" → "fatos", "Do direito" → "direito", stripping
-// articles and lowercasing. Falls back to the whole slug for exotic titles.
-// The FE's slugTitle uses the same rule so IDs match across both sides.
-func slugTitle(title string) string {
-	base := shortTitleOf(title)
-	base = strings.ToLower(base)
-	base = removeDiacritics(base)
-	// Only [a-z0-9] survives; runs of separators collapse to a single dash.
-	var b strings.Builder
-	prevDash := false
-	for _, r := range base {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-			prevDash = false
-			continue
-		}
-		if !prevDash {
-			b.WriteByte('-')
-			prevDash = true
-		}
-	}
-	return strings.Trim(b.String(), "-")
-}
-
 // shortTitleOf strips the leading article ("Dos fatos" → "Fatos") for chip
 // display. Case-insensitive.
 func shortTitleOf(title string) string {
@@ -136,19 +113,4 @@ func shortTitleOf(title string) string {
 		}
 	}
 	return trimmed
-}
-
-// removeDiacritics folds "ç" → "c", "á" → "a", etc. Minimal table covering
-// Portuguese; the slug never surfaces to the user (only in URLs / chip keys)
-// so completeness isn't critical.
-func removeDiacritics(s string) string {
-	repl := strings.NewReplacer(
-		"á", "a", "à", "a", "ã", "a", "â", "a", "ä", "a",
-		"é", "e", "è", "e", "ê", "e", "ë", "e",
-		"í", "i", "ì", "i", "î", "i", "ï", "i",
-		"ó", "o", "ò", "o", "õ", "o", "ô", "o", "ö", "o",
-		"ú", "u", "ù", "u", "û", "u", "ü", "u",
-		"ç", "c",
-	)
-	return repl.Replace(s)
 }

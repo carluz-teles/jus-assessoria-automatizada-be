@@ -97,3 +97,48 @@ func TestParseHTMLToStructured_NoHeading(t *testing.T) {
 		}
 	}
 }
+
+// TestStableSectionID cobre o id estável: romano em minúsculo, fallback por
+// posição sem romano OU em colisão, e UNICIDADE garantida (o byID map do
+// /iterate colidiria com ids repetidos).
+func TestStableSectionID(t *testing.T) {
+	t.Parallel()
+	seen := map[string]bool{}
+	cases := []struct {
+		roman string
+		ord   int
+		want  string
+	}{
+		{"I", 1, "i"},         // romano → minúsculo
+		{"II", 2, "ii"},       // idem
+		{"I", 3, "s3"},        // romano repetido → cai na posição (unicidade)
+		{"", 4, "s4"},         // sem romano → posição
+		{"  iii  ", 5, "iii"}, // trim + lower
+	}
+	for _, c := range cases {
+		if got := stableSectionID(c.roman, c.ord, seen); got != c.want {
+			t.Errorf("stableSectionID(%q,%d) = %q, want %q", c.roman, c.ord, got, c.want)
+		}
+	}
+	// Todos os ids gerados devem ser distintos.
+	if len(seen) != len(cases) {
+		t.Errorf("ids colidiram: seen=%v (esperado %d únicos)", seen, len(cases))
+	}
+}
+
+// TestParseHTMLToStructured_DuplicateRomanUniqueIDs prova que dois headings com o
+// MESMO romano não geram ids repetidos (o segundo cai na posição).
+func TestParseHTMLToStructured_DuplicateRomanUniqueIDs(t *testing.T) {
+	t.Parallel()
+	htmlStr := "<h2>I – DAS PRELIMINARES</h2><p>a</p><h2>I – OUTRA</h2><p>b</p>"
+	got := parseHTMLToStructured(htmlStr)
+	if got == nil || len(got.Sections) != 2 {
+		t.Fatalf("sections = %v", got)
+	}
+	if got.Sections[0].ID == got.Sections[1].ID {
+		t.Errorf("ids repetidos: %q e %q", got.Sections[0].ID, got.Sections[1].ID)
+	}
+	if got.Sections[0].ID != "i" || got.Sections[1].ID != "s2" {
+		t.Errorf("ids = %q,%q, want i,s2", got.Sections[0].ID, got.Sections[1].ID)
+	}
+}

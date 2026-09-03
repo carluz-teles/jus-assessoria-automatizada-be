@@ -62,10 +62,10 @@ func TestParseStructured_FullDefesa(t *testing.T) {
 		t.Fatalf("sections = %d, want 3", len(got.Sections))
 	}
 
-	// Section I
+	// Section I — id ESTÁVEL = romano em minúsculo ("i"), não o slug do título.
 	s := got.Sections[0]
-	if s.Roman != "I" || s.Title != "Dos fatos" || s.ShortTitle != "fatos" || s.ID != "fatos" {
-		t.Errorf("section[0] = %+v, want Roman=I Title='Dos fatos' Short='fatos' ID='fatos'", s)
+	if s.Roman != "I" || s.Title != "Dos fatos" || s.ShortTitle != "fatos" || s.ID != "i" {
+		t.Errorf("section[0] = %+v, want Roman=I Title='Dos fatos' Short='fatos' ID='i'", s)
 	}
 	if len(s.Paragraphs) != 2 {
 		t.Errorf("section[0].paragraphs = %d, want 2", len(s.Paragraphs))
@@ -73,14 +73,14 @@ func TestParseStructured_FullDefesa(t *testing.T) {
 
 	// Section II
 	s = got.Sections[1]
-	if s.Roman != "II" || s.Title != "Do direito" || s.ShortTitle != "direito" {
-		t.Errorf("section[1] = %+v", s)
+	if s.Roman != "II" || s.Title != "Do direito" || s.ShortTitle != "direito" || s.ID != "ii" {
+		t.Errorf("section[1] = %+v, want ID='ii'", s)
 	}
 
 	// Section III
 	s = got.Sections[2]
-	if s.Roman != "III" || s.Title != "Dos pedidos" || s.ShortTitle != "pedidos" {
-		t.Errorf("section[2] = %+v", s)
+	if s.Roman != "III" || s.Title != "Dos pedidos" || s.ShortTitle != "pedidos" || s.ID != "iii" {
+		t.Errorf("section[2] = %+v, want ID='iii'", s)
 	}
 }
 

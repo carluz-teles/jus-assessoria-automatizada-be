@@ -58,6 +58,7 @@ func parseHTMLToStructured(htmlStr string) *StructuredContent {
 	preamble := StructuredPreamble{}
 	var sections []StructuredSection
 	var current *StructuredSection
+	seen := map[string]bool{} // garante ids únicos na peça (stableSectionID)
 
 	var visit func(n *html.Node)
 	visit = func(n *html.Node) {
@@ -72,7 +73,7 @@ func parseHTMLToStructured(htmlStr string) *StructuredContent {
 		case "h1", "h2", "h3":
 			text := strings.TrimSpace(nodeText(n))
 			roman, title := parseSectionHeading(text)
-			id := slugForSection(title, roman, len(sections)+1)
+			id := stableSectionID(roman, len(sections)+1, seen)
 			shortTitle := shortTitleFromTitle(title, roman)
 			sections = append(sections, StructuredSection{
 				ID:         id,
@@ -90,7 +91,7 @@ func parseHTMLToStructured(htmlStr string) *StructuredContent {
 			if tag == "p" {
 				if m := headingRE.FindStringSubmatch(text); m != nil {
 					roman, title := m[1], strings.TrimSpace(m[2])
-					id := slugForSection(title, roman, len(sections)+1)
+					id := stableSectionID(roman, len(sections)+1, seen)
 					shortTitle := shortTitleFromTitle(title, roman)
 					sections = append(sections, StructuredSection{
 						ID:         id,
@@ -185,24 +186,19 @@ func isBlockTag(tag string) bool {
 	return false
 }
 
-func slugForSection(title, roman string, ord int) string {
-	base := strings.ToLower(strings.TrimSpace(title))
-	if base == "" {
-		base = strings.ToLower(roman)
+// stableSectionID gera o id ESTÁVEL de uma seção: o algarismo romano em minúsculo
+// ("i", "ii", "iii", "iv") — que NÃO muda se o título da seção for editado entre
+// gerações — com fallback pela POSIÇÃO ("s1", "s2"…) quando não há romano OU
+// quando aquele romano já foi usado nesta peça. `seen` garante unicidade (a
+// posição `ord` é sempre única no passe de parse), o que os consumidores exigem
+// (o byID map do /iterate colidiria silenciosamente com ids repetidos).
+func stableSectionID(roman string, ord int, seen map[string]bool) string {
+	id := strings.ToLower(strings.TrimSpace(roman))
+	if id == "" || seen[id] {
+		id = "s" + itoa(ord)
 	}
-	base = strings.ReplaceAll(base, " ", "-")
-	// remove acentos simples: só ASCII
-	var sb strings.Builder
-	for _, r := range base {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			sb.WriteRune(r)
-		}
-	}
-	out := sb.String()
-	if out == "" {
-		return "s" + itoa(ord)
-	}
-	return out
+	seen[id] = true
+	return id
 }
 
 func shortTitleFromTitle(title, roman string) string {
