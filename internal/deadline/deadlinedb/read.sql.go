@@ -1173,7 +1173,6 @@ LEFT JOIN LATERAL (
 ) p ON true
 LEFT JOIN court_record cr ON cr.id = t.court_record_id
 LEFT JOIN draft d ON d.task_id = t.id AND d.superseded_at IS NULL
-LEFT JOIN action_item ai ON ai.id = t.action_item_id
 WHERE t.tenant_id = $1::uuid
   AND t.status <> 'DISMISSED'
   AND ($2::text = '' OR t.status = $2::text)
@@ -1182,10 +1181,9 @@ WHERE t.tenant_id = $1::uuid
   AND ($5::uuid IS NULL OR t.intimation_id = $5::uuid)
   AND ($6::date IS NULL OR t.due_date >= $6::date)
   AND ($7::date IS NULL OR t.due_date <= $7::date)
-  AND ($8::bool = false OR d.id IS NOT NULL OR t.kind = 'PECA' OR ai.gera_peca = true)
-  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($9::date, $10::uuid)
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($8::date, $9::uuid)
 ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
-LIMIT $11
+LIMIT $10
 `
 
 type ListTasksParams struct {
@@ -1196,7 +1194,6 @@ type ListTasksParams struct {
 	IntimationID pgtype.UUID `json:"intimation_id"`
 	FromDate     pgtype.Date `json:"from_date"`
 	ToDate       pgtype.Date `json:"to_date"`
-	PipelineOnly bool        `json:"pipeline_only"`
 	LastDue      pgtype.Date `json:"last_due"`
 	LastID       uuid.UUID   `json:"last_id"`
 	PageLimit    int32       `json:"page_limit"`
@@ -1239,10 +1236,8 @@ type ListTasksRow struct {
 // excluded (a dispensada task is out of the agenda, not just out of the cockpit derivation).
 // draft_id/sent_to_signing_at/filed_at come from a LEFT JOIN on the task's VIGENTE draft
 // (superseded_at IS NULL — draft_task_id_uidx, migration 0089, guarantees at most one such
-// row per task), and gera_peca (via action_item, LEFT JOIN on task.action_item_id) — the
-// ingredients read.go's derivePipelineStage turns into pipeline_stage. @pipeline_only (bool)
-// restricts to "peça-bound" tasks (has a draft, OR kind='PECA', OR the providência gera_peca)
-// when true; false (the default) leaves every non-DISMISSED task in.
+// row per task) — the ingredients read.go's deriveTaskStage turns into the 4-stage stage
+// (A_FAZER|ELABORACAO|REVISAO|CONCLUIDA), together with the task's own status.
 func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error) {
 	rows, err := q.db.Query(ctx, listTasks,
 		arg.TenantID,
@@ -1252,7 +1247,6 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTas
 		arg.IntimationID,
 		arg.FromDate,
 		arg.ToDate,
-		arg.PipelineOnly,
 		arg.LastDue,
 		arg.LastID,
 		arg.PageLimit,
