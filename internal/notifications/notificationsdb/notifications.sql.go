@@ -40,7 +40,7 @@ func (q *Queries) CountUnread(ctx context.Context, arg CountUnreadParams) (int64
 }
 
 const findDeliveryByProviderMessageID = `-- name: FindDeliveryByProviderMessageID :one
-SELECT id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at FROM notification_delivery
+SELECT id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at, motivo, seen_at, archived_at FROM notification_delivery
 WHERE provider_message_id = $1
 LIMIT 1
 `
@@ -63,6 +63,9 @@ func (q *Queries) FindDeliveryByProviderMessageID(ctx context.Context, providerM
 		&i.Error,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Motivo,
+		&i.SeenAt,
+		&i.ArchivedAt,
 	)
 	return i, err
 }
@@ -133,7 +136,7 @@ const insertDelivery = `-- name: InsertDelivery :one
 INSERT INTO notification_delivery (
     notification_id, tenant_id, channel, status, provider_message_id, error
 ) VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at
+RETURNING id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at, motivo, seen_at, archived_at
 `
 
 type InsertDeliveryParams struct {
@@ -169,6 +172,9 @@ func (q *Queries) InsertDelivery(ctx context.Context, arg InsertDeliveryParams) 
 		&i.Error,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Motivo,
+		&i.SeenAt,
+		&i.ArchivedAt,
 	)
 	return i, err
 }
@@ -178,7 +184,7 @@ const insertNotification = `-- name: InsertNotification :one
 INSERT INTO notification (
     tenant_id, recipient_user_id, type, title, body, payload, status
 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, tenant_id, recipient_user_id, type, payload, status, created_at, title, body
+RETURNING id, tenant_id, recipient_user_id, type, payload, status, created_at, title, body, severidade, group_key, expires_at, source_kind, source_id, source_event_id, court_case_id
 `
 
 type InsertNotificationParams struct {
@@ -221,6 +227,13 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		&i.CreatedAt,
 		&i.Title,
 		&i.Body,
+		&i.Severidade,
+		&i.GroupKey,
+		&i.ExpiresAt,
+		&i.SourceKind,
+		&i.SourceID,
+		&i.SourceEventID,
+		&i.CourtCaseID,
 	)
 	return i, err
 }
@@ -437,7 +450,7 @@ UPDATE notification_delivery
        updated_at = now()
  WHERE id = $1
    AND tenant_id = $2
-RETURNING id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at
+RETURNING id, notification_id, tenant_id, channel, status, provider_message_id, error, created_at, updated_at, motivo, seen_at, archived_at
 `
 
 type UpdateDeliveryStatusParams struct {
@@ -471,6 +484,9 @@ func (q *Queries) UpdateDeliveryStatus(ctx context.Context, arg UpdateDeliverySt
 		&i.Error,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Motivo,
+		&i.SeenAt,
+		&i.ArchivedAt,
 	)
 	return i, err
 }

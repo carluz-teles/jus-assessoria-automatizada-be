@@ -538,6 +538,13 @@ type Notification struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	Title           *string            `json:"title"`
 	Body            *string            `json:"body"`
+	Severidade      string             `json:"severidade"`
+	GroupKey        *string            `json:"group_key"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	SourceKind      *string            `json:"source_kind"`
+	SourceID        pgtype.UUID        `json:"source_id"`
+	SourceEventID   *string            `json:"source_event_id"`
+	CourtCaseID     pgtype.UUID        `json:"court_case_id"`
 }
 
 type NotificationDelivery struct {
@@ -550,6 +557,9 @@ type NotificationDelivery struct {
 	Error             *string            `json:"error"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	Motivo            *string            `json:"motivo"`
+	SeenAt            pgtype.Timestamptz `json:"seen_at"`
+	ArchivedAt        pgtype.Timestamptz `json:"archived_at"`
 }
 
 type NotificationPreference struct {
@@ -723,6 +733,15 @@ type SectionRule struct {
 	ID                uuid.UUID `json:"id"`
 	ProfileSectionID  uuid.UUID `json:"profile_section_id"`
 	ComplianceRuleKey string    `json:"compliance_rule_key"`
+}
+
+type SeenMarker struct {
+	ID         uuid.UUID          `json:"id"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	AppUserID  uuid.UUID          `json:"app_user_id"`
+	EscopoKind string             `json:"escopo_kind"`
+	EscopoID   uuid.UUID          `json:"escopo_id"`
+	LastSeenAt pgtype.Timestamptz `json:"last_seen_at"`
 }
 
 type SegmentAnchor struct {

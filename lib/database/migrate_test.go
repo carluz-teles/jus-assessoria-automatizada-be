@@ -367,8 +367,13 @@ func TestEmbeddedSource(t *testing.T) {
 	if next, err := src.Next(95); err != nil || next != 96 {
 		t.Fatalf("Next(95) = (%d, %v), want (96, nil)", next, err)
 	}
-	if _, err := src.Next(96); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(96) error = %v, want fs.ErrNotExist", err)
+	// The alerts schema-extension slice adds 97 (notification/notification_delivery
+	// alert columns + seen_marker) — 97 is the last — nothing follows it.
+	if next, err := src.Next(96); err != nil || next != 97 {
+		t.Fatalf("Next(96) = (%d, %v), want (97, nil)", next, err)
+	}
+	if _, err := src.Next(97); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(97) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

@@ -147,6 +147,27 @@ type Notification struct {
 	// ReadAt lived here in slice 1a as a tenant-wide flag; read state is now per-user
 	// (the notification_read table, migration 0018), so it is off the aggregate.
 	CreatedAt time.Time
+
+	// Severidade classifies the aviso for display/triage: info | atencao | critico
+	// (migration 0097, the Alertas schema evolution). Defaults to "info" in the DB;
+	// nothing in this slice sets it yet (a later fatia wires routing/severity).
+	Severidade string
+	// GroupKey clusters related avisos (e.g. same prazo firing more than once) so a
+	// future UI can collapse them. "" stands in for SQL NULL (ungrouped).
+	GroupKey string
+	// ExpiresAt is when the aviso stops being actionable/relevant. nil stands in for
+	// SQL NULL (no expiry).
+	ExpiresAt *time.Time
+	// SourceKind/SourceID identify the domain object that triggered the aviso (e.g.
+	// "deadline"/<deadline id>). "" stands in for SQL NULL (no source recorded).
+	SourceKind string
+	SourceID   string
+	// SourceEventID is the producing event's id, unique when set — the DB-level
+	// idempotency floor for alert generation. "" stands in for SQL NULL.
+	SourceEventID string
+	// CourtCaseID links the aviso to a processo when applicable. "" stands in for
+	// SQL NULL (no linked processo).
+	CourtCaseID string
 }
 
 // NotificationPreference is one user's saved channel override for one aviso type
@@ -178,4 +199,29 @@ type NotificationDelivery struct {
 	Error             string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+
+	// Motivo records why this delivery ended up in its current state (e.g. a
+	// human-readable dedup/suppression reason), distinct from Error which is
+	// specifically the FAILED/BOUNCED/COMPLAINED failure reason. "" stands in for
+	// SQL NULL (migration 0097, the Alertas schema evolution).
+	Motivo string
+	// SeenAt/ArchivedAt are per-delivery viewer state (seen in an inbox, archived by
+	// the recipient). nil stands in for SQL NULL (not seen / not archived).
+	SeenAt     *time.Time
+	ArchivedAt *time.Time
+}
+
+// SeenMarker records the last time a user saw a given scope (e.g. an inbox or a
+// processo's alert feed), so unread/new counts can be computed without a per-item
+// read table. EscopoKind + EscopoID name the scope (e.g. "inbox"/"" or
+// "court_case"/<id>); LastSeenAt is bumped every time the user opens that scope.
+// One row per (TenantID, AppUserID, EscopoKind, EscopoID) — see the UNIQUE
+// constraint in migration 0097.
+type SeenMarker struct {
+	ID         string
+	TenantID   string
+	AppUserID  string
+	EscopoKind string
+	EscopoID   string
+	LastSeenAt time.Time
 }
