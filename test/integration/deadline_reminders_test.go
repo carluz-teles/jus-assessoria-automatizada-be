@@ -113,8 +113,11 @@ func TestDeadline_Observed_SchedulesReminderAndMissedChecks(t *testing.T) {
 	}
 }
 
-// DR2: a fired reminder_check on a still-active (PENDING) prazo emits exactly one
-// deadline.due_soon — IMMEDIATE (process_at NULL) — carrying the days_left through.
+// DR2: a fired reminder_check on a still-active (PENDING or OPEN — either is non-terminal)
+// prazo emits exactly one deadline.due_soon — IMMEDIATE (process_at NULL) — carrying the
+// days_left through. Uses the default seletiva policy, so this fixture is actually born OPEN
+// (this fix); OnReminderCheck treats PENDING and OPEN identically (both "active"), so which
+// one it is does not matter here — see TestOnReminderCheck_ReChecksStatus (unit) for both.
 func TestDeadline_ReminderCheck_ActiveEmitsDueSoon(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
@@ -259,11 +262,15 @@ func TestDeadline_MissedCheck_OpenOverdueMarksMissed(t *testing.T) {
 }
 
 // DR5: the carência on a still-PENDING (unconfirmed) prazo is a pure no-op — a prazo that
-// was never confirmed is never auto-missed (decisão travada: MISSED SÓ em OPEN).
+// was never confirmed is never auto-missed (decisão travada: MISSED SÓ em OPEN). Seeds an
+// obrigatoria policy so the prazo is DETERMINISTICALLY born PENDING (not the default
+// seletiva's auto-OPEN — see TestDeadline_Observed_DerivesOpenDeadlineAndEvent), because this
+// test's whole point is proving the carência guard on a genuinely-PENDING row.
 func TestDeadline_MissedCheck_PendingNoOp(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	seedObrigatoriaPolicy(ctx, t, pool, p.tenantID)
 	uc := newDeadlineUCAt(pool, deadlineTestNow)
 
 	obs := observedFor(p, uuid.NewString(), "INTIMACAO", "TJSP", "SP", "2024-03-04")

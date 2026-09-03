@@ -1,7 +1,9 @@
 // Package deadline is the prazos slice: the CREATION path of a legal deadline. Its
 // listener consumes acquisition.intimation.observed, derives the prazo
-// DETERMINISTICALLY (rules layer → lib/calendar), and persists it born PENDING while
-// emitting deadline.opened — all in one idempotent, tenant-scoped transaction.
+// DETERMINISTICALLY (rules layer → lib/calendar), and persists it born PENDING —
+// or already OPEN when confirmacao_exigida is false (the system assumed it, emitting
+// deadline.assumed alongside) — while always emitting deadline.opened, all in one
+// idempotent, tenant-scoped transaction.
 //
 // It is a vertical slice: it talks to acquisition ONLY by event contract (it imports
 // the produced type's const, never acquisition's entity/repo), and it never touches
@@ -13,7 +15,9 @@ import "time"
 // Deadline is the legal countdown derived from an intimação — the product's core fact
 // (docs/erd-prazos.md §1). It anchors on a court_record (FK) and is 1:1 with the
 // intimação (the notification_id UNIQUE column). A rule-derived prazo is BORN PENDING
-// (a suggestion) and only becomes OPEN on the human F2 confirmation (a later slice);
+// (a suggestion awaiting the human F2 confirmation) UNLESS the system already decided
+// no confirmation is needed (ConfirmacaoExigida=false), in which case it is BORN OPEN
+// directly — counting, entering alerts, without waiting on a manual click. Either way,
 // the calendar math (EndDate, HolidaysApplied) is deterministic and auditable, so
 // "por que dia 14 e não 12?" is answerable from the row.
 //
@@ -113,7 +117,7 @@ type DeadlineEvent struct {
 	ID         string
 	TenantID   string
 	DeadlineID string
-	Tipo       string // calculado | validado | confirmado | recalculado | em_risco | cumprido | override
+	Tipo       string // calculado | assumido | validado | confirmado | recalculado | em_risco | cumprido | override
 	Detalhe    string
 	AtorID     string
 	Em         time.Time
@@ -139,8 +143,12 @@ const (
 )
 
 // Status is the prazo lifecycle, a closed set the DB CHECK (0024) also enforces. A
-// rule-derived prazo is born PENDING; the confirmation/revocation/expiry transitions
-// are later slices — this slice only ever writes PENDING.
+// rule-derived prazo is born PENDING (awaiting human confirmation) UNLESS
+// confirmacao_exigida is already false (seal=confiavel, tenant policy seletiva) — the
+// system already decided no human is needed, so it is born OPEN directly, skipping the
+// PENDING→OPEN manual confirm step. A prazo born already past its D+1 carência is born
+// MISSED instead, regardless of confirmacao_exigida (see OnIntimationObserved). The
+// remaining transitions (revocation/expiry/met) are later slices.
 type Status string
 
 const (

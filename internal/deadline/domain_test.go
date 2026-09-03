@@ -162,11 +162,12 @@ type mockRepo struct {
 	insertActivityErr   error
 
 	// V1 audit trail capture
-	gotCalcMemory      *CalcMemory
-	gotCrossValidation *CrossValidation
-	gotDeadlineEvent   *DeadlineEvent
-	gotAppliedHolidays []*AppliedHoliday
-	policy             DeadlinePolicy
+	gotCalcMemory          *CalcMemory
+	gotCrossValidation     *CrossValidation
+	gotDeadlineEvent       *DeadlineEvent   // the LAST InsertDeadlineEvent call (back-compat single-insert flows)
+	insertedDeadlineEvents []*DeadlineEvent // every InsertDeadlineEvent call, in order (multi-insert creation flow)
+	gotAppliedHolidays     []*AppliedHoliday
+	policy                 DeadlinePolicy
 
 	// V1 apuração (apurar.go): ApurarDivergencia/ApurarTipo repo doubles
 	crossValidation              *CrossValidation
@@ -677,9 +678,13 @@ func (m *mockRepo) InsertCrossValidation(_ context.Context, _ database.Tx, cv *C
 	return cv, nil
 }
 
-// InsertDeadlineEvent is a V1 stub — captures the event for assertion.
+// InsertDeadlineEvent is a V1 stub — captures the event for assertion. gotDeadlineEvent
+// keeps the LAST call (the single-insert apuração flows read this); insertedDeadlineEvents
+// accumulates every call in order (the creation flow can insert more than one — calculado
+// + assumido).
 func (m *mockRepo) InsertDeadlineEvent(_ context.Context, _ database.Tx, e *DeadlineEvent) error {
 	m.gotDeadlineEvent = e
+	m.insertedDeadlineEvents = append(m.insertedDeadlineEvents, e)
 	return nil
 }
 
@@ -910,11 +915,19 @@ func cancelledFixture() IntimationCancelled {
 
 // --- tests ------------------------------------------------------------------
 
-// TestOnIntimationObserved_DerivesPendingRuleDeadline is the happy path: a CITACAO on a
-// cível court derives a CONTESTACAO/15/BUSINESS prazo, born PENDING + source RULE +
-// unconfirmed, computed via AddBusinessDays with the event's UF/court, and emits exactly
-// one deadline.opened whose aggregate is the new deadline id.
-func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
+// TestOnIntimationObserved_DerivesOpenRuleDeadline is the happy path: a CITACAO on a
+// cível court derives a CONTESTACAO/15/BUSINESS prazo, source RULE, computed via
+// AddBusinessDays with the event's UF/court, and emits exactly one deadline.opened whose
+// aggregate is the new deadline id. This scenario's confirmacao_exigida is false
+// (selo=confiável, política seletiva — the mockRepo default) and the prazo is not born
+// overdue, so it is born OPEN directly — the fix this test locks in: the engine used to
+// hardcode PENDING here regardless of confirmacao_exigida, stranding the prazo until a
+// manual click the policy had already decided was unnecessary. It also emits
+// deadline.assumed and records the "assumido" audit marker (see
+// TestOnIntimationObserved_OverdueBornMissed for the born-MISSED counterpart, which
+// emits neither, and TestOnIntimationObserved_ConfirmacaoExigida_PolicyObrigatoria for
+// the born-PENDING counterpart, confirmacao_exigida=true).
+func TestOnIntimationObserved_DerivesOpenRuleDeadline(t *testing.T) {
 	ev := observedFixture()
 	deadlineID := uuid.NewString()
 	holiday := time.Date(2024, 1, 25, 0, 0, 0, 0, time.UTC)
@@ -923,7 +936,7 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 	repo := &mockRepo{class: "Procedimento Comum Cível", rule: citacaoRule(), insertID: deadlineID}
 	cal := &fakeCalendar{endDate: end, holidays: []time.Time{holiday}}
 	outbox := &fakeOutbox{}
-	// Relógio ANTES do fim do prazo → nasce PENDING (o born-MISSED só vale depois da
+	// Relógio ANTES do fim do prazo → não nasce MISSED (o born-MISSED só vale depois da
 	// carência D+1 — ver TestOnIntimationObserved_OverdueBornMissed).
 	uc := NewUseCase(repo, cal, outbox, &fakeDedup{}, &fakeUOW{},
 		WithClock(func() time.Time { return time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC) }))
@@ -937,8 +950,11 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 	if d == nil {
 		t.Fatal("expected a deadline to be inserted")
 	}
-	if d.Status != StatusPending {
-		t.Errorf("Status = %q, want PENDING (born as a suggestion)", d.Status)
+	if d.ConfirmacaoExigida {
+		t.Fatal("confirmacao_exigida = true, want false (selo=confiável, política seletiva — precondition of this test)")
+	}
+	if d.Status != StatusOpen {
+		t.Errorf("Status = %q, want OPEN (confirmacao_exigida=false, not overdue: the system assumes it)", d.Status)
 	}
 	if d.Source != SourceRule {
 		t.Errorf("Source = %q, want RULE", d.Source)
@@ -998,6 +1014,44 @@ func TestOnIntimationObserved_DerivesPendingRuleDeadline(t *testing.T) {
 	}
 	if opened.Kind != KindContestacao || opened.EndDate != "2024-02-06" || opened.Counting != "BUSINESS" {
 		t.Errorf("opened kind/end/counting = %q/%q/%q", opened.Kind, opened.EndDate, opened.Counting)
+	}
+
+	// deadline.assumed: emitted exactly once, since this prazo was born OPEN, not MISSED.
+	assumeds := publishedOfType[DeadlineAssumed](outbox)
+	if len(assumeds) != 1 {
+		t.Fatalf("deadline.assumed publicados = %d, want 1", len(assumeds))
+	}
+	assumed := assumeds[0]
+	if assumed.Type() != TypeDeadlineAssumed || assumed.AggregateType() != aggregateTypeDeadline {
+		t.Errorf("assumed event type/aggregate = %q/%q", assumed.Type(), assumed.AggregateType())
+	}
+	if assumed.AggregateID() != deadlineID || assumed.DeadlineID != deadlineID {
+		t.Errorf("assumed deadline id = %q/%q, want %q", assumed.AggregateID(), assumed.DeadlineID, deadlineID)
+	}
+	if assumed.EndDate != "2024-02-06" {
+		t.Errorf("assumed.EndDate = %q, want 2024-02-06", assumed.EndDate)
+	}
+
+	// No deadline.confirmation_required — the two are mutually exclusive per creation.
+	if n := len(publishedOfType[DeadlineConfirmationRequired](outbox)); n != 0 {
+		t.Errorf("deadline.confirmation_required publicados = %d, want 0 (confirmacao_exigida=false)", n)
+	}
+
+	// The audit trail carries both "calculado" and "assumido" rows.
+	var gotCalculado, gotAssumido bool
+	for _, e := range repo.insertedDeadlineEvents {
+		if e.DeadlineID != deadlineID {
+			t.Errorf("deadline_event.deadline_id = %q, want %q", e.DeadlineID, deadlineID)
+		}
+		switch e.Tipo {
+		case "calculado":
+			gotCalculado = true
+		case "assumido":
+			gotAssumido = true
+		}
+	}
+	if !gotCalculado || !gotAssumido {
+		t.Errorf("deadline_event tipos = %+v, want both calculado and assumido", repo.insertedDeadlineEvents)
 	}
 }
 
@@ -1078,9 +1132,14 @@ func TestOnIntimationObserved_ComunicacaoIsNoOp(t *testing.T) {
 
 // TestOnIntimationObserved_OverdueBornMissed cobre o "prazo órfão" do backfill: quando a
 // intimação é histórica e o prazo já NASCE vencido (a carência D+1 já passou no now da
-// criação), ele nasce MISSED — não PENDING — senão o missed_check (agendado só para ETAs
-// futuras em scheduleChecks) nunca é enfileirado e o prazo ficaria PENDING para sempre. É
-// silencioso: emite só deadline.opened, nunca um deadline.missed nem checks agendados.
+// criação), ele nasce MISSED — não PENDING nem OPEN — senão o missed_check (agendado só
+// para ETAs futuras em scheduleChecks) nunca é enfileirado e o prazo ficaria PENDING/OPEN
+// para sempre. É silencioso: emite só deadline.opened, nunca um deadline.missed nem checks
+// agendados — e, apesar de confirmacao_exigida=false neste cenário (seal=confiavel,
+// policy=seletiva), também NUNCA deadline.assumed nem o marcador "assumido": um prazo
+// nascido MISSED nunca esteve OPEN, então o sistema não "assumiu" nada — mirrora como
+// deadline.opened já trata esse mesmo caso hoje (o MISSED override vence sobre o branch
+// OPEN, ver OnIntimationObserved).
 func TestOnIntimationObserved_OverdueBornMissed(t *testing.T) {
 	ev := observedFixture()
 	end := time.Date(2024, 2, 6, 0, 0, 0, 0, time.UTC)
@@ -1102,19 +1161,29 @@ func TestOnIntimationObserved_OverdueBornMissed(t *testing.T) {
 	if repo.inserted.Status != StatusMissed {
 		t.Errorf("Status = %q, want MISSED (nascido já vencido)", repo.inserted.Status)
 	}
+	if repo.inserted.ConfirmacaoExigida {
+		t.Fatal("confirmacao_exigida = true, want false (selo=confiável, política seletiva — precondition of this test)")
+	}
 	// Silencioso: opened + V1 calculated + V1 seal_assigned; nenhum deadline.missed,
-	// missed_check ou reminder_check. (No confirmation required: seal=confiavel, policy=seletiva.)
+	// missed_check, reminder_check OU deadline.assumed. (No confirmation required:
+	// seal=confiavel, policy=seletiva — but born MISSED, never "assumed".)
 	if got := len(outbox.published); got != 3 {
 		t.Fatalf("published events = %d, want 3 (opened + calculated + seal_assigned)", got)
 	}
 	if _, ok := outbox.published[0].(DeadlineOpened); !ok {
 		t.Errorf("published[0] = %T, want DeadlineOpened", outbox.published[0])
 	}
+	if n := len(publishedOfType[DeadlineAssumed](outbox)); n != 0 {
+		t.Errorf("deadline.assumed publicados = %d, want 0 (nascido MISSED, nunca esteve OPEN)", n)
+	}
 	if n := len(publishedOfType[DeadlineMissedCheck](outbox)); n != 0 {
 		t.Errorf("missed_check agendados = %d, want 0 (marca no passado)", n)
 	}
 	if n := len(publishedOfType[DeadlineReminderCheck](outbox)); n != 0 {
 		t.Errorf("reminder_check agendados = %d, want 0 (marcas no passado)", n)
+	}
+	if len(repo.insertedDeadlineEvents) != 1 || repo.insertedDeadlineEvents[0].Tipo != "calculado" {
+		t.Errorf("deadline_event tipos = %+v, want exactly [calculado] (nascido MISSED, sem marcador assumido)", repo.insertedDeadlineEvents)
 	}
 }
 
@@ -1375,9 +1444,10 @@ func TestOnIntimationObserved_SchedulesReminderAndMissedChecks(t *testing.T) {
 		t.Errorf("missed_check idempotency key = %q, want %q", missed[0].IdempotencyKey(), want)
 	}
 
-	// opened + 3 reminders + 1 missed + V1 calculated + V1 seal_assigned = 7 total, nothing else.
-	if len(outbox.published) != 7 {
-		t.Errorf("total published = %d, want 7", len(outbox.published))
+	// opened + 3 reminders + 1 missed + V1 calculated + V1 seal_assigned + V1 assumed (born
+	// OPEN: confirmacao_exigida=false, not overdue) = 8 total, nothing else.
+	if len(outbox.published) != 8 {
+		t.Errorf("total published = %d, want 8", len(outbox.published))
 	}
 }
 
@@ -1398,14 +1468,18 @@ func TestOnIntimationObserved_SkipsPastMarks(t *testing.T) {
 			now:          time.Date(2024, 1, 30, 12, 0, 0, 0, time.UTC), // D-3 (01-29) already past
 			wantDaysLeft: []int{1, 0},
 			wantMissed:   true,
-			wantTotalPub: 6, // opened + 2 reminders + missed + V1 calculated + V1 seal_assigned
+			// carência D+1 (02-02) is still future at this now → born OPEN, not MISSED:
+			// opened + 2 reminders + missed_check + V1 calculated + seal_assigned + assumed.
+			wantTotalPub: 7,
 		},
 		{
 			name:         "born after vencimento schedules nothing",
 			now:          time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC), // even D+1 is past
 			wantDaysLeft: nil,
 			wantMissed:   false,
-			wantTotalPub: 3, // opened + V1 calculated + V1 seal_assigned
+			// carência already past at this now → born MISSED, so no deadline.assumed either
+			// (never was OPEN): opened + V1 calculated + V1 seal_assigned.
+			wantTotalPub: 3,
 		},
 	}
 	for _, tt := range tests {
@@ -2251,6 +2325,9 @@ func TestOnIntimationObserved_V1Fields(t *testing.T) {
 	if d.ConfirmacaoExigida {
 		t.Error("confirmacao_exigida = true, want false (seal=confiavel + policy=seletiva)")
 	}
+	if d.Status != StatusOpen {
+		t.Errorf("Status = %q, want OPEN (confirmacao_exigida=false, not overdue: the system assumes it)", d.Status)
+	}
 
 	// Verify calc_memory was persisted
 	if repo.gotCalcMemory == nil {
@@ -2280,25 +2357,29 @@ func TestOnIntimationObserved_V1Fields(t *testing.T) {
 		}
 	}
 
-	// Verify deadline_event was persisted
-	if repo.gotDeadlineEvent == nil {
-		t.Error("InsertDeadlineEvent not called")
-	} else {
-		if repo.gotDeadlineEvent.DeadlineID != d.ID {
-			t.Errorf("deadline_event.deadline_id = %s, want %s", repo.gotDeadlineEvent.DeadlineID, d.ID)
-		}
-		if repo.gotDeadlineEvent.Tipo != "calculado" {
-			t.Errorf("deadline_event.tipo = %q, want %q", repo.gotDeadlineEvent.Tipo, "calculado")
+	// Verify deadline_event was persisted — this scenario is born OPEN (confirmacao_exigida
+	// false, not overdue), so TWO rows land: "calculado" (always) and "assumido" (this
+	// fix); TestOnIntimationObserved_DerivesOpenRuleDeadline is the dedicated test for the
+	// "assumido" row's own fields, so here we only re-verify "calculado" was not displaced.
+	var gotCalculado *DeadlineEvent
+	for _, e := range repo.insertedDeadlineEvents {
+		if e.Tipo == "calculado" {
+			gotCalculado = e
 		}
 	}
+	if gotCalculado == nil {
+		t.Error("InsertDeadlineEvent(tipo=calculado) not called")
+	} else if gotCalculado.DeadlineID != d.ID {
+		t.Errorf("deadline_event.deadline_id = %s, want %s", gotCalculado.DeadlineID, d.ID)
+	}
 
-	// V1 events: opened + calculated + seal_assigned + 3 reminders + 1 missed = 7
-	if got := len(outbox.published); got != 7 {
+	// V1 events: opened + calculated + seal_assigned + assumed + 3 reminders + 1 missed = 8
+	if got := len(outbox.published); got != 8 {
 		names := make([]string, got)
 		for i, e := range outbox.published {
 			names[i] = e.Type()
 		}
-		t.Errorf("published events = %d (%v), want 7 (opened + calculated + seal_assigned + 3 reminders + missed)", got, names)
+		t.Errorf("published events = %d (%v), want 8 (opened + calculated + seal_assigned + assumed + 3 reminders + missed)", got, names)
 	}
 
 	// No skipped days were returned by AddBusinessDays (fakeCalendar.holidays unset), so the
@@ -2399,7 +2480,10 @@ func TestOnIntimationObserved_AppliedHolidayLabels(t *testing.T) {
 
 // TestOnIntimationObserved_ConfirmacaoExigida_PolicyObrigatoria verifies the
 // piso inegociável: even with seal=confiavel, a tenant with ConfirmacaoObrigatoria=true
-// gets confirmacao_exigida=true and a deadline.confirmation_required event.
+// gets confirmacao_exigida=true and a deadline.confirmation_required event — and, being
+// the confirmacao_exigida=true counterpart of TestOnIntimationObserved_DerivesOpenRuleDeadline,
+// that the prazo is born PENDING (not OPEN) and NEVER gets deadline.assumed nor the
+// "assumido" audit marker — that branch is exclusive to confirmacao_exigida=false.
 func TestOnIntimationObserved_ConfirmacaoExigida_PolicyObrigatoria(t *testing.T) {
 	tenantID := uuid.NewString()
 
@@ -2445,6 +2529,9 @@ func TestOnIntimationObserved_ConfirmacaoExigida_PolicyObrigatoria(t *testing.T)
 	if d.Seal != SealConfiavel {
 		t.Errorf("selo = %q, want %q", d.Seal, SealConfiavel)
 	}
+	if d.Status != StatusPending {
+		t.Errorf("Status = %q, want PENDING (confirmacao_exigida=true: awaits the manual confirm)", d.Status)
+	}
 
 	// V1 events: opened + calculated + seal_assigned + confirmation_required + 3 reminders + 1 missed = 8
 	if got := len(outbox.published); got != 8 {
@@ -2454,10 +2541,21 @@ func TestOnIntimationObserved_ConfirmacaoExigida_PolicyObrigatoria(t *testing.T)
 		}
 		t.Errorf("published events = %d (%v), want 8 (opened + calculated + seal_assigned + confirmation_required + 3 reminders + missed)", got, names)
 	}
+	if n := len(publishedOfType[DeadlineAssumed](outbox)); n != 0 {
+		t.Errorf("deadline.assumed publicados = %d, want 0 (confirmacao_exigida=true)", n)
+	}
+	for _, e := range repo.insertedDeadlineEvents {
+		if e.Tipo == "assumido" {
+			t.Error("deadline_event tipo=assumido gravado, want none (confirmacao_exigida=true)")
+		}
+	}
 }
 
 // TestOnIntimationObserved_DeclaradoOrigem verifies that when PrazoDeclarado is present,
-// the origem is "declarado" and seal is "confiavel".
+// the origem is "declarado" and seal is "confiavel" — and, being the exact scenario this
+// fix targets (prazo DECLARADO na intimação, sem divergência com o cálculo, política
+// seletiva do tenant), that confirmacao_exigida derives false and the prazo is born OPEN
+// directly (not stranded in PENDING), publishing deadline.assumed.
 func TestOnIntimationObserved_DeclaradoOrigem(t *testing.T) {
 	tenantID := uuid.NewString()
 
@@ -2499,6 +2597,24 @@ func TestOnIntimationObserved_DeclaradoOrigem(t *testing.T) {
 	}
 	if d.Seal != SealConfiavel {
 		t.Errorf("selo = %q, want %q (declarado + not divergent = confiavel)", d.Seal, SealConfiavel)
+	}
+	if d.ConfirmacaoExigida {
+		t.Fatal("confirmacao_exigida = true, want false (declarado + confiavel + política seletiva — precondition of this test)")
+	}
+	if d.Status != StatusOpen {
+		t.Errorf("Status = %q, want OPEN (the bug this fix addresses: declarado sem divergência nascia PENDING mesmo com confirmacao_exigida=false)", d.Status)
+	}
+	if n := len(publishedOfType[DeadlineAssumed](outbox)); n != 1 {
+		t.Errorf("deadline.assumed publicados = %d, want 1", n)
+	}
+	var gotAssumido bool
+	for _, e := range repo.insertedDeadlineEvents {
+		if e.Tipo == "assumido" {
+			gotAssumido = true
+		}
+	}
+	if !gotAssumido {
+		t.Errorf("deadline_event tipos = %+v, want an \"assumido\" row", repo.insertedDeadlineEvents)
 	}
 }
 

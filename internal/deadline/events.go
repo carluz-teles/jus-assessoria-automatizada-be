@@ -89,11 +89,12 @@ const TypeDeadlineOpened = "deadline.opened"
 
 const aggregateTypeDeadline = "deadline"
 
-// DeadlineOpened announces a freshly derived prazo (born PENDING). It carries what a
-// consumer needs without reading back the deadline row: the prazo and its origin ids,
-// the legible kind, the computed EndDate (wire date 2006-01-02) and the counting. The
-// aggregate is the deadline, so its stream orders by the deadline id; Base carries the
-// event id (consumer dedup) and that aggregate id.
+// DeadlineOpened announces a freshly derived prazo — born PENDING, OPEN, or (already
+// vencido at creation) MISSED; see deadline.assumed for the PENDING/OPEN distinction. It
+// carries what a consumer needs without reading back the deadline row: the prazo and its
+// origin ids, the legible kind, the computed EndDate (wire date 2006-01-02) and the
+// counting. The aggregate is the deadline, so its stream orders by the deadline id; Base
+// carries the event id (consumer dedup) and that aggregate id.
 type DeadlineOpened struct {
 	events.Base
 	DeadlineID    string `json:"deadline_id"`
@@ -723,6 +724,38 @@ func newDeadlineConfirmationRequired(tenantID, deadlineID string) DeadlineConfir
 		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
 		TenantID:   tenantID,
 		DeadlineID: deadlineID,
+	}
+}
+
+// TypeDeadlineAssumed is emitted when a prazo is born already OPEN because the system
+// decided human confirmation was not needed (confirmacao_exigida=false: seal=confiavel,
+// tenant policy seletiva — the piso inegociável floor was not triggered). It is the
+// counterpart of deadline.confirmation_required: exactly one of the two fires per
+// creation, never both (docs/design-motor-de-prazos-v1.md §7 "prazo.prazo_assumido").
+// NOT emitted when the prazo is born MISSED instead (already past its D+1 carência at
+// creation) — a prazo that never was OPEN was never "assumed", mirroring how
+// deadline.confirmation_required is likewise skipped in that same scenario today.
+const TypeDeadlineAssumed = "deadline.assumed"
+
+// DeadlineAssumed announces a prazo the system opened on its own, skipping the manual
+// PENDING→OPEN confirm step. Consumers (read models, Pipeline/Fila) use it to show the
+// prazo as already active instead of "aguardando confirmação".
+type DeadlineAssumed struct {
+	events.Base
+	DeadlineID string `json:"deadline_id"`
+	EndDate    string `json:"end_date"`
+}
+
+var _ events.Event = DeadlineAssumed{}
+
+func (DeadlineAssumed) Type() string          { return TypeDeadlineAssumed }
+func (DeadlineAssumed) AggregateType() string { return aggregateTypeDeadline }
+
+func newDeadlineAssumed(d *Deadline) DeadlineAssumed {
+	return DeadlineAssumed{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: d.ID},
+		DeadlineID: d.ID,
+		EndDate:    d.EndDate.Format(time.DateOnly),
 	}
 }
 
