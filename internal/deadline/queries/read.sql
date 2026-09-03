@@ -213,19 +213,24 @@ WHERE t.court_record_id = @court_record_id::uuid
 -- window [@from_date, @to_date] (NULL = open bound). The window filters on the REAL
 -- due_date, so it naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window
 -- query wants dated items. Ascending (sort_due, id) keyset; the first page passes the min
--- sentinel ('0001-01-01', zero-uuid).
+-- sentinel ('0001-01-01', zero-uuid). cnj_number/court come from a LEFT JOIN on
+-- court_record (mirrors ListPrazos/GetPrazoSuggestContext) — LEFT, not JOIN, because
+-- task.court_record_id is nullable (an avulsa task hangs on no process, so it carries no
+-- context; the columns come back NULL/"" rather than dropping the row).
 SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at,
        -- done_items feeds the derived display_status (see ListTasksByProcesso).
-       COALESCE(p.done_items, 0)::bigint AS done_items
+       COALESCE(p.done_items, 0)::bigint AS done_items,
+       cr.cnj_number, cr.court
 FROM task t
 LEFT JOIN LATERAL (
   SELECT count(*) FILTER (WHERE ti.done) AS done_items
   FROM task_item ti
   WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
 ) p ON true
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
 WHERE t.tenant_id = @tenant_id::uuid
   AND (@status::text = '' OR t.status = @status::text)
   AND (sqlc.narg('assignee_id')::uuid IS NULL OR t.assignee_user_id = sqlc.narg('assignee_id')::uuid)

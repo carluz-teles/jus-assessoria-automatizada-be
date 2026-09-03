@@ -550,6 +550,8 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 			IntimationID:   uuidText(row.IntimationID),
 			CourtRecordID:  uuidText(row.CourtRecordID),
 			CompletedAt:    timestampPtr(row.CompletedAt),
+			CNJNumber:      derefString(row.CnjNumber),
+			Court:          derefString(row.Court),
 			sortDue:        row.SortDue.Time,
 			doneItems:      int(row.DoneItems),
 		})
