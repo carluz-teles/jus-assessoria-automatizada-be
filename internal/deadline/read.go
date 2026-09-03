@@ -181,10 +181,12 @@ type TaskView struct {
 	// "" for a DISMISSED task) the cockpit/agenda bucket the row by — additive to the existing
 	// wire shape, so cockpit and agenda keep consuming Status while the new tabs read this.
 	DisplayStatus string `json:"display_status,omitempty"`
-	// PipelineStage is the DERIVED peça-pipeline stage (GET /v1/tasks only; see
-	// derivePipelineStage) for a "peça-bound" task — ELABORACAO|REVISAO|PROTOCOLADO. Set from
-	// the task's vigente draft (LEFT JOIN, superseded_at IS NULL) sent_to_signing_at/filed_at.
-	PipelineStage  string     `json:"pipeline_stage,omitempty"`
+	// Stage is the DERIVED 4-stage task stage — A_FAZER|ELABORACAO|REVISAO|CONCLUIDA. Populated
+	// only by ListTasks (GET /v1/tasks): every task, peça-bound or not, sits in one of the four
+	// stages there. ListTasksByProcesso does NOT set it (omitempty hides it from that response
+	// instead of leaking a bogus ""). Set from the task's own status plus its vigente draft's
+	// (LEFT JOIN, superseded_at IS NULL) hasDraft/sent_to_signing_at/filed_at.
+	Stage          string     `json:"stage,omitempty"`
 	Source         string     `json:"source"`
 	AssigneeUserID string     `json:"assignee_user_id,omitempty"`
 	DeadlineID     string     `json:"deadline_id,omitempty"`
@@ -242,10 +244,7 @@ type TasksByProcessoQuery struct {
 // IntimationID ("" = all; = a specific uuid to list only tasks of that intimação), and a
 // due_date window [From, To] (each "" = open bound). The dates/assignee/intimation_id are the
 // wire layout; the handler validates them, the repo parses. LastDue is the coalesced sort value
-// (see TasksByProcessoQuery). PipelineOnly (?pipeline=true) is opt-in: it restricts the agenda to
-// "peça-bound" tasks (has a vigente draft, OR kind='PECA', OR the providência gera_peca) — the
-// default (false) leaves every non-DISMISSED task in, so it does NOT participate in Filtered()
-// (the "X de Y" counter's CountTasks stays untouched, per the fatia's exact scope).
+// (see TasksByProcessoQuery).
 type TasksQuery struct {
 	TenantID     string
 	Status       string
@@ -254,7 +253,6 @@ type TasksQuery struct {
 	IntimationID string
 	From         string
 	To           string
-	PipelineOnly bool
 	LastDue      string
 	LastID       string
 	Limit        int
@@ -699,30 +697,34 @@ func assigneeOptions(assignees []AssigneeOption) []httpx.FilterOption {
 	return opts
 }
 
-// PipelineStage constants — the closed set derivePipelineStage returns (GET /v1/tasks): a
-// peça-bound task moves ELABORACAO → REVISAO → PROTOCOLADO as its vigente draft advances
-// through the signing/filing workflow (mirrors the Construção/Assinatura/Protocolo/Concluído
-// steps migration 0059 documents on draft, collapsed to the 3 stages the task agenda needs).
+// Stage constants — the closed set deriveTaskStage returns (GET /v1/tasks): EVERY task, peça-
+// bound or not, sits in one of these four stages, moving A_FAZER → ELABORACAO → REVISAO →
+// CONCLUIDA as work on it (and its optional draft) advances.
 const (
-	PipelineStageElaboracao  = "ELABORACAO"
-	PipelineStageRevisao     = "REVISAO"
-	PipelineStageProtocolado = "PROTOCOLADO"
+	StageAFazer     = "A_FAZER"
+	StageElaboracao = "ELABORACAO"
+	StageRevisao    = "REVISAO"
+	StageConcluida  = "CONCLUIDA"
 )
 
-// derivePipelineStage is the SINGLE source of truth for a task's peça-pipeline stage — the
-// read repo calls it per row (ListTasks) off the task's vigente draft (superseded_at IS NULL,
-// draft_task_id_uidx guarantees at most one). Rules, evaluated in order:
-//   - no draft, OR a draft not yet sent to signing (sentToSigningAt == nil) → ELABORACAO;
-//   - a draft already filed (filedAt != nil)                               → PROTOCOLADO;
-//   - otherwise (sent to signing, not yet filed)                          → REVISAO.
-func derivePipelineStage(hasDraft bool, sentToSigningAt, filedAt *time.Time) string {
-	if !hasDraft || sentToSigningAt == nil {
-		return PipelineStageElaboracao
+// deriveTaskStage is the SINGLE source of truth for a task's 4-stage stage — the read repo
+// calls it per row (ListTasks) off the task's own status plus its vigente draft (superseded_at
+// IS NULL, draft_task_id_uidx guarantees at most one). Rules, evaluated in order:
+//   - the task is DONE, OR its draft is already filed (filedAt != nil) → CONCLUIDA;
+//   - it has a draft already sent to signing (sentToSigningAt != nil)  → REVISAO;
+//   - it has a draft at all (not yet sent to signing)                 → ELABORACAO;
+//   - otherwise (no draft)                                            → A_FAZER.
+func deriveTaskStage(status TaskStatus, hasDraft bool, sentToSigningAt, filedAt *time.Time) string {
+	if status == TaskStatusDone || filedAt != nil {
+		return StageConcluida
 	}
-	if filedAt != nil {
-		return PipelineStageProtocolado
+	if hasDraft && sentToSigningAt != nil {
+		return StageRevisao
 	}
-	return PipelineStageRevisao
+	if hasDraft {
+		return StageElaboracao
+	}
+	return StageAFazer
 }
 
 // decorateDisplayStatus fills each row's DERIVED display_status from its (status, done-item

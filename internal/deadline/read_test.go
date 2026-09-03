@@ -613,12 +613,15 @@ func TestReadUseCase_TaskDetail_NotFound(t *testing.T) {
 	}
 }
 
-// --- derivePipelineStage (the single peça-pipeline-stage derivation) --------
+// --- deriveTaskStage (the single 4-stage task-stage derivation) -------------
 
-// TestDerivePipelineStage_FourCases proves the derived pipeline_stage is correct across its three
-// buckets (ELABORACAO/REVISAO/PROTOCOLADO) from (hasDraft, sentToSigningAt, filedAt) — the
-// ingredients ListTasks' LEFT JOIN on the task's vigente draft supplies.
-func TestDerivePipelineStage_FourCases(t *testing.T) {
+// TestDeriveTaskStage_Cases proves the derived stage is correct across its four buckets
+// (A_FAZER/ELABORACAO/REVISAO/CONCLUIDA) from (status, hasDraft, sentToSigningAt, filedAt) — the
+// ingredients ListTasks' LEFT JOIN on the task's vigente draft supplies, plus the task's own
+// status. Two cases deliberately isolate each half of the "OR" in the CONCLUIDA rule: a filed
+// draft on an OPEN task, and a DONE task with a sent-not-filed draft — proving the OR triggers on
+// either signal alone.
+func TestDeriveTaskStage_Cases(t *testing.T) {
 	t.Parallel()
 
 	sentToSigning := time.Date(2024, 3, 10, 9, 0, 0, 0, time.UTC)
@@ -626,39 +629,50 @@ func TestDerivePipelineStage_FourCases(t *testing.T) {
 
 	tests := []struct {
 		name            string
+		status          TaskStatus
 		hasDraft        bool
 		sentToSigningAt *time.Time
 		filedAt         *time.Time
 		want            string
 	}{
 		{
-			name:     "no draft at all is ELABORACAO",
-			hasDraft: false, sentToSigningAt: nil, filedAt: nil,
-			want: PipelineStageElaboracao,
+			name:   "no draft, OPEN is A_FAZER",
+			status: TaskStatusOpen, hasDraft: false, sentToSigningAt: nil, filedAt: nil,
+			want: StageAFazer,
 		},
 		{
-			name:     "draft not yet sent to signing is ELABORACAO",
-			hasDraft: true, sentToSigningAt: nil, filedAt: nil,
-			want: PipelineStageElaboracao,
+			name:   "no draft, DONE is CONCLUIDA",
+			status: TaskStatusDone, hasDraft: false, sentToSigningAt: nil, filedAt: nil,
+			want: StageConcluida,
 		},
 		{
-			name:     "draft sent to signing, not yet filed is REVISAO",
-			hasDraft: true, sentToSigningAt: &sentToSigning, filedAt: nil,
-			want: PipelineStageRevisao,
+			name:   "draft not yet sent to signing, OPEN is ELABORACAO",
+			status: TaskStatusOpen, hasDraft: true, sentToSigningAt: nil, filedAt: nil,
+			want: StageElaboracao,
 		},
 		{
-			name:     "draft filed is PROTOCOLADO",
-			hasDraft: true, sentToSigningAt: &sentToSigning, filedAt: &filed,
-			want: PipelineStageProtocolado,
+			name:   "draft sent to signing, not filed, OPEN is REVISAO",
+			status: TaskStatusOpen, hasDraft: true, sentToSigningAt: &sentToSigning, filedAt: nil,
+			want: StageRevisao,
+		},
+		{
+			name:   "draft filed, OPEN is CONCLUIDA (OR triggers on filed_at alone)",
+			status: TaskStatusOpen, hasDraft: true, sentToSigningAt: &sentToSigning, filedAt: &filed,
+			want: StageConcluida,
+		},
+		{
+			name:   "draft sent-not-filed, DONE is CONCLUIDA (OR triggers on status alone)",
+			status: TaskStatusDone, hasDraft: true, sentToSigningAt: &sentToSigning, filedAt: nil,
+			want: StageConcluida,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := derivePipelineStage(tt.hasDraft, tt.sentToSigningAt, tt.filedAt)
+			got := deriveTaskStage(tt.status, tt.hasDraft, tt.sentToSigningAt, tt.filedAt)
 			if got != tt.want {
-				t.Errorf("derivePipelineStage() = %q, want %q", got, tt.want)
+				t.Errorf("deriveTaskStage() = %q, want %q", got, tt.want)
 			}
 		})
 	}

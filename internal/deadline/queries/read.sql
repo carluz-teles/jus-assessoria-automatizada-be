@@ -220,10 +220,8 @@ WHERE t.court_record_id = @court_record_id::uuid
 -- excluded (a dispensada task is out of the agenda, not just out of the cockpit derivation).
 -- draft_id/sent_to_signing_at/filed_at come from a LEFT JOIN on the task's VIGENTE draft
 -- (superseded_at IS NULL — draft_task_id_uidx, migration 0089, guarantees at most one such
--- row per task), and gera_peca (via action_item, LEFT JOIN on task.action_item_id) — the
--- ingredients read.go's derivePipelineStage turns into pipeline_stage. @pipeline_only (bool)
--- restricts to "peça-bound" tasks (has a draft, OR kind='PECA', OR the providência gera_peca)
--- when true; false (the default) leaves every non-DISMISSED task in.
+-- row per task) — the ingredients read.go's deriveTaskStage turns into the 4-stage stage
+-- (A_FAZER|ELABORACAO|REVISAO|CONCLUIDA), together with the task's own status.
 SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        COALESCE(t.due_date, '9999-12-31')::date AS sort_due,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
@@ -240,7 +238,6 @@ LEFT JOIN LATERAL (
 ) p ON true
 LEFT JOIN court_record cr ON cr.id = t.court_record_id
 LEFT JOIN draft d ON d.task_id = t.id AND d.superseded_at IS NULL
-LEFT JOIN action_item ai ON ai.id = t.action_item_id
 WHERE t.tenant_id = @tenant_id::uuid
   AND t.status <> 'DISMISSED'
   AND (@status::text = '' OR t.status = @status::text)
@@ -249,7 +246,6 @@ WHERE t.tenant_id = @tenant_id::uuid
   AND (sqlc.narg('intimation_id')::uuid IS NULL OR t.intimation_id = sqlc.narg('intimation_id')::uuid)
   AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
   AND (@to_date::date IS NULL OR t.due_date <= @to_date::date)
-  AND (@pipeline_only::bool = false OR d.id IS NOT NULL OR t.kind = 'PECA' OR ai.gera_peca = true)
   AND (COALESCE(t.due_date, '9999-12-31'), t.id) > (@last_due::date, @last_id::uuid)
 ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
 LIMIT @page_limit;

@@ -526,7 +526,6 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 		IntimationID: intimationID,
 		FromDate:     from,
 		ToDate:       to,
-		PipelineOnly: q.PipelineOnly,
 		LastDue:      lastDue,
 		LastID:       lastID,
 		PageLimit:    int32(q.Limit),
@@ -538,14 +537,16 @@ func (r *pgReadRepository) ListTasks(ctx context.Context, q TasksQuery) ([]TaskV
 	out := make([]TaskView, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, TaskView{
-			ID:             row.ID.String(),
-			Title:          row.Title,
-			Description:    derefString(row.Description),
-			Kind:           derefString(row.Kind),
-			Priority:       derefString(row.Priority),
-			DueDate:        datePtr(row.DueDate),
-			Status:         row.Status,
-			PipelineStage:  derivePipelineStage(row.DraftID.Valid, timestampPtr(row.SentToSigningAt), timestampPtr(row.FiledAt)),
+			ID:          row.ID.String(),
+			Title:       row.Title,
+			Description: derefString(row.Description),
+			Kind:        derefString(row.Kind),
+			Priority:    derefString(row.Priority),
+			DueDate:     datePtr(row.DueDate),
+			Status:      row.Status,
+			Stage: deriveTaskStage(
+				TaskStatus(row.Status), row.DraftID.Valid, timestampPtr(row.SentToSigningAt), timestampPtr(row.FiledAt),
+			),
 			Source:         row.Source,
 			AssigneeUserID: uuidText(row.AssigneeUserID),
 			DeadlineID:     uuidText(row.DeadlineID),
