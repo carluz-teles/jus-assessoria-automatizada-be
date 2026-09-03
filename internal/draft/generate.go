@@ -125,6 +125,12 @@ type chunkPublisher interface {
 // worker (produtor) e pelo endpoint SSE (consumidor) sem depender um do outro.
 func chunkChannel(draftID string) string { return "draft:" + draftID + ":stream" }
 
+// StreamResetMarker é o 1º chunk publicado a cada (re)geração: sinaliza ao FE que
+// uma nova geração começou e o buffer acumulado (possível replay stale da geração
+// anterior) deve ser zerado. U+241E (␞, record separator) não aparece em markdown
+// jurídico e é transportado 1:1 pelo SSE (sem \n → um único `data:`).
+const StreamResetMarker = "␞"
+
 type GenerateUseCase struct {
 	uow      database.UnitOfWork
 	reader   generationDepsReader
@@ -420,6 +426,16 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 			slog.WarnContext(ctx, "draft chunk stream reset failed",
 				slog.String("draft_id", ev.DraftID),
 				slog.String("err", resetErr.Error()))
+		}
+		// Marcador de RESET como 1º chunk da geração. O XReset acima não basta: numa
+		// REGERAÇÃO o cliente SSE tipicamente conecta ANTES do worker resetar (o saga
+		// vira EXTRACTING de forma síncrona, mas o worker leva ~1-2s no RAG), então
+		// ele lê os chunks da peça ANTERIOR do stream (replay de 0-0). Ao receber este
+		// marcador (que só aparece no início da geração ATUAL), o FE zera o buffer —
+		// descarta o replay stale e passa a acumular só o texto novo.
+		if _, e := uc.chunkPub.XPublish(ctx, channel, []byte(StreamResetMarker)); e != nil {
+			slog.WarnContext(ctx, "draft chunk reset marker publish failed",
+				slog.String("draft_id", ev.DraftID), slog.String("err", e.Error()))
 		}
 		return uc.gen.GenerateJSONStream(ctx, req, func(chunk string) error {
 			// Best-effort: erro no XADD não aborta. Cliente que reconecta usa
