@@ -151,9 +151,11 @@ WHERE i.tenant_id = $1
     OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
   )
   -- Status = work_stage derivado. O CASE ESPELHA deriveWorkStage (read.go) — mesma
-  -- precedência marco-mais-avançado-vence. Manter os dois em sincronia.
+  -- precedência marco-mais-avançado-vence. Manter os dois em sincronia. @work_stage é
+  -- uma lista (CSV no handler → text[] aqui): vazia = sem filtro; 1+ valores = OR
+  -- (ANY) — a intimação casa se seu estágio derivado estiver em QUALQUER um deles.
   AND (
-    @work_stage::text = ''
+    @work_stage::text[] = '{}'
     OR (CASE
       WHEN dr.filed_at IS NOT NULL THEN 'FILED'
       WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
@@ -161,7 +163,7 @@ WHERE i.tenant_id = $1
       WHEN d.id IS NULL THEN 'RECEIVED'
       WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
       ELSE 'AWAITING_CONFIRMATION'
-    END) = @work_stage::text
+    END) = ANY(@work_stage::text[])
   )
   AND (
     @urgencia::text = ''
@@ -326,9 +328,10 @@ WHERE i.tenant_id = $1
     sqlc.narg('assignee_id')::uuid IS NULL
     OR i.assignee_user_id = sqlc.narg('assignee_id')::uuid
   )
-  -- Status = work_stage (CASE espelha deriveWorkStage; igual ao ListIntimacoes).
+  -- Status = work_stage (CASE espelha deriveWorkStage; igual ao ListIntimacoes). Lista
+  -- OR-matched (ANY) — ver comentário em ListIntimacoes.
   AND (
-    @work_stage::text = ''
+    @work_stage::text[] = '{}'
     OR (CASE
       WHEN dr.filed_at IS NOT NULL THEN 'FILED'
       WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
@@ -336,7 +339,7 @@ WHERE i.tenant_id = $1
       WHEN d.id IS NULL THEN 'RECEIVED'
       WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
       ELSE 'AWAITING_CONFIRMATION'
-    END) = @work_stage::text
+    END) = ANY(@work_stage::text[])
   )
   AND (
     @urgencia::text = ''

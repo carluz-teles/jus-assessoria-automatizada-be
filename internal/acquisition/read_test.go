@@ -344,7 +344,7 @@ func TestIntimacoesQuery_Filtered(t *testing.T) {
 		{"urgencia", IntimacoesQuery{Urgencia: UrgenciaAtraso}, true},
 		{"nao_confirmado", IntimacoesQuery{NaoConfirmado: true}, true},
 		{"assignee", IntimacoesQuery{Assignee: "u-1"}, true},
-		{"work_stage", IntimacoesQuery{WorkStage: WorkStageAwaitingConfirmation}, true},
+		{"work_stage", IntimacoesQuery{WorkStage: []string{WorkStageAwaitingConfirmation}}, true},
 	}
 	for _, tc := range cases {
 		tc := tc

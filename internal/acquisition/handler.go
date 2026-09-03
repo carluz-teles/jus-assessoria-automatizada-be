@@ -3,6 +3,7 @@ package acquisition
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -273,6 +274,40 @@ func isKnownWorkStage(v string) bool {
 	default:
 		return false
 	}
+}
+
+// parseWorkStageFilter parses the ?work_stage CSV (ex.: "RECEIVED,CONFIRMED") into
+// the OR-matched list the repo passes straight to `= ANY(@work_stage::text[])`.
+// Each token is trimmed and validated against isKnownWorkStage; a blank raw string,
+// or one made only of blank/comma tokens (e.g. ",,"), yields a nil slice — "no
+// filter", mirroring the pre-CSV "" sentinel. Duplicate tokens are deduped
+// (order-preserving) so the SQL predicate never repeats a value pointlessly. The
+// first invalid token is returned as a typed 400 — same convention as the other
+// closed-set filters in this handler (type/user_status/urgencia).
+func parseWorkStageFilter(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, tok := range strings.Split(raw, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if !isKnownWorkStage(tok) {
+			return nil, apperr.NewInvalid("invalid work_stage filter")
+		}
+		if seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		out = append(out, tok)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // integrationView is the read model returned to the client — a per-endpoint DTO.
@@ -590,9 +625,9 @@ func (h *Handler) listIntimacoes(c *fiber.Ctx) error {
 	if urgencia == UrgenciaSemProvidencia {
 		urgencia = ""
 	}
-	workStage := c.Query("work_stage")
-	if workStage != "" && !isKnownWorkStage(workStage) {
-		return httpx.WriteError(c, apperr.NewInvalid("invalid work_stage filter"))
+	workStage, err := parseWorkStageFilter(c.Query("work_stage"))
+	if err != nil {
+		return httpx.WriteError(c, err)
 	}
 	naoConfirmado := c.Query("nao_confirmado") == "true" || c.Query("nao_confirmado") == "1"
 	p, ok := httpx.PrincipalFromCtx(c)

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -803,6 +805,85 @@ func TestHandler_ListIntimacoes_InvalidUrgencia_400(t *testing.T) {
 				"/v1/intimacoes?urgencia="+tt.urgencia, "", "jwt")
 			if status != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400 for unknown urgencia %q", status, tt.urgencia)
+			}
+		})
+	}
+}
+
+// ?work_stage accepts a CSV of the closed set (WorkStage* consts), OR-matched: each
+// well-formed token is forwarded to the read port as a []string, deduped, order
+// preserved, absent/blank means no filter (nil slice).
+func TestHandler_ListIntimacoes_ValidWorkStage_ForwardedToReader(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		workStage  string
+		wantStages []string
+	}{
+		{name: "single value", workStage: WorkStageReceived, wantStages: []string{WorkStageReceived}},
+		{
+			name:       "two values csv",
+			workStage:  WorkStageReceived + "," + WorkStageConfirmed,
+			wantStages: []string{WorkStageReceived, WorkStageConfirmed},
+		},
+		{
+			name:       "duplicate tokens deduped",
+			workStage:  WorkStageReceived + "," + WorkStageReceived,
+			wantStages: []string{WorkStageReceived},
+		},
+		{
+			name:       "blank tokens and surrounding spaces trimmed",
+			workStage:  " " + WorkStageReceived + " , ," + WorkStageConfirmed + ",",
+			wantStages: []string{WorkStageReceived, WorkStageConfirmed},
+		},
+		{name: "absent", workStage: "", wantStages: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rd := &recordingReader{}
+			app := newAppWithReader(&fakeHandlerUC{}, rd, "LAWYER", "tenant-9")
+
+			path := "/v1/intimacoes"
+			if tt.workStage != "" {
+				path += "?work_stage=" + url.QueryEscape(tt.workStage)
+			}
+			status, body := do(t, app, http.MethodGet, path, "", "jwt")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", status, body)
+			}
+			if !slices.Equal(rd.gotIntiListQ.WorkStage, tt.wantStages) {
+				t.Errorf("forwarded WorkStage = %v, want %v", rd.gotIntiListQ.WorkStage, tt.wantStages)
+			}
+		})
+	}
+}
+
+// ?work_stage with any token outside the closed set is a client error → 400, even
+// when it rides alongside otherwise-valid tokens in the CSV.
+func TestHandler_ListIntimacoes_InvalidWorkStage_400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		workStage string
+	}{
+		{name: "typo", workStage: "RECEBIDA"},
+		{name: "lowercase", workStage: "received"},
+		{name: "arbitrary", workStage: "ARCHIVED"},
+		{name: "one bad token among valid ones", workStage: WorkStageReceived + ",bogus"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			app := newAppWithReader(&fakeHandlerUC{}, &recordingReader{}, "LAWYER", "tenant-9")
+			status, _ := do(t, app, http.MethodGet,
+				"/v1/intimacoes?work_stage="+url.QueryEscape(tt.workStage), "", "jwt")
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for invalid work_stage %q", status, tt.workStage)
 			}
 		})
 	}

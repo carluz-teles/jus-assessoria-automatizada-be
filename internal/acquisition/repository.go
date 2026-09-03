@@ -2035,7 +2035,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 		Court:             q.Court,
 		AssigneeID:        nullUUID(q.Assignee),
 		Urgencia:          q.Urgencia,
-		WorkStage:         q.WorkStage,
+		WorkStage:         stringsOrEmpty(q.WorkStage),
 		NaoConfirmado:     q.NaoConfirmado,
 		LastMadeAvailable: pgtype.Date{Time: lastMade, Valid: true},
 		LastID:            lastID,
@@ -2165,9 +2165,13 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 	}, nil
 }
 
-// stringsOrEmpty normalizes a possibly-nil string slice (array_agg over zero rows
-// comes back nil) to an initialized empty slice, so the read model never carries nil
-// and the JSON serializes as [] rather than null.
+// stringsOrEmpty normalizes a possibly-nil string slice to an initialized empty slice.
+// Two callers: (1) a read-model field (array_agg over zero rows comes back nil), so the
+// JSON serializes as [] rather than null; (2) a text[] query param (IntimacoesQuery.WorkStage
+// is nil when ?work_stage is absent — Go's zero value for a slice), where pgx would otherwise
+// encode nil as SQL NULL and the query's `@work_stage::text[] = '{}'` short-circuit compares
+// NULL to '{}', which is SQL NULL (not TRUE), silently failing the whole ANDed WHERE clause
+// instead of matching every row.
 func stringsOrEmpty(s []string) []string {
 	if s == nil {
 		return []string{}
@@ -2676,7 +2680,7 @@ func (r *pgRepository) CountIntimacoes(ctx context.Context, q IntimacoesQuery) (
 		Court:         q.Court,
 		AssigneeID:    nullUUID(q.Assignee),
 		Urgencia:      q.Urgencia,
-		WorkStage:     q.WorkStage,
+		WorkStage:     stringsOrEmpty(q.WorkStage),
 		NaoConfirmado: q.NaoConfirmado,
 	})
 	if err != nil {
