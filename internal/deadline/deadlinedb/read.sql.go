@@ -1156,13 +1156,15 @@ SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        t.status, t.source, t.assignee_user_id, t.deadline_id, t.intimation_id,
        t.court_record_id, t.completed_at,
        -- done_items feeds the derived display_status (see ListTasksByProcesso).
-       COALESCE(p.done_items, 0)::bigint AS done_items
+       COALESCE(p.done_items, 0)::bigint AS done_items,
+       cr.cnj_number, cr.court
 FROM task t
 LEFT JOIN LATERAL (
   SELECT count(*) FILTER (WHERE ti.done) AS done_items
   FROM task_item ti
   WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
 ) p ON true
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
 WHERE t.tenant_id = $1::uuid
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
@@ -1204,6 +1206,8 @@ type ListTasksRow struct {
 	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 	DoneItems      int64              `json:"done_items"`
+	CnjNumber      *string            `json:"cnj_number"`
+	Court          *string            `json:"court"`
 }
 
 // The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
@@ -1213,7 +1217,10 @@ type ListTasksRow struct {
 // window [@from_date, @to_date] (NULL = open bound). The window filters on the REAL
 // due_date, so it naturally EXCLUDES undated tasks (NULL >= date is NULL) — a dated-window
 // query wants dated items. Ascending (sort_due, id) keyset; the first page passes the min
-// sentinel ('0001-01-01', zero-uuid).
+// sentinel ('0001-01-01', zero-uuid). cnj_number/court come from a LEFT JOIN on
+// court_record (mirrors ListPrazos/GetPrazoSuggestContext) — LEFT, not JOIN, because
+// task.court_record_id is nullable (an avulsa task hangs on no process, so it carries no
+// context; the columns come back NULL/"" rather than dropping the row).
 func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error) {
 	rows, err := q.db.Query(ctx, listTasks,
 		arg.TenantID,
@@ -1250,6 +1257,8 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTas
 			&i.CourtRecordID,
 			&i.CompletedAt,
 			&i.DoneItems,
+			&i.CnjNumber,
+			&i.Court,
 		); err != nil {
 			return nil, err
 		}

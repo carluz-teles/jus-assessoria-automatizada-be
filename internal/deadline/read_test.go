@@ -487,6 +487,54 @@ func TestReadUseCase_Tasks_ForwardsFiltersAndWiresTotals(t *testing.T) {
 	}
 }
 
+// The global task agenda passes through the process context (cnj_number/court) the repo
+// joins off court_record_id — a task anchored on a process carries it, an avulsa task (no
+// court_record_id) carries neither and still returns (the row is not dropped).
+func TestReadUseCase_Tasks_CarriesCourtContext(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		row           TaskView
+		wantCNJNumber string
+		wantCourt     string
+	}{
+		{
+			name:          "task anchored on a process",
+			row:           TaskView{ID: "t-1", CourtRecordID: "cr-1", CNJNumber: "0001", Court: "TJSP"},
+			wantCNJNumber: "0001",
+			wantCourt:     "TJSP",
+		},
+		{
+			name:          "avulsa task (no court_record_id)",
+			row:           TaskView{ID: "t-2"},
+			wantCNJNumber: "",
+			wantCourt:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := &recordingReadRepo{tasksAgendaRows: []TaskView{tt.row}, tasksTotalCount: 1, tasksTotal: 1}
+			uc := NewReadUseCase(repo)
+
+			res, err := uc.Tasks(context.Background(), TasksQuery{TenantID: "t-1", Limit: 10})
+			if err != nil {
+				t.Fatalf("Tasks: %v", err)
+			}
+			if len(res.Items) != 1 {
+				t.Fatalf("len(Items) = %d, want 1 (row must still return)", len(res.Items))
+			}
+			got := res.Items[0]
+			if got.CNJNumber != tt.wantCNJNumber || got.Court != tt.wantCourt {
+				t.Errorf("(CNJNumber, Court) = (%q, %q), want (%q, %q)", got.CNJNumber, got.Court, tt.wantCNJNumber, tt.wantCourt)
+			}
+		})
+	}
+}
+
 // --- TaskDetail + display_status + summaries --------------------------------
 
 // TestReadUseCase_TaskDetail_AssemblesItemsProgressAndDisplayStatus proves the detail read model

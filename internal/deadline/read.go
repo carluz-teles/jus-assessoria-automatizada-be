@@ -187,7 +187,13 @@ type TaskView struct {
 	IntimationID   string     `json:"intimation_id,omitempty"`
 	CourtRecordID  string     `json:"court_record_id,omitempty"`
 	CompletedAt    *time.Time `json:"completed_at"`
-	sortDue        time.Time
+	// CNJNumber/Court are the process context (ListTasks agenda only, joined off
+	// court_record_id) — "" for an avulsa task (no court_record_id) and omitted from the
+	// wire shape. ListTasksByProcesso does NOT carry these (the :id in the route already
+	// is the process context, mirroring PrazoView).
+	CNJNumber string `json:"cnj_number,omitempty"`
+	Court     string `json:"court,omitempty"`
+	sortDue   time.Time
 	// doneItems is the count of ticked checklist items for the row, the raw ingredient the
 	// read use case turns into DisplayStatus (any done ⇒ Em execução). Unexported so it never
 	// serializes — the FE reads DisplayStatus, not this count.
