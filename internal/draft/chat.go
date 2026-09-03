@@ -185,7 +185,7 @@ func (uc *ChatUseCase) AnswerQuestion(ctx context.Context, cmd AnswerQuestionCom
 	chunks, chunkHits, _ := runRAG(ctx, uc.emb, uc.search, uc.ragCache, cmd.TenantID, crid, cmd.Question, 8)
 
 	// 2b. Compose prompt.
-	chatCtx := buildChatContext(d, history, chunks, cmd.Question)
+	chatCtx := buildChatContext(d, history, chunks, chunkHits, cmd.Question)
 	composed, err := uc.composer.ComposeChat(advisory.AgentChatGrounding, chatCtx)
 	if err != nil {
 		return nil, fmt.Errorf("chat: compose prompt: %w", err)
@@ -296,14 +296,28 @@ func (uc *ChatUseCase) GetThread(ctx context.Context, tenantID, draftID string) 
 }
 
 // buildChatContext converts the domain objects to an advisory.ChatContext for prompt composition.
-func buildChatContext(d *Draft, history []ChatMessage, chunks []string, question string) advisory.ChatContext {
+// hits carries the same RAG results as chunks but with the document_id/page the prompt must
+// expose so the model can cite by document_id (chunks alone is bare text — see chat_grounding/v2).
+func buildChatContext(d *Draft, history []ChatMessage, chunks []string, hits []indexing.ChunkHit, question string) advisory.ChatContext {
 	turns := make([]advisory.ChatTurn, 0, len(history))
 	for _, m := range history {
 		turns = append(turns, advisory.ChatTurn{Role: m.Role, Content: m.Content})
 	}
+	refs := make([]advisory.ChatChunkRef, 0, len(hits))
+	for _, h := range hits {
+		if h.DocumentID == "" {
+			continue
+		}
+		refs = append(refs, advisory.ChatChunkRef{
+			DocumentID: h.DocumentID,
+			Page:       h.Page,
+			Text:       h.Text,
+		})
+	}
 	return advisory.ChatContext{
 		DraftContent: d.Content,
 		Chunks:       chunks,
+		ChunkRefs:    refs,
 		History:      turns,
 		Question:     question,
 	}

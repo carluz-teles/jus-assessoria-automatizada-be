@@ -182,8 +182,8 @@ func TestTemplateComposer_ComposeDraft_v4_FullContext(t *testing.T) {
 		t.Fatalf("ComposeDraft() error = %v", err)
 	}
 
-	if out.PromptVersion != "draft_minuta/v12" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v13" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v13", out.PromptVersion)
 	}
 
 	// System must contain the gold rule (v4: parties + signing lawyer instruction).
@@ -274,8 +274,8 @@ func TestTemplateComposer_ComposeDraft_v4_EmptyContext(t *testing.T) {
 	if !strings.Contains(out.User, "sem contexto adicional") {
 		t.Errorf("empty context should say '(sem contexto adicional)':\n%s", out.User)
 	}
-	if out.PromptVersion != "draft_minuta/v12" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v13" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v13", out.PromptVersion)
 	}
 }
 
@@ -336,8 +336,8 @@ func TestTemplateComposer_ComposeDraft_v10_ProfileSectionsRendered(t *testing.T)
 	if !strings.Contains(out.System, "TESES SELECIONADAS") {
 		t.Errorf("profile prompt missing aceita_teses guidance")
 	}
-	if out.PromptVersion != "draft_minuta/v12" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v13" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v13", out.PromptVersion)
 	}
 }
 
@@ -601,8 +601,8 @@ func TestTemplateComposer_ComposeDraft_v12_MultiAnchor(t *testing.T) {
 			t.Errorf("multi-anchor user prompt missing %q\n---\n%s", want, out.User)
 		}
 	}
-	if out.PromptVersion != "draft_minuta/v12" {
-		t.Errorf("PromptVersion = %q, want draft_minuta/v12", out.PromptVersion)
+	if out.PromptVersion != "draft_minuta/v13" {
+		t.Errorf("PromptVersion = %q, want draft_minuta/v13", out.PromptVersion)
 	}
 }
 

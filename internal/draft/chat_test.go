@@ -558,8 +558,12 @@ func TestBuildChatContext(t *testing.T) {
 		{Role: ChatRoleAssistant, Content: "A1", Citations: []Citation{}},
 	}
 	chunks := []string{"chunk 1", "chunk 2"}
+	hits := []indexing.ChunkHit{
+		{DocumentID: "doc-1", Page: 3, Text: "chunk 1"},
+		{DocumentID: "doc-2", Page: 7, Text: "chunk 2"},
+	}
 
-	ctx := buildChatContext(d, history, chunks, "Nova pergunta")
+	ctx := buildChatContext(d, history, chunks, hits, "Nova pergunta")
 
 	if ctx.DraftContent != d.Content {
 		t.Errorf("DraftContent = %q, want %q", ctx.DraftContent, d.Content)

@@ -324,6 +324,23 @@ type ChatContext struct {
 	History      []ChatTurn // last N turns of the conversation (oldest first)
 	Question     string     // the user's current question
 	Playbook     string     // always empty in v0
+
+	// ChunkRefs are the SAME RAG hits as Chunks but carrying the document_id/page the
+	// model must cite (Chunks alone is bare text — the model can't invent the id). When
+	// non-empty, composeChatGrounding renders each chunk WITH its document_id so the
+	// model returns a citation.document_id that actually matches a retrieved chunk (the
+	// caller validates against exactly this set). Empty → falls back to the bare Chunks
+	// rendering (backward-compat with callers that don't populate refs).
+	ChunkRefs []ChatChunkRef
+}
+
+// ChatChunkRef is one retrieved RAG chunk as exposed to the chat_grounding prompt: the
+// document_id (which the model MUST echo back in citations.document_id) + page + text.
+// Mirrors the citation-relevant fields of indexing.ChunkHit without a slice import.
+type ChatChunkRef struct {
+	DocumentID string
+	Page       int
+	Text       string
 }
 
 // PromptComposer composes the instruction-set for a named advisory agent from a case context.
@@ -429,7 +446,13 @@ const summarizeProcessVersion = "process_summary/v1"
 // thesis_anchor 1:N) — todos os documentos dos autos que a sustentam ("Apoio nos autos:
 // Certidão ('...'); Ato ordinatório ('...')") em vez de um único trecho. Teses sem âncoras
 // caem no caminho singular (Excerpt/SourceLabel), byte-idêntico ao v11 (backward-compat).
-const draftMinutaVersion = "draft_minuta/v12"
+// Bumped to v13: PROÍBE explicitamente que a minuta final contenha marcadores entre
+// colchetes ou meta-notas ("[fls. ...]", "[número da página]", "[não informado nos
+// trechos]", "[inserir ...]", "[data]", etc). Quando uma referência a fls./página for
+// desconhecida, o modelo deve remeter genericamente ("conforme consta nos autos",
+// "conforme os atos ordinatórios e certidões juntados") ou omitir a referência — nunca
+// deixar um placeholder no texto protocolável.
+const draftMinutaVersion = "draft_minuta/v13"
 
 // suggestThesesVersion is the pinned version of the suggest_theses template (POST
 // /v1/pecas/:id/theses — stateless read+LLM). BUMP IT whenever the template text changes.
@@ -437,7 +460,12 @@ const suggestThesesVersion = "suggest_theses/v4"
 
 // chatGroundingVersion is the pinned version of the chat_grounding template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
-const chatGroundingVersion = "chat_grounding/v1"
+// Bumped to v2: os trechos dos autos agora são renderizados COM o seu document_id (e
+// página), e o prompt manda o modelo citar por esse document_id no array `citations` —
+// não mais por marcadores inline "[n]" (que referenciam o índice do trecho e ficavam
+// órfãos no texto). Sem isso o modelo nunca via o document_id e o array vinha vazio
+// (grounded=false). Callers que não preencherem ChunkRefs caem no render textual v1.
+const chatGroundingVersion = "chat_grounding/v2"
 
 // reviewMinutaVersion is the pinned version of the review_minuta template. BUMP IT whenever the
 // template text changes so the feedback delta of the OLD prompt stays attributable to the OLD version.
@@ -668,6 +696,18 @@ func composeDraftMinuta(c DraftContext) Composed {
 			"contexto — USE-AS na qualificação/endereçamento conforme o papel " +
 			"(PLAINTIFF = autor/exequente/requerente; DEFENDANT = réu/executado/requerido). " +
 			"Prefira SEMPRE a parte estruturada ao que você extrairia do teor da intimação.\n\n" +
+
+			"PROIBIÇÃO ABSOLUTA DE MARCADORES/PLACEHOLDERS: a minuta é o texto FINAL, pronto " +
+			"para protocolo. NUNCA emita marcadores entre colchetes ou meta-notas dirigidas ao " +
+			"leitor, tais como \"[fls. ...]\", \"fls. [não informado nos trechos]\", \"de fls. " +
+			"[número da página]\", \"[não informado nos trechos]\", \"[inserir ...]\", \"[data]\", " +
+			"\"[preencher]\" ou qualquer texto entre colchetes referindo-se ao que faltou nos " +
+			"trechos. Em especial, quando uma referência a FOLHAS/PÁGINA (fls.) dos autos for " +
+			"desconhecida, NÃO escreva o número entre colchetes: remeta de forma genérica " +
+			"(ex.: \"conforme consta nos autos\", \"conforme os atos ordinatórios e certidões " +
+			"juntados aos autos\", \"consoante documento acostado\") OU simplesmente omita a " +
+			"referência à folha. O resultado deve ser prosa jurídica limpa e final, SEM nenhum " +
+			"colchete ou placeholder residual.\n\n" +
 
 			"ESTRUTURA CANÔNICA (nesta ordem, blocos separados por linha em branco):\n" +
 			"1) ENDEREÇAMENTO em CAIXA ALTA, adaptado ao foro: Vara Cível comum → " +
@@ -1171,16 +1211,22 @@ func composeChatGrounding(c ChatContext) Composed {
 	sys.WriteString(
 		"Você é um assistente jurídico brasileiro especializado em análise de autos processuais. " +
 			"Responda à pergunta do advogado com base EXCLUSIVAMENTE nos trechos dos autos fornecidos " +
-			"como contexto. Para cada afirmação factual, cite o trecho correspondente usando " +
-			"document_id, page e quote. Se não houver trechos dos autos ou se a informação " +
-			"necessária não estiver nos trechos, responda honestamente que não encontrou essa " +
-			"informação nos documentos disponíveis — nunca invente fatos. " +
-			"Quando citar, use apenas document_ids que apareçam exatamente nos trechos fornecidos.\n\n" +
+			"como contexto. Cada trecho vem rotulado com o seu `document_id` (e página). Para cada " +
+			"afirmação factual, você DEVE incluir uma entrada no array `citations` com: `document_id` " +
+			"(copiado EXATAMENTE do rótulo do trecho que a sustenta — nunca invente, nunca altere), " +
+			"`page` (a página do trecho) e `quote` (a citação literal). Se não houver trechos dos autos " +
+			"ou se a informação necessária não estiver nos trechos, responda honestamente que não " +
+			"encontrou essa informação nos documentos disponíveis — nunca invente fatos.\n\n" +
 			"REGRAS OBRIGATÓRIAS:\n" +
 			"- Responda SOMENTE com base nos trechos fornecidos; se não houver trechos suficientes, " +
 			"diga que não encontrou a informação nos autos disponíveis.\n" +
-			"- `citations` deve conter APENAS citações de trechos que aparecem literalmente no contexto.\n" +
-			"- `citations` pode ser vazio [] quando não houver contexto suficiente — nunca invente document_ids.\n" +
+			"- Sempre que a resposta se apoiar em um trecho, POPULE `citations` com o `document_id` " +
+			"daquele trecho — o array só fica vazio [] quando a resposta não se apoia em nenhum trecho.\n" +
+			"- `citations[].document_id` deve ser um dos `document_id` que aparecem nos rótulos dos " +
+			"trechos fornecidos; nunca invente nem componha um id.\n" +
+			"- NÃO use marcadores inline como \"[1]\", \"[6]\" no texto da resposta para referenciar " +
+			"trechos — a atribuição de fonte vai EXCLUSIVAMENTE no array `citations`. O campo `answer` " +
+			"não deve conter nenhum marcador \"[n]\" órfão.\n" +
 			"- Mantenha o tom jurídico formal brasileiro.",
 	)
 	if pb := strings.TrimSpace(c.Playbook); pb != "" {
@@ -1197,8 +1243,21 @@ func composeChatGrounding(c ChatContext) Composed {
 		usr.WriteString("\n\n")
 	}
 
-	// Inject the retrieved RAG chunks.
-	if len(c.Chunks) > 0 {
+	// Inject the retrieved RAG chunks. Prefer ChunkRefs (which carry the document_id
+	// the model must echo into citations); fall back to bare Chunks text (v1 render)
+	// for callers that don't populate refs.
+	switch {
+	case len(c.ChunkRefs) > 0:
+		usr.WriteString("Trechos dos autos disponíveis (RAG) — cite pelo document_id indicado:\n")
+		for i, ref := range c.ChunkRefs {
+			if i >= 8 {
+				break
+			}
+			usr.WriteString(strconv.Itoa(i+1) + ". [document_id=" + ref.DocumentID +
+				" | página=" + strconv.Itoa(ref.Page) + "] " + ref.Text + "\n")
+		}
+		usr.WriteString("\n")
+	case len(c.Chunks) > 0:
 		usr.WriteString("Trechos dos autos disponíveis (RAG):\n")
 		for i, chunk := range c.Chunks {
 			if i >= 8 {
@@ -1207,7 +1266,7 @@ func composeChatGrounding(c ChatContext) Composed {
 			usr.WriteString(strconv.Itoa(i+1) + ". " + chunk + "\n")
 		}
 		usr.WriteString("\n")
-	} else {
+	default:
 		usr.WriteString("(Nenhum trecho dos autos disponível para esta pergunta.)\n\n")
 	}
 
@@ -1442,6 +1501,11 @@ func composeDraftIterate(c IterateContext) Composed {
 			"- Se nada melhora com o pedido, devolva `changes: []` (não force reescritas).\n" +
 			"- NÃO invente fatos, valores, súmulas, datas ou nºs de processo que não " +
 			"constem do contexto.\n" +
+			"- NUNCA emita marcadores entre colchetes ou meta-notas no `new_paragraphs` " +
+			"(\"[fls. ...]\", \"[número da página]\", \"[não informado nos trechos]\", " +
+			"\"[inserir ...]\", \"[data]\", etc). Quando uma folha/página for desconhecida, " +
+			"remeta genericamente (\"conforme consta nos autos\") ou omita a referência — o " +
+			"texto reescrito é FINAL e protocolável, sem colchetes ou placeholders residuais.\n" +
 			"- Preserve tom técnico-jurídico brasileiro, artigos de lei no formato " +
 			"\"art. XXX, inciso, da Lei nº .../CPC\".",
 	)
