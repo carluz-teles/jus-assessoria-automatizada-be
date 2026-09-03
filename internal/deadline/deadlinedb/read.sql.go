@@ -86,6 +86,7 @@ func (q *Queries) CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (
 const countTasks = `-- name: CountTasks :one
 SELECT count(*) FROM task t
 WHERE t.tenant_id = $1::uuid
+  AND t.status <> 'DISMISSED'
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
   AND ($4::text = '' OR t.source = $4::text)
@@ -106,7 +107,10 @@ type CountTasksParams struct {
 
 // The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
 // @status / @assignee_id / @source / @intimation_id / window. Called only when a filter
-// is present; the unfiltered "Y" reuses CountTasksByTenant.
+// is present; the unfiltered "Y" reuses CountTasksByTenant. DISMISSED is always excluded,
+// mirroring ListTasks (the agenda never shows dismissed tasks) — so this stays consistent
+// with the list's row count even when @status='DISMISSED' is passed explicitly: both then
+// resolve to zero instead of a non-empty total_count against an empty data page.
 func (q *Queries) CountTasks(ctx context.Context, arg CountTasksParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countTasks,
 		arg.TenantID,
@@ -143,11 +147,13 @@ func (q *Queries) CountTasksByProcesso(ctx context.Context, arg CountTasksByProc
 }
 
 const countTasksByTenant = `-- name: CountTasksByTenant :one
-SELECT count(*) FROM task WHERE tenant_id = $1::uuid
+SELECT count(*) FROM task WHERE tenant_id = $1::uuid AND status <> 'DISMISSED'
 `
 
 // The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
-// any filter.
+// any filter. DISMISSED is always excluded (mirrors ListTasks — the agenda never shows
+// dismissed tasks, filtered or not), so this stays consistent with the list even on an
+// unfiltered GET /v1/tasks.
 func (q *Queries) CountTasksByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countTasksByTenant, tenantID)
 	var count int64
@@ -1157,7 +1163,8 @@ SELECT t.id, t.title, t.description, t.kind, t.priority, t.due_date,
        t.court_record_id, t.completed_at,
        -- done_items feeds the derived display_status (see ListTasksByProcesso).
        COALESCE(p.done_items, 0)::bigint AS done_items,
-       cr.cnj_number, cr.court
+       cr.cnj_number, cr.court,
+       d.id AS draft_id, d.sent_to_signing_at, d.filed_at
 FROM task t
 LEFT JOIN LATERAL (
   SELECT count(*) FILTER (WHERE ti.done) AS done_items
@@ -1165,16 +1172,20 @@ LEFT JOIN LATERAL (
   WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
 ) p ON true
 LEFT JOIN court_record cr ON cr.id = t.court_record_id
+LEFT JOIN draft d ON d.task_id = t.id AND d.superseded_at IS NULL
+LEFT JOIN action_item ai ON ai.id = t.action_item_id
 WHERE t.tenant_id = $1::uuid
+  AND t.status <> 'DISMISSED'
   AND ($2::text = '' OR t.status = $2::text)
   AND ($3::uuid IS NULL OR t.assignee_user_id = $3::uuid)
   AND ($4::text = '' OR t.source = $4::text)
   AND ($5::uuid IS NULL OR t.intimation_id = $5::uuid)
   AND ($6::date IS NULL OR t.due_date >= $6::date)
   AND ($7::date IS NULL OR t.due_date <= $7::date)
-  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($8::date, $9::uuid)
+  AND ($8::bool = false OR d.id IS NOT NULL OR t.kind = 'PECA' OR ai.gera_peca = true)
+  AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($9::date, $10::uuid)
 ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
-LIMIT $10
+LIMIT $11
 `
 
 type ListTasksParams struct {
@@ -1185,29 +1196,33 @@ type ListTasksParams struct {
 	IntimationID pgtype.UUID `json:"intimation_id"`
 	FromDate     pgtype.Date `json:"from_date"`
 	ToDate       pgtype.Date `json:"to_date"`
+	PipelineOnly bool        `json:"pipeline_only"`
 	LastDue      pgtype.Date `json:"last_due"`
 	LastID       uuid.UUID   `json:"last_id"`
 	PageLimit    int32       `json:"page_limit"`
 }
 
 type ListTasksRow struct {
-	ID             uuid.UUID          `json:"id"`
-	Title          string             `json:"title"`
-	Description    *string            `json:"description"`
-	Kind           *string            `json:"kind"`
-	Priority       *string            `json:"priority"`
-	DueDate        pgtype.Date        `json:"due_date"`
-	SortDue        pgtype.Date        `json:"sort_due"`
-	Status         string             `json:"status"`
-	Source         string             `json:"source"`
-	AssigneeUserID pgtype.UUID        `json:"assignee_user_id"`
-	DeadlineID     pgtype.UUID        `json:"deadline_id"`
-	IntimationID   pgtype.UUID        `json:"intimation_id"`
-	CourtRecordID  pgtype.UUID        `json:"court_record_id"`
-	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
-	DoneItems      int64              `json:"done_items"`
-	CnjNumber      *string            `json:"cnj_number"`
-	Court          *string            `json:"court"`
+	ID              uuid.UUID          `json:"id"`
+	Title           string             `json:"title"`
+	Description     *string            `json:"description"`
+	Kind            *string            `json:"kind"`
+	Priority        *string            `json:"priority"`
+	DueDate         pgtype.Date        `json:"due_date"`
+	SortDue         pgtype.Date        `json:"sort_due"`
+	Status          string             `json:"status"`
+	Source          string             `json:"source"`
+	AssigneeUserID  pgtype.UUID        `json:"assignee_user_id"`
+	DeadlineID      pgtype.UUID        `json:"deadline_id"`
+	IntimationID    pgtype.UUID        `json:"intimation_id"`
+	CourtRecordID   pgtype.UUID        `json:"court_record_id"`
+	CompletedAt     pgtype.Timestamptz `json:"completed_at"`
+	DoneItems       int64              `json:"done_items"`
+	CnjNumber       *string            `json:"cnj_number"`
+	Court           *string            `json:"court"`
+	DraftID         pgtype.UUID        `json:"draft_id"`
+	SentToSigningAt pgtype.Timestamptz `json:"sent_to_signing_at"`
+	FiledAt         pgtype.Timestamptz `json:"filed_at"`
 }
 
 // The global task agenda (GET /v1/tasks, "meus prazos"): the tenant's tasks, soonest due
@@ -1220,7 +1235,14 @@ type ListTasksRow struct {
 // sentinel ('0001-01-01', zero-uuid). cnj_number/court come from a LEFT JOIN on
 // court_record (mirrors ListPrazos/GetPrazoSuggestContext) — LEFT, not JOIN, because
 // task.court_record_id is nullable (an avulsa task hangs on no process, so it carries no
-// context; the columns come back NULL/"" rather than dropping the row).
+// context; the columns come back NULL/"" rather than dropping the row). DISMISSED is always
+// excluded (a dispensada task is out of the agenda, not just out of the cockpit derivation).
+// draft_id/sent_to_signing_at/filed_at come from a LEFT JOIN on the task's VIGENTE draft
+// (superseded_at IS NULL — draft_task_id_uidx, migration 0089, guarantees at most one such
+// row per task), and gera_peca (via action_item, LEFT JOIN on task.action_item_id) — the
+// ingredients read.go's derivePipelineStage turns into pipeline_stage. @pipeline_only (bool)
+// restricts to "peça-bound" tasks (has a draft, OR kind='PECA', OR the providência gera_peca)
+// when true; false (the default) leaves every non-DISMISSED task in.
 func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error) {
 	rows, err := q.db.Query(ctx, listTasks,
 		arg.TenantID,
@@ -1230,6 +1252,7 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTas
 		arg.IntimationID,
 		arg.FromDate,
 		arg.ToDate,
+		arg.PipelineOnly,
 		arg.LastDue,
 		arg.LastID,
 		arg.PageLimit,
@@ -1259,6 +1282,9 @@ func (q *Queries) ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTas
 			&i.DoneItems,
 			&i.CnjNumber,
 			&i.Court,
+			&i.DraftID,
+			&i.SentToSigningAt,
+			&i.FiledAt,
 		); err != nil {
 			return nil, err
 		}

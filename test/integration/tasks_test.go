@@ -251,6 +251,72 @@ func assertTaskEvent(ctx context.Context, t *testing.T, pool *pgxpool.Pool, even
 	}
 }
 
+// TSK4: a DISMISSED task must never inflate the agenda's "X de Y" counter beyond what
+// GET /v1/tasks actually returns — regression for the bug where CountTasks/CountTasksByTenant
+// counted DISMISSED rows while ListTasks always excludes them (t.status <> 'DISMISSED'
+// unconditionally), so `total_count > 0` came back against an empty `data` page whenever
+// ?status=DISMISSED was requested (and, more subtly, total_count/total ran too high even with
+// no filter, since a dismissed task was always absent from Items but always present in the
+// count). Seeds one OPEN + one DISMISSED task on the same tenant and asserts len(Items) ==
+// TotalCount == Total in two scenarios: no status filter, and an explicit ?status=DISMISSED.
+func TestTasks_DismissedNeverInflatesTotalCount(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	uc := newDeadlineUC(pool)
+	reader := newDeadlineReader(pool)
+	tenant := p.tenantID.String()
+	userID := uuid.NewString()
+
+	openTask, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenant, UserID: userID, Title: "fica aberta",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (open): %v", err)
+	}
+	dismissedTask, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenant, UserID: userID, Title: "vai ser dispensada",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (to dismiss): %v", err)
+	}
+	if _, err := uc.DismissTask(ctx, tenant, userID, dismissedTask.ID); err != nil {
+		t.Fatalf("DismissTask: %v", err)
+	}
+
+	// Scenario 1: no status filter — the DISMISSED task is excluded from BOTH the page and
+	// the totals, so only the OPEN task counts.
+	all, err := reader.Tasks(ctx, deadline.TasksQuery{
+		TenantID: tenant, LastDue: "0001-01-01", LastID: "00000000-0000-0000-0000-000000000000", Limit: 20,
+	})
+	if err != nil {
+		t.Fatalf("Tasks (no filter): %v", err)
+	}
+	if len(all.Items) != 1 || all.Items[0].ID != openTask.ID {
+		t.Fatalf("unfiltered items = %d (first id %q), want 1 item = the OPEN task %q", len(all.Items), ids0(all.Items), openTask.ID)
+	}
+	if all.TotalCount != int64(len(all.Items)) || all.Total != int64(len(all.Items)) {
+		t.Errorf("unfiltered totals = %d/%d, want both == len(data) = %d", all.TotalCount, all.Total, len(all.Items))
+	}
+
+	// Scenario 2: an explicit ?status=DISMISSED filter — ListTasks' unconditional exclusion
+	// makes this contradictory (status <> 'DISMISSED' AND status = 'DISMISSED'), so both the
+	// page and the count resolve to zero, consistently.
+	dismissedOnly, err := reader.Tasks(ctx, deadline.TasksQuery{
+		TenantID: tenant, Status: string(deadline.TaskStatusDismissed),
+		LastDue: "0001-01-01", LastID: "00000000-0000-0000-0000-000000000000", Limit: 20,
+	})
+	if err != nil {
+		t.Fatalf("Tasks (status=DISMISSED): %v", err)
+	}
+	if len(dismissedOnly.Items) != 0 {
+		t.Fatalf("status=DISMISSED items = %d, want 0", len(dismissedOnly.Items))
+	}
+	if dismissedOnly.TotalCount != 0 {
+		t.Errorf("status=DISMISSED total_count = %d, want 0 (must match the empty data page)", dismissedOnly.TotalCount)
+	}
+}
+
 // ids0 is a tiny debug helper: the assignee of the first agenda task (for failure messages).
 func ids0(items []deadline.TaskView) string {
 	if len(items) == 0 {

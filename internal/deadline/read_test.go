@@ -613,6 +613,57 @@ func TestReadUseCase_TaskDetail_NotFound(t *testing.T) {
 	}
 }
 
+// --- derivePipelineStage (the single peça-pipeline-stage derivation) --------
+
+// TestDerivePipelineStage_FourCases proves the derived pipeline_stage is correct across its three
+// buckets (ELABORACAO/REVISAO/PROTOCOLADO) from (hasDraft, sentToSigningAt, filedAt) — the
+// ingredients ListTasks' LEFT JOIN on the task's vigente draft supplies.
+func TestDerivePipelineStage_FourCases(t *testing.T) {
+	t.Parallel()
+
+	sentToSigning := time.Date(2024, 3, 10, 9, 0, 0, 0, time.UTC)
+	filed := time.Date(2024, 3, 15, 9, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name            string
+		hasDraft        bool
+		sentToSigningAt *time.Time
+		filedAt         *time.Time
+		want            string
+	}{
+		{
+			name:     "no draft at all is ELABORACAO",
+			hasDraft: false, sentToSigningAt: nil, filedAt: nil,
+			want: PipelineStageElaboracao,
+		},
+		{
+			name:     "draft not yet sent to signing is ELABORACAO",
+			hasDraft: true, sentToSigningAt: nil, filedAt: nil,
+			want: PipelineStageElaboracao,
+		},
+		{
+			name:     "draft sent to signing, not yet filed is REVISAO",
+			hasDraft: true, sentToSigningAt: &sentToSigning, filedAt: nil,
+			want: PipelineStageRevisao,
+		},
+		{
+			name:     "draft filed is PROTOCOLADO",
+			hasDraft: true, sentToSigningAt: &sentToSigning, filedAt: &filed,
+			want: PipelineStageProtocolado,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := derivePipelineStage(tt.hasDraft, tt.sentToSigningAt, tt.filedAt)
+			if got != tt.want {
+				t.Errorf("derivePipelineStage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestReadUseCase_Tasks_DecoratesDisplayStatus proves the LIST read decorates each row's
 // display_status from its status + done-item count + due_date (the additive field the new tabs read).
 func TestReadUseCase_Tasks_DecoratesDisplayStatus(t *testing.T) {

@@ -144,7 +144,7 @@ var (
 	}
 	tasksListParams = map[string]struct{}{
 		"status": {}, "assignee": {}, "source": {}, "from": {}, "to": {},
-		"limit": {}, "cursor": {}, "intimation_id": {},
+		"limit": {}, "cursor": {}, "intimation_id": {}, "pipeline": {},
 	}
 )
 
@@ -520,7 +520,8 @@ func (h *Handler) listTasksByProcesso(c *fiber.Ctx) error {
 // closed set), ?intimation_id (a uuid, narrows to tasks of a specific intimação — mirrors the
 // prazos route's same-name filter) and a due_date window ?from/?to. A bad
 // status/date/assignee/intimation_id is a client error → 400; a param outside the route's
-// allowlist is likewise 400.
+// allowlist is likewise 400. ?pipeline=true is opt-in: it restricts the agenda to "peça-bound"
+// tasks (see TasksQuery.PipelineOnly) — a missing/false value keeps every non-DISMISSED task.
 func (h *Handler) listTasks(c *fiber.Ctx) error {
 	if err := httpx.RejectUnknownParams(c, tasksListParams); err != nil {
 		return httpx.WriteError(c, err)
@@ -571,7 +572,7 @@ func (h *Handler) listTasks(c *fiber.Ctx) error {
 
 	res, err := h.reader.Tasks(c.UserContext(), TasksQuery{
 		TenantID: tenantID, Status: status, Assignee: assignee, Source: source,
-		IntimationID: intimationID, From: from, To: to,
+		IntimationID: intimationID, From: from, To: to, PipelineOnly: c.QueryBool("pipeline"),
 		LastDue: lastDue, LastID: lastID, Limit: limit,
 	})
 	if err != nil {

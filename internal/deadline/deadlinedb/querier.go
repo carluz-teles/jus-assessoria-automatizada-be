@@ -41,13 +41,18 @@ type Querier interface {
 	CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// The filtered "X" of the task agenda's "X de Y" counter: how many tasks match the active
 	// @status / @assignee_id / @source / @intimation_id / window. Called only when a filter
-	// is present; the unfiltered "Y" reuses CountTasksByTenant.
+	// is present; the unfiltered "Y" reuses CountTasksByTenant. DISMISSED is always excluded,
+	// mirroring ListTasks (the agenda never shows dismissed tasks) — so this stays consistent
+	// with the list's row count even when @status='DISMISSED' is passed explicitly: both then
+	// resolve to zero instead of a non-empty total_count against an empty data page.
 	CountTasks(ctx context.Context, arg CountTasksParams) (int64, error)
 	// The "X de Y" total for the Tasks tab: how many tasks the process holds. Same tenant +
 	// court_record scoping as the list.
 	CountTasksByProcesso(ctx context.Context, arg CountTasksByProcessoParams) (int64, error)
 	// The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
-	// any filter.
+	// any filter. DISMISSED is always excluded (mirrors ListTasks — the agenda never shows
+	// dismissed tasks, filtered or not), so this stays consistent with the list even on an
+	// unfiltered GET /v1/tasks.
 	CountTasksByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// Remove one checklist item (DELETE …/items/:itemId), keyed by (id, task_id, tenant_id)
 	// (barrier 1). Returns the deleted id so a no-match (foreign/unknown item) → pgx.ErrNoRows →
@@ -437,7 +442,14 @@ type Querier interface {
 	// sentinel ('0001-01-01', zero-uuid). cnj_number/court come from a LEFT JOIN on
 	// court_record (mirrors ListPrazos/GetPrazoSuggestContext) — LEFT, not JOIN, because
 	// task.court_record_id is nullable (an avulsa task hangs on no process, so it carries no
-	// context; the columns come back NULL/"" rather than dropping the row).
+	// context; the columns come back NULL/"" rather than dropping the row). DISMISSED is always
+	// excluded (a dispensada task is out of the agenda, not just out of the cockpit derivation).
+	// draft_id/sent_to_signing_at/filed_at come from a LEFT JOIN on the task's VIGENTE draft
+	// (superseded_at IS NULL — draft_task_id_uidx, migration 0089, guarantees at most one such
+	// row per task), and gera_peca (via action_item, LEFT JOIN on task.action_item_id) — the
+	// ingredients read.go's derivePipelineStage turns into pipeline_stage. @pipeline_only (bool)
+	// restricts to "peça-bound" tasks (has a draft, OR kind='PECA', OR the providência gera_peca)
+	// when true; false (the default) leaves every non-DISMISSED task in.
 	ListTasks(ctx context.Context, arg ListTasksParams) ([]ListTasksRow, error)
 	// ── task read models (GET /v1/processos/:id/tasks, GET /v1/tasks) ────────────
 	// The task agenda reads soonest-due first, but due_date is NULLABLE (an undated backlog
