@@ -86,6 +86,9 @@ type generationDepsReader interface {
 type generationWriter interface {
 	UpdateSagaState(ctx context.Context, tx database.Tx, draftID, tenantID, sagaState string, updateContent bool, content string, structured *StructuredContent) (*Draft, error)
 	UpdateDraftContentHtml(ctx context.Context, tx database.Tx, draftID, tenantID, html string) error
+	// SetDraftContentEdited reseta o flag de edição manual (0096) na geração:
+	// a peça recém-gerada não tem ajuste manual.
+	SetDraftContentEdited(ctx context.Context, tx database.Tx, draftID, tenantID string, edited bool) error
 	InsertReview(ctx context.Context, tx database.Tx, r *Review) (*Review, error)
 	DeleteReviewsForDraft(ctx context.Context, tx database.Tx, draftID string) error
 	// Segment persistence (thesis↔trecho, 0095): DeleteSuggestedThesisSegmentsByDraft
@@ -497,6 +500,10 @@ func (uc *GenerateUseCase) OnGenerationRequested(ctx context.Context, ev Generat
 		structured := parseHTMLToStructured(htmlOut)
 		if e := uc.writer.UpdateDraftContentHtml(ctx, tx, ev.DraftID, ev.TenantID, htmlOut); e != nil {
 			return fmt.Errorf("update content_html: %w", e)
+		}
+		// Peça recém-gerada não tem edição manual — reseta o flag (0096).
+		if e := uc.writer.SetDraftContentEdited(ctx, tx, ev.DraftID, ev.TenantID, false); e != nil {
+			return fmt.Errorf("reset content_edited: %w", e)
 		}
 		if _, e := uc.writer.UpdateSagaState(ctx, tx, ev.DraftID, ev.TenantID, SagaStateDrafted, true, plainText, structured); e != nil {
 			return fmt.Errorf("update saga state: %w", e)

@@ -684,6 +684,7 @@ SELECT
     d.updated_at,
     d.structured_content,
     d.content_html,
+    d.content_edited,
     d.authorship,
 
     -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.
@@ -761,6 +762,7 @@ type GetDraftDetailRow struct {
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 	StructuredContent         []byte             `json:"structured_content"`
 	ContentHtml               *string            `json:"content_html"`
+	ContentEdited             bool               `json:"content_edited"`
 	Authorship                string             `json:"authorship"`
 	SentToSigningAt           pgtype.Timestamptz `json:"sent_to_signing_at"`
 	SignedAt                  pgtype.Timestamptz `json:"signed_at"`
@@ -809,6 +811,7 @@ func (q *Queries) GetDraftDetail(ctx context.Context, arg GetDraftDetailParams) 
 		&i.UpdatedAt,
 		&i.StructuredContent,
 		&i.ContentHtml,
+		&i.ContentEdited,
 		&i.Authorship,
 		&i.SentToSigningAt,
 		&i.SignedAt,
@@ -2280,6 +2283,25 @@ type RevokeEsajCredentialParams struct {
 // Soft-delete idempotente: só marca revoked_at quando ainda ativa.
 func (q *Queries) RevokeEsajCredential(ctx context.Context, arg RevokeEsajCredentialParams) error {
 	_, err := q.db.Exec(ctx, revokeEsajCredential, arg.ID, arg.TenantID)
+	return err
+}
+
+const setDraftContentEdited = `-- name: SetDraftContentEdited :exec
+UPDATE draft
+SET content_edited = $3
+WHERE id = $1 AND tenant_id = $2
+`
+
+type SetDraftContentEditedParams struct {
+	ID            uuid.UUID `json:"id"`
+	TenantID      uuid.UUID `json:"tenant_id"`
+	ContentEdited bool      `json:"content_edited"`
+}
+
+// Marca/desmarca o flag de edição manual (0096). Autosave → true; geração
+// bem-sucedida → false. Escopo (id, tenant_id).
+func (q *Queries) SetDraftContentEdited(ctx context.Context, arg SetDraftContentEditedParams) error {
+	_, err := q.db.Exec(ctx, setDraftContentEdited, arg.ID, arg.TenantID, arg.ContentEdited)
 	return err
 }
 

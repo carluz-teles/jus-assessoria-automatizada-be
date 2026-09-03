@@ -92,6 +92,10 @@ func (f *fakeWriter) UpdateDraftContentHtml(_ context.Context, _ database.Tx, _,
 	return nil
 }
 
+func (f *fakeWriter) SetDraftContentEdited(_ context.Context, _ database.Tx, _, _ string, _ bool) error {
+	return nil
+}
+
 func (f *fakeWriter) InsertReview(_ context.Context, _ database.Tx, r *Review) (*Review, error) {
 	f.insertedReview = r
 	if f.returnedReview != nil {

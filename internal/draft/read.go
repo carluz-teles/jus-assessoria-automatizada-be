@@ -29,6 +29,9 @@ type DraftDetailView struct {
 	// Nil para peças legacy ou recém-geradas (structured_content ainda é a
 	// fonte). Quando não-nil, source-of-truth pro renderer PDF (Fase C).
 	ContentHtml *string
+	// ContentEdited: o content_html foi editado à mão desde a última geração
+	// (0096). O FE usa pra avisar antes de regerar (mudar teses descarta ajustes).
+	ContentEdited bool
 	// Authorship is "assistant" (default, FE shows Iterar tab) or "human_taken"
 	// (advogado assumiu autoria, FE shows Revisão tab). See migration 0056.
 	Authorship string
@@ -152,6 +155,7 @@ func detailViewFromRow(r draftdb.GetDraftDetailRow) *DraftDetailView {
 		UpdatedAt:           timestamptzToTime(r.UpdatedAt),
 		StructuredContent:   structuredContentFromJSON(r.StructuredContent),
 		ContentHtml:         r.ContentHtml,
+		ContentEdited:       r.ContentEdited,
 		Authorship:          r.Authorship,
 		Attachments:         []Attachment{}, // never nil — serializes as [] not null
 		Providences:         []Providence{}, // never nil

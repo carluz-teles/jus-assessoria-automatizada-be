@@ -399,6 +399,7 @@ type Draft struct {
 	PieceProfileKey     *string            `json:"piece_profile_key"`
 	SupersededAt        pgtype.Timestamptz `json:"superseded_at"`
 	SupersededByDraftID pgtype.UUID        `json:"superseded_by_draft_id"`
+	ContentEdited       bool               `json:"content_edited"`
 }
 
 type DraftAttachment struct {

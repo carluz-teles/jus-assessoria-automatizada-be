@@ -326,6 +326,9 @@ type Querier interface {
 	RevertToConstruction(ctx context.Context, arg RevertToConstructionParams) (RevertToConstructionRow, error)
 	// Soft-delete idempotente: só marca revoked_at quando ainda ativa.
 	RevokeEsajCredential(ctx context.Context, arg RevokeEsajCredentialParams) error
+	// Marca/desmarca o flag de edição manual (0096). Autosave → true; geração
+	// bem-sucedida → false. Escopo (id, tenant_id).
+	SetDraftContentEdited(ctx context.Context, arg SetDraftContentEditedParams) error
 	// Persist the Gerar-time generation params (tone/instructions/selected_theses,
 	// Fatia 5) chosen on POST /v1/pecas/:id/generate. Called by TriggerGeneration in
 	// the SAME tx as UpdateSagaState → EXTRACTING; the draft.generation_requested event

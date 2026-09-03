@@ -238,6 +238,13 @@ SET content_html = $3,
 WHERE id = $1 AND tenant_id = $2
 RETURNING id, updated_at;
 
+-- name: SetDraftContentEdited :exec
+-- Marca/desmarca o flag de edição manual (0096). Autosave → true; geração
+-- bem-sucedida → false. Escopo (id, tenant_id).
+UPDATE draft
+SET content_edited = $3
+WHERE id = $1 AND tenant_id = $2;
+
 -- name: GetDraftDetail :one
 -- Read model for GET /v1/pecas/:id: a JOIN over draft, intimation (optional),
 -- court_record (via intimation), and deadline (via intimation 1:1 UNIQUE). All
@@ -256,6 +263,7 @@ SELECT
     d.updated_at,
     d.structured_content,
     d.content_html,
+    d.content_edited,
     d.authorship,
 
     -- workflow timestamps (0060) — a UI deriva o step atual a partir deles.

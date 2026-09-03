@@ -241,6 +241,9 @@ func (r *fakeRepo) UpdateDraftContent(_ context.Context, _ database.Tx, _, _, _ 
 	return r.updateResult, r.updateErr
 }
 
+func (r *fakeRepo) SetDraftContentEdited(_ context.Context, _ database.Tx, _, _ string, _ bool) error {
+	return nil
+}
 func (r *fakeRepo) UpdateDraftContentHtml(_ context.Context, _ database.Tx, _, _, _ string) error {
 	return nil
 }

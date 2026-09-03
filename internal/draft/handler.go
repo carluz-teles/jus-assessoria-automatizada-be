@@ -508,7 +508,10 @@ type detailResponse struct {
 	// ContentHTML (Fase B do editor rico) — HTML do Tiptap. null pra peças
 	// legacy ou geradas pela IA antes do 1º save do editor humano.
 	ContentHTML *string `json:"content_html"`
-	Authorship  string  `json:"authorship"`
+	// ContentEdited: o content_html foi editado à mão desde a última geração
+	// (0096). O FE avisa antes de regerar ao mudar teses.
+	ContentEdited bool   `json:"content_edited"`
+	Authorship    string `json:"authorship"`
 
 	Intimation  *intimationResponse  `json:"intimation,omitempty"`
 	Process     *processResponse     `json:"process,omitempty"`
@@ -631,6 +634,7 @@ func detailToResponse(v *DraftDetailView) detailResponse {
 		UpdatedAt:           v.UpdatedAt.Format(time.RFC3339),
 		StructuredContent:   v.StructuredContent,
 		ContentHTML:         v.ContentHtml,
+		ContentEdited:       v.ContentEdited,
 		Authorship:          v.Authorship,
 		SentToSigningAt:     timePtrToRFC3339(v.SentToSigningAt),
 		SignedAt:            timePtrToRFC3339(v.SignedAt),

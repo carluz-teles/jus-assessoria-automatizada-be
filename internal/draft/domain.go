@@ -1014,7 +1014,12 @@ func isTSATransient(err error) bool {
 // tenantID vem do principal, nunca do body. Chamado pelo autosave do FE.
 func (uc *UseCase) SaveContentHtml(ctx context.Context, tenantID, draftID, html string) error {
 	return uc.repo.Do(ctx, tenantID, func(tx database.Tx) error {
-		return uc.rw.UpdateDraftContentHtml(ctx, tx, draftID, tenantID, html)
+		if err := uc.rw.UpdateDraftContentHtml(ctx, tx, draftID, tenantID, html); err != nil {
+			return err
+		}
+		// Marca edição manual (0096): mudar teses depois disto regenera a peça e
+		// descartaria estes ajustes — o FE avisa antes ("avisar e confirmar").
+		return uc.rw.SetDraftContentEdited(ctx, tx, draftID, tenantID, true)
 	})
 }
 

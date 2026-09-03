@@ -104,6 +104,9 @@ type Repository interface {
 	// pro renderer PDF; structured_content fica congelado. Escopo
 	// (draftID, tenantID). No-match → ErrDraftNotFound.
 	UpdateDraftContentHtml(ctx context.Context, tx database.Tx, draftID, tenantID, html string) error
+	// SetDraftContentEdited marca/desmarca o flag de edição manual (0096): autosave
+	// → true; geração bem-sucedida → false. Escopo (draftID, tenantID).
+	SetDraftContentEdited(ctx context.Context, tx database.Tx, draftID, tenantID string, edited bool) error
 	// GetDraftDetail runs the JOIN read model for GET /v1/pecas/:id. A miss is
 	// ErrDraftNotFound.
 	GetDraftDetail(ctx context.Context, tx database.Tx, tenantID, draftID string) (*DraftDetailView, error)
@@ -777,6 +780,25 @@ func (r *pgRepository) UpdateDraftContentHtml(ctx context.Context, tx database.T
 		return ErrDraftNotFound
 	}
 	if err != nil {
+		return database.WrapInfra(err)
+	}
+	return nil
+}
+
+func (r *pgRepository) SetDraftContentEdited(ctx context.Context, tx database.Tx, draftID, tenantID string, edited bool) error {
+	did, err := parseUUID(draftID)
+	if err != nil {
+		return err
+	}
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return err
+	}
+	if err := draftdb.New(tx).SetDraftContentEdited(ctx, draftdb.SetDraftContentEditedParams{
+		ID:            did,
+		TenantID:      tid,
+		ContentEdited: edited,
+	}); err != nil {
 		return database.WrapInfra(err)
 	}
 	return nil
