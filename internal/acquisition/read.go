@@ -418,19 +418,19 @@ type IntimacoesQuery struct {
 	LastMadeAvailable string
 	LastID            string
 	Limit             int
-	Search            string // ?search: ILIKE on the court record's cnj_number; "" means no filter
-	Type              string // ?type: closed set (IntimationType* consts); "" = all
-	UserStatus        string // ?user_status: closed set (IntimationUserStatus* consts); "" = all
-	Court             string // ?court: exact match (from ListIntimacaoCourts); "" = all
-	Urgencia          string // ?urgencia: closed set (atraso|hoje|proximos_dois_dias|semana|este_mes|mais_adiante|sem_data_definida); "" = all
-	NaoConfirmado     bool   // ?nao_confirmado: server-side triage toggle; true = only suggested-not-confirmed deadlines (d.status = 'PENDING')
-	Assignee          string // ?assignee: a user id ("me" resolved by the handler); matches assignee_user_id (0057 single-assignee); "" = any
-	WorkStage         string // ?work_stage: closed set (WorkStage* consts); filtra pelo estágio derivado (CASE espelha deriveWorkStage); "" = all
+	Search            string   // ?search: ILIKE on the court record's cnj_number; "" means no filter
+	Type              string   // ?type: closed set (IntimationType* consts); "" = all
+	UserStatus        string   // ?user_status: closed set (IntimationUserStatus* consts); "" = all
+	Court             string   // ?court: exact match (from ListIntimacaoCourts); "" = all
+	Urgencia          string   // ?urgencia: closed set (atraso|hoje|proximos_dois_dias|semana|este_mes|mais_adiante|sem_data_definida); "" = all
+	NaoConfirmado     bool     // ?nao_confirmado: server-side triage toggle; true = only suggested-not-confirmed deadlines (d.status = 'PENDING')
+	Assignee          string   // ?assignee: a user id ("me" resolved by the handler); matches assignee_user_id (0057 single-assignee); "" = any
+	WorkStage         []string // ?work_stage: CSV de valores do conjunto fechado (WorkStage* consts), OR-matched contra o estágio derivado (CASE espelha deriveWorkStage); vazio = all
 }
 
 // Filtered reports whether any list filter (search included) is active.
 func (q IntimacoesQuery) Filtered() bool {
-	return q.Search != "" || q.Type != "" || q.UserStatus != "" || q.Court != "" || q.Urgencia != "" || q.NaoConfirmado || q.Assignee != "" || q.WorkStage != ""
+	return q.Search != "" || q.Type != "" || q.UserStatus != "" || q.Court != "" || q.Urgencia != "" || q.NaoConfirmado || q.Assignee != "" || len(q.WorkStage) > 0
 }
 
 // AndamentosQuery carries the descending keyset cursor (the last row's occurred_at

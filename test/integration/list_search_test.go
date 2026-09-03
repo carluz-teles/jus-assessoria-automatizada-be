@@ -226,7 +226,7 @@ func TestListIntimacoes_WorkStageAloneFiltersTotal(t *testing.T) {
 
 	got, err := uc.Intimacoes(ctx, acquisition.IntimacoesQuery{
 		TenantID: tenantID, Limit: 20, LastMadeAvailable: maxDateLit, LastID: maxUUIDlit,
-		WorkStage: acquisition.WorkStageAwaitingConfirmation,
+		WorkStage: []string{acquisition.WorkStageAwaitingConfirmation},
 	})
 	if err != nil {
 		t.Fatalf("Intimacoes (work_stage): %v", err)
@@ -240,6 +240,78 @@ func TestListIntimacoes_WorkStageAloneFiltersTotal(t *testing.T) {
 	if got.Total != 3 {
 		t.Errorf("total = %d, want 3 (global, unfiltered)", got.Total)
 	}
+}
+
+// TestListIntimacoes_WorkStageMultiValueOrUnion covers ?work_stage as a CSV of 2+
+// values: the list is the OR-union of every stage (an intimation matches if its
+// derived stage is ANY of them), and total_count is the real union count — not a
+// naive sum of two independent per-stage COUNTs (which would double count if a
+// caller passed the same value twice, or drift if computed as two separate
+// queries instead of the single `= ANY(@work_stage::text[])` predicate).
+func TestListIntimacoes_WorkStageMultiValueOrUnion(t *testing.T) {
+	pool := newPool(t)
+	repo := acquisition.NewRepository(pool)
+	uc := acquisition.NewReadUseCase(repo)
+	ctx := context.Background()
+
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-work-stage-union", 0)
+
+	// Two RECEIVED (no deadline) + one AWAITING_CONFIRMATION (unconfirmed deadline) +
+	// one CONFIRMED (confirmed deadline) — four distinct stages seeded so a 2-value
+	// filter must select exactly the union of its two stages, excluding the other two.
+	recA, caseA := seedCourtRecordCNJ(t, pool, tenantID, "0009101-11.2026.8.26.0001")
+	recB, caseB := seedCourtRecordCNJ(t, pool, tenantID, "0009102-22.2026.8.26.0002")
+	recC, caseC := seedCourtRecordCNJ(t, pool, tenantID, "0009103-33.2026.8.26.0003")
+	recD, caseD := seedCourtRecordCNJ(t, pool, tenantID, "0009104-44.2026.8.26.0004")
+	receivedA := seedIntimationReturningID(t, pool, tenantID, caseA, recA)
+	receivedB := seedIntimationReturningID(t, pool, tenantID, caseB, recB)
+	awaiting := seedIntimationReturningID(t, pool, tenantID, caseC, recC)
+	seedDeadlineFor(t, pool, tenantID, recC, awaiting, 10) // unconfirmed → AWAITING_CONFIRMATION, deliberately excluded from the filter
+	confirmed := seedIntimationReturningID(t, pool, tenantID, caseD, recD)
+	seedDeadlineFor(t, pool, tenantID, recD, confirmed, 10)
+	mustExec(t, pool,
+		`UPDATE deadline SET confirmed_by = gen_random_uuid(), confirmed_at = now() WHERE notification_id = $1`,
+		confirmed)
+
+	got, err := uc.Intimacoes(ctx, acquisition.IntimacoesQuery{
+		TenantID: tenantID, Limit: 20, LastMadeAvailable: maxDateLit, LastID: maxUUIDlit,
+		WorkStage: []string{acquisition.WorkStageReceived, acquisition.WorkStageConfirmed},
+	})
+	if err != nil {
+		t.Fatalf("Intimacoes (work_stage union): %v", err)
+	}
+	gotIDs := make([]string, len(got.Items))
+	for i, item := range got.Items {
+		gotIDs[i] = item.ID
+	}
+	wantIDs := []string{receivedA, receivedB, confirmed}
+	if !sameIDSet(gotIDs, wantIDs) {
+		t.Fatalf("work_stage=RECEIVED,CONFIRMED: got IDs %v, want the union %v", gotIDs, wantIDs)
+	}
+	if got.TotalCount != 3 {
+		t.Errorf("total_count = %d, want 3 (real OR-union count, not a naive per-stage sum)", got.TotalCount)
+	}
+	if got.Total != 4 {
+		t.Errorf("total = %d, want 4 (global, unfiltered)", got.Total)
+	}
+}
+
+// sameIDSet reports whether got and want contain the same ids, ignoring order.
+func sameIDSet(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	set := make(map[string]bool, len(want))
+	for _, id := range want {
+		set[id] = true
+	}
+	for _, id := range got {
+		if !set[id] {
+			return false
+		}
+	}
+	return true
 }
 
 // seedIntimationFor inserts one intimation for the record (no discovering window —

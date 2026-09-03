@@ -167,9 +167,10 @@ WHERE i.tenant_id = $1
     $6::uuid IS NULL
     OR i.assignee_user_id = $6::uuid
   )
-  -- Status = work_stage (CASE espelha deriveWorkStage; igual ao ListIntimacoes).
+  -- Status = work_stage (CASE espelha deriveWorkStage; igual ao ListIntimacoes). Lista
+  -- OR-matched (ANY) — ver comentário em ListIntimacoes.
   AND (
-    $7::text = ''
+    $7::text[] = '{}'
     OR (CASE
       WHEN dr.filed_at IS NOT NULL THEN 'FILED'
       WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
@@ -177,7 +178,7 @@ WHERE i.tenant_id = $1
       WHEN d.id IS NULL THEN 'RECEIVED'
       WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
       ELSE 'AWAITING_CONFIRMATION'
-    END) = $7::text
+    END) = ANY($7::text[])
   )
   AND (
     $8::text = ''
@@ -199,7 +200,7 @@ type CountIntimacoesFilteredParams struct {
 	UserStatus    string      `json:"user_status"`
 	Court         string      `json:"court"`
 	AssigneeID    pgtype.UUID `json:"assignee_id"`
-	WorkStage     string      `json:"work_stage"`
+	WorkStage     []string    `json:"work_stage"`
 	Urgencia      string      `json:"urgencia"`
 	NaoConfirmado bool        `json:"nao_confirmado"`
 }
@@ -846,9 +847,11 @@ WHERE i.tenant_id = $1
     OR i.assignee_user_id = $7::uuid
   )
   -- Status = work_stage derivado. O CASE ESPELHA deriveWorkStage (read.go) — mesma
-  -- precedência marco-mais-avançado-vence. Manter os dois em sincronia.
+  -- precedência marco-mais-avançado-vence. Manter os dois em sincronia. @work_stage é
+  -- uma lista (CSV no handler → text[] aqui): vazia = sem filtro; 1+ valores = OR
+  -- (ANY) — a intimação casa se seu estágio derivado estiver em QUALQUER um deles.
   AND (
-    $8::text = ''
+    $8::text[] = '{}'
     OR (CASE
       WHEN dr.filed_at IS NOT NULL THEN 'FILED'
       WHEN dr.status IN ('SIGNED', 'REVIEWED') THEN 'PARTNER_REVIEW'
@@ -856,7 +859,7 @@ WHERE i.tenant_id = $1
       WHEN d.id IS NULL THEN 'RECEIVED'
       WHEN d.confirmed_by IS NOT NULL THEN 'CONFIRMED'
       ELSE 'AWAITING_CONFIRMATION'
-    END) = $8::text
+    END) = ANY($8::text[])
   )
   AND (
     $9::text = ''
@@ -885,7 +888,7 @@ type ListIntimacoesParams struct {
 	UserStatus        string      `json:"user_status"`
 	Court             string      `json:"court"`
 	AssigneeID        pgtype.UUID `json:"assignee_id"`
-	WorkStage         string      `json:"work_stage"`
+	WorkStage         []string    `json:"work_stage"`
 	Urgencia          string      `json:"urgencia"`
 	NaoConfirmado     bool        `json:"nao_confirmado"`
 	LastMadeAvailable pgtype.Date `json:"last_made_available"`
