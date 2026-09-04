@@ -99,7 +99,7 @@ func (f *fakeHandlerUC) AssignResponsible(_ context.Context, tenantID, courtReco
 	return f.assignErr
 }
 
-func (f *fakeHandlerUC) UpdateProcessoManual(_ context.Context, _, _ string, _ *string, _ *float64) error {
+func (f *fakeHandlerUC) UpdateProcessoManual(_ context.Context, _, _ string, _ *string, _ *float64, _ *string) error {
 	return nil
 }
 

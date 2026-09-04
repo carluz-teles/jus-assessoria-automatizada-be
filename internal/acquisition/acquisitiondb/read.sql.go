@@ -287,6 +287,8 @@ const getIntimacao = `-- name: GetIntimacao :one
 SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        i.recipients, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id, cr.judging_body,
+       cc.label,
+       COALESCE(fd.name, '')                                                        AS first_defendant_name,
        (SELECT array_agg(p.name ORDER BY p.name)
           FROM party p
          WHERE p.case_id = cr.case_id
@@ -328,6 +330,16 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN court_case cc ON cc.id = cr.case_id
+LEFT JOIN LATERAL (
+    SELECT p.name
+    FROM party p
+    WHERE p.case_id = cr.case_id
+      AND p.tenant_id = cr.tenant_id
+      AND p.role = 'DEFENDANT'
+    ORDER BY p.created_at ASC
+    LIMIT 1
+) fd ON true
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua  ON ua.id = i.assignee_user_id
 LEFT JOIN app_user ucf ON ucf.id = d.confirmed_by
@@ -359,6 +371,8 @@ type GetIntimacaoRow struct {
 	Subject              *string            `json:"subject"`
 	CourtRecordID        uuid.UUID          `json:"court_record_id"`
 	JudgingBody          *string            `json:"judging_body"`
+	Label                *string            `json:"label"`
+	FirstDefendantName   string             `json:"first_defendant_name"`
 	Plaintiffs           []string           `json:"plaintiffs"`
 	Defendants           []string           `json:"defendants"`
 	DistributionDate     pgtype.Date        `json:"distribution_date"`
@@ -394,7 +408,10 @@ type GetIntimacaoRow struct {
 // The LEFT JOIN deadline mirrors ListIntimacoes (same 1:1 notification_id join); NULL
 // when the intimação has no prazo yet. Scoped by tenant_id (barrier 1): a foreign or
 // unknown id yields no row (→ typed 404 upstream, never nil,nil). Read-only, off the
-// write path.
+// write path. cc.label + first_defendant_name back BuildCaseTitle (title.go) — same
+// inputs as ListIntimacoes/ListProcessos. first_defendant_name is a DIFFERENT tie-break
+// than the "defendants" array below (that one is ORDER BY name, for the Partes card;
+// this one is ORDER BY created_at — first ever captured — for the título).
 func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error) {
 	row := q.db.QueryRow(ctx, getIntimacao, arg.ID, arg.TenantID)
 	var i GetIntimacaoRow
@@ -417,6 +434,8 @@ func (q *Queries) GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (Get
 		&i.Subject,
 		&i.CourtRecordID,
 		&i.JudgingBody,
+		&i.Label,
+		&i.FirstDefendantName,
 		&i.Plaintiffs,
 		&i.Defendants,
 		&i.DistributionDate,
@@ -446,11 +465,14 @@ SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subje
        -- responsável do processo, joined at case level (see ListProcessos). LEFT JOINs so
        -- an unassigned case still returns the record with NULL assigned_user_id/name.
        cc.assigned_user_id, au.name AS assigned_user_name,
+       -- rótulo manual do processo (título, Achado 1) — NULL até o advogado preencher.
+       cc.label,
        COALESCE(m.text, '') AS last_movement_text, m.occurred_at AS last_movement_at,
        -- prazo mais próximo ABERTO do processo (nil = JSON null when absent).
        nd.end_date AS next_deadline_end_date,
        CASE WHEN nd.end_date IS NOT NULL THEN (nd.end_date - CURRENT_DATE)::int END AS next_deadline_days_left,
-       nd.kind    AS next_deadline_kind
+       nd.kind    AS next_deadline_kind,
+       COALESCE(fd.name, '') AS first_defendant_name
 FROM court_record cr
 LEFT JOIN court_case cc ON cc.id = cr.case_id
 LEFT JOIN app_user au ON au.id = cc.assigned_user_id
@@ -471,6 +493,15 @@ LEFT JOIN LATERAL (
     ORDER BY d.end_date ASC
     LIMIT 1
 ) nd ON true
+LEFT JOIN LATERAL (
+    SELECT p.name
+    FROM party p
+    WHERE p.case_id = cr.case_id
+      AND p.tenant_id = cr.tenant_id
+      AND p.role = 'DEFENDANT'
+    ORDER BY p.created_at ASC
+    LIMIT 1
+) fd ON true
 WHERE cr.id = $1 AND cr.tenant_id = $2
 `
 
@@ -496,11 +527,13 @@ type GetProcessoRow struct {
 	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
+	Label                *string            `json:"label"`
 	LastMovementText     string             `json:"last_movement_text"`
 	LastMovementAt       pgtype.Timestamptz `json:"last_movement_at"`
 	NextDeadlineEndDate  pgtype.Date        `json:"next_deadline_end_date"`
 	NextDeadlineDaysLeft interface{}        `json:"next_deadline_days_left"`
 	NextDeadlineKind     *string            `json:"next_deadline_kind"`
+	FirstDefendantName   string             `json:"first_defendant_name"`
 }
 
 // One process by id, for the FE deep-link into the processes detail (a process not on
@@ -509,7 +542,8 @@ type GetProcessoRow struct {
 // Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
 // placeholder is still reachable by direct link. A foreign or unknown id yields no row
 // (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
-// next_deadline: same correlated LATERAL as ListProcessos (see above).
+// next_deadline: same correlated LATERAL as ListProcessos (see above). cc.label +
+// fd.name (first_defendant_name): same BuildCaseTitle inputs as ListProcessos.
 func (q *Queries) GetProcesso(ctx context.Context, arg GetProcessoParams) (GetProcessoRow, error) {
 	row := q.db.QueryRow(ctx, getProcesso, arg.ID, arg.TenantID)
 	var i GetProcessoRow
@@ -530,11 +564,13 @@ func (q *Queries) GetProcesso(ctx context.Context, arg GetProcessoParams) (GetPr
 		&i.ClaimValue,
 		&i.AssignedUserID,
 		&i.AssignedUserName,
+		&i.Label,
 		&i.LastMovementText,
 		&i.LastMovementAt,
 		&i.NextDeadlineEndDate,
 		&i.NextDeadlineDaysLeft,
 		&i.NextDeadlineKind,
+		&i.FirstDefendantName,
 	)
 	return i, err
 }
@@ -816,6 +852,7 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        i.content, i.type, i.status, i.user_status, i.source, i.source_url,
        cr.cnj_number, cr.court, cr.degree, cr.class, cr.subject, cr.id AS court_record_id,
        i.ai_analyzed_at, i.assignee_user_id, ua.name AS assignee_user_name,
+       cc.label, COALESCE(fd.name, '') AS first_defendant_name,
        -- prazo derivado (nullable — nem toda intimação tem prazo ainda). CASE WHEN
        -- garante que todas as expressões derivadas sejam NULL quando não há prazo
        -- (LEFT JOIN miss), forçando o sqlc a inferir os tipos como nullable (*T).
@@ -829,6 +866,16 @@ SELECT i.id, i.made_available_at, i.published_at, i.deadline_start_at,
        dr.filed_at                                                                AS draft_filed_at
 FROM intimation i
 JOIN court_record cr ON cr.id = i.court_record_id
+LEFT JOIN court_case cc ON cc.id = cr.case_id
+LEFT JOIN LATERAL (
+    SELECT p.name
+    FROM party p
+    WHERE p.case_id = cr.case_id
+      AND p.tenant_id = cr.tenant_id
+      AND p.role = 'DEFENDANT'
+    ORDER BY p.created_at ASC
+    LIMIT 1
+) fd ON true
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 LEFT JOIN app_user ua ON ua.id = i.assignee_user_id
 LEFT JOIN draft dr ON dr.intimation_id = i.id AND dr.tenant_id = i.tenant_id
@@ -896,32 +943,34 @@ type ListIntimacoesParams struct {
 }
 
 type ListIntimacoesRow struct {
-	ID               uuid.UUID          `json:"id"`
-	MadeAvailableAt  pgtype.Date        `json:"made_available_at"`
-	PublishedAt      pgtype.Date        `json:"published_at"`
-	DeadlineStartAt  pgtype.Date        `json:"deadline_start_at"`
-	Content          string             `json:"content"`
-	Type             *string            `json:"type"`
-	Status           string             `json:"status"`
-	UserStatus       string             `json:"user_status"`
-	Source           string             `json:"source"`
-	SourceUrl        *string            `json:"source_url"`
-	CnjNumber        string             `json:"cnj_number"`
-	Court            string             `json:"court"`
-	Degree           string             `json:"degree"`
-	Class            *string            `json:"class"`
-	Subject          *string            `json:"subject"`
-	CourtRecordID    uuid.UUID          `json:"court_record_id"`
-	AiAnalyzedAt     pgtype.Timestamptz `json:"ai_analyzed_at"`
-	AssigneeUserID   pgtype.UUID        `json:"assignee_user_id"`
-	AssigneeUserName *string            `json:"assignee_user_name"`
-	PrazoDeadlineID  pgtype.UUID        `json:"prazo_deadline_id"`
-	PrazoEndDate     pgtype.Date        `json:"prazo_end_date"`
-	PrazoDaysLeft    interface{}        `json:"prazo_days_left"`
-	PrazoStatus      *string            `json:"prazo_status"`
-	PrazoConfirmed   interface{}        `json:"prazo_confirmed"`
-	DraftStatus      *string            `json:"draft_status"`
-	DraftFiledAt     pgtype.Timestamptz `json:"draft_filed_at"`
+	ID                 uuid.UUID          `json:"id"`
+	MadeAvailableAt    pgtype.Date        `json:"made_available_at"`
+	PublishedAt        pgtype.Date        `json:"published_at"`
+	DeadlineStartAt    pgtype.Date        `json:"deadline_start_at"`
+	Content            string             `json:"content"`
+	Type               *string            `json:"type"`
+	Status             string             `json:"status"`
+	UserStatus         string             `json:"user_status"`
+	Source             string             `json:"source"`
+	SourceUrl          *string            `json:"source_url"`
+	CnjNumber          string             `json:"cnj_number"`
+	Court              string             `json:"court"`
+	Degree             string             `json:"degree"`
+	Class              *string            `json:"class"`
+	Subject            *string            `json:"subject"`
+	CourtRecordID      uuid.UUID          `json:"court_record_id"`
+	AiAnalyzedAt       pgtype.Timestamptz `json:"ai_analyzed_at"`
+	AssigneeUserID     pgtype.UUID        `json:"assignee_user_id"`
+	AssigneeUserName   *string            `json:"assignee_user_name"`
+	Label              *string            `json:"label"`
+	FirstDefendantName string             `json:"first_defendant_name"`
+	PrazoDeadlineID    pgtype.UUID        `json:"prazo_deadline_id"`
+	PrazoEndDate       pgtype.Date        `json:"prazo_end_date"`
+	PrazoDaysLeft      interface{}        `json:"prazo_days_left"`
+	PrazoStatus        *string            `json:"prazo_status"`
+	PrazoConfirmed     interface{}        `json:"prazo_confirmed"`
+	DraftStatus        *string            `json:"draft_status"`
+	DraftFiledAt       pgtype.Timestamptz `json:"draft_filed_at"`
 }
 
 // The intimações inbox: the tenant's intimations, newest availability first, with
@@ -934,7 +983,10 @@ type ListIntimacoesRow struct {
 // exposes the derived prazo (1:1 per notification_id, UNIQUE); NULL when no prazo
 // exists yet. ai_analyzed_at + assignee_user_id/name mirror GetIntimacao's
 // projection (same LEFT JOIN app_user pattern) so the inbox row can render the
-// "não analisada" badge and the responsável label without a deep-link.
+// "não analisada" badge and the responsável label without a deep-link. cc.label +
+// fd.name (first_defendant_name) back BuildCaseTitle (title.go) — same inputs as
+// ListProcessos/GetProcesso, joined here at case level (cr.case_id) so the inbox row
+// shows the same título as the processes screen for the same processo.
 func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error) {
 	rows, err := q.db.Query(ctx, listIntimacoes,
 		arg.TenantID,
@@ -977,6 +1029,8 @@ func (q *Queries) ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) 
 			&i.AiAnalyzedAt,
 			&i.AssigneeUserID,
 			&i.AssigneeUserName,
+			&i.Label,
+			&i.FirstDefendantName,
 			&i.PrazoDeadlineID,
 			&i.PrazoEndDate,
 			&i.PrazoDaysLeft,
@@ -1294,11 +1348,14 @@ SELECT cr.id, cr.case_id, cr.cnj_number, cr.court, cr.degree, cr.class, cr.subje
        -- graus, so the join is cr → cc → au. Both are LEFT JOINs — an unassigned case
        -- leaves assigned_user_id/name NULL, never dropping the record from the list.
        cc.assigned_user_id, au.name AS assigned_user_name,
+       -- rótulo manual do processo (título, Achado 1) — NULL até o advogado preencher.
+       cc.label,
        COALESCE(m.text, '') AS last_movement_text, m.occurred_at AS last_movement_at,
        -- prazo mais próximo ABERTO do processo (nil = JSON null when absent).
        nd.end_date AS next_deadline_end_date,
        CASE WHEN nd.end_date IS NOT NULL THEN (nd.end_date - CURRENT_DATE)::int END AS next_deadline_days_left,
-       nd.kind    AS next_deadline_kind
+       nd.kind    AS next_deadline_kind,
+       COALESCE(fd.name, '') AS first_defendant_name
 FROM court_record cr
 LEFT JOIN court_case cc ON cc.id = cr.case_id
 LEFT JOIN app_user au ON au.id = cc.assigned_user_id
@@ -1319,6 +1376,15 @@ LEFT JOIN LATERAL (
     ORDER BY d.end_date ASC
     LIMIT 1
 ) nd ON true
+LEFT JOIN LATERAL (
+    SELECT p.name
+    FROM party p
+    WHERE p.case_id = cr.case_id
+      AND p.tenant_id = cr.tenant_id
+      AND p.role = 'DEFENDANT'
+    ORDER BY p.created_at ASC
+    LIMIT 1
+) fd ON true
 WHERE cr.tenant_id = $1
   AND ($3::text = '' OR cr.cnj_number ILIKE '%' || $3 || '%' ESCAPE '\')
   AND ($4::text = '' OR cr.court = $4::text)
@@ -1360,11 +1426,13 @@ type ListProcessosRow struct {
 	ClaimValue           pgtype.Numeric     `json:"claim_value"`
 	AssignedUserID       pgtype.UUID        `json:"assigned_user_id"`
 	AssignedUserName     *string            `json:"assigned_user_name"`
+	Label                *string            `json:"label"`
 	LastMovementText     string             `json:"last_movement_text"`
 	LastMovementAt       pgtype.Timestamptz `json:"last_movement_at"`
 	NextDeadlineEndDate  pgtype.Date        `json:"next_deadline_end_date"`
 	NextDeadlineDaysLeft interface{}        `json:"next_deadline_days_left"`
 	NextDeadlineKind     *string            `json:"next_deadline_kind"`
+	FirstDefendantName   string             `json:"first_defendant_name"`
 }
 
 // read-model queries (acquisition slice) — the screen reads, kept OFF the write
@@ -1385,6 +1453,11 @@ type ListProcessosRow struct {
 // is the historic FK name for intimation_id). NULL when no OPEN/PENDING prazo exists.
 // CASE WHEN d.id IS NOT NULL guards all nullable deadline expressions (mirrors the
 // ListIntimacoes pattern in this file) so sqlc infers nullable types correctly.
+// cc.label + fd.name (first_defendant_name) back BuildCaseTitle (title.go, Go-side
+// pure function): label (manual, when set) wins over réu+CNJ, which wins over the
+// classe·assunto fallback already above. fd is a correlated LATERAL on party — first
+// DEFENDANT ever captured (ORDER BY created_at ASC LIMIT 1), the tie-break for a
+// litisconsórcio passivo (matches the party_tenant_id_case_id_idx composite index).
 func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([]ListProcessosRow, error) {
 	rows, err := q.db.Query(ctx, listProcessos,
 		arg.TenantID,
@@ -1421,11 +1494,13 @@ func (q *Queries) ListProcessos(ctx context.Context, arg ListProcessosParams) ([
 			&i.ClaimValue,
 			&i.AssignedUserID,
 			&i.AssignedUserName,
+			&i.Label,
 			&i.LastMovementText,
 			&i.LastMovementAt,
 			&i.NextDeadlineEndDate,
 			&i.NextDeadlineDaysLeft,
 			&i.NextDeadlineKind,
+			&i.FirstDefendantName,
 		); err != nil {
 			return nil, err
 		}

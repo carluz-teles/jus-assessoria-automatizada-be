@@ -53,22 +53,28 @@ func (r AssignResponsibleRequest) Validate() error {
 }
 
 // UpdateProcessoManualRequest é o corpo do PATCH /v1/processos/:id: os campos que o
-// advogado preenche à mão no cockpit — a fase (override manual, vence a derivada) e o valor
-// da causa. Ambos *ponteiro: omitir deixa o campo como está (PATCH parcial). tenant_id vem do
-// principal, nunca do body.
+// advogado preenche à mão no cockpit — a fase (override manual, vence a derivada), o valor
+// da causa e o título manual do processo (Label, court_case.label — Achado 1: substitui o
+// título genérico "classe · assunto" quando preenchido). Todos *ponteiro: omitir deixa o
+// campo como está (PATCH parcial); Label="" (não-nil, vazio) LIMPA o título manual, voltando
+// pro título derivado (réu+CNJ ou classe·assunto — ver title.go's BuildCaseTitle). tenant_id
+// vem do principal, nunca do body.
 type UpdateProcessoManualRequest struct {
 	Phase      *string  `json:"phase"`
 	ClaimValue *float64 `json:"claim_value"`
+	Label      *string  `json:"label"`
 }
 
-// Validate: quando presente, a fase tem que estar no conjunto fechado do stepper e o valor
-// da causa não pode ser negativo (400 na borda). Ambos nil é válido (no-op).
+// Validate: quando presente, a fase tem que estar no conjunto fechado do stepper, o valor
+// da causa não pode ser negativo, e o label (quando presente) tem um tamanho máximo razoável
+// (400 na borda). Todos nil é válido (no-op); Label="" é válido (limpa o título manual).
 func (r UpdateProcessoManualRequest) Validate() error {
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.Phase, validation.In(
 			FaseConhecimento, FaseInstrucao, FaseSentenca, FaseRecurso, FaseExecucao,
 		)),
 		validation.Field(&r.ClaimValue, validation.Min(0.0)),
+		validation.Field(&r.Label, validation.Length(0, 255)),
 	)
 }
 

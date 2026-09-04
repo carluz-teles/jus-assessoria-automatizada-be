@@ -57,6 +57,15 @@ type ProcessoView struct {
 	// first). Nil (JSON null) when the process has no open/pending prazo. Derived from a
 	// correlated subquery in ListProcessos/GetProcesso — no extra round-trip.
 	NextDeadline *NextDeadlineView `json:"next_deadline"`
+	// Label is the advogado's own manual título (court_case.label), written via PATCH
+	// /v1/processos/:id. Nil (JSON null) until set — the raw value, so the FE can prefill
+	// an edit field; Title (below) is the DERIVED display title, never the raw column.
+	Label *string `json:"label"`
+	// Title is the DERIVED display title (Achado 1 — see title.go's BuildCaseTitle):
+	// Label when set, else the first captured réu + CNJNumber, else the original
+	// Class + " · " + Subject fallback. CNJNumber stays a separate field (the subtitle) —
+	// never folded into Title except inside the réu branch, by design.
+	Title string `json:"title"`
 }
 
 // IntimacaoPrazoView carries the derived deadline for one intimation. It is embedded
@@ -105,6 +114,13 @@ type IntimacaoView struct {
 	// protocolada), fonte ÚNICA do stepper do detalhe e do filtro/pill de Status na
 	// lista. Projeção pura de prazo + peça — ver deriveWorkStage. Um dos WorkStage*.
 	WorkStage string `json:"work_stage"`
+	// Title is the DERIVED display title of the process behind this intimação (Achado
+	// 1 — see title.go's BuildCaseTitle): the process's manual label when set, else the
+	// first captured réu + CNJNumber, else the original Class + " · " + Subject fallback
+	// (unchanged). CNJNumber stays a separate field, never folded in except in the réu
+	// branch. Editing the label happens on the process (PATCH /v1/processos/:id), not
+	// here — this is read-only on the intimação side.
+	Title string `json:"title"`
 }
 
 // IntimacaoHistoryEntry is one event in the intimation's derived timeline (Histórico

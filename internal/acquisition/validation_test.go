@@ -1,6 +1,9 @@
 package acquisition
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // req is a small builder for a valid ActivateIntegrationRequest that each case
 // then perturbs, so every test starts from a known-good baseline.
@@ -56,6 +59,75 @@ func TestActivateIntegrationRequest_Validate(t *testing.T) {
 		{
 			name:    "one bad oab among good ones is invalid",
 			request: req([]string{"SP123456", "bad"}),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.request.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatalf("Validate() = nil, want an error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestUpdateProcessoManualRequest_Validate covers the Label boundary rule added for
+// Achado 1 (PATCH /v1/processos/:id): absent (nil) is a no-op, a well-formed value up to
+// 255 runes is accepted, an empty string is accepted (it clears the manual título), and
+// anything past 255 runes is a 400 at the edge. The pre-existing Phase/ClaimValue rules
+// are left untouched (regression guard: they must keep working alongside Label).
+func TestUpdateProcessoManualRequest_Validate(t *testing.T) {
+	t.Parallel()
+
+	label := func(s string) *string { return &s }
+	phase := FaseInstrucao
+	claim := 1000.0
+
+	tests := []struct {
+		name    string
+		request UpdateProcessoManualRequest
+		wantErr bool
+	}{
+		{
+			name:    "all nil is valid (no-op PATCH)",
+			request: UpdateProcessoManualRequest{},
+			wantErr: false,
+		},
+		{
+			name:    "label present, well-formed",
+			request: UpdateProcessoManualRequest{Label: label("Ação de Cobrança — Cliente ACME")},
+			wantErr: false,
+		},
+		{
+			name:    "label empty string clears the manual título — valid",
+			request: UpdateProcessoManualRequest{Label: label("")},
+			wantErr: false,
+		},
+		{
+			name:    "label at the 255-rune boundary is valid",
+			request: UpdateProcessoManualRequest{Label: label(strings.Repeat("a", 255))},
+			wantErr: false,
+		},
+		{
+			name:    "label past 255 runes is invalid",
+			request: UpdateProcessoManualRequest{Label: label(strings.Repeat("a", 256))},
+			wantErr: true,
+		},
+		{
+			name:    "label alongside valid phase/claim_value is valid",
+			request: UpdateProcessoManualRequest{Label: label("Título"), Phase: &phase, ClaimValue: &claim},
+			wantErr: false,
+		},
+		{
+			name:    "an invalid phase still fails regardless of label",
+			request: UpdateProcessoManualRequest{Label: label("Título"), Phase: strPtrTitle("NOT_A_FASE")},
 			wantErr: true,
 		},
 	}

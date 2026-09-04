@@ -38,9 +38,10 @@ type handlerUC interface {
 	// :id, in one tx. It returns only an error; the handler re-reads the ProcessoView
 	// through the read port so the FE reidrates the header from the fresh row.
 	AssignResponsible(ctx context.Context, tenantID, courtRecordID string, assignedUserID *string) error
-	// UpdateProcessoManual grava a fase (override) e/ou o valor da causa preenchidos à mão
-	// no cockpit. PATCH parcial (nil deixa o campo como está); o handler re-lê o ProcessoView.
-	UpdateProcessoManual(ctx context.Context, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error
+	// UpdateProcessoManual grava a fase (override), o valor da causa e/ou o título manual
+	// (label) preenchidos à mão no cockpit. PATCH parcial (nil deixa o campo como está); o
+	// handler re-lê o ProcessoView.
+	UpdateProcessoManual(ctx context.Context, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64, label *string) error
 	// BulkAssignResponsible atribui o responsável a vários processos (por ids ou toda a
 	// faixa via All+filtros). Devolve a contagem afetada (court_record rows).
 	BulkAssignResponsible(ctx context.Context, tenantID string, all bool, q ProcessosQuery, ids []string, assignedUserID *string) (int64, error)
@@ -892,10 +893,12 @@ func (h *Handler) assignResponsible(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(view)
 }
 
-// updateProcessoManual handles PATCH /v1/processos/:id: grava a fase (override manual) e/ou o
-// valor da causa preenchidos à mão no cockpit. PATCH parcial — só os campos presentes no body
-// são escritos. Re-lê o ProcessoView e responde 200 com ele, pra o FE reidratar o header da
-// linha fresca. tenant_id vem do principal; um :id inválido/foreign é o 404/400 tipado do write.
+// updateProcessoManual handles PATCH /v1/processos/:id: grava a fase (override manual), o
+// valor da causa e/ou o título manual (label — Achado 1) preenchidos à mão no cockpit. PATCH
+// parcial — só os campos presentes no body são escritos (Label="" limpa o título manual,
+// voltando pro título derivado). Re-lê o ProcessoView e responde 200 com ele, pra o FE
+// reidratar o header da linha fresca. tenant_id vem do principal; um :id inválido/foreign é o
+// 404/400 tipado do write.
 func (h *Handler) updateProcessoManual(c *fiber.Ctx) error {
 	var req UpdateProcessoManualRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -907,7 +910,7 @@ func (h *Handler) updateProcessoManual(c *fiber.Ctx) error {
 
 	tenantID := httpx.TenantFromCtx(c)
 	id := c.Params("id")
-	if err := h.uc.UpdateProcessoManual(c.UserContext(), tenantID, id, req.Phase, req.ClaimValue); err != nil {
+	if err := h.uc.UpdateProcessoManual(c.UserContext(), tenantID, id, req.Phase, req.ClaimValue, req.Label); err != nil {
 		return httpx.WriteError(c, err)
 	}
 

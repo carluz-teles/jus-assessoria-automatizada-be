@@ -125,6 +125,47 @@ func TestSync_CourtRecordUpsert_Idempotent(t *testing.T) {
 	}
 }
 
+// TestSync_ManualLabelSurvivesReobservation proves Achado 1's write-path claim by running
+// code, not by reading it: the sync/ingestion cycle (OnSyncRequested → BatchUpsertCourtRecords)
+// NEVER writes court_case.label — only UpdateCaseLabel (repository.go, reached exclusively
+// through UseCase.UpdateProcessoManual, PATCH /v1/processos/:id) does. A manual título set
+// between two deliveries of the SAME window must survive a re-observation untouched, exactly
+// like TestSync_CourtRecordUpsert_Idempotent proves the court_case ROW itself is stable.
+func TestSync_ManualLabelSurvivesReobservation(t *testing.T) {
+	pool := newPool(t)
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-sync-label", 0)
+	integID := seedIntegration(t, pool, tenantID, acquisition.SourceDJEN)
+
+	uc := newSyncUC(pool)
+	ctx := context.Background()
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+
+	var caseID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM court_case WHERE tenant_id=$1`, tenantID).Scan(&caseID); err != nil {
+		t.Fatalf("read seeded court_case: %v", err)
+	}
+	const manualLabel = "Ação de Cobrança — Cliente ACME"
+	if _, err := pool.Exec(ctx, `UPDATE court_case SET label=$1 WHERE id=$2`, manualLabel, caseID); err != nil {
+		t.Fatalf("seed manual label: %v", err)
+	}
+
+	// Re-observation: a second delivery of the SAME window (idempotent upsert path).
+	if err := uc.OnSyncRequested(ctx, syncEvent(t, pool, tenantID, integID)); err != nil {
+		t.Fatalf("second delivery (re-observation): %v", err)
+	}
+
+	var label *string
+	if err := pool.QueryRow(ctx, `SELECT label FROM court_case WHERE id=$1`, caseID).Scan(&label); err != nil {
+		t.Fatalf("read court_case.label after re-observation: %v", err)
+	}
+	if label == nil || *label != manualLabel {
+		t.Fatalf("court_case.label after re-observation = %v, want unchanged %q (ingestion must never write it)", label, manualLabel)
+	}
+}
+
 // I3: docket entries dedup on (court_record_id, hash) — two deliveries of the two
 // fixture entries leave exactly two rows, and the second run tallies both as
 // deduped.
