@@ -107,6 +107,12 @@ type Repository interface {
 	// parcial: um argumento nil deixa o campo como está.
 	UpdateProcessoManualFields(ctx context.Context, tx database.Tx, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error
 
+	// UpdateCaseLabel grava (ou limpa, quando label == "") o título manual do processo
+	// (court_case.label — Achado 1), no caseID já resolvido por ResolveCaseIDByCourtRecord
+	// (mesmo hop de AssignCaseResponsible). Direto em court_case, SEM cascata — o label é
+	// uma propriedade do CASE (compartilhada entre graus), nunca da intimação.
+	UpdateCaseLabel(ctx context.Context, tx database.Tx, tenantID, caseID, label string) error
+
 	// CascadeCaseResponsibleToIntimations propagates the case's responsável to every
 	// intimação already anchored under it (via court_record_id → court_record.case_id), in
 	// the SAME tx as AssignCaseResponsible. Always overwrites (retroactive, no per-intimação
@@ -1713,6 +1719,30 @@ func (r *pgRepository) AssignCaseResponsible(ctx context.Context, tx database.Tx
 	return database.WrapInfra(err)
 }
 
+// UpdateCaseLabel writes (or clears, when label == "") the manual título on a court_case
+// inside the caller's tx, scoped by tenant_id (barrier 1, RLS barrier 2). caseID is the
+// one ResolveCaseIDByCourtRecord resolved (same hop AssignCaseResponsible uses); the
+// WHERE ties the write to the caller's own tenant so a mismatched (case, tenant) touches
+// nothing. An empty label writes SQL NULL (clears back to the derived BuildCaseTitle
+// fallback), mirroring the nil-clears convention of AssignCaseResponsible/desatribuir.
+func (r *pgRepository) UpdateCaseLabel(ctx context.Context, tx database.Tx, tenantID, caseID, label string) error {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+	cid, err := uuid.Parse(caseID)
+	if err != nil {
+		return database.WrapInfra(err)
+	}
+
+	err = acquisitiondb.New(tx).UpdateCaseLabel(ctx, acquisitiondb.UpdateCaseLabelParams{
+		Label:    strPtrOrNil(label),
+		CaseID:   cid,
+		TenantID: tid,
+	})
+	return database.WrapInfra(err)
+}
+
 // UpdateProcessoManualFields writes the hand-entered fase/valor onto the court_record.
 // A nil phaseOverride/claimValue leaves that column untouched (the SQL COALESCE keeps the
 // current value), so the same endpoint serves "set only the fase" and "set only o valor".
@@ -1942,14 +1972,16 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 	}
 	out := make([]ProcessoView, 0, len(rows))
 	for _, row := range rows {
+		class, subject := deref(row.Class), deref(row.Subject)
+		defendant := strPtrOrNil(row.FirstDefendantName)
 		out = append(out, ProcessoView{
 			ID:               row.ID.String(),
 			CaseID:           row.CaseID.String(),
 			CNJNumber:        row.CnjNumber,
 			Court:            row.Court,
 			Degree:           row.Degree,
-			Class:            deref(row.Class),
-			Subject:          deref(row.Subject),
+			Class:            class,
+			Subject:          subject,
 			JudgingBody:      deref(row.JudgingBody),
 			FiledAt:          datePtr(row.FiledAt),
 			Secrecy:          row.Secrecy,
@@ -1962,6 +1994,8 @@ func (r *pgRepository) ListProcessos(ctx context.Context, q ProcessosQuery) ([]P
 			LastMovementText: row.LastMovementText,
 			LastMovementAt:   timestampPtr(row.LastMovementAt),
 			NextDeadline:     mapNextDeadline(row.NextDeadlineEndDate, row.NextDeadlineDaysLeft, row.NextDeadlineKind),
+			Label:            row.Label,
+			Title:            BuildCaseTitle(row.Label, defendant, row.CnjNumber, class, subject),
 		})
 	}
 	return out, nil
@@ -1988,14 +2022,16 @@ func (r *pgRepository) GetProcesso(ctx context.Context, tenantID, id string) (Pr
 	if err != nil {
 		return ProcessoView{}, database.WrapInfra(err)
 	}
+	class, subject := deref(row.Class), deref(row.Subject)
+	defendant := strPtrOrNil(row.FirstDefendantName)
 	return ProcessoView{
 		ID:               row.ID.String(),
 		CaseID:           row.CaseID.String(),
 		CNJNumber:        row.CnjNumber,
 		Court:            row.Court,
 		Degree:           row.Degree,
-		Class:            deref(row.Class),
-		Subject:          deref(row.Subject),
+		Class:            class,
+		Subject:          subject,
 		JudgingBody:      deref(row.JudgingBody),
 		FiledAt:          datePtr(row.FiledAt),
 		Secrecy:          row.Secrecy,
@@ -2008,6 +2044,8 @@ func (r *pgRepository) GetProcesso(ctx context.Context, tenantID, id string) (Pr
 		LastMovementText: row.LastMovementText,
 		LastMovementAt:   timestampPtr(row.LastMovementAt),
 		NextDeadline:     mapNextDeadline(row.NextDeadlineEndDate, row.NextDeadlineDaysLeft, row.NextDeadlineKind),
+		Label:            row.Label,
+		Title:            BuildCaseTitle(row.Label, defendant, row.CnjNumber, class, subject),
 	}, nil
 }
 
@@ -2046,11 +2084,13 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 	out := make([]IntimacaoView, 0, len(rows))
 	for _, row := range rows {
 		prazo := mapPrazo(row.PrazoDeadlineID, row.PrazoEndDate, row.PrazoDaysLeft, row.PrazoStatus, row.PrazoConfirmed)
+		class, subject := deref(row.Class), deref(row.Subject)
+		defendant := strPtrOrNil(row.FirstDefendantName)
 		out = append(out, IntimacaoView{
 			ID:               row.ID.String(),
 			CNJNumber:        row.CnjNumber,
-			Class:            deref(row.Class),
-			Subject:          deref(row.Subject),
+			Class:            class,
+			Subject:          subject,
 			CourtRecordID:    row.CourtRecordID.String(),
 			Court:            row.Court,
 			Degree:           row.Degree,
@@ -2068,6 +2108,7 @@ func (r *pgRepository) ListIntimacoes(ctx context.Context, q IntimacoesQuery) ([
 			AssigneeUserID:   uuidPtrFromPgtype(row.AssigneeUserID),
 			AssigneeUserName: row.AssigneeUserName,
 			WorkStage:        deriveWorkStage(prazo, deref(row.DraftStatus), row.DraftFiledAt.Valid),
+			Title:            BuildCaseTitle(row.Label, defendant, row.CnjNumber, class, subject),
 		})
 	}
 	return out, nil
@@ -2125,12 +2166,14 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 		return IntimacaoDetailView{}, database.WrapInfra(err)
 	}
 
+	class, subject := deref(row.Class), deref(row.Subject)
+	defendant := strPtrOrNil(row.FirstDefendantName)
 	return IntimacaoDetailView{
 		IntimacaoView: IntimacaoView{
 			ID:              row.ID.String(),
 			CNJNumber:       row.CnjNumber,
-			Class:           deref(row.Class),
-			Subject:         deref(row.Subject),
+			Class:           class,
+			Subject:         subject,
 			CourtRecordID:   row.CourtRecordID.String(),
 			Court:           row.Court,
 			Degree:          row.Degree,
@@ -2150,6 +2193,7 @@ func (r *pgRepository) GetIntimacao(ctx context.Context, tenantID, id string) (I
 			AssigneeUserID:   assigneeID,
 			AssigneeUserName: row.AssigneeUserName,
 			WorkStage:        workStage,
+			Title:            BuildCaseTitle(row.Label, defendant, row.CnjNumber, class, subject),
 		},
 		Content:          row.Content,
 		JudgingBody:      deref(row.JudgingBody),

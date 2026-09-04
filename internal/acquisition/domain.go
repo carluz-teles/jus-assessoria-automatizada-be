@@ -273,11 +273,28 @@ func (uc *UseCase) AssignResponsible(ctx context.Context, tenantID, courtRecordI
 }
 
 // UpdateProcessoManual grava os campos que o advogado preenche à mão no cockpit — a fase
-// (phase_override, que vence a derivada no read model) e o valor da causa (claim_value, sem
-// fonte automática). Um argumento nil deixa o campo como está (PATCH parcial). tenantID vem
-// do principal, nunca do body.
-func (uc *UseCase) UpdateProcessoManual(ctx context.Context, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64) error {
+// (phase_override, que vence a derivada no read model), o valor da causa (claim_value, sem
+// fonte automática) e o título manual do processo (label, court_case.label — Achado 1). Um
+// argumento nil deixa o campo como está (PATCH parcial); um label não-nil (mesmo "") escreve
+// — "" limpa de volta pro título derivado (BuildCaseTitle). tenantID vem do principal, nunca
+// do body.
+//
+// O label vive em court_case (case-level, compartilhado entre graus), não em court_record
+// como phase/claim_value — então, quando presente, a mesma tx primeiro resolve court_record
+// → court_case (ResolveCaseIDByCourtRecord, o MESMO hop de AssignResponsible) antes de
+// escrever. Um :id desconhecido/de outro tenant é o típico ErrProcessoNotFound (→ 404) dessa
+// resolução — nada é escrito.
+func (uc *UseCase) UpdateProcessoManual(ctx context.Context, tenantID, courtRecordID string, phaseOverride *string, claimValue *float64, label *string) error {
 	return uc.uow.Do(ctx, tenantID, func(tx database.Tx) error {
+		if label != nil {
+			caseID, err := uc.repo.ResolveCaseIDByCourtRecord(ctx, tx, tenantID, courtRecordID)
+			if err != nil {
+				return err
+			}
+			if err := uc.repo.UpdateCaseLabel(ctx, tx, tenantID, caseID, *label); err != nil {
+				return err
+			}
+		}
 		return uc.repo.UpdateProcessoManualFields(ctx, tx, tenantID, courtRecordID, phaseOverride, claimValue)
 	})
 }

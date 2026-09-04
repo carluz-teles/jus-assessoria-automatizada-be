@@ -60,6 +60,21 @@ type mockRepo struct {
 	caseAssignedID  *string
 	caseAssignedErr error
 
+	// Título manual do processo (UpdateProcessoManual → UpdateCaseLabel, Achado 1).
+	// Captures the caseID/label the write got, so a test can assert the SAME caseID
+	// ResolveCaseIDByCourtRecord resolved was used (mirrors AssignResponsible's pattern).
+	updateCaseLabelCalls  int
+	updateCaseLabelCaseID string
+	updateCaseLabelValue  string
+	updateCaseLabelErr    error
+
+	// UpdateProcessoManualFields (fase/valor da causa) capture — so a test can assert the
+	// PATCH still writes phase/claim_value alongside (or independently of) the label.
+	updateManualFieldsCalls    int
+	updateManualFieldsRecordID string
+	updateManualFieldsPhase    *string
+	updateManualFieldsClaim    *float64
+
 	// Bulk responsável do processo (BulkAssignResponsible). Each mode's call is
 	// captured separately (ids-mode vs filter-mode) so a test can assert exactly one
 	// ran; both share a canned affected-count/error pair per mode.
@@ -369,8 +384,19 @@ func (m *mockRepo) AssignCaseResponsible(_ context.Context, _ database.Tx, _, ca
 	return nil
 }
 
-func (m *mockRepo) UpdateProcessoManualFields(_ context.Context, _ database.Tx, _, _ string, _ *string, _ *float64) error {
+func (m *mockRepo) UpdateProcessoManualFields(_ context.Context, _ database.Tx, _, courtRecordID string, phaseOverride *string, claimValue *float64) error {
+	m.updateManualFieldsCalls++
+	m.updateManualFieldsRecordID = courtRecordID
+	m.updateManualFieldsPhase = phaseOverride
+	m.updateManualFieldsClaim = claimValue
 	return nil
+}
+
+func (m *mockRepo) UpdateCaseLabel(_ context.Context, _ database.Tx, _, caseID, label string) error {
+	m.updateCaseLabelCalls++
+	m.updateCaseLabelCaseID = caseID
+	m.updateCaseLabelValue = label
+	return m.updateCaseLabelErr
 }
 
 func (m *mockRepo) CascadeCaseResponsibleToIntimations(_ context.Context, _ database.Tx, _, caseID string, assignedUserID *string) (int64, error) {
@@ -947,6 +973,117 @@ func TestUseCase_AssignResponsible_NilCascadesToNilOnIntimacoes(t *testing.T) {
 	}
 	if repo.cascadeUser != nil {
 		t.Fatalf("cascade user = %v, want nil", repo.cascadeUser)
+	}
+}
+
+// --- UpdateProcessoManual (fase/valor/label manuais — PATCH /v1/processos/:id) -----
+
+// A nil Label is the common path — the PATCH only carries phase/claim_value (or nothing
+// new at all). UpdateCaseLabel must NEVER run, and the resolve hop must not run either
+// (it would be a wasted round-trip when there is nothing to write on court_case). This is
+// also the SAME path every re-ingestão implicitly exercises (it never calls
+// UpdateProcessoManual at all — see TestSync_ManualLabelSurvivesReobservation, integration
+// — but at the domain level this proves the nil-label branch writes nothing to court_case).
+func TestUseCase_UpdateProcessoManual_NilLabel_SkipsCaseLabelWrite(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	phase := FaseInstrucao
+	claim := 1500.50
+	if err := uc.UpdateProcessoManual(context.Background(), testTenant, "cr-1", &phase, &claim, nil); err != nil {
+		t.Fatalf("UpdateProcessoManual() error = %v", err)
+	}
+
+	if repo.updateCaseLabelCalls != 0 {
+		t.Fatalf("UpdateCaseLabel calls = %d, want 0 (nil label must not touch court_case)", repo.updateCaseLabelCalls)
+	}
+	if repo.updateManualFieldsCalls != 1 {
+		t.Fatalf("UpdateProcessoManualFields calls = %d, want 1", repo.updateManualFieldsCalls)
+	}
+	if repo.updateManualFieldsPhase == nil || *repo.updateManualFieldsPhase != phase {
+		t.Fatalf("phase written = %v, want %q", repo.updateManualFieldsPhase, phase)
+	}
+	if repo.updateManualFieldsClaim == nil || *repo.updateManualFieldsClaim != claim {
+		t.Fatalf("claim_value written = %v, want %v", repo.updateManualFieldsClaim, claim)
+	}
+}
+
+// A present (non-nil) Label resolves court_record → court_case (the SAME hop
+// AssignResponsible uses) and writes court_case.label with THAT resolved caseID — never a
+// different id, never a second transaction (uow.calls stays 1).
+func TestUseCase_UpdateProcessoManual_SetsLabel_ResolvesCaseFirst(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-77"}
+	uow := &fakeUoW{}
+	uc := NewUseCase(repo, &fakeOutbox{}, uow)
+
+	label := "Ação de Cobrança — Cliente ACME"
+	if err := uc.UpdateProcessoManual(context.Background(), testTenant, "cr-1", nil, nil, &label); err != nil {
+		t.Fatalf("UpdateProcessoManual() error = %v", err)
+	}
+
+	if uow.calls != 1 {
+		t.Fatalf("uow calls = %d, want 1 (resolve + write in the SAME tx)", uow.calls)
+	}
+	if repo.updateCaseLabelCalls != 1 {
+		t.Fatalf("UpdateCaseLabel calls = %d, want 1", repo.updateCaseLabelCalls)
+	}
+	if repo.updateCaseLabelCaseID != "case-77" {
+		t.Fatalf("UpdateCaseLabel caseID = %q, want the resolved case-77", repo.updateCaseLabelCaseID)
+	}
+	if repo.updateCaseLabelValue != label {
+		t.Fatalf("UpdateCaseLabel value = %q, want %q", repo.updateCaseLabelValue, label)
+	}
+	// phase/claim_value still run (PATCH parcial — both nil here, a no-op write).
+	if repo.updateManualFieldsCalls != 1 {
+		t.Fatalf("UpdateProcessoManualFields calls = %d, want 1 (still runs even with both nil)", repo.updateManualFieldsCalls)
+	}
+}
+
+// Label="" (present, empty) IS a write — it clears the manual título back to the derived
+// fallback (BuildCaseTitle). It must resolve the case and call UpdateCaseLabel with "",
+// same as any other non-nil label.
+func TestUseCase_UpdateProcessoManual_EmptyLabel_ClearsCaseLabel(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveCaseID: "case-77"}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	empty := ""
+	if err := uc.UpdateProcessoManual(context.Background(), testTenant, "cr-1", nil, nil, &empty); err != nil {
+		t.Fatalf("UpdateProcessoManual() error = %v", err)
+	}
+
+	if repo.updateCaseLabelCalls != 1 {
+		t.Fatalf("UpdateCaseLabel calls = %d, want 1 (clearing is still a write)", repo.updateCaseLabelCalls)
+	}
+	if repo.updateCaseLabelValue != "" {
+		t.Fatalf("UpdateCaseLabel value = %q, want empty (clear)", repo.updateCaseLabelValue)
+	}
+}
+
+// An unknown/foreign court_record :id (the record→case hop finds nothing) → the typed
+// ErrProcessoNotFound, and NOTHING is written — neither the label nor phase/claim_value.
+func TestUseCase_UpdateProcessoManual_UnknownRecord_NotFound(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockRepo{resolveErr: ErrProcessoNotFound}
+	uc := NewUseCase(repo, &fakeOutbox{}, &fakeUoW{})
+
+	label := "Título Manual"
+	err := uc.UpdateProcessoManual(context.Background(), testTenant, "cr-missing", nil, nil, &label)
+	if !errors.Is(err, ErrProcessoNotFound) {
+		t.Fatalf("error = %v, want ErrProcessoNotFound", err)
+	}
+	if repo.updateCaseLabelCalls != 0 {
+		t.Fatalf("UpdateCaseLabel calls = %d, want 0 (resolve failed, nothing written)", repo.updateCaseLabelCalls)
+	}
+	if repo.updateManualFieldsCalls != 0 {
+		t.Fatalf("UpdateProcessoManualFields calls = %d, want 0 (same tx rolls back on the resolve error)", repo.updateManualFieldsCalls)
 	}
 }
 

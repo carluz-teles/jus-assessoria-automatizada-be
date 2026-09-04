@@ -303,7 +303,10 @@ type Querier interface {
 	// The LEFT JOIN deadline mirrors ListIntimacoes (same 1:1 notification_id join); NULL
 	// when the intimação has no prazo yet. Scoped by tenant_id (barrier 1): a foreign or
 	// unknown id yields no row (→ typed 404 upstream, never nil,nil). Read-only, off the
-	// write path.
+	// write path. cc.label + first_defendant_name back BuildCaseTitle (title.go) — same
+	// inputs as ListIntimacoes/ListProcessos. first_defendant_name is a DIFFERENT tie-break
+	// than the "defendants" array below (that one is ORDER BY name, for the Partes card;
+	// this one is ORDER BY created_at — first ever captured — for the título).
 	GetIntimacao(ctx context.Context, arg GetIntimacaoParams) (GetIntimacaoRow, error)
 	// analise.sql — queries for the AI analysis of one intimation (POST /v1/intimacoes/:id/analise).
 	// GetIntimacaoAnaliseContext reads the teor + the court context the prompt needs; the write
@@ -330,7 +333,8 @@ type Querier interface {
 	// Scoped by id + tenant_id (barrier 1); NOT filtered by lifecycle, so a SUPERSEDED
 	// placeholder is still reachable by direct link. A foreign or unknown id yields no row
 	// (→ typed 404 upstream, never nil,nil). Read-only, off the write path.
-	// next_deadline: same correlated LATERAL as ListProcessos (see above).
+	// next_deadline: same correlated LATERAL as ListProcessos (see above). cc.label +
+	// fd.name (first_defendant_name): same BuildCaseTitle inputs as ListProcessos.
 	GetProcesso(ctx context.Context, arg GetProcessoParams) (GetProcessoRow, error)
 	// One import's reconciliação header (the detail screen), same shape/aggregation as
 	// ListReconciliations but for a single backfill_job.
@@ -545,7 +549,10 @@ type Querier interface {
 	// exposes the derived prazo (1:1 per notification_id, UNIQUE); NULL when no prazo
 	// exists yet. ai_analyzed_at + assignee_user_id/name mirror GetIntimacao's
 	// projection (same LEFT JOIN app_user pattern) so the inbox row can render the
-	// "não analisada" badge and the responsável label without a deep-link.
+	// "não analisada" badge and the responsável label without a deep-link. cc.label +
+	// fd.name (first_defendant_name) back BuildCaseTitle (title.go) — same inputs as
+	// ListProcessos/GetProcesso, joined here at case level (cr.case_id) so the inbox row
+	// shows the same título as the processes screen for the same processo.
 	ListIntimacoes(ctx context.Context, arg ListIntimacoesParams) ([]ListIntimacoesRow, error)
 	// The "Intimações" tab of one process: the intimations filed on this court record,
 	// newest availability first, with the record's number/court/degree joined in (same
@@ -617,6 +624,11 @@ type Querier interface {
 	// is the historic FK name for intimation_id). NULL when no OPEN/PENDING prazo exists.
 	// CASE WHEN d.id IS NOT NULL guards all nullable deadline expressions (mirrors the
 	// ListIntimacoes pattern in this file) so sqlc infers nullable types correctly.
+	// cc.label + fd.name (first_defendant_name) back BuildCaseTitle (title.go, Go-side
+	// pure function): label (manual, when set) wins over réu+CNJ, which wins over the
+	// classe·assunto fallback already above. fd is a correlated LATERAL on party — first
+	// DEFENDANT ever captured (ORDER BY created_at ASC LIMIT 1), the tie-break for a
+	// litisconsórcio passivo (matches the party_tenant_id_case_id_idx composite index).
 	ListProcessos(ctx context.Context, arg ListProcessosParams) ([]ListProcessosRow, error)
 	// The court records a window first discovered (collapse). Scoped by tenant (RLS +
 	// filter) and the discovering sync_run_id; bounded defensively.
@@ -757,6 +769,17 @@ type Querier interface {
 	// pre-existing graded record. It no longer represents a live process (the graded record
 	// does), so it drops out of the ACTIVE count and the scheduler (next_sync_at NULL).
 	SupersedeCourtRecord(ctx context.Context, arg SupersedeCourtRecordParams) error
+	// rótulo manual do processo (court_case.label) — o TÍTULO que o advogado escolhe pra
+	// diferenciar o caso na lista/painel/cockpit (Achado 1: classe·assunto sozinho repete em
+	// 62-74% dos processos). Escrito via PATCH /v1/processos/:id (UpdateProcessoManualRequest.
+	// Label), reusando o MESMO hop court_record → court_case de AssignResponsible
+	// (responsible.sql's GetCaseIDByCourtRecord) — não há query nova de resolve aqui.
+	// Grava (ou limpa, quando o argumento vem NULL) o court_case.label, tenant-scoped
+	// (barreira 1 + RLS barreira 2). Direto em court_case, SEM cascata — o label é uma
+	// propriedade do CASE (compartilhada entre graus), nunca da intimação/court_record.
+	// O caseID já foi resolvido a partir do court_record chamador pela query
+	// GetCaseIDByCourtRecord (responsible.sql) — mesmo padrão de AssignResponsible.
+	UpdateCaseLabel(ctx context.Context, arg UpdateCaseLabelParams) error
 	// enrichment cycle queries (acquisition slice).
 	// DATAJUD enrichment reacts to court_record_observed for a DJEN placeholder
 	// (degree=UNKNOWN): it fetches the process by number, reveals the grau, and GRADES
