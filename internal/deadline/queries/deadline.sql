@@ -39,12 +39,14 @@ ORDER BY (intimation_type = $2) DESC,
 LIMIT 1;
 
 -- name: InsertDeadline :one
--- Persist the derived prazo, BORN PENDING (status), source RULE. Idempotent on the 1:1
--- notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO row on a re-derivation, so
--- the mapper reads pgx.ErrNoRows as "already exists" (ErrDeadlineExists) instead of
--- poisoning the tx with a constraint error. confirmed_by/at stay NULL (no human aval
--- yet — that is the F2 slice). Returns the DB-assigned id; the repo maps the rest from
--- the input entity.
+-- Persist the derived prazo, BORN PENDING, OPEN, or MISSED (status) per
+-- confirmacao_exigida and carência — see domain.go's OnIntimationObserved step 7 — source
+-- RULE. Idempotent on the 1:1 notification_id (UNIQUE): ON CONFLICT DO NOTHING yields NO
+-- row on a re-derivation, so the mapper reads pgx.ErrNoRows as "already exists"
+-- (ErrDeadlineExists) instead of poisoning the tx with a constraint error.
+-- confirmed_by/at stay NULL (no human aval yet — that is the F2 slice, regardless of the
+-- birth status). Returns the DB-assigned id; the repo maps the rest from the input
+-- entity.
 INSERT INTO deadline (
     tenant_id, court_record_id, notification_id,
     start_date, end_date, days, counting, doubled, doubled_reason,
@@ -135,6 +137,20 @@ WHERE id = $1 AND tenant_id = $2;
 -- subsequent operations — they are never overwritten by confirm or adjust. A no-match
 -- yields NO row → pgx.ErrNoRows → ErrDeadlineNotFound at the mapper. $1 = intimation_id,
 -- $2 = tenant_id, then the confirmed fields.
+--
+-- NO "WHERE status = 'PENDING'" GUARD, BY DESIGN: this UPDATE runs regardless of the
+-- prazo's current status (PENDING or already-OPEN, e.g. auto-assumed per
+-- confirmacao_exigida=false), because re-confirming an OPEN prazo is the intentional
+-- "editar e recomputar" flow (advogado corrige days/counting/doubled e reconfirma — see
+-- confirm.go's Confirm doc comment). Blocking accidental blind reconfirmation of an
+-- already-OPEN prazo is the FE's job, not this query's: the one-click "Confirmar prazo"
+-- button only renders in the "pending" state (status==="PENDING"), never for an
+-- already-OPEN prazo — jus-assessoria-automatizada-fe's
+-- src/features/prazos/hooks/use-prazo-da-intimacao.ts:59-77 derives "confirmed" (not
+-- "pending") whenever status !== "PENDING", and confirmar-prazo.tsx's PainelConfirmado
+-- (state "confirmed", ~L697-801) only exposes "Editar prazo" (opens the edit form) and
+-- "Remover prazo" — never the direct one-click confirm. An OPEN prazo can only reach this
+-- query again via that explicit edit form, which is the deliberate recompute path.
 UPDATE deadline
 SET status            = 'OPEN',
     kind              = $3,

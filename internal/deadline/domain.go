@@ -443,7 +443,8 @@ var reminderDaysLeft = []int{3, 1, 0}
 //  4. resolve the conservative rule for (type, court) → {kind, days, counting, doubled};
 //  5. decide the counting: the rule suggests it, the rito may override to CALENDAR (P2);
 //  6. compute end_date + holidays_applied via the chosen lib/calendar motor;
-//  7. persist the prazo born PENDING, source RULE (idempotent on the 1:1 intimação);
+//  7. persist the prazo born PENDING, OPEN, or MISSED per confirmacao_exigida and
+//     carência (source RULE, idempotent on the 1:1 intimação);
 //  8. emit deadline.opened in the SAME tx.
 //
 // tenantID comes from the event payload (a trusted producer inside the same system, no
