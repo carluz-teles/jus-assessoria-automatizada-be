@@ -215,52 +215,6 @@ func (r ApurarDivergenciaRequest) toApurarDivergenciaCommand(tenantID, userID, d
 	return cmd, nil
 }
 
-// ApurarTipoRequest is the POST /v1/prazos/:id/apurar-tipo body (V1, docs/design-motor-de-
-// prazos-v1.md §"Fallback IA"): the human's confirmation/reclassification of the IA-inferred
-// tipo de ato. Tipo is required ONLY when Acao=="reclassificar" (enforced below); tenant_id/
-// user/the prazo id come from the principal + path, never the body.
-type ApurarTipoRequest struct {
-	Acao string  `json:"acao"`
-	Tipo *string `json:"tipo"`
-}
-
-// Validate enforces acao ∈ {confirmar, reclassificar} and a non-empty tipo when reclassificar.
-func (r ApurarTipoRequest) Validate() error {
-	return validation.ValidateStruct(&r,
-		validation.Field(&r.Acao, validation.Required, validation.In(
-			string(acaoConfirmar), string(acaoReclassificar))),
-		validation.Field(&r.Tipo, validation.By(requiredTipoIfReclassificar(r.Acao))),
-	)
-}
-
-// requiredTipoIfReclassificar rejects a missing/empty tipo when acao=="reclassificar"; any other
-// acao is a no-op (tipo is ignored on confirmar).
-func requiredTipoIfReclassificar(acao string) validation.RuleFunc {
-	return func(value any) error {
-		if acao != string(acaoReclassificar) {
-			return nil
-		}
-		t, ok := value.(*string)
-		if !ok || t == nil || *t == "" {
-			return errors.New("required when acao is reclassificar")
-		}
-		return nil
-	}
-}
-
-// toApurarTipoCommand maps the validated request + the principal's ids + the path id into the
-// use-case command. TenantID/UserID come from the principal and DeadlineID from the path (never
-// the body).
-func (r ApurarTipoRequest) toApurarTipoCommand(tenantID, userID, deadlineID string) ApurarTipoCommand {
-	return ApurarTipoCommand{
-		TenantID:   tenantID,
-		UserID:     userID,
-		DeadlineID: deadlineID,
-		Acao:       apurarTipoAcao(r.Acao),
-		Tipo:       r.Tipo,
-	}
-}
-
 // CreateTaskRequest is the POST /v1/tasks body (docs/erd-prazos.md §9): a manual task. Title is
 // required; the context FKs (court_record_id, deadline_id, intimation_id) and the assignee are
 // optional (a task can be avulsa / unassigned) but must be well-formed uuids when present.

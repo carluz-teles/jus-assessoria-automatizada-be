@@ -144,53 +144,6 @@ func (q *Queries) GetActionItemCourtRecordID(ctx context.Context, arg GetActionI
 	return court_record_id, err
 }
 
-const getCalcMemory = `-- name: GetCalcMemory :one
-SELECT id, prazo_base, prazo_base_fonte, termo_inicial_regra, dias_uteis, dobra_motivo,
-       tabela_legal_ref, ia_tipo_inferido, ia_confianca, calendar_provider_version
-FROM calc_memory
-WHERE deadline_id = $1 AND tenant_id = $2
-`
-
-type GetCalcMemoryParams struct {
-	DeadlineID uuid.UUID `json:"deadline_id"`
-	TenantID   uuid.UUID `json:"tenant_id"`
-}
-
-type GetCalcMemoryRow struct {
-	ID                      uuid.UUID `json:"id"`
-	PrazoBase               *string   `json:"prazo_base"`
-	PrazoBaseFonte          *string   `json:"prazo_base_fonte"`
-	TermoInicialRegra       *string   `json:"termo_inicial_regra"`
-	DiasUteis               *bool     `json:"dias_uteis"`
-	DobraMotivo             *string   `json:"dobra_motivo"`
-	TabelaLegalRef          *string   `json:"tabela_legal_ref"`
-	IaTipoInferido          *string   `json:"ia_tipo_inferido"`
-	IaConfianca             *float64  `json:"ia_confianca"`
-	CalendarProviderVersion *string   `json:"calendar_provider_version"`
-}
-
-// Read one deadline's calc_memory (apurar-tipo: the IA's inferred tipo/confiança the human
-// confirms or overrides). Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing
-// row → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper (→ 404), never (nil, nil).
-// $1 = deadline_id, $2 = tenant_id.
-func (q *Queries) GetCalcMemory(ctx context.Context, arg GetCalcMemoryParams) (GetCalcMemoryRow, error) {
-	row := q.db.QueryRow(ctx, getCalcMemory, arg.DeadlineID, arg.TenantID)
-	var i GetCalcMemoryRow
-	err := row.Scan(
-		&i.ID,
-		&i.PrazoBase,
-		&i.PrazoBaseFonte,
-		&i.TermoInicialRegra,
-		&i.DiasUteis,
-		&i.DobraMotivo,
-		&i.TabelaLegalRef,
-		&i.IaTipoInferido,
-		&i.IaConfianca,
-		&i.CalendarProviderVersion,
-	)
-	return i, err
-}
-
 const getCourtRecordClass = `-- name: GetCourtRecordClass :one
 
 SELECT class
@@ -268,12 +221,11 @@ type GetCrossValidationRow struct {
 }
 
 // ── V1 apuração (human decision on a_apurar prazos) ─────────────────────────
-// POST /v1/prazos/:id/apurar-divergencia | .../apurar-tipo (apurar.go). Both flip selo
-// a_apurar → confiavel; origem is NEVER touched here (immutable after creation — only the
-// creation path in domain.go writes it). The deadline row itself is patched via the ALREADY
-// existing UpdateDeadlineAdjust (ajuste_manual path) or UpdateDeadlineEndDate (aceita_declarado
-// path) below; aceita_calculado writes nothing (the stored end_date already IS the calculado
-// date).
+// POST /v1/prazos/:id/apurar-divergencia (apurar.go). Flips selo a_apurar → confiavel; origem
+// is NEVER touched here (immutable after creation — only the creation path in domain.go writes
+// it). The deadline row itself is patched via the ALREADY existing UpdateDeadlineAdjust
+// (ajuste_manual path) or UpdateDeadlineEndDate (aceita_declarado path) below; aceita_calculado
+// writes nothing (the stored end_date already IS the calculado date).
 // Read the declared×calculado cross-validation for one deadline (apurar-divergencia gate:
 // resultado must be "divergente" AND decisao must still be "" — the idempotency guard). Scoped
 // to tenant_id (barrier 1, on top of RLS barrier 2). A missing row (no prazo_declarado at birth,
@@ -354,7 +306,7 @@ type GetDeadlineForAdjustRow struct {
 // {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
 // over (a field absent from the body keeps its stored value). status gates the ajuste (only
 // a PENDING/OPEN prazo is adjustable). origem/selo (V1) ride along for apurar.go — origem is
-// immutable (only stamped onto deadline.seal_assigned), selo gates apurar-tipo. Keyed by id
+// immutable (only stamped onto deadline.seal_assigned), selo gates the apuração. Keyed by id
 // and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing id in the tenant →
 // pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper (→ 404), never (nil, nil). $1 = id,
 // $2 = tenant_id (from the principal).
@@ -1725,39 +1677,6 @@ func (q *Queries) TaskExistsInTenant(ctx context.Context, arg TaskExistsInTenant
 	return id, err
 }
 
-const updateCalcMemoryTipoConfirmation = `-- name: UpdateCalcMemoryTipoConfirmation :one
-UPDATE calc_memory
-SET ia_tipo_inferido = $3,
-    ia_confianca = $4
-WHERE deadline_id = $1 AND tenant_id = $2
-RETURNING id
-`
-
-type UpdateCalcMemoryTipoConfirmationParams struct {
-	DeadlineID     uuid.UUID `json:"deadline_id"`
-	TenantID       uuid.UUID `json:"tenant_id"`
-	IaTipoInferido *string   `json:"ia_tipo_inferido"`
-	IaConfianca    *float64  `json:"ia_confianca"`
-}
-
-// Record the human's confirmation/reclassification of the IA-inferred tipo de ato
-// (apurar-tipo, confirmar|reclassificar): ia_tipo_inferido becomes the confirmed/overridden
-// tipo, ia_confianca becomes 1.0 (human-confirmed, full confidence) — an UPDATE, not an INSERT
-// (the row already exists since InsertCalcMemory ran at birth). Scoped to tenant_id (barrier
-// 1). A no-match → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper. $1 = deadline_id,
-// $2 = tenant_id, $3 = ia_tipo_inferido, $4 = ia_confianca.
-func (q *Queries) UpdateCalcMemoryTipoConfirmation(ctx context.Context, arg UpdateCalcMemoryTipoConfirmationParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, updateCalcMemoryTipoConfirmation,
-		arg.DeadlineID,
-		arg.TenantID,
-		arg.IaTipoInferido,
-		arg.IaConfianca,
-	)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
-}
-
 const updateCrossValidationDecision = `-- name: UpdateCrossValidationDecision :one
 UPDATE cross_validation
 SET decisao = $3,
@@ -1917,18 +1836,18 @@ type UpdateDeadlineSeloParams struct {
 	ConfirmedAt pgtype.Timestamptz `json:"confirmed_at"`
 }
 
-// Flip the confidence selo (a_apurar → confiavel) AND stamp who/when confirmed it — the shared
-// write both apurar-divergencia and apurar-tipo end with, after the divergência/tipo decision is
-// recorded (Architect decisão: "apurar também confirma", reusing the confirmed_by/confirmed_at
-// columns from migration 0024 — the SAME human-approval stamp F2's ConfirmDeadline/MarkNoDeadline
-// already write, now also written on THIS confirmation path). origem is NEVER written here
-// (immutable after creation). Scoped to tenant_id (barrier 1). The `selo = 'a_apurar'` guard makes
-// the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor, mirroring
-// MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller pre-checks the
-// selo before calling, and this guard defends the write against a racing second apuração on the
-// SAME prazo — a no-match (the row vanished mid-tx, OR a concurrent apuração already sealed it
-// confiavel) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the mapper (never a silent no-op
-// re-seal). $1 = id, $2 = tenant_id, $3 = selo, $4 = confirmed_by, $5 = confirmed_at.
+// Flip the confidence selo (a_apurar → confiavel) AND stamp who/when confirmed it — the write
+// apurar-divergencia ends with, after the divergência decision is recorded (Architect decisão:
+// "apurar também confirma", reusing the confirmed_by/confirmed_at columns from migration 0024 —
+// the SAME human-approval stamp F2's ConfirmDeadline/MarkNoDeadline already write, now also
+// written on THIS confirmation path). origem is NEVER written here (immutable after creation).
+// Scoped to tenant_id (barrier 1). The `selo = 'a_apurar'` guard makes the flip SAFE and
+// IDEMPOTENT under concurrency (the concurrency floor, mirroring MarkTaskStatus/
+// MarkDeadlineStatus's `status = current_status` guard): the caller pre-checks the selo before
+// calling, and this guard defends the write against a racing second apuração on the SAME prazo
+// — a no-match (the row vanished mid-tx, OR a concurrent apuração already sealed it confiavel)
+// → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the mapper (never a silent no-op re-seal).
+// $1 = id, $2 = tenant_id, $3 = selo, $4 = confirmed_by, $5 = confirmed_at.
 func (q *Queries) UpdateDeadlineSelo(ctx context.Context, arg UpdateDeadlineSeloParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, updateDeadlineSelo,
 		arg.ID,

@@ -168,7 +168,7 @@ type mockRepo struct {
 	gotAppliedHolidays []*AppliedHoliday
 	policy             DeadlinePolicy
 
-	// V1 apuração (apurar.go): ApurarDivergencia/ApurarTipo repo doubles
+	// V1 apuração (apurar.go): ApurarDivergencia repo doubles
 	crossValidation              *CrossValidation
 	crossValidationErr           error
 	gotGetCrossValidationTenant  string
@@ -188,12 +188,6 @@ type mockRepo struct {
 	gotUpdateSelo                Seal
 	gotUpdateSeloConfirmedBy     string
 	gotUpdateSeloConfirmedAt     time.Time
-	calcMemory                   *CalcMemory
-	calcMemoryErr                error
-	updateCalcMemoryTipoErr      error
-	updateCalcMemoryTipoCalls    int
-	gotUpdateCalcMemoryTipo      string
-	gotUpdateCalcMemoryConfianca float64
 
 	// captured inputs
 	gotClassTenantID         string
@@ -725,22 +719,6 @@ func (m *mockRepo) UpdateDeadlineSelo(_ context.Context, _ database.Tx, tenantID
 	m.gotUpdateSeloConfirmedBy = confirmedBy
 	m.gotUpdateSeloConfirmedAt = confirmedAt
 	return m.updateSeloErr
-}
-
-// GetCalcMemory is a V1 apuração stub — returns the configured row/error.
-func (m *mockRepo) GetCalcMemory(_ context.Context, _ database.Tx, tenantID, deadlineID string) (*CalcMemory, error) {
-	if m.calcMemoryErr != nil {
-		return nil, m.calcMemoryErr
-	}
-	return m.calcMemory, nil
-}
-
-// UpdateCalcMemoryTipoConfirmation is a V1 apuração stub — captures the confirmed tipo for assertion.
-func (m *mockRepo) UpdateCalcMemoryTipoConfirmation(_ context.Context, _ database.Tx, tenantID, deadlineID, tipo string, confianca float64) error {
-	m.updateCalcMemoryTipoCalls++
-	m.gotUpdateCalcMemoryTipo = tipo
-	m.gotUpdateCalcMemoryConfianca = confianca
-	return m.updateCalcMemoryTipoErr
 }
 
 // fakeCalendar records which motor was called (business vs calendar) and the args, and
