@@ -37,6 +37,9 @@ const (
 const (
 	TypeDeadlineDueSoon = deadline.TypeDeadlineDueSoon
 	TypeDeadlineMissed  = deadline.TypeDeadlineMissed
+	// TypeDeadlineResolvedOnConclusion (Achado 2, fatia 2c) follows the SAME mold: only the
+	// dotted id crosses the boundary, the payload shape is redefined locally below.
+	TypeDeadlineResolvedOnConclusion = deadline.TypeDeadlineResolvedOnConclusion
 )
 
 // DeadlineDueSoon is the LOCAL decode shape of deadline.due_soon: a prazo approaching its
@@ -54,6 +57,15 @@ type DeadlineDueSoon struct {
 // at the D+1 carência. Same tenant scope and only-ever-decoded contract as DeadlineDueSoon;
 // it needs just the deadline id. Base yields the event id for dedup.
 type DeadlineMissed struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
+
+// DeadlineResolvedOnConclusion is the LOCAL decode shape of deadline.resolved_on_conclusion
+// (Achado 2, fatia 2c): a prazo auto-resolved because its court_record concluded. Same
+// tenant scope and only-ever-decoded contract as DeadlineMissed.
+type DeadlineResolvedOnConclusion struct {
 	events.Base
 	TenantID   string `json:"tenant_id"`
 	DeadlineID string `json:"deadline_id"`

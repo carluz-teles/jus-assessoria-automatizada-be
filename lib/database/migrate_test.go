@@ -368,12 +368,17 @@ func TestEmbeddedSource(t *testing.T) {
 		t.Fatalf("Next(95) = (%d, %v), want (96, nil)", next, err)
 	}
 	// The alerts schema-extension slice adds 97 (notification/notification_delivery
-	// alert columns + seen_marker) — 97 is the last — nothing follows it.
+	// alert columns + seen_marker).
 	if next, err := src.Next(96); err != nil || next != 97 {
 		t.Fatalf("Next(96) = (%d, %v), want (97, nil)", next, err)
 	}
-	if _, err := src.Next(97); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Next(97) error = %v, want fs.ErrNotExist", err)
+	// Achado 2's deadline lifecycle-reconciliation slice adds 98 (RESOLVED_ON_CONCLUSION
+	// status) — 98 is the last — nothing follows it.
+	if next, err := src.Next(97); err != nil || next != 98 {
+		t.Fatalf("Next(97) = (%d, %v), want (98, nil)", next, err)
+	}
+	if _, err := src.Next(98); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Next(98) error = %v, want fs.ErrNotExist", err)
 	}
 }
 

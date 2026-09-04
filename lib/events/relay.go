@@ -277,12 +277,19 @@ func queueFor(typ string) string {
 	// cycle). Must match worker-ingestao's deadlineQueue and the dedicated server's Queues.
 	if typ == "acquisition.intimation.observed" || typ == "acquisition.intimation.cancelled" ||
 		typ == "deadline.reminder_check" || typ == "deadline.missed_check" ||
-		typ == "deadline.opened" {
+		typ == "deadline.opened" || typ == "acquisition.court_record_archived" {
 		// deadline.opened is HIGH-VOLUME (one per prazo — a backfill mints thousands) and has
 		// no functional consumer, but it MUST NOT ride "ingestao" (the orphan default in the
 		// switch below): there it fails handler-not-found, retries, and STARVES the DATAJUD
 		// enrichment sharing that queue. Route it to the deadline server, which acks it with a
 		// no-op handler (deadline.Listener) — cheap, no retry, no queue clog.
+		//
+		// acquisition.court_record_archived (Achado 2, fatia 2b) joins them here for the SAME
+		// starvation reason: OnCourtRecordArchived is fast (DB + outbox, no external fetch) and
+		// has no OTHER consumer today (unlike docket_entry_observed's real fan-out), so a plain
+		// single-queue route — not queuesFor's fan-out — is enough. It carries the "acquisition"
+		// prefix, so it must be routed HERE too (before the prefix switch below sends
+		// "acquisition" to "ingestao", where deadline.Listener has no mux mounted).
 		return "deadline"
 	}
 	// actionitem.created/confirmed (fatia 3, docs/erd-costura-providencia-tarefa-peca.md §6):
@@ -305,8 +312,10 @@ func queueFor(typ string) string {
 	// deadline.due_soon/missed are NOT consumed by the deadline server — they are consumed by
 	// the NOTIFICATIONS listener, which runs on the main server (it serves "notifications").
 	// Route them to that queue so the reminder/miss avisos are delivered, not to "deadline"
-	// (whose server has no notifications handler) nor to "ingestao".
-	if typ == "deadline.due_soon" || typ == "deadline.missed" {
+	// (whose server has no notifications handler) nor to "ingestao". deadline.resolved_on_
+	// conclusion (Achado 2, fatia 2c) joins them here for the identical reason — its only
+	// consumer is the SAME notifications listener (a low-priority "resolvido" aviso).
+	if typ == "deadline.due_soon" || typ == "deadline.missed" || typ == "deadline.resolved_on_conclusion" {
 		return "notifications"
 	}
 	// The trial provisioning flow (fatia 2) shares the "notifications" queue too: billing

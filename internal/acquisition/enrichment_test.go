@@ -23,12 +23,25 @@ type fakeEnrichRepo struct {
 	updateParams GradeParams
 	updateCalls  int
 
+	// oldLifecycle is the PRE-update lifecycle UpdateCourtRecordGrade reports (Achado 2).
+	// "" by default — never equals ARCHIVED/SUPERSEDED, so existing tests that do not care
+	// about the transition see no spurious court_record_archived event.
+	oldLifecycle string
+
 	repointFrom  string
 	repointTo    string
 	repointCalls int
 
+	repointDeadlinesFrom  string
+	repointDeadlinesTo    string
+	repointDeadlinesCalls int
+
 	supersedeID   string
 	supersedeCall int
+	// supersedeAlreadyDone simulates a replay against an already-SUPERSEDED placeholder
+	// (the guarded UPDATE's "0 rows" case): when true, SupersedeCourtRecord reports NO
+	// transition, so gradeInTx must not emit court_record_superseded.
+	supersedeAlreadyDone bool
 
 	docketParams []DocketEntryParams
 
@@ -54,11 +67,20 @@ func (r *fakeEnrichRepo) GetCourtRecordByKey(_ context.Context, _ database.Tx, _
 	return r.existing, r.existingFound, nil
 }
 
-func (r *fakeEnrichRepo) UpdateCourtRecordGrade(_ context.Context, _ database.Tx, p GradeParams) (*CourtRecord, error) {
+func (r *fakeEnrichRepo) UpdateCourtRecordGrade(_ context.Context, _ database.Tx, p GradeParams) (*GradedCourtRecord, error) {
 	r.updateCalls++
 	r.updateParams = p
+	// Mirrors the real SQL's CASE: a SUPERSEDED old lifecycle is sticky; otherwise the new
+	// grade's lifecycle wins when non-empty, falling back to the old one (COALESCE).
+	newLifecycle := r.oldLifecycle
+	switch {
+	case r.oldLifecycle == LifecycleSuperseded:
+		newLifecycle = LifecycleSuperseded
+	case p.Lifecycle != "":
+		newLifecycle = p.Lifecycle
+	}
 	// Grade in place: the returned record keeps the id it was asked to mutate.
-	return &CourtRecord{ID: p.CourtRecordID, TenantID: p.TenantID, Degree: p.Degree, Court: p.Court}, nil
+	return &GradedCourtRecord{ID: p.CourtRecordID, OldLifecycle: r.oldLifecycle, Lifecycle: newLifecycle}, nil
 }
 
 func (r *fakeEnrichRepo) RepointIntimations(_ context.Context, _ database.Tx, _, from, to string) (int, error) {
@@ -67,10 +89,16 @@ func (r *fakeEnrichRepo) RepointIntimations(_ context.Context, _ database.Tx, _,
 	return 1, nil
 }
 
-func (r *fakeEnrichRepo) SupersedeCourtRecord(_ context.Context, _ database.Tx, _, id string) error {
+func (r *fakeEnrichRepo) RepointDeadlines(_ context.Context, _ database.Tx, _, from, to string) (int, error) {
+	r.repointDeadlinesCalls++
+	r.repointDeadlinesFrom, r.repointDeadlinesTo = from, to
+	return 1, nil
+}
+
+func (r *fakeEnrichRepo) SupersedeCourtRecord(_ context.Context, _ database.Tx, _, id string) (bool, error) {
 	r.supersedeCall++
 	r.supersedeID = id
-	return nil
+	return !r.supersedeAlreadyDone, nil
 }
 
 func (r *fakeEnrichRepo) UpsertDocketEntries(_ context.Context, _ database.Tx, params []DocketEntryParams) ([]DocketEntry, error) {
@@ -383,5 +411,142 @@ func TestEnrichment_NoHitsIsAck(t *testing.T) {
 	}
 	if repo.updateCalls != 0 {
 		t.Errorf("empty DATAJUD result still graded (updateCalls=%d), want 0", repo.updateCalls)
+	}
+}
+
+// ─── Achado 2 (lifecycle reconciliation, fatia 2a) — gradeInTx's transition detection ───
+// These call gradeInTx directly (unexported, same-package test) since the transition
+// logic lives entirely inside it — no fetch/parse plumbing needed.
+
+// TestGradeInTx_ArchivedTransition_PublishesEvent proves the core detection: a REAL
+// ARCHIVED transition (old lifecycle was NOT archived, the new grade IS) publishes
+// exactly one acquisition.court_record_archived keyed on the graded record's id.
+func TestGradeInTx_ArchivedTransition_PublishesEvent(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{oldLifecycle: LifecycleActive}
+	outbox := &fakeOutbox{}
+	uc := NewEnrichmentUseCase(repo, outbox, nil, nil, nil)
+
+	graded := ParsedCourtRecord{CNJNumber: "cnj-1", Degree: "G1", Lifecycle: LifecycleArchived}
+	if _, _, err := uc.gradeInTx(context.Background(), stubTx{}, testTenant, "cr-1", graded, nil); err != nil {
+		t.Fatalf("gradeInTx: %v", err)
+	}
+
+	if got := countByType(outbox.published)[TypeCourtRecordArchived]; got != 1 {
+		t.Fatalf("court_record_archived events = %d, want 1", got)
+	}
+	for _, ev := range outbox.published {
+		archived, ok := ev.(CourtRecordArchived)
+		if !ok {
+			continue
+		}
+		if archived.CourtRecordID != "cr-1" || archived.TenantID != testTenant {
+			t.Errorf("event = %+v, want court_record_id=cr-1 tenant=%s", archived, testTenant)
+		}
+	}
+}
+
+// TestGradeInTx_ArchivedNoChange_NoEvent proves idempotency: a re-poll that finds the
+// record ALREADY archived (old==new==ARCHIVED) must NOT re-publish — no event storm on
+// every scheduler re-poll of an already-concluded process.
+func TestGradeInTx_ArchivedNoChange_NoEvent(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{oldLifecycle: LifecycleArchived}
+	outbox := &fakeOutbox{}
+	uc := NewEnrichmentUseCase(repo, outbox, nil, nil, nil)
+
+	graded := ParsedCourtRecord{CNJNumber: "cnj-1", Degree: "G1", Lifecycle: LifecycleArchived}
+	if _, _, err := uc.gradeInTx(context.Background(), stubTx{}, testTenant, "cr-1", graded, nil); err != nil {
+		t.Fatalf("gradeInTx: %v", err)
+	}
+
+	if got := countByType(outbox.published)[TypeCourtRecordArchived]; got != 0 {
+		t.Errorf("re-poll with unchanged ARCHIVED lifecycle published %d court_record_archived events, want 0", got)
+	}
+}
+
+// TestGradeInTx_NonArchivedTransition_NoEvent proves the event is scoped to the
+// ARCHIVED transition specifically: an ACTIVE→SUSPENDED (or any other) change is a real
+// transition but not the one Achado 2 cares about, so it publishes no
+// court_record_archived either.
+func TestGradeInTx_NonArchivedTransition_NoEvent(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{oldLifecycle: LifecycleActive}
+	outbox := &fakeOutbox{}
+	uc := NewEnrichmentUseCase(repo, outbox, nil, nil, nil)
+
+	graded := ParsedCourtRecord{CNJNumber: "cnj-1", Degree: "G1", Lifecycle: LifecycleSuspended}
+	if _, _, err := uc.gradeInTx(context.Background(), stubTx{}, testTenant, "cr-1", graded, nil); err != nil {
+		t.Fatalf("gradeInTx: %v", err)
+	}
+
+	if got := countByType(outbox.published)[TypeCourtRecordArchived]; got != 0 {
+		t.Errorf("ACTIVE→SUSPENDED published %d court_record_archived events, want 0", got)
+	}
+}
+
+// TestGradeInTx_MergeSupersedes_RepointsDeadlinesAndPublishesEvent proves the merge
+// path's Achado 2 addition: RepointDeadlines runs alongside RepointIntimations (before
+// SupersedeCourtRecord, same tx — the production leak this closes: deadlines orphaned on
+// a SUPERSEDED placeholder), and a REAL supersede (the guarded UPDATE touched a row)
+// publishes exactly one acquisition.court_record_superseded keyed on the RETIRING
+// placeholder's id.
+func TestGradeInTx_MergeSupersedes_RepointsDeadlinesAndPublishesEvent(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{
+		existing:      &CourtRecord{ID: "graded-existing", Degree: "G1"},
+		existingFound: true,
+	}
+	outbox := &fakeOutbox{}
+	uc := NewEnrichmentUseCase(repo, outbox, nil, nil, nil)
+
+	graded := ParsedCourtRecord{CNJNumber: "cnj-1", Degree: "G1"}
+	if _, _, err := uc.gradeInTx(context.Background(), stubTx{}, testTenant, "placeholder-1", graded, nil); err != nil {
+		t.Fatalf("gradeInTx: %v", err)
+	}
+
+	if repo.repointDeadlinesCalls != 1 || repo.repointDeadlinesFrom != "placeholder-1" || repo.repointDeadlinesTo != "graded-existing" {
+		t.Errorf("RepointDeadlines = %d calls, %s→%s; want 1, placeholder-1→graded-existing",
+			repo.repointDeadlinesCalls, repo.repointDeadlinesFrom, repo.repointDeadlinesTo)
+	}
+	if got := countByType(outbox.published)[TypeCourtRecordSuperseded]; got != 1 {
+		t.Fatalf("court_record_superseded events = %d, want 1", got)
+	}
+	for _, ev := range outbox.published {
+		superseded, ok := ev.(CourtRecordSuperseded)
+		if !ok {
+			continue
+		}
+		if superseded.CourtRecordID != "placeholder-1" || superseded.TenantID != testTenant {
+			t.Errorf("event = %+v, want court_record_id=placeholder-1 tenant=%s", superseded, testTenant)
+		}
+	}
+}
+
+// TestGradeInTx_MergeReplay_NoSupersededEvent proves the guard's idempotency: a
+// redelivery against an already-SUPERSEDED placeholder (SupersedeCourtRecord's guarded
+// UPDATE touches 0 rows) must NOT re-publish court_record_superseded.
+func TestGradeInTx_MergeReplay_NoSupersededEvent(t *testing.T) {
+	t.Parallel()
+
+	repo := &fakeEnrichRepo{
+		existing:             &CourtRecord{ID: "graded-existing", Degree: "G1"},
+		existingFound:        true,
+		supersedeAlreadyDone: true,
+	}
+	outbox := &fakeOutbox{}
+	uc := NewEnrichmentUseCase(repo, outbox, nil, nil, nil)
+
+	graded := ParsedCourtRecord{CNJNumber: "cnj-1", Degree: "G1"}
+	if _, _, err := uc.gradeInTx(context.Background(), stubTx{}, testTenant, "placeholder-1", graded, nil); err != nil {
+		t.Fatalf("gradeInTx: %v", err)
+	}
+
+	if got := countByType(outbox.published)[TypeCourtRecordSuperseded]; got != 0 {
+		t.Errorf("replay published %d court_record_superseded events, want 0", got)
 	}
 }

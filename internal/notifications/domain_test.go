@@ -278,6 +278,16 @@ func deadlineMissed(eventID string) DeadlineMissed {
 	}
 }
 
+// deadlineResolvedOnConclusion builds a deadline.resolved_on_conclusion for the fixture
+// tenant (Achado 2, fatia 2c).
+func deadlineResolvedOnConclusion(eventID string) DeadlineResolvedOnConclusion {
+	return DeadlineResolvedOnConclusion{
+		Base:       baseWithID(eventID),
+		TenantID:   tenantID,
+		DeadlineID: "deadline-uuid",
+	}
+}
+
 var trialEndsAtFixture = time.Date(2026, 3, 13, 0, 0, 0, 0, time.UTC)
 
 func trialEndingSoon(eventID string, daysLeft int) TrialEndingSoon {
@@ -793,6 +803,69 @@ func TestInAppUseCase_OnDeadlineMissed_ReplayIsNoOp(t *testing.T) {
 
 	if err := uc.OnDeadlineMissed(context.Background(), deadlineMissed("evt-ms-dup")); err != nil {
 		t.Fatalf("OnDeadlineMissed: %v", err)
+	}
+	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
+		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)
+	}
+	if len(pub.channels) != 0 {
+		t.Fatalf("replay pushed %d times, want 0", len(pub.channels))
+	}
+}
+
+// Achado 2 (fatia 2c): a deadline.resolved_on_conclusion creates one "Prazo resolvido"
+// aviso + one IN_APP delivery QUEUED, tenant-level, and pushes it once. severidade is left
+// unset by record() (the INSERT omits the column), so migration 0097's DB default 'info'
+// applies — this test only asserts what the Go layer controls (type/title/body/payload);
+// the severidade default itself is a DB-level fact, verified by the integration test.
+func TestInAppUseCase_OnDeadlineResolvedOnConclusion_CreatesAviso(t *testing.T) {
+	repo := repoInApp()
+	dedup := &fakeDedup{}
+	uow := &fakeUOW{}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, dedup, uow, pub)
+
+	if err := uc.OnDeadlineResolvedOnConclusion(context.Background(), deadlineResolvedOnConclusion("evt-roc-1")); err != nil {
+		t.Fatalf("OnDeadlineResolvedOnConclusion: %v", err)
+	}
+
+	if len(repo.insertedNotif) != 1 {
+		t.Fatalf("inserted notifications = %d, want 1", len(repo.insertedNotif))
+	}
+	notif := repo.insertedNotif[0]
+	if notif.Type != TypeDeadlineResolvedOnConclusionAviso || notif.Status != StatusCreated || notif.RecipientUserID != "" {
+		t.Fatalf("notification = %+v, want deadline_resolved_on_conclusion/CREATED/tenant-level", notif)
+	}
+	if notif.Title != deadlineResolvedOnConclusionTitle || notif.Body != deadlineResolvedOnConclusionBody {
+		t.Fatalf("title/body = %q / %q, want the resolved-on-conclusion strings", notif.Title, notif.Body)
+	}
+	if notif.Payload["deadline_id"] != "deadline-uuid" {
+		t.Fatalf("payload = %v, want deadline_id", notif.Payload)
+	}
+	if len(repo.insertedDelivery) != 1 || repo.insertedDelivery[0].Channel != ChannelInApp || repo.insertedDelivery[0].Status != DeliveryQueued {
+		t.Fatalf("inserted delivery = %+v, want one IN_APP/QUEUED", repo.insertedDelivery)
+	}
+	if len(dedup.marked) != 1 || dedup.marked[0] != "evt-roc-1" || dedup.consumers[0] != consumerDeadlineResolvedOnConclusion {
+		t.Fatalf("dedup = {marked:%v consumers:%v}, want [evt-roc-1] under %q", dedup.marked, dedup.consumers, consumerDeadlineResolvedOnConclusion)
+	}
+	push := assertPushedOnce(t, pub)
+	if push["id"] != notifID || push["type"] != TypeDeadlineResolvedOnConclusionAviso {
+		t.Fatalf("push = %v, want the deadline_resolved_on_conclusion aviso", push)
+	}
+}
+
+// Achado 2 (fatia 2c): a replay of a deadline.resolved_on_conclusion is a pure no-op — no
+// aviso, no delivery, no push.
+func TestInAppUseCase_OnDeadlineResolvedOnConclusion_ReplayIsNoOp(t *testing.T) {
+	repo := repoInApp()
+	repo.insertNotif = func(context.Context, database.Tx, InsertNotificationParams) (*Notification, error) {
+		t.Fatal("insert notification ran on a replay")
+		return nil, nil
+	}
+	pub := &fakePublisher{}
+	uc := NewInAppUseCase(repo, &fakeDedup{seen: true}, &fakeUOW{}, pub)
+
+	if err := uc.OnDeadlineResolvedOnConclusion(context.Background(), deadlineResolvedOnConclusion("evt-roc-dup")); err != nil {
+		t.Fatalf("OnDeadlineResolvedOnConclusion: %v", err)
 	}
 	if len(repo.insertedNotif) != 0 || len(repo.insertedDelivery) != 0 {
 		t.Fatalf("replay wrote: notif=%v delivery=%v", repo.insertedNotif, repo.insertedDelivery)

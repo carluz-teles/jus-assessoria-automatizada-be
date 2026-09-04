@@ -246,6 +246,13 @@ WHERE t.tenant_id = @tenant_id::uuid
   AND (sqlc.narg('intimation_id')::uuid IS NULL OR t.intimation_id = sqlc.narg('intimation_id')::uuid)
   AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
   AND (@to_date::date IS NULL OR t.due_date <= @to_date::date)
+  -- Achado 2 (fatia 2c, "Meus Prazos"/"Pipeline"): an OPEN task whose court_record already
+  -- concluded (ARCHIVED) leaves the fila ativa — nothing left to fazer when the processo
+  -- itself is done. Mirrors ListIntimacoes' exclusion (internal/acquisition), scoped to
+  -- OPEN only (a DONE task stays visible, same precedent as a RESOLVED intimação). IS
+  -- DISTINCT FROM is null-safe: an avulsa task (cr is NULL via the LEFT JOIN above) is
+  -- never excluded — NULL IS DISTINCT FROM 'ARCHIVED' is true.
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED')
   AND (COALESCE(t.due_date, '9999-12-31'), t.id) > (@last_due::date, @last_id::uuid)
 ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
 LIMIT @page_limit;
@@ -258,6 +265,7 @@ LIMIT @page_limit;
 -- with the list's row count even when @status='DISMISSED' is passed explicitly: both then
 -- resolve to zero instead of a non-empty total_count against an empty data page.
 SELECT count(*) FROM task t
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
 WHERE t.tenant_id = @tenant_id::uuid
   AND t.status <> 'DISMISSED'
   AND (@status::text = '' OR t.status = @status::text)
@@ -265,14 +273,23 @@ WHERE t.tenant_id = @tenant_id::uuid
   AND (@source::text = '' OR t.source = @source::text)
   AND (sqlc.narg('intimation_id')::uuid IS NULL OR t.intimation_id = sqlc.narg('intimation_id')::uuid)
   AND (@from_date::date IS NULL OR t.due_date >= @from_date::date)
-  AND (@to_date::date IS NULL OR t.due_date <= @to_date::date);
+  AND (@to_date::date IS NULL OR t.due_date <= @to_date::date)
+  -- Achado 2 (fatia 2c): mirrors ListTasks' exclusion so the counter agrees with the page.
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED');
 
 -- name: CountTasksByTenant :one
 -- The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
 -- any filter. DISMISSED is always excluded (mirrors ListTasks — the agenda never shows
 -- dismissed tasks, filtered or not), so this stays consistent with the list even on an
--- unfiltered GET /v1/tasks.
-SELECT count(*) FROM task WHERE tenant_id = @tenant_id::uuid AND status <> 'DISMISSED';
+-- unfiltered GET /v1/tasks. Achado 2 (fatia 2c): the SAME OPEN+ARCHIVED exclusion applies
+-- here too — "Y" must agree with what an unfiltered ListTasks actually returns, or "X de Y"
+-- goes inconsistent the moment no filter is active (CountTasks' Go wrapper reuses this
+-- value as BOTH X and Y when unfiltered).
+SELECT count(*) FROM task t
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
+WHERE t.tenant_id = @tenant_id::uuid
+  AND t.status <> 'DISMISSED'
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED');
 
 -- ── task detail + checklist (GET /v1/tasks/:id) ─────────────────────────────
 -- The task detail screen (docs/erd-prazos.md, a Tarefa aberta): the task's own fields + its
@@ -346,6 +363,9 @@ WHERE d.tenant_id = @tenant_id::uuid;
 -- LATERAL folds each task's done-item count in. Buckets (DISMISSED excluded, mirrors the derived
 -- display_status): concluidas = DONE; atrasadas = OPEN with due_date < today; em_execucao = OPEN,
 -- not yet due, with at least one done item; abertas = OPEN, not yet due, no done item. $1 = tenant_id.
+-- Achado 2 (fatia 2c): the OPEN+ARCHIVED exclusion (mirrors ListTasks/CountTasks) is applied at
+-- the outer WHERE, so it uniformly narrows the three OPEN-only buckets (atrasadas/em_execucao/
+-- abertas); concluidas (DONE) is untouched — the predicate is a no-op for any non-OPEN task.
 SELECT
   count(*) FILTER (WHERE t.status = 'DONE')::bigint AS concluidas,
   count(*) FILTER (
@@ -362,12 +382,14 @@ SELECT
       AND p.done_items = 0
   )::bigint AS abertas
 FROM task t
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
 LEFT JOIN LATERAL (
   SELECT count(*) FILTER (WHERE ti.done) AS done_items
   FROM task_item ti
   WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
 ) p ON true
-WHERE t.tenant_id = @tenant_id::uuid;
+WHERE t.tenant_id = @tenant_id::uuid
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED');
 
 -- ── filter options (the envelope's selectable sets) ──────────────────────────
 -- Distinct-value reads that back the prazos/tasks agenda envelopes' filter chips.

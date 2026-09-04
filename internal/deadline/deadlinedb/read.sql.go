@@ -85,6 +85,7 @@ func (q *Queries) CountPrazosByTenant(ctx context.Context, tenantID uuid.UUID) (
 
 const countTasks = `-- name: CountTasks :one
 SELECT count(*) FROM task t
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
 WHERE t.tenant_id = $1::uuid
   AND t.status <> 'DISMISSED'
   AND ($2::text = '' OR t.status = $2::text)
@@ -93,6 +94,8 @@ WHERE t.tenant_id = $1::uuid
   AND ($5::uuid IS NULL OR t.intimation_id = $5::uuid)
   AND ($6::date IS NULL OR t.due_date >= $6::date)
   AND ($7::date IS NULL OR t.due_date <= $7::date)
+  -- Achado 2 (fatia 2c): mirrors ListTasks' exclusion so the counter agrees with the page.
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED')
 `
 
 type CountTasksParams struct {
@@ -147,13 +150,20 @@ func (q *Queries) CountTasksByProcesso(ctx context.Context, arg CountTasksByProc
 }
 
 const countTasksByTenant = `-- name: CountTasksByTenant :one
-SELECT count(*) FROM task WHERE tenant_id = $1::uuid AND status <> 'DISMISSED'
+SELECT count(*) FROM task t
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
+WHERE t.tenant_id = $1::uuid
+  AND t.status <> 'DISMISSED'
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED')
 `
 
 // The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
 // any filter. DISMISSED is always excluded (mirrors ListTasks — the agenda never shows
 // dismissed tasks, filtered or not), so this stays consistent with the list even on an
-// unfiltered GET /v1/tasks.
+// unfiltered GET /v1/tasks. Achado 2 (fatia 2c): the SAME OPEN+ARCHIVED exclusion applies
+// here too — "Y" must agree with what an unfiltered ListTasks actually returns, or "X de Y"
+// goes inconsistent the moment no filter is active (CountTasks' Go wrapper reuses this
+// value as BOTH X and Y when unfiltered).
 func (q *Queries) CountTasksByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countTasksByTenant, tenantID)
 	var count int64
@@ -527,12 +537,14 @@ SELECT
       AND p.done_items = 0
   )::bigint AS abertas
 FROM task t
+LEFT JOIN court_record cr ON cr.id = t.court_record_id
 LEFT JOIN LATERAL (
   SELECT count(*) FILTER (WHERE ti.done) AS done_items
   FROM task_item ti
   WHERE ti.task_id = t.id AND ti.tenant_id = t.tenant_id
 ) p ON true
 WHERE t.tenant_id = $1::uuid
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED')
 `
 
 type GetTasksSummaryRow struct {
@@ -547,6 +559,9 @@ type GetTasksSummaryRow struct {
 // LATERAL folds each task's done-item count in. Buckets (DISMISSED excluded, mirrors the derived
 // display_status): concluidas = DONE; atrasadas = OPEN with due_date < today; em_execucao = OPEN,
 // not yet due, with at least one done item; abertas = OPEN, not yet due, no done item. $1 = tenant_id.
+// Achado 2 (fatia 2c): the OPEN+ARCHIVED exclusion (mirrors ListTasks/CountTasks) is applied at
+// the outer WHERE, so it uniformly narrows the three OPEN-only buckets (atrasadas/em_execucao/
+// abertas); concluidas (DONE) is untouched — the predicate is a no-op for any non-OPEN task.
 func (q *Queries) GetTasksSummary(ctx context.Context, tenantID uuid.UUID) (GetTasksSummaryRow, error) {
 	row := q.db.QueryRow(ctx, getTasksSummary, tenantID)
 	var i GetTasksSummaryRow
@@ -1181,6 +1196,13 @@ WHERE t.tenant_id = $1::uuid
   AND ($5::uuid IS NULL OR t.intimation_id = $5::uuid)
   AND ($6::date IS NULL OR t.due_date >= $6::date)
   AND ($7::date IS NULL OR t.due_date <= $7::date)
+  -- Achado 2 (fatia 2c, "Meus Prazos"/"Pipeline"): an OPEN task whose court_record already
+  -- concluded (ARCHIVED) leaves the fila ativa — nothing left to fazer when the processo
+  -- itself is done. Mirrors ListIntimacoes' exclusion (internal/acquisition), scoped to
+  -- OPEN only (a DONE task stays visible, same precedent as a RESOLVED intimação). IS
+  -- DISTINCT FROM is null-safe: an avulsa task (cr is NULL via the LEFT JOIN above) is
+  -- never excluded — NULL IS DISTINCT FROM 'ARCHIVED' is true.
+  AND (t.status <> 'OPEN' OR cr.lifecycle IS DISTINCT FROM 'ARCHIVED')
   AND (COALESCE(t.due_date, '9999-12-31'), t.id) > ($8::date, $9::uuid)
 ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.id ASC
 LIMIT $10

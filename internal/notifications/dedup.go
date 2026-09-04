@@ -12,14 +12,15 @@ import (
 // distinct from consumerNotifications (the email path) and from each other, so
 // marking one event never blocks another consumer.
 const (
-	consumerBackfill        = "notifications.backfill"
-	consumerDocket          = "notifications.docket"
-	consumerDeadlineDueSoon = "notifications.deadline_due_soon"
-	consumerDeadlineMissed  = "notifications.deadline_missed"
-	consumerTrialEndingSoon = "notifications.trial_ending_soon"
-	consumerPaymentFailed   = "notifications.payment_failed"
-	consumerFilingSucceeded = "notifications.filing_succeeded"
-	consumerFilingFailed    = "notifications.filing_failed"
+	consumerBackfill                     = "notifications.backfill"
+	consumerDocket                       = "notifications.docket"
+	consumerDeadlineDueSoon              = "notifications.deadline_due_soon"
+	consumerDeadlineMissed               = "notifications.deadline_missed"
+	consumerDeadlineResolvedOnConclusion = "notifications.deadline_resolved_on_conclusion"
+	consumerTrialEndingSoon              = "notifications.trial_ending_soon"
+	consumerPaymentFailed                = "notifications.payment_failed"
+	consumerFilingSucceeded              = "notifications.filing_succeeded"
+	consumerFilingFailed                 = "notifications.filing_failed"
 )
 
 // txDeduper adapts lib/events' Dedup to the deduper port. events.Dedup binds its

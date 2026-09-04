@@ -1283,6 +1283,69 @@ func (r *pgRepository) MarkMet(ctx context.Context, tx database.Tx, deadlineID, 
 	return met.String(), nil
 }
 
+// ListDeadlinesForConclusion loads the PENDING/OPEN/MISSED prazos of a court_record inside
+// the caller's tx, filtered by tenantID (barrier 1) — the Achado 2 counterpart of
+// ListReconcilableDeadlines, widened to include PENDING (fatia 2b). No resolvable prazo
+// yields an empty slice (a :many never returns pgx.ErrNoRows), never an error; the mapper
+// absorbs the driver types (uuid.UUID, pgtype.Date).
+func (r *pgRepository) ListDeadlinesForConclusion(ctx context.Context, tx database.Tx, courtRecordID, tenantID string) ([]ReconcilableDeadline, error) {
+	recordID, err := parseUUID(courtRecordID)
+	if err != nil {
+		return nil, err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := deadlinedb.New(tx).ListDeadlinesForConclusion(ctx, deadlinedb.ListDeadlinesForConclusionParams{
+		CourtRecordID: recordID,
+		TenantID:      tenant,
+	})
+	if err != nil {
+		return nil, database.WrapInfra(err)
+	}
+
+	out := make([]ReconcilableDeadline, len(rows))
+	for i, row := range rows {
+		out[i] = ReconcilableDeadline{
+			ID:        row.ID.String(),
+			StartDate: row.StartDate.Time,
+		}
+	}
+	return out, nil
+}
+
+// MarkResolvedOnConclusion resolves the prazo PENDING/OPEN/MISSED → RESOLVED_ON_CONCLUSION
+// inside the caller's tx, filtered by tenantID (barrier 1). The query's
+// status IN ('PENDING','OPEN','MISSED') guard means a redelivery — or an already-terminal
+// prazo — updates no row: sqlc returns pgx.ErrNoRows, mapped to the typed
+// ErrDeadlineNotFound so the use case no-ops instead of emitting a phantom event. On a hit
+// it returns the resolved prazo's id. It mirrors MarkMet's shape, widened to the three
+// resolvable statuses.
+func (r *pgRepository) MarkResolvedOnConclusion(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error) {
+	id, err := parseUUID(deadlineID)
+	if err != nil {
+		return "", err
+	}
+	tenant, err := parseUUID(tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	resolved, err := deadlinedb.New(tx).MarkResolvedOnConclusion(ctx, deadlinedb.MarkResolvedOnConclusionParams{
+		ID:       id,
+		TenantID: tenant,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrDeadlineNotFound
+	}
+	if err != nil {
+		return "", database.WrapInfra(err)
+	}
+	return resolved.String(), nil
+}
+
 // RevokeDeadlineByIntimation cancels the prazo derived from the intimação inside the
 // caller's tx, filtered by tenantID (barrier 1). The query's status <> 'CANCELLED' guard
 // means a redelivery — or a cancel that arrives before (or without) any prazo — updates no

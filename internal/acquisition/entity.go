@@ -132,6 +132,18 @@ type CourtRecord struct {
 	Court     string
 }
 
+// GradedCourtRecord is the narrow result of UpdateCourtRecordGrade (Achado 2, fatia 2a):
+// the graded row's id/case — what the docket upsert needs — plus the lifecycle BEFORE
+// and AFTER the grade. OldLifecycle/Lifecycle is exactly the pair gradeInTx diffs to
+// detect a REAL ARCHIVED transition (old≠ARCHIVED, new=ARCHIVED): a re-poll that leaves
+// the lifecycle unchanged (old==new) must never re-publish court_record_archived.
+type GradedCourtRecord struct {
+	ID           string
+	CaseID       string
+	OldLifecycle string
+	Lifecycle    string
+}
+
 // DocketEntry is one andamento persisted by the sync cycle. The use case builds
 // it only for entries that were actually inserted (the new set), so it can emit
 // docket_entry_observed for each — ID is the freshly assigned row id.

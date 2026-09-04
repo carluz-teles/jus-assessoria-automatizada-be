@@ -65,9 +65,21 @@ type GradeParams struct {
 type enrichRepo interface {
 	AcquireTenantWriteLock(ctx context.Context, tx database.Tx, tenantID string) error
 	GetCourtRecordByKey(ctx context.Context, tx database.Tx, tenantID, cnjNumber, degree string) (record *CourtRecord, found bool, err error)
-	UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*CourtRecord, error)
+	// UpdateCourtRecordGrade grades a court_record IN PLACE and returns it with BOTH the
+	// pre- and post-update lifecycle (Achado 2) — gradeInTx diffs them to detect a REAL
+	// ARCHIVED transition.
+	UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*GradedCourtRecord, error)
 	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
-	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
+	// RepointDeadlines mirrors RepointIntimations for the deadline table (Achado 2, fatia
+	// 2a): the merge path's other orphan risk — a deadline hangs off court_record_id the
+	// same way an intimation does, so a merge that forgets to repoint it leaves the
+	// deadline stranded on the retiring placeholder.
+	RepointDeadlines(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
+	// SupersedeCourtRecord retires the placeholder and reports whether this call caused a
+	// REAL transition (guarded lifecycle <> 'SUPERSEDED', Achado 2): false on a replay
+	// against an already-superseded row means gradeInTx must NOT re-publish
+	// court_record_superseded.
+	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) (transitioned bool, err error)
 	UpsertDocketEntries(ctx context.Context, tx database.Tx, params []DocketEntryParams) (newEntries []DocketEntry, err error)
 
 	// CascadeCaseResponsibleToIntimations + GetCaseAssignedUser re-sync the destination
@@ -227,9 +239,13 @@ func (uc *EnrichmentUseCase) applyEnrichment(ctx context.Context, ev CourtRecord
 // (applyEnrichment) and the batch job (OnEnrichmentBatchRequested) — so the FIX B grade +
 // the rare (tenant, cnj, degree) merge fallback live in exactly one place. courtRecordID is
 // the row to grade (the DJEN placeholder, or a batch-due record); graded/movimentos are the
-// DATAJUD-parsed process. It does NOT dedup, take the lock, or emit events — the caller owns
-// the tx boundary and the event/audit decisions.
-func (uc *EnrichmentUseCase) gradeInTx(ctx context.Context, tx database.Tx, tenantID, courtRecordID string, graded ParsedCourtRecord, movimentos []ParsedDocketEntry) (*CourtRecord, []DocketEntry, error) {
+// DATAJUD-parsed process. It does NOT dedup or take the lock — the caller owns those — but
+// it DOES emit the two Achado 2 structural facts (court_record_archived/superseded) directly:
+// unlike docket_entry_observed (whose emission the caller must conditionally suppress during
+// backfill, so it stays the caller's call), these two are unconditional consequences of the
+// grade itself, and BOTH callers need them, so centralizing them here is the one place they
+// cannot drift apart.
+func (uc *EnrichmentUseCase) gradeInTx(ctx context.Context, tx database.Tx, tenantID, courtRecordID string, graded ParsedCourtRecord, movimentos []ParsedDocketEntry) (*GradedCourtRecord, []DocketEntry, error) {
 	// FIX B — grade the record IN PLACE. The row we mutate keeps courtRecordID, so its
 	// intimations/deadlines/docket stay anchored (no orphan, no duplicate). Mutating the
 	// degree would violate the (tenant, cnj, degree) UNIQUE only if a DIFFERENT record
@@ -243,14 +259,33 @@ func (uc *EnrichmentUseCase) gradeInTx(ctx context.Context, tx database.Tx, tena
 	}
 	if found && existing.ID != courtRecordID {
 		// Rare conflict: a graded record already holds this (tenant, cnj, degree). Merge the
-		// placeholder INTO it — move its intimations onto the graded record and retire the
-		// placeholder. DJEN discovery produces no docket entries, so the placeholder never
-		// has any to re-point; the DATAJUD movimentos below land on the graded record.
+		// placeholder INTO it — move its intimations AND deadlines onto the graded record and
+		// retire the placeholder. DJEN discovery produces no docket entries, so the
+		// placeholder never has any to re-point; the DATAJUD movimentos below land on the
+		// graded record.
 		if _, err := uc.repo.RepointIntimations(ctx, tx, tenantID, courtRecordID, existing.ID); err != nil {
 			return nil, nil, err
 		}
-		if err := uc.repo.SupersedeCourtRecord(ctx, tx, tenantID, courtRecordID); err != nil {
+		// Achado 2 (fatia 2a): repoint the placeholder's deadlines the SAME way, in the SAME
+		// tx, BEFORE SupersedeCourtRecord retires it — the production leak this closes (61
+		// MISSED deadlines orphaned on a SUPERSEDED record, never re-pointed like intimation
+		// already is).
+		if _, err := uc.repo.RepointDeadlines(ctx, tx, tenantID, courtRecordID, existing.ID); err != nil {
 			return nil, nil, err
+		}
+		transitioned, err := uc.repo.SupersedeCourtRecord(ctx, tx, tenantID, courtRecordID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if transitioned {
+			// A REAL SUPERSEDED transition (the guarded UPDATE touched a row, not a replay
+			// against an already-superseded placeholder) — announce it. No known consumer
+			// today (RepointDeadlines above already did the deadline slice's only actionable
+			// work for this path), but the fact is worth broadcasting for future audit/read
+			// model consumers, same as any other structural court_record fact.
+			if err := uc.outbox.Publish(ctx, tx, newCourtRecordSuperseded(tenantID, courtRecordID)); err != nil {
+				return nil, nil, err
+			}
 		}
 		// The repointed intimations now hang off existing.CaseID (the destination case), so
 		// their responsável must match ITS vigente assignee — not whatever the placeholder's
@@ -287,6 +322,18 @@ func (uc *EnrichmentUseCase) gradeInTx(ctx context.Context, tx database.Tx, tena
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Achado 2 (fatia 2a): a REAL ARCHIVED transition (old lifecycle was NOT archived, the
+	// new one IS) announces court_record_archived so the deadline slice's OnCourtRecordArchived
+	// can resolve every PENDING/OPEN/MISSED prazo still pending on the now-concluded process.
+	// old==new (including an already-ARCHIVED record re-confirmed on a scheduler re-poll) is
+	// NOT a transition — never re-publish (idempotency: the deadline reconcile is a one-shot
+	// per real conclusion, not a resend on every re-poll).
+	if gradedRec.OldLifecycle != LifecycleArchived && gradedRec.Lifecycle == LifecycleArchived {
+		if err := uc.outbox.Publish(ctx, tx, newCourtRecordArchived(tenantID, gradedRec.ID)); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	newDocket, err := uc.repo.UpsertDocketEntries(ctx, tx, enrichDocketParams(gradedRec.ID, movimentos))

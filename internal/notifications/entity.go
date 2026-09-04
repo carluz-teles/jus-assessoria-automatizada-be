@@ -97,6 +97,11 @@ const (
 	// TypeFilingFailedAviso — a tentativa de protocolo automático no e-SAJ falhou
 	// (filing.failed); o usuário deve protocolar manualmente.
 	TypeFilingFailedAviso = "filing_failed"
+	// TypeDeadlineResolvedOnConclusionAviso — a prazo foi resolvido automaticamente porque o
+	// processo concluiu (deadline.resolved_on_conclusion, Achado 2 / fatia 2c). Baixa
+	// prioridade por natureza (severidade='info', o default de migration 0097 — resolve
+	// trabalho, não cria) — record() a deixa sem setar a coluna explicitamente.
+	TypeDeadlineResolvedOnConclusionAviso = "deadline_resolved_on_conclusion"
 	// TypeMemberJoinedAviso — a user joined the escritório (identity.member_joined),
 	// delivered through the generic notification.requested/EMAIL path (NotifyUseCase),
 	// not the in-app record() path the other Type*Aviso consts above go through. Named
@@ -113,15 +118,16 @@ const (
 // PUT /v1/notifications/preferences guard: a typo'd type is a 400, not a silently
 // saved dead preference that will never match a real aviso.
 var validNotificationTypes = map[string]bool{
-	TypeImportFinished:       true,
-	TypeNewAndamento:         true,
-	TypeDeadlineDueSoonAviso: true,
-	TypeDeadlineMissedAviso:  true,
-	TypeTrialEndingSoonAviso: true,
-	TypePaymentFailedAviso:   true,
-	TypeMemberJoinedAviso:    true,
-	TypeFilingSucceededAviso: true,
-	TypeFilingFailedAviso:    true,
+	TypeImportFinished:                    true,
+	TypeNewAndamento:                      true,
+	TypeDeadlineDueSoonAviso:              true,
+	TypeDeadlineMissedAviso:               true,
+	TypeTrialEndingSoonAviso:              true,
+	TypePaymentFailedAviso:                true,
+	TypeMemberJoinedAviso:                 true,
+	TypeFilingSucceededAviso:              true,
+	TypeFilingFailedAviso:                 true,
+	TypeDeadlineResolvedOnConclusionAviso: true,
 }
 
 // ValidNotificationType reports whether t is a known aviso type. The empty string

@@ -163,6 +163,15 @@ const (
 	// prazo sits OUTSIDE the MarkMissed (status='OPEN') and reconcile (MISSED,OPEN) guards, so
 	// it never auto-flips to MISSED nor gets resurrected.
 	StatusNoDeadline Status = "NO_DEADLINE"
+	// StatusResolvedOnConclusion is the Achado 2 terminal state (fatia 2b, migration 0098):
+	// a PENDING/OPEN/MISSED prazo auto-resolved because its court_record concluded (lifecycle
+	// → ARCHIVED). DISTINCT from CANCELLED (a retificação-driven revocation, deadline slice's
+	// own event) and from NO_DEADLINE (a human "mera ciência" declaration): this transition is
+	// system-driven by a DIFFERENT slice's fact (acquisition.court_record_archived) and must
+	// stay auditable in the deadline_event trail as "resolvido por conclusão do processo", not
+	// collapse into a generic cancellation. Irreversible in v0 (no reopen path, unlike
+	// NO_DEADLINE) — the process concluding is not expected to un-conclude.
+	StatusResolvedOnConclusion Status = "RESOLVED_ON_CONCLUSION"
 )
 
 // AnchorEvent is which observed date of the intimação anchors the prazo's start_date (a closed
