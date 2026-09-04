@@ -24,6 +24,8 @@ type stubUC struct {
 	missedCalls    int
 	docketErr      error
 	docketCalls    int
+	archivedErr    error
+	archivedCalls  int
 }
 
 func (s *stubUC) OnIntimationObserved(context.Context, IntimationObserved) error {
@@ -49,6 +51,11 @@ func (s *stubUC) OnMissedCheck(context.Context, DeadlineMissedCheck) error {
 func (s *stubUC) OnDocketEntryObserved(context.Context, DocketEntryObserved) error {
 	s.docketCalls++
 	return s.docketErr
+}
+
+func (s *stubUC) OnCourtRecordArchived(context.Context, CourtRecordArchived) error {
+	s.archivedCalls++
+	return s.archivedErr
 }
 
 // TestListener_handleIntimationObserved covers the listener's contract: a terminal

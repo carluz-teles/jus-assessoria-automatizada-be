@@ -26,6 +26,7 @@ type useCase interface {
 	OnReminderCheck(ctx context.Context, ev DeadlineReminderCheck) error
 	OnMissedCheck(ctx context.Context, ev DeadlineMissedCheck) error
 	OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error
+	OnCourtRecordArchived(ctx context.Context, ev CourtRecordArchived) error
 }
 
 // Listener is the deadline slice's asynq consumer. It holds no transport state; the use
@@ -54,6 +55,7 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeDeadlineReminderCheck, l.handleReminderCheck)
 	mux.HandleFunc(TypeDeadlineMissedCheck, l.handleMissedCheck)
 	mux.HandleFunc(TypeDocketEntryObserved, l.handleDocketEntryObserved)
+	mux.HandleFunc(TypeCourtRecordArchived, l.handleCourtRecordArchived)
 	// The providência→tarefa task creation is now SYNCHRONOUS (internal/actionitem creates+links
 	// the task in-tx via the injected ActionItemTaskCreator), so this slice no longer consumes
 	// actionitem.created/confirmed to create tasks.
@@ -165,6 +167,26 @@ func (l *Listener) handleDocketEntryObserved(ctx context.Context, t *asynq.Task)
 		return err
 	}
 	if err := l.uc.OnDocketEntryObserved(ctx, ev); err != nil {
+		if isTerminal(err) {
+			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
+		}
+		return err
+	}
+	return nil
+}
+
+// handleCourtRecordArchived is the asynq.HandlerFunc for acquisition.court_record_archived
+// (Achado 2, fatia 2b). It decodes the LOCAL shape and delegates to OnCourtRecordArchived,
+// mapping the outcome to asynq's retry decision the same way as the other handlers. Like
+// the docket-entry reconcile, a racing flip (ErrDeadlineNotFound from MarkResolvedOnConclusion)
+// is an in-use-case per-prazo no-op that returns nil, so a terminal domain error never
+// surfaces from that path.
+func (l *Listener) handleCourtRecordArchived(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[CourtRecordArchived](t)
+	if err != nil {
+		return err
+	}
+	if err := l.uc.OnCourtRecordArchived(ctx, ev); err != nil {
 		if isTerminal(err) {
 			return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 		}

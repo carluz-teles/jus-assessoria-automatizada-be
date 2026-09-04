@@ -295,16 +295,28 @@ func TestQueueFor(t *testing.T) {
 		{"acquisition.intimation.cancelled", "deadline"},
 		{"deadline.reminder_check", "deadline"},
 		{"deadline.missed_check", "deadline"},
+		// Achado 2 (lifecycle reconciliation, fatia 2b): a court_record's ARCHIVED
+		// transition is fast (DB + outbox, no fetch) and joins the SAME dedicated queue,
+		// ahead of the acquisition→ingestao prefix, for the same starvation reason.
+		{"acquisition.court_record_archived", "deadline"},
 		// due_soon/missed are consumed by the NOTIFICATIONS listener (main server), not the
 		// deadline server — route them to the queue that listener serves.
 		{"deadline.due_soon", "notifications"},
 		{"deadline.missed", "notifications"},
+		// deadline.resolved_on_conclusion (Achado 2, fatia 2c) joins them — its only
+		// consumer is the SAME notifications listener.
+		{"deadline.resolved_on_conclusion", "notifications"},
 		// deadline.opened is high-volume (one per prazo) and gets a no-op handler on the
 		// deadline server, so it routes to "deadline" — NOT "ingestao" (where it would clog
 		// the enrichment). The low-volume rest stays on "ingestao" (archived, no consumer).
 		{"deadline.opened", "deadline"},
 		{"deadline.revoked", "ingestao"},
 		{"deadline.task.created", "ingestao"},
+		// acquisition.court_record_superseded (Achado 2) has no consumer today
+		// (RepointDeadlines already does the deadline slice's actionable work
+		// synchronously, in the same tx) — stays on the acquisition→ingestao default,
+		// same as deadline.revoked above.
+		{"acquisition.court_record_superseded", "ingestao"},
 		// actionitem.created/confirmed (fatia 3) get the SAME dedicated queue as the intimation
 		// events — deadline's listener creates a task fast, must not queue behind enrichment.
 		{"actionitem.created", "deadline"},
@@ -374,7 +386,9 @@ func TestQueuesFor(t *testing.T) {
 		// Regression: every other event stays single-queue (queueFor unchanged).
 		{"ingestao.movimento.observed", []string{"ingestao"}},
 		{"acquisition.intimation.observed", []string{"deadline"}},
+		{"acquisition.court_record_archived", []string{"deadline"}},
 		{"deadline.due_soon", []string{"notifications"}},
+		{"deadline.resolved_on_conclusion", []string{"notifications"}},
 		{"ai.revisao.requested", []string{"ai"}},
 		{"notification.requested", []string{"notifications"}},
 		{"nodot", []string{"default"}},

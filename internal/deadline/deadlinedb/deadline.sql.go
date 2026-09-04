@@ -1280,6 +1280,56 @@ func (q *Queries) InsertTaskSuggestion(ctx context.Context, arg InsertTaskSugges
 	return id, err
 }
 
+const listDeadlinesForConclusion = `-- name: ListDeadlinesForConclusion :many
+
+SELECT id, start_date
+FROM deadline
+WHERE court_record_id = $1
+  AND tenant_id = $2
+  AND status IN ('PENDING', 'OPEN', 'MISSED')
+`
+
+type ListDeadlinesForConclusionParams struct {
+	CourtRecordID uuid.UUID `json:"court_record_id"`
+	TenantID      uuid.UUID `json:"tenant_id"`
+}
+
+type ListDeadlinesForConclusionRow struct {
+	ID        uuid.UUID   `json:"id"`
+	StartDate pgtype.Date `json:"start_date"`
+}
+
+// ── Achado 2 (lifecycle reconciliation, fatia 2b) — OnCourtRecordArchived ───────────────
+// List the prazos of a court_record that OnCourtRecordArchived resolves when the process
+// concludes (Achado 2). Scoped to (court_record_id, tenant_id) (barrier 1, on top of RLS
+// barrier 2). status IN ('PENDING', 'OPEN', 'MISSED') — the WIDER set than
+// ListReconcilableDeadlines above: a still-unconfirmed suggestion (PENDING) is ALSO
+// resolved (decisão de produto: nada resta a cumprir quando o processo em si concluiu, não
+// só o já confirmado/perdido), never a MET (already done), CANCELLED (revoked), NO_DEADLINE
+// (mera ciência) nor an already RESOLVED_ON_CONCLUSION prazo. Reuses ListReconcilableDeadlines'
+// projection shape (id, start_date) though start_date is unused by the resolution path — no
+// rows → an empty slice, never an error. $1 = court_record_id, $2 = tenant_id, both from the
+// trusted event payload.
+func (q *Queries) ListDeadlinesForConclusion(ctx context.Context, arg ListDeadlinesForConclusionParams) ([]ListDeadlinesForConclusionRow, error) {
+	rows, err := q.db.Query(ctx, listDeadlinesForConclusion, arg.CourtRecordID, arg.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDeadlinesForConclusionRow
+	for rows.Next() {
+		var i ListDeadlinesForConclusionRow
+		if err := rows.Scan(&i.ID, &i.StartDate); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReconcilableDeadlines = `-- name: ListReconcilableDeadlines :many
 SELECT id, start_date
 FROM deadline
@@ -1484,6 +1534,33 @@ func (q *Queries) MarkNoDeadline(ctx context.Context, arg MarkNoDeadlineParams) 
 		arg.ConfirmedBy,
 		arg.ConfirmedAt,
 	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const markResolvedOnConclusion = `-- name: MarkResolvedOnConclusion :one
+UPDATE deadline
+SET status = 'RESOLVED_ON_CONCLUSION'
+WHERE id = $1 AND tenant_id = $2 AND status IN ('PENDING', 'OPEN', 'MISSED')
+RETURNING id
+`
+
+type MarkResolvedOnConclusionParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Resolve a prazo PENDING/OPEN/MISSED → RESOLVED_ON_CONCLUSION (Achado 2, migration 0098),
+// keyed by id and scoped to tenant_id (barrier 1). The `status IN (...)` guard makes the
+// flip SAFE and IDEMPOTENT, mirroring MarkMet widened to the three resolvable statuses: a
+// redelivery, or a prazo already MET/CANCELLED/NO_DEADLINE/RESOLVED_ON_CONCLUSION, updates
+// NO row → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper, the use case's per-prazo
+// no-op (never a phantom deadline.resolved_on_conclusion). On a hit it returns the id so the
+// deadline_event audit row + deadline.resolved_on_conclusion commit in the SAME tx. $1 = id,
+// $2 = tenant_id, both from the trusted event payload.
+func (q *Queries) MarkResolvedOnConclusion(ctx context.Context, arg MarkResolvedOnConclusionParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, markResolvedOnConclusion, arg.ID, arg.TenantID)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err

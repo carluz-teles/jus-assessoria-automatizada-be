@@ -27,6 +27,7 @@ type inAppUC interface {
 	OnDocketEntryObserved(ctx context.Context, ev DocketEntryObserved) error
 	OnDeadlineDueSoon(ctx context.Context, ev DeadlineDueSoon) error
 	OnDeadlineMissed(ctx context.Context, ev DeadlineMissed) error
+	OnDeadlineResolvedOnConclusion(ctx context.Context, ev DeadlineResolvedOnConclusion) error
 	OnTrialEndingSoon(ctx context.Context, ev TrialEndingSoon) error
 	OnPaymentFailed(ctx context.Context, ev PaymentFailed) error
 	OnFilingSucceeded(ctx context.Context, ev FilingSucceeded) error
@@ -57,6 +58,7 @@ func (l *Listener) Register(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeDocketEntryObserved, l.handleDocketEntryObserved)
 	mux.HandleFunc(TypeDeadlineDueSoon, l.handleDeadlineDueSoon)
 	mux.HandleFunc(TypeDeadlineMissed, l.handleDeadlineMissed)
+	mux.HandleFunc(TypeDeadlineResolvedOnConclusion, l.handleDeadlineResolvedOnConclusion)
 	mux.HandleFunc(TypeTrialEndingSoon, l.handleTrialEndingSoon)
 	mux.HandleFunc(TypePaymentFailed, l.handlePaymentFailed)
 	mux.HandleFunc(TypeFilingSucceeded, l.handleFilingSucceeded)
@@ -120,6 +122,18 @@ func (l *Listener) handleDeadlineMissed(ctx context.Context, t *asynq.Task) erro
 		return err
 	}
 	return l.inApp.OnDeadlineMissed(ctx, ev)
+}
+
+// handleDeadlineResolvedOnConclusion is the asynq.HandlerFunc for
+// deadline.resolved_on_conclusion (Achado 2, fatia 2c). It decodes the payload and hands
+// off to the in-app use case (→ a low-priority "prazo resolvido" aviso). Same error
+// contract as the other handlers.
+func (l *Listener) handleDeadlineResolvedOnConclusion(ctx context.Context, t *asynq.Task) error {
+	ev, err := events.Decode[DeadlineResolvedOnConclusion](t)
+	if err != nil {
+		return err
+	}
+	return l.inApp.OnDeadlineResolvedOnConclusion(ctx, ev)
 }
 
 // handleTrialEndingSoon is the asynq.HandlerFunc for billing.trial_ending_soon

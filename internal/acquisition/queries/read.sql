@@ -179,6 +179,13 @@ WHERE i.tenant_id = $1
   -- temporal tab. Reuses the former nao_confirmado predicate — a suggested (not yet
   -- human-confirmed) deadline has d.status = 'PENDING'. When off, no extra filter.
   AND (@nao_confirmado::bool = false OR d.status = 'PENDING')
+  -- Achado 2 (fatia 2c): a PENDING-de-triagem intimação de um processo já ARCHIVED sai da
+  -- fila ativa — nada resta a fazer quando o processo concluiu. NÃO afeta RESOLVED/IGNORED
+  -- (já fora da fila por definição) nem o detalhe/histórico do processo (GetIntimacao,
+  -- ListIntimacoesByProcesso — telas separadas, não tocadas). user_status só assume
+  -- PENDING/RESOLVED/IGNORED (migration 0030), então esta cláusula é equivalente a
+  -- "i.user_status <> 'PENDING' OR cr.lifecycle <> 'ARCHIVED'".
+  AND NOT (i.user_status = 'PENDING' AND cr.lifecycle = 'ARCHIVED')
   AND (i.made_available_at, i.id) < (@last_made_available::date, @last_id::uuid)
 ORDER BY i.made_available_at DESC, i.id DESC
 LIMIT $2;
@@ -351,7 +358,9 @@ WHERE i.tenant_id = $1
     OR (@urgencia::text = 'mais_adiante'       AND d.end_date > (date_trunc('month', CURRENT_DATE) + interval '1 month' - interval '1 day')::date AND d.status IN ('PENDING', 'OPEN') AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
     OR (@urgencia::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
   )
-  AND (@nao_confirmado::bool = false OR d.status = 'PENDING');
+  AND (@nao_confirmado::bool = false OR d.status = 'PENDING')
+  -- Achado 2 (fatia 2c): mirrors ListIntimacoes' exclusion so the counter agrees with the page.
+  AND NOT (i.user_status = 'PENDING' AND cr.lifecycle = 'ARCHIVED');
 
 -- ── filter options (the envelope's selectable sets) ──────────────────────────
 -- Distinct-value reads that back the list envelopes' filter chips. Each is
@@ -575,9 +584,16 @@ WHERE tenant_id = $1;
 -- `em_analise` (AI-in-progress) has no source yet — kept at 0 so the FE contract is
 -- stable. `criticas` is retired (replaced by em_atraso/vencem_hoje/nao_confirmado),
 -- kept at 0 for backward-compat. tenant-scoped (barrier 1, RLS barrier 2).
+-- `total`/`resolvidas`/`ignoradas` stay UNSCOPED by lifecycle (they count every
+-- intimação the tenant ever had, not the active queue). `pendentes` is the ACTIVE
+-- queue count, so it gets the Achado 2 exclusion (fatia 2c) — a PENDING intimação of an
+-- already-ARCHIVED processo is not "awaiting decision" anymore. `em_atraso`/
+-- `vencem_hoje`/`nao_confirmado` already self-correct: their d.status IN ('PENDING',
+-- 'OPEN') / = 'PENDING' guard naturally excludes a prazo fatia 2b already flipped to
+-- RESOLVED_ON_CONCLUSION when the process archived.
 SELECT
     count(*)::bigint                                                                                                        AS total,
-    count(*) FILTER (WHERE i.user_status NOT IN ('RESOLVED', 'IGNORED'))::bigint                                           AS pendentes,
+    count(*) FILTER (WHERE i.user_status NOT IN ('RESOLVED', 'IGNORED') AND NOT (i.user_status = 'PENDING' AND cr.lifecycle = 'ARCHIVED'))::bigint AS pendentes,
     0::bigint                                                                                                               AS em_analise,
     count(*) FILTER (WHERE i.user_status = 'RESOLVED')::bigint                                                             AS resolvidas,
     count(*) FILTER (WHERE i.user_status = 'IGNORED')::bigint                                                              AS ignoradas,
@@ -586,6 +602,7 @@ SELECT
     count(*) FILTER (WHERE (d.end_date - CURRENT_DATE) = 0  AND d.status IN ('PENDING', 'OPEN'))::bigint                   AS vencem_hoje,
     count(*) FILTER (WHERE d.status = 'PENDING')::bigint                                                                   AS nao_confirmado
 FROM intimation i
+JOIN court_record cr ON cr.id = i.court_record_id
 LEFT JOIN deadline d ON d.notification_id = i.id AND d.tenant_id = i.tenant_id
 WHERE i.tenant_id = $1;
 
@@ -622,4 +639,6 @@ WHERE i.tenant_id = $1
   )
   AND (@type::text = '' OR i.type = @type::text)
   AND (@user_status::text = '' OR i.user_status = @user_status::text)
-  AND (@court::text = '' OR cr.court = @court::text);
+  AND (@court::text = '' OR cr.court = @court::text)
+  -- Achado 2 (fatia 2c): mirrors ListIntimacoes' exclusion so every bucket agrees with the page.
+  AND NOT (i.user_status = 'PENDING' AND cr.lifecycle = 'ARCHIVED');

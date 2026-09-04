@@ -323,7 +323,7 @@ func (m *mockRepo) GetCourtRecordByKey(_ context.Context, _ database.Tx, _, _, _
 	return nil, false, nil
 }
 
-func (m *mockRepo) UpdateCourtRecordGrade(_ context.Context, _ database.Tx, _ GradeParams) (*CourtRecord, error) {
+func (m *mockRepo) UpdateCourtRecordGrade(_ context.Context, _ database.Tx, _ GradeParams) (*GradedCourtRecord, error) {
 	return nil, nil
 }
 
@@ -331,8 +331,12 @@ func (m *mockRepo) RepointIntimations(_ context.Context, _ database.Tx, _, _, _ 
 	return 0, nil
 }
 
-func (m *mockRepo) SupersedeCourtRecord(_ context.Context, _ database.Tx, _, _ string) error {
-	return nil
+func (m *mockRepo) RepointDeadlines(_ context.Context, _ database.Tx, _, _, _ string) (int, error) {
+	return 0, nil
+}
+
+func (m *mockRepo) SupersedeCourtRecord(_ context.Context, _ database.Tx, _, _ string) (bool, error) {
+	return false, nil
 }
 
 func (m *mockRepo) DueCourtRecordsForResync(_ context.Context, _ database.Tx, _ int) ([]DueRecord, error) {

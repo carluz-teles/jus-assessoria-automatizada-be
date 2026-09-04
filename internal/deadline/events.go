@@ -82,6 +82,26 @@ type DocketEntryObserved struct {
 	CourtRecordID string `json:"court_record_id"`
 }
 
+// TypeCourtRecordArchived is the FOURTH dotted id this slice CONSUMES (Achado 2, fatia
+// 2b): a court_record's REAL transition to ARCHIVED (acquisition's gradeInTx diffing old
+// vs. new lifecycle — never a re-poll that leaves it unchanged). It drives
+// OnCourtRecordArchived, which resolves every PENDING/OPEN/MISSED prazo still pending on
+// the now-concluded process. As with the other consumed types, ONLY the const crosses the
+// boundary from acquisition; the payload SHAPE is redefined LOCALLY as CourtRecordArchived
+// below (this slice never imports acquisition's event struct). A round-trip test
+// (deadline_events_test.go) guards the shape.
+const TypeCourtRecordArchived = acquisition.TypeCourtRecordArchived
+
+// CourtRecordArchived is the LOCAL decode shape of acquisition.court_record_archived: the
+// exact subset OnCourtRecordArchived reads — TenantID (RLS scope + dedup) and
+// CourtRecordID (the record whose PENDING/OPEN/MISSED prazos get resolved). Base yields
+// the event id for dedup.
+type CourtRecordArchived struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	CourtRecordID string `json:"court_record_id"`
+}
+
 // TypeDeadlineOpened is the dotted id this slice PRODUCES when a prazo is derived. Its
 // "deadline" prefix routes it to the ingestao/default work at the relay; downstream
 // slices (read models, reminders) consume it.
@@ -345,6 +365,39 @@ func (DeadlineMet) AggregateType() string { return aggregateTypeDeadline }
 // mirroring newDeadlineMissed.
 func newDeadlineMet(tenantID, deadlineID string) DeadlineMet {
 	return DeadlineMet{
+		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
+		TenantID:   tenantID,
+		DeadlineID: deadlineID,
+	}
+}
+
+// TypeDeadlineResolvedOnConclusion is the dotted id this slice PRODUCES per prazo resolved
+// by OnCourtRecordArchived (Achado 2, fatia 2b: a court_record concluded, so every
+// PENDING/OPEN/MISSED prazo on it is resolved in batch). Same "deadline" prefix/routing
+// family as deadline.met/missed; its consumer (notifications, fatia 2c) materializes a
+// low-priority "resolve trabalho, não cria" aviso.
+const TypeDeadlineResolvedOnConclusion = "deadline.resolved_on_conclusion"
+
+// DeadlineResolvedOnConclusion announces one prazo auto-resolved because its process
+// concluded. It mirrors DeadlineMet/DeadlineMissed: TenantID scopes the consumer's
+// RLS-guarded read/send, DeadlineID is the prazo. Immediate (no process_at). The
+// aggregate is the deadline, so its stream orders by the deadline id.
+type DeadlineResolvedOnConclusion struct {
+	events.Base
+	TenantID   string `json:"tenant_id"`
+	DeadlineID string `json:"deadline_id"`
+}
+
+var _ events.Event = DeadlineResolvedOnConclusion{}
+
+func (DeadlineResolvedOnConclusion) Type() string          { return TypeDeadlineResolvedOnConclusion }
+func (DeadlineResolvedOnConclusion) AggregateType() string { return aggregateTypeDeadline }
+
+// newDeadlineResolvedOnConclusion builds the immediate RESOLVED_ON_CONCLUSION fact. Fresh
+// uuid v7 event id (the consumer dedup key); aggregate_id is the deadline id, mirroring
+// newDeadlineMet.
+func newDeadlineResolvedOnConclusion(tenantID, deadlineID string) DeadlineResolvedOnConclusion {
+	return DeadlineResolvedOnConclusion{
 		Base:       events.Base{EventID: uuid.Must(uuid.NewV7()).String(), Aggregate: deadlineID},
 		TenantID:   tenantID,
 		DeadlineID: deadlineID,

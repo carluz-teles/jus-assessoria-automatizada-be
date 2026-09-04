@@ -668,6 +668,17 @@ type Querier interface {
 	// ZERO per-OAB DJEN calls. The forward daily match (MatchPublicationsByDay) covers
 	// everything from tomorrow on.
 	MatchPublicationsForTenantSince(ctx context.Context, arg MatchPublicationsForTenantSinceParams) ([]MatchPublicationsForTenantSinceRow, error)
+	// Merge-path only (Achado 2, fatia 2a): move the placeholder's deadlines onto a
+	// PRE-EXISTING graded record, the SAME merge RepointIntimations handles for
+	// intimations — a deadline hangs off court_record_id too (deadline.court_record_id,
+	// migration 0001), so a merge that repoints intimations but not deadlines leaves the
+	// deadline orphaned on the retiring placeholder (the production leak Achado 2 found:
+	// 61 MISSED deadlines on SUPERSEDED records, never re-pointed). Called in the SAME tx as
+	// RepointIntimations, BEFORE SupersedeCourtRecord. deadline has no (tenant, case, hash)
+	// dedup key to worry about (unlike intimation) — the swap only changes which
+	// court_record the row's countdown is anchored on; status/dates are untouched. Returns
+	// the number of rows moved.
+	RepointDeadlines(ctx context.Context, arg RepointDeadlinesParams) (int64, error)
 	// Merge-path only: move the placeholder's intimations onto a PRE-EXISTING graded
 	// record when grading in place would violate the (tenant, cnj, degree) UNIQUE.
 	// Unicidade de intimation é (tenant, case_id, hash), so swapping court_record_id never
@@ -742,6 +753,13 @@ type Querier interface {
 	// `em_analise` (AI-in-progress) has no source yet — kept at 0 so the FE contract is
 	// stable. `criticas` is retired (replaced by em_atraso/vencem_hoje/nao_confirmado),
 	// kept at 0 for backward-compat. tenant-scoped (barrier 1, RLS barrier 2).
+	// `total`/`resolvidas`/`ignoradas` stay UNSCOPED by lifecycle (they count every
+	// intimação the tenant ever had, not the active queue). `pendentes` is the ACTIVE
+	// queue count, so it gets the Achado 2 exclusion (fatia 2c) — a PENDING intimação of an
+	// already-ARCHIVED processo is not "awaiting decision" anymore. `em_atraso`/
+	// `vencem_hoje`/`nao_confirmado` already self-correct: their d.status IN ('PENDING',
+	// 'OPEN') / = 'PENDING' guard naturally excludes a prazo fatia 2b already flipped to
+	// RESOLVED_ON_CONCLUSION when the process archived.
 	SummarizeIntimacoes(ctx context.Context, tenantID uuid.UUID) (SummarizeIntimacoesRow, error)
 	// The KPI counts for the processes list header (GET /v1/processos/summary), one
 	// aggregate scan over the tenant's court_records grouped into the FE's buckets by
@@ -753,10 +771,15 @@ type Querier interface {
 	// models it — kept in the projection so the FE contract is stable. tenant-scoped
 	// (barrier 1, RLS barrier 2).
 	SummarizeProcessos(ctx context.Context, tenantID uuid.UUID) (SummarizeProcessosRow, error)
-	// Merge-path only: retire the UNKNOWN placeholder after its intimations moved onto the
-	// pre-existing graded record. It no longer represents a live process (the graded record
-	// does), so it drops out of the ACTIVE count and the scheduler (next_sync_at NULL).
-	SupersedeCourtRecord(ctx context.Context, arg SupersedeCourtRecordParams) error
+	// Merge-path only: retire the UNKNOWN placeholder after its intimations/deadlines moved
+	// onto the pre-existing graded record. It no longer represents a live process (the
+	// graded record does), so it drops out of the ACTIVE count and the scheduler
+	// (next_sync_at NULL). The `lifecycle <> 'SUPERSEDED'` guard (Achado 2) makes the flip
+	// SAFE and IDEMPOTENT, mirroring MarkMet/MarkMissed's guarded-UPDATE shape in the
+	// deadline slice: a redelivery (the placeholder already SUPERSEDED) touches no row, so
+	// the caller reads "0 rows" as "no real transition, skip the court_record_superseded
+	// event" instead of emitting a phantom duplicate on every replay.
+	SupersedeCourtRecord(ctx context.Context, arg SupersedeCourtRecordParams) (int64, error)
 	// enrichment cycle queries (acquisition slice).
 	// DATAJUD enrichment reacts to court_record_observed for a DJEN placeholder
 	// (degree=UNKNOWN): it fetches the process by number, reveals the grau, and GRADES
@@ -767,9 +790,16 @@ type Querier interface {
 	// duplicate (FIX B). The (tenant, cnj, degree) UNIQUE means the ONE case that cannot
 	// graduate in place is a rare pre-existing graded record at that grade: the use case
 	// detects it first (GetCourtRecordByKey, sync.sql) and MERGES the placeholder into it
-	// instead — RepointIntimations moves the placeholder's intimations onto the graded
-	// record and SupersedeCourtRecord retires the placeholder (DJEN discovery produces no
-	// docket entries, so the placeholder never has any to re-point).
+	// instead — RepointIntimations AND RepointDeadlines move the placeholder's intimations
+	// and deadlines onto the graded record and SupersedeCourtRecord retires the placeholder
+	// (DJEN discovery produces no docket entries, so the placeholder never has any to
+	// re-point). Achado 2 (lifecycle reconciliation): UpdateCourtRecordGrade also returns
+	// the PRE-update lifecycle (old_lifecycle) alongside the post-update one, so the use
+	// case can detect a REAL ARCHIVED transition (old≠ARCHIVED, new=ARCHIVED) and publish
+	// acquisition.court_record_archived exactly once — never on a re-poll that leaves the
+	// lifecycle unchanged. SupersedeCourtRecord mirrors this: its guard (lifecycle <>
+	// 'SUPERSEDED') makes the SUPERSEDED transition detectable the same way (0 rows
+	// affected = already superseded = no event).
 	// Grade a court_record IN PLACE: mutate the row named by @court_record_id — the DJEN
 	// UNKNOWN placeholder — to the DATAJUD-revealed degree and the fields DATAJUD is
 	// authoritative for, keeping the SAME id. Because the id is stable, every child
@@ -787,6 +817,9 @@ type Querier interface {
 	// structural merge operation and must survive a scheduler re-poll. When @lifecycle is
 	// empty (source does not carry movimentos) the existing lifecycle is preserved via the
 	// NULLIF/COALESCE: NULLIF('', lifecycle) = NULL → COALESCE falls back to lifecycle.
+	// old_lifecycle (Achado 2) is captured by the `before` CTE — a plain (non-modifying) SELECT
+	// that reads the row's PRE-update snapshot, so the caller can diff it against the
+	// post-update `lifecycle` column to detect a REAL transition (never on a no-op re-poll).
 	UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRecordGradeParams) (UpdateCourtRecordGradeRow, error)
 	// Campos do processo preenchidos À MÃO no cockpit: a fase (phase_override — vence a
 	// derivada no read model) e o valor da causa (claim_value, sem fonte automática). PATCH

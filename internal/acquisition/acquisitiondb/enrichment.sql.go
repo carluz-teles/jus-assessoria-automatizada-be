@@ -59,6 +59,36 @@ func (q *Queries) MarkEnrichmentAttempted(ctx context.Context, arg MarkEnrichmen
 	return err
 }
 
+const repointDeadlines = `-- name: RepointDeadlines :execrows
+UPDATE deadline
+SET court_record_id = $1
+WHERE tenant_id = $2 AND court_record_id = $3
+`
+
+type RepointDeadlinesParams struct {
+	ToCourtRecordID   uuid.UUID `json:"to_court_record_id"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	FromCourtRecordID uuid.UUID `json:"from_court_record_id"`
+}
+
+// Merge-path only (Achado 2, fatia 2a): move the placeholder's deadlines onto a
+// PRE-EXISTING graded record, the SAME merge RepointIntimations handles for
+// intimations — a deadline hangs off court_record_id too (deadline.court_record_id,
+// migration 0001), so a merge that repoints intimations but not deadlines leaves the
+// deadline orphaned on the retiring placeholder (the production leak Achado 2 found:
+// 61 MISSED deadlines on SUPERSEDED records, never re-pointed). Called in the SAME tx as
+// RepointIntimations, BEFORE SupersedeCourtRecord. deadline has no (tenant, case, hash)
+// dedup key to worry about (unlike intimation) — the swap only changes which
+// court_record the row's countdown is anchored on; status/dates are untouched. Returns
+// the number of rows moved.
+func (q *Queries) RepointDeadlines(ctx context.Context, arg RepointDeadlinesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, repointDeadlines, arg.ToCourtRecordID, arg.TenantID, arg.FromCourtRecordID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const repointIntimations = `-- name: RepointIntimations :execrows
 UPDATE intimation
 SET court_record_id = $1
@@ -142,10 +172,10 @@ func (q *Queries) SelectDueForEnrichment(ctx context.Context, arg SelectDueForEn
 	return items, nil
 }
 
-const supersedeCourtRecord = `-- name: SupersedeCourtRecord :exec
+const supersedeCourtRecord = `-- name: SupersedeCourtRecord :execrows
 UPDATE court_record
 SET lifecycle = 'SUPERSEDED', next_sync_at = NULL
-WHERE tenant_id = $1 AND id = $2
+WHERE tenant_id = $1 AND id = $2 AND lifecycle <> 'SUPERSEDED'
 `
 
 type SupersedeCourtRecordParams struct {
@@ -153,16 +183,27 @@ type SupersedeCourtRecordParams struct {
 	ID       uuid.UUID `json:"id"`
 }
 
-// Merge-path only: retire the UNKNOWN placeholder after its intimations moved onto the
-// pre-existing graded record. It no longer represents a live process (the graded record
-// does), so it drops out of the ACTIVE count and the scheduler (next_sync_at NULL).
-func (q *Queries) SupersedeCourtRecord(ctx context.Context, arg SupersedeCourtRecordParams) error {
-	_, err := q.db.Exec(ctx, supersedeCourtRecord, arg.TenantID, arg.ID)
-	return err
+// Merge-path only: retire the UNKNOWN placeholder after its intimations/deadlines moved
+// onto the pre-existing graded record. It no longer represents a live process (the
+// graded record does), so it drops out of the ACTIVE count and the scheduler
+// (next_sync_at NULL). The `lifecycle <> 'SUPERSEDED'` guard (Achado 2) makes the flip
+// SAFE and IDEMPOTENT, mirroring MarkMet/MarkMissed's guarded-UPDATE shape in the
+// deadline slice: a redelivery (the placeholder already SUPERSEDED) touches no row, so
+// the caller reads "0 rows" as "no real transition, skip the court_record_superseded
+// event" instead of emitting a phantom duplicate on every replay.
+func (q *Queries) SupersedeCourtRecord(ctx context.Context, arg SupersedeCourtRecordParams) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeCourtRecord, arg.TenantID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateCourtRecordGrade = `-- name: UpdateCourtRecordGrade :one
 
+WITH before AS (
+    SELECT lifecycle FROM court_record WHERE id = $12 AND tenant_id = $13
+)
 UPDATE court_record SET
     degree = $1,
     court = $2,
@@ -180,8 +221,8 @@ UPDATE court_record SET
     -- phase: refresh the DERIVED value; keep the existing one when the grade carries none
     -- (empty). phase_override (the manual correction) is a separate column, never touched here.
     phase = COALESCE(NULLIF($11, ''), phase)
-WHERE id = $12 AND tenant_id = $13
-RETURNING id, case_id
+WHERE court_record.id = $12 AND court_record.tenant_id = $13
+RETURNING id, case_id, lifecycle, (SELECT lifecycle FROM before) AS old_lifecycle
 `
 
 type UpdateCourtRecordGradeParams struct {
@@ -201,8 +242,10 @@ type UpdateCourtRecordGradeParams struct {
 }
 
 type UpdateCourtRecordGradeRow struct {
-	ID     uuid.UUID `json:"id"`
-	CaseID uuid.UUID `json:"case_id"`
+	ID           uuid.UUID `json:"id"`
+	CaseID       uuid.UUID `json:"case_id"`
+	Lifecycle    string    `json:"lifecycle"`
+	OldLifecycle string    `json:"old_lifecycle"`
 }
 
 // enrichment cycle queries (acquisition slice).
@@ -215,9 +258,16 @@ type UpdateCourtRecordGradeRow struct {
 // duplicate (FIX B). The (tenant, cnj, degree) UNIQUE means the ONE case that cannot
 // graduate in place is a rare pre-existing graded record at that grade: the use case
 // detects it first (GetCourtRecordByKey, sync.sql) and MERGES the placeholder into it
-// instead — RepointIntimations moves the placeholder's intimations onto the graded
-// record and SupersedeCourtRecord retires the placeholder (DJEN discovery produces no
-// docket entries, so the placeholder never has any to re-point).
+// instead — RepointIntimations AND RepointDeadlines move the placeholder's intimations
+// and deadlines onto the graded record and SupersedeCourtRecord retires the placeholder
+// (DJEN discovery produces no docket entries, so the placeholder never has any to
+// re-point). Achado 2 (lifecycle reconciliation): UpdateCourtRecordGrade also returns
+// the PRE-update lifecycle (old_lifecycle) alongside the post-update one, so the use
+// case can detect a REAL ARCHIVED transition (old≠ARCHIVED, new=ARCHIVED) and publish
+// acquisition.court_record_archived exactly once — never on a re-poll that leaves the
+// lifecycle unchanged. SupersedeCourtRecord mirrors this: its guard (lifecycle <>
+// 'SUPERSEDED') makes the SUPERSEDED transition detectable the same way (0 rows
+// affected = already superseded = no event).
 // Grade a court_record IN PLACE: mutate the row named by @court_record_id — the DJEN
 // UNKNOWN placeholder — to the DATAJUD-revealed degree and the fields DATAJUD is
 // authoritative for, keeping the SAME id. Because the id is stable, every child
@@ -235,6 +285,9 @@ type UpdateCourtRecordGradeRow struct {
 // structural merge operation and must survive a scheduler re-poll. When @lifecycle is
 // empty (source does not carry movimentos) the existing lifecycle is preserved via the
 // NULLIF/COALESCE: NULLIF(”, lifecycle) = NULL → COALESCE falls back to lifecycle.
+// old_lifecycle (Achado 2) is captured by the `before` CTE — a plain (non-modifying) SELECT
+// that reads the row's PRE-update snapshot, so the caller can diff it against the
+// post-update `lifecycle` column to detect a REAL transition (never on a no-op re-poll).
 func (q *Queries) UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRecordGradeParams) (UpdateCourtRecordGradeRow, error) {
 	row := q.db.QueryRow(ctx, updateCourtRecordGrade,
 		arg.Degree,
@@ -252,6 +305,11 @@ func (q *Queries) UpdateCourtRecordGrade(ctx context.Context, arg UpdateCourtRec
 		arg.TenantID,
 	)
 	var i UpdateCourtRecordGradeRow
-	err := row.Scan(&i.ID, &i.CaseID)
+	err := row.Scan(
+		&i.ID,
+		&i.CaseID,
+		&i.Lifecycle,
+		&i.OldLifecycle,
+	)
 	return i, err
 }

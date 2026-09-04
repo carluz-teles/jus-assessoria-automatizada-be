@@ -33,6 +33,9 @@ type spyInAppUC struct {
 	docket         DocketEntryObserved
 	dueSoon        DeadlineDueSoon
 	missed         DeadlineMissed
+	resolved       DeadlineResolvedOnConclusion
+	resolvedN      int
+	resolvedErr    error
 	trialEndSoon   TrialEndingSoon
 	paymentFail    PaymentFailed
 	backfillN      int
@@ -77,6 +80,12 @@ func (s *spyInAppUC) OnDeadlineMissed(_ context.Context, ev DeadlineMissed) erro
 	s.missedN++
 	s.missed = ev
 	return s.missedErr
+}
+
+func (s *spyInAppUC) OnDeadlineResolvedOnConclusion(_ context.Context, ev DeadlineResolvedOnConclusion) error {
+	s.resolvedN++
+	s.resolved = ev
+	return s.resolvedErr
 }
 
 func (s *spyInAppUC) OnTrialEndingSoon(_ context.Context, ev TrialEndingSoon) error {

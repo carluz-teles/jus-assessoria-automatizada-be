@@ -72,6 +72,9 @@ UPDATE intimation
           OR ($8::text = 'sem_data_definida'  AND d.id IS NULL AND i.user_status NOT IN ('RESOLVED', 'IGNORED'))
         )
         AND ($9::bool = false OR d.status = 'PENDING')
+        -- Achado 2 (fatia 2c): mirrors ListIntimacoes' exclusion — "todos os filtrados"
+        -- must be exactly the rows the list shows, never MORE.
+        AND NOT (i.user_status = 'PENDING' AND cr.lifecycle = 'ARCHIVED')
     )
 `
 

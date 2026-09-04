@@ -313,6 +313,12 @@ const (
 	deadlineMissedTitle      = "Prazo vencido"
 	deadlineMissedBody       = "Um prazo venceu sem confirmação."
 
+	// deadlineResolvedOnConclusion aviso (Achado 2, fatia 2c): fully fixed, low-priority
+	// (severidade='info' — the record() write leaves the column unset, so migration 0097's
+	// DB default applies).
+	deadlineResolvedOnConclusionTitle = "Prazo resolvido"
+	deadlineResolvedOnConclusionBody  = "Um prazo foi resolvido automaticamente porque o processo foi concluído."
+
 	// Trial aviso (fatia 2). The body varies by days_left the same way
 	// deadlineDueSoonBody does (0 → "hoje").
 	trialEndingSoonTitle     = "Período de teste terminando"
@@ -518,6 +524,39 @@ func (uc *InAppUseCase) OnDeadlineMissed(ctx context.Context, ev DeadlineMissed)
 		return err
 	}
 	uc.publish(ctx, ev.TenantID, TypeDeadlineMissed, created)
+	return nil
+}
+
+// OnDeadlineResolvedOnConclusion handles one deadline.resolved_on_conclusion (Achado 2,
+// fatia 2c): a prazo auto-resolved because its court_record concluded. Same
+// dedup-then-record shape as OnDeadlineMissed, with a fixed "Prazo resolvido" aviso.
+// severidade is deliberately left unset (record()'s INSERT omits the column) — migration
+// 0097's DB default 'info' applies, matching the decisão travada (baixa prioridade: resolve
+// trabalho, não cria).
+func (uc *InAppUseCase) OnDeadlineResolvedOnConclusion(ctx context.Context, ev DeadlineResolvedOnConclusion) error {
+	var created *Notification
+	err := uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerDeadlineResolvedOnConclusion, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		notif, err := uc.record(ctx, tx, ev.TenantID, TypeDeadlineResolvedOnConclusionAviso, deadlineResolvedOnConclusionTitle, deadlineResolvedOnConclusionBody, map[string]any{
+			"deadline_id": ev.DeadlineID,
+		})
+		if err != nil {
+			return err
+		}
+		created = notif
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	uc.publish(ctx, ev.TenantID, TypeDeadlineResolvedOnConclusion, created)
 	return nil
 }
 

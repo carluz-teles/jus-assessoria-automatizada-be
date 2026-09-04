@@ -528,6 +528,39 @@ SET status = 'MET'
 WHERE id = $1 AND tenant_id = $2 AND status IN ('MISSED', 'OPEN')
 RETURNING id;
 
+-- ── Achado 2 (lifecycle reconciliation, fatia 2b) — OnCourtRecordArchived ───────────────
+
+-- name: ListDeadlinesForConclusion :many
+-- List the prazos of a court_record that OnCourtRecordArchived resolves when the process
+-- concludes (Achado 2). Scoped to (court_record_id, tenant_id) (barrier 1, on top of RLS
+-- barrier 2). status IN ('PENDING', 'OPEN', 'MISSED') — the WIDER set than
+-- ListReconcilableDeadlines above: a still-unconfirmed suggestion (PENDING) is ALSO
+-- resolved (decisão de produto: nada resta a cumprir quando o processo em si concluiu, não
+-- só o já confirmado/perdido), never a MET (already done), CANCELLED (revoked), NO_DEADLINE
+-- (mera ciência) nor an already RESOLVED_ON_CONCLUSION prazo. Reuses ListReconcilableDeadlines'
+-- projection shape (id, start_date) though start_date is unused by the resolution path — no
+-- rows → an empty slice, never an error. $1 = court_record_id, $2 = tenant_id, both from the
+-- trusted event payload.
+SELECT id, start_date
+FROM deadline
+WHERE court_record_id = $1
+  AND tenant_id = $2
+  AND status IN ('PENDING', 'OPEN', 'MISSED');
+
+-- name: MarkResolvedOnConclusion :one
+-- Resolve a prazo PENDING/OPEN/MISSED → RESOLVED_ON_CONCLUSION (Achado 2, migration 0098),
+-- keyed by id and scoped to tenant_id (barrier 1). The `status IN (...)` guard makes the
+-- flip SAFE and IDEMPOTENT, mirroring MarkMet widened to the three resolvable statuses: a
+-- redelivery, or a prazo already MET/CANCELLED/NO_DEADLINE/RESOLVED_ON_CONCLUSION, updates
+-- NO row → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper, the use case's per-prazo
+-- no-op (never a phantom deadline.resolved_on_conclusion). On a hit it returns the id so the
+-- deadline_event audit row + deadline.resolved_on_conclusion commit in the SAME tx. $1 = id,
+-- $2 = tenant_id, both from the trusted event payload.
+UPDATE deadline
+SET status = 'RESOLVED_ON_CONCLUSION'
+WHERE id = $1 AND tenant_id = $2 AND status IN ('PENDING', 'OPEN', 'MISSED')
+RETURNING id;
+
 -- name: MarkNoDeadline :one
 -- Declare "mera ciência" on a prazo (§3 "Máquina de estados": PENDING|OPEN → NO_DEADLINE via
 -- "Remover prazo" / "Não há prazo"), keyed by id and scoped to tenant_id (barrier 1). Stamps

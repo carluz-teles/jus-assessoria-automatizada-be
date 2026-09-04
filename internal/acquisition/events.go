@@ -43,6 +43,19 @@ const (
 	TypeDocketEntryObserved = "acquisition.docket_entry_observed"
 )
 
+// Type ids of the two Achado 2 structural facts gradeInTx emits when a court_record's
+// lifecycle makes a REAL transition (enrichment.go): ARCHIVED (the process concluded —
+// a terminal baixa/extinção code derived from DATAJUD movimentos) or SUPERSEDED (the
+// merge path retiring a DJEN UNKNOWN placeholder). The deadline slice consumes
+// court_record_archived to resolve every prazo still pending on the concluded process
+// (OnCourtRecordArchived); court_record_superseded has no consumer today (RepointDeadlines
+// already does the deadline slice's actionable work for that path, synchronously, in the
+// SAME tx) but is announced for the same reason every other structural fact is.
+const (
+	TypeCourtRecordArchived   = "acquisition.court_record_archived"
+	TypeCourtRecordSuperseded = "acquisition.court_record_superseded"
+)
+
 // Type ids of the intimation events the sync cycle produces in the SAME tx as the
 // intimation upsert: observed for a newly landed intimação, cancelled when the DJEN
 // retracts one (ACTIVE → CANCELLED). The deadline slice consumes them to open/revoke
@@ -177,6 +190,57 @@ var _ events.Event = CourtRecordObserved{}
 
 func (CourtRecordObserved) Type() string          { return TypeCourtRecordObserved }
 func (CourtRecordObserved) AggregateType() string { return aggregateTypeCourtRecord }
+
+// CourtRecordArchived announces a REAL ARCHIVED transition (old lifecycle was not
+// ARCHIVED, the new one is — gradeInTx's diff of UpdateCourtRecordGrade's old/new
+// lifecycle). It carries only what OnCourtRecordArchived needs to load the record's
+// pending prazos: the tenant (RLS scope) and the court_record id. Aggregate id is the
+// court_record id, mirroring CourtRecordObserved.
+type CourtRecordArchived struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	CourtRecordID string `json:"court_record_id"`
+}
+
+var _ events.Event = CourtRecordArchived{}
+
+func (CourtRecordArchived) Type() string          { return TypeCourtRecordArchived }
+func (CourtRecordArchived) AggregateType() string { return aggregateTypeCourtRecord }
+
+// newCourtRecordArchived builds the event from the graded record's tenant/id. Fresh
+// uuid v7 event id (the consumer dedup key); aggregate_id is the court_record id.
+func newCourtRecordArchived(tenantID, courtRecordID string) CourtRecordArchived {
+	return CourtRecordArchived{
+		Base:          events.Base{EventID: newEventID(), Aggregate: courtRecordID},
+		TenantID:      tenantID,
+		CourtRecordID: courtRecordID,
+	}
+}
+
+// CourtRecordSuperseded announces a REAL SUPERSEDED transition — the merge path retiring
+// a DJEN UNKNOWN placeholder (SupersedeCourtRecord's guarded UPDATE touched a row, not a
+// replay). Aggregate id is the SUPERSEDED (retiring) court_record id, not the surviving
+// graded record it merged into.
+type CourtRecordSuperseded struct {
+	events.Base
+	TenantID      string `json:"tenant_id"`
+	CourtRecordID string `json:"court_record_id"`
+}
+
+var _ events.Event = CourtRecordSuperseded{}
+
+func (CourtRecordSuperseded) Type() string          { return TypeCourtRecordSuperseded }
+func (CourtRecordSuperseded) AggregateType() string { return aggregateTypeCourtRecord }
+
+// newCourtRecordSuperseded builds the event from the retiring placeholder's tenant/id.
+// Fresh uuid v7 event id (the consumer dedup key); aggregate_id is the court_record id.
+func newCourtRecordSuperseded(tenantID, courtRecordID string) CourtRecordSuperseded {
+	return CourtRecordSuperseded{
+		Base:          events.Base{EventID: newEventID(), Aggregate: courtRecordID},
+		TenantID:      tenantID,
+		CourtRecordID: courtRecordID,
+	}
+}
 
 // DocketEntryObserved announces one NEWLY inserted andamento (deduped entries do
 // not emit it, so a re-sync of the same window is silent). It carries the entry

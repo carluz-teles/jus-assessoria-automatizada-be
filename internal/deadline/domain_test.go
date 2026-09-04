@@ -59,6 +59,18 @@ type mockRepo struct {
 	markMetIDs         []string
 	markMetTenantIDs   []string
 
+	// Achado 2 (fatia 2b) — OnCourtRecordArchived's conclusion-resolve path
+	conclusionResolvable      []ReconcilableDeadline
+	conclusionResolvableErr   error
+	gotConclusionRecord       string
+	gotConclusionTenant       string
+	conclusionResolvableCalls int
+	resolvedID                string           // returned id when no per-id override; defaults to the input id
+	resolvedErr               error            // blanket MarkResolvedOnConclusion error
+	resolvedErrByID           map[string]error // per-deadline-id error (e.g. racing flip → ErrDeadlineNotFound)
+	resolvedIDs               []string
+	resolvedTenantIDs         []string
+
 	// confirm path
 	confirmAnchor    *DeadlineForConfirm
 	confirmAnchorErr error
@@ -165,6 +177,10 @@ type mockRepo struct {
 	gotCalcMemory      *CalcMemory
 	gotCrossValidation *CrossValidation
 	gotDeadlineEvent   *DeadlineEvent
+	// deadlineEvents accumulates EVERY InsertDeadlineEvent call (gotDeadlineEvent only keeps
+	// the last), so a test iterating multiple prazos (e.g. OnCourtRecordArchived's batch) can
+	// assert one audit row per resolved prazo.
+	deadlineEvents     []*DeadlineEvent
 	gotAppliedHolidays []*AppliedHoliday
 	policy             DeadlinePolicy
 
@@ -383,6 +399,34 @@ func (m *mockRepo) MarkMet(_ context.Context, _ database.Tx, deadlineID, tenantI
 	}
 	if m.markMetID != "" {
 		return m.markMetID, nil
+	}
+	return deadlineID, nil
+}
+
+// ListDeadlinesForConclusion returns the configured PENDING/OPEN/MISSED prazos and records
+// the (record, tenant) scoping, mirroring ListReconcilableDeadlines.
+func (m *mockRepo) ListDeadlinesForConclusion(_ context.Context, _ database.Tx, courtRecordID, tenantID string) ([]ReconcilableDeadline, error) {
+	m.conclusionResolvableCalls++
+	m.gotConclusionRecord = courtRecordID
+	m.gotConclusionTenant = tenantID
+	return m.conclusionResolvable, m.conclusionResolvableErr
+}
+
+// MarkResolvedOnConclusion echoes the resolved id (or a per-id/blanket error) and records
+// every (id, tenant) it flipped, mirroring MarkMet.
+func (m *mockRepo) MarkResolvedOnConclusion(_ context.Context, _ database.Tx, deadlineID, tenantID string) (string, error) {
+	m.resolvedIDs = append(m.resolvedIDs, deadlineID)
+	m.resolvedTenantIDs = append(m.resolvedTenantIDs, tenantID)
+	if m.resolvedErrByID != nil {
+		if err, ok := m.resolvedErrByID[deadlineID]; ok {
+			return "", err
+		}
+	}
+	if m.resolvedErr != nil {
+		return "", m.resolvedErr
+	}
+	if m.resolvedID != "" {
+		return m.resolvedID, nil
 	}
 	return deadlineID, nil
 }
@@ -677,9 +721,11 @@ func (m *mockRepo) InsertCrossValidation(_ context.Context, _ database.Tx, cv *C
 	return cv, nil
 }
 
-// InsertDeadlineEvent is a V1 stub — captures the event for assertion.
+// InsertDeadlineEvent is a V1 stub — captures the event for assertion (both the last-call
+// pointer older tests read, and the full accumulated slice for a multi-event test).
 func (m *mockRepo) InsertDeadlineEvent(_ context.Context, _ database.Tx, e *DeadlineEvent) error {
 	m.gotDeadlineEvent = e
+	m.deadlineEvents = append(m.deadlineEvents, e)
 	return nil
 }
 
@@ -1841,6 +1887,206 @@ func TestOnDocketEntryObserved_InfraErrorPropagates(t *testing.T) {
 			uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
 
 			err := uc.OnDocketEntryObserved(context.Background(), ev)
+			if err == nil {
+				t.Fatal("expected an error to propagate")
+			}
+			ae, ok := apperr.From(err)
+			if !ok || ae.Kind != apperr.KindInfra {
+				t.Errorf("error kind = %v, want KindInfra", err)
+			}
+			if len(outbox.published) != 0 {
+				t.Errorf("published events = %d, want 0 on error", len(outbox.published))
+			}
+		})
+	}
+}
+
+// courtRecordArchivedFixture builds a well-formed acquisition.court_record_archived for the
+// conclusion-resolve path; tests override the fields they exercise.
+func courtRecordArchivedFixture() CourtRecordArchived {
+	return CourtRecordArchived{
+		Base:          events.Base{EventID: uuid.NewString(), Aggregate: uuid.NewString()},
+		TenantID:      uuid.NewString(),
+		CourtRecordID: uuid.NewString(),
+	}
+}
+
+// TestOnCourtRecordArchived_ResolvesPendingOpenAndMissed proves the core batch: PENDING,
+// OPEN and MISSED prazos of the archived court_record are all resolved to
+// RESOLVED_ON_CONCLUSION, each with one deadline_event ("resolvido_por_conclusao") and one
+// deadline.resolved_on_conclusion. The list + resolve ran scoped to the event's
+// record/tenant (barrier 1).
+func TestOnCourtRecordArchived_ResolvesPendingOpenAndMissed(t *testing.T) {
+	ev := courtRecordArchivedFixture()
+	pendingID, openID, missedID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+
+	repo := &mockRepo{
+		conclusionResolvable: []ReconcilableDeadline{
+			{ID: pendingID},
+			{ID: openID},
+			{ID: missedID},
+		},
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnCourtRecordArchived(context.Background(), ev); err != nil {
+		t.Fatalf("OnCourtRecordArchived() error = %v", err)
+	}
+
+	if repo.gotConclusionRecord != ev.CourtRecordID || repo.gotConclusionTenant != ev.TenantID {
+		t.Errorf("list scope record/tenant = %q/%q, want %q/%q",
+			repo.gotConclusionRecord, repo.gotConclusionTenant, ev.CourtRecordID, ev.TenantID)
+	}
+
+	wantIDs := []string{pendingID, openID, missedID}
+	if len(repo.resolvedIDs) != len(wantIDs) {
+		t.Fatalf("MarkResolvedOnConclusion ids = %v, want %v", repo.resolvedIDs, wantIDs)
+	}
+	for i, id := range wantIDs {
+		if repo.resolvedIDs[i] != id || repo.resolvedTenantIDs[i] != ev.TenantID {
+			t.Errorf("resolve[%d] = (%q,%q), want (%q,%q)", i, repo.resolvedIDs[i], repo.resolvedTenantIDs[i], id, ev.TenantID)
+		}
+	}
+
+	if len(repo.deadlineEvents) != 3 {
+		t.Fatalf("deadline_event rows = %d, want 3 (one per resolved prazo)", len(repo.deadlineEvents))
+	}
+	for i, de := range repo.deadlineEvents {
+		if de.Tipo != "resolvido_por_conclusao" {
+			t.Errorf("deadline_event[%d].tipo = %q, want %q", i, de.Tipo, "resolvido_por_conclusao")
+		}
+		if de.DeadlineID != wantIDs[i] || de.TenantID != ev.TenantID {
+			t.Errorf("deadline_event[%d] = (%q,%q), want (%q,%q)", i, de.DeadlineID, de.TenantID, wantIDs[i], ev.TenantID)
+		}
+	}
+
+	resolved := publishedOfType[DeadlineResolvedOnConclusion](outbox)
+	if len(resolved) != 3 {
+		t.Fatalf("deadline.resolved_on_conclusion events = %d, want 3", len(resolved))
+	}
+	for i, re := range resolved {
+		if re.Type() != TypeDeadlineResolvedOnConclusion || re.AggregateType() != aggregateTypeDeadline {
+			t.Errorf("event type/aggregate = %q/%q", re.Type(), re.AggregateType())
+		}
+		if re.DeadlineID != wantIDs[i] || re.TenantID != ev.TenantID {
+			t.Errorf("resolved[%d] deadline/tenant = %q/%q, want %q/%q", i, re.DeadlineID, re.TenantID, wantIDs[i], ev.TenantID)
+		}
+		if _, err := uuid.Parse(re.AggregateID()); err != nil {
+			t.Errorf("aggregate id is not a uuid: %v", err)
+		}
+	}
+}
+
+// TestOnCourtRecordArchived_NoResolvableNoOp proves a court_record with NOTHING resolvable
+// (all MET/CANCELLED/NO_DEADLINE/RESOLVED_ON_CONCLUSION already) resolves nothing — the
+// PENDING/OPEN/MISSED-only filter lives in the query (ListDeadlinesForConclusion), so a
+// terminal prazo simply never appears in the set the use case iterates.
+func TestOnCourtRecordArchived_NoResolvableNoOp(t *testing.T) {
+	ev := courtRecordArchivedFixture()
+	repo := &mockRepo{conclusionResolvable: nil}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnCourtRecordArchived(context.Background(), ev); err != nil {
+		t.Fatalf("OnCourtRecordArchived() error = %v", err)
+	}
+	if repo.conclusionResolvableCalls != 1 {
+		t.Errorf("ListDeadlinesForConclusion calls = %d, want 1", repo.conclusionResolvableCalls)
+	}
+	if len(repo.resolvedIDs) != 0 || len(outbox.published) != 0 {
+		t.Errorf("resolve/published = %v/%d, want none", repo.resolvedIDs, len(outbox.published))
+	}
+}
+
+// TestOnCourtRecordArchived_MarkResolvedGuardNoOp proves the guarded flip's per-prazo
+// no-op: a racing transition (already moved out of PENDING/OPEN/MISSED between the list and
+// the guarded UPDATE) touches no row — no deadline_event, no deadline.resolved_on_conclusion,
+// no error, and the batch keeps resolving the rest.
+func TestOnCourtRecordArchived_MarkResolvedGuardNoOp(t *testing.T) {
+	ev := courtRecordArchivedFixture()
+	racedID := uuid.NewString()
+	okID := uuid.NewString()
+
+	repo := &mockRepo{
+		conclusionResolvable: []ReconcilableDeadline{{ID: racedID}, {ID: okID}},
+		resolvedErrByID:      map[string]error{racedID: ErrDeadlineNotFound},
+	}
+	outbox := &fakeOutbox{}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+	if err := uc.OnCourtRecordArchived(context.Background(), ev); err != nil {
+		t.Fatalf("OnCourtRecordArchived() error = %v, want nil (guarded no-op)", err)
+	}
+	if len(repo.resolvedIDs) != 2 {
+		t.Errorf("MarkResolvedOnConclusion calls = %d, want 2 (attempted both)", len(repo.resolvedIDs))
+	}
+	if len(repo.deadlineEvents) != 1 || repo.deadlineEvents[0].DeadlineID != okID {
+		t.Errorf("deadline_event rows = %v, want exactly one for %q", repo.deadlineEvents, okID)
+	}
+	if got := len(publishedOfType[DeadlineResolvedOnConclusion](outbox)); got != 1 {
+		t.Errorf("deadline.resolved_on_conclusion events = %d, want 1 (only the non-raced prazo)", got)
+	}
+}
+
+// TestOnCourtRecordArchived_Idempotent proves a replay (dedup reports seen) is a pure
+// no-op — no list, no resolve, no event. It dedups under the SEPARATE consumerConclusion
+// name (neither consumerDeadline nor consumerReconcile), so it has its own processed_event
+// floor independent of the other consumers of this slice.
+func TestOnCourtRecordArchived_Idempotent(t *testing.T) {
+	ev := courtRecordArchivedFixture()
+	repo := &mockRepo{conclusionResolvable: []ReconcilableDeadline{{ID: uuid.NewString()}}}
+	outbox := &fakeOutbox{}
+	dedup := &fakeDedup{seen: true}
+	uc := NewUseCase(repo, &fakeCalendar{}, outbox, dedup, &fakeUOW{})
+
+	if err := uc.OnCourtRecordArchived(context.Background(), ev); err != nil {
+		t.Fatalf("OnCourtRecordArchived() error = %v", err)
+	}
+	if repo.conclusionResolvableCalls != 0 {
+		t.Errorf("ListDeadlinesForConclusion calls = %d, want 0 on a replay", repo.conclusionResolvableCalls)
+	}
+	if len(outbox.published) != 0 {
+		t.Errorf("published events = %d, want 0 on a replay", len(outbox.published))
+	}
+	if len(dedup.consumers) != 1 || dedup.consumers[0] != consumerConclusion {
+		t.Errorf("dedup consumer = %v, want [%q]", dedup.consumers, consumerConclusion)
+	}
+	if consumerConclusion == consumerDeadline || consumerConclusion == consumerReconcile {
+		t.Error("OnCourtRecordArchived must dedup under a DISTINCT consumer name from the other consumers")
+	}
+}
+
+// TestOnCourtRecordArchived_InfraErrorPropagates proves an infra fault (from the list or the
+// guarded resolve) aborts the tx (retryable) and emits nothing — only ErrDeadlineNotFound
+// from MarkResolvedOnConclusion is a per-prazo no-op.
+func TestOnCourtRecordArchived_InfraErrorPropagates(t *testing.T) {
+	infra := apperr.NewInfra("db down", errors.New("boom"))
+	tests := []struct {
+		name   string
+		mutate func(r *mockRepo)
+	}{
+		{
+			name:   "list fails → propagate",
+			mutate: func(r *mockRepo) { r.conclusionResolvableErr = infra },
+		},
+		{
+			name: "resolve fails → propagate",
+			mutate: func(r *mockRepo) {
+				r.conclusionResolvable = []ReconcilableDeadline{{ID: uuid.NewString()}}
+				r.resolvedErr = infra
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := courtRecordArchivedFixture()
+			repo := &mockRepo{}
+			tt.mutate(repo)
+			outbox := &fakeOutbox{}
+			uc := NewUseCase(repo, &fakeCalendar{}, outbox, &fakeDedup{}, &fakeUOW{})
+
+			err := uc.OnCourtRecordArchived(context.Background(), ev)
 			if err == nil {
 				t.Fatal("expected an error to propagate")
 			}

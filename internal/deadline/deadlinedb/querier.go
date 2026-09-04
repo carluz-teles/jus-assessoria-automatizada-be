@@ -348,6 +348,18 @@ type Querier interface {
 	// barrier 2). No holidays applied (a dias corridos calc, or a short prazo that skipped none)
 	// yields an empty slice, never an error. $1 = calc_memory_id, $2 = tenant_id.
 	ListAppliedHolidaysByCalcMemory(ctx context.Context, arg ListAppliedHolidaysByCalcMemoryParams) ([]ListAppliedHolidaysByCalcMemoryRow, error)
+	// ── Achado 2 (lifecycle reconciliation, fatia 2b) — OnCourtRecordArchived ───────────────
+	// List the prazos of a court_record that OnCourtRecordArchived resolves when the process
+	// concludes (Achado 2). Scoped to (court_record_id, tenant_id) (barrier 1, on top of RLS
+	// barrier 2). status IN ('PENDING', 'OPEN', 'MISSED') — the WIDER set than
+	// ListReconcilableDeadlines above: a still-unconfirmed suggestion (PENDING) is ALSO
+	// resolved (decisão de produto: nada resta a cumprir quando o processo em si concluiu, não
+	// só o já confirmado/perdido), never a MET (already done), CANCELLED (revoked), NO_DEADLINE
+	// (mera ciência) nor an already RESOLVED_ON_CONCLUSION prazo. Reuses ListReconcilableDeadlines'
+	// projection shape (id, start_date) though start_date is unused by the resolution path — no
+	// rows → an empty slice, never an error. $1 = court_record_id, $2 = tenant_id, both from the
+	// trusted event payload.
+	ListDeadlinesForConclusion(ctx context.Context, arg ListDeadlinesForConclusionParams) ([]ListDeadlinesForConclusionRow, error)
 	// Selectable ?court values for the prazos agenda: the distinct courts of the tenant's
 	// intimated court records (the same join the list uses), ordered by name
 	// (case-insensitive). Same DISTINCT-inner / ORDER BY-outer shape as ListPrazoKinds.
@@ -496,6 +508,15 @@ type Querier interface {
 	// returns the id so deadline.no_deadline commits in the SAME tx. $1 = id, $2 = tenant_id,
 	// $3 = confirmed_by, $4 = confirmed_at.
 	MarkNoDeadline(ctx context.Context, arg MarkNoDeadlineParams) (uuid.UUID, error)
+	// Resolve a prazo PENDING/OPEN/MISSED → RESOLVED_ON_CONCLUSION (Achado 2, migration 0098),
+	// keyed by id and scoped to tenant_id (barrier 1). The `status IN (...)` guard makes the
+	// flip SAFE and IDEMPOTENT, mirroring MarkMet widened to the three resolvable statuses: a
+	// redelivery, or a prazo already MET/CANCELLED/NO_DEADLINE/RESOLVED_ON_CONCLUSION, updates
+	// NO row → pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper, the use case's per-prazo
+	// no-op (never a phantom deadline.resolved_on_conclusion). On a hit it returns the id so the
+	// deadline_event audit row + deadline.resolved_on_conclusion commit in the SAME tx. $1 = id,
+	// $2 = tenant_id, both from the trusted event payload.
+	MarkResolvedOnConclusion(ctx context.Context, arg MarkResolvedOnConclusionParams) (uuid.UUID, error)
 	// Manual lifecycle transition of a task (§9: POST /v1/tasks/:id/done → OPEN→DONE stamping
 	// completed_at; .../dismiss → OPEN→DISMISSED, completed_at NULL). Flips status from
 	// current_status to new_status and sets completed_at (the caller passes now() for done, NULL

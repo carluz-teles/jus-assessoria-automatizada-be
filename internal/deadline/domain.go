@@ -39,6 +39,11 @@ const intimationTypeComunicacao = "COMUNICACAO"
 // event never collides with this one on the (consumer, event_id) key.
 const consumerReconcile = "deadline.reconcile"
 
+// consumerConclusion is the Achado 2 (fatia 2b) processed_event consumer name
+// OnCourtRecordArchived dedups under — its own name, same reasoning as consumerReconcile:
+// acquisition.court_record_archived is yet another distinct event.
+const consumerConclusion = "deadline.conclusion"
+
 // responseTPUcodes are the CNJ/TPU movement codes that mark a peça de RESPOSTA já nos autos
 // (petição, contestação, manifestação, impugnação, recurso). A docket_entry carrying one of
 // these — on/after the prazo's start_date — means the prazo foi cumprido, so a prazo histórico
@@ -211,6 +216,24 @@ type Repository interface {
 	// ErrDeadlineNotFound (the reconcile's no-op). On a hit it returns the id so deadline.met
 	// commits in the same tx. It mirrors MarkMissed, widened to the two reconcilable statuses.
 	MarkMet(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
+
+	// ── Achado 2 (lifecycle reconciliation, fatia 2b) — OnCourtRecordArchived ───────────
+
+	// ListDeadlinesForConclusion loads the prazos of a court_record OnCourtRecordArchived may
+	// resolve — status IN ('PENDING','OPEN','MISSED'), the WIDER set than
+	// ListReconcilableDeadlines (PENDING included: a still-unconfirmed suggestion is also
+	// resolved when the process concludes, not just a confirmed/missed one) — scoped to
+	// tenantID (barrier 1). Reuses ReconcilableDeadline's shape (id + start_date) though
+	// start_date is unused here; a record with nothing resolvable yields an empty slice, never
+	// an error.
+	ListDeadlinesForConclusion(ctx context.Context, tx database.Tx, courtRecordID, tenantID string) ([]ReconcilableDeadline, error)
+	// MarkResolvedOnConclusion flips a prazo PENDING/OPEN/MISSED → RESOLVED_ON_CONCLUSION,
+	// keyed by its id and scoped to tenantID (barrier 1). The `status IN (...)` guard makes the
+	// flip SAFE and IDEMPOTENT, mirroring MarkMet: a racing flip (already MET/CANCELLED/
+	// NO_DEADLINE/RESOLVED_ON_CONCLUSION) touches no row and returns ErrDeadlineNotFound (the
+	// per-prazo no-op). On a hit it returns the id so the deadline_event + deadline.
+	// resolved_on_conclusion commit in the same tx.
+	MarkResolvedOnConclusion(ctx context.Context, tx database.Tx, deadlineID, tenantID string) (string, error)
 	// MarkNoDeadline flips a prazo PENDING|OPEN → NO_DEADLINE ("mera ciência"), stamping
 	// confirmed_by/at, keyed by its id and scoped to tenantID (barrier 1). The
 	// `status IN ('PENDING','OPEN')` guard makes the flip safe and idempotent; the use case
@@ -889,6 +912,73 @@ func (uc *UseCase) OnDocketEntryObserved(ctx context.Context, ev DocketEntryObse
 			}
 
 			if err := uc.outbox.Publish(ctx, tx, newDeadlineMet(ev.TenantID, metID)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// OnCourtRecordArchived is the Achado 2 (fatia 2b) RESOLUTION path: a court_record just
+// made a REAL transition to ARCHIVED (acquisition.gradeInTx's diff of old vs. new
+// lifecycle — never on a re-poll that leaves it unchanged). Every PENDING/OPEN/MISSED
+// prazo still pending on that now-concluded process is resolved in BATCH: nothing left to
+// cumprir when the process itself is done. Unlike the docket-entry reconcile (MISSED/OPEN
+// → MET, "turns out it WAS met"), this is "the question is moot" — a DIFFERENT terminal
+// state (RESOLVED_ON_CONCLUSION), auditable in deadline_event as
+// "resolvido_por_conclusao", distinct from CANCELLED (retificação) and NO_DEADLINE (human
+// mera-ciência declaration).
+//
+// Steps:
+//  1. dedup under consumerConclusion — a replay marks nothing new and returns before any write;
+//  2. load the PENDING/OPEN/MISSED prazos of the court_record;
+//  3. for each: MarkResolvedOnConclusion (guarded PENDING/OPEN/MISSED→RESOLVED_ON_CONCLUSION)
+//     — a racing flip touches no row (ErrDeadlineNotFound), a safe per-prazo no-op;
+//  4. on a hit, append a deadline_event audit row AND emit deadline.resolved_on_conclusion,
+//     both in the SAME tx.
+//
+// tenantID comes from the trusted event payload (no Clerk token on the worker) and scopes
+// the transaction's RLS.
+func (uc *UseCase) OnCourtRecordArchived(ctx context.Context, ev CourtRecordArchived) error {
+	return uc.uow.Do(ctx, ev.TenantID, func(tx database.Tx) error {
+		seen, err := uc.dedup.SeenOrMark(ctx, tx, consumerConclusion, ev.EventID)
+		if err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
+
+		prazos, err := uc.repo.ListDeadlinesForConclusion(ctx, tx, ev.CourtRecordID, ev.TenantID)
+		if err != nil {
+			return err
+		}
+
+		for _, p := range prazos {
+			resolvedID, err := uc.repo.MarkResolvedOnConclusion(ctx, tx, p.ID, ev.TenantID)
+			if errors.Is(err, ErrDeadlineNotFound) {
+				// A racing flip already moved this prazo out of PENDING/OPEN/MISSED (met/
+				// cancelled/no_deadline by another path between the list and the guarded
+				// UPDATE): touch no row, emit nothing, keep resolving the rest. The dedup mark
+				// still commits.
+				continue
+			}
+			if err != nil {
+				return err
+			}
+
+			de := &DeadlineEvent{
+				TenantID:   ev.TenantID,
+				DeadlineID: resolvedID,
+				Tipo:       "resolvido_por_conclusao",
+				Detalhe:    "Prazo resolvido: processo concluído (arquivado)",
+				Em:         uc.now(),
+			}
+			if err := uc.repo.InsertDeadlineEvent(ctx, tx, de); err != nil {
+				return err
+			}
+
+			if err := uc.outbox.Publish(ctx, tx, newDeadlineResolvedOnConclusion(ev.TenantID, resolvedID)); err != nil {
 				return err
 			}
 		}

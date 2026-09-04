@@ -83,11 +83,14 @@ type Repository interface {
 	// DATAJUD enrichment — the in-place grade (FIX B) plus the merge fallback for a
 	// rare grade conflict. The enrichment use case depends on the narrow enrichRepo
 	// view of these. GetCourtRecordByKey is the conflict lookup (natural-key resolve);
-	// UpdateCourtRecordGrade mutates the placeholder in place.
+	// UpdateCourtRecordGrade mutates the placeholder in place and returns its pre/post
+	// lifecycle (Achado 2). RepointDeadlines mirrors RepointIntimations for the deadline
+	// table; SupersedeCourtRecord reports whether it caused a real SUPERSEDED transition.
 	GetCourtRecordByKey(ctx context.Context, tx database.Tx, tenantID, cnjNumber, degree string) (record *CourtRecord, found bool, err error)
-	UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*CourtRecord, error)
+	UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*GradedCourtRecord, error)
 	RepointIntimations(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
-	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error
+	RepointDeadlines(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (moved int, err error)
+	SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) (transitioned bool, err error)
 
 	// Re-poll scheduler — the system-scoped due scan and claim. The scheduler use
 	// case depends on the narrow schedulerRepo view of these.
@@ -1506,8 +1509,9 @@ func (r *pgRepository) GetCourtRecordByKey(ctx context.Context, tx database.Tx, 
 // child already anchored to it stays correct (FIX B). It is NOT entitlement-gated
 // (the process already counted against the plan as a placeholder). A miss (the row
 // vanished under RLS or was deleted) is the typed ErrCourtRecordNotFound, never
-// (nil, nil).
-func (r *pgRepository) UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*CourtRecord, error) {
+// (nil, nil). Returns BOTH the pre- and post-update lifecycle (Achado 2, fatia 2a) so
+// gradeInTx can detect a REAL ARCHIVED transition.
+func (r *pgRepository) UpdateCourtRecordGrade(ctx context.Context, tx database.Tx, params GradeParams) (*GradedCourtRecord, error) {
 	tid, err := uuid.Parse(params.TenantID)
 	if err != nil {
 		return nil, database.WrapInfra(err)
@@ -1541,12 +1545,11 @@ func (r *pgRepository) UpdateCourtRecordGrade(ctx context.Context, tx database.T
 	if err != nil {
 		return nil, database.WrapInfra(err)
 	}
-	return &CourtRecord{
-		ID:       row.ID.String(),
-		TenantID: params.TenantID,
-		CaseID:   row.CaseID.String(),
-		Degree:   params.Degree,
-		Court:    params.Court,
+	return &GradedCourtRecord{
+		ID:           row.ID.String(),
+		CaseID:       row.CaseID.String(),
+		OldLifecycle: row.OldLifecycle,
+		Lifecycle:    row.Lifecycle,
 	}, nil
 }
 
@@ -1577,22 +1580,54 @@ func (r *pgRepository) RepointIntimations(ctx context.Context, tx database.Tx, t
 	return int(moved), nil
 }
 
-// SupersedeCourtRecord retires the UNKNOWN placeholder inside the caller's tx,
-// scoped by tenant_id. It is a no-op if the row is invisible (RLS) or gone.
-func (r *pgRepository) SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) error {
+// RepointDeadlines moves the placeholder's deadlines onto the graded record inside the
+// caller's tx and returns how many moved — the Achado 2 counterpart of RepointIntimations
+// (fatia 2a), same shape, scoped by tenant_id (RLS barrier 1).
+func (r *pgRepository) RepointDeadlines(ctx context.Context, tx database.Tx, tenantID, fromRecordID, toRecordID string) (int, error) {
 	tid, err := uuid.Parse(tenantID)
 	if err != nil {
-		return database.WrapInfra(err)
+		return 0, database.WrapInfra(err)
+	}
+	from, err := uuid.Parse(fromRecordID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	to, err := uuid.Parse(toRecordID)
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	moved, err := acquisitiondb.New(tx).RepointDeadlines(ctx, acquisitiondb.RepointDeadlinesParams{
+		TenantID:          tid,
+		FromCourtRecordID: from,
+		ToCourtRecordID:   to,
+	})
+	if err != nil {
+		return 0, database.WrapInfra(err)
+	}
+	return int(moved), nil
+}
+
+// SupersedeCourtRecord retires the UNKNOWN placeholder inside the caller's tx, scoped by
+// tenant_id, guarded by lifecycle <> 'SUPERSEDED' (Achado 2). It reports whether THIS call
+// caused a real transition: false means the row was invisible (RLS), gone, or already
+// SUPERSEDED (a replay) — the caller's signal to skip the court_record_superseded event.
+func (r *pgRepository) SupersedeCourtRecord(ctx context.Context, tx database.Tx, tenantID, recordID string) (bool, error) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		return false, database.WrapInfra(err)
 	}
 	rid, err := uuid.Parse(recordID)
 	if err != nil {
-		return database.WrapInfra(err)
+		return false, database.WrapInfra(err)
 	}
-	err = acquisitiondb.New(tx).SupersedeCourtRecord(ctx, acquisitiondb.SupersedeCourtRecordParams{
+	rows, err := acquisitiondb.New(tx).SupersedeCourtRecord(ctx, acquisitiondb.SupersedeCourtRecordParams{
 		TenantID: tid,
 		ID:       rid,
 	})
-	return database.WrapInfra(err)
+	if err != nil {
+		return false, database.WrapInfra(err)
+	}
+	return rows > 0, nil
 }
 
 // DueCourtRecordsForResync reads the ACTIVE records whose next_sync_at is due,
