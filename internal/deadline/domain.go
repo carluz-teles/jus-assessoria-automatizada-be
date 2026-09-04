@@ -443,7 +443,8 @@ var reminderDaysLeft = []int{3, 1, 0}
 //  4. resolve the conservative rule for (type, court) → {kind, days, counting, doubled};
 //  5. decide the counting: the rule suggests it, the rito may override to CALENDAR (P2);
 //  6. compute end_date + holidays_applied via the chosen lib/calendar motor;
-//  7. persist the prazo born PENDING, source RULE (idempotent on the 1:1 intimação);
+//  7. persist the prazo born PENDING, OPEN, or MISSED per confirmacao_exigida and
+//     carência (source RULE, idempotent on the 1:1 intimação);
 //  8. emit deadline.opened in the SAME tx.
 //
 // tenantID comes from the event payload (a trusted producer inside the same system, no
@@ -552,17 +553,35 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 		seal := deriveSeal(origem, divergent)
 		confirmacao := deriveConfirmacaoExigida(seal, policy.ConfirmacaoObrigatoria)
 
+		// Um prazo cujo confirmacao_exigida já deu false (selo=confiável, política seletiva
+		// do tenant — o piso inegociável não foi acionado) nasce OPEN direto: o sistema já
+		// decidiu que não precisa de um humano confirmar, então não faz sentido represar o
+		// prazo em PENDING esperando um clique manual que a política já dispensou (bug
+		// original desta fatia — PENDING sempre, ignorando a flag). Só nasce PENDING quando
+		// confirmacao_exigida=true (selo=a_apurar ou política obrigatória).
+		status := StatusPending
+		if !confirmacao {
+			status = StatusOpen
+		}
+
 		// Um prazo NASCIDO já vencido — a carência D+1 (startOfDay(end)+1) já passou no
 		// momento da criação, típico do backfill de uma intimação histórica — nasce
-		// MISSED, não PENDING. Sem isto o carência missed_check (agendado só para ETAs
-		// FUTURAS em scheduleChecks) nunca é enfileirado e o prazo ficaria PENDING para
-		// sempre — o "prazo órfão". Silencioso por decisão: NÃO emitimos deadline.missed
-		// (um prazo que nunca esteve aberto não gera aviso "Prazo vencido"); o
-		// deadline.opened abaixo registra o fato, e o status já reflete o vencimento.
-		status := StatusPending
+		// MISSED, não PENDING/OPEN. ORDEM IMPORTA: este check roda DEPOIS do branch acima e
+		// sempre vence, sobre PENDING ou OPEN — um prazo nascido vencido nunca esteve
+		// "aberto". Sem isto o carência missed_check (agendado só para ETAs FUTURAS em
+		// scheduleChecks) nunca é enfileirado e o prazo ficaria PENDING/OPEN para sempre —
+		// o "prazo órfão". Silencioso por decisão: NÃO emitimos deadline.missed (um prazo
+		// que nunca esteve aberto não gera aviso "Prazo vencido"); o deadline.opened abaixo
+		// registra o fato, e o status já reflete o vencimento.
 		if carencia := startOfDay(endDate).AddDate(0, 0, 1); !carencia.After(uc.now()) {
 			status = StatusMissed
 		}
+
+		// assumedBySystem é o mesmo predicado usado para decidir tanto o evento
+		// deadline.assumed quanto o marcador de auditoria "assumido" abaixo: o sistema só
+		// "assumiu" o prazo quando ele de fato nasceu OPEN (não quando a carência já
+		// tinha passado e o override acima o rebaixou a MISSED — esse nunca esteve aberto).
+		assumedBySystem := !confirmacao && status == StatusOpen
 
 		d := &Deadline{
 			TenantID:           ev.TenantID,
@@ -612,6 +631,24 @@ func (uc *UseCase) OnIntimationObserved(ctx context.Context, ev IntimationObserv
 		}
 		if confirmacao {
 			if err := uc.outbox.Publish(ctx, tx, newDeadlineConfirmationRequired(saved.TenantID, saved.ID)); err != nil {
+				return err
+			}
+		} else if assumedBySystem {
+			// O sistema assumiu o prazo (nasceu OPEN, sem confirmação humana pendente):
+			// publica deadline.assumed, o contrapondo de deadline.confirmation_required
+			// (docs/design-motor-de-prazos-v1.md §7 "prazo.prazo_assumido") — e grava o
+			// marcador no audit trail agora que saved.ID existe.
+			if err := uc.outbox.Publish(ctx, tx, newDeadlineAssumed(saved)); err != nil {
+				return err
+			}
+			assumedEvent := &DeadlineEvent{
+				TenantID:   ev.TenantID,
+				DeadlineID: saved.ID,
+				Tipo:       "assumido",
+				Detalhe:    "Prazo assumido pelo sistema: confirmação humana não exigida",
+				Em:         uc.now(),
+			}
+			if err := uc.repo.InsertDeadlineEvent(ctx, tx, assumedEvent); err != nil {
 				return err
 			}
 		}

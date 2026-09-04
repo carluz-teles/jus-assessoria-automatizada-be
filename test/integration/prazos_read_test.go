@@ -3,11 +3,13 @@
 // Prazos read-model integration tests — prove the fatia 3 read surface (GET
 // /v1/processos/:id/prazos, GET /v1/prazos, GET /v1/prazos/:id) against a REAL Postgres
 // with every migration applied. A deadline is SEEDED through the real 2c creation use
-// case (listener path) so the reads run over a genuinely-derived PENDING prazo, and the
-// tests assert the read models carry the right fields (days_left computed in SQL,
-// confirmed=false, holidays_applied, the process context) and that the agenda's ascending
-// (end_date, id) keyset pages correctly. Each test uses a fresh tenant, so the tenant
-// filter (barrier 1) isolates counts on the shared DB.
+// case (listener path) so the reads run over a genuinely-derived prazo (born OPEN under
+// the default seletiva policy — no prazo_declarado, no divergence — see
+// TestDeadline_Observed_DerivesOpenDeadlineAndEvent), and the tests assert the read models
+// carry the right fields (days_left computed in SQL, confirmed=false, holidays_applied,
+// the process context) and that the agenda's ascending (end_date, id) keyset pages
+// correctly. Each test uses a fresh tenant, so the tenant filter (barrier 1) isolates
+// counts on the shared DB.
 package integration_test
 
 import (
@@ -50,9 +52,9 @@ func expectedDaysLeft(ctx context.Context, t *testing.T, pool *pgxpool.Pool, dea
 	return days
 }
 
-// PR1: a derived PENDING prazo is returned by all three read endpoints with the right
-// fields — the Prazos tab, the agenda (with process context), and the detail (with
-// rules_version). A foreign tenant gets a typed 404 on the detail.
+// PR1: a derived prazo is returned by all three read endpoints with the right fields — the
+// Prazos tab, the agenda (with process context), and the detail (with rules_version). A
+// foreign tenant gets a typed 404 on the detail.
 func TestPrazosRead_ThreeEndpoints_ReturnDerivedDeadline(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
@@ -84,8 +86,11 @@ func TestPrazosRead_ThreeEndpoints_ReturnDerivedDeadline(t *testing.T) {
 	if row.ID != deadlineID {
 		t.Errorf("row.ID = %q, want %q", row.ID, deadlineID)
 	}
-	if row.Kind != "MANIFESTACAO" || row.Counting != "BUSINESS" || row.Status != "PENDING" {
-		t.Errorf("kind/counting/status = %q/%q/%q, want MANIFESTACAO/BUSINESS/PENDING", row.Kind, row.Counting, row.Status)
+	// OPEN, not PENDING: this tenant has no seeded deadline_policy (default seletiva), and the
+	// derivation is calculado/not-divergent, so confirmacao_exigida is false — the prazo is
+	// born OPEN directly (see TestDeadline_Observed_DerivesOpenDeadlineAndEvent).
+	if row.Kind != "MANIFESTACAO" || row.Counting != "BUSINESS" || row.Status != "OPEN" {
+		t.Errorf("kind/counting/status = %q/%q/%q, want MANIFESTACAO/BUSINESS/OPEN", row.Kind, row.Counting, row.Status)
 	}
 	if row.Confirmed {
 		t.Error("Confirmed = true, want false (no human aval yet)")

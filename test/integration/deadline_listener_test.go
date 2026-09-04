@@ -63,6 +63,22 @@ func newDeadlineUCAt(pool *pgxpool.Pool, now time.Time) *deadline.UseCase {
 	)
 }
 
+// seedObrigatoriaPolicy inserts a deadline_policy row with confirmacao_obrigatoria=true for
+// the tenant — the piso-raising override (docs/design-motor-de-prazos-v1.md §5). Tests that
+// need a DETERMINISTICALLY-born-PENDING prazo (proving a PENDING-specific guard: e.g. the
+// carência never auto-misses PENDING, or an adjust preserves a still-PENDING status) call
+// this BEFORE deriving, decoupling the fixture from the default seletiva policy — under
+// which a non-divergent, non-IA prazo is now born OPEN directly (this fix). No RLS gymnastics
+// needed: this pool connects as the table owner, which bypasses RLS by default.
+func seedObrigatoriaPolicy(ctx context.Context, t *testing.T, pool *pgxpool.Pool, tenantID uuid.UUID) {
+	t.Helper()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO deadline_policy (tenant_id, confirmacao_obrigatoria) VALUES ($1, true)`,
+		tenantID); err != nil {
+		t.Fatalf("seed obrigatoria policy: %v", err)
+	}
+}
+
 // seedDeadlineParentsCommitted seeds the tenant → case → record → intimation chain and
 // COMMITS it (the rolled-back seedDeadlineParents is for pure schema tests). Returns the
 // ids the derived prazo anchors on.
@@ -106,10 +122,15 @@ func cancelledFor(p deadlineParents, eventID, reason string) deadline.Intimation
 	}
 }
 
-// DL1: a fresh observed intimação derives exactly one PENDING deadline (source RULE,
-// kind/days/counting from the seeded rule) AND one deadline.opened, in the same tx, with
-// the deadline id as the outbox aggregate.
-func TestDeadline_Observed_DerivesPendingDeadlineAndEvent(t *testing.T) {
+// DL1: a fresh observed intimação derives exactly one deadline (source RULE, kind/days/
+// counting from the seeded rule) AND one deadline.opened, in the same tx, with the deadline
+// id as the outbox aggregate. The tenant here has NO seeded deadline_policy (the default
+// seletiva), and the derivation is calculado/not-divergent (no prazo_declarado, no IA), so
+// confirmacao_exigida derives false and the prazo is born OPEN directly — plus
+// deadline.assumed and the "assumido" audit row (this fix; see
+// TestDeadline_MissedCheck_PendingNoOp and TestDeadline_Adjust_RecomputesEndAndEmitsUpdated
+// for the genuinely-PENDING counterpart, which seeds an obrigatoria policy on purpose).
+func TestDeadline_Observed_DerivesOpenDeadlineAndEvent(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
@@ -136,8 +157,8 @@ func TestDeadline_Observed_DerivesPendingDeadlineAndEvent(t *testing.T) {
 		t.Fatalf("read deadline: %v", err)
 	}
 
-	if status != "PENDING" {
-		t.Errorf("status = %q, want PENDING", status)
+	if status != "OPEN" {
+		t.Errorf("status = %q, want OPEN (confirmacao_exigida=false: seletiva policy, not divergent)", status)
 	}
 	if source != "RULE" || kind != "MANIFESTACAO" || days != 5 || counting != "BUSINESS" {
 		t.Errorf("source/kind/days/counting = %q/%q/%d/%q, want RULE/MANIFESTACAO/5/BUSINESS", source, kind, days, counting)
@@ -185,6 +206,51 @@ func TestDeadline_Observed_DerivesPendingDeadlineAndEvent(t *testing.T) {
 	}
 	if payloadDeadlineID != id || payloadKind != "MANIFESTACAO" || payloadEnd != "2024-03-11" || payloadCounting != "BUSINESS" {
 		t.Errorf("payload deadline_id/kind/end/counting = %q/%q/%q/%q", payloadDeadlineID, payloadKind, payloadEnd, payloadCounting)
+	}
+
+	// Exactly one deadline.assumed (this fix), aggregate = the deadline id, carrying the end
+	// date — since confirmacao_exigida=false and the prazo landed OPEN (not MISSED).
+	var assumedCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM outbox
+		WHERE type = $1 AND aggregate_type = 'deadline' AND aggregate_id = $2`,
+		deadline.TypeDeadlineAssumed, id).Scan(&assumedCount); err != nil {
+		t.Fatalf("count deadline.assumed: %v", err)
+	}
+	if assumedCount != 1 {
+		t.Fatalf("deadline.assumed rows = %d, want 1", assumedCount)
+	}
+	var assumedPayloadDeadlineID, assumedPayloadEnd string
+	if err := pool.QueryRow(ctx, `
+		SELECT payload->>'deadline_id', payload->>'end_date'
+		FROM outbox WHERE type = $1 AND aggregate_id = $2`,
+		deadline.TypeDeadlineAssumed, id).Scan(&assumedPayloadDeadlineID, &assumedPayloadEnd); err != nil {
+		t.Fatalf("read deadline.assumed payload: %v", err)
+	}
+	if assumedPayloadDeadlineID != id || assumedPayloadEnd != "2024-03-11" {
+		t.Errorf("deadline.assumed payload deadline_id/end = %q/%q, want %q/2024-03-11", assumedPayloadDeadlineID, assumedPayloadEnd, id)
+	}
+
+	// The audit trail carries both "calculado" (always) and "assumido" (this fix) rows — both
+	// stamped by the SAME pinned clock, so order is not asserted (only set membership).
+	rows, err := pool.Query(ctx, `SELECT tipo FROM deadline_event WHERE deadline_id = $1`, id)
+	if err != nil {
+		t.Fatalf("query deadline_event: %v", err)
+	}
+	defer rows.Close()
+	gotTipos := map[string]bool{}
+	for rows.Next() {
+		var tipo string
+		if err := rows.Scan(&tipo); err != nil {
+			t.Fatalf("scan deadline_event.tipo: %v", err)
+		}
+		gotTipos[tipo] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate deadline_event: %v", err)
+	}
+	if len(gotTipos) != 2 || !gotTipos["calculado"] || !gotTipos["assumido"] {
+		t.Errorf("deadline_event tipos = %v, want {calculado, assumido}", gotTipos)
 	}
 }
 

@@ -114,6 +114,20 @@ type ConfirmResult struct {
 // UPDATE is keyed by the 1:1 intimação, so re-confirming re-UPDATEs the one row, never a
 // second prazo.
 //
+// NO status guard (e.g. "only if PENDING"), BY DESIGN: this also runs against a prazo
+// already OPEN (e.g. auto-assumed at birth per confirmacao_exigida=false — see domain.go's
+// OnIntimationObserved). That is the intentional "editar e recomputar" flow (advogado
+// corrige days/counting/doubled num prazo já aberto e reconfirma), which
+// erd-motor-de-prazos-v1.md §4 names "confirmação opcional em lote" for the
+// system-assumed case — a human MAY still act on an already-OPEN prazo. Guarding against
+// an accidental BLIND reconfirmation (clicking a bare "Confirmar" on an already-OPEN
+// prazo without editing anything) is the FE's job, not this use case's: the one-click
+// "Confirmar prazo" button only renders in the "pending" state; an OPEN prazo only exposes
+// "Editar prazo" (opens the form) before it can reach this call again — see
+// jus-assessoria-automatizada-fe's src/features/prazos/hooks/use-prazo-da-intimacao.ts:59-77
+// and src/features/prazos/components/confirmar-prazo.tsx's PainelConfirmado. Adding a
+// status guard here would break that documented edit flow.
+//
 // Steps (§9):
 //  1. load the prazo's anchor by the 1:1 intimação (a miss → ErrDeadlineNotFound → 404);
 //  2. read the record's court and derive the UF (pkg/tribunal.UF) for the recompute;

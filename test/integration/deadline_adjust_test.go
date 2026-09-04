@@ -43,10 +43,14 @@ func seedOpenDeadline(ctx context.Context, t *testing.T, uc *deadline.UseCase, p
 // DLA1: PATCH a still-PENDING prazo's day count → the end_date is RECOMPUTED (2024-03-11 →
 // 2024-03-18) through the real calendar, the status stays PENDING (the ajuste never flips the
 // lifecycle), and exactly one deadline.updated commits to the outbox with the recomputed end.
+// Seeds an obrigatoria policy so the prazo is DETERMINISTICALLY born PENDING (not the default
+// seletiva's auto-OPEN — see TestDeadline_Observed_DerivesOpenDeadlineAndEvent), because this
+// test's whole point is proving PENDING specifically survives the PATCH untouched.
 func TestDeadline_Adjust_RecomputesEndAndEmitsUpdated(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	seedObrigatoriaPolicy(ctx, t, pool, p.tenantID)
 	uc := newDeadlineUCAt(pool, deadlineTestNow)
 
 	// Seed the PENDING prazo (INTIMACAO/TJSP → MANIFESTACAO/5/BUSINESS → end 2024-03-11).
@@ -179,11 +183,15 @@ func TestDeadline_MarkMissed_FlipsMissedAndEmits(t *testing.T) {
 
 // DLA4: the transition guards against a REAL row. met on a still-PENDING prazo is refused
 // (ErrDeadlineNotOpen, status untouched); after a met flip, the prazo is terminal and PATCH is
-// refused (ErrDeadlineNotAdjustable, dates frozen).
+// refused (ErrDeadlineNotAdjustable, dates frozen). Seeds an obrigatoria policy so the prazo is
+// DETERMINISTICALLY born PENDING (not the default seletiva's auto-OPEN — see
+// TestDeadline_Observed_DerivesOpenDeadlineAndEvent), because the FIRST guard this test proves
+// is specific to a genuinely-PENDING row.
 func TestDeadline_TransitionGuards(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
 	p := seedDeadlineParentsCommitted(ctx, t, pool)
+	seedObrigatoriaPolicy(ctx, t, pool, p.tenantID)
 	uc := newDeadlineUCAt(pool, deadlineTestNow)
 
 	// A PENDING prazo (never confirmed) cannot be marked met.
