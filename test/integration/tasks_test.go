@@ -324,3 +324,111 @@ func ids0(items []deadline.TaskView) string {
 	}
 	return items[0].AssigneeUserID
 }
+
+// TestTasks_ExcludesOpenTaskOnArchivedProcess (Achado 2, fatia 2c — "Meus Prazos"/"Pipeline"
+// coverage): an OPEN task whose court_record is already ARCHIVED leaves the fila ativa (the
+// agenda list, its "X de Y" counters, and the KPI summary), the SAME exclusion
+// internal/acquisition already applies to a PENDING intimação. A DONE task on the SAME
+// archived process stays visible — the exclusion targets active/OPEN work, not the whole
+// archived process (mirrors how a RESOLVED intimação stays visible). An avulsa task (no
+// court_record_id) is never affected by the null-safe predicate. The process's own Tasks tab
+// (TasksByProcesso, the detail/history view) is NOT filtered — it keeps showing everything,
+// exactly like GetIntimacao/ListIntimacoesByProcesso for intimações.
+func TestTasks_ExcludesOpenTaskOnArchivedProcess(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	uc := newDeadlineUC(pool)
+	reader := newDeadlineReader(pool)
+
+	tenantID := uuid.NewString()
+	seedTenant(t, pool, tenantID, "org-tasks-fila-ativa", 0)
+
+	activeRecord, _ := seedCourtRecordCNJ(t, pool, tenantID, "0000015-00.2024.8.26.0015")
+	archivedRecord, _ := seedCourtRecordCNJWithLifecycle(t, pool, tenantID, "0000016-00.2024.8.26.0016", "ARCHIVED")
+
+	activeOpen, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenantID, UserID: uuid.NewString(), CourtRecordID: activeRecord, Title: "Ativo aberta",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (active, open): %v", err)
+	}
+	archivedOpen, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenantID, UserID: uuid.NewString(), CourtRecordID: archivedRecord, Title: "Arquivada aberta",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (archived, open): %v", err)
+	}
+	archivedDone, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenantID, UserID: uuid.NewString(), CourtRecordID: archivedRecord, Title: "Arquivada concluída",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (archived, to-be-done): %v", err)
+	}
+	if _, err := uc.MarkTaskDone(ctx, tenantID, uuid.NewString(), archivedDone.ID); err != nil {
+		t.Fatalf("MarkTaskDone: %v", err)
+	}
+	avulsa, err := uc.CreateTask(ctx, deadline.CreateTaskCommand{
+		TenantID: tenantID, UserID: uuid.NewString(), Title: "Avulsa sem processo",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (avulsa): %v", err)
+	}
+
+	// The agenda (GET /v1/tasks, no filter): active-open + archived-done + avulsa are visible;
+	// archived-open is excluded.
+	res, err := reader.Tasks(ctx, deadline.TasksQuery{
+		TenantID: tenantID, LastDue: "0001-01-01", LastID: "00000000-0000-0000-0000-000000000000", Limit: 50,
+	})
+	if err != nil {
+		t.Fatalf("Tasks: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, item := range res.Items {
+		seen[item.ID] = true
+	}
+	if !seen[activeOpen.ID] {
+		t.Error("active-process OPEN task missing from the agenda")
+	}
+	if seen[archivedOpen.ID] {
+		t.Error("archived-process OPEN task still appears in the agenda, want excluded")
+	}
+	if !seen[archivedDone.ID] {
+		t.Error("archived-process DONE task missing — the exclusion must target OPEN only")
+	}
+	if !seen[avulsa.ID] {
+		t.Error("avulsa task (no court_record) missing — the null-safe predicate must never exclude it")
+	}
+
+	// "X de Y": both must agree with the visible set (3 tasks: active-open, archived-done,
+	// avulsa), not 4 (the excluded archived-open must not inflate either counter).
+	if res.TotalCount != 3 || res.Total != 3 {
+		t.Errorf("agenda totals = %d/%d, want 3/3 (archived-process OPEN task excluded from both)", res.TotalCount, res.Total)
+	}
+
+	// The KPI summary (GET /v1/tasks/summary): abertas counts the active-process OPEN task
+	// AND the avulsa one (no court_record to exclude on) but NOT the archived-process OPEN
+	// task; concluidas counts the archived-process DONE task (untouched).
+	summary, err := reader.TasksSummary(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("TasksSummary: %v", err)
+	}
+	if summary.Abertas != 2 {
+		t.Errorf("summary.abertas = %d, want 2 (active-process OPEN + avulsa, archived-process OPEN excluded)", summary.Abertas)
+	}
+	if summary.Concluidas != 1 {
+		t.Errorf("summary.concluidas = %d, want 1 (the archived-process DONE task, unaffected)", summary.Concluidas)
+	}
+
+	// The process's own Tasks tab (detail/history) is NOT filtered — the archived-open task
+	// stays reachable there, exactly like GetIntimacao/ListIntimacoesByProcesso for intimações.
+	tab := firstPageTasksByProcesso(ctx, t, reader, tenantID, archivedRecord)
+	var tabHasOpen bool
+	for _, item := range tab.Items {
+		if item.ID == archivedOpen.ID {
+			tabHasOpen = true
+		}
+	}
+	if !tabHasOpen {
+		t.Error("archived-process OPEN task missing from its own process Tasks tab — detail/history must stay unfiltered")
+	}
+}

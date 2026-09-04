@@ -52,7 +52,10 @@ type Querier interface {
 	// The tenant-wide "Y" of the task agenda counter: every task the tenant holds, regardless of
 	// any filter. DISMISSED is always excluded (mirrors ListTasks — the agenda never shows
 	// dismissed tasks, filtered or not), so this stays consistent with the list even on an
-	// unfiltered GET /v1/tasks.
+	// unfiltered GET /v1/tasks. Achado 2 (fatia 2c): the SAME OPEN+ARCHIVED exclusion applies
+	// here too — "Y" must agree with what an unfiltered ListTasks actually returns, or "X de Y"
+	// goes inconsistent the moment no filter is active (CountTasks' Go wrapper reuses this
+	// value as BOTH X and Y when unfiltered).
 	CountTasksByTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 	// Remove one checklist item (DELETE …/items/:itemId), keyed by (id, task_id, tenant_id)
 	// (barrier 1). Returns the deleted id so a no-match (foreign/unknown item) → pgx.ErrNoRows →
@@ -255,6 +258,9 @@ type Querier interface {
 	// LATERAL folds each task's done-item count in. Buckets (DISMISSED excluded, mirrors the derived
 	// display_status): concluidas = DONE; atrasadas = OPEN with due_date < today; em_execucao = OPEN,
 	// not yet due, with at least one done item; abertas = OPEN, not yet due, no done item. $1 = tenant_id.
+	// Achado 2 (fatia 2c): the OPEN+ARCHIVED exclusion (mirrors ListTasks/CountTasks) is applied at
+	// the outer WHERE, so it uniformly narrows the three OPEN-only buckets (atrasadas/em_execucao/
+	// abertas); concluidas (DONE) is untouched — the predicate is a no-op for any non-OPEN task.
 	GetTasksSummary(ctx context.Context, tenantID uuid.UUID) (GetTasksSummaryRow, error)
 	// Does the court_record hold an andamento de RESPOSTA on/after the prazo's start_date?
 	// The predicate the reconcile hangs on (docs): a movimento é resposta quando seu tpu_code
