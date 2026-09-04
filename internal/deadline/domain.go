@@ -340,19 +340,10 @@ type Repository interface {
 	UpdateDeadlineEndDate(ctx context.Context, tx database.Tx, tenantID, deadlineID string, endDate, prazoInterno time.Time) error
 	// UpdateDeadlineSelo flips the confidence selo AND stamps who/when confirmed it
 	// (confirmed_by/confirmed_at, reusing the migration 0024 columns), keyed by the prazo id and
-	// scoped to tenantID (barrier 1) — the shared write both ApurarDivergencia and ApurarTipo end
-	// with ("apurar também confirma"). origem is NEVER written here (immutable after creation). A
-	// no-match is ErrDeadlineNotDivergent (a racing apuração already sealed it).
+	// scoped to tenantID (barrier 1) — the write ApurarDivergencia ends with ("apurar também
+	// confirma"). origem is NEVER written here (immutable after creation). A no-match is
+	// ErrDeadlineNotDivergent (a racing apuração already sealed it).
 	UpdateDeadlineSelo(ctx context.Context, tx database.Tx, tenantID, deadlineID string, selo Seal, confirmedBy string, confirmedAt time.Time) error
-	// GetCalcMemory reads one deadline's calc_memory, scoped to tenantID (barrier 1).
-	// ApurarTipo reads it to confirm/override the IA-inferred tipo/confiança. A missing row is
-	// ErrCalcMemoryNotFound (→ 404), never (nil, nil).
-	GetCalcMemory(ctx context.Context, tx database.Tx, tenantID, deadlineID string) (*CalcMemory, error)
-	// UpdateCalcMemoryTipoConfirmation records the human's confirmed/reclassified tipo de ato
-	// (ia_tipo_inferido) + the resulting confiança (1.0, human-confirmed), keyed by deadline_id
-	// and scoped to tenantID (barrier 1). An UPDATE, not an INSERT — the row already exists
-	// since InsertCalcMemory ran at birth. A no-match is ErrCalcMemoryNotFound.
-	UpdateCalcMemoryTipoConfirmation(ctx context.Context, tx database.Tx, tenantID, deadlineID, tipo string, confianca float64) error
 }
 
 // deduper is the consumer-side idempotency guard port. It marks (consumer, eventID)

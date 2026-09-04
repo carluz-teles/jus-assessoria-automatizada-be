@@ -507,9 +507,9 @@ type DeadlineForAdjust struct {
 	DoubledReason   string
 	AnchorEvent     AnchorEvent
 	ManualExtraDays int
-	// Origem/Selo (V1) ride along so the apurar.go use cases (ApurarDivergencia/ApurarTipo) can
-	// gate on the current selo and stamp the UNCHANGED origem onto the deadline.seal_assigned
-	// event without a second read — origem is immutable after creation (only selo flips).
+	// Origem/Selo (V1) ride along so apurar.go's ApurarDivergencia can gate on the current selo
+	// and stamp the UNCHANGED origem onto the deadline.seal_assigned event without a second
+	// read — origem is immutable after creation (only selo flips).
 	Origem Origem
 	Selo   Seal
 }

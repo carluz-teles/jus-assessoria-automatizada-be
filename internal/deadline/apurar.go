@@ -11,16 +11,15 @@ import (
 )
 
 // apurar.go is the human decision path over an a_apurar prazo (V1, docs/design-motor-de-prazos-
-// v1.md §"Divergência"/§"Fallback IA"): POST /v1/prazos/:id/apurar-divergencia resolves a
-// declarado×calculado divergência, POST /v1/prazos/:id/apurar-tipo confirms or reclassifies the
-// IA-inferred tipo de ato. Both flip selo a_apurar → confiavel and emit deadline.seal_assigned
-// (REUSED from birth, events.go newDeadlineSealAssigned — no new event type). Origem is NEVER
-// touched here — the Architect's decision is that origem is immutable after creation (only
-// domain.go's OnIntimationObserved writes it); apurar.go only ever reads it back to stamp the
-// unchanged value onto the event. It mirrors adjust.go's shape (a UseCase method per command,
-// the SAME uow/outbox transactional-outbox pattern); the ajuste_manual decisão sets a
-// lawyer-picked data fatal (end_date) directly — the SAME shape as aceita_declarado (a chosen
-// date), recomputing only the internal safety buffer in lockstep.
+// v1.md §"Divergência"): POST /v1/prazos/:id/apurar-divergencia resolves a declarado×calculado
+// divergência, flipping selo a_apurar → confiavel and emitting deadline.seal_assigned (REUSED
+// from birth, events.go newDeadlineSealAssigned — no new event type). Origem is NEVER touched
+// here — the Architect's decision is that origem is immutable after creation (only domain.go's
+// OnIntimationObserved writes it); apurar.go only ever reads it back to stamp the unchanged
+// value onto the event. It mirrors adjust.go's shape (a UseCase method per command, the SAME
+// uow/outbox transactional-outbox pattern); the ajuste_manual decisão sets a lawyer-picked data
+// fatal (end_date) directly — the SAME shape as aceita_declarado (a chosen date), recomputing
+// only the internal safety buffer in lockstep.
 
 // apurarDecisao is the closed set POST /v1/prazos/:id/apurar-divergencia accepts.
 type apurarDecisao string
@@ -40,23 +39,6 @@ func validApurarDecisao(d apurarDecisao) bool {
 	return false
 }
 
-// apurarTipoAcao is the closed set POST /v1/prazos/:id/apurar-tipo accepts.
-type apurarTipoAcao string
-
-const (
-	acaoConfirmar     apurarTipoAcao = "confirmar"
-	acaoReclassificar apurarTipoAcao = "reclassificar"
-)
-
-// validApurarTipoAcao reports whether a is a member of the closed apurarTipoAcao set.
-func validApurarTipoAcao(a apurarTipoAcao) bool {
-	switch a {
-	case acaoConfirmar, acaoReclassificar:
-		return true
-	}
-	return false
-}
-
 // decisaoLabel is the human "trilha" phrase for an apurarDecisao — never the raw enum value
 // (mirrors domain.go's anchorEventLabel/countingLabel pattern).
 func decisaoLabel(d apurarDecisao) string {
@@ -69,18 +51,6 @@ func decisaoLabel(d apurarDecisao) string {
 		return "ajuste manual aplicado"
 	default:
 		return string(d)
-	}
-}
-
-// acaoLabel is the human "trilha" phrase for an apurarTipoAcao — never the raw enum value.
-func acaoLabel(a apurarTipoAcao) string {
-	switch a {
-	case acaoConfirmar:
-		return "confirmado"
-	case acaoReclassificar:
-		return "reclassificado"
-	default:
-		return string(a)
 	}
 }
 
@@ -103,24 +73,6 @@ type ApuradoDivergencia struct {
 	EndDate time.Time
 	Seal    Seal
 	Decisao apurarDecisao
-}
-
-// ApurarTipoCommand is the apurar-tipo input the handler builds from the request + the verified
-// principal. Tipo is used ONLY when Acao=="reclassificar" (required then); "confirmar" reads the
-// stored calc_memory.ia_tipo_inferido and stamps it as human-confirmed.
-type ApurarTipoCommand struct {
-	TenantID   string
-	UserID     string
-	DeadlineID string
-	Acao       apurarTipoAcao
-	Tipo       *string
-}
-
-// ApuradoTipo is the apurar-tipo outcome: the confirmed/reclassified tipo and the flipped selo.
-type ApuradoTipo struct {
-	ID   string
-	Tipo string
-	Seal Seal
 }
 
 // ApurarDivergencia resolves a declarado×calculado divergência (§"Divergência"): the human
@@ -232,78 +184,6 @@ func (uc *UseCase) ApurarDivergencia(ctx context.Context, cmd ApurarDivergenciaC
 	})
 	if err != nil {
 		return ApuradoDivergencia{}, err
-	}
-	return result, nil
-}
-
-// ApurarTipo confirms or reclassifies the IA-inferred tipo de ato (§"Fallback IA"): "confirmar"
-// stamps the stored calc_memory.ia_tipo_inferido as human-confirmed (ia_confianca → 1.0);
-// "reclassificar" overrides it with the human's Tipo. Both flip selo a_apurar → confiavel,
-// append a deadline_event and emit deadline.seal_assigned, in ONE tenant-scoped tx.
-//
-// Guards: the prazo must exist and be non-terminal (ErrDeadlineNotApuravel), and its selo must
-// still be a_apurar (ErrDeadlineNotDivergent otherwise — also the idempotency guard: a second
-// apuração on an already-confiavel prazo is refused, not reprocessed).
-func (uc *UseCase) ApurarTipo(ctx context.Context, cmd ApurarTipoCommand) (ApuradoTipo, error) {
-	if !validApurarTipoAcao(cmd.Acao) {
-		return ApuradoTipo{}, apperr.NewInvalid("acao must be confirmar or reclassificar")
-	}
-	if cmd.Acao == acaoReclassificar && (cmd.Tipo == nil || *cmd.Tipo == "") {
-		return ApuradoTipo{}, apperr.NewInvalid("tipo is required to reclassificar")
-	}
-
-	var result ApuradoTipo
-	err := uc.uow.Do(ctx, cmd.TenantID, func(tx database.Tx) error {
-		cur, err := uc.repo.GetDeadlineForAdjust(ctx, tx, cmd.DeadlineID, cmd.TenantID)
-		if err != nil {
-			return err
-		}
-		if cur.Status == StatusMet || cur.Status == StatusCancelled {
-			return ErrDeadlineNotApuravel
-		}
-		if cur.Selo != SealAApurar {
-			return ErrDeadlineNotDivergent
-		}
-
-		cm, err := uc.repo.GetCalcMemory(ctx, tx, cmd.TenantID, cmd.DeadlineID)
-		if err != nil {
-			return err
-		}
-
-		tipo := cm.IATipoInferido
-		if cmd.Acao == acaoReclassificar {
-			tipo = *cmd.Tipo
-		}
-		const confiancaHumanoConfirmado = 1.0
-		if err := uc.repo.UpdateCalcMemoryTipoConfirmation(ctx, tx, cmd.TenantID, cmd.DeadlineID, tipo, confiancaHumanoConfirmado); err != nil {
-			return err
-		}
-		if err := uc.repo.UpdateDeadlineSelo(ctx, tx, cmd.TenantID, cmd.DeadlineID, SealConfiavel, cmd.UserID, uc.now()); err != nil {
-			return err
-		}
-
-		de := &DeadlineEvent{
-			TenantID:   cmd.TenantID,
-			DeadlineID: cmd.DeadlineID,
-			Tipo:       "confirmado",
-			Detalhe:    fmt.Sprintf("Tipo apurado: %s (%s)", tipo, acaoLabel(cmd.Acao)),
-			AtorID:     cmd.UserID,
-			Em:         uc.now(),
-		}
-		if err := uc.repo.InsertDeadlineEvent(ctx, tx, de); err != nil {
-			return err
-		}
-
-		sealed := &Deadline{ID: cmd.DeadlineID, Origem: cur.Origem, Seal: SealConfiavel}
-		if err := uc.outbox.Publish(ctx, tx, newDeadlineSealAssigned(sealed)); err != nil {
-			return err
-		}
-
-		result = ApuradoTipo{ID: cmd.DeadlineID, Tipo: tipo, Seal: SealConfiavel}
-		return nil
-	})
-	if err != nil {
-		return ApuradoTipo{}, err
 	}
 	return result, nil
 }

@@ -388,7 +388,7 @@ RETURNING id;
 -- {kind, days, counting, doubled, doubled_reason} are the base the partial patch is applied
 -- over (a field absent from the body keeps its stored value). status gates the ajuste (only
 -- a PENDING/OPEN prazo is adjustable). origem/selo (V1) ride along for apurar.go — origem is
--- immutable (only stamped onto deadline.seal_assigned), selo gates apurar-tipo. Keyed by id
+-- immutable (only stamped onto deadline.seal_assigned), selo gates the apuração. Keyed by id
 -- and scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing id in the tenant →
 -- pgx.ErrNoRows → typed ErrDeadlineNotFound at the mapper (→ 404), never (nil, nil). $1 = id,
 -- $2 = tenant_id (from the principal).
@@ -727,12 +727,11 @@ SET ai_summary = $1,
 WHERE id = $3 AND tenant_id = $4 AND ai_summary IS NULL;
 
 -- ── V1 apuração (human decision on a_apurar prazos) ─────────────────────────
--- POST /v1/prazos/:id/apurar-divergencia | .../apurar-tipo (apurar.go). Both flip selo
--- a_apurar → confiavel; origem is NEVER touched here (immutable after creation — only the
--- creation path in domain.go writes it). The deadline row itself is patched via the ALREADY
--- existing UpdateDeadlineAdjust (ajuste_manual path) or UpdateDeadlineEndDate (aceita_declarado
--- path) below; aceita_calculado writes nothing (the stored end_date already IS the calculado
--- date).
+-- POST /v1/prazos/:id/apurar-divergencia (apurar.go). Flips selo a_apurar → confiavel; origem
+-- is NEVER touched here (immutable after creation — only the creation path in domain.go writes
+-- it). The deadline row itself is patched via the ALREADY existing UpdateDeadlineAdjust
+-- (ajuste_manual path) or UpdateDeadlineEndDate (aceita_declarado path) below; aceita_calculado
+-- writes nothing (the stored end_date already IS the calculado date).
 
 -- name: GetCrossValidation :one
 -- Read the declared×calculado cross-validation for one deadline (apurar-divergencia gate:
@@ -776,44 +775,21 @@ WHERE id = $1 AND tenant_id = $2
 RETURNING id;
 
 -- name: UpdateDeadlineSelo :one
--- Flip the confidence selo (a_apurar → confiavel) AND stamp who/when confirmed it — the shared
--- write both apurar-divergencia and apurar-tipo end with, after the divergência/tipo decision is
--- recorded (Architect decisão: "apurar também confirma", reusing the confirmed_by/confirmed_at
--- columns from migration 0024 — the SAME human-approval stamp F2's ConfirmDeadline/MarkNoDeadline
--- already write, now also written on THIS confirmation path). origem is NEVER written here
--- (immutable after creation). Scoped to tenant_id (barrier 1). The `selo = 'a_apurar'` guard makes
--- the flip SAFE and IDEMPOTENT under concurrency (the concurrency floor, mirroring
--- MarkTaskStatus/MarkDeadlineStatus's `status = current_status` guard): the caller pre-checks the
--- selo before calling, and this guard defends the write against a racing second apuração on the
--- SAME prazo — a no-match (the row vanished mid-tx, OR a concurrent apuração already sealed it
--- confiavel) → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the mapper (never a silent no-op
--- re-seal). $1 = id, $2 = tenant_id, $3 = selo, $4 = confirmed_by, $5 = confirmed_at.
+-- Flip the confidence selo (a_apurar → confiavel) AND stamp who/when confirmed it — the write
+-- apurar-divergencia ends with, after the divergência decision is recorded (Architect decisão:
+-- "apurar também confirma", reusing the confirmed_by/confirmed_at columns from migration 0024 —
+-- the SAME human-approval stamp F2's ConfirmDeadline/MarkNoDeadline already write, now also
+-- written on THIS confirmation path). origem is NEVER written here (immutable after creation).
+-- Scoped to tenant_id (barrier 1). The `selo = 'a_apurar'` guard makes the flip SAFE and
+-- IDEMPOTENT under concurrency (the concurrency floor, mirroring MarkTaskStatus/
+-- MarkDeadlineStatus's `status = current_status` guard): the caller pre-checks the selo before
+-- calling, and this guard defends the write against a racing second apuração on the SAME prazo
+-- — a no-match (the row vanished mid-tx, OR a concurrent apuração already sealed it confiavel)
+-- → pgx.ErrNoRows → typed ErrDeadlineNotDivergent at the mapper (never a silent no-op re-seal).
+-- $1 = id, $2 = tenant_id, $3 = selo, $4 = confirmed_by, $5 = confirmed_at.
 UPDATE deadline
 SET selo         = $3,
     confirmed_by = $4,
     confirmed_at = $5
 WHERE id = $1 AND tenant_id = $2 AND selo = 'a_apurar'
-RETURNING id;
-
--- name: GetCalcMemory :one
--- Read one deadline's calc_memory (apurar-tipo: the IA's inferred tipo/confiança the human
--- confirms or overrides). Scoped to tenant_id (barrier 1, on top of RLS barrier 2). A missing
--- row → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper (→ 404), never (nil, nil).
--- $1 = deadline_id, $2 = tenant_id.
-SELECT id, prazo_base, prazo_base_fonte, termo_inicial_regra, dias_uteis, dobra_motivo,
-       tabela_legal_ref, ia_tipo_inferido, ia_confianca, calendar_provider_version
-FROM calc_memory
-WHERE deadline_id = $1 AND tenant_id = $2;
-
--- name: UpdateCalcMemoryTipoConfirmation :one
--- Record the human's confirmation/reclassification of the IA-inferred tipo de ato
--- (apurar-tipo, confirmar|reclassificar): ia_tipo_inferido becomes the confirmed/overridden
--- tipo, ia_confianca becomes 1.0 (human-confirmed, full confidence) — an UPDATE, not an INSERT
--- (the row already exists since InsertCalcMemory ran at birth). Scoped to tenant_id (barrier
--- 1). A no-match → pgx.ErrNoRows → typed ErrCalcMemoryNotFound at the mapper. $1 = deadline_id,
--- $2 = tenant_id, $3 = ia_tipo_inferido, $4 = ia_confianca.
-UPDATE calc_memory
-SET ia_tipo_inferido = $3,
-    ia_confianca = $4
-WHERE deadline_id = $1 AND tenant_id = $2
 RETURNING id;
